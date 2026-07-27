@@ -1,0 +1,20 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2024"
+description = "QuickJS harness PoC — research artifact, not production"
+
+[dependencies]
+rquickjs = "0.12.1"
+ureq = "3.3.0"
+
+# QuickJS assumes an 8 MiB thread stack (the Linux glibc default).
+# Windows defaults to 1 MiB, which crashes deep JS recursion before the
+# engine's own stack guard fires.  Raise it at link time.
+# NOTE: these flags are NOT honored by `cargo install` — the production
+# integration uses std::thread::Builder::stack_size() instead.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

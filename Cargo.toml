@@ -1,0 +1,16 @@
+[workspace]
+members = ["zerostack", "spike"]
+resolver = "2"
+
+[profile.dev]
+opt-level = 1
+debug = false
+codegen-units = 16
+incremental = true
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+debug = false
