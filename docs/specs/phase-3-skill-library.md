@@ -64,6 +64,8 @@ pub struct Skill {
 
 Database path: `~/.config/zerostack/skills.db` (respects `$XDG_CONFIG_HOME`). Use `rusqlite` with `features = ["bundled"]` so no system SQLite is required.
 
+> **Schema note**: `SPEC.md §3.2` shows a `name TEXT NOT NULL` column that is absent from the `Skill` struct in `SPEC.md §3.1`. The schema below is the resolved version — it matches the struct exactly (no `name`, includes `created_at` and `usage_count`). Do not add a `name` column.
+
 ```sql
 CREATE TABLE IF NOT EXISTS skills (
     id          TEXT    PRIMARY KEY,
@@ -218,6 +220,8 @@ Retrieval uses the agent step's current context (last N tokens of the conversati
 ---
 
 ## Skill verification — `src/extras/js/skills/mod.rs`
+
+**Prerequisite**: Phase 1 must declare `run_step` as `pub(crate)` (not private `fn`). The Phase 1 spec already annotates this; verify before implementing Phase 3.
 
 ```rust
 pub fn verify_skill(skill: &Skill) -> Result<(), String> {

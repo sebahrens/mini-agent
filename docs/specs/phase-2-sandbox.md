@@ -55,7 +55,7 @@ The `js` feature and the `sandbox` feature are **independent**. An implementor s
 
 ## Current state of `src/sandbox.rs`
 
-The `Sandbox` struct (defined at `src/sandbox.rs:8`) currently wraps two Linux backends:
+The `Sandbox` struct (defined at `src/sandbox.rs:9`; `#[derive(Debug, Clone)]` is on line 8) currently wraps two Linux backends:
 - **bwrap** (`bubblewrap`) — checked via `bwrap_exists()` at line 18
 - **zerobox** — checked via `zerobox_exists()` at line 22
 - **macOS/Windows** — no sandbox backend; `is_effectively_sandboxed()` returns `false`

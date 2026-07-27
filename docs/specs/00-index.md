@@ -11,6 +11,14 @@ All specs derive from `SPEC.md` (single source of truth). Architecture decisions
 
 Prior research artifact (superseded by this index): `2026-07-27-js-engine-blueprint.md`
 
+## Cross-phase dependencies
+
+| Dependency | Produces | Consumed by |
+|-----------|---------|------------|
+| `run_step` visibility | Phase 1 must declare `pub(crate) fn run_step` | Phase 3 `verify_skill()` calls it cross-module |
+| `SkillStore` + `Skill` types | Phase 3 | Phase 4 `propose_skill()` host global |
+| `skills_pending` table | Phase 4 extends Phase 3's store | Phase 4 promotion gate |
+
 ## Quick orientation
 
 The monorepo was flattened in commit `7872f7b` (`zerostack/ → root`). All source lives under `src/` at the repo root — not under `zerostack/src/`. References to `zerostack/` in older docs mean `src/`.

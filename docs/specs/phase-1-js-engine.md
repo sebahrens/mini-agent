@@ -141,7 +141,8 @@ pub fn js_thread_main(rx: mpsc::Receiver<JsRequest>) {
     }
 }
 
-fn run_step(code: &str) -> JsOutcome {
+// pub(crate) required: Phase 3's verify_skill() calls this across modules
+pub(crate) fn run_step(code: &str) -> JsOutcome {
     // Fresh Runtime EVERY step — OOM poisons allocator; never reuse
     let rt = match Runtime::new() {
         Ok(r) => r,
