@@ -42,7 +42,7 @@ All new files go in `src/` at the repo root (monorepo was flattened in commit `7
 | `src/extras/js/tool.rs` | TO BE CREATED | `JsTool` — `rig::tool::Tool` impl |
 | `src/extras/js/host.rs` | TO BE CREATED | Host global implementations |
 | `src/extras/js/mod.rs` | TO BE CREATED | Module re-exports |
-| `src/extras/mod.rs` | EXISTS (line 41) | Add `#[cfg(feature = "js")] pub mod js;` after line 41 |
+| `src/extras/mod.rs` | EXISTS (line 40) | Add `#[cfg(feature = "js")] pub mod js;` after line 40 |
 | `src/agent/builder.rs` | EXISTS | Add `#[cfg(feature = "js")]` block after line 279 |
 
 ---
@@ -300,13 +300,20 @@ The LLM uses this to revise its JS on the next step.
 ## JsTool — `src/extras/js/tool.rs`
 
 Imports from existing code:
-- `use crate::agent::tools::{AskSender, PermCheck, ToolError};` — types in `src/agent/tools/mod.rs`
-- `use crate::agent::tools::check_perm;` — function at `src/agent/tools/mod.rs:199`
+- `use crate::permission::ask::AskSender;` — type alias `mpsc::Sender<AskRequest>` defined at `src/permission/ask.rs:5`
+- `use crate::permission::checker::PermCheck;` — type alias `Arc<Mutex<PermissionChecker>>` defined at `src/permission/checker.rs:10`
+- `use crate::agent::tools::{ToolError, check_perm};` — error type at `src/agent/tools/mod.rs:88`, permission helper at `src/agent/tools/mod.rs:199`
 - `use rig::tool::Tool;`
+
+> **Import trap**: `AskSender` and `PermCheck` are NOT re-exported from `crate::agent::tools`.
+> They appear in `tools/mod.rs` as private `use` items — accessible to child modules of `tools`
+> (e.g. `bash.rs`) but NOT from `crate::extras::js::tool`. Use the direct paths above.
 
 ```rust
 use rig::tool::Tool;
-use crate::agent::tools::{AskSender, PermCheck, ToolError};
+use crate::permission::ask::AskSender;
+use crate::permission::checker::PermCheck;
+use crate::agent::tools::{ToolError, check_perm};
 use crate::extras::js::types::*;
 
 pub struct JsTool {
@@ -384,14 +391,14 @@ pub mod types;
 
 ## Module declaration — `src/extras/mod.rs`
 
-Append after the last existing line (line 41):
+Append after the last existing line (line 40):
 
 ```rust
 #[cfg(feature = "js")]
 pub mod js;
 ```
 
-Existing content of `src/extras/mod.rs` ends with `pub(crate) mod truncate;` at line 41. The new line goes after it.
+Existing content of `src/extras/mod.rs` ends with `pub(crate) mod truncate;` at line 40. The new line goes after it.
 
 ---
 
