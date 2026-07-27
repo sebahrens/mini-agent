@@ -78,6 +78,30 @@ pub enum JsOutcome {
     Timeout,
     OomKilled,
 }
+
+/// Sent from the JS thread to tokio to request permission for a host call.
+/// The JS thread blocks on `reply_rx.recv()` while tokio resolves the check.
+#[derive(Debug)]
+pub struct PermRequest {
+    pub tool:  String,
+    pub key:   String,
+    pub reply: std::sync::mpsc::Sender<PermResponse>,
+}
+
+#[derive(Debug)]
+pub enum PermResponse {
+    Allowed,
+    Denied(String),
+}
+
+/// Returned to JS by `spawn(cmd, args)`.
+/// Visible in JS as `{ stdout: string, stderr: string, code: number }`.
+#[derive(Debug, serde::Serialize)]
+pub struct SpawnResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub code:   i32,
+}
 ```
 
 ---
