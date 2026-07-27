@@ -270,6 +270,17 @@ pub fn make_spawn(ctx: SpawnContext) -> impl Fn(String, Vec<String>) -> rquickjs
 
 `Sandbox::wrap_command` is defined at `src/sandbox.rs:109`. It applies bubblewrap/zerobox sandboxing on Linux and falls back to unsandboxed on platforms without the backend binary.
 
+**Reference pattern**: the `BashTool` permission call at `src/agent/tools/bash.rs:137` shows the exact idiom to mirror:
+
+```rust
+// src/agent/tools/bash.rs:137 — reference implementation
+if let Some(msg) = check_perm(&self.permission, &self.ask_tx, "bash", cmd).await? {
+    coaching = Some(msg);
+}
+```
+
+For `JsTool`'s host globals, replace `"bash"` with the JS-specific tool key (e.g. `"js/spawn"`, `"js/read_file"`, `"js/write_file"`) and `cmd` with the relevant input string.
+
 ### Interrupt handler scope
 
 `set_interrupt_handler` fires only during **JS bytecode execution**, not during blocking Rust host calls. A `spawn()` call that hangs will not be interrupted by the JS timeout. Mitigation for blocking host calls is a per-call `tokio::time::timeout` on the tokio side (Phase 2 concern; see `ARCHITECTURE.md §5`).
