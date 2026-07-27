@@ -1,7 +1,7 @@
 # Phase 3 — Skill Library
 
 **Status**: Pre-implementation  
-**Prerequisite**: Phase 1 complete and passing  
+**Prerequisite**: Phase 1 complete and passing (Phase 2 is NOT required)  
 **Delivers**: A content-addressed SQLite skill store with embedding-based retrieval. Top-K skills are injected as a JS preamble before each agent step.
 
 ---
@@ -26,13 +26,13 @@ fastembed  = { version = "3", optional = true }
 rusqlite   = { version = "0.31", features = ["bundled"], optional = true }
 ```
 
-Gate all skill code behind `#[cfg(feature = "skills")]`. The binary without `--features skills` must compile and all Phase 1/2 tests must pass.
+Gate all skill code behind `#[cfg(feature = "skills")]`. The binary without `--features skills` must compile and all Phase 1/2 tests must pass. `rusqlite` uses `features = ["bundled"]` so no system SQLite is required.
 
 ---
 
 ## File placement
 
-All new files in `src/extras/js/skills/` (to be created):
+All new files go in `src/extras/js/skills/` (to be created):
 
 | File | Status | Purpose |
 |------|--------|---------|
@@ -47,24 +47,24 @@ All new files in `src/extras/js/skills/` (to be created):
 
 ```rust
 pub struct Skill {
-    pub id:          String,   // sha256(source) hex — first 16 chars used as store key
-    pub source:      String,   // JS function source (the actual code)
-    pub description: String,   // embedded for retrieval; human-readable
+    pub id:          String,      // sha256(source) hex — first 16 chars used as store key
+    pub source:      String,      // JS function source (the actual code)
+    pub description: String,      // embedded for retrieval; human-readable
     pub tests:       Vec<String>, // JS expressions each evaluating to true
-    pub created_at:  u64,      // Unix timestamp
+    pub created_at:  u64,         // Unix timestamp
     pub usage_count: u64,
 }
 ```
 
-**Content-addressing invariant**: `id = sha256(source)[..16]`. Changing `source` changes `id` and the old skill record is unreachable. This is structurally enforced — there is no `UPDATE source` operation.
+**Content-addressing invariant**: `id = sha256(source)[..16]` (first 16 hex chars of the SHA-256 hash of the source bytes). Changing `source` changes `id` and the old skill record is unreachable. There is no `UPDATE source` operation — content is immutable.
+
+**Schema conflict resolved**: `SPEC.md §3.2` lists a `name TEXT NOT NULL` column that is absent from the `Skill` struct in `SPEC.md §3.1`. The spec below matches the struct exactly — no `name` column.
 
 ---
 
 ## SQL schema — `src/extras/js/skills/store.rs`
 
-Database path: `~/.config/zerostack/skills.db` (respects `$XDG_CONFIG_HOME`). Use `rusqlite` with `features = ["bundled"]` so no system SQLite is required.
-
-> **Schema note**: `SPEC.md §3.2` shows a `name TEXT NOT NULL` column that is absent from the `Skill` struct in `SPEC.md §3.1`. The schema below is the resolved version — it matches the struct exactly (no `name`, includes `created_at` and `usage_count`). Do not add a `name` column.
+Database path: `~/.config/zerostack/skills.db` (respects `$XDG_CONFIG_HOME`).
 
 ```sql
 CREATE TABLE IF NOT EXISTS skills (
@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS skills (
     description TEXT    NOT NULL,
     tests       TEXT    NOT NULL,   -- JSON array of strings
     created_at  INTEGER NOT NULL,
-    usage_count INTEGER NOT NULL DEFAULT 0
+    usage_count INTEGER NOT NULL DEFAULT 0,
+    embedding   BLOB                -- NULL until embed() is called; f32 LE bytes
 );
 ```
 
@@ -85,7 +86,7 @@ pub struct SkillStore {
 }
 
 impl SkillStore {
-    pub fn open() -> anyhow::Result<Self>;          // opens ~/.config/zerostack/skills.db
+    pub fn open() -> anyhow::Result<Self>;
 
     /// Insert a skill. Returns Err if id already exists (content-addressed — no update).
     pub fn insert(&mut self, skill: &Skill) -> anyhow::Result<()>;
@@ -98,26 +99,6 @@ impl SkillStore {
 
     pub fn delete(&mut self, id: &str) -> anyhow::Result<()>;
 }
-```
-
-The `embedding` column (Phase 3 extension) stores a `BLOB` of little-endian `f32` values. It is added to the schema after the skills table:
-
-```sql
-ALTER TABLE skills ADD COLUMN embedding BLOB;
-```
-
-Or define it in the initial schema:
-
-```sql
-CREATE TABLE IF NOT EXISTS skills (
-    id          TEXT    PRIMARY KEY,
-    source      TEXT    NOT NULL,
-    description TEXT    NOT NULL,
-    tests       TEXT    NOT NULL,
-    created_at  INTEGER NOT NULL,
-    usage_count INTEGER NOT NULL DEFAULT 0,
-    embedding   BLOB            -- NULL until embed() is called
-);
 ```
 
 ---
@@ -176,13 +157,13 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-For Phase 3 scale (tens to hundreds of skills), linear scan is sufficient. A vector index (e.g., HNSW) is a Phase 3+ stretch concern.
+For Phase 3 scale (tens to hundreds of skills), linear scan is sufficient. A vector index (HNSW etc.) is a stretch concern.
 
 ---
 
 ## Preamble injection — `src/extras/js/engine.rs`
 
-Before evaluating agent code, retrieve top-3 skills and prepend as a preamble:
+Before evaluating agent code, retrieve top-3 skills and prepend as a preamble. Modify `run_step` (or add a wrapper) to accept optional skills:
 
 ```javascript
 // === Skill library (auto-injected) ===
@@ -196,7 +177,7 @@ function readLines(path) { return read_file(path).split('\n').filter(l => l.leng
 <agent JS code here>
 ```
 
-Implementation in `run_step` (or a wrapper):
+Implementation:
 
 ```rust
 fn build_full_code(agent_code: &str, skills: &[Skill]) -> String {
@@ -215,21 +196,21 @@ fn build_full_code(agent_code: &str, skills: &[Skill]) -> String {
 }
 ```
 
-Retrieval uses the agent step's current context (last N tokens of the conversation) as the query for embedding. Top-3 is the default `k`.
+Retrieval uses the agent step's current context (last N tokens of the conversation) as the embedding query. Default `k = 3`.
 
 ---
 
 ## Skill verification — `src/extras/js/skills/mod.rs`
 
-**Prerequisite**: Phase 1 must declare `run_step` as `pub(crate)` (not private `fn`). The Phase 1 spec already annotates this; verify before implementing Phase 3.
+**Prerequisite**: Phase 1 must declare `run_step` as `pub(crate)` (not private). The Phase 1 spec already annotates this — verify before implementing Phase 3.
 
 ```rust
 pub fn verify_skill(skill: &Skill) -> Result<(), String> {
     for test_expr in &skill.tests {
-        // Run each test expression in a fresh sandbox Runtime (reuse run_step machinery)
-        let result = crate::extras::js::engine::run_step(
-            &format!("({}); {}", skill.source, test_expr)
-        );
+        // Run each test expression in a fresh sandbox Runtime (reuses run_step machinery)
+        // Prepend the skill source so the test can call its functions
+        let code = format!("({}); {}", skill.source, test_expr);
+        let result = crate::extras::js::engine::run_step(&code);
         match result {
             JsOutcome::Value(v) if v == "true" => {}
             JsOutcome::Void => {}

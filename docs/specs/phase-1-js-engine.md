@@ -33,7 +33,7 @@ Gate any new code behind `#[cfg(feature = "js")]`. The binary compiles and all e
 
 ## File placement
 
-All new files go in `src/` at the repo root (monorepo was flattened in commit `7872f7b`; `zerostack/` no longer exists).
+All new files go in `src/` at the repo root. The `zerostack/` directory no longer exists (monorepo flattened). The `src/extras/js/` directory does not exist yet and must be created.
 
 | File | Status | Purpose |
 |------|--------|---------|
@@ -42,8 +42,8 @@ All new files go in `src/` at the repo root (monorepo was flattened in commit `7
 | `src/extras/js/tool.rs` | TO BE CREATED | `JsTool` — `rig::tool::Tool` impl |
 | `src/extras/js/host.rs` | TO BE CREATED | Host global implementations |
 | `src/extras/js/mod.rs` | TO BE CREATED | Module re-exports |
-| `src/extras/mod.rs` | EXISTS (line 40) | Add `#[cfg(feature = "js")] pub mod js;` after line 40 |
-| `src/agent/builder.rs` | EXISTS | Add `#[cfg(feature = "js")]` block after line 279 |
+| `src/extras/mod.rs` | EXISTS (40 lines) | Append `#[cfg(feature = "js")] pub mod js;` after line 40 |
+| `src/agent/builder.rs` | EXISTS | Add `#[cfg(feature = "js")]` block at lines 333–334 (see §Builder registration) |
 
 ---
 
@@ -260,30 +260,29 @@ pub fn make_spawn(ctx: SpawnContext) -> impl Fn(String, Vec<String>) -> rquickjs
             Err(_) =>
                 return Err(rquickjs::Error::new_from_js("spawn", "permission channel closed")),
         }
-        // 2. Execute via Sandbox::wrap_command (src/sandbox.rs:109)
-        //    wrap_command returns a tokio::process::Command; use blocking::unblock or
-        //    std::process::Command directly on the JS thread (acceptable — dedicated thread)
+        // 2. Execute via std::process::Command (blocking — JS thread acceptable)
+        //    Apply Sandbox parameters manually or call ctx.sandbox.wrap_command(&cmd)
+        //    and convert the tokio::process::Command to blocking via .into_std().
+        //    src/sandbox.rs:109 Sandbox::wrap_command returns tokio::process::Command.
         // ...
     }
 }
 ```
 
-`Sandbox::wrap_command` is defined at `src/sandbox.rs:109`. It applies bubblewrap/zerobox sandboxing on Linux and falls back to unsandboxed on platforms without the backend binary.
-
-**Reference pattern**: the `BashTool` permission call at `src/agent/tools/bash.rs:137` shows the exact idiom to mirror:
+**Reference pattern**: the `BashTool` permission call at `src/agent/tools/bash.rs:137` shows the exact idiom to mirror (from inside a tokio async context):
 
 ```rust
-// src/agent/tools/bash.rs:137 — reference implementation
+// src/agent/tools/bash.rs:137 — reference implementation (async path)
 if let Some(msg) = check_perm(&self.permission, &self.ask_tx, "bash", cmd).await? {
     coaching = Some(msg);
 }
 ```
 
-For `JsTool`'s host globals, replace `"bash"` with the JS-specific tool key (e.g. `"js/spawn"`, `"js/read_file"`, `"js/write_file"`) and `cmd` with the relevant input string.
+For `JsTool`'s async `call()` method (before sending to the JS thread), replace `"bash"` with the JS-specific tool key (e.g. `"js/spawn"`, `"js/read_file"`, `"js/write_file"`) and `cmd` with the relevant input string. The sync-channel `SpawnContext` approach is used when the permission check must be made from the non-async JS thread side.
 
 ### Interrupt handler scope
 
-`set_interrupt_handler` fires only during **JS bytecode execution**, not during blocking Rust host calls. A `spawn()` call that hangs will not be interrupted by the JS timeout. Mitigation for blocking host calls is a per-call `tokio::time::timeout` on the tokio side (Phase 2 concern; see `ARCHITECTURE.md §5`).
+`set_interrupt_handler` fires only during **JS bytecode execution**, not during blocking Rust host calls. A `spawn()` call that hangs will not be interrupted by the JS timeout. Mitigation is a per-call timeout on the tokio side (Phase 2 concern; see `ARCHITECTURE.md §5`).
 
 ---
 
@@ -310,15 +309,18 @@ The LLM uses this to revise its JS on the next step.
 
 ## JsTool — `src/extras/js/tool.rs`
 
-Imports from existing code:
-- `use crate::permission::ask::AskSender;` — type alias `mpsc::Sender<AskRequest>` defined at `src/permission/ask.rs:5`
-- `use crate::permission::checker::PermCheck;` — type alias `Arc<Mutex<PermissionChecker>>` defined at `src/permission/checker.rs:10`
-- `use crate::agent::tools::{ToolError, check_perm};` — error type at `src/agent/tools/mod.rs:88`, permission helper at `src/agent/tools/mod.rs:199`
-- `use rig::tool::Tool;`
+### Import paths
 
-> **Import trap**: `AskSender` and `PermCheck` are NOT re-exported from `crate::agent::tools`.
-> They appear in `tools/mod.rs` as private `use` items — accessible to child modules of `tools`
-> (e.g. `bash.rs`) but NOT from `crate::extras::js::tool`. Use the direct paths above.
+`AskSender` and `PermCheck` are **NOT** re-exported via `pub use` from `crate::agent::tools`. They appear in `src/agent/tools/mod.rs` as private `use` items (lines 84–85), accessible to child modules of `tools` (like `bash.rs`) but NOT from `crate::extras::js::tool`. Use the direct module paths:
+
+| Type | Direct path | Declared at |
+|------|-------------|-------------|
+| `AskSender` | `crate::permission::ask::AskSender` | `src/permission/ask.rs:5` |
+| `PermCheck` | `crate::permission::checker::PermCheck` | `src/permission/checker.rs:10` |
+| `ToolError` | `crate::agent::tools::ToolError` | `src/agent/tools/mod.rs:88` |
+| `check_perm` | `crate::agent::tools::check_perm` | `src/agent/tools/mod.rs:199` |
+
+### Full implementation
 
 ```rust
 use rig::tool::Tool;
@@ -402,23 +404,23 @@ pub mod types;
 
 ## Module declaration — `src/extras/mod.rs`
 
-Append after the last existing line (line 40):
+Append after the last existing line (line 40, which is `pub(crate) mod truncate;`):
 
 ```rust
 #[cfg(feature = "js")]
 pub mod js;
 ```
 
-Existing content of `src/extras/mod.rs` ends with `pub(crate) mod truncate;` at line 40. The new line goes after it.
-
 ---
 
 ## Builder registration — `src/agent/builder.rs`
 
-The existing tool injection creates `all_tools` at **line 279**. The JS block goes after that line, following the same pattern as the `#[cfg(feature = "subagents")]` block at line 281.
+`all_tools` is created at **line 279**. Existing feature-gated tool blocks occupy lines 281–333 (subagents, memory, mcp, advisor, lsp). The JS block must be inserted **after the `#[cfg(feature = "lsp")]` block (which ends at line 333) and before `filter_tools_by_allowlist` (line 335)**.
+
+Existing `BashTool` injection is at lines 242–247 inside `base_tools` (a fixed-size `SmallVec`). JS goes into `all_tools` after construction because it is feature-gated and cannot be included in the fixed-size array.
 
 ```rust
-// After line 279: let mut all_tools: Vec<Box<dyn rig::tool::ToolDyn>> = base_tools.into_vec();
+// Insert at lines 333–334, before: let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
 
 #[cfg(feature = "js")]
 {
@@ -432,8 +434,6 @@ The existing tool injection creates `all_tools` at **line 279**. The JS block go
     all_tools.push(Box::new(JsTool::new(js_tx, permission.clone(), ask_tx.clone())));
 }
 ```
-
-The existing `BashTool` injection is at lines 242–247 inside `base_tools`. JS goes into `all_tools` after construction, not into `base_tools`, because it is behind a feature gate and `base_tools` uses a fixed-size `SmallVec::from_buf`.
 
 ---
 

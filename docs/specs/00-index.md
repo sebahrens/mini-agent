@@ -15,15 +15,33 @@ Prior research artifact (superseded by this index): `2026-07-27-js-engine-bluepr
 
 | Dependency | Produces | Consumed by |
 |-----------|---------|------------|
-| `run_step` visibility | Phase 1 must declare `pub(crate) fn run_step` | Phase 3 `verify_skill()` calls it cross-module |
+| `pub(crate) fn run_step` | Phase 1 must declare it with this visibility | Phase 3 `verify_skill()` calls it cross-module |
 | `SkillStore` + `Skill` types | Phase 3 | Phase 4 `propose_skill()` host global |
 | `skills_pending` table | Phase 4 extends Phase 3's store | Phase 4 promotion gate |
 
-## Quick orientation
+## Confirmed source locations (verified 2026-07-27)
 
-The monorepo was flattened in commit `7872f7b` (`zerostack/ → root`). All source lives under `src/` at the repo root — not under `zerostack/src/`. References to `zerostack/` in older docs mean `src/`.
+The monorepo was flattened (old `zerostack/` → repo root). All source is under `src/` at the repo root.
+References to `zerostack/src/` in older docs mean `src/`.
 
-The `js` feature gate and `rquickjs` dependency are **already present** in `Cargo.toml` (lines 37 and 80). No Cargo.toml edits are needed for Phase 1.
+| Symbol | Location | Line |
+|--------|----------|------|
+| `js = ["dep:rquickjs"]` feature | `Cargo.toml` | 37 |
+| `rquickjs` dep | `Cargo.toml` | 80 |
+| `reqwest = "0.13"` dep | `Cargo.toml` | 67 |
+| `pub type AskSender` | `src/permission/ask.rs` | 5 |
+| `pub type PermCheck` | `src/permission/checker.rs` | 10 |
+| `pub enum ToolError` | `src/agent/tools/mod.rs` | 88 |
+| `pub async fn check_perm` | `src/agent/tools/mod.rs` | 199 |
+| `check_perm(...)` call in BashTool | `src/agent/tools/bash.rs` | 137 |
+| `pub struct Sandbox` | `src/sandbox.rs` | 9 |
+| `pub fn wrap_command` | `src/sandbox.rs` | 109 |
+| `pub async fn output_command` | `src/sandbox.rs` | 205 |
+| `let mut all_tools` | `src/agent/builder.rs` | 279 |
+| `filter_tools_by_allowlist` call | `src/agent/builder.rs` | 335 |
+| `pub(crate) mod truncate` (last line) | `src/extras/mod.rs` | 40 |
+
+**Not yet implemented**: `src/extras/js/` directory and all contents.
 
 ## Build commands (mandatory)
 

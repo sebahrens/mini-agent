@@ -24,22 +24,12 @@ Phase 1 `spawn()` routes through `Sandbox::wrap_command` but only applies bubble
 sandbox = ["dep:birdcage"]
 
 [dependencies]
-birdcage  = { version = "0.7", optional = true }
-reqwest   = { version = "0.13", features = ["blocking"], optional = true }
+birdcage = { version = "0.7", optional = true }
 ```
 
-Note: `reqwest` (non-blocking) is already a mandatory dep at line 67 of `Cargo.toml`. The `blocking` feature should be added as an optional dep or the existing `reqwest` dep should gain `features = ["blocking"]` under the `sandbox` feature. Do not add a second `reqwest` entry.
+**reqwest note**: `reqwest = "0.13"` is already a mandatory dep at `Cargo.toml:67`. To enable `reqwest/blocking` (needed for the JS-thread `fetch()` implementation), add `features = ["blocking"]` to the existing entry rather than adding a second `reqwest` entry. Do NOT add a duplicate dep.
 
----
-
-## Feature gate
-
-```rust
-// Any new sandbox-specific code
-#[cfg(feature = "sandbox")]
-```
-
-The `js` feature and the `sandbox` feature are **independent**. An implementor should be able to enable either without the other. `spawn()` sandboxing in Phase 2 requires both `js` and `sandbox`.
+The `sandbox` and `js` features are **independent**. Enabling `sandbox` without `js` must compile (it only extends `src/sandbox.rs`). Enabling `js` without `sandbox` must compile (Phase 1 behavior, unsandboxed spawn).
 
 ---
 
@@ -49,26 +39,25 @@ The `js` feature and the `sandbox` feature are **independent**. An implementor s
 |------|--------|--------|
 | `src/sandbox.rs` | EXISTS (10.0 KB) | Add `birdcage`-backed `wrap_spawn_sandboxed` method |
 | `src/extras/js/host.rs` | TO BE CREATED in Phase 1 | Add `make_fetch()` and file allow-list checks |
-| `Cargo.toml` | EXISTS | Add `sandbox`, `birdcage`, `reqwest` blocking feature |
+| `Cargo.toml` | EXISTS | Add `sandbox` feature, `birdcage` optional dep, `reqwest/blocking` feature |
 
 ---
 
 ## Current state of `src/sandbox.rs`
 
-The `Sandbox` struct (defined at `src/sandbox.rs:9`; `#[derive(Debug, Clone)]` is on line 8) currently wraps two Linux backends:
-- **bwrap** (`bubblewrap`) — checked via `bwrap_exists()` at line 18
-- **zerobox** — checked via `zerobox_exists()` at line 22
-- **macOS/Windows** — no sandbox backend; `is_effectively_sandboxed()` returns `false`
+The `Sandbox` struct (defined at `src/sandbox.rs:9`; `#[derive(Debug, Clone)]`) currently wraps two Linux backends:
 
-`Sandbox::wrap_command` at line 109 applies bubblewrap or zerobox on Linux and falls back to unsandboxed elsewhere. `Sandbox::output_command` (called in `bash.rs:145`) calls `wrap_command` and awaits the output.
+- **bwrap** (`bubblewrap`) — checked via `bwrap_exists()` at line 18
+- **zerobox** — checked via `zerobox_exists()` at line 24
+- `Sandbox::wrap_command` at line 109 returns `tokio::process::Command`; applies bubblewrap or zerobox on Linux, falls back to unsandboxed on macOS/Windows
+- `Sandbox::output_command` at line 205 (async) — calls `wrap_command` and awaits the output
+- `kill_process_group` at line 294 is `#[cfg(unix)]` with empty Windows arm — keep this pattern
+
+**macOS/Windows**: No sandbox backend in Phase 1. `is_effectively_sandboxed()` returns `false` on both.
 
 ---
 
 ## fetch() host global
-
-### Cargo
-
-Enable `reqwest/blocking` under the `sandbox` (or `js`) feature gate to avoid tokio-in-tokio issues on the dedicated JS thread.
 
 ### Permission routing
 
@@ -78,7 +67,7 @@ Enable `reqwest/blocking` under the `sandbox` (or `js`) feature gate to avoid to
 patterns = ["https://api.github.com/**", "https://*.openai.com/**"]
 ```
 
-Permission check call site pattern (mirrors `check_perm` at `src/agent/tools/mod.rs:199`):
+Permission check call pattern (mirrors `check_perm` at `src/agent/tools/mod.rs:199`):
 
 ```rust
 check_perm(&self.permission, &self.ask_tx, "js/fetch", &url).await?
@@ -92,7 +81,7 @@ Unknown URLs fall to `Ask` — user approves interactively.
 pub fn make_fetch() -> impl Fn(String, Option<serde_json::Value>) -> rquickjs::Result<FetchResult> {
     move |url: String, _opts: Option<serde_json::Value>| {
         // Permission is checked via sync channel before this executes
-        // (same SpawnContext pattern as spawn())
+        // (same SpawnContext pattern as spawn() in Phase 1)
         let client = reqwest::blocking::Client::new();
         let resp = client.get(&url).send()
             .map_err(|e| rquickjs::Error::new_from_js("fetch", &e.to_string()))?;
@@ -102,9 +91,16 @@ pub fn make_fetch() -> impl Fn(String, Option<serde_json::Value>) -> rquickjs::R
         })
     }
 }
+
+pub struct FetchResult {
+    pub status: u16,
+    pub text: String,
+}
 ```
 
 Response visible to JS: `{ status: number, text: string }`.
+
+`reqwest::blocking` is used because `fetch()` runs on the dedicated JS thread, which has no tokio runtime. Using `reqwest::blocking` avoids tokio-inside-tokio issues.
 
 ---
 
@@ -146,7 +142,7 @@ It provides a single swap point if Apple removes `sandbox-exec` in a future macO
 
 ### Integration point
 
-`spawn()` in `host.rs` currently calls `Sandbox::wrap_command` (a `tokio::process::Command`). With birdcage, a new method is added:
+`spawn()` in `host.rs` currently calls `Sandbox::wrap_command` (at `src/sandbox.rs:109`). With birdcage, a new method is added to `Sandbox`:
 
 ```rust
 // src/sandbox.rs — new method, gated behind #[cfg(feature = "sandbox")]
@@ -154,10 +150,11 @@ It provides a single swap point if Apple removes `sandbox-exec` in a future macO
 pub fn wrap_spawn_sandboxed(&self, cmd: &str, args: &[String]) -> std::process::Command {
     use birdcage::{Birdcage, Sandbox as BirdcageSandbox};
     // Configure birdcage with read/write access matching Sandbox parameters
-    // ...
     // Returns a std::process::Command (blocking — JS thread acceptable)
 }
 ```
+
+`Sandbox::wrap_command` (existing, at line 109) returns `tokio::process::Command`. `wrap_spawn_sandboxed` returns `std::process::Command` for use on the JS thread. The two are parallel paths.
 
 ### Platform matrix
 
@@ -165,10 +162,10 @@ pub fn wrap_spawn_sandboxed(&self, cmd: &str, args: &[String]) -> std::process::
 |----------|-----------|--------|
 | Linux | Landlock + seccomp (via birdcage) | Phase 2 |
 | macOS | Seatbelt / `sandbox-exec` (via birdcage) | Phase 2 |
-| Windows | Job Objects + AppContainer | Out of scope for Phase 2 |
-| Windows fallback | Unsandboxed (same as Phase 1) | Phase 2 |
+| Windows | Unsandboxed (same as Phase 1) | Phase 2 fallback |
+| Windows enforcement | Job Objects + AppContainer (`rappct`) | Out of scope for Phase 2 |
 
-Windows enforcement requires `rappct` (separate crate, Phase 2 stretch or Phase 3). The existing `#[cfg(unix)]` pattern in `src/sandbox.rs` (`kill_process_group`) shows the convention: Windows arms are empty stubs.
+Follow the `#[cfg(unix)]` pattern from `src/sandbox.rs:294` (`kill_process_group`): Windows arms are empty stubs, not absent.
 
 ---
 
@@ -177,7 +174,7 @@ Windows enforcement requires `rappct` (separate crate, Phase 2 stretch or Phase 
 All must pass under `cargo test --features js,sandbox`:
 
 - [ ] `fetch("https://example.com")` returns `{ status: 200, text: "..." }` in an integration test
-- [ ] `fetch()` with a URL not matching the allow-list returns a JS error, not a panic
+- [ ] `fetch()` with a URL not matching the allow-list returns a JS error string, not a panic
 - [ ] `read_file("/etc/shadow")` returns a JS error when the allow-list excludes `/etc/**`
 - [ ] `spawn("ls", ["/tmp"])` on Linux runs inside a birdcage cage (Landlock-enforced)
 - [ ] `cargo test --features js` (without `sandbox`) still passes unchanged — features are independent
