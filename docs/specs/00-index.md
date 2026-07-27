@@ -19,10 +19,12 @@ Prior research artifact (superseded by this index): `2026-07-27-js-engine-bluepr
 | `SkillStore` + `Skill` types | Phase 3 | Phase 4 `propose_skill()` host global |
 | `skills_pending` table | Phase 4 extends Phase 3's store | Phase 4 promotion gate |
 
-## Confirmed source locations (verified 2026-07-27)
+## Confirmed source locations (re-verified 2026-07-27)
 
 The monorepo was flattened (old `zerostack/` → repo root). All source is under `src/` at the repo root.
 References to `zerostack/src/` in older docs mean `src/`.
+
+**Verification method**: `narsil-mcp` does not index this repo. Use `grep -n <pattern> <file>` directly to confirm line numbers before implementing.
 
 | Symbol | Location | Line |
 |--------|----------|------|
@@ -35,13 +37,19 @@ References to `zerostack/src/` in older docs mean `src/`.
 | `pub async fn check_perm` | `src/agent/tools/mod.rs` | 199 |
 | `check_perm(...)` call in BashTool | `src/agent/tools/bash.rs` | 137 |
 | `pub struct Sandbox` | `src/sandbox.rs` | 9 |
+| `pub fn is_effectively_sandboxed` | `src/sandbox.rs` | 91 |
+| `fn bwrap_exists` | `src/sandbox.rs` | 18 |
+| `fn zerobox_exists` | `src/sandbox.rs` | 24 |
 | `pub fn wrap_command` | `src/sandbox.rs` | 109 |
 | `pub async fn output_command` | `src/sandbox.rs` | 205 |
+| `pub(crate) fn kill_process_group` | `src/sandbox.rs` | 294 |
 | `let mut all_tools` | `src/agent/builder.rs` | 279 |
 | `filter_tools_by_allowlist` call | `src/agent/builder.rs` | 335 |
 | `pub(crate) mod truncate` (last line) | `src/extras/mod.rs` | 40 |
 
 **Not yet implemented**: `src/extras/js/` directory and all contents.
+
+**Import path note**: `AskSender` and `PermCheck` are private `use` items in `src/agent/tools/mod.rs` (lines 84–85) — not `pub use`. Child modules of `tools/` (like `bash.rs`) can reach them, but `src/extras/js/tool.rs` cannot. Use the direct paths: `crate::permission::ask::AskSender` and `crate::permission::checker::PermCheck`.
 
 ## Build commands (mandatory)
 
