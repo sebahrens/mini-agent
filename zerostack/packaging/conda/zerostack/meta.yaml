@@ -1,0 +1,44 @@
+{% set name = "zerostack" %}
+{% set version = "1.7.0" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/gi-dellav/zerostack/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: ec28bc735b683b0c556388c898cc528affd5109ffccc026f36d64702e63561ee
+
+build:
+  number: 0
+  script_env:
+    - CARGO_PROFILE_RELEASE_STRIP=symbols
+    - CARGO_PROFILE_RELEASE_LTO=fat
+
+requirements:
+  build:
+    - {{ stdlib('c') }}
+    - {{ compiler('c') }}
+    - {{ compiler('rust') }}
+    - cargo-bundle-licenses
+    - cargo-auditable
+
+test:
+  commands:
+    - zerostack --help
+    - zerostack --version
+    - test -f ${PREFIX}/THIRDPARTY.yml
+
+about:
+  home: https://github.com/gi-dellav/zerostack
+  summary: Minimalistic coding agent written in Rust, optimized for memory footprint and performance
+  license: GPL-3.0-only
+  license_file:
+    - LICENSE
+    - THIRDPARTY.yml
+  documentation: https://github.com/gi-dellav/zerostack
+  repository: https://github.com/gi-dellav/zerostack
+
+extra:
+  recipe-maintainers:
+    - gi-dellav

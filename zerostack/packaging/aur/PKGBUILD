@@ -1,0 +1,31 @@
+# Maintainer: Giuseppe Della Vedova <giuseppe@zerostack.dev>
+# Upstream: https://github.com/gi-dellav/zerostack
+
+pkgname=zerostack-bin
+pkgver=1.7.0
+pkgrel=1
+pkgdesc="Minimalistic coding agent written in Rust, optimized for memory footprint and performance"
+arch=('x86_64' 'aarch64')
+url="https://github.com/gi-dellav/zerostack"
+license=('GPL-3.0-only')
+provides=('zerostack')
+conflicts=('zerostack')
+makedepends=()
+depends=()
+
+source_x86_64=(
+    "${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/gi-dellav/zerostack/releases/download/v${pkgver}/zerostack-x86_64-unknown-linux-musl.tar.gz"
+    "LICENSE::https://raw.githubusercontent.com/gi-dellav/zerostack/v${pkgver}/LICENSE"
+)
+source_aarch64=(
+    "${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/gi-dellav/zerostack/releases/download/v${pkgver}/zerostack-aarch64-unknown-linux-musl.tar.gz"
+    "LICENSE::https://raw.githubusercontent.com/gi-dellav/zerostack/v${pkgver}/LICENSE"
+)
+
+sha256sums_x86_64=('bee067458568c2b021dced37d91377301ee356d792b855c119f48f03cd698364' '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986')
+sha256sums_aarch64=('0b1e28ed7552c38ebbea1f1c918ec1c3e5d4bab299c010b416aef1e2f74a9213' '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986')
+
+package() {
+    install -Dm755 "zerostack-${CARCH}-unknown-linux-musl" "${pkgdir}/usr/bin/zerostack"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

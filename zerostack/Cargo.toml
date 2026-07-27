@@ -1,0 +1,90 @@
+[package]
+name = "zerostack"
+version = "1.7.2"
+edition = "2024"
+authors = ["Giuseppe Della Vedova"]
+description = "Minimalistic coding agent written in Rust, optimized for memory footprint and performance"
+license = "GPL-3.0-only"
+homepage = "https://github.com/gi-dellav/zerostack"
+repository = "https://github.com/gi-dellav/zerostack"
+readme = "README.md"
+keywords = ["ai", "cli", "dev"]
+
+[features]
+default = ['loop', 'git-worktree', 'mcp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export']
+status-signals = []
+loop = []
+export = []
+git-worktree = []
+mcp = [
+    "dep:rmcp",
+    "rmcp?/client",
+    "rmcp?/transport-child-process",
+    "rmcp?/transport-streamable-http-client-reqwest",
+    "rmcp?/auth",
+]
+acp = ["dep:agent-client-protocol", "dep:blocking"]
+memory = []                              
+subagents = []
+archmd = []
+multithread = ["tokio/rt-multi-thread"]  
+multimodal = ["rig/image"]               
+pdf = ["multimodal", "rig/pdf"]   
+advisor = []
+hooks = []
+lsp = ["dep:lsp-types"]
+
+[dependencies]
+rig = { version = "0.40", features = ["rmcp"] }
+rmcp = { version = "2.0", optional = true, default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+toml = "1.1"
+tokio = { version = "1", features = [
+    "rt",
+    "macros",
+    "sync",
+    "time",
+    "process",
+    "fs",
+] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+futures = "0.3"
+reqwest = "0.13"
+dirs = "6"
+compact_str = { version = "0.10", features = ["serde"] }
+smallvec = "1"
+regex = "1"
+unicode-width = "0.2"
+ignore = "0.4"
+pulldown-cmark = "0.13"
+include_dir = "0.7"
+http = "1"
+agent-client-protocol = { version = "1.0.1", optional = true }
+blocking = { version = "1", optional = true }
+lsp-types = { version = "0.97", optional = true }
+mimalloc = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+# Adds rig-core's `test_utils` module (scripted `CompletionModel` test
+# doubles) for the fake-model carrier under `src/tests/fake_model.rs`. The
+# edition-2024 resolver keeps dev-dependency features out of non-test builds,
+# so the release binary never compiles `test-utils`. Tradeoff: the normal dep
+# above requests `rmcp` and this one adds `test-utils`, so `cargo build`
+# (rig[rmcp]) and a following `cargo test` (rig[rmcp+test-utils]) ask for
+# different feature sets and rig is recompiled between them. That is the
+# accepted cost of a test-only feature; folding `test-utils` into the release
+# dep to skip the rebuild would instead ship dead test code in the binary.
+rig = { version = "0.40", features = ["test-utils"] }

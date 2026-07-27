@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>zerostack — minimal coding agent</title>
+<meta name="description" content="Minimal AI coding agent for the terminal, written in Rust. Sandboxed execution, granular permissions, MCP support, session rewind — around 16 MB RAM, free and open source.">
+<link rel="canonical" href="https://gi-dellav.github.io/zerostack/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://gi-dellav.github.io/zerostack/">
+<meta property="og:title" content="zerostack — minimal coding agent">
+<meta property="og:description" content="Minimal AI coding agent for the terminal, written in Rust. Sandboxed execution, granular permissions, MCP support, session rewind — around 16 MB RAM, free and open source.">
+<meta property="og:image" content="https://raw.githubusercontent.com/gi-dellav/zerostack/main/assets/banner.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="zerostack — minimal coding agent">
+<meta name="twitter:description" content="Minimal AI coding agent for the terminal, written in Rust. Sandboxed execution, granular permissions, MCP support, session rewind — around 16 MB RAM, free and open source.">
+<meta name="twitter:image" content="https://raw.githubusercontent.com/gi-dellav/zerostack/main/assets/banner.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "zerostack",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux, macOS",
+  "description": "Minimal AI coding agent for the terminal, written in Rust. Sandboxed execution, granular permissions, MCP support, session rewind — around 16 MB RAM, free and open source.",
+  "url": "https://gi-dellav.github.io/zerostack/",
+  "downloadUrl": "https://github.com/gi-dellav/zerostack/releases",
+  "codeRepository": "https://github.com/gi-dellav/zerostack",
+  "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "author": { "@type": "Person", "name": "Giuseppe Della Vedova" }
+}
+</script>
+<link rel="icon" href="https://raw.githubusercontent.com/gi-dellav/zerostack/main/assets/logo_rounded.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d0d0d;--surface:#141414;--border:#1e1e1e;--text:#c0c0c0;--text-dim:#666;--accent:#5f9;--accent-dim:#3a7;--heading:#e0e0e0}
+html{font-size:15px;scroll-behavior:smooth}
+body{font-family:'JetBrains Mono','Cascadia Code','Fira Code','Consolas',monospace;background:var(--bg);color:var(--text);line-height:1.7;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none;transition:color .15s}
+a:hover{color:var(--accent-dim)}
+::selection{background:var(--accent);color:var(--bg)}
+.container{max-width:820px;margin:0 auto;padding:0 24px}
+/* hero banner */
+.hero{background:var(--surface);border-bottom:1px solid var(--border);overflow:hidden}
+.hero img{display:block;width:100%;max-width:1000px;margin:0 auto;height:auto;image-rendering:pixelated}
+/* screenshot */
+.screenshot-wrap{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-bottom:24px}
+.screenshot-wrap img{display:block;width:100%;height:auto}
+/* header */
+header{padding:48px 0 32px;border-bottom:1px solid var(--border)}
+.header-inner{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.logo{width:56px;height:56px;border-radius:8px;image-rendering:pixelated}
+.header-text{flex:1}
+.header-text h1{font-size:1.8rem;font-weight:700;color:var(--heading);letter-spacing:-.02em}
+.header-text .tagline{color:var(--text-dim);font-size:.85rem;margin-top:2px}
+.header-links{margin-top:12px;display:flex;gap:20px;font-size:.8rem}
+.header-links a{color:var(--text-dim);transition:color .15s}
+.header-links a:hover{color:var(--accent)}
+/* sections */
+section{padding:48px 0;border-bottom:1px solid var(--border)}
+section:last-child{border-bottom:0}
+h2{font-size:1.15rem;font-weight:700;color:var(--heading);margin-bottom:20px;letter-spacing:-.01em}
+h2::before{content:'## ';color:var(--accent)}
+h3{font-size:.95rem;font-weight:500;color:var(--heading);margin-bottom:8px;margin-top:24px}
+p{margin-bottom:16px}
+/* perf grid */
+.perf-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.perf-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px}
+.perf-card .value{font-size:1.3rem;font-weight:700;color:var(--accent)}
+.perf-card .label{font-size:.75rem;color:var(--text-dim);margin-top:4px}
+/* callout */
+.callouts{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:32px;margin-top:-8px}
+.callout{background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:16px}
+.callout .callout-title{font-size:.9rem;font-weight:700;color:var(--accent);margin-bottom:4px}
+.callout .callout-desc{font-size:.78rem;color:var(--text-dim);line-height:1.6}
+.callout .callout-desc a{color:var(--accent)}
+/* feature list */
+.features{list-style:none;margin-bottom:16px}
+.features li{padding:8px 0 8px 20px;position:relative;font-size:.88rem;border-bottom:1px solid var(--border)}
+.features li:last-child{border-bottom:0}
+.features li::before{content:'•';position:absolute;left:0;color:var(--accent)}
+/* commands */
+.cmd{margin-bottom:20px}
+.cmd-header{font-size:.82rem;color:var(--text-dim)}
+.cmd-header strong{color:var(--heading)}
+code{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:.82rem;color:var(--accent)}
+pre{margin-bottom:16px}
+pre code{display:block;padding:14px 16px;overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:6px;line-height:1.6;color:var(--text);border:none}
+/* tables */
+table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:.85rem}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border)}
+th{color:var(--accent);font-weight:500}
+/* flag list */
+.flag-list{list-style:none;margin-bottom:16px}
+.flag-list li{padding:6px 0;font-size:.85rem;border-bottom:1px solid var(--border)}
+.flag-list li:last-child{border-bottom:0}
+.flag-list .flag{color:var(--accent)}
+/* footer */
+footer{padding:32px 0;text-align:center;font-size:.78rem;color:var(--text-dim)}
+/* responsive */
+@media(max-width:600px){
+  .header-inner{flex-direction:column;align-items:flex-start;gap:12px}
+  .logo{width:48px;height:48px}
+  .header-text h1{font-size:1.4rem}
+  .perf-grid{grid-template-columns:repeat(2,1fr)}
+  section{padding:32px 0}
+}
+</style>
+</head>
+<body>
+
+<header>
+<div class="container header-inner">
+<img class="logo" src="https://raw.githubusercontent.com/gi-dellav/zerostack/main/assets/logo.png" alt="zerostack logo" width="56" height="56">
+<div class="header-text">
+<h1>zerostack</h1>
+<div class="tagline">~30k LoC (core) · 26MB binary · ~16 MB RAM (avg) / ~24 MB (peak)</div>
+<div class="header-links">
+<a href="#overview">Overview</a>
+<a href="#docs">Docs</a>
+<a href="#quickstart">Quick Start</a>
+<a href="#install">Install</a>
+<a href="https://github.com/gi-dellav/zerostack" target="_blank" rel="noopener">GitHub ↗</a>
+<a href="https://app.element.io/#/room/#zerostack-general:matrix.org" target="_blank" rel="noopener">Matrix ↗</a>
+</div>
+</div>
+</div>
+</header>
+
+<div class="hero">
+<img src="https://raw.githubusercontent.com/gi-dellav/zerostack/main/assets/banner.png" alt="zerostack banner">
+</div>
+
+<main class="container">
+
+<!-- overview -->
+<section id="overview">
+<a href="https://www.producthunt.com/products/zerostack-coding-agent/reviews/new?utm_source=badge-product_review&utm_medium=badge&utm_source=badge-zerostack&#0045;coding&#0045;agent" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/product_review.svg?product_id=1236867&theme=light" alt="Zerostack&#0032;Coding&#0032;Agent - A&#0032;minimal&#0032;coding&#0032;agent&#0044;&#0032;with&#0032;a&#0032;bundle&#0032;of&#0032;innovative&#0032;features | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
+<h2>Overview</h2>
+<p>
+Minimal coding agent written in Rust — ~30k LoC (core), 26MB binary, ~16 MB RAM (avg), ~24 MB (peak).
+Peak RAM ~24 MB vs ~700 MB for JS-based agents. CPU: 0.0% idle, ~1.5% under load.
+</p>
+<div class="perf-grid">
+<div class="perf-card"><div class="value">~30k</div><div class="label">Lines of Code</div></div>
+<div class="perf-card"><div class="value">26MB</div><div class="label">Binary Size</div></div>
+<div class="perf-card"><div class="value">~16 MB</div><div class="label">RAM (avg)</div></div>
+<div class="perf-card"><div class="value">0.0%</div><div class="label">CPU (idle)</div></div>
+</div>
+<ul class="features">
+<li><strong>Multi-provider</strong> — OpenRouter, OpenAI, Anthropic, Gemini, Ollama, plus custom providers</li>
+<li><strong>Standard tools</strong> — all tools exposed to coding agents (as described by opencode)</li>
+<li><strong>Permission system</strong> — 5 modes, per-tool patterns, session allowlists</li>
+<li><strong>Terminal UI</strong> — crossterm, markdown rendering, mouse support, scrollback</li>
+<li><strong>Prompts system</strong> — 14 built-in prompts, switchable at runtime</li>
+<li><strong>Session management</strong> — save/load/resume, auto-compaction</li>
+<li><strong>MCP support</strong> — connect external tool servers</li>
+<li><strong>Ralph Wiggum loops</strong> — iterative coding for long-horizon tasks</li>
+<li><strong>Git Worktrees</strong> — branch-per-task workflow</li>
+<li><strong>ACP support</strong> (gated) — editor integration (Zed, etc.)</li>
+<li><strong>Persistent memory</strong> (gated) — plain-Markdown memory across sessions</li>
+<li><strong>Lifecycle hooks</strong> (gated) — observe/gate tool calls and session lifecycle via external commands</li>
+<li><strong>Advisor</strong> (gated) — consult a second model mid-session for strategic guidance</li>
+<li><strong>Multimodal input</strong> (gated) — attach images and PDFs to messages</li>
+<li><strong>Subagents</strong> — parallel, fast codebase exploration</li>
+<li><strong>ARCHITECTURE.md</strong> — shared core knowledge for all agents on the same codebase</li>
+<li><strong>Sandbox mode</strong> — bubblewrap / zerobox isolation</li>
+<li><strong>Exa search</strong> — WebFetch &amp; WebSearch tools</li>
+<li><strong>Prompt chaining</strong> — offers to advance brainstorm → plan → code → review</li>
+<li><strong>Status signals</strong> — start/stop/git-conflict events over a Unix socket</li>
+</ul>
+<div class="screenshot-wrap">
+<img src="https://raw.githubusercontent.com/gi-dellav/zerostack/main/assets/tui_screenshot0.png" alt="zerostack TUI screenshot">
+</div>
+</section>
+
+<!-- callouts -->
+<div class="callouts">
+<div class="callout">
+<div class="callout-title">/prompt autoconfig</div>
+<div class="callout-desc">Run this inside zerostack after install to explore the docs and configure everything interactively.</div>
+</div>
+<div class="callout">
+<div class="callout-title">--parallel</div>
+<div class="callout-desc">Run multiple agents on the same repo. Each gets a temporary git worktree, merged &amp; cleaned up on exit.</div>
+</div>
+<div class="callout">
+<div class="callout-title">Matrix chatroom</div>
+<div class="callout-desc">Questions? Ideas? Join the <a href="https://app.element.io/#/room/#zerostack-general:matrix.org" target="_blank" rel="noopener">zerostack-general room</a> on Matrix.</div>
+</div>
+</div>
+
+<!-- prompts -->
+<section id="prompts">
+<h2>Prompts</h2>
+<p>Built-in system prompts that change the agent's behavior and tone — switch at runtime with <code>/prompt</code>:</p>
+<table>
+<thead><tr><th>Prompt</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>code</code></td><td>Coding mode with full file &amp; bash access, TDD workflow</td></tr>
+<tr><td><code>plan</code></td><td>Planning-only — explores and produces a plan without code</td></tr>
+<tr><td><code>review</code></td><td>Code review for correctness, design, testing, and impact</td></tr>
+<tr><td><code>debug</code></td><td>Finds root cause before proposing fixes</td></tr>
+<tr><td><code>ask</code></td><td>Read-only mode — no writes or bash</td></tr>
+<tr><td><code>brainstorm</code></td><td>Design-only — explores ideas without code</td></tr>
+<tr><td><code>frontend-design</code></td><td>Distinctive, production-grade UI</td></tr>
+<tr><td><code>review-security</code></td><td>Finds exploitable vulnerabilities</td></tr>
+<tr><td><code>simplify</code></td><td>Refines for clarity without behavior change</td></tr>
+<tr><td><code>write-prompt</code></td><td>Creates and optimizes agent prompts</td></tr>
+</tbody>
+</table>
+<p>Custom prompts can be created by placing markdown files in <code>$XDG_CONFIG_HOME/zerostack/prompts/</code>.</p>
+</section>
+
+<!-- permission modes -->
+<section id="permissions">
+<h2>Permissions</h2>
+<table>
+<thead><tr><th>Mode</th><th>CLI</th><th>Behavior</th></tr></thead>
+<tbody>
+<tr><td><strong>restrictive</strong></td><td><code>-R</code></td><td>Ask for every operation</td></tr>
+<tr><td><strong>readonly</strong></td><td><code>--read-only</code></td><td>Read/grep/list only. Deny writes, edits, bash</td></tr>
+<tr><td><strong>guarded</strong></td><td><code>--guarded</code></td><td>Allow reads. Ask for writes, edits, bash</td></tr>
+<tr><td><strong>standard</strong></td><td>(default)</td><td>Allow path tools within CWD. Safe bash auto-allowed</td></tr>
+<tr><td><strong>yolo</strong></td><td><code>--yolo</code></td><td>Allow everything, prompt for destructive commands</td></tr>
+</tbody>
+</table>
+<p>Per-tool granular glob patterns, session allowlists, and doom-loop detection prevent runaway agents. The <code>--dangerously-skip-permissions</code> flag bypasses all checks.</p>
+</section>
+
+<!-- slash commands -->
+<section id="commands">
+<h2>Commands</h2>
+<div class="cmd">
+<div class="cmd-header"><strong>/model</strong> — Switch model</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/thinking</strong> — Set thinking level</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/clear</strong> — Clear conversation</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/session</strong> — List/save/load sessions</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/loop</strong> — Schedule recurring prompts</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/prompt</strong> — List or change system prompt</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/mode</strong> — Set permission mode</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/worktree</strong> — Create git worktree and move into it</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/wt-merge</strong> — Merge worktree branch, push, clean up, return</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/wt-exit</strong> — Return to main repo without merging</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/queue</strong> — Manage input queued while the agent is busy</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/btw</strong> — Ask a quick side question in parallel</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/review</strong> — Run a one-shot code review</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/hooks</strong> (gated) — Show the installed hook dispatcher config</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/advisor</strong> (gated) — Show or change advisor status</div>
+</div>
+<div class="cmd">
+<div class="cmd-header"><strong>/help</strong> — Show all commands</div>
+</div>
+</section>
+
+<!-- documentation -->
+<section id="docs">
+<h2>Documentation</h2>
+<ul class="features">
+<li><a href="GET_STARTED.html">GET_STARTED.md</a> — Installation, first session, and essential commands</li>
+<li><a href="ARCHITECTURE.html">ARCHITECTURE.md</a> — Project architecture and design decisions</li>
+<li><a href="COMMANDS.html">COMMANDS.md</a> — Slash commands reference</li>
+<li><a href="CONFIG.html">CONFIG.md</a> — Full configuration guide (TOML/YAML)</li>
+<li><a href="HASHEDIT.html">HASHEDIT.md</a> — Hashedit edit system reference</li>
+<li><a href="MEMORY.html">MEMORY.md</a> — Persistent memory across sessions</li>
+<li><a href="PROVIDERS.html">PROVIDERS.md</a> — Provider setup and API keys</li>
+<li><a href="SUBAGENTS.html">SUBAGENTS.md</a> — Parallel subagent delegation</li>
+</ul>
+</section>
+
+<!-- quickstart -->
+<section id="quickstart">
+<h2>Quick Start</h2>
+<pre><code># Set your API key (OpenRouter is default)
+export OPENROUTER_API_KEY="[api_key]"
+
+# Interactive session (default prompt: code)
+zerostack
+
+# Monochrome TUI
+zerostack --no-color
+
+# One-shot mode
+zerostack -p "Explain this project"
+
+# Continue last session
+zerostack -c
+
+# Explicit provider/model
+zerostack --provider openrouter --model deepseek/deepseek-v4-flash</code></pre>
+</section>
+
+<!-- install -->
+<section id="install">
+<h2>Installation</h2>
+<p>Requires <a href="https://rustup.rs/" target="_blank" rel="noopener">Cargo</a> and git:</p>
+<pre><code># Default — loop, git-worktree, mcp, subagents, archmd, status-signals, multithread
+cargo install zerostack
+
+# With ACP (Agent Communication Protocol) support for editor integration
+cargo install zerostack --features acp
+
+# With Memory support
+cargo install zerostack --features memory
+
+# With hooks and advisor
+cargo install zerostack --features hooks,advisor</code></pre>
+<p>Pre-built binaries are also available on <a href="https://github.com/gi-dellav/zerostack/releases" target="_blank" rel="noopener">GitHub Releases</a>.</p>
+<p>Once installed, run <code>/prompt autoconfig</code> inside zerostack to configure the tool interactively.</p>
+
+<h3>Optional: Sandbox</h3>
+<pre><code># Debian/Ubuntu
+apt install bubblewrap
+
+# Fedora
+dnf install bubblewrap
+
+# Arch
+pacman -S bubblewrap</code></pre>
+</section>
+
+<!-- parallel -->
+<section id="parallel">
+<h2>Parallel Agent</h2>
+<p>Run multiple zerostack agents on the same repository simultaneously without manual git worktree management.</p>
+<pre><code>zerostack --parallel</code></pre>
+<p>Each parallel agent operates in a temporary git worktree. Changes are merged and the worktree is removed when the agent exits.</p>
+</section>
+
+<!-- acp -->
+<section id="acp">
+<h2>ACP (Agent Communication Protocol)</h2>
+<p>With the <code>acp</code> feature, zerostack acts as an ACP Agent server, allowing editors like <strong>Zed</strong> to connect to it as a coding agent backend:</p>
+<pre><code># Stdio mode (editor spawns as subprocess)
+zerostack --acp
+
+# TCP mode
+zerostack --acp --acp-host 0.0.0.0 --acp-port 7243</code></pre>
+</section>
+
+<!-- supported providers -->
+<section id="providers">
+<h2>Providers</h2>
+<ul class="features">
+<li><strong>OpenRouter</strong> (default)</li>
+<li><strong>OpenAI-compatible</strong> (vLLM, LiteLLM, etc.)</li>
+<li><strong>Anthropic</strong></li>
+<li><strong>Gemini</strong></li>
+<li><strong>Ollama</strong></li>
+</ul>
+<p>Custom providers can be configured with any base URL and API key environment variable.</p>
+</section>
+
+<!-- session mgmt -->
+<section id="sessions">
+<h2>Sessions</h2>
+<p>Sessions are saved to <code>$XDG_DATA_HOME/zerostack/sessions/</code>. Use <code>-c</code> to resume the most recent session, <code>-r</code> to browse and select one, <code>--session &lt;id-or-name&gt;</code> to load a specific session, or <code>--name &lt;name&gt;</code> to assign a name at creation.</p>
+</section>
+
+<!-- license -->
+<section id="license">
+<h2>License</h2>
+<p><a href="https://github.com/gi-dellav/zerostack/blob/main/LICENSE" target="_blank" rel="noopener">GPL-3.0-only</a></p>
+</section>
+
+</main>
+
+<footer>
+<div class="container">
+<p>zerostack &mdash; by <a href="https://github.com/gi-dellav" target="_blank" rel="noopener">Giuseppe Della Vedova</a></p>
+<p>Community &amp; support on <a href="https://app.element.io/#/room/#zerostack-general:matrix.org" target="_blank" rel="noopener">Matrix (#zerostack-general)</a></p>
+</div>
+</footer>
+
+</body>
+</html>

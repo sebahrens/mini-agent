@@ -1,0 +1,881 @@
+use compact_str::CompactString;
+use futures::StreamExt;
+use rig::agent::{Agent, MultiTurnStreamItem, StreamingResult};
+#[cfg(feature = "multimodal")]
+use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
+use rig::completion::{CompletionModel, Message};
+use rig::message::ToolResultContent;
+use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
+use tokio::sync::mpsc;
+
+use crate::event::{AgentEvent, BtwEvent};
+#[cfg(feature = "hooks")]
+use crate::extras::hooks::LoopInfo;
+use crate::retry::{self, RetryConfig};
+use crate::session::{MessageRole, Session};
+
+pub struct AgentRunner {
+    pub event_rx: mpsc::Receiver<AgentEvent>,
+    /// Cancels the underlying agent task. Without this a superseded or
+    /// interrupted run keeps driving its stream — and therefore keeps executing
+    /// tools (edit/write/bash) — invisibly. Aborting stops it for real.
+    pub abort_handle: tokio::task::AbortHandle,
+}
+
+/// Handle to an in-flight `/btw` side-question task. The `abort_handle` lets the
+/// UI cancel the side question (e.g. on Ctrl-C) without touching the main agent.
+pub struct BtwRunner {
+    pub abort_handle: tokio::task::AbortHandle,
+}
+
+fn streamed_reasoning_text<R>(content: &StreamedAssistantContent<R>) -> Option<CompactString> {
+    match content {
+        StreamedAssistantContent::Reasoning(reasoning) => {
+            Some(CompactString::new(reasoning.display_text()))
+        }
+        StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+            if reasoning.is_empty() {
+                None
+            } else {
+                Some(CompactString::from(reasoning.as_str()))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Spawn an isolated, single-turn, tool-less side-question run. The full result
+/// is delivered as a single [`BtwEvent::Done`] (or [`BtwEvent::Error`]) tagged
+/// with `id`. Unlike [`spawn_agent`], it never registers a subagent event sink
+/// and never mutates the session.
+pub fn spawn_btw<M>(
+    agent: Agent<M>,
+    prompt: String,
+    history: Vec<Message>,
+    event_tx: mpsc::Sender<BtwEvent>,
+    id: u32,
+    retry_config: RetryConfig,
+) -> BtwRunner
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    let join = tokio::spawn(async move {
+        let stream_result = {
+            let agent_ref = &agent;
+            retry::retry_stream_chat(&retry_config, move || {
+                let p = prompt.clone();
+                let h = history.clone();
+                async move { agent_ref.stream_chat(p, h).await }
+            })
+            .await
+        };
+        let mut stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = event_tx
+                    .send(BtwEvent::Error {
+                        id,
+                        message: CompactString::new(e.to_string()),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let mut acc = String::new();
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
+                    text,
+                ))) => acc.push_str(&text.text),
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    let usage = res.usage();
+                    let response_text = res.output;
+                    let response = if response_text.is_empty() {
+                        CompactString::from(acc.as_str())
+                    } else {
+                        CompactString::from(response_text)
+                    };
+                    let _ = event_tx
+                        .send(BtwEvent::Done {
+                            id,
+                            response,
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cached_input_tokens: usage.cached_input_tokens,
+                            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                        })
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(BtwEvent::Error {
+                            id,
+                            message: CompactString::new(e.to_string()),
+                        })
+                        .await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let _ = event_tx
+            .send(BtwEvent::Error {
+                id,
+                message: CompactString::new("side question ended without a response"),
+            })
+            .await;
+    });
+
+    BtwRunner {
+        abort_handle: join.abort_handle(),
+    }
+}
+
+pub fn convert_history(session: &Session) -> Vec<Message> {
+    let (summary, first_kept) = session.compacted_context();
+    let remaining = session.messages.len().saturating_sub(first_kept);
+    let extra = if summary.is_some() { 1 } else { 0 };
+    let mut messages = Vec::with_capacity(remaining + extra);
+
+    // The compaction summary is emitted as an Assistant message rather
+    // than a System message: the agent already has a System preamble
+    // (SYSTEM_PROMPT + mode prompt + context files), and some model chat
+    // templates (notably Qwen 3.x) refuse any System message past
+    // position 0. Assistant role also produces clean User↔Assistant
+    // alternation when the next user prompt arrives, which reads as
+    // "the agent recaps what it did, then the user continues" — a
+    // natural resumed-conversation shape. The "[Recap of my prior work
+    // in this conversation]" prefix labels the message as a self-recap
+    // so the agent doesn't treat it as a fresh continuation of its own
+    // voice.
+    if let Some(summary) = summary {
+        messages.push(Message::assistant(format!(
+            "[Recap of my prior work in this conversation]\n{}",
+            summary
+        )));
+    }
+
+    for msg in &session.messages[first_kept..] {
+        match msg.role {
+            MessageRole::User => messages.push(Message::user(msg.content.to_string())),
+            MessageRole::Assistant => messages.push(Message::assistant(msg.content.to_string())),
+            // Convert non-user transcript records to Assistant for the
+            // same reason as the summary above: the templates that reject
+            // mid-stream System/tool roles tolerate Assistant, and code-symmetry with
+            // the summary push keeps the resumed-conversation shape
+            // consistent.
+            MessageRole::System => messages.push(Message::assistant(msg.content.to_string())),
+            MessageRole::ToolCall => {
+                messages.push(Message::assistant(format!("[ToolCall]: {}", msg.content)))
+            }
+            MessageRole::ToolResult => {
+                messages.push(Message::assistant(format!("[ToolResult]: {}", msg.content)))
+            }
+            MessageRole::SubagentToolCall => messages.push(Message::assistant(format!(
+                "[SubagentToolCall]: {}",
+                msg.content
+            ))),
+        }
+    }
+
+    messages
+}
+
+#[cfg(feature = "multimodal")]
+pub fn media_to_messages(media: &[crate::extras::multimodal::MediaAttachment]) -> Vec<Message> {
+    use rig::OneOrMany;
+    use rig::completion::message::UserContent;
+
+    media
+        .iter()
+        .map(|m| match m {
+            crate::extras::multimodal::MediaAttachment::Image { data, mime, .. } => Message::User {
+                content: OneOrMany::one(UserContent::image_raw(
+                    data.clone(),
+                    Some(image_media_type(mime)),
+                    None,
+                )),
+            },
+            crate::extras::multimodal::MediaAttachment::Audio { data, mime, .. } => Message::User {
+                content: OneOrMany::one(UserContent::audio_raw(
+                    data.clone(),
+                    Some(audio_media_type(mime)),
+                )),
+            },
+            crate::extras::multimodal::MediaAttachment::Document { data, mime, .. } => {
+                Message::User {
+                    content: OneOrMany::one(UserContent::document_raw(
+                        data.clone(),
+                        Some(document_media_type(mime)),
+                    )),
+                }
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "multimodal")]
+fn image_media_type(mime: &str) -> ImageMediaType {
+    match mime {
+        "image/png" => ImageMediaType::PNG,
+        "image/jpeg" => ImageMediaType::JPEG,
+        "image/gif" => ImageMediaType::GIF,
+        "image/webp" => ImageMediaType::WEBP,
+        other => {
+            tracing::warn!("unknown image mime type: {other}, defaulting to PNG");
+            ImageMediaType::PNG
+        }
+    }
+}
+
+#[cfg(feature = "multimodal")]
+fn audio_media_type(mime: &str) -> AudioMediaType {
+    match mime {
+        "audio/mpeg" => AudioMediaType::MP3,
+        "audio/wav" => AudioMediaType::WAV,
+        "audio/ogg" => AudioMediaType::OGG,
+        "audio/flac" => AudioMediaType::FLAC,
+        "audio/mp4" => AudioMediaType::M4A,
+        "audio/aac" => AudioMediaType::AAC,
+        other => {
+            tracing::warn!("unknown audio mime type: {other}, defaulting to MP3");
+            AudioMediaType::MP3
+        }
+    }
+}
+
+#[cfg(feature = "multimodal")]
+fn document_media_type(mime: &str) -> DocumentMediaType {
+    match mime {
+        "application/pdf" => DocumentMediaType::PDF,
+        other => {
+            tracing::warn!("unknown document mime type: {other}, defaulting to PDF");
+            DocumentMediaType::PDF
+        }
+    }
+}
+
+async fn continue_prompt_injector<M>(
+    agent: &Agent<M>,
+    retry_prompt: &str,
+    retry_history: &[Message],
+    tool_interactions: &[Message],
+    retry_config: &RetryConfig,
+) -> StreamingResult<M::StreamingResponse>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    let mut new_history = retry_history.to_vec();
+    new_history.extend_from_slice(tool_interactions);
+    new_history.push(Message::user(retry_prompt.to_string()));
+    new_history.push(Message::assistant(String::new()));
+    match retry::retry_stream_chat(retry_config, || {
+        let h = new_history.clone();
+        async move { agent.stream_chat("Please continue.", h).await }
+    })
+    .await
+    {
+        Ok(stream) => stream,
+        Err(e) => Box::pin(futures::stream::once(async move { Err(e) })),
+    }
+}
+
+/// Builds the forked context for a `/btw` side question: the committed
+/// conversation history, plus — when the main agent is mid-task — a synthesized
+/// note describing the in-flight turn so the side question can see what the
+/// agent is doing right now. The returned messages are a by-value snapshot; the
+/// session is never mutated, so there is nothing to roll back afterwards.
+pub fn build_btw_snapshot(
+    session: &Session,
+    turn_trace: &[CompactString],
+    main_running: bool,
+) -> Vec<Message> {
+    let mut snapshot = convert_history(session);
+    if main_running && !turn_trace.is_empty() {
+        snapshot.push(Message::user(format!(
+            "(Context only — the main assistant is working in parallel right now. \
+Its progress so far this turn:\n{}\nThe last step may still be running. Use this \
+only if the user's question is about what the main assistant is doing.)",
+            turn_trace.join("\n")
+        )));
+    }
+    snapshot
+}
+
+pub fn spawn_agent<M>(
+    agent: Agent<M>,
+    prompt: String,
+    history: Vec<Message>,
+    retry_config: RetryConfig,
+    // `--loop` iteration/active state, for the `Stop` hook envelope's
+    // `loop_iteration`/`loop_active` fields (per-iteration reset of
+    // `stop_hook_active`/the block cap falls out for free: each iteration is
+    // a fresh call to this function). `None` outside loop mode.
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+) -> AgentRunner
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
+
+    #[cfg(feature = "subagents")]
+    crate::extras::subagents::set_subagent_event_tx(event_tx.clone());
+
+    let join = tokio::spawn(async move {
+        tracing::debug!(
+            "spawn_agent: prompt_len={}, history_len={}, max_attempts={}",
+            prompt.len(),
+            history.len(),
+            retry_config.max_attempts,
+        );
+        let retry_prompt = prompt.clone();
+        let retry_history: Vec<Message> = history.clone();
+        let mut tool_interactions: Vec<Message> = Vec::new();
+        let mut last_tool_name: Option<String> = None;
+        let mut empty_response_count: u32 = 0;
+        const MAX_EMPTY_RESPONSES: u32 = 3;
+        // Overrides the next continuation message (bottom of the outer
+        // `loop`); set when a `Stop` hook forces continuation instead of the
+        // default re-injected `retry_prompt`.
+        let mut next_instruction: Option<String> = None;
+        #[cfg(feature = "hooks")]
+        let mut stop_hook_active = false;
+        #[cfg(feature = "hooks")]
+        let mut consecutive_stop_blocks: u32 = 0;
+        #[cfg(feature = "hooks")]
+        const MAX_STOP_BLOCKS: u32 = 8;
+
+        let mut stream: StreamingResult<M::StreamingResponse> = {
+            let mut attempt: usize = 0;
+            let mut backoff = std::time::Duration::from_millis(retry_config.initial_backoff_ms);
+            let max_backoff = std::time::Duration::from_millis(retry_config.max_backoff_ms);
+            loop {
+                attempt += 1;
+                let mut s = agent.stream_chat(prompt.clone(), history.clone()).await;
+                let first = s.next().await;
+                match first {
+                    Some(Ok(item)) => {
+                        break futures::stream::once(std::future::ready(Ok(item)))
+                            .chain(s)
+                            .boxed();
+                    }
+                    Some(Err(e))
+                        if attempt < retry_config.max_attempts && retry::is_retryable(&e) =>
+                    {
+                        tracing::warn!(
+                            "agent retry {attempt}/{max} after error: {e}",
+                            max = retry_config.max_attempts,
+                        );
+                        let _ = event_tx
+                            .send(AgentEvent::Retrying {
+                                attempt,
+                                max: retry_config.max_attempts,
+                            })
+                            .await;
+                        let jitter = retry::simple_jitter(backoff.as_millis() as u64);
+                        tokio::time::sleep(backoff + jitter).await;
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!("agent non-retryable error on attempt {attempt}: {e}");
+                        let _ = event_tx
+                            .send(AgentEvent::Error(CompactString::new(e.to_string())))
+                            .await;
+                        return;
+                    }
+                    None => break s.boxed(),
+                }
+            }
+        };
+
+        loop {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
+                        if let Some(reasoning) = streamed_reasoning_text(&content) {
+                            let _ = event_tx.send(AgentEvent::Reasoning(reasoning)).await;
+                            continue;
+                        }
+
+                        match content {
+                            StreamedAssistantContent::Text(text) => {
+                                let _ = event_tx
+                                    .send(AgentEvent::Token(CompactString::from(text.text)))
+                                    .await;
+                            }
+                            StreamedAssistantContent::ToolCall { tool_call, .. } => {
+                                let tool_name = &tool_call.function.name;
+                                tracing::debug!(
+                                    "agent tool start: name={}, args_len={}",
+                                    tool_name,
+                                    tool_call.function.arguments.to_string().len(),
+                                );
+                                last_tool_name = Some(tool_name.clone());
+                                tool_interactions.push(tool_call.clone().into());
+                                let _ = event_tx
+                                    .send(AgentEvent::ToolCall {
+                                        name: CompactString::from(tool_call.function.name),
+                                        args: tool_call.function.arguments,
+                                    })
+                                    .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                        tool_result,
+                        ..
+                    })) => {
+                        let tool_name =
+                            CompactString::new(last_tool_name.take().unwrap_or_default());
+                        let mut output = String::new();
+                        for c in tool_result.content.iter() {
+                            if let ToolResultContent::Text(t) = c {
+                                if !output.is_empty() {
+                                    output.push('\n');
+                                }
+                                output.push_str(&t.text);
+                            }
+                        }
+                        tracing::debug!(
+                            "agent tool result: name={}, output_len={}",
+                            tool_name,
+                            output.len(),
+                        );
+                        let _ = event_tx
+                            .send(AgentEvent::ToolResult {
+                                name: tool_name.clone(),
+                                output: CompactString::from(output),
+                            })
+                            .await;
+                        tool_interactions.push(tool_result.clone().into());
+                    }
+                    Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                        let usage = res.usage();
+                        let response_text = res.output;
+                        tracing::info!(
+                            "agent done: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}",
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            usage.cached_input_tokens,
+                            usage.cache_creation_input_tokens,
+                        );
+
+                        if !response_text.is_empty() {
+                            #[cfg(feature = "hooks")]
+                            if let crate::extras::hooks::StopGate::Continue { reason } =
+                                crate::extras::hooks::dispatch_stop(
+                                    stop_hook_active,
+                                    loop_info.map(|info| u64::from(info.iteration)),
+                                    loop_info.map(|info| info.active),
+                                )
+                                .await
+                            {
+                                consecutive_stop_blocks += 1;
+                                if consecutive_stop_blocks <= MAX_STOP_BLOCKS {
+                                    stop_hook_active = true;
+                                    tracing::info!(
+                                        "hooks: Stop hook forced continuation ({consecutive_stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
+                                    );
+                                    next_instruction = Some(reason);
+                                    break;
+                                }
+                                tracing::warn!(
+                                    "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
+                                );
+                            }
+                            let _ = event_tx
+                                .send(AgentEvent::Done {
+                                    response: CompactString::from(response_text),
+                                    input_tokens: usage.input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                    cached_input_tokens: usage.cached_input_tokens,
+                                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                                })
+                                .await;
+                            return;
+                        }
+                        empty_response_count += 1;
+                        if empty_response_count >= MAX_EMPTY_RESPONSES {
+                            tracing::warn!(
+                                "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
+                            );
+                            let _ = event_tx
+                                .send(AgentEvent::Error(CompactString::from(
+                                    "Agent returned empty response too many times, aborting.",
+                                )))
+                                .await;
+                            return;
+                        }
+                        break;
+                    }
+                    Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                        let usage = call.usage;
+                        tracing::debug!(
+                            "agent completion: input_tokens={}, output_tokens={}",
+                            usage.input_tokens,
+                            usage.output_tokens,
+                        );
+                        let _ = event_tx
+                            .send(AgentEvent::CompletionCall {
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                cached_input_tokens: usage.cached_input_tokens,
+                                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::error!("agent stream error: {e}");
+                        let _ = event_tx
+                            .send(AgentEvent::Error(CompactString::new(e.to_string())))
+                            .await;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
+            tracing::debug!(
+                "agent injecting continue prompt, tool_interactions={}",
+                tool_interactions.len(),
+            );
+            let injected_prompt = next_instruction
+                .take()
+                .unwrap_or_else(|| retry_prompt.clone());
+            stream = continue_prompt_injector(
+                &agent,
+                &injected_prompt,
+                &retry_history,
+                &tool_interactions,
+                &retry_config,
+            )
+            .await;
+        }
+    });
+
+    AgentRunner {
+        event_rx,
+        abort_handle: join.abort_handle(),
+    }
+}
+
+/// Headless (`-p`, `--loop`) counterpart to [`spawn_agent`]'s turn loop.
+/// Deliberately drives its own manual loop instead of rig's
+/// `.max_turns(max_turns)` combinator: `max_turns` is an opaque black box
+/// that only ever yields a single terminal `FinalResponse` for the whole
+/// session, with no seam to inject "one more turn" after it — exactly what a
+/// `Stop` hook needs to do. The agent's own `default_max_turns` (set at
+/// construction, see `agent::builder::build_agent_inner`) still bounds
+/// internal tool-call round trips per call, same as [`spawn_agent`], which
+/// never used `.max_turns()` either.
+pub async fn run_print<M>(
+    agent: &Agent<M>,
+    prompt: &str,
+    pure_stdout: bool,
+    retry_config: &RetryConfig,
+    // Prior turns from a resumed session (e.g. `--continue`), converted via
+    // `convert_history`. Fed to the initial `stream_chat` call below and
+    // seeded into `retry_history` for the hooks `Stop`-continuation retry,
+    // mirroring `spawn_agent`. Empty for a fresh session.
+    history: Vec<Message>,
+    // `--loop` iteration/active state, for the `Stop` hook envelope's
+    // `loop_iteration`/`loop_active` fields; see `runner::spawn_agent`.
+    // `None` for plain `-p` one-shot runs.
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+) -> anyhow::Result<(String, rig::completion::Usage)>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    let mut stream = retry::retry_stream_chat(retry_config, || {
+        let p = prompt.to_string();
+        let h = history.clone();
+        async move { agent.stream_chat(p, h).await }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    #[cfg(feature = "hooks")]
+    let retry_history: Vec<Message> = history;
+    #[cfg(feature = "hooks")]
+    let mut tool_interactions: Vec<Message> = Vec::new();
+    let mut full_response = String::new();
+    let mut last_tool_name: Option<String> = None;
+    let mut usage = rig::completion::Usage::new();
+    // Set true only when a `Stop` hook forces another turn; drives the outer
+    // loop. Stays false (single pass, no continuation) in the hooks-off build.
+    let mut continue_turn = true;
+    #[cfg(feature = "hooks")]
+    let mut next_instruction: Option<String> = None;
+    #[cfg(feature = "hooks")]
+    let mut stop_hook_active = false;
+    #[cfg(feature = "hooks")]
+    let mut consecutive_stop_blocks: u32 = 0;
+    #[cfg(feature = "hooks")]
+    const MAX_STOP_BLOCKS: u32 = 8;
+
+    while continue_turn {
+        continue_turn = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
+                    text,
+                ))) => {
+                    full_response.push_str(&text.text);
+                    print!("{}", text.text);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Reasoning(r),
+                )) => {
+                    eprint!("{}", r.display_text());
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ToolCall { tool_call, .. },
+                )) => {
+                    if pure_stdout {
+                        let name = &tool_call.function.name;
+                        last_tool_name = Some(name.clone());
+                        let summary = format_tool_args_summary(&tool_call.function.arguments);
+                        println!("\n◈ {} {}", name, summary);
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                    #[cfg(feature = "hooks")]
+                    tool_interactions.push(tool_call.clone().into());
+                }
+                Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                    tool_result,
+                    ..
+                })) => {
+                    if pure_stdout {
+                        let name = last_tool_name.take().unwrap_or_default();
+                        let mut output = String::new();
+                        for c in tool_result.content.iter() {
+                            if let ToolResultContent::Text(t) = c {
+                                if !output.is_empty() {
+                                    output.push('\n');
+                                }
+                                output.push_str(&t.text);
+                            }
+                        }
+                        if !output.is_empty() {
+                            println!("◈ {} result:", name);
+                            let lines: Vec<&str> = output.lines().collect();
+                            if lines.len() > 40 {
+                                let truncated: Vec<&str> = lines.iter().take(40).copied().collect();
+                                println!("{}", truncated.join("\n"));
+                                println!(
+                                    "(truncated {} more lines)",
+                                    lines.len().saturating_sub(40)
+                                );
+                            } else {
+                                println!("{}", output);
+                            }
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                    }
+                    #[cfg(feature = "hooks")]
+                    tool_interactions.push(tool_result.clone().into());
+                }
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    usage = res.usage();
+                    #[cfg(feature = "hooks")]
+                    if let crate::extras::hooks::StopGate::Continue { reason } =
+                        crate::extras::hooks::dispatch_stop(
+                            stop_hook_active,
+                            loop_info.map(|info| u64::from(info.iteration)),
+                            loop_info.map(|info| info.active),
+                        )
+                        .await
+                    {
+                        consecutive_stop_blocks += 1;
+                        if consecutive_stop_blocks <= MAX_STOP_BLOCKS {
+                            stop_hook_active = true;
+                            tracing::info!(
+                                "hooks: Stop hook forced continuation ({consecutive_stop_blocks}/{MAX_STOP_BLOCKS}): {reason}"
+                            );
+                            next_instruction = Some(reason);
+                            continue_turn = true;
+                        } else {
+                            tracing::warn!(
+                                "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
+                            );
+                        }
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Propagate the stream failure instead of returning `Ok`
+                    // with a truncated/empty response: dispatch must exit
+                    // non-zero and must never persist an empty assistant turn
+                    // (which would then be replayed as history on `--continue`).
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+            }
+        }
+
+        #[cfg(feature = "hooks")]
+        if continue_turn {
+            let injected_prompt = next_instruction
+                .take()
+                .unwrap_or_else(|| prompt.to_string());
+            // Keep the text already streamed to stdout this turn: the caller
+            // persists the returned string as the assistant message, so
+            // clearing it here would drop turn-1 output the user already saw
+            // and desync the saved transcript from the terminal.
+            stream = continue_prompt_injector(
+                agent,
+                &injected_prompt,
+                &retry_history,
+                &tool_interactions,
+                retry_config,
+            )
+            .await;
+        }
+    }
+
+    println!();
+    Ok((full_response, usage))
+}
+
+fn format_tool_args_summary(args_json: &serde_json::Value) -> String {
+    match args_json {
+        serde_json::Value::Object(obj) => {
+            let first_key = [
+                "path",
+                "file_path",
+                "pattern",
+                "command",
+                "description",
+                "content",
+                "name",
+                "question",
+                "prompt",
+            ];
+            for key in &first_key {
+                if let Some(val) = obj.get(*key) {
+                    let s = match val {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let truncated: String = if s.len() > 120 {
+                        // char-boundary-safe truncation for non-ASCII
+                        let mut end = 117;
+                        while !s.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}...", &s[..end])
+                    } else {
+                        s
+                    };
+                    return truncated.to_string();
+                }
+            }
+            String::new()
+        }
+        _ => format!("{}", args_json),
+    }
+}
+
+/// Run an agent silently (no stdout/stderr printing), collecting the full
+/// response text. Used by subagent tasks.
+#[cfg(feature = "subagents")]
+pub async fn run_subagent<M>(
+    agent: &Agent<M>,
+    prompt: &str,
+    max_turns: usize,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    retry_config: &RetryConfig,
+) -> anyhow::Result<String>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    let mut stream = retry::retry_stream_chat(retry_config, || {
+        let p = prompt.to_string();
+        async move {
+            agent
+                .stream_chat(p, Vec::<Message>::new())
+                .max_turns(max_turns)
+                .await
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("subagent error: {e}"))?;
+
+    let mut full_response = String::new();
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+                full_response.push_str(&text.text);
+            }
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                tool_call,
+                ..
+            })) => {
+                if let Some(tx) = event_tx {
+                    let _ = tx
+                        .send(AgentEvent::SubagentToolCall {
+                            name: CompactString::from(tool_call.function.name),
+                            args: tool_call.function.arguments,
+                        })
+                        .await;
+                }
+            }
+            Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                full_response = res.output.to_string();
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!("subagent error: {}", e));
+            }
+        }
+    }
+
+    if full_response.is_empty() {
+        anyhow::bail!("subagent returned empty response");
+    }
+
+    Ok(full_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::streamed_reasoning_text;
+    use rig::streaming::StreamedAssistantContent;
+
+    #[test]
+    fn streamed_reasoning_delta_is_forwardable_as_reasoning_text() {
+        let content = StreamedAssistantContent::<()>::ReasoningDelta {
+            id: Some("rs_demo".to_string()),
+            reasoning: "thinking in progress".to_string(),
+        };
+
+        assert_eq!(
+            streamed_reasoning_text(&content).as_deref(),
+            Some("thinking in progress")
+        );
+    }
+
+    #[test]
+    fn empty_reasoning_delta_is_ignored() {
+        let content = StreamedAssistantContent::<()>::ReasoningDelta {
+            id: None,
+            reasoning: String::new(),
+        };
+
+        assert!(streamed_reasoning_text(&content).is_none());
+    }
+}
