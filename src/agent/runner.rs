@@ -332,9 +332,9 @@ where
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
 
     #[cfg(feature = "subagents")]
-    crate::extras::subagents::set_subagent_event_tx(event_tx.clone());
+    let subagent_event_tx = event_tx.clone();
 
-    let join = tokio::spawn(async move {
+    let agent_future = async move {
         tracing::debug!(
             "spawn_agent: prompt_len={}, history_len={}, max_attempts={}",
             prompt.len(),
@@ -584,7 +584,13 @@ where
             )
             .await;
         }
-    });
+    };
+
+    #[cfg(feature = "subagents")]
+    let agent_future =
+        crate::extras::subagents::scope_subagent_event_tx(subagent_event_tx, agent_future);
+
+    let join = tokio::spawn(agent_future);
 
     AgentRunner {
         event_rx,
@@ -902,6 +908,43 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(feature = "subagents")]
+    #[derive(Clone)]
+    struct RoutingProbeTool {
+        marker: &'static str,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[cfg(feature = "subagents")]
+    impl Tool for RoutingProbeTool {
+        const NAME: &'static str = "routing_probe";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Emit a marker through the current runner's subagent event sender".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            self.barrier.wait().await;
+            let event_tx = crate::extras::subagents::clone_subagent_event_tx()
+                .expect("spawn_agent must scope a subagent event sender");
+            event_tx
+                .send(crate::event::AgentEvent::SubagentToolCall {
+                    name: self.marker.into(),
+                    args: serde_json::json!({}),
+                })
+                .await
+                .expect("runner event receiver must remain open");
+            Ok(self.marker.to_string())
+        }
+    }
+
     #[derive(Clone)]
     struct CountingTool(Arc<AtomicUsize>);
 
@@ -923,6 +966,76 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("counted".to_string())
         }
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn concurrent_agents_route_subagent_events_to_their_own_runner() {
+        async fn collect_subagent_markers(
+            mut runner: super::AgentRunner,
+        ) -> Vec<compact_str::CompactString> {
+            let mut markers = Vec::new();
+            while let Some(event) = runner.event_rx.recv().await {
+                match event {
+                    crate::event::AgentEvent::SubagentToolCall { name, .. } => markers.push(name),
+                    crate::event::AgentEvent::Done { .. }
+                    | crate::event::AgentEvent::Error(_) => break,
+                    _ => {}
+                }
+            }
+            markers
+        }
+
+        fn probe_agent(
+            marker: &'static str,
+            barrier: Arc<tokio::sync::Barrier>,
+        ) -> rig::agent::Agent<MockCompletionModel> {
+            let model = MockCompletionModel::from_stream_turns(vec![vec![
+                MockStreamEvent::tool_call(
+                    format!("{marker}-call"),
+                    RoutingProbeTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]]);
+            AgentBuilder::new(model)
+                .tool(RoutingProbeTool { marker, barrier })
+                .default_max_turns(2)
+                .build()
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let runner_one = super::spawn_agent(
+            probe_agent("runner-one", barrier.clone()),
+            "start one".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let runner_two = super::spawn_agent(
+            probe_agent("runner-two", barrier),
+            "start two".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let (markers_one, markers_two) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async {
+                tokio::join!(
+                    collect_subagent_markers(runner_one),
+                    collect_subagent_markers(runner_two)
+                )
+            },
+        )
+        .await
+        .expect("concurrent agent runs must complete without deadlocking");
+
+        assert_eq!(markers_one, ["runner-one"]);
+        assert_eq!(markers_two, ["runner-two"]);
     }
 
     #[tokio::test]

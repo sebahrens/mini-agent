@@ -551,9 +551,7 @@ async fn await_js_response(
 ) -> Result<JsResponse, ToolError> {
     match tokio::time::timeout(timeout, reply_rx).await {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => Err(ToolError::Msg(
-            "JS engine reply channel closed".into(),
-        )),
+        Ok(Err(_)) => Err(ToolError::Msg("JS engine reply channel closed".into())),
         Err(_) => Err(ToolError::Msg("JS engine reply timeout".into())),
     }
 }

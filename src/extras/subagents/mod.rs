@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Mutex;
 
 use tokio::sync::mpsc;
@@ -20,20 +21,26 @@ pub(crate) struct SubagentConfig {
 
 static CONFIG: Mutex<Option<SubagentConfig>> = Mutex::new(None);
 
-static SUBAGENT_EVENT_TX: Mutex<Option<mpsc::Sender<AgentEvent>>> = Mutex::new(None);
+tokio::task_local! {
+    static SUBAGENT_EVENT_TX: mpsc::Sender<AgentEvent>;
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("subagents: SubagentConfig not initialized (call init() in main.rs)")]
 pub(crate) struct ConfigNotInitialized;
 
-pub(crate) fn set_subagent_event_tx(tx: mpsc::Sender<AgentEvent>) {
-    let mut guard = SUBAGENT_EVENT_TX.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some(tx);
+pub(crate) async fn scope_subagent_event_tx<F>(
+    tx: mpsc::Sender<AgentEvent>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    SUBAGENT_EVENT_TX.scope(tx, future).await
 }
 
 pub(crate) fn clone_subagent_event_tx() -> Option<mpsc::Sender<AgentEvent>> {
-    let guard = SUBAGENT_EVENT_TX.lock().unwrap_or_else(|e| e.into_inner());
-    guard.clone()
+    SUBAGENT_EVENT_TX.try_with(|tx| tx.clone()).ok()
 }
 
 pub(crate) fn with_config<F, R>(f: F) -> Result<R, ConfigNotInitialized>
