@@ -22,13 +22,10 @@ pub const MAX_INJECT_BYTES: usize = 32 * 1024;
 pub const MAX_WRITE_BYTES: usize = 64 * 1024;
 
 /// Write a file atomically: write to a temporary file first, then rename.
-/// On POSIX (and Windows same-volume), rename is atomic — readers see either
-/// the old content or the new, never a partial/corrupt write.
+/// Linux/macOS use the shared descriptor-relative implementation; other
+/// platforms use its conservative no-symlink fallback.
 fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, content)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    crate::fs::atomic_write_sync(path, content.as_bytes())
 }
 
 /// Take a single-version backup of `path` before a content-destroying mutation,

@@ -558,6 +558,15 @@ impl Tool for EditTool {
         let expanded = crate::fs::expand_tilde(&args.path);
         let resolved = tokio::fs::canonicalize(&expanded).await?;
         let path = resolved.to_string_lossy().into_owned();
+        let approved_parent = crate::fs::stable_path_metadata(
+            resolved.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "edit target has no parent directory",
+                )
+            })?,
+        )
+        .await?;
         let es = edit_system();
         tracing::debug!(
             "tool edit start: path={}, mode={:?}, has_block={}, has_edits={}",
@@ -620,7 +629,7 @@ impl Tool for EditTool {
                 expanded
             )));
         }
-        crate::fs::atomic_write_resolved(&resolved, &output).await?;
+        crate::fs::atomic_write_resolved_checked(&resolved, &output, approved_parent).await?;
         crate::agent::tools::untrack_read_path(&expanded);
 
         tracing::debug!(

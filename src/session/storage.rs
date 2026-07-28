@@ -48,12 +48,10 @@ pub(crate) fn config_path() -> PathBuf {
 /// directory, then rename. On POSIX this is atomic; a crash mid-write leaves
 /// the previous version intact.
 pub fn atomic_write(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
-    let tmp = path.with_extension("json.tmp");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
+    crate::fs::atomic_write_sync(path, content.as_bytes())?;
     Ok(())
 }
 
@@ -92,7 +90,7 @@ pub fn save_tool_output(
         "txt",
     )?;
     let path = dir.join(filename);
-    std::fs::write(&path, output)?;
+    crate::fs::atomic_create_sync(&path, output.as_bytes())?;
     Ok(path)
 }
 
@@ -230,7 +228,7 @@ pub fn save_theme_name(name: Option<&str>) -> anyhow::Result<()> {
         Some(n) => serde_json::json!({ "theme": n }),
         None => serde_json::json!({ "theme": null }),
     };
-    std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
+    atomic_write(&path, &serde_json::to_string_pretty(&value)?)?;
     Ok(())
 }
 

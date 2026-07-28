@@ -15,13 +15,10 @@ use crate::session::storage;
 
 /// Write `content` to `path` atomically via temp-file + rename.
 fn atomic_config_write(path: &Path, content: &str) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    crate::fs::atomic_write_sync(path, content.as_bytes())
 }
 
 /// Candidate config filenames, in priority order within each search dir.
@@ -347,7 +344,7 @@ fn load_from_path(path: PathBuf, local_config_path: &Path) -> (Config, bool) {
         if path.extension().and_then(|e| e.to_str()) == Some("toml")
             && let Ok(content) = toml::to_string(&default)
         {
-            std::fs::write(&path, content).ok();
+            atomic_config_write(&path, &content).ok();
         }
         default
     } else {
@@ -537,11 +534,11 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => {
             let content = toml::to_string(&cfg).map_err(io::Error::other)?;
-            std::fs::write(&path, content)?;
+            atomic_config_write(&path, &content)?;
         }
-        _ => std::fs::write(
+        _ => atomic_config_write(
             &path,
-            serde_yaml_ng::to_string(&cfg).map_err(io::Error::other)?,
+            &serde_yaml_ng::to_string(&cfg).map_err(io::Error::other)?,
         )?,
     }
     tracing::debug!("config saved to {}", path.display());

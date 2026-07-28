@@ -137,7 +137,14 @@ impl Tool for WriteTool {
                 expanded
             )));
         }
-        crate::fs::atomic_write_resolved(path, &args.content).await?;
+        let approved_parent = crate::fs::stable_path_metadata(path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "write target has no parent directory",
+            )
+        })?)
+        .await?;
+        crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent).await?;
         crate::agent::tools::untrack_read_path(&expanded);
         tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
         let mut result = format!("Written {} bytes to {}", bytes, expanded);

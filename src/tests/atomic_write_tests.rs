@@ -1,14 +1,15 @@
 //! Tests for `crate::fs::atomic_write`.
 //!
-//! These exercise the public contract through `atomic_write` only: that writes
-//! are atomic (a reader never sees a truncated file), that permissions are
-//! preserved, that symlinks are written through rather than clobbered, and that
-//! no temp-file residue is left behind.
+//! These exercise the atomic-write contract: writes are atomic (a reader never
+//! sees a truncated file), permissions are preserved, symlink redirection and
+//! containment escapes are rejected, and no temp-file residue is left behind.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::fs::atomic_write;
+use crate::fs::{
+    atomic_create_sync, atomic_write, atomic_write_with_failure_sync, atomic_write_within_sync,
+};
 
 /// A unique temp directory per call, removed on drop. Uniqueness (process id +
 /// monotonic counter) keeps parallel test runs from colliding without pulling
@@ -64,6 +65,19 @@ async fn creates_new_file() {
     assert_eq!(temp_residue(dir.path()), 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn atomic_write_security_creates_new_file_with_restrictive_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("restrictive_permissions");
+    let target = dir.join("private.txt");
+    atomic_write(&target, b"private").await.unwrap();
+
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
 #[tokio::test]
 async fn overwrites_existing_file() {
     let dir = TempDir::new("overwrite");
@@ -71,6 +85,17 @@ async fn overwrites_existing_file() {
     std::fs::write(&f, b"old contents").unwrap();
     atomic_write(&f, b"new contents").await.unwrap();
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "new contents");
+    assert_eq!(temp_residue(dir.path()), 0);
+}
+
+#[test]
+fn atomic_write_security_create_only_never_replaces_existing_target() {
+    let dir = TempDir::new("create_only");
+    let target = dir.join("target.txt");
+    std::fs::write(&target, b"attacker-created").unwrap();
+
+    assert!(atomic_create_sync(&target, b"replacement").is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"attacker-created");
     assert_eq!(temp_residue(dir.path()), 0);
 }
 
@@ -98,78 +123,126 @@ async fn preserves_permissions_on_overwrite() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn writes_through_symlink() {
+async fn atomic_write_security_rejects_final_symlink() {
     use std::os::unix::fs::symlink;
     let dir = TempDir::new("symlink");
-    let real = dir.join("real.txt");
+    let outside = TempDir::new("symlink_outside");
+    let real = outside.join("real.txt");
     let link = dir.join("link.txt");
     std::fs::write(&real, b"old").unwrap();
     symlink(&real, &link).unwrap();
 
-    atomic_write(&link, b"new via link").await.unwrap();
+    assert!(atomic_write(&link, b"hostile write").await.is_err());
 
-    // The link must still be a link, and the real file must hold the new data.
     assert!(
         std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
             .is_symlink(),
-        "the symlink itself must be preserved, not replaced with a regular file"
+        "the hostile symlink must not be replaced"
     );
-    assert_eq!(std::fs::read_to_string(&real).unwrap(), "new via link");
-    assert_eq!(std::fs::read_to_string(&link).unwrap(), "new via link");
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "old");
     assert_eq!(temp_residue(dir.path()), 0);
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn writes_through_symlink_chain() {
+#[test]
+fn atomic_write_security_rejects_parent_symlink_swap() {
     use std::os::unix::fs::symlink;
-    let dir = TempDir::new("chain");
-    let real = dir.join("real.txt");
-    let link = dir.join("link.txt");
-    let link2 = dir.join("link2.txt");
-    std::fs::write(&real, b"old").unwrap();
-    symlink(&real, &link).unwrap();
-    symlink(&link, &link2).unwrap();
+    let root = TempDir::new("parent_swap");
+    let outside = TempDir::new("parent_swap_outside");
+    let approved_parent = root.join("approved");
+    std::fs::create_dir(&approved_parent).unwrap();
+    std::fs::remove_dir(&approved_parent).unwrap();
+    symlink(outside.path(), &approved_parent).unwrap();
 
-    atomic_write(&link2, b"via chain").await.unwrap();
-
-    assert!(
-        std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert!(
-        std::fs::symlink_metadata(&link2)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(std::fs::read_to_string(&real).unwrap(), "via chain");
+    let target = approved_parent.join("escaped.txt");
+    assert!(atomic_write_within_sync(root.path(), &target, b"escape").is_err());
+    assert!(!outside.join("escaped.txt").exists());
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn resolves_relative_symlink_target() {
+async fn atomic_write_security_does_not_follow_symlinked_destination_directory() {
     use std::os::unix::fs::symlink;
-    let dir = TempDir::new("relsym");
-    let real = dir.join("r.txt");
-    let link = dir.join("rlink.txt");
-    std::fs::write(&real, b"x").unwrap();
-    // Relative target: must resolve against the link's own directory.
-    symlink(Path::new("r.txt"), &link).unwrap();
 
-    atomic_write(&link, b"relative ok").await.unwrap();
+    let root = TempDir::new("symlinked_parent");
+    let outside = TempDir::new("symlinked_parent_outside");
+    let parent = root.join("approved");
+    symlink(outside.path(), &parent).unwrap();
 
-    assert!(
-        std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink()
+    let target = parent.join("escaped.txt");
+    assert!(atomic_write(&target, b"escape").await.is_err());
+    assert!(!outside.join("escaped.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_security_rejects_sibling_prefix() {
+    let parent = TempDir::new("sibling_prefix");
+    let approved_root = parent.join("safe-root");
+    let sibling = parent.join("safe-root-evil");
+    std::fs::create_dir(&approved_root).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+
+    let target = sibling.join("escaped.txt");
+    assert!(atomic_write_within_sync(&approved_root, &target, b"escape").is_err());
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn atomic_write_security_rejects_destination_directory_without_residue() {
+    let dir = TempDir::new("destination_directory");
+    let target = dir.join("target");
+    std::fs::create_dir(&target).unwrap();
+
+    assert!(atomic_write(&target, b"replacement").await.is_err());
+    assert!(target.is_dir());
+    assert_eq!(temp_residue(dir.path()), 0);
+}
+
+#[tokio::test]
+async fn atomic_write_security_does_not_touch_precreated_predictable_temp_name() {
+    let dir = TempDir::new("precreated_temp");
+    let target = dir.join("target.txt");
+    let predictable = dir.join(format!(
+        ".target.txt.zswrite.{}.0.tmp",
+        std::process::id()
+    ));
+    std::fs::write(&predictable, b"attacker-owned").unwrap();
+
+    atomic_write(&target, b"complete").await.unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"complete");
+    assert_eq!(
+        std::fs::read(&predictable).unwrap(),
+        b"attacker-owned",
+        "cleanup must not delete or truncate a precreated attacker path"
     );
-    assert_eq!(std::fs::read_to_string(&real).unwrap(), "relative ok");
+}
+
+#[test]
+fn atomic_write_security_injected_failures_preserve_prior_file_and_clean_temp() {
+    let dir = TempDir::new("injected_failures");
+    let target = dir.join("target.txt");
+    std::fs::write(&target, b"prior complete contents").unwrap();
+
+    for fail_rename in [false, true] {
+        assert!(
+            atomic_write_with_failure_sync(
+                dir.path(),
+                &target,
+                b"incomplete replacement",
+                fail_rename,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"prior complete contents"
+        );
+        assert_eq!(temp_residue(dir.path()), 0);
+    }
 }
 
 #[tokio::test]
@@ -191,6 +264,32 @@ async fn concurrent_writes_to_distinct_files_leave_no_residue() {
         let p = dir.join(&format!("p{i}.txt"));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("file {i}"));
     }
+    assert_eq!(temp_residue(dir.path()), 0);
+}
+
+#[tokio::test]
+async fn atomic_write_security_concurrent_writers_publish_only_complete_values() {
+    let dir = TempDir::new("concurrent_same_target");
+    let target = dir.join("target.txt");
+    let mut handles = Vec::new();
+    for i in 0..32 {
+        let path = target.clone();
+        handles.push(tokio::spawn(async move {
+            let byte = b'A' + (i % 26) as u8;
+            atomic_write(&path, vec![byte; 16 * 1024]).await
+        }));
+    }
+    let mut successes = 0;
+    for handle in handles {
+        if handle.await.unwrap().is_ok() {
+            successes += 1;
+        }
+    }
+
+    assert!(successes >= 1);
+    let contents = std::fs::read(&target).unwrap();
+    assert_eq!(contents.len(), 16 * 1024);
+    assert!(contents.iter().all(|byte| *byte == contents[0]));
     assert_eq!(temp_residue(dir.path()), 0);
 }
 

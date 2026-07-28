@@ -1,13 +1,25 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use tokio::io::AsyncWriteExt;
 
 fn path_changed_error(path: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
         format!("Path changed after permission check: {}", path.display()),
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtomicWriteFailure {
+    None,
+    #[cfg(test)]
+    Write,
+    #[cfg(test)]
+    Rename,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtomicWriteMode {
+    Replace,
+    CreateNew,
 }
 
 #[cfg(unix)]
@@ -66,122 +78,776 @@ pub(crate) async fn open_stable_file(path: &Path) -> std::io::Result<tokio::fs::
 
 /// Atomically write `contents` to `path`.
 ///
-/// Writes to a temporary file in the *same directory* as `path`, then renames
-/// it over the target. POSIX `rename(2)` is atomic, so neither a concurrent
-/// reader nor a process that is killed mid-write (e.g. the terminal being
-/// closed → SIGHUP) can ever observe a truncated or partially-written file: the
-/// target is always either the complete old contents or the complete new
-/// contents.
+/// On Linux and macOS, every destination-directory operation is relative to an
+/// open directory descriptor and every traversed component uses `O_NOFOLLOW`.
+/// The final target must be absent or a regular file; symlinks and directories
+/// are rejected. The temporary file is created exclusively with a random name
+/// and mode `0600`, then renamed over the target in the same directory.
 ///
-/// This replaces the previous `tokio::fs::write` calls, which used
-/// open-truncate-then-stream and could leave an existing file destroyed if the
-/// process died after truncation but before the write completed.
+/// The helper intentionally flushes userspace buffers but does not `fsync`;
+/// this preserves the existing atomicity (not power-loss durability) contract.
 ///
-/// Note: this intentionally does *not* fsync. Atomicity against a killed
-/// process comes from `rename` alone; fsync would only buy durability across a
-/// power loss / kernel panic, at ~20-50x the per-write cost, which is not the
-/// failure mode being defended against here.
-///
-/// If `path` is a symlink (or chain of symlinks), the write goes *through* it to
-/// the file it points at, leaving the link intact; a plain rename would replace
-/// the link with a regular file.
-///
-/// If `path` already exists, its permission bits are copied onto the new file —
-/// a plain create-and-rename would otherwise reset them to the umask default
-/// and silently drop e.g. the executable bit on scripts.
-///
-/// The temp file lives in the same directory (not the system temp dir) because
-/// `rename` is only atomic within a single filesystem.
+/// Other platforms use a conservative no-symlink fallback. Because their
+/// standard library APIs cannot provide equivalent descriptor-relative replace
+/// semantics, replacing an existing file fails closed with `Unsupported`.
 #[cfg(test)]
 pub async fn atomic_write(
     path: impl AsRef<Path>,
     contents: impl AsRef<[u8]>,
 ) -> std::io::Result<()> {
-    // Write *through* symlinks: if the target is a symlink (or a chain of them),
-    // resolve to the final file so the rename replaces that file and leaves the
-    // link itself intact. A plain rename over a symlink would instead clobber the
-    // link with a regular file. A non-symlink path is returned unchanged.
-    let resolved = resolve_symlink_target(path.as_ref()).await;
-    atomic_write_resolved(resolved, contents).await
+    atomic_write_resolved(path, contents).await
 }
 
 /// Atomically write to a path that the caller has already resolved and
 /// permission-checked.
 ///
-/// Unlike the test-only `atomic_write` helper, this function deliberately does
-/// not follow a symlink at `path`. That lets permission-gated callers bind the
-/// write to the path they checked instead of re-resolving an attacker-swappable
-/// symlink between the permission decision and the rename.
+/// The parent directory is treated as the approved root. Path containment is
+/// component-aware, so a sibling such as `/safe-root-evil` never satisfies an
+/// approval for `/safe-root`.
+#[cfg(test)]
 pub(crate) async fn atomic_write_resolved(
     path: impl AsRef<Path>,
     contents: impl AsRef<[u8]>,
 ) -> std::io::Result<()> {
-    let path = path.as_ref();
+    atomic_write_resolved_inner(path.as_ref(), contents.as_ref(), None).await
+}
+
+/// Variant used when a permission-gated caller captured the approved parent
+/// before waiting for user input. The opened directory descriptor must still
+/// identify that exact directory or the write fails.
+pub(crate) async fn atomic_write_resolved_checked(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+    approved_parent: std::fs::Metadata,
+) -> std::io::Result<()> {
+    atomic_write_resolved_inner(path.as_ref(), contents.as_ref(), Some(approved_parent)).await
+}
+
+async fn atomic_write_resolved_inner(
+    path: &Path,
+    contents: &[u8],
+    approved_parent: Option<std::fs::Metadata>,
+) -> std::io::Result<()> {
     tracing::debug!(
         "atomic_write: {} ({} bytes)",
         path.display(),
-        contents.as_ref().len(),
+        contents.len(),
     );
-    let dir = match path.parent() {
+    let root = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
+    let path = path.to_path_buf();
+    let contents = contents.to_vec();
+    tokio::task::spawn_blocking(move || {
+        atomic_write_within_sync_impl(
+            &root,
+            &path,
+            &contents,
+            approved_parent.as_ref(),
+            AtomicWriteMode::Replace,
+            AtomicWriteFailure::None,
+        )
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
 
-    let tmp_path = unique_tmp_path(path, &dir);
+/// Create a new file atomically after permission approval. If any entry appears
+/// at the final name before the descriptor-relative rename, the operation fails
+/// instead of replacing it.
+pub(crate) async fn atomic_create_resolved_checked(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+    approved_parent: std::fs::Metadata,
+) -> std::io::Result<()> {
+    let path = path.as_ref().to_path_buf();
+    let contents = contents.as_ref().to_vec();
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        atomic_write_within_sync_impl(
+            &root,
+            &path,
+            &contents,
+            Some(&approved_parent),
+            AtomicWriteMode::CreateNew,
+            AtomicWriteFailure::None,
+        )
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
 
-    // Write into the temp file, cleaning it up on any failure so we never leave
-    // stray `.*.zswrite.*.tmp` files behind on error.
-    //
-    // Deliberately no fsync: the crash-safety we need here comes entirely from
-    // `rename(2)`, which is atomic, so a process killed mid-write (terminal
-    // closed → SIGHUP, or a crash) can never leave a truncated target. fsync
-    // would only add power-loss durability — at ~20-50x the per-write cost — and
-    // that is out of scope for this threat model. The file is closed at the end
-    // of this block (scope exit), before the rename.
-    let write_result = async {
-        let mut f = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .await?;
-        f.write_all(contents.as_ref()).await?;
-        f.flush().await?;
-        Ok::<(), std::io::Error>(())
+/// Synchronous entry point for config/session/memory persistence.
+pub(crate) fn atomic_write_sync(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    atomic_write_within_sync_impl(
+        root,
+        path,
+        contents,
+        None,
+        AtomicWriteMode::Replace,
+        AtomicWriteFailure::None,
+    )
+}
+
+/// Synchronous create-only variant used for randomly named tool output.
+pub(crate) fn atomic_create_sync(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    atomic_write_within_sync_impl(
+        root,
+        path,
+        contents,
+        None,
+        AtomicWriteMode::CreateNew,
+        AtomicWriteFailure::None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn atomic_write_within_sync(
+    approved_root: &Path,
+    path: &Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    atomic_write_within_sync_impl(
+        approved_root,
+        path,
+        contents,
+        None,
+        AtomicWriteMode::Replace,
+        AtomicWriteFailure::None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn atomic_write_with_failure_sync(
+    approved_root: &Path,
+    path: &Path,
+    contents: &[u8],
+    fail_rename: bool,
+) -> std::io::Result<()> {
+    atomic_write_within_sync_impl(
+        approved_root,
+        path,
+        contents,
+        None,
+        AtomicWriteMode::Replace,
+        if fail_rename {
+            AtomicWriteFailure::Rename
+        } else {
+            AtomicWriteFailure::Write
+        },
+    )
+}
+
+fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    let source = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in source.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
     }
-    .await;
-    if let Err(e) = write_result {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e);
-    }
+    Ok(normalized)
+}
 
-    // Preserve the original file's permissions when replacing an existing file.
-    // (For brand-new files `metadata` errors out and we keep the default perms.)
-    // `symlink_metadata` deliberately avoids following a symlink that appeared
-    // after a permission-gated caller resolved the path.
-    if let Ok(meta) = tokio::fs::symlink_metadata(path).await
-        && !meta.file_type().is_symlink()
+fn relative_target<'a>(
+    approved_root: &Path,
+    path: &'a Path,
+) -> std::io::Result<(PathBuf, &'a std::ffi::OsStr)> {
+    use std::path::Component;
+
+    let relative = path.strip_prefix(approved_root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is outside approved root {}",
+                path.display(),
+                approved_root.display()
+            ),
+        )
+    })?;
+    let leaf = relative.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic write target must name a file",
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
     {
-        let _ = tokio::fs::set_permissions(&tmp_path, meta.permissions()).await;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic write target contains an invalid path component",
+        ));
+    }
+    Ok((
+        relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf(),
+        leaf,
+    ))
+}
+
+fn atomic_write_within_sync_impl(
+    approved_root: &Path,
+    path: &Path,
+    contents: &[u8],
+    approved_parent: Option<&std::fs::Metadata>,
+    mode: AtomicWriteMode,
+    failure: AtomicWriteFailure,
+) -> std::io::Result<()> {
+    let approved_root = absolute_lexical(approved_root)?;
+    let path = absolute_lexical(path)?;
+    let (relative_parent, leaf) = relative_target(&approved_root, &path)?;
+    let approved_root_metadata = std::fs::symlink_metadata(&approved_root)?;
+    if approved_root_metadata.file_type().is_symlink() || !approved_root_metadata.is_dir() {
+        return Err(path_changed_error(&approved_root));
+    }
+    let canonical_root = std::fs::canonicalize(&approved_root)?;
+    ensure_same_file(
+        &approved_root,
+        &approved_root_metadata,
+        &std::fs::metadata(&canonical_root)?,
+    )?;
+
+    atomic_write_platform(
+        &canonical_root,
+        &relative_parent,
+        leaf,
+        contents,
+        &approved_root_metadata,
+        approved_parent,
+        mode,
+        failure,
+    )
+}
+
+#[cfg(target_os = "linux")]
+const OPEN_DIRECTORY: std::os::raw::c_int = 0x1_0000;
+#[cfg(target_os = "linux")]
+const OPEN_NOFOLLOW: std::os::raw::c_int = 0x2_0000;
+#[cfg(target_os = "linux")]
+const OPEN_CLOEXEC: std::os::raw::c_int = 0x8_0000;
+#[cfg(target_os = "linux")]
+const OPEN_CREATE: std::os::raw::c_int = 0x40;
+#[cfg(target_os = "linux")]
+const OPEN_EXCLUSIVE: std::os::raw::c_int = 0x80;
+
+#[cfg(target_os = "macos")]
+const OPEN_DIRECTORY: std::os::raw::c_int = 0x10_0000;
+#[cfg(target_os = "macos")]
+const OPEN_NOFOLLOW: std::os::raw::c_int = 0x100;
+#[cfg(target_os = "macos")]
+const OPEN_CLOEXEC: std::os::raw::c_int = 0x100_0000;
+#[cfg(target_os = "macos")]
+const OPEN_CREATE: std::os::raw::c_int = 0x200;
+#[cfg(target_os = "macos")]
+const OPEN_EXCLUSIVE: std::os::raw::c_int = 0x800;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_write_platform(
+    canonical_root: &Path,
+    relative_parent: &Path,
+    leaf: &std::ffi::OsStr,
+    contents: &[u8],
+    approved_root: &std::fs::Metadata,
+    approved_parent: Option<&std::fs::Metadata>,
+    mode: AtomicWriteMode,
+    failure: AtomicWriteFailure,
+) -> std::io::Result<()> {
+    use std::ffi::{CString, OsStr};
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::raw::{c_char, c_int, c_uint};
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn openat(directory: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+        fn renameat(
+            old_directory: c_int,
+            old_path: *const c_char,
+            new_directory: c_int,
+            new_path: *const c_char,
+        ) -> c_int;
+        #[cfg(target_os = "linux")]
+        fn renameat2(
+            old_directory: c_int,
+            old_path: *const c_char,
+            new_directory: c_int,
+            new_path: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
+        #[cfg(target_os = "macos")]
+        fn renameatx_np(
+            old_directory: c_int,
+            old_path: *const c_char,
+            new_directory: c_int,
+            new_path: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
+        fn unlinkat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
     }
 
-    // Atomic replace.
-    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e);
+    let _ = failure;
+
+    fn c_name(name: &OsStr) -> std::io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path component contains NUL",
+            )
+        })
     }
+
+    fn open_at(
+        directory: &File,
+        name: &OsStr,
+        flags: c_int,
+        mode: c_uint,
+    ) -> std::io::Result<File> {
+        let name = c_name(name)?;
+        // SAFETY: `name` is NUL-terminated for this call and `directory` owns a
+        // valid descriptor. A successful descriptor is transferred to `File`.
+        let descriptor = unsafe { openat(directory.as_raw_fd(), name.as_ptr(), flags, mode) };
+        if descriptor < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: `openat` returned a new owned descriptor.
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+    }
+
+    fn open_directory_at(directory: &File, name: &OsStr) -> std::io::Result<File> {
+        open_at(
+            directory,
+            name,
+            OPEN_DIRECTORY | OPEN_NOFOLLOW | OPEN_CLOEXEC,
+            0,
+        )
+    }
+
+    fn open_absolute_directory(path: &Path) -> std::io::Result<File> {
+        use std::path::Component;
+
+        let mut directory = File::open(Path::new("/"))?;
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    directory = open_directory_at(&directory, name)?;
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "canonical root contains an invalid component",
+                    ));
+                }
+            }
+        }
+        Ok(directory)
+    }
+
+    fn open_parent(
+        canonical_root: &Path,
+        relative_parent: &Path,
+        approved_root: &std::fs::Metadata,
+    ) -> std::io::Result<File> {
+        let mut directory = open_absolute_directory(canonical_root)?;
+        ensure_same_file(canonical_root, approved_root, &directory.metadata()?)?;
+        for component in relative_parent.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "relative parent contains an invalid component",
+                ));
+            };
+            directory = open_directory_at(&directory, name)?;
+        }
+        Ok(directory)
+    }
+
+    fn inspect_target(directory: &File, name: &OsStr) -> std::io::Result<Option<std::fs::Metadata>> {
+        match open_at(directory, name, OPEN_NOFOLLOW | OPEN_CLOEXEC, 0) {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                if !metadata.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "atomic write target is not a regular file",
+                    ));
+                }
+                Ok(Some(metadata))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn same_optional_target(
+        path: &Path,
+        before: Option<&std::fs::Metadata>,
+        after: Option<&std::fs::Metadata>,
+    ) -> std::io::Result<()> {
+        match (before, after) {
+            (None, None) => Ok(()),
+            (Some(before), Some(after)) => ensure_same_file(path, before, after),
+            _ => Err(path_changed_error(path)),
+        }
+    }
+
+    fn unlink_owned_temp(
+        directory: &File,
+        name: &CString,
+        identity: &std::fs::Metadata,
+    ) {
+        let still_ours = open_at(directory, OsStr::from_bytes(name.as_bytes()), OPEN_NOFOLLOW, 0)
+            .and_then(|file| file.metadata())
+            .is_ok_and(|metadata| same_file_identity(identity, &metadata));
+        if still_ours {
+            // SAFETY: both the directory descriptor and C string are valid.
+            let _ = unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+
+    fn rename_entry(
+        directory: &File,
+        old_name: &CString,
+        new_name: &CString,
+        mode: AtomicWriteMode,
+    ) -> c_int {
+        if mode == AtomicWriteMode::Replace {
+            // SAFETY: both names are valid C strings and the descriptor remains
+            // open for the duration of the call.
+            return unsafe {
+                renameat(
+                    directory.as_raw_fd(),
+                    old_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    new_name.as_ptr(),
+                )
+            };
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // `RENAME_NOREPLACE` makes create-only publication atomic with the
+            // non-existence check instead of relying on a racy final `stat`.
+            unsafe {
+                renameat2(
+                    directory.as_raw_fd(),
+                    old_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    new_name.as_ptr(),
+                    1,
+                )
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin's `RENAME_EXCL` is the create-only equivalent.
+            unsafe {
+                renameatx_np(
+                    directory.as_raw_fd(),
+                    old_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    new_name.as_ptr(),
+                    0x4,
+                )
+            }
+        }
+    }
+
+    let directory = open_parent(canonical_root, relative_parent, approved_root)?;
+    let directory_metadata = directory.metadata()?;
+    if let Some(approved) = approved_parent {
+        ensure_same_file(canonical_root, approved, &directory_metadata)?;
+    }
+
+    let target_path = canonical_root.join(relative_parent).join(leaf);
+    let initial_target = inspect_target(&directory, leaf)?;
+    if mode == AtomicWriteMode::CreateNew && initial_target.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "atomic create target already exists",
+        ));
+    }
+
+    let (temp_name, mut temp, temp_identity) = {
+        let mut result = None;
+        for _ in 0..128 {
+            let candidate = CString::new(format!(
+                ".zswrite.{}.tmp",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .expect("UUID temp name never contains NUL");
+            match open_at(
+                &directory,
+                OsStr::from_bytes(candidate.as_bytes()),
+                1 | OPEN_CREATE | OPEN_EXCLUSIVE | OPEN_NOFOLLOW | OPEN_CLOEXEC,
+                0o600,
+            ) {
+                Ok(file) => {
+                    let identity = file.metadata()?;
+                    result = Some((candidate, file, identity));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        result.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique atomic-write temp file",
+            )
+        })?
+    };
+
+    let write_result = (|| {
+        #[cfg(test)]
+        if failure == AtomicWriteFailure::Write {
+            return Err(std::io::Error::other("injected atomic-write failure"));
+        }
+        temp.write_all(contents)?;
+        temp.flush()
+    })();
+    if let Err(error) = write_result {
+        drop(temp);
+        unlink_owned_temp(&directory, &temp_name, &temp_identity);
+        return Err(error);
+    }
+
+    let current_target = match inspect_target(&directory, leaf) {
+        Ok(target) => target,
+        Err(error) => {
+            drop(temp);
+            unlink_owned_temp(&directory, &temp_name, &temp_identity);
+            return Err(error);
+        }
+    };
+    if let Err(error) = same_optional_target(
+        &target_path,
+        initial_target.as_ref(),
+        current_target.as_ref(),
+    ) {
+        drop(temp);
+        unlink_owned_temp(&directory, &temp_name, &temp_identity);
+        return Err(error);
+    }
+
+    let current_directory_metadata =
+        match open_parent(canonical_root, relative_parent, approved_root)
+            .and_then(|directory| directory.metadata())
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                drop(temp);
+                unlink_owned_temp(&directory, &temp_name, &temp_identity);
+                return Err(error);
+            }
+        };
+    if !same_file_identity(&directory_metadata, &current_directory_metadata) {
+        drop(temp);
+        unlink_owned_temp(&directory, &temp_name, &temp_identity);
+        return Err(path_changed_error(&target_path));
+    }
+
+    let temp_still_ours = open_at(
+        &directory,
+        OsStr::from_bytes(temp_name.as_bytes()),
+        OPEN_NOFOLLOW | OPEN_CLOEXEC,
+        0,
+    )
+    .and_then(|file| file.metadata())
+    .is_ok_and(|metadata| same_file_identity(&temp_identity, &metadata));
+    if !temp_still_ours {
+        drop(temp);
+        return Err(path_changed_error(&target_path));
+    }
+
+    #[cfg(test)]
+    if failure == AtomicWriteFailure::Rename {
+        drop(temp);
+        unlink_owned_temp(&directory, &temp_name, &temp_identity);
+        return Err(std::io::Error::other("injected atomic-rename failure"));
+    }
+
+    if let Some(metadata) = initial_target.as_ref()
+        && let Err(error) = temp.set_permissions(metadata.permissions())
+    {
+        drop(temp);
+        unlink_owned_temp(&directory, &temp_name, &temp_identity);
+        return Err(error);
+    }
+
+    let leaf = match c_name(leaf) {
+        Ok(leaf) => leaf,
+        Err(error) => {
+            drop(temp);
+            unlink_owned_temp(&directory, &temp_name, &temp_identity);
+            return Err(error);
+        }
+    };
+    let rename_result = rename_entry(&directory, &temp_name, &leaf, mode);
+    if rename_result < 0 {
+        let error = std::io::Error::last_os_error();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = temp.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        drop(temp);
+        unlink_owned_temp(&directory, &temp_name, &temp_identity);
+        return Err(error);
+    }
+    drop(temp);
     Ok(())
 }
 
-/// Build a collision-free temp path next to `target`, within `dir`.
-///
-/// Uniqueness across parallel agents comes from the process id; uniqueness
-/// within a single process comes from the monotonic counter. Both matter
-/// because multistack runs many zerostack processes concurrently.
-fn unique_tmp_path(target: &Path, dir: &Path) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let stem = target.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
-    dir.join(format!(".{stem}.zswrite.{}.{n}.tmp", std::process::id()))
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn atomic_write_platform(
+    canonical_root: &Path,
+    relative_parent: &Path,
+    leaf: &std::ffi::OsStr,
+    contents: &[u8],
+    approved_root: &std::fs::Metadata,
+    approved_parent: Option<&std::fs::Metadata>,
+    mode: AtomicWriteMode,
+    failure: AtomicWriteFailure,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let _ = failure;
+    fn remove_if_owned(path: &Path, identity: &std::fs::Metadata) {
+        let still_ours = std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| same_file_identity(identity, &metadata));
+        if still_ours {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    let parent = canonical_root.join(relative_parent);
+    ensure_same_file(
+        canonical_root,
+        approved_root,
+        &std::fs::metadata(canonical_root)?,
+    )?;
+    let parent_metadata = std::fs::symlink_metadata(&parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(path_changed_error(&parent));
+    }
+    if let Some(approved) = approved_parent {
+        ensure_same_file(&parent, approved, &parent_metadata)?;
+    }
+
+    let target = parent.join(leaf);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(path_changed_error(&target));
+        }
+        Ok(_) if mode == AtomicWriteMode::CreateNew => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "atomic create target already exists",
+            ));
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "atomic replacement is unsupported on this platform",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let temp = parent.join(format!(".zswrite.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let temp_identity = file.metadata()?;
+    #[cfg(test)]
+    let write_result = if failure == AtomicWriteFailure::Write {
+        Err(std::io::Error::other("injected atomic-write failure"))
+    } else {
+        file.write_all(contents).and_then(|()| file.flush())
+    };
+    #[cfg(not(test))]
+    let write_result = file.write_all(contents).and_then(|()| file.flush());
+    if let Err(error) = write_result {
+        drop(file);
+        remove_if_owned(&temp, &temp_identity);
+        return Err(error);
+    }
+    drop(file);
+
+    let current_parent = match std::fs::symlink_metadata(&parent) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            remove_if_owned(&temp, &temp_identity);
+            return Err(error);
+        }
+    };
+    if current_parent.file_type().is_symlink()
+        || ensure_same_file(&parent, &parent_metadata, &current_parent).is_err()
+    {
+        remove_if_owned(&temp, &temp_identity);
+        return Err(path_changed_error(&target));
+    }
+    match std::fs::symlink_metadata(&target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            remove_if_owned(&temp, &temp_identity);
+            return Err(path_changed_error(&target));
+        }
+        Err(error) => {
+            remove_if_owned(&temp, &temp_identity);
+            return Err(error);
+        }
+    }
+    if !std::fs::symlink_metadata(&temp)
+        .is_ok_and(|metadata| same_file_identity(&temp_identity, &metadata))
+    {
+        return Err(path_changed_error(&target));
+    }
+    #[cfg(test)]
+    if failure == AtomicWriteFailure::Rename {
+        remove_if_owned(&temp, &temp_identity);
+        return Err(std::io::Error::other("injected atomic-rename failure"));
+    }
+    if let Err(error) = std::fs::rename(&temp, &target) {
+        remove_if_owned(&temp, &temp_identity);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Follow a symlink (or chain of symlinks) to the file it ultimately points at,
