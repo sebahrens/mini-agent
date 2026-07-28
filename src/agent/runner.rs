@@ -1203,11 +1203,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = MockCompletionModel::from_stream_turns(vec![
             vec![
-                MockStreamEvent::tool_call(
-                    "tool-first",
-                    CountingTool::NAME,
-                    serde_json::json!({}),
-                ),
+                MockStreamEvent::tool_call("tool-first", CountingTool::NAME, serde_json::json!({})),
                 MockStreamEvent::final_response_with_default_usage(),
             ],
             vec![MockStreamEvent::final_response_with_default_usage()],
@@ -1256,9 +1252,7 @@ mod tests {
                     Message::Assistant { content, .. } => content
                         .iter()
                         .filter_map(|content| match content {
-                            AssistantContent::ToolCall(tool_call) => {
-                                Some(tool_call.id.clone())
-                            }
+                            AssistantContent::ToolCall(tool_call) => Some(tool_call.id.clone()),
                             _ => None,
                         })
                         .collect::<Vec<_>>(),

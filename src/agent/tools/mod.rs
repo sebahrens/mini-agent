@@ -50,7 +50,7 @@ pub(crate) fn track_read(path: &str, offset: usize, limit: usize) -> Option<Stri
     let mut tracker = READ_TRACKER.lock().unwrap_or_else(|e| e.into_inner());
     let key = (path.to_string(), offset, limit);
     if tracker.contains(&key) {
-        let end = (offset + limit).saturating_sub(1);
+        let end = offset + limit;
         Some(format!(
             "read blocked: {path} (lines {}-{}) was already read and has not been modified since. Use the previous result or read a different section.",
             offset + 1,
