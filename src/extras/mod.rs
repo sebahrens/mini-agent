@@ -37,6 +37,6 @@ pub mod status_signals;
 #[cfg(feature = "lsp")]
 pub mod lsp;
 
-pub(crate) mod truncate;
 #[cfg(feature = "js")]
 pub mod js;
+pub(crate) mod truncate;
