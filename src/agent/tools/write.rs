@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rig::tool::Tool;
 
@@ -40,6 +40,37 @@ impl WriteTool {
     }
 }
 
+async fn resolve_write_path(path: &Path) -> std::io::Result<PathBuf> {
+    let resolved = crate::fs::resolve_symlink_target(path).await;
+    let mut ancestor = if resolved.is_absolute() {
+        resolved
+    } else {
+        std::env::current_dir()?.join(resolved)
+    };
+    let mut missing_components = Vec::new();
+
+    loop {
+        match tokio::fs::canonicalize(&ancestor).await {
+            Ok(mut canonical) => {
+                for component in missing_components.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(component) = ancestor.file_name().map(|name| name.to_os_string()) else {
+                    return Err(error);
+                };
+                if !ancestor.pop() {
+                    return Err(error);
+                }
+                missing_components.push(component);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl Tool for WriteTool {
     const NAME: &'static str = "write";
 
@@ -64,7 +95,7 @@ impl Tool for WriteTool {
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
         let expanded = crate::fs::expand_tilde(&args.path);
-        let resolved = crate::fs::resolve_symlink_target(Path::new(&expanded)).await;
+        let resolved = resolve_write_path(Path::new(&expanded)).await?;
         let path = resolved.as_path();
         let permission_path = path.to_string_lossy();
         tracing::debug!(
@@ -192,6 +223,49 @@ mod tests {
         assert!(
             !restricted_target.exists(),
             "permission denial must happen before the symlink target is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_permission_on_symlinked_parent_before_write() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let allowed_dir = temp.path().join("allowed");
+        let restricted_dir = temp.path().join("restricted");
+        std::fs::create_dir_all(&allowed_dir).unwrap();
+        std::fs::create_dir_all(&restricted_dir).unwrap();
+
+        let allowed_link = allowed_dir.join("linked-directory");
+        symlink(&restricted_dir, &allowed_link).unwrap();
+        let restricted_target = restricted_dir.join("created-through-parent-link.txt");
+
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(allowed_dir),
+            Some(vec!["standard".to_string()]),
+        );
+        let tool = WriteTool::new(Some(Arc::new(Mutex::new(checker))), None, None);
+
+        let error = tool
+            .call(WriteArgs {
+                path: allowed_link
+                    .join("created-through-parent-link.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+                content: "must not be written".to_string(),
+            })
+            .await
+            .expect_err("the resolved external parent must require permission");
+
+        assert!(
+            error.to_string().contains("Permission denied"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !restricted_target.exists(),
+            "permission denial must happen before the external target is written"
         );
     }
 }
