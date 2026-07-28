@@ -64,14 +64,18 @@ impl Tool for WriteTool {
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
         let expanded = crate::fs::expand_tilde(&args.path);
+        let resolved = crate::fs::resolve_symlink_target(Path::new(&expanded)).await;
+        let path = resolved.as_path();
+        let permission_path = path.to_string_lossy();
         tracing::debug!(
             "tool write start: path={}, content_len={}",
             expanded,
             args.content.len(),
         );
-        let coaching = check_perm_path(&self.permission, &self.ask_tx, "write", &expanded).await?;
+        // Check the path atomic_write will modify, not a symlink that points to it.
+        let coaching =
+            check_perm_path(&self.permission, &self.ask_tx, "write", &permission_path).await?;
 
-        let path = Path::new(&expanded);
         if path.exists() {
             tracing::warn!("tool write file exists: path={}", expanded);
             return Err(ToolError::Msg(format!(
@@ -112,5 +116,82 @@ impl Tool for WriteTool {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{PermissionConfigs, SecurityMode};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "zerostack_write_permission_test_{}_{}",
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_permission_on_broken_symlink_target_before_write() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let allowed_dir = temp.path().join("allowed");
+        let restricted_dir = temp.path().join("restricted");
+        std::fs::create_dir_all(&allowed_dir).unwrap();
+        std::fs::create_dir_all(&restricted_dir).unwrap();
+
+        let restricted_target = restricted_dir.join("created-through-link.txt");
+        let allowed_link = allowed_dir.join("safe-link.txt");
+        symlink(&restricted_target, &allowed_link).unwrap();
+
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(allowed_dir),
+            Some(vec!["standard".to_string()]),
+        );
+        let tool = WriteTool::new(Some(Arc::new(Mutex::new(checker))), None, None);
+
+        let error = tool
+            .call(WriteArgs {
+                path: allowed_link.to_string_lossy().into_owned(),
+                content: "must not be written".to_string(),
+            })
+            .await
+            .expect_err("the resolved external target must require permission");
+
+        assert!(
+            error.to_string().contains("Permission denied"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !restricted_target.exists(),
+            "permission denial must happen before the symlink target is written"
+        );
     }
 }

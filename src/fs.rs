@@ -109,7 +109,7 @@ fn unique_tmp_path(target: &Path, dir: &Path) -> PathBuf {
 /// is not a symlink, or a link is broken/unreadable, the best path resolved so
 /// far is returned — so a plain file, a new file, or a broken link all behave
 /// sensibly (we just write to that path).
-async fn resolve_symlink_target(path: &Path) -> PathBuf {
+pub(crate) async fn resolve_symlink_target(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     for _ in 0..40 {
         match tokio::fs::symlink_metadata(&current).await {
