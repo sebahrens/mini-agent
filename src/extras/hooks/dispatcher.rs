@@ -267,6 +267,7 @@ impl HookDispatcher {
     ) -> Vec<HookOutput> {
         let stdin = serde_json::to_vec(envelope).unwrap_or_default();
         let mut futures = Vec::new();
+        let mut async_handles = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
                 continue;
@@ -313,17 +314,26 @@ impl HookDispatcher {
             let project_dir = project_dir.to_string();
             let args = handler.args.clone();
             if handler.is_async {
-                tokio::spawn(async move {
+                async_handles.push(tokio::spawn(async move {
                     let _ =
                         run_hook(&command, args.as_deref(), &stdin, timeout, &project_dir).await;
-                });
+                }));
             } else {
                 futures.push(async move {
                     run_hook(&command, args.as_deref(), &stdin, timeout, &project_dir).await
                 });
             }
         }
-        futures::future::join_all(futures).await
+        let (outputs, async_results) = tokio::join!(
+            futures::future::join_all(futures),
+            futures::future::join_all(async_handles)
+        );
+        for result in async_results {
+            if let Err(error) = result {
+                tracing::warn!("hooks: async handler task failed: {error}");
+            }
+        }
+        outputs
     }
 }
 

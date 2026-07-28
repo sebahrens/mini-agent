@@ -31,6 +31,13 @@ fn handler_once(command: &str) -> HookHandler {
     }
 }
 
+fn async_handler(command: &str) -> HookHandler {
+    HookHandler {
+        is_async: true,
+        ..handler(command)
+    }
+}
+
 fn ctx() -> HookCtx {
     HookCtx {
         session_id: "sess-1".into(),
@@ -278,6 +285,40 @@ async fn dispatch_generic_blocks_on_decision_block_json() {
         Decision::Block {
             reason: "tests still failing".to_string()
         }
+    );
+}
+
+#[tokio::test]
+async fn dispatch_waits_for_async_handlers_but_ignores_their_decisions() {
+    let marker = std::env::temp_dir().join(format!(
+        "zerostack-hooks-async-complete-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let command = format!(
+        "sleep 0.1; printf complete > {}; echo '{{\"decision\":\"block\"}}'",
+        marker.display()
+    );
+    let config = config_with("Stop", None, vec![async_handler(&command)]);
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+
+    let decision = dispatcher
+        .dispatch(
+            "Stop",
+            None,
+            &ctx(),
+            EventFields::Stop {
+                stop_hook_active: false,
+                loop_iteration: None,
+                loop_active: None,
+            },
+        )
+        .await;
+
+    assert_eq!(decision, Decision::Continue);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap_or_default(),
+        "complete"
     );
 }
 
