@@ -80,7 +80,9 @@ impl Tool for FindFilesTool {
             })
             .build();
 
-        let mut results: Vec<String> = Vec::new();
+        let max_results = self.max_results as usize;
+        let mut results: Vec<String> =
+            Vec::with_capacity(max_results.saturating_add(1).min(64));
         let mut limit_hit = false;
 
         for entry in walker
@@ -90,7 +92,7 @@ impl Tool for FindFilesTool {
             let fname = entry.file_name().to_string_lossy();
             if re.is_match(&fname) {
                 results.push(entry.path().to_string_lossy().to_string());
-                if (results.len() as u64) >= self.max_results {
+                if results.len() > max_results {
                     limit_hit = true;
                     break;
                 }
@@ -105,10 +107,12 @@ impl Tool for FindFilesTool {
             });
         }
 
+        if limit_hit {
+            results.truncate(max_results);
+        }
         results.sort();
 
         let total = results.len();
-        let max_results = self.max_results as usize;
         let result = if limit_hit {
             format!(
                 "{} files found (showing first {}):\n{}\n\n[truncated after {} entries — unknown number of additional entries; narrow the pattern or path]",
@@ -238,5 +242,24 @@ mod tests {
         assert!(output.contains("truncated after 100 entries"));
         assert!(output.contains("unknown number of additional entries"));
         assert!(!output.contains("0 more"));
+    }
+
+    #[tokio::test]
+    async fn does_not_report_truncation_when_walker_is_exhausted_at_result_limit() {
+        let dir = TempDir::new("exact_limit");
+        for index in 0..100 {
+            std::fs::write(dir.path().join(format!("match_{index:03}.txt")), "").unwrap();
+        }
+
+        let output = FindFilesTool::new(None, None, 100)
+            .call(FindFilesArgs {
+                pattern: r"^match_\d+\.txt$".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+            })
+            .await
+            .unwrap();
+
+        assert!(output.starts_with("100 files found:\n"));
+        assert!(!output.contains("[truncated"));
     }
 }
