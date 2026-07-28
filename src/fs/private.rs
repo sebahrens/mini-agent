@@ -699,11 +699,7 @@ mod windows {
         atomic_write_mode(path, bytes, true)
     }
 
-    fn atomic_write_mode(
-        path: &Path,
-        bytes: &[u8],
-        create_only: bool,
-    ) -> std::io::Result<()> {
+    fn atomic_write_mode(path: &Path, bytes: &[u8], create_only: bool) -> std::io::Result<()> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0

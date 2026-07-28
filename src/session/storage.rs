@@ -40,11 +40,7 @@ fn existing_session_dir() -> anyhow::Result<Option<PathBuf>> {
 
 fn read_private_string(path: &Path) -> anyhow::Result<String> {
     let mut file = crate::fs::open_private_file(path).map_err(|error| {
-        anyhow::anyhow!(
-            "refusing unsafe session file {}: {}",
-            path.display(),
-            error
-        )
+        anyhow::anyhow!("refusing unsafe session file {}: {}", path.display(), error)
     })?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
@@ -75,11 +71,7 @@ pub(crate) fn atomic_write_with_failure(
     if let Some(parent) = path.parent() {
         crate::paths::ensure_private_directory(parent)?;
     }
-    crate::fs::private_atomic_write_with_failure_sync(
-        path,
-        content.as_bytes(),
-        fail_rename,
-    )?;
+    crate::fs::private_atomic_write_with_failure_sync(path, content.as_bytes(), fail_rename)?;
     Ok(())
 }
 
@@ -196,8 +188,7 @@ pub fn find_session_by_name(name: &str) -> anyhow::Result<Option<Session>> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json")
-        {
+        if path.extension().is_some_and(|e| e == "json") {
             let json = read_private_string(&path)?;
             if let Ok(session) = serde_json::from_str::<Session>(&json)
                 && session.name.to_lowercase() == lower

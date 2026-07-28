@@ -546,12 +546,9 @@ fn session_storage_permissions_clean_failure_residue_and_preserve_prior_file() {
     let prior = std::fs::read_to_string(&target).unwrap();
 
     for fail_rename in [false, true] {
-        let error = atomic_write_with_failure(
-            &target,
-            "SENTINEL-INCOMPLETE-SESSION-CONTENT",
-            fail_rename,
-        )
-        .expect_err("injected failure must be surfaced");
+        let error =
+            atomic_write_with_failure(&target, "SENTINEL-INCOMPLETE-SESSION-CONTENT", fail_rename)
+                .expect_err("injected failure must be surfaced");
         assert!(
             !error
                 .to_string()

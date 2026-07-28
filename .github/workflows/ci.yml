@@ -63,6 +63,241 @@ jobs:
       - name: Test (${{ matrix.features }})
         run: cargo test --locked ${{ matrix.features }}
 
+  platform-paths:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        feature:
+          - name: default
+            args: ''
+            mcp: true
+          - name: mcp
+            args: '--no-default-features --features mcp'
+            mcp: true
+          - name: js
+            args: '--no-default-features --features js'
+            mcp: false
+          - name: mcp-js
+            args: '--no-default-features --features mcp,js'
+            mcp: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Test deterministic and real platform path acceptance
+        shell: bash
+        run: cargo test --locked ${{ matrix.feature.args }} platform_paths_acceptance
+
+      - name: Test resolver and artifact-owner contract
+        shell: bash
+        run: |
+          cargo test --locked ${{ matrix.feature.args }} app_paths_matrix
+          cargo test --locked ${{ matrix.feature.args }} persistent_artifact_ownership
+
+      - name: Test migration and portable filename contract
+        shell: bash
+        run: |
+          cargo test --locked ${{ matrix.feature.args }} legacy_path_migration
+          cargo test --locked ${{ matrix.feature.args }} portable_filename_policy
+          cargo test --locked ${{ matrix.feature.args }} path_containment
+
+      - name: Test config and session private storage
+        shell: bash
+        run: |
+          cargo test --locked ${{ matrix.feature.args }} config_persistence_permissions
+          cargo test --locked ${{ matrix.feature.args }} session_storage_permissions
+
+      - name: Test MCP OAuth credential storage
+        if: matrix.feature.mcp
+        shell: bash
+        run: |
+          cargo test --locked ${{ matrix.feature.args }} mcp_oauth_identity
+          cargo test --locked ${{ matrix.feature.args }} mcp_oauth_migration
+          cargo test --locked ${{ matrix.feature.args }} mcp_oauth_storage_security
+
+      - name: Write machine-readable platform result
+        if: always()
+        shell: pwsh
+        run: |
+          @{
+            platform = '${{ matrix.os }}'
+            feature = '${{ matrix.feature.name }}'
+            result = '${{ job.status }}'
+            assertions = @(
+              'roots',
+              'owners',
+              'migration',
+              'portable-filenames',
+              'link-or-reparse-containment',
+              'config-private-storage',
+              'session-private-storage',
+              'oauth-private-storage-when-enabled'
+            )
+          } | ConvertTo-Json -Depth 3 | Set-Content 'platform-path-result.json'
+
+      - name: Archive platform result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-paths-${{ matrix.os }}-${{ matrix.feature.name }}
+          path: platform-path-result.json
+          if-no-files-found: error
+
+  platform-path-negative-controls:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Prove intentional contract mutations fail
+        shell: bash
+        run: |
+          for control in \
+            config-to-data \
+            windows-local-to-roaming \
+            credential-acl-broad-read \
+            session-acl-broad-read \
+            migration-silent-conflict \
+            reserved-name-accepted
+          do
+            if ZS_PLATFORM_PATH_NEGATIVE_CONTROL="$control" \
+              cargo test --locked platform_paths_acceptance_intentional_negative_controls
+            then
+              echo "negative control unexpectedly passed: $control" >&2
+              exit 1
+            fi
+          done
+
+      - name: Write machine-readable negative-control result
+        if: always()
+        shell: pwsh
+        run: |
+          @{
+            result = '${{ job.status }}'
+            controls = @(
+              'config-to-data',
+              'windows-local-to-roaming',
+              'credential-acl-broad-read',
+              'session-acl-broad-read',
+              'migration-silent-conflict',
+              'reserved-name-accepted'
+            )
+          } | ConvertTo-Json -Depth 3 | Set-Content 'platform-path-negative-controls.json'
+
+      - name: Archive negative-control result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-path-negative-controls
+          path: platform-path-negative-controls.json
+          if-no-files-found: error
+
+  platform-path-install-smoke:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Install debug binary into a clean root
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP 'zerostack-platform-install'
+          cargo install --locked --path . --debug --root $installRoot
+
+      - name: Verify installed binary reports and uses isolated roots
+        shell: pwsh
+        run: |
+          $smokeRoot = Join-Path $env:RUNNER_TEMP ('zerostack-path-smoke-' + [guid]::NewGuid())
+          $workspace = Join-Path $smokeRoot 'workspace'
+          $cleanHome = Join-Path $smokeRoot 'home'
+          New-Item -ItemType Directory -Path $workspace | Out-Null
+          New-Item -ItemType Directory -Path $cleanHome | Out-Null
+
+          $env:HOME = $cleanHome
+          if ($IsWindows) {
+            $env:USERPROFILE = $cleanHome
+          }
+
+          $env:ZS_CONFIG_DIR = Join-Path $smokeRoot 'config'
+          $env:ZS_DATA_DIR = Join-Path $smokeRoot 'data'
+          $env:ZS_LOCAL_DATA_DIR = Join-Path $smokeRoot 'local-data'
+          $env:ZS_STATE_DIR = Join-Path $smokeRoot 'state'
+          $env:ZS_CACHE_DIR = Join-Path $smokeRoot 'cache'
+          $env:ZS_CREDENTIALS_DIR = Join-Path $smokeRoot 'credentials'
+
+          $binaryName = if ($IsWindows) { 'mini-agent.exe' } else { 'mini-agent' }
+          $binary = Join-Path (Join-Path $env:RUNNER_TEMP 'zerostack-platform-install/bin') $binaryName
+          Push-Location $workspace
+          try {
+            $output = & $binary --print-config 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "installed binary failed: $($output -join [Environment]::NewLine)"
+            }
+          } finally {
+            Pop-Location
+          }
+          $text = $output -join [Environment]::NewLine
+          $roots = @{
+            config = $env:ZS_CONFIG_DIR
+            data = $env:ZS_DATA_DIR
+            local_data = $env:ZS_LOCAL_DATA_DIR
+            state = $env:ZS_STATE_DIR
+            cache = $env:ZS_CACHE_DIR
+            credentials = $env:ZS_CREDENTIALS_DIR
+          }
+          foreach ($entry in $roots.GetEnumerator()) {
+            if (-not (Test-Path -PathType Container $entry.Value)) {
+              throw "installed binary did not create $($entry.Key) root: $($entry.Value)"
+            }
+            if (-not $text.Contains($entry.Value)) {
+              throw "installed binary did not report $($entry.Key) root: $($entry.Value)"
+            }
+          }
+          if (Test-Path (Join-Path $workspace '.zerostack')) {
+            throw 'installed binary wrote persistent state into its working directory'
+          }
+          @{
+            platform = '${{ matrix.os }}'
+            result = 'success'
+            binary = $binary
+            workspace = $workspace
+            roots = $roots
+          } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $env:GITHUB_WORKSPACE 'platform-path-install-smoke.json')
+
+      - name: Ensure machine-readable install-smoke result
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'platform-path-install-smoke.json')) {
+            @{
+              platform = '${{ matrix.os }}'
+              result = '${{ job.status }}'
+            } | ConvertTo-Json | Set-Content 'platform-path-install-smoke.json'
+          }
+
+      - name: Archive install-smoke result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-path-install-smoke-${{ matrix.os }}
+          path: platform-path-install-smoke.json
+          if-no-files-found: error
+
   mcp-stdio:
     if: github.event_name != 'schedule'
     strategy:

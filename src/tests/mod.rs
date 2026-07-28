@@ -67,6 +67,8 @@ mod paste_burst_tests;
 #[cfg(test)]
 mod picker_tests;
 #[cfg(test)]
+mod platform_paths_tests;
+#[cfg(test)]
 mod portable_filename_tests;
 #[cfg(test)]
 mod prompt_mode_tests;

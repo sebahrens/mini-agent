@@ -254,6 +254,26 @@ platform test gates pass. Until then, Windows storage/security claims remain qua
 
 ---
 
+## Platform support gate
+
+Storage support remains conditional on the required `platform-paths`,
+`platform-path-negative-controls`, and `platform-path-install-smoke` CI jobs. A platform is not
+release-ready when any feature row or its real filesystem-security assertions are skipped,
+allowed to fail, or red.
+
+| Platform | Support status | Required executable evidence |
+|----------|----------------|------------------------------|
+| Linux | Conditional on required green jobs | Injected XDG matrix, real no-follow/mode checks, every implemented feature row, negative controls, and clean debug-install smoke on `ubuntu-latest` |
+| macOS | Conditional on required green jobs | Injected Application Support/Caches matrix, real no-follow/mode checks, every implemented feature row, and clean debug-install smoke on `macos-latest` |
+| Windows | Not ready until all required Windows jobs are green | Injected Roaming/Local Known Folder matrix, real junction/reparse and protected-DACL inspection, every implemented feature row, and clean debug-install smoke on `windows-latest` |
+
+The current implemented feature rows are default, `mcp`, `js`, and `mcp,js`. The `skills` and
+`mcp,js,skills` rows become mandatory in this gate when the `skills` Cargo feature lands. Archived
+machine-readable results are evidence for a particular workflow run, not a permanent support
+claim.
+
+---
+
 ## Required tests
 
 All resolution tests use injected platform/environment fixtures and isolated temporary roots.
