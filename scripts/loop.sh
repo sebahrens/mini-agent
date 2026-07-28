@@ -11,12 +11,17 @@
 #   ./scripts/loop.sh review all       # Review: ALL domains in tiered sequence
 #   ./scripts/loop.sh 50               # Build with max 50 iterations
 #   ./scripts/loop.sh review security 3  # Review security with 3 passes
+#   ./scripts/loop.sh codex                      # Build with codex exec (default codex model)
+#   ./scripts/loop.sh codex decompose            # Decompose with codex exec
+#   ./scripts/loop.sh --model o3                 # Build with codex exec, model o3
+#   ./scripts/loop.sh --model claude-opus-4-8    # Build with claude, specific model
 #   ./scripts/loop.sh --codex-verify             # Opt-in: Codex second-opinion after each build iteration
 #   ./scripts/loop.sh review all --codex-verify  # Opt-in: Codex cross-checks during review
 #   ./scripts/loop.sh decompose --codex-verify   # Opt-in: Codex QC review after each decompose round
 #
-# Codex involvement is OPT-IN across all modes. Without --codex-verify, no
-# external Codex companion is invoked anywhere in the loop.
+# Executor selection: pass `codex` or use --model with a non-claude ID to route
+# through `codex exec`; otherwise the claude CLI stream-json path is used.
+# Codex second-opinion (--codex-verify) is OPT-IN and independent of the executor.
 #
 # Review domains (run individually or via 'all'):
 #   Tier 1 (independent):  bugs, security, perf, orphans, missing, quality
@@ -182,6 +187,7 @@ for i in "${!args[@]}"; do
         bugs|security|perf|orphans|missing|quality|arch|deps|compound|debate|synthesis|all)
             ;; # captured by review case
         --codex-verify) CODEX_VERIFY=true ;;
+        codex) AGENT_EXECUTOR="codex" ;;
         --model)
             next="${args[$((i+1))]:-}"
             [ -n "$next" ] && AGENT_MODEL="$next"
@@ -200,13 +206,15 @@ done
 AGENT_MODEL_ARGS=()
 [ -n "${AGENT_MODEL:-}" ] && AGENT_MODEL_ARGS=(--model "$AGENT_MODEL")
 
-# Executor auto-detection: non-claude model IDs (o3, o4-mini, gpt-4o, etc.)
-# route through codex exec; claude-* models and the default stay with the
-# claude CLI stream-json path.
-if [ -n "${AGENT_MODEL:-}" ] && [[ ! "$AGENT_MODEL" =~ ^claude- ]]; then
-    AGENT_EXECUTOR="codex"
-else
-    AGENT_EXECUTOR="claude"
+# Executor resolution: explicit `codex` arg wins; otherwise auto-detect from
+# model name — non-claude IDs (o3, o4-mini, gpt-4o, …) use codex exec,
+# claude-* and the default use the claude CLI stream-json path.
+if [ "${AGENT_EXECUTOR:-}" != "codex" ]; then
+    if [ -n "${AGENT_MODEL:-}" ] && [[ ! "$AGENT_MODEL" =~ ^claude- ]]; then
+        AGENT_EXECUTOR="codex"
+    else
+        AGENT_EXECUTOR="claude"
+    fi
 fi
 
 # Review defaults to 1 iteration per domain
