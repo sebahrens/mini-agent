@@ -176,11 +176,25 @@ pub(crate) fn make_read_file(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String) -> rquickjs::Result<String> {
-    move |path| {
-        let target = block_on_host_call(&runtime, resolve_read_target(&path))?;
-        let canonical = permission_path("js/read_file", &target.path)?;
-        permission_bridge.check_path("js/read_file", &canonical)?;
-        block_on_host_call(&runtime, read_approved_file(target))
+    move |path: String| {
+        let target = block_on_host_call(
+            &runtime,
+            &permission_bridge,
+            "js/read_file",
+            STEP_TIMEOUT,
+            resolve_read_target(&path),
+        )?;
+        let permission_path = permission_path("js/read_file", &target.path)?;
+        permission_bridge
+            .check_path("js/read_file", &permission_path)
+            .map_err(|error| permission_error("js/read_file", error))?;
+        block_on_host_call(
+            &runtime,
+            &permission_bridge,
+            "js/read_file",
+            STEP_TIMEOUT,
+            read_approved_file(target),
+        )
     }
 }
 
@@ -188,12 +202,32 @@ pub(crate) fn make_write_file(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String, String) -> rquickjs::Result<()> {
-    move |path, content| {
-        reject_oversized_write(&content)?;
-        let target = block_on_host_call(&runtime, resolve_write_target(&path))?;
-        let resolved = permission_path("js/write_file", &target.path)?;
-        permission_bridge.check_path("js/write_file", &resolved)?;
-        block_on_host_call(&runtime, write_approved_file(target, content))
+    move |path: String, content: String| {
+        if content.len() > WRITE_FILE_MAX_BYTES {
+            return Err(file_error(
+                "js/write_file",
+                "resource limit",
+                format!("content exceeds {WRITE_FILE_MAX_BYTES} byte write limit"),
+            ));
+        }
+        let target = block_on_host_call(
+            &runtime,
+            &permission_bridge,
+            "js/write_file",
+            STEP_TIMEOUT,
+            resolve_write_target(&path),
+        )?;
+        let permission_path = permission_path("js/write_file", &target.path)?;
+        permission_bridge
+            .check_path("js/write_file", &permission_path)
+            .map_err(|error| permission_error("js/write_file", error))?;
+        block_on_host_call(
+            &runtime,
+            &permission_bridge,
+            "js/write_file",
+            STEP_TIMEOUT,
+            write_approved_file(target, content),
+        )
     }
 }
 ```
