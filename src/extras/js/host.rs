@@ -91,7 +91,7 @@ pub fn make_read_file(
 ) -> impl Fn(String) -> rquickjs::Result<String> {
     move |path: String| {
         runtime
-            .block_on(check_perm_path(&permission, &ask_tx, "js/read_file", &path))
+            .block_on(check_perm_path(&permission, &ask_tx, "read", &path))
             .map_err(|error| permission_error("js/read_file", error))?;
         block_on_host_call(&runtime, "js/read_file", STEP_TIMEOUT, async move {
             tokio::fs::read_to_string(path)
@@ -142,8 +142,17 @@ fn make_spawn_with_timeout(
     duration: Duration,
 ) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
     move |cmd: String, args: Vec<String>| {
+        let permission_command = std::iter::once(cmd.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
         runtime
-            .block_on(check_perm(&permission, &ask_tx, "js/spawn", &cmd))
+            .block_on(check_perm(
+                &permission,
+                &ask_tx,
+                "bash",
+                &permission_command,
+            ))
             .map_err(|error| permission_error("js/spawn", error))?;
         let mut command = sandbox.wrap_command(r#"exec "$0" "$@""#);
         command
@@ -231,7 +240,9 @@ mod tests {
     use super::*;
     use crate::permission::ask::UserDecision;
     use crate::permission::checker::PermissionChecker;
-    use crate::permission::{PermissionConfigs, SecurityMode};
+    use crate::permission::{
+        Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm,
+    };
 
     struct TempDir(PathBuf);
 
@@ -268,6 +279,38 @@ mod tests {
         )))
     }
 
+    fn host_permission(working_dir: PathBuf, action: Action, doom_loop: Action) -> PermCheck {
+        let config = PermissionConfig {
+            bash: Some(ToolPerm::Simple(action)),
+            read: Some(ToolPerm::Simple(action)),
+            write: Some(ToolPerm::Simple(action)),
+            doom_loop: Some(doom_loop),
+            ..PermissionConfig::default()
+        };
+        Arc::new(Mutex::new(PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(working_dir),
+            Some(vec!["standard".to_string()]),
+        )))
+    }
+
+    async fn call_read_file(
+        permission: PermCheck,
+        ask_tx: Option<AskSender>,
+        path: PathBuf,
+    ) -> Result<String, String> {
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            make_read_file(Some(permission), ask_tx, runtime)(
+                path.to_string_lossy().into_owned(),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .expect("read_file test task panicked")
+    }
+
     async fn call_write_file(
         permission: PermCheck,
         ask_tx: Option<AskSender>,
@@ -284,6 +327,26 @@ mod tests {
         })
         .await
         .expect("write_file test task panicked")
+    }
+
+    async fn call_spawn(
+        permission: PermCheck,
+        ask_tx: Option<AskSender>,
+        cmd: &'static str,
+        args: Vec<String>,
+    ) -> Result<SpawnResult, String> {
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            make_spawn(
+                Sandbox::new(false, "bwrap"),
+                Some(permission),
+                ask_tx,
+                runtime,
+            )(cmd.to_string(), args)
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .expect("spawn test task panicked")
     }
 
     #[tokio::test]
@@ -380,6 +443,107 @@ mod tests {
             .expect("write task panicked")
             .expect("approved external write should succeed");
         assert_eq!(std::fs::read_to_string(target).unwrap(), "approved");
+    }
+
+    #[tokio::test]
+    async fn host_calls_prompt_with_standard_tool_names_and_honor_denial() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let source = working_dir.join("source.txt");
+        let target = working_dir.join("target.txt");
+        std::fs::write(&source, "secret").unwrap();
+        let permission = host_permission(working_dir, Action::Ask, Action::Deny);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+
+        let read = tokio::spawn(call_read_file(
+            permission.clone(),
+            Some(ask_tx.clone()),
+            source.clone(),
+        ));
+        let request = ask_rx.recv().await.expect("read should request permission");
+        assert_eq!(request.tool, "read");
+        assert_eq!(
+            request.input.as_str(),
+            source.to_string_lossy().as_ref()
+        );
+        request
+            .reply
+            .send(UserDecision::Deny)
+            .expect("read permission request receiver dropped");
+        let error = read
+            .await
+            .expect("read task panicked")
+            .expect_err("denied read must fail");
+        assert!(error.contains("Permission denied by user"));
+
+        let write = tokio::spawn(call_write_file(
+            permission.clone(),
+            Some(ask_tx.clone()),
+            target.clone(),
+            "forbidden",
+        ));
+        let request = ask_rx.recv().await.expect("write should request permission");
+        assert_eq!(request.tool, "write");
+        assert_eq!(
+            request.input.as_str(),
+            target.to_string_lossy().as_ref()
+        );
+        request
+            .reply
+            .send(UserDecision::Deny)
+            .expect("write permission request receiver dropped");
+        let error = write
+            .await
+            .expect("write task panicked")
+            .expect_err("denied write must fail");
+        assert!(error.contains("Permission denied by user"));
+        assert!(!target.exists(), "denied write created the target");
+
+        let spawn = tokio::spawn(call_spawn(
+            permission,
+            Some(ask_tx),
+            "touch",
+            vec![target.to_string_lossy().into_owned()],
+        ));
+        let request = ask_rx.recv().await.expect("spawn should request permission");
+        assert_eq!(request.tool, "bash");
+        assert_eq!(request.input, format!("touch {}", target.to_string_lossy()));
+        request
+            .reply
+            .send(UserDecision::Deny)
+            .expect("spawn permission request receiver dropped");
+        let error = spawn
+            .await
+            .expect("spawn task panicked")
+            .expect_err("denied spawn must fail");
+        assert!(error.contains("Permission denied by user"));
+        assert!(!target.exists(), "denied spawn created the target");
+    }
+
+    #[tokio::test]
+    async fn repeated_js_read_calls_trigger_doom_loop_detection() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let source = working_dir.join("source.txt");
+        std::fs::write(&source, "allowed").unwrap();
+        let permission = host_permission(working_dir, Action::Allow, Action::Deny);
+
+        for _ in 0..2 {
+            let contents = call_read_file(permission.clone(), None, source.clone())
+                .await
+                .expect("first two reads should be allowed");
+            assert_eq!(contents, "allowed");
+        }
+
+        let error = call_read_file(permission, None, source)
+            .await
+            .expect_err("third identical read should trigger doom-loop denial");
+        assert!(
+            error.contains("Doom loop: repeated identical tool call"),
+            "unexpected doom-loop error: {error}"
+        );
     }
 
     #[cfg(unix)]
