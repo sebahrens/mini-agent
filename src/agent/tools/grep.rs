@@ -365,7 +365,10 @@ mod tests {
             let pattern = format!("^(?:{})$", GrepTool::glob_to_regex(glob));
             let regex = Regex::new(&pattern).expect("glob must produce a valid regex");
 
-            assert!(regex.is_match(literal_match), "{glob:?} must match literally");
+            assert!(
+                regex.is_match(literal_match),
+                "{glob:?} must match literally"
+            );
             assert!(
                 !regex.is_match(regex_only_match),
                 "{glob:?} must not treat literal characters as regex syntax"

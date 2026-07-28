@@ -30,9 +30,20 @@ struct RawModel {
     output_price: Option<f64>,
 }
 
-static CATALOG: LazyLock<HashMap<String, Vec<ModelEntry>>> = LazyLock::new(|| {
-    let raw: HashMap<String, Vec<RawModel>> = serde_json::from_str(CATALOG_JSON)
-        .expect("embedded data/models.json is malformed — run scripts/gen-models-catalog.sh");
+static CATALOG: LazyLock<HashMap<String, Vec<ModelEntry>>> =
+    LazyLock::new(|| parse_catalog(CATALOG_JSON));
+
+fn parse_catalog(json: &str) -> HashMap<String, Vec<ModelEntry>> {
+    let raw: HashMap<String, Vec<RawModel>> = match serde_json::from_str(json) {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::warn!(
+                "embedded data/models.json is malformed; using an empty model catalog: {error}"
+            );
+            return HashMap::new();
+        }
+    };
+
     raw.into_iter()
         .map(|(provider, models)| {
             let entries = models
@@ -49,10 +60,22 @@ static CATALOG: LazyLock<HashMap<String, Vec<ModelEntry>>> = LazyLock::new(|| {
             (provider, entries)
         })
         .collect()
-});
+}
 
 /// Baked model entries for a provider, or `None` when the provider is not in the
 /// catalog (custom gateways, ollama — those resolve live).
 pub fn catalog_entries(provider: &str) -> Option<&'static [ModelEntry]> {
     CATALOG.get(provider).map(|v| v.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_catalog;
+
+    #[test]
+    fn malformed_catalog_falls_back_to_empty() {
+        let catalog = parse_catalog("{not valid json");
+
+        assert!(catalog.is_empty());
+    }
 }
