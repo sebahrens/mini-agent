@@ -54,3 +54,5 @@
 # - github.repo
 
 dolt.shared-server: true
+
+sync.remote: "git+ssh://git@github.com/sebahrens/mini-agent.git"
