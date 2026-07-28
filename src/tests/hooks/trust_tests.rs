@@ -212,6 +212,36 @@ fn headless_unconfirmed_project_hook_is_skipped_without_confirmation() {
 }
 
 #[test]
+fn headless_unconfirmed_project_hook_does_not_disable_global_hooks() {
+    let global = unique_path("global-headless");
+    write_settings(
+        &global,
+        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo global"}]}]}}"#,
+    );
+    let project = unique_path("project-headless");
+    write_settings(
+        &project,
+        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo untrusted"}]}]}}"#,
+    );
+    let managed = missing_path("managed-headless");
+    let trust_path = unique_path("trust-headless");
+    let _ = std::fs::remove_file(&trust_path);
+
+    let dispatcher = trust::build_dispatcher_from_paths(
+        &global,
+        &project,
+        &managed,
+        &project_root(),
+        false,
+        true,
+        &trust_path,
+        &|_| panic!("headless must never prompt for confirmation"),
+    );
+
+    assert_eq!(dispatcher.handlers_for("PreToolUse", "bash").len(), 1);
+}
+
+#[test]
 fn interactive_confirmation_exposes_args_and_condition_and_persists_binding() {
     let global = missing_path("g4");
     let project = unique_path("project4");

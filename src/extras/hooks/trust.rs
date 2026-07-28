@@ -266,13 +266,14 @@ pub(crate) fn load_dispatcher(
     no_hooks_flag: bool,
     headless: bool,
 ) -> HookDispatcher {
+    let trust_unavailable = crate::paths::artifact_disabled("hook trust");
     build_dispatcher_from_paths(
         &global_settings_path(paths),
         &project_settings_path(paths),
         &managed_settings_path(),
         &current_project_root(paths),
-        no_hooks_flag || crate::paths::artifact_disabled("hook trust"),
-        headless,
+        no_hooks_flag,
+        headless || trust_unavailable,
         &default_trust_store_path(paths),
         &confirm_untrusted_hook,
     )

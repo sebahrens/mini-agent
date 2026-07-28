@@ -1320,7 +1320,7 @@ fn reject_link_components(path: &Path) -> io::Result<()> {
                     ),
                 ));
             }
-            Ok(_) => break,
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -2087,5 +2087,39 @@ mod tests {
         ));
         assert!(!canonical.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_path_migration_rejects_symlinked_parent_without_creating_canonical_content() {
+        use std::os::unix::fs::symlink;
+
+        let (root, paths) = isolated_paths();
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("legacy"), b"secret").unwrap();
+        symlink(&outside, root.join("legacy-root")).unwrap();
+
+        let canonical = paths.state_dir.join("copied");
+        let request = LegacyMigrationRequest {
+            artifact: "linked parent",
+            canonical: canonical.clone(),
+            candidates: vec![root.join("legacy-root").join("legacy")],
+            marker: paths
+                .migration_markers_dir()
+                .join("linked-parent.json"),
+            requirement: LegacyArtifactRequirement::Required,
+            kind: LegacyArtifactKind::File,
+            selected: None,
+        };
+
+        assert!(matches!(
+            migrate_legacy_path(&request),
+            Err(LegacyMigrationError::Io { .. })
+        ));
+        assert!(!canonical.exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 }
