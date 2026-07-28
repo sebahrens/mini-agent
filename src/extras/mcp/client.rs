@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 
 use compact_str::CompactString;
 use rmcp::service::{RoleClient, RunningService, serve_client};
@@ -42,6 +43,7 @@ impl McpClientHandle {
                 headers,
                 oauth,
             } => {
+                validate_mcp_server_url(url).await?;
                 tracing::debug!(
                     "MCP HTTP transport: {} ({} headers, OAuth: {})",
                     url,
@@ -136,16 +138,194 @@ fn parse_headers(
     Ok(result)
 }
 
+async fn validate_mcp_server_url(value: &str) -> anyhow::Result<()> {
+    let (host, port, literal_ip) = parse_mcp_server_url(value)?;
+    let addresses = if let Some(address) = literal_ip {
+        vec![address]
+    } else {
+        let resolver_host = host.clone();
+        tokio::task::spawn_blocking(move || {
+            (resolver_host.as_str(), port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>())
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("could not resolve MCP server host '{host}': {error}")
+        })?
+        .map_err(|error| {
+            anyhow::anyhow!("could not resolve MCP server host '{host}': {error}")
+        })?
+    };
+
+    validate_resolved_addresses(&addresses)
+}
+
+fn parse_mcp_server_url(value: &str) -> anyhow::Result<(String, u16, Option<IpAddr>)> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|error| anyhow::anyhow!("invalid MCP server URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("MCP server URL must use the http or https scheme");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("MCP server URL must not include a username or password");
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("MCP server URL must include a host"))?
+        .to_owned();
+    if host.eq_ignore_ascii_case("localhost")
+        || host
+            .to_ascii_lowercase()
+            .strip_suffix(".localhost")
+            .is_some()
+    {
+        anyhow::bail!(
+            "MCP server URL host is local; use a publicly routable HTTP(S) API endpoint"
+        );
+    }
+
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("MCP server URL must include a valid port"))?;
+    let literal_ip = host.parse().ok();
+    Ok((host, port, literal_ip))
+}
+
+fn validate_resolved_addresses(addresses: &[IpAddr]) -> anyhow::Result<()> {
+    if addresses.is_empty() {
+        anyhow::bail!("MCP server host did not resolve to an IP address");
+    }
+
+    for address in addresses {
+        if is_restricted_ip(*address) {
+            anyhow::bail!(
+                "MCP server URL resolves to non-public address {address}; use a publicly routable HTTP(S) API endpoint"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_restricted_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_restricted_ipv4(address),
+        IpAddr::V6(address) => {
+            let octets = address.octets();
+            let is_ipv4_compatible = octets[..12].iter().all(|octet| *octet == 0);
+            let is_ipv4_mapped = octets[..10].iter().all(|octet| *octet == 0)
+                && octets[10] == 0xff
+                && octets[11] == 0xff;
+            if is_ipv4_compatible || is_ipv4_mapped {
+                return is_restricted_ipv4(Ipv4Addr::new(
+                    octets[12],
+                    octets[13],
+                    octets[14],
+                    octets[15],
+                ));
+            }
+
+            let segments = address.segments();
+            let is_global_unicast = (0x2000..=0x3fff).contains(&segments[0]);
+            let is_teredo = segments[0] == 0x2001 && segments[1] == 0;
+            let is_benchmark = segments[0] == 0x2001
+                && segments[1] == 2
+                && segments[2] == 0;
+            let is_orchid = segments[0] == 0x2001
+                && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020);
+            let is_documentation = (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0);
+            let is_6to4 = segments[0] == 0x2002;
+
+            !is_global_unicast
+                || is_teredo
+                || is_benchmark
+                || is_orchid
+                || is_documentation
+                || is_6to4
+        }
+    }
+}
+
+fn is_restricted_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, third, _] = address.octets();
+    first == 0
+        || first == 10
+        || (first == 100 && (64..=127).contains(&second))
+        || first == 127
+        || (first == 169 && second == 254)
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 0 && third == 0)
+        || (first == 192 && second == 0 && third == 2)
+        || (first == 192 && second == 88 && third == 99)
+        || (first == 192 && second == 168)
+        || (first == 198 && (18..=19).contains(&second))
+        || (first == 198 && second == 51 && third == 100)
+        || (first == 203 && second == 0 && third == 113)
+        || first >= 224
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use super::stdio_command;
+    use super::{
+        parse_mcp_server_url, stdio_command, validate_mcp_server_url,
+        validate_resolved_addresses,
+    };
 
     #[test]
     fn stdio_command_resolves_path_lookup_before_spawn() {
         let command = stdio_command("rustc", &[], &HashMap::new()).unwrap();
 
         assert!(std::path::Path::new(command.as_std().get_program()).is_absolute());
+    }
+
+    #[tokio::test]
+    async fn rejects_local_and_private_mcp_server_urls() {
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://192.168.0.1",
+            "http://10.0.0.1",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]",
+        ] {
+            let error = validate_mcp_server_url(url).await.unwrap_err();
+            assert!(
+                error.to_string().contains("publicly routable"),
+                "unexpected error for {url}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_public_https_url_with_public_resolution() {
+        let (host, port, literal_ip) =
+            parse_mcp_server_url("https://api.example.com/mcp").unwrap();
+
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+        assert_eq!(literal_ip, None);
+        assert!(
+            validate_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_scheme_and_embedded_credentials() {
+        let scheme_error = parse_mcp_server_url("ftp://api.example.com").unwrap_err();
+        assert!(scheme_error.to_string().contains("http or https"));
+
+        let credentials_error =
+            parse_mcp_server_url("https://user:password@api.example.com").unwrap_err();
+        assert!(
+            credentials_error
+                .to_string()
+                .contains("username or password")
+        );
     }
 }
