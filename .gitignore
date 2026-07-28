@@ -7,3 +7,6 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Codex workspace-local home (seeded by loop.sh when using codex executor)
+.codex/
