@@ -26,9 +26,7 @@ fn interruption_outcome(
     } else if cancellation.is_cancelled() {
         Some(JsOutcome::Error("execution cancelled".to_string()))
     } else if permission_bridge.is_shutdown() {
-        Some(JsOutcome::Error(
-            "permission bridge shut down".to_string(),
-        ))
+        Some(JsOutcome::Error("permission bridge shut down".to_string()))
     } else {
         None
     }
@@ -104,13 +102,9 @@ fn error_outcome(
 ) -> JsOutcome {
     match error {
         Error::Allocation => JsOutcome::OomKilled,
-        Error::Exception => thrown_value_outcome(
-            ctx,
-            ctx.catch(),
-            deadline,
-            cancellation,
-            permission_bridge,
-        ),
+        Error::Exception => {
+            thrown_value_outcome(ctx, ctx.catch(), deadline, cancellation, permission_bridge)
+        }
         error => JsOutcome::Error(error.to_string()),
     }
 }
@@ -190,13 +184,7 @@ fn drain_pending_jobs(
             Err(job_exception) => {
                 let outcome = job_exception.0.with(|ctx| {
                     let value = ctx.catch();
-                    thrown_value_outcome(
-                        &ctx,
-                        value,
-                        deadline,
-                        cancellation,
-                        permission_bridge,
-                    )
+                    thrown_value_outcome(&ctx, value, deadline, cancellation, permission_bridge)
                 });
                 return Some(outcome);
             }
@@ -290,15 +278,7 @@ fn run_step_with_policy(
     let evaluated: Result<Persistent<Value<'static>>, JsOutcome> = ctx.with(|ctx| {
         ctx.eval::<Value, _>(code)
             .map(|value| Persistent::save(&ctx, value))
-            .map_err(|error| {
-                error_outcome(
-                    &ctx,
-                    error,
-                    deadline,
-                    cancellation,
-                    permission_bridge,
-                )
-            })
+            .map_err(|error| error_outcome(&ctx, error, deadline, cancellation, permission_bridge))
     });
 
     // rquickjs executes one Promise job per call. Use the eval deadline for the
@@ -323,13 +303,9 @@ fn run_step_with_policy(
         Ok(value) => match job_outcome {
             Some(outcome) => outcome,
             None => ctx.with(|ctx| match value.restore(&ctx) {
-                Ok(value) => settled_value_outcome(
-                    &ctx,
-                    value,
-                    deadline,
-                    cancellation,
-                    permission_bridge,
-                ),
+                Ok(value) => {
+                    settled_value_outcome(&ctx, value, deadline, cancellation, permission_bridge)
+                }
                 Err(Error::Allocation) => JsOutcome::OomKilled,
                 Err(error) => JsOutcome::Error(format!("Failed to restore JS result: {error}")),
             }),
