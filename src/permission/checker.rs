@@ -160,7 +160,9 @@ impl PermissionChecker {
             .as_ref()
             .map(|map| {
                 map.iter()
-                    .map(|(pat, action)| (Pattern::new(pat), *action))
+                    .map(|(pat, action)| {
+                        (Pattern::new(&resolve_glob_pattern(pat)), *action)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -565,17 +567,20 @@ impl PermissionChecker {
             Path::new(&self.working_dir).join(p)
         };
         let cwd = Path::new(&self.working_dir);
-        // Canonicalize to resolve symlinks before checking. If canonicalization
-        // fails (e.g. path doesn't exist yet), fall back to syntactic normalize
-        // so we still catch `..` traversal.
-        let normalized = p.canonicalize().unwrap_or_else(|_| normalize_path(&p));
-        let normalized_cwd = cwd.canonicalize().unwrap_or_else(|_| normalize_path(cwd));
-        !normalized.starts_with(&normalized_cwd)
+        let Some(normalized) = resolve_path_allow_missing(&p) else {
+            return true;
+        };
+        let Some(normalized_cwd) = resolve_path_allow_missing(cwd) else {
+            return true;
+        };
+        !normalized.starts_with(normalized_cwd)
     }
 
     fn match_ext_dir(&self, path_str: &str) -> Option<Action> {
+        let resolved = resolve_path_allow_missing(Path::new(path_str))?;
+        let resolved = resolved.to_string_lossy();
         for (pattern, action) in &self.ext_dir_rules {
-            if pattern.matches(path_str) {
+            if pattern.matches(&resolved) {
                 return Some(*action);
             }
         }
@@ -638,9 +643,147 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
+/// Resolve symlinks in the existing portion of a path while permitting a
+/// non-existent suffix. Errors other than a missing path fail closed.
+fn resolve_path_allow_missing(path: &Path) -> Option<PathBuf> {
+    fn resolve(path: &Path, symlink_depth: usize) -> Option<PathBuf> {
+        if symlink_depth > 40 {
+            return None;
+        }
+
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        let mut resolved = PathBuf::new();
+
+        for component in absolute.components() {
+            match component {
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    resolved.push(component.as_os_str());
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    resolved.pop();
+                }
+                std::path::Component::Normal(name) => {
+                    resolved.push(name);
+                    match std::fs::symlink_metadata(&resolved) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            let target = std::fs::read_link(&resolved).ok()?;
+                            let target = if target.is_absolute() {
+                                target
+                            } else {
+                                resolved.parent()?.join(target)
+                            };
+                            resolved = resolve(&target, symlink_depth + 1)?;
+                        }
+                        Ok(_) => {
+                            resolved = resolved.canonicalize().ok()?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => return None,
+                    }
+                }
+            }
+        }
+
+        Some(resolved)
+    }
+
+    resolve(path, 0).map(|resolved| normalize_path(&resolved))
+}
+
+/// Canonicalize the non-pattern prefix so external-directory rules are matched
+/// against the same resolved path used for workspace containment.
+fn resolve_glob_pattern(pattern: &str) -> String {
+    let expanded = crate::fs::expand_tilde(pattern);
+    let Some(wildcard) = expanded.find(['*', '?']) else {
+        return resolve_path_allow_missing(Path::new(&expanded))
+            .unwrap_or_else(|| PathBuf::from(expanded))
+            .to_string_lossy()
+            .into_owned();
+    };
+    let Some(prefix_end) = expanded[..wildcard].rfind(['/', '\\']).map(|index| index + 1) else {
+        return expanded;
+    };
+    let Some(prefix) = resolve_path_allow_missing(Path::new(&expanded[..prefix_end])) else {
+        return expanded;
+    };
+    prefix
+        .join(&expanded[prefix_end..])
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn is_plan_file(path: &str) -> bool {
     Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| name.starts_with("PLAN") && name.ends_with(".md"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "zerostack_permission_checker_test_{}_{}",
+                std::process::id(),
+                sequence
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn external_directory_allow_does_not_follow_workspace_symlink() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let external = temp.0.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        symlink(&external, workspace.join("evil-link")).unwrap();
+
+        let config = PermissionConfig {
+            external_directory: Some(
+                [(
+                    format!("{}/**", workspace.to_string_lossy()),
+                    Action::Allow,
+                )]
+                .into(),
+            ),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["standard".to_string()]),
+        );
+
+        let result = checker.check_path("write", &workspace.join("evil-link/new-file").to_string_lossy());
+
+        assert!(
+            matches!(result, CheckResult::Ask),
+            "resolved external target must not match the workspace allow rule, got {result:?}"
+        );
+    }
 }
