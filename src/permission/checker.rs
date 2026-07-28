@@ -160,9 +160,7 @@ impl PermissionChecker {
             .as_ref()
             .map(|map| {
                 map.iter()
-                    .map(|(pat, action)| {
-                        (Pattern::new(&resolve_glob_pattern(pat)), *action)
-                    })
+                    .map(|(pat, action)| (Pattern::new(&resolve_glob_pattern(pat)), *action))
                     .collect()
             })
             .unwrap_or_default();
@@ -705,7 +703,10 @@ fn resolve_glob_pattern(pattern: &str) -> String {
             .to_string_lossy()
             .into_owned();
     };
-    let Some(prefix_end) = expanded[..wildcard].rfind(['/', '\\']).map(|index| index + 1) else {
+    let Some(prefix_end) = expanded[..wildcard]
+        .rfind(['/', '\\'])
+        .map(|index| index + 1)
+    else {
         return expanded;
     };
     let Some(prefix) = resolve_path_allow_missing(Path::new(&expanded[..prefix_end])) else {
@@ -764,11 +765,7 @@ mod tests {
 
         let config = PermissionConfig {
             external_directory: Some(
-                [(
-                    format!("{}/**", workspace.to_string_lossy()),
-                    Action::Allow,
-                )]
-                .into(),
+                [(format!("{}/**", workspace.to_string_lossy()), Action::Allow)].into(),
             ),
             ..PermissionConfig::default()
         };
@@ -779,7 +776,10 @@ mod tests {
             Some(vec!["standard".to_string()]),
         );
 
-        let result = checker.check_path("write", &workspace.join("evil-link/new-file").to_string_lossy());
+        let result = checker.check_path(
+            "write",
+            &workspace.join("evil-link/new-file").to_string_lossy(),
+        );
 
         assert!(
             matches!(result, CheckResult::Ask),

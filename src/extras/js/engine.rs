@@ -56,12 +56,14 @@ pub(crate) fn run_step(
         Err(e) => return JsOutcome::Error(format!("Context::full failed: {e}")),
     };
 
-    register_host_globals(
+    if let Err(error) = register_host_globals(
         &ctx,
         sandbox.clone(),
         permission_bridge.clone(),
         runtime.clone(),
-    );
+    ) {
+        return JsOutcome::Error(format!("Failed to register host globals: {error}"));
+    }
 
     let result = ctx.with(|ctx| match ctx.eval::<Value, _>(code) {
         Err(rquickjs::Error::Exception) => {

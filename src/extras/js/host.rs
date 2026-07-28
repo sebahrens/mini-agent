@@ -206,40 +206,33 @@ pub(crate) fn register_host_globals(
     sandbox: Sandbox,
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
-) {
+) -> rquickjs::Result<()> {
     ctx.with(|ctx| {
         let globals = ctx.globals();
 
-        globals
-            .set(
-                "read_file",
-                Func::from(make_read_file(permission_bridge.clone(), runtime.clone())),
-            )
-            .expect("register read_file");
-        globals
-            .set(
-                "write_file",
-                Func::from(make_write_file(permission_bridge.clone(), runtime.clone())),
-            )
-            .expect("register write_file");
-        globals
-            .set(
-                "spawn",
-                Func::from(make_spawn(sandbox, permission_bridge, runtime)),
-            )
-            .expect("register spawn");
+        globals.set(
+            "read_file",
+            Func::from(make_read_file(permission_bridge.clone(), runtime.clone())),
+        )?;
+        globals.set(
+            "write_file",
+            Func::from(make_write_file(permission_bridge.clone(), runtime.clone())),
+        )?;
+        globals.set(
+            "spawn",
+            Func::from(make_spawn(sandbox, permission_bridge, runtime)),
+        )?;
 
-        let console = Object::new(ctx.clone()).expect("console object");
-        console
-            .set(
-                "log",
-                Func::from(|msg: Value| {
-                    eprintln!("[js] {:?}", msg);
-                }),
-            )
-            .expect("register console.log");
-        globals.set("console", console).expect("register console");
-    });
+        let console = Object::new(ctx.clone())?;
+        console.set(
+            "log",
+            Func::from(|msg: Value| {
+                eprintln!("[js] {:?}", msg);
+            }),
+        )?;
+        globals.set("console", console)?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -303,6 +296,26 @@ mod tests {
             Some(working_dir),
             Some(vec!["standard".to_string()]),
         )))
+    }
+
+    #[tokio::test]
+    async fn register_host_globals_returns_error_under_memory_pressure() {
+        let runtime = rquickjs::Runtime::new().expect("create QuickJS runtime");
+        let ctx = Context::full(&runtime).expect("create QuickJS context");
+        runtime.set_memory_limit(1);
+
+        let permission_owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let result = register_host_globals(
+            &ctx,
+            Sandbox::new(false, "bwrap"),
+            permission_owner.bridge(),
+            tokio::runtime::Handle::current(),
+        );
+
+        assert!(
+            result.is_err(),
+            "host-global registration should report allocation failure"
+        );
     }
 
     async fn call_read_file(
