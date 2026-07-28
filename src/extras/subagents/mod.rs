@@ -29,10 +29,7 @@ tokio::task_local! {
 #[error("subagents: SubagentConfig not initialized (call init() in main.rs)")]
 pub(crate) struct ConfigNotInitialized;
 
-pub(crate) async fn scope_subagent_event_tx<F>(
-    tx: mpsc::Sender<AgentEvent>,
-    future: F,
-) -> F::Output
+pub(crate) async fn scope_subagent_event_tx<F>(tx: mpsc::Sender<AgentEvent>, future: F) -> F::Output
 where
     F: Future,
 {

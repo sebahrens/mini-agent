@@ -978,8 +978,9 @@ mod tests {
             while let Some(event) = runner.event_rx.recv().await {
                 match event {
                     crate::event::AgentEvent::SubagentToolCall { name, .. } => markers.push(name),
-                    crate::event::AgentEvent::Done { .. }
-                    | crate::event::AgentEvent::Error(_) => break,
+                    crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error(_) => {
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -1022,17 +1023,15 @@ mod tests {
             None,
         );
 
-        let (markers_one, markers_two) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async {
+        let (markers_one, markers_two) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 tokio::join!(
                     collect_subagent_markers(runner_one),
                     collect_subagent_markers(runner_two)
                 )
-            },
-        )
-        .await
-        .expect("concurrent agent runs must complete without deadlocking");
+            })
+            .await
+            .expect("concurrent agent runs must complete without deadlocking");
 
         assert_eq!(markers_one, ["runner-one"]);
         assert_eq!(markers_two, ["runner-two"]);
