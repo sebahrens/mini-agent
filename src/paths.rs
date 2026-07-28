@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 pub mod portable;
 
-pub use portable::{digest_filename, opaque_name, validate_portable_component};
 #[allow(unused_imports)]
 pub use portable::{
     MAX_PORTABLE_COMPONENT_BYTES, MAX_PORTABLE_COMPONENT_UTF16_UNITS, MAX_PORTABLE_PATH_BYTES,
     MAX_PORTABLE_PATH_UTF16_UNITS, PortablePathError, collision_key, contained_join,
     ensure_contained, ensure_no_link_traversal, validate_portable_relative_path,
 };
+pub use portable::{digest_filename, opaque_name, validate_portable_component};
 
 const APP_COMPONENT: &str = "zerostack";
 
