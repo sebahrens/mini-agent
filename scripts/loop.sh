@@ -781,8 +781,10 @@ run_verification() {
 
     # Tier-by-iteration test policy:
     #   every iter:        check    (skip test step entirely; clippy covered it)
-    #   iter % 3 == 0:     libbins  (cargo test --lib --bins)
-    #   iter % 10 == 0:    full     (cargo test --lib --bins --tests)
+    #   iter % 3 == 0:     libbins  (cargo test --bins)
+    #   iter % 10 == 0:    full     (cargo test --bins --tests)
+    # Both workspace packages are binary-only, so requesting --lib makes Cargo
+    # fail with "no library targets found" before it can build any tests.
     # Override via env: LOOP_TEST_TIER=check|libbins|full
     local test_tier="${LOOP_TEST_TIER:-}"
     if [ -z "$test_tier" ]; then
@@ -805,8 +807,8 @@ run_verification() {
         local test_cmd_label
         local -a test_cmd_args
         case "$test_tier" in
-            libbins) test_cmd_args=("test" "--lib" "--bins") ;;
-            full)    test_cmd_args=("test" "--lib" "--bins" "--tests") ;;
+            libbins) test_cmd_args=("test" "--bins") ;;
+            full)    test_cmd_args=("test" "--bins" "--tests") ;;
         esac
         if [ -n "$existing_crates" ]; then
             local c
@@ -814,14 +816,14 @@ run_verification() {
             local _crates_joined
             _crates_joined=$(echo $existing_crates | tr '\n' ' ')
             case "$test_tier" in
-                libbins) test_cmd_label="cargo test --lib --bins -p $_crates_joined" ;;
-                full)    test_cmd_label="cargo test --lib --bins --tests -p $_crates_joined" ;;
+                libbins) test_cmd_label="cargo test --bins -p $_crates_joined" ;;
+                full)    test_cmd_label="cargo test --bins --tests -p $_crates_joined" ;;
             esac
         else
             test_cmd_args+=("--workspace")
             case "$test_tier" in
-                libbins) test_cmd_label="cargo test --workspace --lib --bins" ;;
-                full)    test_cmd_label="cargo test --workspace --lib --bins --tests" ;;
+                libbins) test_cmd_label="cargo test --workspace --bins" ;;
+                full)    test_cmd_label="cargo test --workspace --bins --tests" ;;
             esac
         fi
         echo -e "${BOLD}│${NC}  ${DIM}test tier: ${test_tier} (iter ${CURRENT_ITERATION})${NC}"
