@@ -4,17 +4,31 @@ use std::time::Instant;
 
 use crate::extras::js::host::register_host_globals;
 use crate::extras::js::types::*;
+use crate::permission::ask::AskSender;
+use crate::permission::checker::PermCheck;
 use crate::sandbox::Sandbox;
 
-pub fn js_thread_main(rx: mpsc::Receiver<JsRequest>, sandbox: Sandbox) {
+pub fn js_thread_main(
+    rx: mpsc::Receiver<JsRequest>,
+    sandbox: Sandbox,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    runtime: tokio::runtime::Handle,
+) {
     while let Ok(req) = rx.recv() {
-        let outcome = run_step(&req.code, &sandbox);
+        let outcome = run_step(&req.code, &sandbox, &permission, &ask_tx, &runtime);
         let _ = req.reply.send(JsResponse { outcome });
     }
 }
 
 // pub(crate) required: Phase 3's verify_skill() calls this cross-module
-pub(crate) fn run_step(code: &str, sandbox: &Sandbox) -> JsOutcome {
+pub(crate) fn run_step(
+    code: &str,
+    sandbox: &Sandbox,
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    runtime: &tokio::runtime::Handle,
+) -> JsOutcome {
     // Fresh Runtime EVERY step — OOM poisons allocator; never reuse
     let rt = match Runtime::new() {
         Ok(r) => r,
@@ -31,7 +45,13 @@ pub(crate) fn run_step(code: &str, sandbox: &Sandbox) -> JsOutcome {
         Err(e) => return JsOutcome::Error(format!("Context::full failed: {e}")),
     };
 
-    register_host_globals(&ctx, sandbox.clone());
+    register_host_globals(
+        &ctx,
+        sandbox.clone(),
+        permission.clone(),
+        ask_tx.clone(),
+        runtime.clone(),
+    );
 
     let result = ctx.with(|ctx| match ctx.eval::<Value, _>(code) {
         Err(rquickjs::Error::Exception) => {

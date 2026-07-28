@@ -340,10 +340,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 types::{JsRequest, THREAD_STACK},
             };
             let (js_tx, js_rx) = std::sync::mpsc::channel::<JsRequest>();
+            let js_permission = permission.clone();
+            let js_ask_tx = ask_tx.clone();
+            let runtime = tokio::runtime::Handle::current();
             std::thread::Builder::new()
                 .name("js-engine".into())
                 .stack_size(THREAD_STACK)
-                .spawn(move || js_thread_main(js_rx, sandbox))
+                .spawn(move || {
+                    js_thread_main(js_rx, sandbox, js_permission, js_ask_tx, runtime)
+                })
                 .expect("failed to spawn JS thread");
             all_tools.push(Box::new(JsTool::new(
                 js_tx,
