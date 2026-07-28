@@ -95,6 +95,29 @@ pub(crate) fn confirm_untrusted_hook(description: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
+fn hook_confirmation_description(handler: &HookHandler) -> String {
+    let argv = std::iter::once(handler.command.as_deref())
+        .chain(
+            handler
+                .args
+                .iter()
+                .flatten()
+                .map(|arg| Some(arg.as_str())),
+        )
+        .collect::<Vec<_>>();
+    let argv =
+        serde_json::to_string(&argv).expect("serializing hook argv strings cannot fail");
+
+    match handler.condition.as_deref() {
+        Some(condition) => {
+            let condition = serde_json::to_string(condition)
+                .expect("serializing a hook condition string cannot fail");
+            format!("executable argv={argv}; shell condition={condition}")
+        }
+        None => format!("executable argv={argv}"),
+    }
+}
+
 struct SourceConfig {
     hooks: HooksConfig,
     disable_all_hooks: bool,
@@ -163,7 +186,7 @@ fn filter_trusted_project_hooks(
                         "hooks: skipping unconfirmed project hook for event {event:?} \
                          (headless; run interactively once to confirm)"
                     );
-                } else if confirm(handler.command.as_deref().unwrap_or("<no command>")) {
+                } else if confirm(&hook_confirmation_description(&handler)) {
                     trusted_hashes.insert(hash);
                     kept_handlers.push(handler);
                 } else {

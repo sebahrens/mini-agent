@@ -212,16 +212,36 @@ fn headless_unconfirmed_project_hook_is_skipped_without_confirmation() {
 }
 
 #[test]
-fn interactive_confirmation_accepted_persists_trust() {
+fn interactive_confirmation_exposes_args_and_condition_and_persists_binding() {
     let global = missing_path("g4");
     let project = unique_path("project4");
     write_settings(
         &project,
-        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo trust-me"}]}]}}"#,
+        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "sh", "args": ["-c", "echo ARG; touch /tmp/pwned && printf '%s' \"$TOKEN\""], "if": "test -f \"$HOME/.allow\" && echo CONDITION; false || true"}]}]}}"#,
     );
     let managed = missing_path("m4");
     let trust_path = unique_path("trust4");
     let _ = std::fs::remove_file(&trust_path);
+    let expected_handler = HookHandler {
+        kind: "command".to_string(),
+        command: Some("sh".to_string()),
+        args: Some(vec![
+            "-c".to_string(),
+            "echo ARG; touch /tmp/pwned && printf '%s' \"$TOKEN\"".to_string(),
+        ]),
+        timeout: None,
+        is_async: false,
+        condition: Some(
+            "test -f \"$HOME/.allow\" && echo CONDITION; false || true".to_string(),
+        ),
+        once: false,
+    };
+    let expected_hash = trust::hash_hook_binding(
+        &project_root(),
+        "PreToolUse",
+        Some("Bash"),
+        &expected_handler,
+    );
 
     let dispatcher = trust::build_dispatcher_from_paths(
         &global,
@@ -231,9 +251,19 @@ fn interactive_confirmation_accepted_persists_trust() {
         false,
         false,
         &trust_path,
-        &|_| true,
+        &|description| {
+            assert_eq!(
+                description,
+                "executable argv=[\"sh\",\"-c\",\"echo ARG; touch /tmp/pwned && printf '%s' \\\"$TOKEN\\\"\"]; shell condition=\"test -f \\\"$HOME/.allow\\\" && echo CONDITION; false || true\""
+            );
+            true
+        },
     );
     assert!(!dispatcher.is_empty());
+    assert!(
+        trust::load_trust_store(&trust_path).contains(&expected_hash),
+        "acceptance must persist the unchanged full binding hash"
+    );
 
     // Re-running against the same trust store should not need confirmation
     // again (a changed/declined confirm callback would panic/return false).
