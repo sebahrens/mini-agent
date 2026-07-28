@@ -186,6 +186,21 @@ pub struct Config {
     #[cfg(feature = "subagents")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_max_turns: Option<usize>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_max_prompts: Option<usize>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_max_concurrency: Option<usize>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_max_output_bytes: Option<usize>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_max_cost_units: Option<u64>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_repeated_reads: Option<bool>,
     /// Show the session cost in the status bar even when it is $0.0000 (e.g. when
@@ -420,6 +435,31 @@ impl Config {
     #[cfg(feature = "subagents")]
     pub fn resolve_subagent_max_list_dir_entries(&self) -> Option<u64> {
         self.subagent_max_list_dir_entries
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_max_prompts(&self) -> usize {
+        self.task_max_prompts.unwrap_or(8)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_max_concurrency(&self) -> usize {
+        self.task_max_concurrency.unwrap_or(4)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_max_output_bytes(&self) -> usize {
+        self.task_max_output_bytes.unwrap_or(256 * 1024)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_max_cost_units(&self) -> u64 {
+        self.task_max_cost_units.unwrap_or(500_000)
+    }
+
+    #[cfg(feature = "subagents")]
+    pub fn resolve_task_timeout_secs(&self) -> u64 {
+        self.task_timeout_secs.unwrap_or(300)
     }
 
     pub fn resolve_always_show_welcome(&self) -> bool {

@@ -681,13 +681,13 @@ impl AnyAgent {
     }
 
     #[cfg(feature = "subagents")]
-    pub async fn run_subagent(
+    pub(crate) async fn run_subagent(
         &self,
         prompt: &str,
         max_turns: usize,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         retry_config: &RetryConfig,
-    ) -> anyhow::Result<String> {
+    ) -> runner::SubagentRunOutput {
         match self {
             AnyAgent::OpenRouter(a) => {
                 runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await

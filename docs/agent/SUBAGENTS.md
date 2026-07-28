@@ -15,10 +15,10 @@ Subagents are designed for **highly specific questions**, not wide exploration.
 Avoid broad instructions like "check all documentation" — instead ask precise
 questions that can be answered with a few file reads and searches.
 
-When the main agent calls the `task` tool, one subagent is spawned per prompt.
-If multiple prompts are given, they run in **parallel**. Each subagent has
-access only to read tools and returns a summary of findings, which the main
-agent then incorporates into its response.
+When the main agent calls the `task` tool, one subagent is scheduled per
+prompt. Multiple prompts use **bounded parallelism**. Each subagent has access
+only to read tools and returns a summary of findings, which the main agent then
+incorporates into its response.
 
 ## Feature Gate
 
@@ -41,8 +41,10 @@ The main agent has a new tool called `task`. It accepts:
 ```
 
 - **Single prompt**: one subagent explores, returns findings.
-- **Multiple prompts**: subagents run concurrently via `tokio::spawn`. Each
-  result appears under a `## Task N:` heading.
+- **Multiple prompts**: up to `task_max_concurrency` subagents run at once.
+  Each result appears under a `## Task N:` heading in original prompt order.
+- The complete request is rejected before permission checking or execution if
+  it is empty, contains a blank prompt, or exceeds `task_max_prompts`.
 
 ## What the Subagent Can Do
 
@@ -89,12 +91,25 @@ The main agent's `task` tool itself goes through the normal permission check
 
 ## Configuration
 
-| Config field           | Type      | Default             | Description                           |
-|------------------------|-----------|---------------------|---------------------------------------|
-| `task_max_turns`       | `usize`   | `15`                | Max agent turns per subagent          |
-| `task_enabled`         | `bool`    | `true`              | Whether the `task` tool is registered |
-| `subagent_model`       | `string`  | `none (uses main model)` | Model name or quick-model alias       |
-| `subagent_provider`    | `string`  | (same as main)      | Provider for the subagent (optional)  |
+| Config field                | Type     | Default                  | Description |
+|-----------------------------|----------|--------------------------|-------------|
+| `task_max_turns`            | `usize`  | `20`                     | Max agent turns per subagent |
+| `task_max_prompts`          | `usize`  | `8`                      | Max child prompts in one tool call |
+| `task_max_concurrency`      | `usize`  | `4`                      | Max simultaneously running children |
+| `task_max_output_bytes`     | `usize`  | `262144` (256 KiB)       | Hard cap on the complete returned tool output |
+| `task_max_cost_units`       | `u64`    | `500000`                 | Aggregate provider token/cost-unit budget |
+| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline |
+| `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
+| `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
+| `subagent_provider`         | `string` | (same as main)           | Provider for the subagent (optional) |
+
+All numeric task limits must be greater than zero.
+`task_max_output_bytes` must be at least 256, leaving room for an explicit
+partial-status header, and `task_timeout_secs` cannot exceed 86400 (24 hours).
+Cost units use the provider-reported aggregate token usage when present.
+Because provider usage shapes differ, cached and cache-creation input are
+conservatively included. If a provider reports no usage, the task tool falls
+back to a text-size estimate so unknown usage is not treated as free.
 
 ### Model resolution (in order of precedence)
 
@@ -112,6 +127,11 @@ Example `opencode.json`:
 ```json
 {
   "task_max_turns": 20,
+  "task_max_prompts": 8,
+  "task_max_concurrency": 4,
+  "task_max_output_bytes": 262144,
+  "task_max_cost_units": 500000,
+  "task_timeout_secs": 300,
   "task_enabled": true,
   "subagent_model": "deepseek-v4-flash",
   "subagent_provider": "openrouter"
@@ -173,9 +193,24 @@ technical questions (`src/extras/subagents/prompt.rs`). It instructs the
 subagent to focus on the question given, use the available tools, and report
 findings concisely without preamble or wandering.
 
-## Parallel Execution
+## Bounded Execution and Partial Results
 
-When multiple prompts are supplied, each runs in its own `tokio::spawn` task.
-`futures::future::join_all` gathers the results. A failed subagent (panic or
-error) does not cancel the others — its output shows the error while the rest
-complete normally. Results are ordered by the original prompt index.
+The task tool keeps at most `task_max_concurrency` child futures in flight.
+Queued prompts are started only as slots become available. The whole call owns
+all child futures, so dropping or cancelling the call drops every child before
+returning; no detached subagent task is left running.
+
+The first child failure stops new launches and cancels in-flight siblings.
+Aggregate output exhaustion, aggregate cost exhaustion, and the whole-call
+deadline do the same. Every prompt still receives one deterministic status in
+original prompt order:
+
+- completed children contain their response;
+- the triggering failure contains `[failed: ...]`;
+- started siblings contain `[cancelled: ...]`;
+- queued prompts contain `[not started: ...]`.
+
+Partial returns begin with a summary containing the stop reason and aggregate
+started/completed/cost accounting. A 128 KiB per-child response cap remains as
+defense in depth, while `task_max_output_bytes` is a final hard cap over the
+entire rendered tool result, including headings and status markers.

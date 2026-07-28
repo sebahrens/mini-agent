@@ -4,6 +4,8 @@ use rig::agent::{Agent, MultiTurnStreamItem, StreamingResult};
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
 use rig::completion::{CompletionModel, Message};
+#[cfg(feature = "subagents")]
+use rig::completion::Usage;
 use rig::message::ToolResultContent;
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use tokio::sync::mpsc;
@@ -837,18 +839,24 @@ fn format_tool_args_summary(args_json: &serde_json::Value) -> String {
 /// Run an agent silently (no stdout/stderr printing), collecting the full
 /// response text. Used by subagent tasks.
 #[cfg(feature = "subagents")]
-pub async fn run_subagent<M>(
+pub(crate) struct SubagentRunOutput {
+    pub response: Result<String, String>,
+    pub usage: Usage,
+}
+
+#[cfg(feature = "subagents")]
+pub(crate) async fn run_subagent<M>(
     agent: &Agent<M>,
     prompt: &str,
     max_turns: usize,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     retry_config: &RetryConfig,
-) -> anyhow::Result<String>
+) -> SubagentRunOutput
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
-    let mut stream = retry::retry_stream_chat(retry_config, || {
+    let stream = retry::retry_stream_chat(retry_config, || {
         let p = prompt.to_string();
         async move {
             agent
@@ -857,10 +865,19 @@ where
                 .await
         }
     })
-    .await
-    .map_err(|e| anyhow::anyhow!("subagent error: {e}"))?;
+    .await;
+    let mut stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            return SubagentRunOutput {
+                response: Err(format!("subagent error: {error}")),
+                usage: Usage::new(),
+            };
+        }
+    };
 
     let mut full_response = String::new();
+    let mut usage = Usage::new();
 
     while let Some(item) = stream.next().await {
         match item {
@@ -881,21 +898,37 @@ where
                 }
             }
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                let final_usage = res.usage();
+                if final_usage.has_values() {
+                    usage = final_usage;
+                }
                 full_response = res.output.to_string();
                 break;
             }
+            Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                usage += call.usage;
+            }
             Ok(_) => {}
             Err(e) => {
-                return Err(anyhow::anyhow!("subagent error: {}", e));
+                return SubagentRunOutput {
+                    response: Err(format!("subagent error: {e}")),
+                    usage,
+                };
             }
         }
     }
 
     if full_response.is_empty() {
-        anyhow::bail!("subagent returned empty response");
+        return SubagentRunOutput {
+            response: Err("subagent returned empty response".to_string()),
+            usage,
+        };
     }
 
-    Ok(full_response)
+    SubagentRunOutput {
+        response: Ok(full_response),
+        usage,
+    }
 }
 
 #[cfg(test)]

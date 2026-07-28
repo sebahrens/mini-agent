@@ -171,6 +171,16 @@ fn rich_default_config() -> Config {
         subagent_max_grep_results: Some(200),
         #[cfg(feature = "subagents")]
         subagent_max_find_results: Some(200),
+        #[cfg(feature = "subagents")]
+        task_max_prompts: Some(8),
+        #[cfg(feature = "subagents")]
+        task_max_concurrency: Some(4),
+        #[cfg(feature = "subagents")]
+        task_max_output_bytes: Some(256 * 1024),
+        #[cfg(feature = "subagents")]
+        task_max_cost_units: Some(500_000),
+        #[cfg(feature = "subagents")]
+        task_timeout_secs: Some(300),
         #[cfg(feature = "advisor")]
         advisor: Some(crate::config::types::AdvisorConfig::default()),
         statusline: Some(StatusLineConfig {
