@@ -165,8 +165,8 @@ editing in a known location, grepping for a literal you will act on immediately.
     }
 
     fn parameters(&self) -> serde_json::Value {
-        let max_prompts = with_config(|cfg| cfg.config.resolve_task_max_prompts())
-            .unwrap_or(DEFAULT_MAX_PROMPTS);
+        let max_prompts =
+            with_config(|cfg| cfg.config.resolve_task_max_prompts()).unwrap_or(DEFAULT_MAX_PROMPTS);
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -242,16 +242,12 @@ editing in a known location, grepping for a literal you will act on immediately.
                     ),
                 )
                 .await;
-                let mut run = match result {
+                let run = match result {
                     Ok(run) => run,
                     Err(_) => {
                         let output = Err("timeout: subagent exceeded 300s".to_string());
                         return ChildExecution {
-                            cost_units: usage_cost_units(
-                                &Usage::new(),
-                                &display_prompt,
-                                &output,
-                            ),
+                            cost_units: usage_cost_units(&Usage::new(), &display_prompt, &output),
                             output,
                         };
                     }
@@ -306,11 +302,7 @@ struct ChildExecution {
     cost_units: u64,
 }
 
-fn indexed_child_future(
-    index: usize,
-    prompt: String,
-    child: ChildFuture,
-) -> IndexedChildFuture {
+fn indexed_child_future(index: usize, prompt: String, child: ChildFuture) -> IndexedChildFuture {
     Box::pin(async move {
         let child = match AssertUnwindSafe(child).catch_unwind().await {
             Ok(child) => child,
@@ -494,9 +486,7 @@ async fn execute_tasks(
         let work_remains = next_index < task_count || !in_flight.is_empty();
         if child_failed {
             stop_reason = Some(StopReason::ChildFailure(index));
-        } else if output_exhausted
-            || (output_bytes >= limits.max_output_bytes && work_remains)
-        {
+        } else if output_exhausted || (output_bytes >= limits.max_output_bytes && work_remains) {
             stop_reason = Some(StopReason::OutputLimit);
         } else if cost_units > limits.max_cost_units
             || (cost_units == limits.max_cost_units && work_remains)
@@ -568,11 +558,7 @@ fn section_overhead_bytes(index: usize, prompt: &str, task_count: usize) -> usiz
         .saturating_add(trailing_newline)
 }
 
-fn usage_cost_units(
-    usage: &Usage,
-    prompt: &str,
-    response: &Result<String, String>,
-) -> u64 {
+fn usage_cost_units(usage: &Usage, prompt: &str, response: &Result<String, String>) -> u64 {
     let itemized = usage
         .input_tokens
         .saturating_add(usage.output_tokens)
@@ -716,7 +702,11 @@ mod tests {
 
         let error = validate_prompts(&request, limits).unwrap_err();
 
-        assert!(error.to_string().contains("received 3 prompts, maximum is 2"));
+        assert!(
+            error
+                .to_string()
+                .contains("received 3 prompts, maximum is 2")
+        );
         assert_eq!(counters.started.load(Ordering::SeqCst), 0);
     }
 

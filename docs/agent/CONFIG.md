@@ -307,6 +307,13 @@ zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 | `if` | string | A shell command evaluated (with the same stdin envelope) before the handler runs; the handler only runs if it exits `0`. Fails closed: a broken/unparseable/timed-out condition still runs the handler, with a warning. |
 | `once` | boolean | Runs the handler at most once per event per session; later matches are skipped. |
 
+Hook subprocess output has non-configurable hard limits: 1 MiB for stdout,
+1 MiB for stderr, and 1.5 MiB combined. Stdout and stderr are drained
+concurrently. Exceeding any limit is a hard hook failure: zerostack kills and
+reaps the process group, retains at most the bounded prefixes for diagnostics,
+and never interprets truncated stdout as a complete hook decision. The same
+cleanup occurs on timeout or output-consumer failure.
+
 `matcher` (on the handler group, not the handler) follows Claude Code
 semantics: omitted, `""`, or `"*"` matches every tool; a bare name or a
 `|`/`,`-separated list is an exact case-insensitive match after tool-name

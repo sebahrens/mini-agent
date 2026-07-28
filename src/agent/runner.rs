@@ -1,11 +1,11 @@
 use compact_str::CompactString;
 use futures::StreamExt;
 use rig::agent::{Agent, MultiTurnStreamItem, StreamingResult};
+#[cfg(feature = "subagents")]
+use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
 use rig::completion::{CompletionModel, Message};
-#[cfg(feature = "subagents")]
-use rig::completion::Usage;
 use rig::message::ToolResultContent;
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use tokio::sync::mpsc;

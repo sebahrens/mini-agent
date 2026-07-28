@@ -1,4 +1,4 @@
-use super::subprocess::HookOutput;
+use super::subprocess::{HookOutput, HookStatus};
 
 /// Normalized result of interpreting one hook's raw process output via the
 /// exit-code and stdout-JSON channels, per the hook-dispatch spec's
@@ -17,11 +17,16 @@ pub(crate) enum ChannelResult {
     },
     /// The hook exceeded its timeout and was killed.
     TimedOut,
+    /// The hook exceeded a hard output cap and was killed. Its bounded output
+    /// prefix must not be interpreted as a complete hook response.
+    OutputLimitExceeded,
 }
 
 pub(crate) fn interpret_hook_output(output: &HookOutput) -> ChannelResult {
-    if output.timed_out {
-        return ChannelResult::TimedOut;
+    match output.status {
+        HookStatus::TimedOut => return ChannelResult::TimedOut,
+        HookStatus::OutputLimitExceeded(_) => return ChannelResult::OutputLimitExceeded,
+        HookStatus::Completed | HookStatus::Failed => {}
     }
     match output.exit_code {
         Some(0) => {

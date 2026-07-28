@@ -1,18 +1,28 @@
 use crate::extras::hooks::channel::{ChannelResult, interpret_hook_output};
-use crate::extras::hooks::subprocess::HookOutput;
+use crate::extras::hooks::subprocess::{HookOutput, HookStatus, OutputLimit};
 
-fn output(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8], timed_out: bool) -> HookOutput {
+fn output(
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    status: HookStatus,
+) -> HookOutput {
     HookOutput {
         exit_code,
         stdout: stdout.to_vec(),
         stderr: stderr.to_vec(),
-        timed_out,
+        status,
     }
 }
 
 #[test]
 fn exit_zero_with_valid_json_returns_the_json() {
-    let out = output(Some(0), br#"{"permissionDecision":"allow"}"#, b"", false);
+    let out = output(
+        Some(0),
+        br#"{"permissionDecision":"allow"}"#,
+        b"",
+        HookStatus::Completed,
+    );
     match interpret_hook_output(&out) {
         ChannelResult::NoObjection { json: Some(v) } => {
             assert_eq!(v["permissionDecision"], "allow");
@@ -23,7 +33,7 @@ fn exit_zero_with_valid_json_returns_the_json() {
 
 #[test]
 fn exit_zero_with_non_json_stdout_is_ignored() {
-    let out = output(Some(0), b"not json at all", b"", false);
+    let out = output(Some(0), b"not json at all", b"", HookStatus::Completed);
     assert!(matches!(
         interpret_hook_output(&out),
         ChannelResult::NoObjection { json: None }
@@ -32,7 +42,7 @@ fn exit_zero_with_non_json_stdout_is_ignored() {
 
 #[test]
 fn exit_zero_with_empty_stdout_is_no_objection() {
-    let out = output(Some(0), b"", b"", false);
+    let out = output(Some(0), b"", b"", HookStatus::Completed);
     assert!(matches!(
         interpret_hook_output(&out),
         ChannelResult::NoObjection { json: None }
@@ -41,7 +51,12 @@ fn exit_zero_with_empty_stdout_is_no_objection() {
 
 #[test]
 fn exit_two_blocks_with_stderr_feedback() {
-    let out = output(Some(2), b"", b"denied: dangerous command", false);
+    let out = output(
+        Some(2),
+        b"",
+        b"denied: dangerous command",
+        HookStatus::Completed,
+    );
     match interpret_hook_output(&out) {
         ChannelResult::Block { stderr } => assert_eq!(stderr, "denied: dangerous command"),
         other => panic!("expected Block, got {other:?}"),
@@ -54,7 +69,7 @@ fn exit_two_with_json_also_present_ignores_the_json() {
         Some(2),
         br#"{"permissionDecision":"allow"}"#,
         b"denied",
-        false,
+        HookStatus::Completed,
     );
     match interpret_hook_output(&out) {
         ChannelResult::Block { stderr } => assert_eq!(stderr, "denied"),
@@ -64,7 +79,7 @@ fn exit_two_with_json_also_present_ignores_the_json() {
 
 #[test]
 fn other_exit_code_is_non_blocking_error() {
-    let out = output(Some(1), b"", b"boom", false);
+    let out = output(Some(1), b"", b"boom", HookStatus::Completed);
     match interpret_hook_output(&out) {
         ChannelResult::Error { exit_code, stderr } => {
             assert_eq!(exit_code, Some(1));
@@ -76,9 +91,23 @@ fn other_exit_code_is_non_blocking_error() {
 
 #[test]
 fn timeout_is_reported_distinctly() {
-    let out = output(None, b"", b"", true);
+    let out = output(None, b"", b"", HookStatus::TimedOut);
     assert!(matches!(
         interpret_hook_output(&out),
         ChannelResult::TimedOut
+    ));
+}
+
+#[test]
+fn output_limit_is_reported_distinctly() {
+    let out = output(
+        None,
+        b"partial",
+        b"",
+        HookStatus::OutputLimitExceeded(OutputLimit::Stdout),
+    );
+    assert!(matches!(
+        interpret_hook_output(&out),
+        ChannelResult::OutputLimitExceeded
     ));
 }

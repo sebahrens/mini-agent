@@ -6,7 +6,7 @@ use super::channel::{ChannelResult, interpret_hook_output};
 use super::envelope::{EventFields, build_envelope};
 use super::normalize::canonical_tool_name;
 use super::settings::{HookHandler, HooksConfig};
-use super::subprocess::{HookOutput, run_hook, run_shell_condition};
+use super::subprocess::{HookOutput, HookStatus, run_hook, run_shell_condition};
 use super::{Decision, HookCtx, PreDecision, Verdict};
 
 /// Default per-hook timeout when a handler doesn't declare one.
@@ -284,17 +284,23 @@ impl HookDispatcher {
                     std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
                 let cond_output =
                     run_shell_condition(condition, &stdin, cond_timeout, project_dir).await;
-                if cond_output.timed_out {
-                    tracing::warn!(
-                        "hooks: `if` condition for {command:?} timed out; failing closed (running the handler)"
-                    );
-                } else {
-                    match cond_output.exit_code {
+                match cond_output.status {
+                    HookStatus::TimedOut => {
+                        tracing::warn!(
+                            "hooks: `if` condition for {command:?} timed out; failing closed (running the handler)"
+                        );
+                    }
+                    HookStatus::OutputLimitExceeded(limit) => {
+                        tracing::warn!(
+                            "hooks: `if` condition for {command:?} exceeded its {limit:?} output limit; failing closed (running the handler)"
+                        );
+                    }
+                    HookStatus::Completed | HookStatus::Failed => match cond_output.exit_code {
                         Some(0) => {}
                         Some(_) => continue,
                         None => {
                             tracing::warn!(
-                                "hooks: `if` condition for {command:?} could not be spawned; failing closed (running the handler)"
+                                "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
                             );
                         }
                     }
@@ -367,6 +373,14 @@ fn parse_pre_decision_part(output: &HookOutput) -> PreDecisionPart {
         }
         ChannelResult::TimedOut => {
             tracing::warn!("hooks: hook timed out");
+            PreDecisionPart {
+                verdict: Verdict::Defer,
+                reason: None,
+                updated_input: None,
+            }
+        }
+        ChannelResult::OutputLimitExceeded => {
+            tracing::warn!("hooks: hook exceeded its output limit");
             PreDecisionPart {
                 verdict: Verdict::Defer,
                 reason: None,
@@ -446,7 +460,9 @@ fn parse_decision(event: &str, output: &HookOutput) -> Decision {
             Decision::Continue
         }
         ChannelResult::NoObjection { json: None } => Decision::Continue,
-        ChannelResult::Error { .. } | ChannelResult::TimedOut => Decision::Continue,
+        ChannelResult::Error { .. }
+        | ChannelResult::TimedOut
+        | ChannelResult::OutputLimitExceeded => Decision::Continue,
     }
 }
 
