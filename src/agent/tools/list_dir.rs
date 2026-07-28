@@ -233,8 +233,7 @@ mod tests {
             Some(vec!["restrictive".to_string()]),
         );
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
-        let tool =
-            ListDirTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None);
+        let tool = ListDirTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None);
 
         let call = tool.call(ListDirArgs {
             path: Some(link.to_string_lossy().into_owned()),

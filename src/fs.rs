@@ -6,10 +6,7 @@ use tokio::io::AsyncWriteExt;
 fn path_changed_error(path: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
-        format!(
-            "Path changed after permission check: {}",
-            path.display()
-        ),
+        format!("Path changed after permission check: {}", path.display()),
     )
 }
 
@@ -95,6 +92,7 @@ pub(crate) async fn open_stable_file(path: &Path) -> std::io::Result<tokio::fs::
 ///
 /// The temp file lives in the same directory (not the system temp dir) because
 /// `rename` is only atomic within a single filesystem.
+#[cfg(test)]
 pub async fn atomic_write(
     path: impl AsRef<Path>,
     contents: impl AsRef<[u8]>,
@@ -110,10 +108,10 @@ pub async fn atomic_write(
 /// Atomically write to a path that the caller has already resolved and
 /// permission-checked.
 ///
-/// Unlike [`atomic_write`], this function deliberately does not follow a
-/// symlink at `path`. That lets permission-gated callers bind the write to the
-/// path they checked instead of re-resolving an attacker-swappable symlink
-/// between the permission decision and the rename.
+/// Unlike the test-only `atomic_write` helper, this function deliberately does
+/// not follow a symlink at `path`. That lets permission-gated callers bind the
+/// write to the path they checked instead of re-resolving an attacker-swappable
+/// symlink between the permission decision and the rename.
 pub(crate) async fn atomic_write_resolved(
     path: impl AsRef<Path>,
     contents: impl AsRef<[u8]>,
