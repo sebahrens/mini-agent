@@ -18,6 +18,9 @@ impl<'js> IntoJs<'js> for SpawnResult {
         obj.set("stdout", self.stdout)?;
         obj.set("stderr", self.stderr)?;
         obj.set("code", self.code)?;
+        obj.set("timed_out", self.timed_out)?;
+        obj.set("stdout_truncated", self.stdout_truncated)?;
+        obj.set("stderr_truncated", self.stderr_truncated)?;
         Ok(obj.into())
     }
 }
@@ -177,6 +180,9 @@ fn make_spawn_with_timeout(
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             code: output.status.code().unwrap_or(-1),
+            timed_out: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
         })
     }
 }

@@ -103,7 +103,10 @@ async fn test_spawn_captures_output_and_exit_code() {
         .await
         .expect("spawn call failed");
 
-    assert_eq!(result, r#"{"stdout":"out","stderr":"err","code":7}"#);
+    assert_eq!(
+        result,
+        r#"{"stdout":"out","stderr":"err","code":7,"timed_out":false,"stdout_truncated":false,"stderr_truncated":false}"#
+    );
 }
 
 #[cfg(unix)]
@@ -120,7 +123,10 @@ async fn test_spawn_uses_configured_sandbox_wrapper() {
         .await
         .expect("spawn call failed");
 
-    assert_eq!(result, r#"{"stdout":"","stderr":"","code":1}"#);
+    assert_eq!(
+        result,
+        r#"{"stdout":"","stderr":"","code":1,"timed_out":false,"stdout_truncated":false,"stderr_truncated":false}"#
+    );
 }
 
 #[tokio::test]

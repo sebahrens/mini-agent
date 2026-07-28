@@ -160,14 +160,8 @@ fn guarded_asks_for_write_and_bash() {
     // Bash: no default rule matches (it's a different pattern)
     assert!(matches!(checker.check("bash", "wget"), CheckResult::Ask));
     // Only byte-for-byte exact Bash allow rules apply.
-    assert!(matches!(
-        checker.check("bash", "ls -la"),
-        CheckResult::Ask
-    ));
-    assert!(matches!(
-        checker.check("bash", "pwd"),
-        CheckResult::Allowed
-    ));
+    assert!(matches!(checker.check("bash", "ls -la"), CheckResult::Ask));
+    assert!(matches!(checker.check("bash", "pwd"), CheckResult::Allowed));
 }
 
 // --- Deny rules ---
@@ -550,10 +544,7 @@ fn standard_deny_still_works_for_non_path_tools() {
 #[test]
 fn standard_allows_configured_bash_commands() {
     let mut checker = make_checker(SecurityMode::Standard);
-    assert!(matches!(
-        checker.check("bash", "ls -la"),
-        CheckResult::Ask
-    ));
+    assert!(matches!(checker.check("bash", "ls -la"), CheckResult::Ask));
     assert!(matches!(
         checker.check("bash", "git status"),
         CheckResult::Allowed

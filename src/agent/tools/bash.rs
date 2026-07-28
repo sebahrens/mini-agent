@@ -62,8 +62,7 @@ impl Tool for BashTool {
         // The complete script is the permission key and is passed unchanged to
         // the shell. Never split or tokenize it: Bash can execute nested
         // programs from syntax that ad-hoc command splitting cannot classify.
-        let coaching =
-            check_perm(&self.permission, &self.ask_tx, "bash", &args.command).await?;
+        let coaching = check_perm(&self.permission, &self.ask_tx, "bash", &args.command).await?;
 
         let output = if let Some(secs) = args.timeout {
             match timeout(
