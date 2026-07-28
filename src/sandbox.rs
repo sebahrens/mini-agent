@@ -1,7 +1,7 @@
 use std::collections::HashSet;
-use std::process::{ExitStatus, Stdio};
 #[cfg(test)]
 use std::process::Output;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
