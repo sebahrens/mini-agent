@@ -554,15 +554,19 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {
-        let path = crate::fs::expand_tilde(&args.path);
+        let expanded = crate::fs::expand_tilde(&args.path);
+        let resolved =
+            crate::fs::resolve_symlink_target(std::path::Path::new(&expanded)).await;
+        let path = resolved.to_string_lossy().into_owned();
         let es = edit_system();
         tracing::debug!(
             "tool edit start: path={}, mode={:?}, has_block={}, has_edits={}",
-            path,
+            expanded,
             es,
             args.block.is_some(),
             args.edits.as_ref().map(|e| e.len()).unwrap_or(0),
         );
+        // Check the path atomic_write will modify, not a symlink that points to it.
         let coaching = check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await?;
 
         let bytes = tokio::fs::read(&path).await?;
@@ -608,15 +612,15 @@ impl Tool for EditTool {
         };
 
         crate::fs::atomic_write(&path, &output).await?;
-        crate::agent::tools::untrack_read_path(&path);
+        crate::agent::tools::untrack_read_path(&expanded);
 
         tracing::debug!(
             "tool edit done: path={}, edit_count={}, notes={}",
-            path,
+            expanded,
             edit_count,
             notes.len(),
         );
-        let mut result = format!("Applied {} edit(s) to {}", edit_count, path);
+        let mut result = format!("Applied {} edit(s) to {}", edit_count, expanded);
         for note in &notes {
             result.push_str(&format!("\n  Note: {}", note));
         }
@@ -634,5 +638,90 @@ impl Tool for EditTool {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{PermissionConfigs, SecurityMode};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "zerostack_edit_permission_test_{}_{}",
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_permission_on_symlink_target_before_edit() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let allowed_dir = temp.path().join("allowed");
+        let restricted_dir = temp.path().join("restricted");
+        std::fs::create_dir_all(&allowed_dir).unwrap();
+        std::fs::create_dir_all(&restricted_dir).unwrap();
+
+        let restricted_target = restricted_dir.join("existing.txt");
+        let original = "original contents\n";
+        std::fs::write(&restricted_target, original).unwrap();
+        let allowed_link = allowed_dir.join("safe-link.txt");
+        symlink(&restricted_target, &allowed_link).unwrap();
+
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(allowed_dir),
+            Some(vec!["standard".to_string()]),
+        );
+        let tool = EditTool::new(Some(Arc::new(Mutex::new(checker))), None);
+
+        let error = tool
+            .call(EditArgs {
+                path: allowed_link.to_string_lossy().into_owned(),
+                block: Some(
+                    "<<<<<<< SEARCH\noriginal contents\n=======\nmodified contents\n>>>>>>> REPLACE"
+                        .to_string(),
+                ),
+                file_crc: None,
+                edits: None,
+            })
+            .await
+            .expect_err("the resolved external target must require permission");
+
+        assert!(
+            error.to_string().contains("Permission denied"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&restricted_target).unwrap(),
+            original,
+            "permission denial must happen before the symlink target is edited"
+        );
     }
 }
