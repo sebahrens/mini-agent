@@ -240,9 +240,7 @@ mod tests {
     use super::*;
     use crate::permission::ask::UserDecision;
     use crate::permission::checker::PermissionChecker;
-    use crate::permission::{
-        Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm,
-    };
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
     struct TempDir(PathBuf);
 
@@ -302,10 +300,8 @@ mod tests {
     ) -> Result<String, String> {
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            make_read_file(Some(permission), ask_tx, runtime)(
-                path.to_string_lossy().into_owned(),
-            )
-            .map_err(|error| error.to_string())
+            make_read_file(Some(permission), ask_tx, runtime)(path.to_string_lossy().into_owned())
+                .map_err(|error| error.to_string())
         })
         .await
         .expect("read_file test task panicked")
@@ -365,6 +361,82 @@ mod tests {
                 "unexpected {tool} timeout error: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_paths_within_working_directory() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let source = working_dir.join("source.txt");
+        std::fs::write(&source, "allowed").unwrap();
+
+        let contents = call_read_file(standard_permission(working_dir), None, source)
+            .await
+            .expect("workspace read should be allowed");
+
+        assert_eq!(contents, "allowed");
+    }
+
+    #[tokio::test]
+    async fn read_file_denies_external_absolute_path_without_permission_response() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let source = external_dir.join("secret.txt");
+        std::fs::write(&source, "secret").unwrap();
+
+        let error = call_read_file(standard_permission(working_dir), None, source)
+            .await
+            .expect_err("external read should require permission");
+
+        assert!(
+            error.contains("Permission denied"),
+            "unexpected permission error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_denies_relative_parent_traversal_without_permission_response() {
+        let working_dir = std::env::current_dir().unwrap();
+        let path = PathBuf::from("../".repeat(32)).join("etc/passwd");
+
+        let error = call_read_file(standard_permission(working_dir), None, path)
+            .await
+            .expect_err("relative traversal should require permission");
+
+        assert!(
+            error.contains("Permission denied"),
+            "unexpected permission error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_denies_symlink_escape_without_permission_response() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let external_source = external_dir.join("secret.txt");
+        let allowed_link = working_dir.join("source-link.txt");
+        std::fs::write(&external_source, "secret").unwrap();
+        symlink(&external_source, &allowed_link).unwrap();
+
+        let error = call_read_file(standard_permission(working_dir), None, allowed_link)
+            .await
+            .expect_err("symlinked external read should require permission");
+
+        assert!(
+            error.contains("Permission denied"),
+            "unexpected permission error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -463,10 +535,7 @@ mod tests {
         ));
         let request = ask_rx.recv().await.expect("read should request permission");
         assert_eq!(request.tool, "read");
-        assert_eq!(
-            request.input.as_str(),
-            source.to_string_lossy().as_ref()
-        );
+        assert_eq!(request.input.as_str(), source.to_string_lossy().as_ref());
         request
             .reply
             .send(UserDecision::Deny)
@@ -483,12 +552,12 @@ mod tests {
             target.clone(),
             "forbidden",
         ));
-        let request = ask_rx.recv().await.expect("write should request permission");
+        let request = ask_rx
+            .recv()
+            .await
+            .expect("write should request permission");
         assert_eq!(request.tool, "write");
-        assert_eq!(
-            request.input.as_str(),
-            target.to_string_lossy().as_ref()
-        );
+        assert_eq!(request.input.as_str(), target.to_string_lossy().as_ref());
         request
             .reply
             .send(UserDecision::Deny)
@@ -506,7 +575,10 @@ mod tests {
             "touch",
             vec![target.to_string_lossy().into_owned()],
         ));
-        let request = ask_rx.recv().await.expect("spawn should request permission");
+        let request = ask_rx
+            .recv()
+            .await
+            .expect("spawn should request permission");
         assert_eq!(request.tool, "bash");
         assert_eq!(request.input, format!("touch {}", target.to_string_lossy()));
         request
