@@ -10,6 +10,7 @@ use crate::config::{
 };
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::McpServerConfig;
+use crate::paths::AppPaths;
 use crate::session::storage;
 
 /// Write `content` to `path` atomically via temp-file + rename.
@@ -309,7 +310,23 @@ fn rich_default_config() -> Config {
 }
 
 pub fn load() -> (Config, bool) {
-    let path = resolve_config_path();
+    load_from_path(resolve_config_path(), Path::new(LOCAL_CONFIG_PATH))
+}
+
+pub fn load_with_paths(paths: &AppPaths) -> (Config, bool) {
+    let local_config_path = paths
+        .project_dir
+        .as_deref()
+        .map(|directory| directory.join("config.toml"));
+    load_from_path(
+        pick_existing(&paths.config_dir),
+        local_config_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new(LOCAL_CONFIG_PATH)),
+    )
+}
+
+fn load_from_path(path: PathBuf, local_config_path: &Path) -> (Config, bool) {
     let is_first_startup = !path.exists();
     #[allow(unused_mut)]
     let mut cfg: Config = if is_first_startup {
@@ -366,7 +383,7 @@ pub fn load() -> (Config, bool) {
         cfg.custom_providers.as_ref().map(|m| m.len()).unwrap_or(0),
     );
 
-    apply_local_override(&mut cfg);
+    apply_local_override(&mut cfg, local_config_path);
 
     #[cfg(feature = "mcp")]
     inject_mcp_defaults(&mut cfg);
@@ -374,15 +391,17 @@ pub fn load() -> (Config, bool) {
     (cfg, is_first_startup)
 }
 
-/// Project-local config override, resolved relative to the CWD at startup.
+/// Legacy relative spelling for the project-local config override.
+///
+/// Production startup resolves this beneath `AppPaths::project_dir`; the
+/// relative path remains for direct library-style callers during migration.
 pub const LOCAL_CONFIG_PATH: &str = ".zerostack/config.toml";
 
 /// Merge `.zerostack/config.toml` over the global config when it exists.
 /// The local file is trusted exactly like the global one — it can set any
 /// key, including `yolo` or permission rules — so a startup note is printed
 /// whenever an override is applied.
-fn apply_local_override(cfg: &mut Config) {
-    let path = std::path::Path::new(LOCAL_CONFIG_PATH);
+fn apply_local_override(cfg: &mut Config, path: &Path) {
     if !path.exists() {
         return;
     }

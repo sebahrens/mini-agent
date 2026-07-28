@@ -11,6 +11,7 @@ mod extras;
 mod fs;
 mod logging;
 mod models_catalog;
+mod paths;
 mod permission;
 mod pricing;
 mod print;
@@ -44,10 +45,13 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
+    let workspace_root =
+        std::env::current_dir().context("failed to resolve the startup workspace root")?;
+    let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     logging::install_panic_hook();
     logging::init(&cli);
 
-    let (mut cfg, is_first_startup) = config::load();
+    let (mut cfg, is_first_startup) = config::load_with_paths(&app_paths);
 
     if cli.print_config {
         print::print_config(&cli, &cfg);
@@ -107,8 +111,15 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let mut startup =
-        startup::Startup::init(cli, cfg, is_first_startup, version_changed, is_interactive).await?;
+    let mut startup = startup::Startup::init(
+        cli,
+        cfg,
+        app_paths,
+        is_first_startup,
+        version_changed,
+        is_interactive,
+    )
+    .await?;
 
     // ACP mode: serve and exit before feature init
     #[cfg(feature = "acp")]

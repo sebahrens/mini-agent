@@ -4,6 +4,10 @@
 **Scope**: Normative foundation for every phase and every feature that persists files
 **Target platforms**: Linux, macOS, and Windows MSVC
 
+**Foundation implementation**: `src/paths.rs` provides the host-independent `AppPaths` resolver
+and injected `PathEnvironment` fixtures. Startup constructs the immutable roots once; artifact
+owner migration remains staged in the follow-up delivery tasks.
+
 ---
 
 ## Goal and authority

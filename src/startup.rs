@@ -8,6 +8,7 @@ use crate::extras::status_signals::StatusSignals;
 use crate::permission::SecurityMode;
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::{PermCheck, PermissionChecker};
+use crate::paths::AppPaths;
 use crate::provider::{self, AnyClient};
 use crate::sandbox::Sandbox;
 use crate::session::{self, MessageRole, Session};
@@ -141,6 +142,7 @@ pub(crate) async fn connect_headless_mcp(
 pub(crate) struct Startup {
     pub cli: Cli,
     pub cfg: Config,
+    pub paths: AppPaths,
     pub is_first_startup: bool,
     pub context: ContextFiles,
     pub provider: CompactString,
@@ -169,6 +171,7 @@ impl Startup {
     pub(crate) async fn init(
         cli: Cli,
         cfg: Config,
+        paths: AppPaths,
         is_first_startup: bool,
         version_changed: bool,
         is_interactive: bool,
@@ -298,6 +301,7 @@ impl Startup {
         Ok(Self {
             cli,
             cfg,
+            paths,
             is_first_startup,
             context,
             provider,
