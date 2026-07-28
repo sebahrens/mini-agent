@@ -5,7 +5,7 @@ use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
 use rig::completion::{CompletionModel, Message};
-use rig::message::ToolResultContent;
+use rig::message::{ToolResult, ToolResultContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use tokio::sync::mpsc;
 
@@ -43,6 +43,31 @@ fn streamed_reasoning_text<R>(content: &StreamedAssistantContent<R>) -> Option<C
         }
         _ => None,
     }
+}
+
+fn attributed_tool_result(
+    last_tool_name: &mut Option<String>,
+    tool_result: &ToolResult,
+) -> Option<(CompactString, String)> {
+    let Some(tool_name) = last_tool_name.take() else {
+        tracing::error!(
+            tool_result_id = %tool_result.id,
+            "agent received tool result without a preceding tool call; skipping"
+        );
+        return None;
+    };
+
+    let mut output = String::new();
+    for content in tool_result.content.iter() {
+        if let ToolResultContent::Text(text) = content {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&text.text);
+        }
+    }
+
+    Some((CompactString::new(tool_name), output))
 }
 
 fn observed_tokens(usage: Usage) -> u64 {
@@ -459,17 +484,11 @@ where
                         tool_result,
                         ..
                     })) => {
-                        let tool_name =
-                            CompactString::new(last_tool_name.take().unwrap_or_default());
-                        let mut output = String::new();
-                        for c in tool_result.content.iter() {
-                            if let ToolResultContent::Text(t) = c {
-                                if !output.is_empty() {
-                                    output.push('\n');
-                                }
-                                output.push_str(&t.text);
-                            }
-                        }
+                        let Some((tool_name, output)) =
+                            attributed_tool_result(&mut last_tool_name, &tool_result)
+                        else {
+                            continue;
+                        };
                         tracing::debug!(
                             "agent tool result: name={}, output_len={}",
                             tool_name,
@@ -588,8 +607,7 @@ where
                     .await;
                 return;
             }
-            if let Some((used, budget)) =
-                exhausted_token_budget(cumulative_usage, agent.max_tokens)
+            if let Some((used, budget)) = exhausted_token_budget(cumulative_usage, agent.max_tokens)
             {
                 tracing::warn!(
                     "agent: cumulative token budget exhausted before continuation ({used}/{budget})"
@@ -706,9 +724,9 @@ where
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::ToolCall { tool_call, .. },
                 )) => {
+                    let name = &tool_call.function.name;
+                    last_tool_name = Some(name.clone());
                     if pure_stdout {
-                        let name = &tool_call.function.name;
-                        last_tool_name = Some(name.clone());
                         let summary = format_tool_args_summary(&tool_call.function.arguments);
                         println!("\n◈ {} {}", name, summary);
                         let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -720,17 +738,12 @@ where
                     tool_result,
                     ..
                 })) => {
+                    let Some((name, output)) =
+                        attributed_tool_result(&mut last_tool_name, &tool_result)
+                    else {
+                        continue;
+                    };
                     if pure_stdout {
-                        let name = last_tool_name.take().unwrap_or_default();
-                        let mut output = String::new();
-                        for c in tool_result.content.iter() {
-                            if let ToolResultContent::Text(t) = c {
-                                if !output.is_empty() {
-                                    output.push('\n');
-                                }
-                                output.push_str(&t.text);
-                            }
-                        }
                         if !output.is_empty() {
                             println!("◈ {} result:", name);
                             let lines: Vec<&str> = output.lines().collect();
@@ -806,8 +819,7 @@ where
                     "Agent exhausted its maximum turn budget ({max_turns}) before completing."
                 );
             }
-            if let Some((used, budget)) =
-                exhausted_token_budget(cumulative_usage, agent.max_tokens)
+            if let Some((used, budget)) = exhausted_token_budget(cumulative_usage, agent.max_tokens)
             {
                 anyhow::bail!(
                     "Agent exhausted its cumulative token budget ({used}/{budget}) before \
@@ -973,12 +985,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::streamed_reasoning_text;
+    use super::{attributed_tool_result, streamed_reasoning_text};
     use rig::agent::AgentBuilder;
     use rig::completion::Usage;
+    use rig::message::{Text, ToolResult, ToolResultContent};
     use rig::streaming::StreamedAssistantContent;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
     use rig::tool::Tool;
+    use rig::OneOrMany;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1218,6 +1232,18 @@ mod tests {
                 .is_some_and(|message| message.contains("110/100")),
             "the runner must report cumulative token-budget exhaustion"
         );
+    }
+
+    #[test]
+    fn tool_result_without_preceding_tool_call_is_skipped() {
+        let tool_result = ToolResult {
+            id: "orphan-result".to_string(),
+            call_id: None,
+            content: OneOrMany::one(ToolResultContent::Text(Text::new("unexpected output"))),
+        };
+        let mut last_tool_name = None;
+
+        assert!(attributed_tool_result(&mut last_tool_name, &tool_result).is_none());
     }
 
     #[test]
