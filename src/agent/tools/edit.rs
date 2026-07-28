@@ -1,4 +1,5 @@
 use rig::tool::Tool;
+use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::{
@@ -555,7 +556,7 @@ impl Tool for EditTool {
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {
         let expanded = crate::fs::expand_tilde(&args.path);
-        let resolved = crate::fs::resolve_symlink_target(std::path::Path::new(&expanded)).await;
+        let resolved = tokio::fs::canonicalize(&expanded).await?;
         let path = resolved.to_string_lossy().into_owned();
         let es = edit_system();
         tracing::debug!(
@@ -568,7 +569,9 @@ impl Tool for EditTool {
         // Check the path atomic_write will modify, not a symlink that points to it.
         let coaching = check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await?;
 
-        let bytes = tokio::fs::read(&path).await?;
+        let mut file = crate::fs::open_stable_file(&resolved).await?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
         let content = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
 
@@ -610,7 +613,14 @@ impl Tool for EditTool {
             modified
         };
 
-        crate::fs::atomic_write(&path, &output).await?;
+        let current = tokio::fs::canonicalize(&expanded).await?;
+        if current != resolved {
+            return Err(ToolError::Msg(format!(
+                "Path changed after permission check: {}",
+                expanded
+            )));
+        }
+        crate::fs::atomic_write_resolved(&resolved, &output).await?;
         crate::agent::tools::untrack_read_path(&expanded);
 
         tracing::debug!(
@@ -721,6 +731,58 @@ mod tests {
             std::fs::read_to_string(&restricted_target).unwrap(),
             original,
             "permission denial must happen before the symlink target is edited"
+        );
+    }
+
+    #[tokio::test]
+    async fn symlink_swap_after_permission_check_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        use crate::permission::ask::UserDecision;
+
+        let temp = TempDir::new();
+        let checked_target = temp.path().join("checked.txt");
+        let swapped_target = temp.path().join("swapped.txt");
+        let link = temp.path().join("input.txt");
+        std::fs::write(&checked_target, "original checked contents\n").unwrap();
+        std::fs::write(&swapped_target, "original swapped contents\n").unwrap();
+        symlink(&checked_target, &link).unwrap();
+
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Guarded,
+            Some(temp.path().to_path_buf()),
+            Some(vec!["guarded".to_string()]),
+        );
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let tool = EditTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx));
+
+        let call = tool.call(EditArgs {
+            path: link.to_string_lossy().into_owned(),
+            block: Some(
+                "<<<<<<< SEARCH\noriginal checked contents\n=======\nmodified checked contents\n>>>>>>> REPLACE"
+                    .to_string(),
+            ),
+            file_crc: None,
+            edits: None,
+        });
+        let swap = async {
+            let request = ask_rx.recv().await.expect("permission request");
+            assert_eq!(
+                PathBuf::from(&request.input),
+                std::fs::canonicalize(&checked_target).unwrap()
+            );
+            std::fs::remove_file(&checked_target).unwrap();
+            symlink(&swapped_target, &checked_target).unwrap();
+            request.reply.send(UserDecision::AllowOnce).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(call, swap);
+        let error = result.expect_err("edit must reject a swapped permission-checked target");
+        assert!(error.to_string().contains("Path changed"));
+        assert_eq!(
+            std::fs::read_to_string(&swapped_target).unwrap(),
+            "original swapped contents\n"
         );
     }
 }

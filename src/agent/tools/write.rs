@@ -130,7 +130,14 @@ impl Tool for WriteTool {
                 bytes, self.max_text_file_size
             )));
         }
-        crate::fs::atomic_write(path, &args.content).await?;
+        let current = resolve_write_path(Path::new(&expanded)).await?;
+        if current != resolved {
+            return Err(ToolError::Msg(format!(
+                "Path changed after permission check: {}",
+                expanded
+            )));
+        }
+        crate::fs::atomic_write_resolved(path, &args.content).await?;
         crate::agent::tools::untrack_read_path(&expanded);
         tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
         let mut result = format!("Written {} bytes to {}", bytes, expanded);
@@ -267,5 +274,46 @@ mod tests {
             !restricted_target.exists(),
             "permission denial must happen before the external target is written"
         );
+    }
+
+    #[tokio::test]
+    async fn symlink_swap_after_permission_check_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        use crate::permission::ask::UserDecision;
+
+        let temp = TempDir::new();
+        let checked_target = temp.path().join("checked.txt");
+        let swapped_target = temp.path().join("swapped.txt");
+        let link = temp.path().join("input.txt");
+        symlink(&checked_target, &link).unwrap();
+
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Guarded,
+            Some(temp.path().to_path_buf()),
+            Some(vec!["guarded".to_string()]),
+        );
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let tool = WriteTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None);
+
+        let call = tool.call(WriteArgs {
+            path: link.to_string_lossy().into_owned(),
+            content: "checked contents".to_string(),
+        });
+        let swap = async {
+            let request = ask_rx.recv().await.expect("permission request");
+            let expected = std::fs::canonicalize(checked_target.parent().unwrap())
+                .unwrap()
+                .join(checked_target.file_name().unwrap());
+            assert_eq!(PathBuf::from(&request.input), expected);
+            symlink(&swapped_target, &checked_target).unwrap();
+            request.reply.send(UserDecision::AllowOnce).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(call, swap);
+        let error = result.expect_err("write must reject a swapped permission-checked target");
+        assert!(error.to_string().contains("Path changed"));
+        assert!(!swapped_target.exists());
     }
 }

@@ -76,10 +76,14 @@ impl Tool for ListDirTool {
 
     async fn call(&self, args: ListDirArgs) -> Result<String, ToolError> {
         let path = crate::fs::expand_tilde(args.path.as_deref().unwrap_or("."));
+        let resolved = tokio::fs::canonicalize(&path).await?;
+        let permission_path = resolved.to_string_lossy();
         tracing::debug!("tool list_dir start: path={}", path);
-        let coaching = check_perm_path(&self.permission, &self.ask_tx, "list_dir", &path).await?;
+        let coaching =
+            check_perm_path(&self.permission, &self.ask_tx, "list_dir", &permission_path).await?;
+        let checked_metadata = crate::fs::stable_path_metadata(&resolved).await?;
 
-        let walker = WalkBuilder::new(&path)
+        let walker = WalkBuilder::new(&resolved)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
@@ -131,6 +135,8 @@ impl Tool for ListDirTool {
 
             entries.push((name, kind, size));
         }
+        let current_metadata = crate::fs::stable_path_metadata(&resolved).await?;
+        crate::fs::ensure_same_file(&resolved, &checked_metadata, &current_metadata)?;
 
         entries.sort_by(|a, b| {
             let a_is_dir = a.1.starts_with("dir") || a.1 == "link";
@@ -186,5 +192,68 @@ impl Tool for ListDirTool {
             result = format!("{}\n\n{}", msg, result);
         }
         Ok(result)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use rig::tool::Tool;
+
+    use super::ListDirTool;
+    use crate::agent::tools::ListDirArgs;
+    use crate::permission::ask::UserDecision;
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{PermissionConfigs, SecurityMode};
+
+    #[tokio::test]
+    async fn symlink_swap_after_permission_check_is_rejected() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let temp = std::env::temp_dir().join(format!(
+            "zerostack_list_dir_toctou_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let checked_target = temp.join("checked");
+        let swapped_target = temp.join("swapped");
+        let link = temp.join("input");
+        std::fs::create_dir_all(&checked_target).unwrap();
+        std::fs::create_dir_all(&swapped_target).unwrap();
+        std::fs::write(checked_target.join("checked.txt"), "checked").unwrap();
+        std::fs::write(swapped_target.join("swapped.txt"), "swapped").unwrap();
+        std::os::unix::fs::symlink(&checked_target, &link).unwrap();
+
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Restrictive,
+            Some(PathBuf::from(&temp)),
+            Some(vec!["restrictive".to_string()]),
+        );
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let tool =
+            ListDirTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None);
+
+        let call = tool.call(ListDirArgs {
+            path: Some(link.to_string_lossy().into_owned()),
+        });
+        let swap = async {
+            let request = ask_rx.recv().await.expect("permission request");
+            assert_eq!(
+                PathBuf::from(&request.input),
+                std::fs::canonicalize(&checked_target).unwrap()
+            );
+            std::fs::remove_dir_all(&checked_target).unwrap();
+            std::os::unix::fs::symlink(&swapped_target, &checked_target).unwrap();
+            request.reply.send(UserDecision::AllowOnce).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(call, swap);
+        let error = result.expect_err("list_dir must reject a swapped permission-checked target");
+        assert!(error.to_string().contains("Path changed"));
+
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }

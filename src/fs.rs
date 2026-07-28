@@ -3,6 +3,70 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::AsyncWriteExt;
 
+fn path_changed_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "Path changed after permission check: {}",
+            path.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    left.volume_serial_number()
+        .zip(left.file_index())
+        .zip(right.volume_serial_number().zip(right.file_index()))
+        .is_some_and(|(left, right)| left == right)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+    false
+}
+
+pub(crate) async fn stable_path_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.file_type().is_symlink() {
+        return Err(path_changed_error(path));
+    }
+    Ok(metadata)
+}
+
+pub(crate) fn ensure_same_file(
+    path: &Path,
+    checked: &std::fs::Metadata,
+    current: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    if same_file_identity(checked, current) {
+        Ok(())
+    } else {
+        Err(path_changed_error(path))
+    }
+}
+
+/// Open a regular path after permission approval and verify that it was not
+/// replaced while the open was in progress.
+pub(crate) async fn open_stable_file(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let before = stable_path_metadata(path).await?;
+    let file = tokio::fs::File::open(path).await?;
+    let opened = file.metadata().await?;
+    let after = stable_path_metadata(path).await?;
+    ensure_same_file(path, &before, &opened)?;
+    ensure_same_file(path, &opened, &after)?;
+    Ok(file)
+}
+
 /// Atomically write `contents` to `path`.
 ///
 /// Writes to a temporary file in the *same directory* as `path`, then renames
@@ -40,7 +104,21 @@ pub async fn atomic_write(
     // link itself intact. A plain rename over a symlink would instead clobber the
     // link with a regular file. A non-symlink path is returned unchanged.
     let resolved = resolve_symlink_target(path.as_ref()).await;
-    let path = resolved.as_path();
+    atomic_write_resolved(resolved, contents).await
+}
+
+/// Atomically write to a path that the caller has already resolved and
+/// permission-checked.
+///
+/// Unlike [`atomic_write`], this function deliberately does not follow a
+/// symlink at `path`. That lets permission-gated callers bind the write to the
+/// path they checked instead of re-resolving an attacker-swappable symlink
+/// between the permission decision and the rename.
+pub(crate) async fn atomic_write_resolved(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
     tracing::debug!(
         "atomic_write: {} ({} bytes)",
         path.display(),
@@ -63,7 +141,11 @@ pub async fn atomic_write(
     // that is out of scope for this threat model. The file is closed at the end
     // of this block (scope exit), before the rename.
     let write_result = async {
-        let mut f = tokio::fs::File::create(&tmp_path).await?;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await?;
         f.write_all(contents.as_ref()).await?;
         f.flush().await?;
         Ok::<(), std::io::Error>(())
@@ -76,7 +158,11 @@ pub async fn atomic_write(
 
     // Preserve the original file's permissions when replacing an existing file.
     // (For brand-new files `metadata` errors out and we keep the default perms.)
-    if let Ok(meta) = tokio::fs::metadata(path).await {
+    // `symlink_metadata` deliberately avoids following a symlink that appeared
+    // after a permission-gated caller resolved the path.
+    if let Ok(meta) = tokio::fs::symlink_metadata(path).await
+        && !meta.file_type().is_symlink()
+    {
         let _ = tokio::fs::set_permissions(&tmp_path, meta.permissions()).await;
     }
 

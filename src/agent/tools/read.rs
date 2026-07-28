@@ -1,4 +1,5 @@
 use rig::tool::Tool;
+use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::{
@@ -65,6 +66,8 @@ impl Tool for ReadTool {
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
         let path = crate::fs::expand_tilde(&args.path);
+        let resolved = tokio::fs::canonicalize(&path).await?;
+        let permission_path = resolved.to_string_lossy();
         let offset = args.offset.unwrap_or(1).saturating_sub(1);
         let limit = args.limit.unwrap_or(self.max_lines as usize);
         tracing::debug!(
@@ -73,14 +76,16 @@ impl Tool for ReadTool {
             offset,
             limit,
         );
-        let coaching = check_perm_path(&self.permission, &self.ask_tx, "read", &path).await?;
+        let coaching =
+            check_perm_path(&self.permission, &self.ask_tx, "read", &permission_path).await?;
+        let mut file = crate::fs::open_stable_file(&resolved).await?;
 
         if let Some(msg) = crate::agent::tools::track_read(&path, offset, limit) {
             tracing::debug!("tool read blocked (repeated): path={}", path);
             return Err(ToolError::Msg(msg));
         }
 
-        let metadata = tokio::fs::metadata(&path).await?;
+        let metadata = file.metadata().await?;
         let file_size = metadata.len();
         if file_size > self.max_text_file_size {
             tracing::warn!(
@@ -94,7 +99,8 @@ impl Tool for ReadTool {
                 file_size, self.max_text_file_size
             )));
         }
-        let content = tokio::fs::read_to_string(&path).await?;
+        let mut content = String::new();
+        file.read_to_string(&mut content).await?;
         let total_lines = content.lines().count();
 
         let (start, end) = read_bounds(offset, limit, total_lines);
@@ -216,5 +222,67 @@ mod tests {
     #[test]
     fn display_start_handles_empty_file() {
         assert_eq!(display_start(0, 0), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_swap_after_permission_check_is_rejected() {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use rig::tool::Tool;
+
+        use super::ReadTool;
+        use crate::agent::tools::ReadArgs;
+        use crate::permission::ask::UserDecision;
+        use crate::permission::checker::PermissionChecker;
+        use crate::permission::{PermissionConfigs, SecurityMode};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let temp = std::env::temp_dir().join(format!(
+            "zerostack_read_toctou_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let checked_target = temp.join("checked.txt");
+        let swapped_target = temp.join("swapped.txt");
+        let link = temp.join("input.txt");
+        std::fs::write(&checked_target, "checked contents\n").unwrap();
+        std::fs::write(&swapped_target, "swapped contents\n").unwrap();
+        std::os::unix::fs::symlink(&checked_target, &link).unwrap();
+
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Restrictive,
+            Some(PathBuf::from(&temp)),
+            Some(vec!["restrictive".to_string()]),
+        );
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ReadTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None, 100);
+
+        let call = tool.call(ReadArgs {
+            path: link.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+        });
+        let swap = async {
+            let request = ask_rx.recv().await.expect("permission request");
+            assert_eq!(
+                PathBuf::from(&request.input),
+                std::fs::canonicalize(&checked_target).unwrap()
+            );
+            std::fs::remove_file(&checked_target).unwrap();
+            std::os::unix::fs::symlink(&swapped_target, &checked_target).unwrap();
+            request.reply.send(UserDecision::AllowOnce).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(call, swap);
+        let error = result.expect_err("read must reject a swapped permission-checked target");
+        assert!(error.to_string().contains("Path changed"));
+
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }
