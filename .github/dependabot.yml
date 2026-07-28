@@ -8,9 +8,12 @@ updates:
     commit-message:
       prefix: ci
     groups:
-      actions:
+      actions-minor-and-patch:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: cargo
     directory: /
@@ -20,6 +23,9 @@ updates:
     commit-message:
       prefix: build
     groups:
-      cargo:
+      cargo-minor-and-patch:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch

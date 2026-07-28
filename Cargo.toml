@@ -2,6 +2,11 @@
 members = [".", "spike"]
 resolver = "2"
 
+[workspace.metadata.dependency-policy]
+cargo-audit-version = "0.22.1"
+cargo-deny-version = "0.19.4"
+max-exception-days = 90
+
 [package]
 name = "mini-agent"
 version = "1.7.2"

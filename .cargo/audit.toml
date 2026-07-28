@@ -1,0 +1,20 @@
+[advisories]
+# Fail on vulnerabilities rated medium or higher. Advisories without a CVSS
+# score remain reportable and are handled by the deny policy below.
+severity-threshold = "medium"
+informational_warnings = ["unmaintained", "unsound", "notice"]
+ignore = []
+
+[database]
+fetch = true
+stale = false
+
+[output]
+# Unsound dependencies and yanked releases are release blockers.
+# Transitive unmaintained notices remain visible warnings; cargo-deny rejects
+# unmaintained direct workspace dependencies.
+deny = ["unsound", "yanked"]
+
+[yanked]
+enabled = true
+update_index = true

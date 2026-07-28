@@ -1,0 +1,20 @@
+# Every temporary dependency-policy exception is recorded here and projected
+# into .cargo/audit.toml or deny.toml. CI rejects missing, orphaned, malformed,
+# overlong, and expired entries.
+version = 1
+exceptions = []
+
+# Example only:
+#
+# [[exceptions]]
+# kind = "advisory" # advisory | license | source
+# id = "RUSTSEC-YYYY-NNNN"
+# crate = "crate-name@1.2.3"
+# owner = "@github-handle"
+# rationale = "Why the affected code path cannot be reached and the removal plan."
+# created = "2026-07-29"
+# expires = "2026-08-28"
+#
+# License exceptions use an SPDX identifier in id and an exact crate spec.
+# Source exceptions use the exact URL in id and add source-kind = "git" or
+# "registry"; the matching URL must also appear in deny.toml.
