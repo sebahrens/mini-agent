@@ -1,5 +1,7 @@
 use std::collections::HashSet;
-use std::process::{ExitStatus, Output, Stdio};
+use std::process::{ExitStatus, Stdio};
+#[cfg(test)]
+use std::process::Output;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -246,6 +248,7 @@ impl Sandbox {
         cmd
     }
 
+    #[cfg(test)]
     pub async fn output_command(&self, command: &str) -> std::io::Result<Output> {
         let output = self
             .output_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
@@ -387,9 +390,7 @@ impl Sandbox {
             && let Ok(error) = reader_error_rx.try_recv()
         {
             command_status = match error {
-                CommandRunError::OutputLimit(limit) => {
-                    CommandStatus::OutputLimitExceeded(limit)
-                }
+                CommandRunError::OutputLimit(limit) => CommandStatus::OutputLimitExceeded(limit),
                 CommandRunError::Read(error) => {
                     tracing::warn!("sandbox: failed to consume command output: {error}");
                     CommandStatus::Failed
@@ -532,10 +533,11 @@ where
                     return;
                 }
             };
-            let result = captured
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(stream, &buffer[..read], limits);
+            let result = captured.lock().unwrap_or_else(|e| e.into_inner()).push(
+                stream,
+                &buffer[..read],
+                limits,
+            );
             if let Err(limit) = result {
                 let _ = error_tx.send(CommandRunError::OutputLimit(limit));
                 return;

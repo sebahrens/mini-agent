@@ -267,10 +267,7 @@ mod tests {
             .to_string();
         assert!(error.contains("[status: timed_out; timeout_ms: 200]"));
 
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
         wait_for_process_exit(pid).await;
         let _ = std::fs::remove_file(pid_file);
     }
@@ -295,10 +292,7 @@ mod tests {
                 .await
         });
         wait_for_file(&pid_file).await;
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
 
         handle.abort();
         let _ = handle.await;
@@ -310,10 +304,7 @@ mod tests {
     async fn bash_resource_limits_stdout_only_is_bounded() {
         let limits = test_limits();
         let output = Sandbox::new(false, "bwrap")
-            .output_command_with_limits(
-                "while :; do printf '0123456789abcdef'; done",
-                limits,
-            )
+            .output_command_with_limits("while :; do printf '0123456789abcdef'; done", limits)
             .await
             .unwrap();
 
@@ -329,10 +320,7 @@ mod tests {
     async fn bash_resource_limits_stderr_only_is_bounded() {
         let limits = test_limits();
         let output = Sandbox::new(false, "bwrap")
-            .output_command_with_limits(
-                "while :; do printf '0123456789abcdef' >&2; done",
-                limits,
-            )
+            .output_command_with_limits("while :; do printf '0123456789abcdef' >&2; done", limits)
             .await
             .unwrap();
 
