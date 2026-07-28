@@ -205,10 +205,9 @@ async fn atomic_write_security_rejects_destination_directory_without_residue() {
 async fn atomic_write_security_does_not_touch_precreated_predictable_temp_name() {
     let dir = TempDir::new("precreated_temp");
     let target = dir.join("target.txt");
-    let predictable = dir.join(format!(
-        ".target.txt.zswrite.{}.0.tmp",
-        std::process::id()
-    ));
+    let predictable = dir
+        .path()
+        .join(format!(".target.txt.zswrite.{}.0.tmp", std::process::id()));
     std::fs::write(&predictable, b"attacker-owned").unwrap();
 
     atomic_write(&target, b"complete").await.unwrap();
@@ -237,10 +236,7 @@ fn atomic_write_security_injected_failures_preserve_prior_file_and_clean_temp() 
             )
             .is_err()
         );
-        assert_eq!(
-            std::fs::read(&target).unwrap(),
-            b"prior complete contents"
-        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"prior complete contents");
         assert_eq!(temp_residue(dir.path()), 0);
     }
 }

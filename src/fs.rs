@@ -371,6 +371,7 @@ const OPEN_CREATE: std::os::raw::c_int = 0x200;
 const OPEN_EXCLUSIVE: std::os::raw::c_int = 0x800;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments, unsafe_code)]
 fn atomic_write_platform(
     canonical_root: &Path,
     relative_parent: &Path,
@@ -493,7 +494,10 @@ fn atomic_write_platform(
         Ok(directory)
     }
 
-    fn inspect_target(directory: &File, name: &OsStr) -> std::io::Result<Option<std::fs::Metadata>> {
+    fn inspect_target(
+        directory: &File,
+        name: &OsStr,
+    ) -> std::io::Result<Option<std::fs::Metadata>> {
         match open_at(directory, name, OPEN_NOFOLLOW | OPEN_CLOEXEC, 0) {
             Ok(file) => {
                 let metadata = file.metadata()?;
@@ -522,14 +526,15 @@ fn atomic_write_platform(
         }
     }
 
-    fn unlink_owned_temp(
-        directory: &File,
-        name: &CString,
-        identity: &std::fs::Metadata,
-    ) {
-        let still_ours = open_at(directory, OsStr::from_bytes(name.as_bytes()), OPEN_NOFOLLOW, 0)
-            .and_then(|file| file.metadata())
-            .is_ok_and(|metadata| same_file_identity(identity, &metadata));
+    fn unlink_owned_temp(directory: &File, name: &CString, identity: &std::fs::Metadata) {
+        let still_ours = open_at(
+            directory,
+            OsStr::from_bytes(name.as_bytes()),
+            OPEN_NOFOLLOW,
+            0,
+        )
+        .and_then(|file| file.metadata())
+        .is_ok_and(|metadata| same_file_identity(identity, &metadata));
         if still_ours {
             // SAFETY: both the directory descriptor and C string are valid.
             let _ = unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
@@ -602,11 +607,8 @@ fn atomic_write_platform(
     let (temp_name, mut temp, temp_identity) = {
         let mut result = None;
         for _ in 0..128 {
-            let candidate = CString::new(format!(
-                ".zswrite.{}.tmp",
-                uuid::Uuid::new_v4().simple()
-            ))
-            .expect("UUID temp name never contains NUL");
+            let candidate = CString::new(format!(".zswrite.{}.tmp", uuid::Uuid::new_v4().simple()))
+                .expect("UUID temp name never contains NUL");
             match open_at(
                 &directory,
                 OsStr::from_bytes(candidate.as_bytes()),
@@ -732,6 +734,7 @@ fn atomic_write_platform(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
 fn atomic_write_platform(
     canonical_root: &Path,
     relative_parent: &Path,
