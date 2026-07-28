@@ -98,13 +98,7 @@ impl Tool for GrepTool {
         let traversal_root = tokio::fs::canonicalize(&search_path).await?;
         let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
         let permission_path = traversal_root.to_string_lossy();
-        let _ = check_perm_path(
-            &self.permission,
-            &self.ask_tx,
-            "grep",
-            &permission_path,
-        )
-        .await?;
+        let _ = check_perm_path(&self.permission, &self.ask_tx, "grep", &permission_path).await?;
         let traversal_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
         crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &traversal_metadata)?;
         let context = args.context_lines.unwrap_or(0);
@@ -417,10 +411,7 @@ mod tests {
                 .expect("grep did not request path permission")
                 .expect("grep permission channel closed");
             assert_eq!(request.tool.as_str(), "grep");
-            assert_eq!(
-                PathBuf::from(request.input.as_str()),
-                canonical_external
-            );
+            assert_eq!(PathBuf::from(request.input.as_str()), canonical_external);
             request
                 .reply
                 .send(UserDecision::Deny)
@@ -632,10 +623,7 @@ mod tests {
         });
         let swap = async {
             let request = ask_rx.recv().await.expect("permission request");
-            assert_eq!(
-                PathBuf::from(request.input.as_str()),
-                canonical_authorized
-            );
+            assert_eq!(PathBuf::from(request.input.as_str()), canonical_authorized);
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&swapped, &link).unwrap();
             request.reply.send(UserDecision::AllowOnce).unwrap();
@@ -671,10 +659,7 @@ mod tests {
         });
         let replace = async {
             let request = ask_rx.recv().await.expect("permission request");
-            assert_eq!(
-                PathBuf::from(request.input.as_str()),
-                canonical_authorized
-            );
+            assert_eq!(PathBuf::from(request.input.as_str()), canonical_authorized);
             std::fs::rename(&authorized, &moved).unwrap();
             std::os::unix::fs::symlink(&swapped, &authorized).unwrap();
             request.reply.send(UserDecision::AllowOnce).unwrap();

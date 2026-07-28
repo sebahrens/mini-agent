@@ -38,6 +38,5 @@ pub mod status_signals;
 pub mod lsp;
 
 pub(crate) mod truncate;
-
 #[cfg(feature = "js")]
 pub mod js;

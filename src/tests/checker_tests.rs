@@ -552,10 +552,7 @@ fn grep_external_path_permission_pattern_allow_does_not_authorize_root() {
     } else {
         "/outside/secret.txt"
     };
-    assert_eq!(
-        checker.check_path("grep", external),
-        CheckResult::Ask
-    );
+    assert_eq!(checker.check_path("grep", external), CheckResult::Ask);
 }
 
 #[test]
