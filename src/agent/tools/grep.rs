@@ -31,6 +31,10 @@ impl GrepTool {
                 '{' => re.push_str("(?:"),
                 '}' => re.push(')'),
                 ',' => re.push('|'),
+                '(' | ')' | '[' | ']' | '+' | '^' | '$' | '|' | '\\' => {
+                    re.push('\\');
+                    re.push(c);
+                }
                 _ => re.push(c),
             }
         }
@@ -348,6 +352,25 @@ mod tests {
             Some(working_dir.to_path_buf()),
             Some(vec!["standard".to_string()]),
         )))
+    }
+
+    #[test]
+    fn glob_to_regex_escapes_literal_regex_metacharacters() {
+        for (glob, literal_match, regex_only_match) in [
+            ("test(1).rs", "test(1).rs", "test1.rs"),
+            ("file[1].js", "file[1].js", "file1.js"),
+            ("prefix+.js", "prefix+.js", "prefixx.js"),
+            ("cash^$|\\.txt", "cash^$|\\.txt", "cash.txt"),
+        ] {
+            let pattern = format!("^(?:{})$", GrepTool::glob_to_regex(glob));
+            let regex = Regex::new(&pattern).expect("glob must produce a valid regex");
+
+            assert!(regex.is_match(literal_match), "{glob:?} must match literally");
+            assert!(
+                !regex.is_match(regex_only_match),
+                "{glob:?} must not treat literal characters as regex syntax"
+            );
+        }
     }
 
     async fn call_answering_path_permission(
