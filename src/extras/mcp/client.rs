@@ -169,7 +169,11 @@ fn parse_mcp_server_url(value: &str) -> anyhow::Result<(String, u16, Option<IpAd
 
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("MCP server URL must include a host"))?
+        .ok_or_else(|| anyhow::anyhow!("MCP server URL must include a host"))?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
         .to_owned();
     if host.eq_ignore_ascii_case("localhost")
         || host
