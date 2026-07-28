@@ -117,6 +117,13 @@ CODEX_VERIFY="${CODEX_VERIFY:-false}"  # Set to true or pass --codex-verify to e
 # Override with AGENT_TIMEOUT_SECS=0 to disable.
 AGENT_TIMEOUT_SECS="${AGENT_TIMEOUT_SECS:-3600}"
 
+# Codex exec support. CODEX_HOME is a workspace-local copy of ~/.codex so
+# codex exec can find auth without touching the global home.
+# HARD_TIMEOUT is the wall-clock kill-switch for codex exec (separate from
+# AGENT_TIMEOUT_SECS which governs the claude stream watchdog).
+CODEX_HOME="${CODEX_HOME:-}"
+HARD_TIMEOUT="${HARD_TIMEOUT:-$AGENT_TIMEOUT_SECS}"
+
 # Stuck-loop detector state (mutated inside run_iteration as globals).
 # Reset on successful iteration; incremented on the agent-failure path.
 # When the same PICKED_ID fails STUCK_LOOP_THRESHOLD iterations in a row,
@@ -175,6 +182,10 @@ for i in "${!args[@]}"; do
         bugs|security|perf|orphans|missing|quality|arch|deps|compound|debate|synthesis|all)
             ;; # captured by review case
         --codex-verify) CODEX_VERIFY=true ;;
+        --model)
+            next="${args[$((i+1))]:-}"
+            [ -n "$next" ] && AGENT_MODEL="$next"
+            ;;
         *)
             # Strict integer match — "10foo" must not be accepted as 10.
             if [[ "$arg" =~ ^[0-9]+$ ]]; then
@@ -184,6 +195,19 @@ for i in "${!args[@]}"; do
             ;;
     esac
 done
+
+# Build --model flag array for claude invocations (empty when not set)
+AGENT_MODEL_ARGS=()
+[ -n "${AGENT_MODEL:-}" ] && AGENT_MODEL_ARGS=(--model "$AGENT_MODEL")
+
+# Executor auto-detection: non-claude model IDs (o3, o4-mini, gpt-4o, etc.)
+# route through codex exec; claude-* models and the default stay with the
+# claude CLI stream-json path.
+if [ -n "${AGENT_MODEL:-}" ] && [[ ! "$AGENT_MODEL" =~ ^claude- ]]; then
+    AGENT_EXECUTOR="codex"
+else
+    AGENT_EXECUTOR="claude"
+fi
 
 # Review defaults to 1 iteration per domain
 if [ "$MODE" = "review" ] && [ "$USER_SET_ITERATIONS" = false ]; then
@@ -211,6 +235,105 @@ CURRENT_DOMAIN=""
 USE_BEADS=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOTAL_REVIEW_FINDINGS=0
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Codex Exec Support                                              ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+# Claude -> Codex CLI mapping:
+#   claude -p                          -> codex exec -
+#   --dangerously-skip-permissions     -> --dangerously-bypass-approvals-and-sandbox
+#   --output-format stream-json        -> -o "$temp_out" (file) + process exit status
+#   cd "$dir" && claude ...            -> codex exec -C "$dir" ...
+#   env -u ANTHROPIC_API_KEY           -> n/a; codex reads ~/.codex/auth.json
+
+setup_codex_home() {
+    local source_home="$HOME/.codex"
+
+    if ! command -v codex >/dev/null 2>&1; then
+        echo -e "${RED}Error: codex CLI not installed (required for non-claude models)${NC}" >&2
+        exit 1
+    fi
+
+    if [ -z "$CODEX_HOME" ]; then
+        CODEX_HOME="$PWD/.codex"
+    fi
+    export CODEX_HOME
+    mkdir -p "$CODEX_HOME/sessions"
+
+    if [ ! -f "$CODEX_HOME/.gitignore" ]; then
+        printf '*\n!.gitignore\n' > "$CODEX_HOME/.gitignore"
+    fi
+
+    if [ -d "$source_home" ] && [ "$CODEX_HOME" != "$source_home" ]; then
+        local f
+        for f in auth.json config.toml AGENTS.md version.json installation_id; do
+            [ -f "$source_home/$f" ] && [ ! -e "$CODEX_HOME/$f" ] && \
+                cp "$source_home/$f" "$CODEX_HOME/$f" 2>/dev/null || true
+        done
+        local d
+        for d in skills prompts rules; do
+            [ -d "$source_home/$d" ] && [ ! -e "$CODEX_HOME/$d" ] && \
+                { ln -s "$source_home/$d" "$CODEX_HOME/$d" 2>/dev/null || \
+                  cp -R "$source_home/$d" "$CODEX_HOME/$d" 2>/dev/null || true; }
+        done
+    fi
+}
+
+# run_with_codex_exec <prompt_content> <temp_out> [model]
+# Writes agent output to temp_out; returns codex exit code.
+run_with_codex_exec() {
+    local prompt_content="$1"
+    local temp_out="$2"
+    local model="${3:-}"
+    local err_log="${temp_out}.err"
+    local run_log="${temp_out}.log"
+
+    > "$temp_out"; > "$err_log"; > "$run_log"
+    mkdir -p "$CODEX_HOME/sessions"
+
+    local -a codex_cmd=(
+        codex exec
+        --dangerously-bypass-approvals-and-sandbox
+        --skip-git-repo-check
+        --ephemeral
+        -C "$PWD"
+        -o "$temp_out"
+    )
+    [ -n "$model" ] && codex_cmd+=(--model "$model")
+    codex_cmd+=(-)
+
+    local codex_pid watchdog_pid run_exit=0
+    echo "$prompt_content" | "${codex_cmd[@]}" >"$run_log" 2>"$err_log" &
+    codex_pid=$!
+    ( sleep "$HARD_TIMEOUT"; kill "$codex_pid" 2>/dev/null ) &
+    watchdog_pid=$!
+
+    wait "$codex_pid" 2>/dev/null || run_exit=$?
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+
+    if [ -s "$temp_out" ]; then
+        head -c 2000 "$temp_out"
+        echo ""
+    fi
+
+    if [ "$run_exit" -eq 0 ]; then
+        rm -f "$err_log" "$run_log"
+        return 0
+    fi
+
+    [ -s "$err_log" ] && { echo "  stderr:"; head -5 "$err_log" | sed 's/^/    /'; }
+    [ -s "$run_log" ] && { echo "  stdout:"; head -5 "$run_log" | sed 's/^/    /'; }
+    if [ "$run_exit" -eq 143 ] || [ "$run_exit" -eq 137 ]; then
+        echo "  (codex exec timed out after ${HARD_TIMEOUT}s)"
+    else
+        echo "  (codex exec exited $run_exit)"
+    fi
+
+    rm -f "$err_log" "$run_log"
+    return "$run_exit"
+}
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Helper Functions                                                ║
@@ -900,9 +1023,16 @@ Work on bead \`${PICKED_ID}\`. Run \`bd show ${PICKED_ID}\` to read the details,
         agent_prefix=("$TIMEOUT_BIN" "--kill-after=30" "$AGENT_TIMEOUT_SECS")
     fi
 
-    if [ "$AGENT_CMD" = "claude" ]; then
+    if [ "$AGENT_EXECUTOR" = "codex" ]; then
+        local codex_out
+        codex_out=$(mktemp)
+        if ! run_with_codex_exec "$prompt_content" "$codex_out" "${AGENT_MODEL:-}"; then
+            agent_ok=false
+        fi
+        rm -f "$codex_out"
+    elif [ "$AGENT_CMD" = "claude" ]; then
         if ! { echo "$prompt_content" \
-                | { env -u ANTHROPIC_API_KEY "${agent_prefix[@]}" $AGENT_CMD --dangerously-skip-permissions --verbose --output-format stream-json -p - \
+                | { env -u ANTHROPIC_API_KEY "${agent_prefix[@]}" $AGENT_CMD --dangerously-skip-permissions --verbose --output-format stream-json "${AGENT_MODEL_ARGS[@]}" -p - \
                     || true; } \
                 | show_agent_progress; }; then
             agent_ok=false
@@ -1190,9 +1320,16 @@ race to deeper layers; the next round's fresh context will pick that up.
 
         echo -e "${BLUE}Running decomposition agent (round ${round})...${NC}"
         local agent_ok=true
-        if [ "$AGENT_CMD" = "claude" ]; then
+        if [ "$AGENT_EXECUTOR" = "codex" ]; then
+            local codex_out
+            codex_out=$(mktemp)
+            if ! run_with_codex_exec "$prompt_content" "$codex_out" "${AGENT_MODEL:-}"; then
+                agent_ok=false
+            fi
+            rm -f "$codex_out"
+        elif [ "$AGENT_CMD" = "claude" ]; then
             if ! { echo "$prompt_content" \
-                    | { env -u ANTHROPIC_API_KEY $AGENT_CMD --dangerously-skip-permissions --verbose --output-format stream-json -p - \
+                    | { env -u ANTHROPIC_API_KEY $AGENT_CMD --dangerously-skip-permissions --verbose --output-format stream-json "${AGENT_MODEL_ARGS[@]}" -p - \
                         || true; } \
                     | show_agent_progress; }; then
                 agent_ok=false
@@ -1336,7 +1473,13 @@ else
     echo -e "  Mode:       ${GREEN}$MODE${NC}"
 fi
 echo -e "  Max iters:  ${YELLOW}$MAX_ITERATIONS${NC}"
-echo -e "  Agent:      ${BLUE}$AGENT_CMD${NC}"
+if [ "$AGENT_EXECUTOR" = "codex" ]; then
+    echo -e "  Executor:   ${BLUE}codex exec${NC} (model: ${AGENT_MODEL})"
+elif [ -n "${AGENT_MODEL:-}" ]; then
+    echo -e "  Executor:   ${BLUE}$AGENT_CMD${NC} (model: ${AGENT_MODEL})"
+else
+    echo -e "  Executor:   ${BLUE}$AGENT_CMD${NC}"
+fi
 echo -e "  Project:    ${CYAN}mini-agent (minimalistic coding agent with built-in JS engine)${NC}"
 
 # Require beads
@@ -1347,6 +1490,9 @@ else
     echo -e "\n${RED}Error: 'bd' (beads) is required.${NC}"
     exit 1
 fi
+
+# Init codex home only when codex executor is selected
+[ "$AGENT_EXECUTOR" = "codex" ] && setup_codex_home
 
 # Pre-flight: refuse to start with a dirty working tree. Otherwise the first
 # iteration's commit sweeps up unrelated pre-existing changes as "loop work".
