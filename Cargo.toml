@@ -23,6 +23,7 @@ mcp = [
     "rmcp?/transport-child-process",
     "rmcp?/transport-streamable-http-client-reqwest",
     "rmcp?/auth",
+    "rmcp?/which-command",
 ]
 acp = ["dep:agent-client-protocol", "dep:blocking"]
 memory = []

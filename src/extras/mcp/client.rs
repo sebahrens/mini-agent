@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use compact_str::CompactString;
 use rmcp::service::{RoleClient, RunningService, serve_client};
-use rmcp::transport::child_process::TokioChildProcess;
+use rmcp::transport::{child_process::TokioChildProcess, which_command};
 use tokio::process::Command;
 
 use super::config::McpServerConfig;
@@ -25,11 +25,7 @@ impl McpClientHandle {
                     args,
                     env.len(),
                 );
-                let mut cmd = Command::new(command);
-                cmd.args(args);
-                for (k, v) in env {
-                    cmd.env(k, v);
-                }
+                let cmd = stdio_command(command, args, env)?;
                 let transport = TokioChildProcess::new(cmd)?;
                 let running_service = serve_client((), transport).await.map_err(|e| {
                     anyhow::anyhow!("MCP connection failed for '{server_name}': {e}")
@@ -90,6 +86,16 @@ impl McpClientHandle {
     }
 }
 
+fn stdio_command(
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> std::io::Result<Command> {
+    let mut command = which_command(command)?;
+    command.args(args).envs(env);
+    Ok(command)
+}
+
 fn parse_headers(
     headers: &HashMap<String, String>,
 ) -> anyhow::Result<HashMap<http::HeaderName, http::HeaderValue>> {
@@ -104,4 +110,18 @@ fn parse_headers(
         result.insert(h_name, h_value);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::stdio_command;
+
+    #[test]
+    fn stdio_command_resolves_path_lookup_before_spawn() {
+        let command = stdio_command("rustc", &[], &HashMap::new()).unwrap();
+
+        assert!(std::path::Path::new(command.as_std().get_program()).is_absolute());
+    }
 }

@@ -719,10 +719,18 @@ permission-regex:
     "^rm ": deny
 ```
 
-When compiled with MCP support, `mcp_servers` accepts command-based and URL-based
-servers. Servers can also be added per project via `.zerostack/config.toml`
-(see *Project-local override* above); project servers merge with — and can
-override — global ones by name.
+When compiled with MCP support, `mcp_servers` accepts local stdio and remote
+URL-based servers. A local stdio entry launches `command` directly, passes
+`args` without shell parsing, extends the inherited process environment with
+`env`, and speaks MCP over the child process's stdin/stdout. `command` may be
+an executable available on `PATH` or an absolute executable path; zerostack
+resolves platform shims such as Windows `.cmd`/`.exe` launchers before spawn.
+The server must reserve stdout for MCP protocol messages and write diagnostics
+to stderr.
+
+Servers can also be added per project via `.zerostack/config.toml` (see
+*Project-local override* above); project servers merge with — and can override
+— global ones by name.
 
 ```json
 {

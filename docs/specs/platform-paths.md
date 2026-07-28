@@ -175,6 +175,11 @@ direct the model to configured MCP tools, but cannot create trusted MCP identiti
 must compile and have production-wiring tests. Skill retrieval must neither remove MCP tools from
 the agent nor duplicate MCP credentials into skill manifests, telemetry, or archives.
 
+Locally installed MCP servers remain first-class command/stdio transports. The configured command
+is resolved from `PATH` or accepted as an absolute executable path using platform-aware executable
+resolution, then launched directly with explicit arguments and environment additions. There is no
+implicit shell. The child's stdin/stdout carry MCP protocol traffic and stderr carries diagnostics.
+
 ---
 
 ## Filesystem and credential safety
