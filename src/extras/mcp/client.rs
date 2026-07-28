@@ -5,10 +5,11 @@ use rmcp::service::{RoleClient, RunningService, serve_client};
 use rmcp::transport::{child_process::TokioChildProcess, which_command};
 use tokio::process::Command;
 
-use super::config::McpServerConfig;
+use super::config::{McpServerConfig, TrustedMcpServer};
 
 pub struct McpClientHandle {
     pub server_name: CompactString,
+    pub trusted_identity: Option<TrustedMcpServer>,
     pub running_service: RunningService<RoleClient, ()>,
 }
 
@@ -32,6 +33,7 @@ impl McpClientHandle {
                 })?;
                 Ok(Self {
                     server_name,
+                    trusted_identity: config.trusted_identity(),
                     running_service,
                 })
             }
@@ -71,6 +73,29 @@ impl McpClientHandle {
                 };
                 Ok(Self {
                     server_name,
+                    trusted_identity: config.trusted_identity(),
+                    running_service,
+                })
+            }
+            McpServerConfig::BuiltIn { identity, headers } => {
+                let url = identity.endpoint();
+                tracing::debug!(
+                    "MCP built-in HTTP transport: {} ({} headers)",
+                    url,
+                    headers.len(),
+                );
+                let custom_headers = parse_headers(headers)?;
+                let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url)
+                    .custom_headers(custom_headers);
+                type HttpClient =
+                    rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
+                let transport = HttpClient::from_config(cfg);
+                let running_service = serve_client((), transport).await.map_err(|e| {
+                    anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
+                })?;
+                Ok(Self {
+                    server_name,
+                    trusted_identity: config.trusted_identity(),
                     running_service,
                 })
             }

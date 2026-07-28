@@ -465,6 +465,9 @@ fn resolve_oauth_server(
         McpServerConfig::Command { .. } => Err(format!(
             "server '{name}' is command-based; OAuth applies to URL servers"
         )),
+        McpServerConfig::BuiltIn { .. } => Err(format!(
+            "server '{name}' is a built-in server without OAuth"
+        )),
     }
 }
 

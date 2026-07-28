@@ -83,6 +83,8 @@ use serde::Deserialize;
 
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 use crate::permission::checker::{CheckResult, PermCheck};
+#[cfg(feature = "mcp")]
+use crate::extras::mcp::config::TrustedMcpServer;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -222,6 +224,39 @@ pub async fn check_perm(
                 ));
             };
             handle_ask_inner(tx, perm, tool, input_key).await?;
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) async fn check_mcp_perm(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    input_key: &str,
+    trusted_identity: Option<TrustedMcpServer>,
+    mcp_tool_name: &str,
+) -> Result<Option<String>, ToolError> {
+    let Some(perm) = permission else {
+        return Ok(None);
+    };
+    let result = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        guard.check_mcp(input_key, trusted_identity, mcp_tool_name)
+    };
+    match result {
+        CheckResult::Allowed => Ok(None),
+        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
+        CheckResult::Denied(reason) => {
+            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
+        }
+        CheckResult::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(
+                    "Permission denied (non-interactive mode)".to_string(),
+                ));
+            };
+            handle_ask_inner(tx, perm, "mcp_tool", input_key).await?;
             Ok(None)
         }
     }

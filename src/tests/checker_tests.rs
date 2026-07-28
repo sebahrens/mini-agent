@@ -1354,95 +1354,99 @@ fn guarded_mcp_tool_asks_when_no_rule() {
     ));
 }
 
-// --- Read-equivalent MCP tools allowed in ReadOnly / PlanWrite ---
+// --- Trusted built-in MCP read-only exemptions ---
 
+#[cfg(feature = "mcp")]
 #[test]
-fn readonly_allows_exa_mcp_tools() {
+fn mcp_read_only_exemption_allows_only_exact_trusted_pairs() {
+    use std::collections::HashMap;
+
+    use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
+
     let mut checker = make_checker(SecurityMode::ReadOnly);
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Exa Web Search:websearch"),
-        CheckResult::Allowed,
-    ));
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Exa Web Search:webfetch"),
-        CheckResult::Allowed,
-    ));
+    for (registration, server_name, tool_names) in [
+        (
+            McpServerConfig::built_in(TrustedMcpServer::EXA, HashMap::new()),
+            "Exa Web Search",
+            &["websearch", "webfetch"][..],
+        ),
+        (
+            McpServerConfig::built_in(TrustedMcpServer::CONTEXT7, HashMap::new()),
+            "Context7",
+            &["get_context", "search_docs"][..],
+        ),
+        (
+            McpServerConfig::built_in(TrustedMcpServer::GREP_APP, HashMap::new()),
+            "Grep.app",
+            &["search_code", "search_repos"][..],
+        ),
+    ] {
+        for tool_name in tool_names {
+            let input = format!("mcp_tool:{server_name}:{tool_name}");
+            assert!(matches!(
+                checker.check_mcp(&input, registration.trusted_identity(), tool_name),
+                CheckResult::Allowed,
+            ));
+        }
+    }
 }
 
+#[cfg(feature = "mcp")]
 #[test]
-fn planwrite_allows_exa_mcp_tools() {
+fn mcp_read_only_exemption_rejects_spoofed_server_names() {
+    use crate::extras::mcp::config::McpServerConfig;
+
+    let custom: McpServerConfig =
+        serde_json::from_str(r#"{"url":"https://mcp.context7.com/mcp"}"#).unwrap();
+    let untrusted_identity = custom.trusted_identity();
+    let mut checker = make_checker(SecurityMode::ReadOnly);
+    for server_name in [
+        "Context7",
+        "context7",
+        "Context7/resolve-library-id",
+        "Context7-extra",
+        "prefix-Context7",
+    ] {
+        let input = format!("mcp_tool:{server_name}:get_context");
+        assert!(matches!(
+            checker.check_mcp(&input, untrusted_identity, "get_context"),
+            CheckResult::Denied(_),
+        ));
+    }
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_read_only_exemption_rejects_unknown_and_variant_tool_names() {
+    use crate::extras::mcp::config::TrustedMcpServer;
+
+    let mut checker = make_checker(SecurityMode::ReadOnly);
+    for tool_name in [
+        "GET_CONTEXT",
+        "get_context_extra",
+        "resolve-library-id",
+        "unknown_tool",
+    ] {
+        let input = format!("mcp_tool:Context7:{tool_name}");
+        assert!(matches!(
+            checker.check_mcp(&input, Some(TrustedMcpServer::CONTEXT7), tool_name),
+            CheckResult::Denied(_),
+        ));
+    }
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_read_only_exemption_applies_in_planwrite() {
+    use crate::extras::mcp::config::TrustedMcpServer;
+
     let mut checker = make_checker(SecurityMode::PlanWrite);
     assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Exa Web Search:websearch"),
-        CheckResult::Allowed,
-    ));
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Exa Web Search:webfetch"),
-        CheckResult::Allowed,
-    ));
-}
-
-#[test]
-fn readonly_allows_context7_mcp_tools() {
-    let mut checker = make_checker(SecurityMode::ReadOnly);
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Context7:get_context"),
-        CheckResult::Allowed,
-    ));
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Context7:search_docs"),
-        CheckResult::Allowed,
-    ));
-}
-
-#[test]
-fn planwrite_allows_context7_mcp_tools() {
-    let mut checker = make_checker(SecurityMode::PlanWrite);
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Context7:get_context"),
-        CheckResult::Allowed,
-    ));
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Context7:search_docs"),
-        CheckResult::Allowed,
-    ));
-}
-
-#[test]
-fn readonly_allows_grepapp_mcp_tools() {
-    let mut checker = make_checker(SecurityMode::ReadOnly);
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Grep.app:search_code"),
-        CheckResult::Allowed,
-    ));
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Grep.app:search_repos"),
-        CheckResult::Allowed,
-    ));
-}
-
-#[test]
-fn planwrite_allows_grepapp_mcp_tools() {
-    let mut checker = make_checker(SecurityMode::PlanWrite);
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Grep.app:search_code"),
-        CheckResult::Allowed,
-    ));
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Grep.app:search_repos"),
-        CheckResult::Allowed,
-    ));
-}
-
-#[test]
-fn readonly_case_insensitive_mcp_prefix_match() {
-    let mut checker = make_checker(SecurityMode::ReadOnly);
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:exa web search:websearch"),
-        CheckResult::Allowed,
-    ));
-    assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:CONTEXT7:some_tool"),
+        checker.check_mcp(
+            "mcp_tool:Context7:get_context",
+            Some(TrustedMcpServer::CONTEXT7),
+            "get_context",
+        ),
         CheckResult::Allowed,
     ));
 }

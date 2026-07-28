@@ -809,6 +809,16 @@ listed API key environment variable when that variable is set):
 Set `enable-exa-mcp = false` to disable the Exa default without touching
 `mcp_servers`. Set `"mcp_servers": {}` to disable all MCP auto-configuration.
 
+In `readonly` and `planwrite` modes, approval-free MCP access is limited to
+immutable built-in registrations and these exact read-only tool names:
+Exa `websearch` and `webfetch`; Context7 `get_context` and `search_docs`; and
+Grep.app `search_code` and `search_repos`. They are exempt because they only
+retrieve public web, documentation, or source-search results. The exemption is
+bound to zerostack's built-in registration identity, not the configured server
+name or URL. Custom servers—including servers using the same name or
+endpoint—follow normal MCP permission rules, and any unlisted tool on a
+built-in server does too.
+
 ## ACP (Agent Communication Protocol) configuration
 
 When compiled with the `acp` feature, zerostack can act as an ACP agent server.

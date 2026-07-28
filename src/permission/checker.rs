@@ -6,6 +6,8 @@ use smallvec::SmallVec;
 
 use crate::permission::pattern::Pattern;
 use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+#[cfg(feature = "mcp")]
+use crate::extras::mcp::config::TrustedMcpServer;
 
 pub type PermCheck = Arc<Mutex<PermissionChecker>>;
 
@@ -361,6 +363,22 @@ impl PermissionChecker {
     }
 
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
+        self.check_inner(tool, input, false)
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn check_mcp(
+        &mut self,
+        input: &str,
+        trusted_identity: Option<TrustedMcpServer>,
+        mcp_tool_name: &str,
+    ) -> CheckResult {
+        let read_only_exempt = trusted_identity
+            .is_some_and(|identity| identity.exempts_read_only_tool(mcp_tool_name));
+        self.check_inner("mcp_tool", input, read_only_exempt)
+    }
+
+    fn check_inner(&mut self, tool: &str, input: &str, mcp_read_only_exempt: bool) -> CheckResult {
         tracing::debug!("perm check: tool={}, input_len={}", tool, input.len());
         if tool == "todo_write" {
             return CheckResult::Allowed;
@@ -382,7 +400,7 @@ impl PermissionChecker {
         }
         if tool == "mcp_tool"
             && matches!(self.mode, SecurityMode::ReadOnly | SecurityMode::PlanWrite)
-            && is_read_equivalent_mcp(input)
+            && mcp_read_only_exempt
         {
             return CheckResult::Allowed;
         }
@@ -604,11 +622,4 @@ fn is_plan_file(path: &str) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| name.starts_with("PLAN") && name.ends_with(".md"))
-}
-
-fn is_read_equivalent_mcp(input: &str) -> bool {
-    let lower = input.to_lowercase();
-    lower.starts_with("mcp_tool:exa web search:")
-        || lower.starts_with("mcp_tool:context7:")
-        || lower.starts_with("mcp_tool:grep.app:")
 }

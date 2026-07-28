@@ -535,3 +535,43 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
         Some(McpServerConfig::Command { .. })
     ));
 }
+
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_read_only_exemption_trust_is_not_deserialized_or_inferred_from_endpoint() {
+    use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
+
+    let custom: McpServerConfig = serde_json::from_str(
+        r#"{"url":"https://mcp.context7.com/mcp","headers":{}}"#,
+    )
+    .unwrap();
+    assert_eq!(custom.trusted_identity(), None);
+
+    let built_in =
+        McpServerConfig::built_in(TrustedMcpServer::CONTEXT7, HashMap::new());
+    assert_eq!(
+        built_in.trusted_identity(),
+        Some(TrustedMcpServer::CONTEXT7)
+    );
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_read_only_exemption_custom_named_like_builtin_stays_untrusted() {
+    use crate::extras::mcp::config::McpServerConfig;
+
+    let custom: McpServerConfig =
+        serde_json::from_str(r#"{"url":"https://custom.example.com/mcp"}"#).unwrap();
+    let mut cfg = Config {
+        enable_exa_mcp: Some(false),
+        enable_context7_mcp: Some(true),
+        enable_grepapp_mcp: Some(false),
+        mcp_servers: Some(HashMap::from([("Context7".to_string(), custom)])),
+        ..Config::default()
+    };
+
+    crate::config::inject_mcp_defaults(&mut cfg);
+
+    let context7 = cfg.mcp_servers.unwrap().remove("Context7").unwrap();
+    assert_eq!(context7.trusted_identity(), None);
+}

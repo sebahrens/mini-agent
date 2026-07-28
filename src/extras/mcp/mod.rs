@@ -56,12 +56,14 @@ impl McpClientManager {
         for handle in &self.handles {
             let peer = handle.peer();
             let server_name = handle.server_name.clone();
+            let trusted_identity = handle.trusted_identity;
             match handle.list_tools().await {
                 Ok(tools) => {
                     tracing::debug!("MCP server '{}': {} tools listed", server_name, tools.len(),);
                     for definition in tools {
                         all_tools.push(McpTool {
                             server_name: server_name.clone(),
+                            trusted_identity,
                             definition,
                             peer: peer.clone(),
                             permission: permission.clone(),

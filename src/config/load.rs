@@ -9,7 +9,7 @@ use crate::config::{
     Config, EditSystem, QuickModelConfig, StatusLineConfig, StatusLineLine, StatusLineSegment,
 };
 #[cfg(feature = "mcp")]
-use crate::extras::mcp::config::McpServerConfig;
+use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
 use crate::paths::AppPaths;
 use crate::session::storage;
 
@@ -476,11 +476,7 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
         }
         servers
             .entry("Exa Web Search".to_string())
-            .or_insert(McpServerConfig::Url {
-                url: "https://mcp.exa.ai/mcp".to_string(),
-                headers,
-                oauth: None,
-            });
+            .or_insert_with(|| McpServerConfig::built_in(TrustedMcpServer::EXA, headers));
     } else {
         servers.remove("Exa Web Search");
     }
@@ -492,11 +488,7 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
         }
         servers
             .entry("Context7".to_string())
-            .or_insert(McpServerConfig::Url {
-                url: "https://mcp.context7.com/mcp".to_string(),
-                headers,
-                oauth: None,
-            });
+            .or_insert_with(|| McpServerConfig::built_in(TrustedMcpServer::CONTEXT7, headers));
     } else {
         servers.remove("Context7");
     }
@@ -508,11 +500,7 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
         }
         servers
             .entry("Grep.app".to_string())
-            .or_insert(McpServerConfig::Url {
-                url: "https://mcp.grep.app".to_string(),
-                headers,
-                oauth: None,
-            });
+            .or_insert_with(|| McpServerConfig::built_in(TrustedMcpServer::GREP_APP, headers));
     } else {
         servers.remove("Grep.app");
     }

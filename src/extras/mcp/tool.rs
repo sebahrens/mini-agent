@@ -7,7 +7,8 @@ use rig::wasm_compat::WasmBoxedFuture;
 use rmcp::model::{CallToolRequestParams, ContentBlock, JsonObject};
 use rmcp::service::{Peer, RoleClient};
 
-use crate::agent::tools::check_perm;
+use crate::agent::tools::check_mcp_perm;
+use crate::extras::mcp::config::TrustedMcpServer;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 
@@ -24,6 +25,7 @@ impl std::error::Error for McpToolError {}
 
 pub struct McpTool {
     pub server_name: CompactString,
+    pub trusted_identity: Option<TrustedMcpServer>,
     pub definition: rmcp::model::Tool,
     pub peer: Peer<RoleClient>,
     pub permission: Option<PermCheck>,
@@ -49,6 +51,7 @@ impl ToolDyn for McpTool {
 
     fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, ToolError>> {
         let server_name = self.server_name.clone();
+        let trusted_identity = self.trusted_identity;
         let tool_name = self.definition.name.to_string();
         let peer = self.peer.clone();
         let permission = self.permission.clone();
@@ -56,7 +59,13 @@ impl ToolDyn for McpTool {
 
         Box::pin(async move {
             let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
-            let coaching = check_perm(&permission, &ask_tx, "mcp_tool", &perm_key)
+            let coaching = check_mcp_perm(
+                &permission,
+                &ask_tx,
+                &perm_key,
+                trusted_identity,
+                &tool_name,
+            )
                 .await
                 .map_err(|e| {
                     ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(
