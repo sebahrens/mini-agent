@@ -49,6 +49,10 @@ pub struct AdvisorToolConfig {
 static CONFIG: Mutex<Option<AdvisorToolConfig>> = Mutex::new(None);
 static SESSION_MESSAGES: Mutex<Vec<SessionMessage>> = Mutex::new(Vec::new());
 
+#[derive(Debug, thiserror::Error)]
+#[error("advisor config not initialized")]
+pub struct ConfigNotInitialized;
+
 pub fn init_config(cfg: AdvisorToolConfig) {
     tracing::debug!(
         "advisor init: model={}, enabled={}, max_uses={:?}, human_handoff={}",
@@ -60,13 +64,13 @@ pub fn init_config(cfg: AdvisorToolConfig) {
     *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
 }
 
-pub fn with_config<F, R>(f: F) -> R
+pub fn with_config<F, R>(f: F) -> Result<R, ConfigNotInitialized>
 where
     F: FnOnce(&AdvisorToolConfig) -> R,
 {
     let guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
-    let cfg = guard.as_ref().expect("advisor config not initialized");
-    f(cfg)
+    let cfg = guard.as_ref().ok_or(ConfigNotInitialized)?;
+    Ok(f(cfg))
 }
 
 pub fn update_client(client: AnyClient) {
@@ -151,7 +155,8 @@ conversation, so focus your question on the specific decision you need help with
 
         tracing::debug!("advisor call: question_len={}", args.question.len());
 
-        let cfg = with_config(|c| c.clone());
+        let cfg =
+            with_config(|c| c.clone()).map_err(|e| ToolError::Msg(e.to_string()))?;
 
         if let Some(max) = cfg.max_uses {
             self.uses
@@ -211,7 +216,7 @@ async fn run_advisor_completion(
     question: &str,
     messages: &[SessionMessage],
 ) -> anyhow::Result<String> {
-    let kilobytes_limit = with_config(|c| c.kilobytes_limit);
+    let kilobytes_limit = with_config(|c| c.kilobytes_limit)?;
     let conversation = format_conversation(messages, kilobytes_limit);
     let prompt = format!(
         "## Conversation\n\n{}\n\n## Assistant's question\n\n{}",
@@ -354,5 +359,20 @@ where
         Ok("[Advisor returned empty response]".to_string())
     } else {
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_config_without_init_returns_error() {
+        let previous = CONFIG.lock().unwrap_or_else(|e| e.into_inner()).take();
+
+        let result = with_config(|_| ());
+
+        *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = previous;
+        assert!(matches!(result, Err(ConfigNotInitialized)));
     }
 }

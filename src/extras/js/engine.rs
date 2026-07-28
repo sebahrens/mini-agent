@@ -10,8 +10,8 @@ use crate::sandbox::Sandbox;
 fn exception_details(
     exception: Option<&rquickjs::Exception<'_>>,
 ) -> Result<(String, String), JsOutcome> {
-    let exception = exception
-        .ok_or_else(|| JsOutcome::Error("Failed to extract exception".to_string()))?;
+    let exception =
+        exception.ok_or_else(|| JsOutcome::Error("Failed to extract exception".to_string()))?;
     Ok((
         exception.message().unwrap_or_default(),
         exception.stack().unwrap_or_default(),

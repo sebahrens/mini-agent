@@ -55,7 +55,7 @@ async fn handle_reasoning(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Re
 async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     use crate::extras::advisor;
 
-    let current = advisor::with_config(|c| c.clone());
+    let current = advisor::with_config(|c| c.clone())?;
 
     if parts.len() < 2 {
         write_ok(ctx.renderer, "advisor:");
