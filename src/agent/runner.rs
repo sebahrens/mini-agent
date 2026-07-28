@@ -58,13 +58,30 @@ fn attributed_tool_result(
     };
 
     let mut output = String::new();
+    let mut text_content_count = 0usize;
+    let mut non_text_content_count = 0usize;
     for content in tool_result.content.iter() {
-        if let ToolResultContent::Text(text) = content {
-            if !output.is_empty() {
-                output.push('\n');
+        match content {
+            ToolResultContent::Text(text) => {
+                text_content_count += 1;
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&text.text);
             }
-            output.push_str(&text.text);
+            ToolResultContent::Image(_) => non_text_content_count += 1,
         }
+    }
+
+    if text_content_count == 0 {
+        tracing::warn!(
+            tool_result_id = %tool_result.id,
+            non_text_content_count,
+            "agent tool result contained no text content; using a visible fallback"
+        );
+        output.push_str(
+            "[Tool result contained non-text content that cannot be displayed as text.]",
+        );
     }
 
     Some((CompactString::new(tool_name), output))
@@ -743,22 +760,17 @@ where
                     else {
                         continue;
                     };
-                    if pure_stdout {
-                        if !output.is_empty() {
-                            println!("◈ {} result:", name);
-                            let lines: Vec<&str> = output.lines().collect();
-                            if lines.len() > 40 {
-                                let truncated: Vec<&str> = lines.iter().take(40).copied().collect();
-                                println!("{}", truncated.join("\n"));
-                                println!(
-                                    "(truncated {} more lines)",
-                                    lines.len().saturating_sub(40)
-                                );
-                            } else {
-                                println!("{}", output);
-                            }
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                    if pure_stdout && !output.is_empty() {
+                        println!("◈ {} result:", name);
+                        let lines: Vec<&str> = output.lines().collect();
+                        if lines.len() > 40 {
+                            let truncated: Vec<&str> = lines.iter().take(40).copied().collect();
+                            println!("{}", truncated.join("\n"));
+                            println!("(truncated {} more lines)", lines.len().saturating_sub(40));
+                        } else {
+                            println!("{}", output);
                         }
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                     #[cfg(feature = "hooks")]
                     tool_interactions.push(tool_result.clone().into());
@@ -986,13 +998,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{attributed_tool_result, streamed_reasoning_text};
+    use rig::OneOrMany;
     use rig::agent::AgentBuilder;
     use rig::completion::Usage;
-    use rig::message::{Text, ToolResult, ToolResultContent};
+    use rig::message::{Image, Text, ToolResult, ToolResultContent};
     use rig::streaming::StreamedAssistantContent;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
     use rig::tool::Tool;
-    use rig::OneOrMany;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1244,6 +1256,25 @@ mod tests {
         let mut last_tool_name = None;
 
         assert!(attributed_tool_result(&mut last_tool_name, &tool_result).is_none());
+    }
+
+    #[test]
+    fn non_text_tool_result_has_visible_fallback_output() {
+        let tool_result = ToolResult {
+            id: "image-result".to_string(),
+            call_id: None,
+            content: OneOrMany::one(ToolResultContent::Image(Image::default())),
+        };
+        let mut last_tool_name = Some("image_tool".to_string());
+
+        let (tool_name, output) = attributed_tool_result(&mut last_tool_name, &tool_result)
+            .expect("a result with a preceding tool call must be attributed");
+
+        assert_eq!(tool_name, "image_tool");
+        assert_eq!(
+            output,
+            "[Tool result contained non-text content that cannot be displayed as text.]"
+        );
     }
 
     #[test]
