@@ -142,7 +142,9 @@ fn run_step(source: &str) -> StepOutcome {
 /// items get for free.
 fn js_shell<'js>(ctx: Ctx<'js>, cmd: String) -> rquickjs::Result<Object<'js>> {
     #[cfg(windows)]
-    let output = std::process::Command::new("cmd").args(["/C", &cmd]).output();
+    let output = std::process::Command::new("cmd")
+        .args(["/C", &cmd])
+        .output();
     #[cfg(not(windows))]
     let output = std::process::Command::new("sh").args(["-c", &cmd]).output();
 
@@ -151,8 +153,14 @@ fn js_shell<'js>(ctx: Ctx<'js>, cmd: String) -> rquickjs::Result<Object<'js>> {
 
     let obj = Object::new(ctx.clone())?;
     obj.set("code", output.status.code().unwrap_or(-1))?;
-    obj.set("stdout", String::from_utf8_lossy(&output.stdout).into_owned())?;
-    obj.set("stderr", String::from_utf8_lossy(&output.stderr).into_owned())?;
+    obj.set(
+        "stdout",
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )?;
+    obj.set(
+        "stderr",
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )?;
     Ok(obj)
 }
 

@@ -1,10 +1,6 @@
 use std::sync::mpsc;
 
-use crate::extras::js::{
-    engine::js_thread_main,
-    tool::JsTool,
-    types::THREAD_STACK,
-};
+use crate::extras::js::{engine::js_thread_main, tool::JsTool, types::THREAD_STACK};
 use crate::sandbox::Sandbox;
 
 fn make_test_tool() -> JsTool {

@@ -68,12 +68,8 @@ impl Tool for JsTool {
             JsOutcome::Value(v) => Ok(v),
             JsOutcome::Void => Ok(String::new()),
             JsOutcome::Error(e) => Ok(format!("JS error:\n{e}")),
-            JsOutcome::Timeout => {
-                Ok("JS error: execution timed out (30s limit exceeded)".into())
-            }
-            JsOutcome::OomKilled => {
-                Ok("JS error: out of memory (64 MiB limit exceeded)".into())
-            }
+            JsOutcome::Timeout => Ok("JS error: execution timed out (30s limit exceeded)".into()),
+            JsOutcome::OomKilled => Ok("JS error: out of memory (64 MiB limit exceeded)".into()),
         }
     }
 }

@@ -33,34 +33,32 @@ pub(crate) fn run_step(code: &str, sandbox: &Sandbox) -> JsOutcome {
 
     register_host_globals(&ctx, sandbox.clone());
 
-    let result = ctx.with(|ctx| {
-        match ctx.eval::<Value, _>(code) {
-            Err(rquickjs::Error::Exception) => {
-                let exc = ctx.catch();
-                let exc = exc.as_exception().expect("exception type");
-                let msg = exc.message().unwrap_or_default();
-                let stack = exc.stack().unwrap_or_default();
-                if msg.contains("interrupted") || Instant::now() >= deadline {
-                    JsOutcome::Timeout
-                } else {
-                    JsOutcome::Error(format!("{msg}\n{stack}"))
-                }
+    let result = ctx.with(|ctx| match ctx.eval::<Value, _>(code) {
+        Err(rquickjs::Error::Exception) => {
+            let exc = ctx.catch();
+            let exc = exc.as_exception().expect("exception type");
+            let msg = exc.message().unwrap_or_default();
+            let stack = exc.stack().unwrap_or_default();
+            if msg.contains("interrupted") || Instant::now() >= deadline {
+                JsOutcome::Timeout
+            } else {
+                JsOutcome::Error(format!("{msg}\n{stack}"))
             }
-            Err(e) => JsOutcome::Error(e.to_string()),
-            Ok(v) => {
-                if v.is_undefined() || v.is_null() {
-                    JsOutcome::Void
-                } else if let Some(s) = v.as_string() {
-                    JsOutcome::Value(s.to_string().unwrap_or_default())
-                } else if let Some(n) = v.as_int() {
-                    JsOutcome::Value(n.to_string())
-                } else if let Some(f) = v.as_float() {
-                    JsOutcome::Value(f.to_string())
-                } else if let Some(b) = v.as_bool() {
-                    JsOutcome::Value(b.to_string())
-                } else {
-                    JsOutcome::Value(format!("{v:?}"))
-                }
+        }
+        Err(e) => JsOutcome::Error(e.to_string()),
+        Ok(v) => {
+            if v.is_undefined() || v.is_null() {
+                JsOutcome::Void
+            } else if let Some(s) = v.as_string() {
+                JsOutcome::Value(s.to_string().unwrap_or_default())
+            } else if let Some(n) = v.as_int() {
+                JsOutcome::Value(n.to_string())
+            } else if let Some(f) = v.as_float() {
+                JsOutcome::Value(f.to_string())
+            } else if let Some(b) = v.as_bool() {
+                JsOutcome::Value(b.to_string())
+            } else {
+                JsOutcome::Value(format!("{v:?}"))
             }
         }
     });

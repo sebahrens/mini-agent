@@ -1,4 +1,4 @@
-use rquickjs::{prelude::Func, Context, Ctx, IntoJs, Object, Value};
+use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
 
 use crate::extras::js::types::SpawnResult;
 use crate::sandbox::Sandbox;
@@ -18,9 +18,7 @@ pub fn make_read_file() -> impl Fn(String) -> rquickjs::Result<String> {
 }
 
 pub fn make_write_file() -> impl Fn(String, String) -> rquickjs::Result<()> {
-    move |path: String, content: String| {
-        std::fs::write(&path, content).map_err(rquickjs::Error::Io)
-    }
+    move |path: String, content: String| std::fs::write(&path, content).map_err(rquickjs::Error::Io)
 }
 
 pub fn make_spawn(

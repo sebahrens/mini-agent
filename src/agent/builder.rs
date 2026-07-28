@@ -332,6 +332,26 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             all_tools.push(Box::new(tools::lsp::LspTool::new(lsp.clone())));
         }
 
+        #[cfg(feature = "js")]
+        {
+            use crate::extras::js::{
+                engine::js_thread_main,
+                tool::JsTool,
+                types::{JsRequest, THREAD_STACK},
+            };
+            let (js_tx, js_rx) = std::sync::mpsc::channel::<JsRequest>();
+            std::thread::Builder::new()
+                .name("js-engine".into())
+                .stack_size(THREAD_STACK)
+                .spawn(move || js_thread_main(js_rx, sandbox))
+                .expect("failed to spawn JS thread");
+            all_tools.push(Box::new(JsTool::new(
+                js_tx,
+                permission.clone(),
+                ask_tx.clone(),
+            )));
+        }
+
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
 
         #[cfg(feature = "hooks")]
