@@ -79,9 +79,8 @@ fn attributed_tool_result(
             non_text_content_count,
             "agent tool result contained no text content; using a visible fallback"
         );
-        output.push_str(
-            "[Tool result contained non-text content that cannot be displayed as text.]",
-        );
+        output
+            .push_str("[Tool result contained non-text content that cannot be displayed as text.]");
     }
 
     Some((CompactString::new(tool_name), output))
@@ -320,7 +319,7 @@ async fn continue_prompt_injector<M>(
     agent: &Agent<M>,
     retry_prompt: &str,
     retry_history: &[Message],
-    tool_interactions: &[Message],
+    new_tool_interactions: &[Message],
     retry_config: &RetryConfig,
     max_turns: usize,
 ) -> StreamingResult<M::StreamingResponse>
@@ -329,7 +328,7 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
     let mut new_history = retry_history.to_vec();
-    new_history.extend_from_slice(tool_interactions);
+    new_history.extend_from_slice(new_tool_interactions);
     new_history.push(Message::user(retry_prompt.to_string()));
     new_history.push(Message::assistant(String::new()));
     match retry::retry_stream_chat(retry_config, || {
@@ -346,6 +345,15 @@ where
         Ok(stream) => stream,
         Err(e) => Box::pin(futures::stream::once(async move { Err(e) })),
     }
+}
+
+fn take_new_tool_interactions(tool_interactions: &mut Vec<Message>) -> Vec<Message> {
+    let new_tool_interactions = std::mem::take(tool_interactions);
+    tracing::debug!(
+        "agent injecting continue prompt, new_tool_interactions={}",
+        new_tool_interactions.len(),
+    );
+    new_tool_interactions
 }
 
 /// Builds the forked context for a `/btw` side question: the committed
@@ -608,10 +616,6 @@ where
                 }
             }
 
-            tracing::debug!(
-                "agent injecting continue prompt, tool_interactions={}",
-                tool_interactions.len(),
-            );
             let remaining_turns = max_turns.saturating_sub(turns_used);
             if remaining_turns == 0 {
                 tracing::warn!(
@@ -640,11 +644,12 @@ where
             let injected_prompt = next_instruction
                 .take()
                 .unwrap_or_else(|| retry_prompt.clone());
+            let new_tool_interactions = take_new_tool_interactions(&mut tool_interactions);
             stream = continue_prompt_injector(
                 &agent,
                 &injected_prompt,
                 &retry_history,
-                &tool_interactions,
+                &new_tool_interactions,
                 &retry_config,
                 remaining_turns,
             )
@@ -841,6 +846,7 @@ where
             let injected_prompt = next_instruction
                 .take()
                 .unwrap_or_else(|| prompt.to_string());
+            let new_tool_interactions = take_new_tool_interactions(&mut tool_interactions);
             // Keep the text already streamed to stdout this turn: the caller
             // persists the returned string as the assistant message, so
             // clearing it here would drop turn-1 output the user already saw
@@ -849,7 +855,7 @@ where
                 agent,
                 &injected_prompt,
                 &retry_history,
-                &tool_interactions,
+                &new_tool_interactions,
                 retry_config,
                 remaining_turns,
             )
@@ -1000,8 +1006,8 @@ mod tests {
     use super::{attributed_tool_result, streamed_reasoning_text};
     use rig::OneOrMany;
     use rig::agent::AgentBuilder;
-    use rig::completion::Usage;
-    use rig::message::{Image, Text, ToolResult, ToolResultContent};
+    use rig::completion::{Message, Usage};
+    use rig::message::{AssistantContent, Image, Text, ToolResult, ToolResultContent};
     use rig::streaming::StreamedAssistantContent;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
     use rig::tool::Tool;
@@ -1189,6 +1195,84 @@ mod tests {
             calls.load(Ordering::SeqCst),
             3,
             "only tool calls within the original budget may execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuations_include_only_tool_interactions_since_the_previous_injection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "tool-first",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![
+                MockStreamEvent::tool_call(
+                    "tool-second",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls))
+            .default_max_turns(5)
+            .build();
+
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        while let Some(event) = runner.event_rx.recv().await {
+            if matches!(
+                event,
+                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error(_)
+            ) {
+                break;
+            }
+        }
+
+        let requests = model.requests();
+        let request_tool_call_ids = |request_index: usize| {
+            requests[request_index]
+                .chat_history
+                .iter()
+                .flat_map(|message| match message {
+                    Message::Assistant { content, .. } => content
+                        .iter()
+                        .filter_map(|content| match content {
+                            AssistantContent::ToolCall(tool_call) => {
+                                Some(tool_call.id.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(requests.len(), 5);
+        assert_eq!(request_tool_call_ids(2), ["tool-first"]);
+        assert_eq!(
+            request_tool_call_ids(4),
+            ["tool-second"],
+            "the second continuation must not replay interactions sent in the first"
         );
     }
 
