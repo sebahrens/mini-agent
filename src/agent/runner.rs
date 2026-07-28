@@ -509,11 +509,11 @@ where
                                     .await;
                             }
                             StreamedAssistantContent::Unknown(value) => {
-                                warn_unknown_stream_item(
-                                    &MultiTurnStreamItem::<M::StreamingResponse>::StreamAssistantItem(
-                                        StreamedAssistantContent::Unknown(value),
-                                    ),
-                                );
+                                warn_unknown_stream_item(&MultiTurnStreamItem::<
+                                    M::StreamingResponse,
+                                >::StreamAssistantItem(
+                                    StreamedAssistantContent::Unknown(value),
+                                ));
                             }
                             StreamedAssistantContent::ToolCallDelta { .. }
                             | StreamedAssistantContent::Reasoning(_)
@@ -1108,7 +1108,10 @@ mod tests {
 
         impl Write for BufferWriter {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("log buffer lock").extend_from_slice(bytes);
+                self.0
+                    .lock()
+                    .expect("log buffer lock")
+                    .extend_from_slice(bytes);
                 Ok(bytes.len())
             }
 
