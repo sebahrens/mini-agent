@@ -42,8 +42,7 @@ pub(crate) fn pick_existing(dir: &Path) -> PathBuf {
 }
 
 fn resolve_config_path() -> PathBuf {
-    let paths =
-        crate::paths::process_paths().expect("startup must initialize application paths");
+    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     pick_existing(&paths.config_dir)
 }
 
@@ -307,7 +306,10 @@ fn rich_default_config() -> Config {
 
 pub fn load_with_paths(paths: &AppPaths) -> (Config, bool) {
     let local_config_path = paths.project_config_file();
-    load_from_path(pick_existing(&paths.config_dir), local_config_path.as_deref())
+    load_from_path(
+        pick_existing(&paths.config_dir),
+        local_config_path.as_deref(),
+    )
 }
 
 fn load_from_path(path: PathBuf, local_config_path: Option<&Path>) -> (Config, bool) {

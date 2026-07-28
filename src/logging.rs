@@ -160,9 +160,7 @@ fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<
     } else {
         0x2_0000
     };
-    if prepare_parent
-        && let Some(parent) = path.parent()
-    {
+    if prepare_parent && let Some(parent) = path.parent() {
         ensure_private_log_directory(parent)?;
     }
     let file = fs::OpenOptions::new()
@@ -181,9 +179,7 @@ fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    if prepare_parent
-        && let Some(parent) = path.parent()
-    {
+    if prepare_parent && let Some(parent) = path.parent() {
         ensure_private_log_directory(parent)?;
     }
     fs::OpenOptions::new()
@@ -196,9 +192,7 @@ fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<
 
 #[cfg(not(any(unix, windows)))]
 fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<fs::File> {
-    if prepare_parent
-        && let Some(parent) = path.parent()
-    {
+    if prepare_parent && let Some(parent) = path.parent() {
         ensure_private_log_directory(parent)?;
     }
     fs::OpenOptions::new()

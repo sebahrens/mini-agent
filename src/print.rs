@@ -54,8 +54,7 @@ pub(crate) fn print_sessions() {
 }
 
 pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) {
-    let paths =
-        crate::paths::process_paths().expect("startup must initialize application paths");
+    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     let config_dir = paths.config_dir.clone();
     let data_dir = paths.data_dir.clone();
     let sessions_dir = paths.sessions_dir();

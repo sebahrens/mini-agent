@@ -25,6 +25,7 @@ fn disabled(artifact: &'static str) -> bool {
     crate::paths::artifact_disabled(artifact)
 }
 
+#[cfg(test)]
 pub(crate) fn config_path() -> PathBuf {
     app_paths().config_dir
 }

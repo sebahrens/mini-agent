@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 // These shared path-policy primitives are exercised by the acceptance suite
 // before all of their production consumers land.
@@ -100,6 +100,7 @@ pub enum AppPathError {
     RelativeBase { root: AppPathRoot, value: PathBuf },
     #[error("application paths were already initialized with different roots")]
     AlreadyInitialized,
+    #[cfg_attr(test, allow(dead_code))]
     #[error("application paths have not been initialized")]
     NotInitialized,
 }
@@ -277,6 +278,7 @@ impl AppPaths {
         })
     }
 
+    #[allow(dead_code)]
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
     }
@@ -294,6 +296,7 @@ impl AppPaths {
         self.config_dir.join("agent").join("ARCHITECTURE.md")
     }
 
+    #[allow(dead_code)]
     pub fn global_hook_settings_file(&self) -> PathBuf {
         self.config_dir.join("settings.json")
     }
@@ -310,12 +313,14 @@ impl AppPaths {
             .map(|directory| directory.join("prompts"))
     }
 
+    #[allow(dead_code)]
     pub fn project_agent_skills_dir(&self) -> Option<PathBuf> {
         self.project_dir
             .as_ref()
             .map(|directory| directory.join("skills"))
     }
 
+    #[allow(dead_code)]
     pub fn project_hook_settings_file(&self) -> Option<PathBuf> {
         self.project_dir
             .as_ref()
@@ -338,6 +343,7 @@ impl AppPaths {
         self.data_dir.join("memory")
     }
 
+    #[allow(dead_code)]
     pub fn portable_agent_skills_dir(&self) -> PathBuf {
         self.data_dir.join("skills")
     }
@@ -350,14 +356,17 @@ impl AppPaths {
         self.learned_skills_dir().join("skills.db")
     }
 
+    #[allow(dead_code)]
     pub fn embedding_models_dir(&self) -> PathBuf {
         self.cache_dir.join("models")
     }
 
+    #[allow(dead_code)]
     pub fn learned_skills_cache_dir(&self) -> PathBuf {
         self.cache_dir.join("skills")
     }
 
+    #[allow(dead_code)]
     pub fn import_staging_dir(&self) -> PathBuf {
         self.cache_dir.join("import-staging")
     }
@@ -374,6 +383,7 @@ impl AppPaths {
         self.state_dir.join("loops")
     }
 
+    #[allow(dead_code)]
     pub fn turn_telemetry_dir(&self) -> PathBuf {
         self.state_dir.join("telemetry")
     }
@@ -398,6 +408,7 @@ impl AppPaths {
         self.state_dir.join("hooks").join("trusted-hooks.json")
     }
 
+    #[allow(dead_code)]
     pub fn mcp_oauth_dir(&self) -> PathBuf {
         self.credentials_dir.join("mcp-oauth")
     }
@@ -435,7 +446,7 @@ pub fn process_paths() -> Result<AppPaths, AppPathError> {
     }
     #[cfg(test)]
     {
-        return AppPaths::from_process(std::env::current_dir().ok());
+        AppPaths::from_process(std::env::current_dir().ok())
     }
     #[cfg(not(test))]
     {
@@ -559,11 +570,7 @@ pub fn migrate_legacy_path(
     request: &LegacyMigrationRequest,
 ) -> Result<LegacyMigrationStatus, LegacyMigrationError> {
     if path_exists_no_follow(&request.canonical, request.artifact, request.kind)? {
-        if !path_exists_no_follow(
-            &request.marker,
-            request.artifact,
-            LegacyArtifactKind::File,
-        )? {
+        if !path_exists_no_follow(&request.marker, request.artifact, LegacyArtifactKind::File)? {
             let canonical_identity = content_identity(&request.canonical).map_err(|source| {
                 LegacyMigrationError::Io {
                     artifact: request.artifact,
@@ -589,8 +596,7 @@ pub fn migrate_legacy_path(
         return Ok(LegacyMigrationStatus::CanonicalPresent);
     }
 
-    let mut candidates =
-        existing_candidates(&request.candidates, request.artifact, request.kind)?;
+    let mut candidates = existing_candidates(&request.candidates, request.artifact, request.kind)?;
     if candidates.is_empty() {
         return Ok(LegacyMigrationStatus::NoLegacyContent);
     }
@@ -609,9 +615,7 @@ pub fn migrate_legacy_path(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let all_identical = identities
-        .windows(2)
-        .all(|pair| pair[0].1 == pair[1].1);
+    let all_identical = identities.windows(2).all(|pair| pair[0].1 == pair[1].1);
 
     let source = if let Some(selected) = request.selected.as_ref() {
         identities
@@ -649,12 +653,7 @@ pub fn migrate_legacy_path(
             path: source.clone(),
             source: source_error,
         })?;
-    copy_verified(
-        &source,
-        &request.canonical,
-        request.artifact,
-        request.kind,
-    )?;
+    copy_verified(&source, &request.canonical, request.artifact, request.kind)?;
     let canonical_identity =
         content_identity(&request.canonical).map_err(|source_error| LegacyMigrationError::Io {
             artifact: request.artifact,
@@ -728,12 +727,7 @@ pub fn converge_legacy_artifacts(
 
     let legacy_data_roots = documented_legacy_data_roots(paths);
     let legacy_config_roots = documented_legacy_config_roots(paths);
-    let optional: Vec<(
-        &'static str,
-        PathBuf,
-        Vec<PathBuf>,
-        LegacyArtifactKind,
-    )> = vec![
+    let optional: Vec<(&'static str, PathBuf, Vec<PathBuf>, LegacyArtifactKind)> = vec![
         (
             "sessions",
             paths.sessions_dir(),
@@ -820,11 +814,12 @@ pub fn converge_legacy_artifacts(
             paths.learned_skills_db(),
             legacy_config_roots
                 .iter()
-                .flat_map(|root| {
-                    [root.join("skills.db"), root.join("agent").join("skills.db")]
-                })
+                .flat_map(|root| [root.join("skills.db"), root.join("agent").join("skills.db")])
                 .chain(legacy_data_roots.iter().flat_map(|root| {
-                    [root.join("skills.db"), root.join("skills").join("skills.db")]
+                    [
+                        root.join("skills.db"),
+                        root.join("skills").join("skills.db"),
+                    ]
                 }))
                 .collect(),
             LegacyArtifactKind::File,
@@ -885,15 +880,10 @@ fn converge_legacy_config(
     let candidates = legacy_roots
         .iter()
         .flat_map(|root| {
-            ["config.toml", "config.yaml", "config.yml", "config.json"]
-                .map(|name| root.join(name))
+            ["config.toml", "config.yaml", "config.yml", "config.json"].map(|name| root.join(name))
         })
         .collect::<Vec<_>>();
-    let existing = existing_candidates(
-        &candidates,
-        "configuration",
-        LegacyArtifactKind::File,
-    )?;
+    let existing = existing_candidates(&candidates, "configuration", LegacyArtifactKind::File)?;
     let canonical_name = existing
         .first()
         .and_then(|path| path.file_name())
@@ -902,9 +892,7 @@ fn converge_legacy_config(
         artifact: "configuration",
         canonical: paths.config_dir.join(canonical_name),
         candidates,
-        marker: paths
-            .migration_markers_dir()
-            .join("configuration.json"),
+        marker: paths.migration_markers_dir().join("configuration.json"),
         requirement: LegacyArtifactRequirement::Required,
         kind: LegacyArtifactKind::File,
         selected: None,
@@ -1076,8 +1064,7 @@ fn content_identity(path: &Path) -> io::Result<String> {
             }
         } else if metadata.is_dir() {
             hasher.update([1]);
-            let mut entries = std::fs::read_dir(path)?
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
             entries.sort_by_key(|entry| entry.file_name());
             for entry in entries {
                 update(hasher, root, &entry.path())?;
@@ -1118,13 +1105,12 @@ fn copy_verified(
     artifact: &'static str,
     kind: LegacyArtifactKind,
 ) -> Result<(), LegacyMigrationError> {
-    let metadata = std::fs::symlink_metadata(source).map_err(|source_error| {
-        LegacyMigrationError::Io {
+    let metadata =
+        std::fs::symlink_metadata(source).map_err(|source_error| LegacyMigrationError::Io {
             artifact,
             path: source.to_path_buf(),
             source: source_error,
-        }
-    })?;
+        })?;
     if matches!(kind, LegacyArtifactKind::File) && metadata.is_file() {
         let mut input =
             open_regular_no_follow(source).map_err(|source_error| LegacyMigrationError::Io {
@@ -1149,9 +1135,7 @@ fn copy_verified(
         }
         match crate::fs::atomic_create_sync(canonical, &bytes) {
             Ok(()) => Ok(()),
-            Err(_) if existing_content_is_identical(source, canonical) => {
-                Ok(())
-            }
+            Err(_) if existing_content_is_identical(source, canonical) => Ok(()),
             Err(source_error) => Err(LegacyMigrationError::Io {
                 artifact,
                 path: canonical.to_path_buf(),
@@ -1298,9 +1282,7 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 fn create_private_dir(path: &Path) -> io::Result<()> {
     reject_link_components(path)?;
     match std::fs::symlink_metadata(path) {
-        Ok(metadata)
-            if portable::is_link_or_reparse(&metadata) || !metadata.is_dir() =>
-        {
+        Ok(metadata) if portable::is_link_or_reparse(&metadata) || !metadata.is_dir() => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "migration directory must be a real directory",
@@ -1856,16 +1838,8 @@ mod tests {
                 .portable_agent_skills_dir()
                 .starts_with(&paths.data_dir)
         );
-        assert!(
-            paths
-                .learned_skills_db()
-                .starts_with(&paths.local_data_dir)
-        );
-        assert!(
-            paths
-                .embedding_models_dir()
-                .starts_with(&paths.cache_dir)
-        );
+        assert!(paths.learned_skills_db().starts_with(&paths.local_data_dir));
+        assert!(paths.embedding_models_dir().starts_with(&paths.cache_dir));
         assert!(
             paths
                 .learned_skills_cache_dir()
@@ -1878,11 +1852,7 @@ mod tests {
         assert!(paths.chat_history_file().starts_with(&paths.state_dir));
         assert!(paths.hook_trust_file().starts_with(&paths.state_dir));
         assert!(paths.mcp_oauth_dir().starts_with(&paths.credentials_dir));
-        assert!(
-            paths
-                .credentials_dir
-                .starts_with(root.join("credentials"))
-        );
+        assert!(paths.credentials_dir.starts_with(root.join("credentials")));
     }
 
     #[test]
