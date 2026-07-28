@@ -6,10 +6,8 @@ use std::time::Duration;
 use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
 use tokio::time::timeout;
 
-use crate::agent::tools::{ToolError, check_perm, check_perm_path};
+use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::{STEP_TIMEOUT, SpawnResult};
-use crate::permission::ask::AskSender;
-use crate::permission::checker::PermCheck;
 use crate::sandbox::{Sandbox, kill_process_group};
 
 impl<'js> IntoJs<'js> for SpawnResult {
@@ -25,7 +23,7 @@ impl<'js> IntoJs<'js> for SpawnResult {
     }
 }
 
-fn permission_error(tool: &'static str, error: ToolError) -> rquickjs::Error {
+fn permission_error(tool: &'static str, error: PermissionBridgeError) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("permission check", tool, error.to_string())
 }
 
@@ -45,11 +43,19 @@ async fn timeout_host_call<T>(
 
 fn block_on_host_call<T>(
     runtime: &tokio::runtime::Handle,
+    permission_bridge: &PermissionBridge,
     tool: &'static str,
     duration: Duration,
     call: impl Future<Output = rquickjs::Result<T>>,
 ) -> rquickjs::Result<T> {
-    runtime.block_on(timeout_host_call(tool, duration, call))
+    runtime.block_on(async {
+        tokio::select! {
+            result = timeout_host_call(tool, duration, call) => result,
+            _ = permission_bridge.cancelled() => {
+                Err(permission_error(tool, PermissionBridgeError::Cancelled))
+            }
+        }
+    })
 }
 
 async fn resolve_write_target(path: &str) -> PathBuf {
@@ -87,60 +93,63 @@ async fn resolve_write_target(path: &str) -> PathBuf {
     }
 }
 
-pub fn make_read_file(
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
+pub(crate) fn make_read_file(
+    permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String) -> rquickjs::Result<String> {
     move |path: String| {
-        runtime
-            .block_on(check_perm_path(&permission, &ask_tx, "read", &path))
+        permission_bridge
+            .check_path("read", &path)
             .map_err(|error| permission_error("js/read_file", error))?;
-        block_on_host_call(&runtime, "js/read_file", STEP_TIMEOUT, async move {
+        block_on_host_call(
+            &runtime,
+            &permission_bridge,
+            "js/read_file",
+            STEP_TIMEOUT,
+            async move {
             tokio::fs::read_to_string(path)
                 .await
                 .map_err(rquickjs::Error::Io)
-        })
+            },
+        )
     }
 }
 
-pub fn make_write_file(
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
+pub(crate) fn make_write_file(
+    permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String, String) -> rquickjs::Result<()> {
     move |path: String, content: String| {
         let path = runtime.block_on(resolve_write_target(&path));
         let permission_path = path.to_string_lossy();
-        runtime
-            .block_on(check_perm_path(
-                &permission,
-                &ask_tx,
-                "write",
-                &permission_path,
-            ))
+        permission_bridge
+            .check_path("write", &permission_path)
             .map_err(|error| permission_error("js/write_file", error))?;
-        block_on_host_call(&runtime, "js/write_file", STEP_TIMEOUT, async move {
-            tokio::fs::write(path, content)
-                .await
-                .map_err(rquickjs::Error::Io)
-        })
+        block_on_host_call(
+            &runtime,
+            &permission_bridge,
+            "js/write_file",
+            STEP_TIMEOUT,
+            async move {
+                tokio::fs::write(path, content)
+                    .await
+                    .map_err(rquickjs::Error::Io)
+            },
+        )
     }
 }
 
-pub fn make_spawn(
+pub(crate) fn make_spawn(
     sandbox: Sandbox,
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
+    permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
-    make_spawn_with_timeout(sandbox, permission, ask_tx, runtime, STEP_TIMEOUT)
+    make_spawn_with_timeout(sandbox, permission_bridge, runtime, STEP_TIMEOUT)
 }
 
 fn make_spawn_with_timeout(
     sandbox: Sandbox,
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
+    permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
     duration: Duration,
 ) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
@@ -149,13 +158,8 @@ fn make_spawn_with_timeout(
             .chain(args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
-        runtime
-            .block_on(check_perm(
-                &permission,
-                &ask_tx,
-                "bash",
-                &permission_command,
-            ))
+        permission_bridge
+            .check("bash", &permission_command)
             .map_err(|error| permission_error("js/spawn", error))?;
         let mut command = sandbox.wrap_command(r#"exec "$0" "$@""#);
         command
@@ -163,16 +167,26 @@ fn make_spawn_with_timeout(
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let cancellation = permission_bridge.clone();
         let output = runtime.block_on(async {
             let child = command.spawn().map_err(rquickjs::Error::Io)?;
             let pid = child.id();
-            match timeout(duration, child.wait_with_output()).await {
-                Ok(output) => output.map_err(rquickjs::Error::Io),
-                Err(_) => {
+            tokio::select! {
+                output = child.wait_with_output() => output.map_err(rquickjs::Error::Io),
+                _ = tokio::time::sleep(duration) => {
                     if let Some(pid) = pid {
                         kill_process_group(pid);
                     }
                     Err(timeout_error("js/spawn"))
+                }
+                _ = cancellation.cancelled() => {
+                    if let Some(pid) = pid {
+                        kill_process_group(pid);
+                    }
+                    Err(permission_error(
+                        "js/spawn",
+                        PermissionBridgeError::Cancelled,
+                    ))
                 }
             }
         })?;
@@ -187,11 +201,10 @@ fn make_spawn_with_timeout(
     }
 }
 
-pub fn register_host_globals(
+pub(crate) fn register_host_globals(
     ctx: &Context,
     sandbox: Sandbox,
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
+    permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
 ) {
     ctx.with(|ctx| {
@@ -201,8 +214,7 @@ pub fn register_host_globals(
             .set(
                 "read_file",
                 Func::from(make_read_file(
-                    permission.clone(),
-                    ask_tx.clone(),
+                    permission_bridge.clone(),
                     runtime.clone(),
                 )),
             )
@@ -211,8 +223,7 @@ pub fn register_host_globals(
             .set(
                 "write_file",
                 Func::from(make_write_file(
-                    permission.clone(),
-                    ask_tx.clone(),
+                    permission_bridge.clone(),
                     runtime.clone(),
                 )),
             )
@@ -220,7 +231,7 @@ pub fn register_host_globals(
         globals
             .set(
                 "spawn",
-                Func::from(make_spawn(sandbox, permission, ask_tx, runtime)),
+                Func::from(make_spawn(sandbox, permission_bridge, runtime)),
             )
             .expect("register spawn");
 
@@ -244,8 +255,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::permission::ask::UserDecision;
-    use crate::permission::checker::PermissionChecker;
+    use crate::extras::js::tool::PermissionBridgeOwner;
+    use crate::permission::ask::{AskSender, UserDecision};
+    use crate::permission::checker::{PermCheck, PermissionChecker};
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
     struct TempDir(PathBuf);
@@ -305,8 +317,11 @@ mod tests {
         path: PathBuf,
     ) -> Result<String, String> {
         let runtime = tokio::runtime::Handle::current();
+        let owner = PermissionBridgeOwner::new(Some(permission), ask_tx, STEP_TIMEOUT);
+        let bridge = owner.bridge();
         tokio::task::spawn_blocking(move || {
-            make_read_file(Some(permission), ask_tx, runtime)(path.to_string_lossy().into_owned())
+            let _owner = owner;
+            make_read_file(bridge, runtime)(path.to_string_lossy().into_owned())
                 .map_err(|error| error.to_string())
         })
         .await
@@ -320,8 +335,11 @@ mod tests {
         content: &'static str,
     ) -> Result<(), String> {
         let runtime = tokio::runtime::Handle::current();
+        let owner = PermissionBridgeOwner::new(Some(permission), ask_tx, STEP_TIMEOUT);
+        let bridge = owner.bridge();
         tokio::task::spawn_blocking(move || {
-            make_write_file(Some(permission), ask_tx, runtime)(
+            let _owner = owner;
+            make_write_file(bridge, runtime)(
                 path.to_string_lossy().into_owned(),
                 content.to_string(),
             )
@@ -338,13 +356,11 @@ mod tests {
         args: Vec<String>,
     ) -> Result<SpawnResult, String> {
         let runtime = tokio::runtime::Handle::current();
+        let owner = PermissionBridgeOwner::new(Some(permission), ask_tx, STEP_TIMEOUT);
+        let bridge = owner.bridge();
         tokio::task::spawn_blocking(move || {
-            make_spawn(
-                Sandbox::new(false, "bwrap"),
-                Some(permission),
-                ask_tx,
-                runtime,
-            )(cmd.to_string(), args)
+            let _owner = owner;
+            make_spawn(Sandbox::new(false, "bwrap"), bridge, runtime)(cmd.to_string(), args)
             .map_err(|error| error.to_string())
         })
         .await
@@ -627,8 +643,11 @@ mod tests {
     #[tokio::test]
     async fn spawn_preserves_output_and_exit_code_through_sandbox_wrapper() {
         let runtime = tokio::runtime::Handle::current();
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let bridge = owner.bridge();
         let result = tokio::task::spawn_blocking(move || {
-            make_spawn(Sandbox::new(false, "bwrap"), None, None, runtime)(
+            let _owner = owner;
+            make_spawn(Sandbox::new(false, "bwrap"), bridge, runtime)(
                 "sh".to_string(),
                 vec![
                     "-c".to_string(),
@@ -741,11 +760,13 @@ mod tests {
     #[tokio::test]
     async fn spawn_timeout_reports_execution_timed_out() {
         let runtime = tokio::runtime::Handle::current();
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let bridge = owner.bridge();
         let error = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
             let spawn = make_spawn_with_timeout(
                 Sandbox::new(false, "bwrap"),
-                None,
-                None,
+                bridge,
                 runtime,
                 Duration::from_millis(25),
             );

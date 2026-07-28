@@ -1,6 +1,4 @@
-use std::sync::mpsc;
-
-use crate::extras::js::{engine::js_thread_main, tool::JsTool, types::THREAD_STACK};
+use crate::extras::js::tool::JsTool;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
@@ -19,16 +17,7 @@ fn make_test_tool_with_permissions(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) -> JsTool {
-    let (tx, rx) = mpsc::channel();
-    let js_permission = permission.clone();
-    let js_ask_tx = ask_tx.clone();
-    let runtime = tokio::runtime::Handle::current();
-    std::thread::Builder::new()
-        .name("js-engine-test".into())
-        .stack_size(THREAD_STACK)
-        .spawn(move || js_thread_main(rx, sandbox, js_permission, js_ask_tx, runtime))
-        .expect("failed to spawn JS test thread");
-    JsTool::new(tx, permission, ask_tx)
+    JsTool::new(sandbox, permission, ask_tx)
 }
 
 fn restrictive_permission_allowing_js_entrypoint() -> PermCheck {

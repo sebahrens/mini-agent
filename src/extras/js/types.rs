@@ -13,6 +13,7 @@ static NEXT_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct JsRequest {
     pub code: String,
+    pub cancellation: PermCancellation,
     pub reply: tokio::sync::oneshot::Sender<JsResponse>,
 }
 
@@ -21,6 +22,7 @@ impl fmt::Debug for JsRequest {
         f.debug_struct("JsRequest")
             .field("code", &Redacted)
             .field("code_len", &self.code.len())
+            .field("cancellation", &self.cancellation)
             .field("reply", &"<oneshot sender>")
             .finish()
     }
@@ -97,9 +99,23 @@ impl PermRequestId {
 }
 
 /// Cooperative cancellation shared by a permission requester and its bridge.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PermCancellation {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<PermCancellationState>,
+}
+
+#[derive(Default)]
+struct PermCancellationState {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Default for PermCancellation {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(PermCancellationState::default()),
+        }
+    }
 }
 
 impl PermCancellation {
@@ -108,11 +124,25 @@ impl PermCancellation {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        if !self.state.cancelled.swap(true, Ordering::AcqRel) {
+            self.state.notify.notify_waiters();
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.state.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -193,6 +223,14 @@ impl PermRequest {
         Instant::now() >= self.deadline
     }
 
+    pub fn response_guard(&self) -> PermResponseGuard {
+        PermResponseGuard {
+            request_id: self.id,
+            deadline: self.deadline,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
     /// Accept a response only while this request is current.
     ///
     /// Consuming the request prevents a bridge from accepting multiple
@@ -201,20 +239,35 @@ impl PermRequest {
         self,
         response: PermResponse,
     ) -> Result<PermOutcome, PermResponseRejection> {
-        if response.request_id != self.id {
+        self.response_guard().accept_response(response)
+    }
+}
+
+pub struct PermResponseGuard {
+    request_id: PermRequestId,
+    deadline: Instant,
+    cancellation: PermCancellation,
+}
+
+impl PermResponseGuard {
+    pub fn accept_response(
+        self,
+        response: PermResponse,
+    ) -> Result<PermOutcome, PermResponseRejection> {
+        if response.request_id != self.request_id {
             return Err(PermResponseRejection::MismatchedRequestId {
-                expected: self.id,
+                expected: self.request_id,
                 actual: response.request_id,
             });
         }
         if self.cancellation.is_cancelled() {
             return Err(PermResponseRejection::Cancelled {
-                request_id: self.id,
+                request_id: self.request_id,
             });
         }
-        if self.is_expired() {
+        if Instant::now() >= self.deadline {
             return Err(PermResponseRejection::DeadlineExpired {
-                request_id: self.id,
+                request_id: self.request_id,
             });
         }
 
@@ -256,9 +309,9 @@ impl fmt::Display for PermRequestBuildError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PermissionDenial {
-    Policy,
+    Policy(String),
     User,
     NonInteractive,
 }
@@ -271,7 +324,7 @@ pub enum PermissionBackendFailure {
     AskResponseDropped,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PermOutcome {
     Allowed,
     Denied(PermissionDenial),
@@ -281,7 +334,7 @@ pub enum PermOutcome {
     ChannelClosed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermResponse {
     request_id: PermRequestId,
     outcome: PermOutcome,
@@ -300,7 +353,7 @@ impl PermResponse {
     }
 
     pub fn outcome(&self) -> PermOutcome {
-        self.outcome
+        self.outcome.clone()
     }
 }
 
@@ -353,13 +406,8 @@ mod js_permission_types {
     use super::*;
 
     fn request(tool: &str, key: &str) -> PermRequest {
-        PermRequest::new(
-            tool,
-            key,
-            Duration::from_secs(1),
-            PermCancellation::new(),
-        )
-        .expect("valid permission request")
+        PermRequest::new(tool, key, Duration::from_secs(1), PermCancellation::new())
+            .expect("valid permission request")
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -430,10 +478,7 @@ mod js_permission_types {
         let cancelled_id = cancelled.id();
         cancellation.cancel();
         assert_eq!(
-            cancelled.accept_response(PermResponse::new(
-                cancelled_id,
-                PermOutcome::Allowed
-            )),
+            cancelled.accept_response(PermResponse::new(cancelled_id, PermOutcome::Allowed)),
             Err(PermResponseRejection::Cancelled {
                 request_id: cancelled_id
             })
@@ -444,7 +489,7 @@ mod js_permission_types {
     fn all_permission_outcomes_are_typed_and_correlated() {
         let outcomes = [
             PermOutcome::Allowed,
-            PermOutcome::Denied(PermissionDenial::Policy),
+            PermOutcome::Denied(PermissionDenial::Policy("rule denied".to_string())),
             PermOutcome::Denied(PermissionDenial::User),
             PermOutcome::Denied(PermissionDenial::NonInteractive),
             PermOutcome::BackendFailure(PermissionBackendFailure::CheckerUnavailable),
@@ -459,7 +504,7 @@ mod js_permission_types {
         for outcome in outcomes {
             let request = request("js/spawn", "printf secret");
             let id = request.id();
-            let response = PermResponse::new(id, outcome);
+            let response = PermResponse::new(id, outcome.clone());
             assert_eq!(response.request_id(), id);
             assert_eq!(response.outcome(), outcome);
             assert_eq!(request.accept_response(response), Ok(outcome));
@@ -482,23 +527,13 @@ mod js_permission_types {
         assert!(!exact.cancellation().is_cancelled());
 
         assert_eq!(
-            PermRequest::new(
-                "",
-                "key",
-                Duration::from_secs(1),
-                cancellation.clone()
-            )
-            .expect_err("empty tool must fail"),
+            PermRequest::new("", "key", Duration::from_secs(1), cancellation.clone())
+                .expect_err("empty tool must fail"),
             PermRequestBuildError::EmptyTool
         );
         assert_eq!(
-            PermRequest::new(
-                "js/spawn",
-                "",
-                Duration::from_secs(1),
-                cancellation.clone()
-            )
-            .expect_err("empty key must fail"),
+            PermRequest::new("js/spawn", "", Duration::from_secs(1), cancellation.clone())
+                .expect_err("empty key must fail"),
             PermRequestBuildError::EmptyKey
         );
         assert_eq!(

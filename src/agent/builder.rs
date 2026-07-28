@@ -172,22 +172,9 @@ fn register_js_tool(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) {
-    use crate::extras::js::{
-        engine::js_thread_main,
-        tool::JsTool,
-        types::{JsRequest, THREAD_STACK},
-    };
+    use crate::extras::js::tool::JsTool;
 
-    let (js_tx, js_rx) = std::sync::mpsc::channel::<JsRequest>();
-    let js_permission = permission.clone();
-    let js_ask_tx = ask_tx.clone();
-    let runtime = tokio::runtime::Handle::current();
-    std::thread::Builder::new()
-        .name("js-engine".into())
-        .stack_size(THREAD_STACK)
-        .spawn(move || js_thread_main(js_rx, sandbox, js_permission, js_ask_tx, runtime))
-        .expect("failed to spawn JS thread");
-    tools.push(Box::new(JsTool::new(js_tx, permission, ask_tx)));
+    tools.push(Box::new(JsTool::new(sandbox, permission, ask_tx)));
 }
 
 #[allow(clippy::too_many_arguments)]

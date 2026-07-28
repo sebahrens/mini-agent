@@ -3,20 +3,31 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use crate::extras::js::host::register_host_globals;
+use crate::extras::js::tool::PermissionBridge;
 use crate::extras::js::types::*;
-use crate::permission::ask::AskSender;
-use crate::permission::checker::PermCheck;
 use crate::sandbox::Sandbox;
 
-pub fn js_thread_main(
+pub(crate) fn js_thread_main(
     rx: mpsc::Receiver<JsRequest>,
     sandbox: Sandbox,
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
+    permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
 ) {
     while let Ok(req) = rx.recv() {
-        let outcome = run_step(&req.code, &sandbox, &permission, &ask_tx, &runtime);
+        if req.cancellation.is_cancelled() {
+            let _ = req.reply.send(JsResponse {
+                outcome: JsOutcome::Error("execution cancelled".to_string()),
+            });
+            continue;
+        }
+        let bridge = permission_bridge.for_invocation(req.cancellation.clone());
+        let outcome = run_step(
+            &req.code,
+            &sandbox,
+            &bridge,
+            &req.cancellation,
+            &runtime,
+        );
         let _ = req.reply.send(JsResponse { outcome });
     }
 }
@@ -25,8 +36,8 @@ pub fn js_thread_main(
 pub(crate) fn run_step(
     code: &str,
     sandbox: &Sandbox,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
+    permission_bridge: &PermissionBridge,
+    cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
 ) -> JsOutcome {
     // Fresh Runtime EVERY step — OOM poisons allocator; never reuse
@@ -38,7 +49,13 @@ pub(crate) fn run_step(
     rt.set_max_stack_size(STACK_LIMIT);
 
     let deadline = Instant::now() + STEP_TIMEOUT;
-    rt.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let interrupt_cancellation = cancellation.clone();
+    let interrupt_bridge = permission_bridge.clone();
+    rt.set_interrupt_handler(Some(Box::new(move || {
+        Instant::now() >= deadline
+            || interrupt_cancellation.is_cancelled()
+            || interrupt_bridge.is_shutdown()
+    })));
 
     let ctx = match Context::full(&rt) {
         Ok(c) => c,
@@ -48,8 +65,7 @@ pub(crate) fn run_step(
     register_host_globals(
         &ctx,
         sandbox.clone(),
-        permission.clone(),
-        ask_tx.clone(),
+        permission_bridge.clone(),
         runtime.clone(),
     );
 
