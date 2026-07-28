@@ -70,8 +70,24 @@ mod bound_platform {
 
     unsafe extern "C" {
         fn openat(directory: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "fdopendir$INODE64"
+        )]
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fdopendir$INODE64$UNIX2003"
+        )]
         fn fdopendir(descriptor: c_int) -> *mut DirectoryStream;
+        #[cfg_attr(
+            all(target_os = "macos", not(target_arch = "aarch64")),
+            link_name = "readdir$INODE64"
+        )]
         fn readdir(directory: *mut DirectoryStream) -> *mut DirectoryEntry;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "closedir$UNIX2003"
+        )]
         fn closedir(directory: *mut DirectoryStream) -> c_int;
     }
 
