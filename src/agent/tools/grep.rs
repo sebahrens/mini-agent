@@ -1,9 +1,11 @@
-use ignore::WalkBuilder;
+use std::io::Read;
+
 use regex::Regex;
 use rig::tool::Tool;
 
+use super::find_files::BoundDirectory;
 use crate::agent::tools::{
-    AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_path, is_skip_dir,
+    AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_path,
 };
 
 pub struct GrepTool {
@@ -97,6 +99,7 @@ impl Tool for GrepTool {
         let search_path = crate::fs::expand_tilde(requested_path);
         let traversal_root = tokio::fs::canonicalize(&search_path).await?;
         let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
+        let bound_directory = BoundDirectory::open(&traversal_root, &authorized_metadata)?;
         let permission_path = traversal_root.to_string_lossy();
         let _ = check_perm_path(&self.permission, &self.ask_tx, "grep", &permission_path).await?;
         let traversal_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
@@ -108,20 +111,7 @@ impl Tool for GrepTool {
             Regex::new(&pattern).unwrap_or_else(|_| Regex::new(".*").unwrap())
         });
 
-        let walker = WalkBuilder::new(&traversal_root)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .require_git(false)
-            .hidden(false)
-            .filter_entry(|entry| {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    !is_skip_dir(entry.file_name().to_str().unwrap_or(""))
-                } else {
-                    true
-                }
-            })
-            .build();
+        let walker = bound_directory.walker()?;
 
         let max_results = self.max_results as usize;
         let mut file_count = 0;
@@ -129,31 +119,34 @@ impl Tool for GrepTool {
         let mut all_results: Vec<String> = Vec::with_capacity(max_results.min(64));
         let mut limit_hit = false;
 
-        for entry in walker
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        {
+        for entry in walker {
             if all_results.len() >= max_results {
                 limit_hit = true;
                 break;
             }
 
             if let Some(ref re_include) = include_re {
-                let fname = entry.file_name().to_string_lossy();
+                let fname = entry.file_name.to_string_lossy();
                 if !re_include.is_match(&fname) {
                     continue;
                 }
             }
 
-            if let Ok(meta) = entry.metadata()
-                && meta.len() > 10 * 1024 * 1024
-            {
+            if entry.metadata.len() > 10 * 1024 * 1024 {
                 continue;
             }
 
-            let path_str = entry.path().to_string_lossy().to_string();
+            let path_str = entry.path.to_string_lossy().to_string();
+            let capacity = entry.metadata.len() as usize;
+            let mut file = entry.file;
+            let read_result = tokio::task::spawn_blocking(move || {
+                let mut data = Vec::with_capacity(capacity);
+                file.read_to_end(&mut data).map(|_| data)
+            })
+            .await
+            .map_err(|error| ToolError::Msg(format!("grep file reader failed: {error}")))?;
 
-            match tokio::fs::read(entry.path()).await {
+            match read_result {
                 Ok(data) => {
                     if Self::is_binary(&data) {
                         continue;
@@ -669,6 +662,41 @@ mod tests {
         let error = result.expect_err("grep must reject a replaced traversal root");
         assert!(error.to_string().contains("Path changed"));
         assert!(!error.to_string().contains("must_not_be_returned"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bound_file_reads_never_observe_an_aba_root_replacement() {
+        let container = TempDir::new("aba-root-replacement");
+        let authorized = container.path().join("authorized");
+        let moved = container.path().join("moved");
+        let replacement = container.path().join("replacement");
+        std::fs::create_dir_all(&authorized).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(authorized.join("one.txt"), "approved marker one").unwrap();
+        std::fs::write(authorized.join("two.txt"), "approved marker two").unwrap();
+        let secret = "aba_unique_secret_marker";
+        std::fs::write(replacement.join("secret.txt"), secret).unwrap();
+
+        let approved_metadata = std::fs::symlink_metadata(&authorized).unwrap();
+        let bound = BoundDirectory::open(&authorized, &approved_metadata).unwrap();
+        std::fs::rename(&authorized, &moved).unwrap();
+        std::fs::rename(&replacement, &authorized).unwrap();
+
+        let mut walker = bound.walker().unwrap();
+        let mut first = walker.next().expect("approved directory has two files");
+        let mut contents = String::new();
+        first.file.read_to_string(&mut contents).unwrap();
+
+        std::fs::rename(&authorized, &replacement).unwrap();
+        std::fs::rename(&moved, &authorized).unwrap();
+        for mut entry in walker {
+            entry.file.read_to_string(&mut contents).unwrap();
+        }
+
+        assert!(contents.contains("approved marker one"));
+        assert!(contents.contains("approved marker two"));
+        assert!(!contents.contains(secret));
     }
 
     #[tokio::test]

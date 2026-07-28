@@ -1,10 +1,659 @@
-use ignore::WalkBuilder;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use regex::Regex;
 use rig::tool::Tool;
 
 use crate::agent::tools::{
     AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, check_perm_path, is_skip_dir,
 };
+
+fn path_changed_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("Path changed after permission check: {}", path.display()),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(unsafe_code)]
+mod bound_platform {
+    use std::ffi::{CStr, CString, OsStr, OsString};
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::raw::{c_char, c_int, c_uint};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    const OPEN_NOFOLLOW: c_int = 0x2_0000;
+    #[cfg(target_os = "linux")]
+    const OPEN_CLOEXEC: c_int = 0x8_0000;
+    #[cfg(target_os = "linux")]
+    const OPEN_NONBLOCK: c_int = 0x800;
+
+    #[cfg(target_os = "macos")]
+    const OPEN_NOFOLLOW: c_int = 0x100;
+    #[cfg(target_os = "macos")]
+    const OPEN_CLOEXEC: c_int = 0x100_0000;
+    #[cfg(target_os = "macos")]
+    const OPEN_NONBLOCK: c_int = 0x4;
+
+    #[repr(C)]
+    struct DirectoryStream {
+        _private: [u8; 0],
+    }
+
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct DirectoryEntry {
+        inode: u64,
+        offset: i64,
+        record_length: u16,
+        file_type: u8,
+        name: [c_char; 256],
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct DirectoryEntry {
+        inode: u64,
+        seek_offset: u64,
+        record_length: u16,
+        name_length: u16,
+        file_type: u8,
+        name: [c_char; 1024],
+    }
+
+    unsafe extern "C" {
+        fn openat(directory: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+        fn fdopendir(descriptor: c_int) -> *mut DirectoryStream;
+        fn readdir(directory: *mut DirectoryStream) -> *mut DirectoryEntry;
+        fn closedir(directory: *mut DirectoryStream) -> c_int;
+    }
+
+    struct DirectoryStreamGuard(*mut DirectoryStream);
+
+    // SAFETY: the stream is owned by one walker and is never accessed
+    // concurrently; moving that owner between executor threads is safe.
+    unsafe impl Send for DirectoryStreamGuard {}
+
+    impl Drop for DirectoryStreamGuard {
+        fn drop(&mut self) {
+            // SAFETY: fdopendir returned this stream and it is closed exactly once.
+            let _ = unsafe { closedir(self.0) };
+        }
+    }
+
+    pub(super) fn open_root(path: &Path) -> std::io::Result<File> {
+        File::open(path)
+    }
+
+    pub(super) fn open_child(directory: &File, name: &OsStr) -> std::io::Result<File> {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path component contains NUL",
+            )
+        })?;
+        // SAFETY: `name` is NUL-terminated and `directory` owns a valid descriptor.
+        let descriptor = unsafe {
+            openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                OPEN_NOFOLLOW | OPEN_CLOEXEC | OPEN_NONBLOCK,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: openat returned a new owned descriptor.
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+    }
+
+    pub(super) struct DirectoryReader {
+        stream: DirectoryStreamGuard,
+    }
+
+    impl Iterator for DirectoryReader {
+        type Item = OsString;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                // SAFETY: the stream remains valid for the lifetime of the guard.
+                let entry = unsafe { readdir(self.stream.0) };
+                if entry.is_null() {
+                    return None;
+                }
+                // SAFETY: readdir returns a NUL-terminated name within a live entry.
+                let name = unsafe { CStr::from_ptr((*entry).name.as_ptr()) }.to_bytes();
+                if name != b"." && name != b".." {
+                    return Some(OsString::from_vec(name.to_vec()));
+                }
+            }
+        }
+    }
+
+    pub(super) fn read_directory(directory: &File) -> std::io::Result<DirectoryReader> {
+        let descriptor = directory.try_clone()?.into_raw_fd();
+        // SAFETY: ownership of `descriptor` is transferred to fdopendir on success.
+        let stream = unsafe { fdopendir(descriptor) };
+        if stream.is_null() {
+            // SAFETY: fdopendir failed, so ownership of the descriptor remains here.
+            drop(unsafe { File::from_raw_fd(descriptor) });
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(DirectoryReader {
+            stream: DirectoryStreamGuard(stream),
+        })
+    }
+
+    pub(super) fn is_safe_entry(_metadata: &std::fs::Metadata) -> bool {
+        true
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod bound_platform {
+    use std::ffi::{OsStr, OsString, c_void};
+    use std::fs::{File, OpenOptions};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::path::Path;
+    use std::ptr;
+
+    type Handle = *mut c_void;
+    type NtStatus = i32;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_OPEN: u32 = 0x1;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+    const OBJECT_CASE_INSENSITIVE: u32 = 0x40;
+    const STATUS_NO_MORE_FILES: NtStatus = 0x8000_0006_u32 as NtStatus;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: Handle,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut c_void,
+        security_quality_of_service: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: isize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut Handle,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut c_void,
+            ea_length: u32,
+        ) -> NtStatus;
+        fn NtQueryDirectoryFile(
+            file_handle: Handle,
+            event: Handle,
+            apc_routine: *mut c_void,
+            apc_context: *mut c_void,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut c_void,
+            length: u32,
+            file_information_class: u32,
+            return_single_entry: u8,
+            file_name: *mut UnicodeString,
+            restart_scan: u8,
+        ) -> NtStatus;
+    }
+
+    fn nt_error(status: NtStatus) -> std::io::Error {
+        std::io::Error::other(format!("Windows native filesystem error: {status:#x}"))
+    }
+
+    pub(super) fn open_root(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
+    pub(super) fn open_child(directory: &File, name: &OsStr) -> std::io::Result<File> {
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        let byte_length = wide
+            .len()
+            .checked_mul(2)
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path component is too long",
+                )
+            })?;
+        let mut name = UnicodeString {
+            length: byte_length,
+            maximum_length: byte_length,
+            buffer: wide.as_mut_ptr(),
+        };
+        let mut attributes = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: directory.as_raw_handle().cast(),
+            object_name: &mut name,
+            attributes: OBJECT_CASE_INSENSITIVE,
+            security_descriptor: ptr::null_mut(),
+            security_quality_of_service: ptr::null_mut(),
+        };
+        let mut io = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let mut handle = ptr::null_mut();
+        // SAFETY: all native structures point to live storage for the duration
+        // of the call, and a successful handle is transferred to `File`.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                FILE_GENERIC_READ,
+                &mut attributes,
+                &mut io,
+                ptr::null_mut(),
+                0,
+                FILE_SHARE_ALL,
+                FILE_OPEN,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if status < 0 {
+            Err(nt_error(status))
+        } else {
+            // SAFETY: NtCreateFile returned a new owned handle.
+            Ok(unsafe { File::from_raw_handle(handle.cast()) })
+        }
+    }
+
+    pub(super) struct DirectoryReader {
+        directory: File,
+        restart: u8,
+        finished: bool,
+    }
+
+    impl Iterator for DirectoryReader {
+        type Item = OsString;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.finished {
+                return None;
+            }
+            loop {
+                let mut storage = vec![0_u64; 512];
+                let mut io = IoStatusBlock {
+                    status: 0,
+                    information: 0,
+                };
+                // SAFETY: the output buffer and status block remain valid for the call.
+                let status = unsafe {
+                    NtQueryDirectoryFile(
+                        self.directory.as_raw_handle().cast(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        &mut io,
+                        storage.as_mut_ptr().cast(),
+                        (storage.len() * std::mem::size_of::<u64>()) as u32,
+                        1,
+                        1,
+                        ptr::null_mut(),
+                        self.restart,
+                    )
+                };
+                self.restart = 0;
+                if status == STATUS_NO_MORE_FILES {
+                    self.finished = true;
+                    return None;
+                }
+                if status < 0 {
+                    self.finished = true;
+                    return None;
+                }
+                if io.information < 64 {
+                    self.finished = true;
+                    return None;
+                }
+
+                let bytes = storage.as_ptr().cast::<u8>();
+                // FILE_DIRECTORY_INFORMATION stores FileNameLength at byte 60
+                // and the UTF-16 filename at byte 64.
+                let name_length =
+                    unsafe { ptr::read_unaligned(bytes.add(60).cast::<u32>()) } as usize;
+                if name_length % 2 != 0
+                    || name_length > io.information - 64
+                    || name_length > storage.len() * std::mem::size_of::<u64>() - 64
+                {
+                    self.finished = true;
+                    return None;
+                }
+                let name = unsafe {
+                    std::slice::from_raw_parts(bytes.add(64).cast::<u16>(), name_length / 2)
+                };
+                if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                    return Some(OsString::from_wide(name));
+                }
+            }
+        }
+    }
+
+    pub(super) fn read_directory(directory: &File) -> std::io::Result<DirectoryReader> {
+        Ok(DirectoryReader {
+            directory: directory.try_clone()?,
+            restart: 1,
+            finished: false,
+        })
+    }
+
+    pub(super) fn is_safe_entry(metadata: &std::fs::Metadata) -> bool {
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+mod bound_platform {
+    use std::ffi::{OsStr, OsString};
+    use std::fs::File;
+    use std::path::Path;
+
+    fn unsupported() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "descriptor-bound directory traversal is unsupported on this platform",
+        )
+    }
+
+    pub(super) fn open_root(_path: &Path) -> std::io::Result<File> {
+        Err(unsupported())
+    }
+
+    pub(super) fn open_child(_directory: &File, _name: &OsStr) -> std::io::Result<File> {
+        Err(unsupported())
+    }
+
+    pub(super) struct DirectoryReader;
+
+    impl Iterator for DirectoryReader {
+        type Item = OsString;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            None
+        }
+    }
+
+    pub(super) fn read_directory(_directory: &File) -> std::io::Result<DirectoryReader> {
+        Err(unsupported())
+    }
+
+    pub(super) fn is_safe_entry(_metadata: &std::fs::Metadata) -> bool {
+        false
+    }
+}
+
+pub(super) struct BoundFile {
+    pub(super) path: PathBuf,
+    pub(super) file_name: OsString,
+    pub(super) file: File,
+    pub(super) metadata: std::fs::Metadata,
+}
+
+pub(super) struct BoundDirectory {
+    approved_root: PathBuf,
+    root: File,
+}
+
+impl BoundDirectory {
+    pub(super) fn open(
+        approved_root: &Path,
+        approved_metadata: &std::fs::Metadata,
+    ) -> std::io::Result<Self> {
+        if !approved_metadata.is_dir() || !bound_platform::is_safe_entry(approved_metadata) {
+            return Err(path_changed_error(approved_root));
+        }
+        let root = bound_platform::open_root(approved_root)?;
+        let opened_metadata = root.metadata()?;
+        let current_metadata = std::fs::symlink_metadata(approved_root)?;
+        if current_metadata.file_type().is_symlink()
+            || !bound_platform::is_safe_entry(&opened_metadata)
+        {
+            return Err(path_changed_error(approved_root));
+        }
+        crate::fs::ensure_same_file(approved_root, approved_metadata, &opened_metadata)?;
+        crate::fs::ensure_same_file(approved_root, &opened_metadata, &current_metadata)?;
+        Ok(Self {
+            approved_root: approved_root.to_path_buf(),
+            root,
+        })
+    }
+
+    pub(super) fn walker(&self) -> std::io::Result<BoundWalker> {
+        BoundWalker::new(self.root.try_clone()?, self.approved_root.clone())
+    }
+}
+
+struct DirectoryFrame {
+    directory: File,
+    relative_path: PathBuf,
+    names: bound_platform::DirectoryReader,
+    matchers: Vec<Gitignore>,
+}
+
+impl DirectoryFrame {
+    fn new(
+        directory: File,
+        relative_path: PathBuf,
+        mut matchers: Vec<Gitignore>,
+        approved_root: &Path,
+    ) -> std::io::Result<Self> {
+        for ignore_name in [".gitignore", ".ignore"] {
+            if let Some(matcher) =
+                local_ignore_matcher(&directory, &relative_path, approved_root, ignore_name)
+            {
+                matchers.push(matcher);
+            }
+        }
+        let names = bound_platform::read_directory(&directory)?;
+        Ok(Self {
+            directory,
+            relative_path,
+            names,
+            matchers,
+        })
+    }
+}
+
+pub(super) struct BoundWalker {
+    approved_root: PathBuf,
+    stack: Vec<DirectoryFrame>,
+}
+
+impl BoundWalker {
+    fn new(root: File, approved_root: PathBuf) -> std::io::Result<Self> {
+        let mut matchers = Vec::new();
+        let (global, _) = GitignoreBuilder::new(&approved_root).build_global();
+        if !global.is_empty() {
+            matchers.push(global);
+        }
+        matchers.extend(parent_ignore_matchers(&approved_root));
+        if let Ok(exclude) = open_relative(&root, Path::new(".git/info/exclude"))
+            && let Some(matcher) =
+                ignore_matcher(exclude, &approved_root, approved_root.join(".git/info/exclude"))
+        {
+            matchers.push(matcher);
+        }
+        let frame = DirectoryFrame::new(root, PathBuf::new(), matchers, &approved_root)?;
+        Ok(Self {
+            approved_root,
+            stack: vec![frame],
+        })
+    }
+}
+
+impl Iterator for BoundWalker {
+    type Item = BoundFile;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let frame = self.stack.last_mut()?;
+            let Some(name) = frame.names.next() else {
+                self.stack.pop();
+                continue;
+            };
+            let relative_path = frame.relative_path.join(&name);
+            let child = match bound_platform::open_child(&frame.directory, &name) {
+                Ok(child) => child,
+                Err(_) => continue,
+            };
+            let metadata = match child.metadata() {
+                Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
+                _ => continue,
+            };
+            let approved_path = self.approved_root.join(&relative_path);
+            let is_directory = metadata.is_dir();
+            if is_directory
+                && is_skip_dir(name.to_str().unwrap_or(""))
+            {
+                continue;
+            }
+            if is_ignored(&frame.matchers, &approved_path, is_directory) {
+                continue;
+            }
+            if is_directory {
+                let matchers = frame.matchers.clone();
+                if let Ok(child_frame) = DirectoryFrame::new(
+                    child,
+                    relative_path,
+                    matchers,
+                    &self.approved_root,
+                ) {
+                    self.stack.push(child_frame);
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            return Some(BoundFile {
+                path: approved_path,
+                file_name: name,
+                file: child,
+                metadata,
+            });
+        }
+    }
+}
+
+fn open_relative(root: &File, path: &Path) -> std::io::Result<File> {
+    let mut current = root.try_clone()?;
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "relative path contains an invalid component",
+            ));
+        };
+        current = bound_platform::open_child(&current, name)?;
+    }
+    Ok(current)
+}
+
+fn local_ignore_matcher(
+    directory: &File,
+    relative_path: &Path,
+    approved_root: &Path,
+    ignore_name: &str,
+) -> Option<Gitignore> {
+    let file = bound_platform::open_child(directory, ignore_name.as_ref()).ok()?;
+    ignore_matcher(
+        file,
+        &approved_root.join(relative_path),
+        approved_root.join(relative_path).join(ignore_name),
+    )
+}
+
+fn parent_ignore_matchers(approved_root: &Path) -> Vec<Gitignore> {
+    let mut directories: Vec<&Path> = approved_root.ancestors().skip(1).collect();
+    directories.reverse();
+    let mut matchers = Vec::new();
+    for directory in directories {
+        let exclude_path = directory.join(".git/info/exclude");
+        if let Ok(file) = File::open(&exclude_path)
+            && let Some(matcher) = ignore_matcher(file, directory, exclude_path)
+        {
+            matchers.push(matcher);
+        }
+        for ignore_name in [".gitignore", ".ignore"] {
+            let source = directory.join(ignore_name);
+            if let Ok(file) = File::open(&source)
+                && let Some(matcher) = ignore_matcher(file, directory, source)
+            {
+                matchers.push(matcher);
+            }
+        }
+    }
+    matchers
+}
+
+fn ignore_matcher(mut file: File, root: &Path, source: PathBuf) -> Option<Gitignore> {
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    let mut builder = GitignoreBuilder::new(root);
+    for line in contents.lines() {
+        let _ = builder.add_line(Some(source.clone()), line);
+    }
+    builder.build().ok()
+}
+
+fn is_ignored(matchers: &[Gitignore], path: &Path, is_directory: bool) -> bool {
+    let mut ignored = false;
+    for matcher in matchers {
+        let matched = matcher.matched(path, is_directory);
+        if matched.is_ignore() {
+            ignored = true;
+        } else if matched.is_whitelist() {
+            ignored = false;
+        }
+    }
+    ignored
+}
 
 pub struct FindFilesTool {
     pub permission: Option<PermCheck>,
@@ -69,6 +718,7 @@ impl Tool for FindFilesTool {
         let search_path = crate::fs::expand_tilde(requested_path);
         let traversal_root = tokio::fs::canonicalize(&search_path).await?;
         let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
+        let bound_directory = BoundDirectory::open(&traversal_root, &authorized_metadata)?;
         let permission_path = traversal_root.to_string_lossy();
         let _ = check_perm_path(
             &self.permission,
@@ -80,32 +730,16 @@ impl Tool for FindFilesTool {
         let traversal_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
         crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &traversal_metadata)?;
 
-        let walker = WalkBuilder::new(&traversal_root)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .require_git(false)
-            .hidden(false)
-            .filter_entry(|entry| {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    !is_skip_dir(entry.file_name().to_str().unwrap_or(""))
-                } else {
-                    true
-                }
-            })
-            .build();
+        let walker = bound_directory.walker()?;
 
         let max_results = self.max_results as usize;
         let mut results: Vec<String> = Vec::with_capacity(max_results.saturating_add(1).min(64));
         let mut limit_hit = false;
 
-        for entry in walker
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        {
-            let fname = entry.file_name().to_string_lossy();
+        for entry in walker {
+            let fname = entry.file_name.to_string_lossy();
             if re.is_match(&fname) {
-                results.push(entry.path().to_string_lossy().to_string());
+                results.push(entry.path.to_string_lossy().to_string());
                 if results.len() > max_results {
                     limit_hit = true;
                     break;
@@ -470,6 +1104,37 @@ mod tests {
         let error = result.expect_err("find_files must reject a replaced traversal root");
         assert!(error.to_string().contains("Path changed"));
         assert!(!error.to_string().contains("must_not_be_returned.txt"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bound_walker_never_observes_an_aba_root_replacement() {
+        let container = TempDir::new("aba_root_replacement");
+        let authorized = container.path().join("authorized");
+        let moved = container.path().join("moved");
+        let replacement = container.path().join("replacement");
+        std::fs::create_dir_all(&authorized).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(authorized.join("authorized_one.txt"), "").unwrap();
+        std::fs::write(authorized.join("authorized_two.txt"), "").unwrap();
+        let secret = "aba_secret_marker.txt";
+        std::fs::write(replacement.join(secret), "").unwrap();
+
+        let approved_metadata = std::fs::symlink_metadata(&authorized).unwrap();
+        let bound = BoundDirectory::open(&authorized, &approved_metadata).unwrap();
+        std::fs::rename(&authorized, &moved).unwrap();
+        std::fs::rename(&replacement, &authorized).unwrap();
+
+        let mut walker = bound.walker().unwrap();
+        let first = walker.next().expect("approved directory has two files");
+        let mut names = vec![first.file_name.to_string_lossy().into_owned()];
+
+        std::fs::rename(&authorized, &replacement).unwrap();
+        std::fs::rename(&moved, &authorized).unwrap();
+        names.extend(walker.map(|entry| entry.file_name.to_string_lossy().into_owned()));
+
+        assert_eq!(names.len(), 2);
+        assert!(!names.iter().any(|name| name == secret));
     }
 
     #[tokio::test]
