@@ -81,6 +81,7 @@ impl Tool for FindFilesTool {
             .build();
 
         let mut results: Vec<String> = Vec::new();
+        let mut limit_hit = false;
 
         for entry in walker
             .flatten()
@@ -90,6 +91,7 @@ impl Tool for FindFilesTool {
             if re.is_match(&fname) {
                 results.push(entry.path().to_string_lossy().to_string());
                 if (results.len() as u64) >= self.max_results {
+                    limit_hit = true;
                     break;
                 }
             }
@@ -107,14 +109,13 @@ impl Tool for FindFilesTool {
 
         let total = results.len();
         let max_results = self.max_results as usize;
-        let result = if total >= max_results {
+        let result = if limit_hit {
             format!(
-                "{} files found (showing first {}):\n{}\n\n[truncated after {} entries — {} more; narrow the pattern or path]",
+                "{} files found (showing first {}):\n{}\n\n[truncated after {} entries — unknown number of additional entries; narrow the pattern or path]",
                 total,
                 max_results,
                 results[..max_results].join("\n"),
-                max_results,
-                total - max_results
+                max_results
             )
         } else {
             format!("{} files found:\n{}", total, results.join("\n"))
@@ -123,7 +124,7 @@ impl Tool for FindFilesTool {
         tracing::debug!(
             "tool find_files done: results={}, truncated={}",
             total,
-            total >= max_results,
+            limit_hit,
         );
         Ok(match coaching {
             Some(c) => format!("{}\n\n{}", c, result),
@@ -134,13 +135,42 @@ impl Tool for FindFilesTool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use super::*;
     use crate::permission::ask::UserDecision;
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "zerostack_find_files_test_{}_{}_{}",
+                tag,
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn restrictive_permission_allowing_pattern() -> PermCheck {
         let config = PermissionConfig {
@@ -188,5 +218,25 @@ mod tests {
             result,
             Err(ToolError::Msg(ref msg)) if msg == "Permission denied by user"
         ));
+    }
+
+    #[tokio::test]
+    async fn reports_unknown_remaining_count_when_result_limit_is_hit() {
+        let dir = TempDir::new("truncation");
+        for index in 0..101 {
+            std::fs::write(dir.path().join(format!("match_{index:03}.txt")), "").unwrap();
+        }
+
+        let output = FindFilesTool::new(None, None, 100)
+            .call(FindFilesArgs {
+                pattern: r"^match_\d+\.txt$".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+            })
+            .await
+            .unwrap();
+
+        assert!(output.contains("truncated after 100 entries"));
+        assert!(output.contains("unknown number of additional entries"));
+        assert!(!output.contains("0 more"));
     }
 }

@@ -150,12 +150,8 @@ async fn validate_mcp_server_url(value: &str) -> anyhow::Result<()> {
                 .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>())
         })
         .await
-        .map_err(|error| {
-            anyhow::anyhow!("could not resolve MCP server host '{host}': {error}")
-        })?
-        .map_err(|error| {
-            anyhow::anyhow!("could not resolve MCP server host '{host}': {error}")
-        })?
+        .map_err(|error| anyhow::anyhow!("could not resolve MCP server host '{host}': {error}"))?
+        .map_err(|error| anyhow::anyhow!("could not resolve MCP server host '{host}': {error}"))?
     };
 
     validate_resolved_addresses(&addresses)
@@ -181,9 +177,7 @@ fn parse_mcp_server_url(value: &str) -> anyhow::Result<(String, u16, Option<IpAd
             .strip_suffix(".localhost")
             .is_some()
     {
-        anyhow::bail!(
-            "MCP server URL host is local; use a publicly routable HTTP(S) API endpoint"
-        );
+        anyhow::bail!("MCP server URL host is local; use a publicly routable HTTP(S) API endpoint");
     }
 
     let port = url
@@ -219,21 +213,16 @@ fn is_restricted_ip(address: IpAddr) -> bool {
                 && octets[11] == 0xff;
             if is_ipv4_compatible || is_ipv4_mapped {
                 return is_restricted_ipv4(Ipv4Addr::new(
-                    octets[12],
-                    octets[13],
-                    octets[14],
-                    octets[15],
+                    octets[12], octets[13], octets[14], octets[15],
                 ));
             }
 
             let segments = address.segments();
             let is_global_unicast = (0x2000..=0x3fff).contains(&segments[0]);
             let is_teredo = segments[0] == 0x2001 && segments[1] == 0;
-            let is_benchmark = segments[0] == 0x2001
-                && segments[1] == 2
-                && segments[2] == 0;
-            let is_orchid = segments[0] == 0x2001
-                && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020);
+            let is_benchmark = segments[0] == 0x2001 && segments[1] == 2 && segments[2] == 0;
+            let is_orchid =
+                segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020);
             let is_documentation = (segments[0] == 0x2001 && segments[1] == 0x0db8)
                 || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0);
             let is_6to4 = segments[0] == 0x2002;
@@ -272,8 +261,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        parse_mcp_server_url, stdio_command, validate_mcp_server_url,
-        validate_resolved_addresses,
+        parse_mcp_server_url, stdio_command, validate_mcp_server_url, validate_resolved_addresses,
     };
 
     #[test]
@@ -303,15 +291,13 @@ mod tests {
 
     #[test]
     fn accepts_public_https_url_with_public_resolution() {
-        let (host, port, literal_ip) =
-            parse_mcp_server_url("https://api.example.com/mcp").unwrap();
+        let (host, port, literal_ip) = parse_mcp_server_url("https://api.example.com/mcp").unwrap();
 
         assert_eq!(host, "api.example.com");
         assert_eq!(port, 443);
         assert_eq!(literal_ip, None);
         assert!(
-            validate_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
-                .is_ok()
+            validate_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]).is_ok()
         );
     }
 
