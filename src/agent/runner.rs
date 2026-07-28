@@ -45,6 +45,12 @@ fn streamed_reasoning_text<R>(content: &StreamedAssistantContent<R>) -> Option<C
     }
 }
 
+fn warn_unknown_stream_item<R: serde::Serialize>(item: &MultiTurnStreamItem<R>) {
+    let detail = serde_json::to_string(item)
+        .unwrap_or_else(|error| format!("<failed to serialize stream item: {error}>"));
+    tracing::warn!("unknown stream item variant: {detail}");
+}
+
 fn attributed_tool_result(
     last_tool_name: &mut Option<String>,
     tool_result: &ToolResult,
@@ -502,8 +508,28 @@ where
                                     })
                                     .await;
                             }
-                            _ => {}
+                            StreamedAssistantContent::Unknown(value) => {
+                                warn_unknown_stream_item(
+                                    &MultiTurnStreamItem::<M::StreamingResponse>::StreamAssistantItem(
+                                        StreamedAssistantContent::Unknown(value),
+                                    ),
+                                );
+                            }
+                            StreamedAssistantContent::ToolCallDelta { .. }
+                            | StreamedAssistantContent::Reasoning(_)
+                            | StreamedAssistantContent::ReasoningDelta { .. }
+                            | StreamedAssistantContent::Final(_) => {}
                         }
+                    }
+                    Ok(MultiTurnStreamItem::ToolExecutionStart {
+                        tool_call,
+                        internal_call_id,
+                    }) => {
+                        tracing::debug!(
+                            tool_name = %tool_call.function.name,
+                            internal_call_id,
+                            "agent tool execution started"
+                        );
                     }
                     Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
                         tool_result,
@@ -612,7 +638,7 @@ where
                             .await;
                         return;
                     }
-                    _ => {}
+                    Ok(item) => warn_unknown_stream_item(&item),
                 }
             }
 
@@ -1003,14 +1029,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{attributed_tool_result, streamed_reasoning_text};
+    use super::{attributed_tool_result, streamed_reasoning_text, warn_unknown_stream_item};
     use rig::OneOrMany;
-    use rig::agent::AgentBuilder;
+    use rig::agent::{AgentBuilder, MultiTurnStreamItem};
     use rig::completion::{Message, Usage};
     use rig::message::{AssistantContent, Image, Text, ToolResult, ToolResultContent};
     use rig::streaming::StreamedAssistantContent;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
     use rig::tool::Tool;
+    use std::io::Write;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1072,6 +1099,45 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("counted".to_string())
         }
+    }
+
+    #[test]
+    fn unknown_stream_item_warning_includes_item_information() {
+        #[derive(Clone)]
+        struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for BufferWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer lock").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = BufferWriter(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let item = MultiTurnStreamItem::<serde_json::Value>::StreamAssistantItem(
+            StreamedAssistantContent::Unknown(serde_json::json!({
+                "type": "cacheStatus",
+                "cached": true,
+            })),
+        );
+
+        tracing::subscriber::with_default(subscriber, || warn_unknown_stream_item(&item));
+
+        let output = output.lock().expect("log buffer lock");
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("unknown stream item variant"));
+        assert!(output.contains("cacheStatus"));
     }
 
     #[cfg(feature = "subagents")]
