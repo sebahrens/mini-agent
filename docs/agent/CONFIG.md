@@ -94,6 +94,30 @@ and error category but omit config source excerpts, which could contain stored
 secrets. Config persistence currently creates no lock or backup file; any
 future lock or backup artifact must use the same `0600`/protected-DACL policy.
 
+## Session-storage privacy
+
+Saved sessions and full tool outputs can contain prompts, source code, command
+output, authorization data, and other secrets. zerostack applies the same
+private-persistence policy to the state root's `sessions/` and
+`tool-outputs/` trees:
+
+- On Unix, newly created directories are `0700`; session, tool-output, lock,
+  and atomic-write temporary files are `0600` from creation, independent of
+  umask. Before reading or replacing an existing path, zerostack repairs a
+  current-user-owned real directory or regular file to the exact private mode.
+- On Windows, Unix mode bits do not provide protection. Directories and every
+  final, lock, and temporary file receive a protected DACL from creation time,
+  with full access limited to the current user and `SYSTEM`. Inherited access
+  for `Everyone` and ordinary `Users` is removed.
+- Symbolic links, Windows reparse points, wrong file types, and paths not owned
+  by the current user are rejected without chmod, DACL repair, replacement, or
+  deletion through the unsafe path. Unsupported platforms fail closed.
+
+Session replacement publishes only a fully written private temporary file.
+Failure cleanup removes a temporary file only after confirming that it is the
+same file created by the failed write. Session saves are currently lock-free;
+any lock artifact added later must continue to use the private storage helper.
+
 On startup, known legacy content is copied through a private, no-follow,
 content-verified migration and the original is retained. Identical candidates
 are safe to converge. Differing candidates require an explicit numbered

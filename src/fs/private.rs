@@ -93,6 +93,36 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private file must have a parent directory",
+        )
+    })?;
+    ensure_directory(parent)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private create target is not a regular file",
+            ));
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "private create target already exists",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    super::atomic_create_sync(path, bytes)?;
+    drop(open_existing(path)?);
+    Ok(())
+}
+
 #[cfg(all(test, unix))]
 pub(crate) fn atomic_write_with_failure(
     path: &Path,
@@ -137,7 +167,7 @@ fn current_uid() -> u32 {
 }
 
 #[cfg(windows)]
-pub(crate) use windows::{atomic_write, ensure_directory, open_existing};
+pub(crate) use windows::{atomic_create, atomic_write, ensure_directory, open_existing};
 
 #[cfg(all(test, windows))]
 pub(crate) use windows::dacl_sddl;
@@ -154,6 +184,11 @@ pub(crate) fn open_existing(_path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn atomic_write(_path: &Path, _bytes: &[u8]) -> std::io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn atomic_create(_path: &Path, _bytes: &[u8]) -> std::io::Result<()> {
     Err(unsupported())
 }
 
@@ -657,6 +692,18 @@ mod windows {
     }
 
     pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        atomic_write_mode(path, bytes, false)
+    }
+
+    pub(crate) fn atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        atomic_write_mode(path, bytes, true)
+    }
+
+    fn atomic_write_mode(
+        path: &Path,
+        bytes: &[u8],
+        create_only: bool,
+    ) -> std::io::Result<()> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -665,6 +712,12 @@ mod windows {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         "private target is a reparse point or has the wrong type",
+                    ));
+                }
+                if create_only {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "private create target already exists",
                     ));
                 }
                 repair_path(path, false)?;
@@ -690,7 +743,7 @@ mod windows {
 
             let target_wide = wide(path.as_os_str());
             let temp_wide = wide(temp.as_os_str());
-            let replaced = if std::fs::symlink_metadata(path).is_ok() {
+            let replaced = if !create_only && std::fs::symlink_metadata(path).is_ok() {
                 unsafe {
                     ReplaceFileW(
                         target_wide.as_ptr(),

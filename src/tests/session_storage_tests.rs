@@ -2,7 +2,8 @@ use crate::permission::checker::{CheckResult, PermissionChecker};
 use crate::permission::{PermissionConfigs, SecurityMode};
 use crate::session::MessageRole;
 use crate::session::storage::{
-    delete_session, find_sessions_by_prefix, load_suffix, save_session, suffix_path,
+    atomic_write, delete_session, find_sessions_by_prefix, load_suffix, save_session,
+    save_tool_output, suffix_path,
 };
 use crate::session::{
     PermissionAllowEntry, Session, TOOL_RESULT_HEAD_CHARS, TOOL_RESULT_SAVE_THRESHOLD,
@@ -38,11 +39,54 @@ fn setup_test_env() -> TestEnv {
     let data_dir = dir.to_str().unwrap().to_string();
     unsafe { env::set_var("ZS_DATA_DIR", &data_dir) };
     unsafe { env::set_var("ZS_CONFIG_DIR", &data_dir) };
+    unsafe { env::set_var("ZS_STATE_DIR", &data_dir) };
     std::fs::create_dir_all(format!("{}/sessions", data_dir)).unwrap();
     TestEnv {
         dir,
         data_dir,
         _lock: lock,
+    }
+}
+
+fn private_temp_residue(directory: &Path) -> usize {
+    std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            usize::from(name.starts_with(".zswrite.") || name.starts_with(".zsconfig."))
+                + if path.is_dir() {
+                    private_temp_residue(&path)
+                } else {
+                    0
+                }
+        })
+        .sum()
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+#[cfg(unix)]
+fn assert_private_unix_tree(path: &Path) {
+    assert_eq!(mode(path), 0o700, "directory is not private: {path:?}");
+    for entry in std::fs::read_dir(path).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            assert_private_unix_tree(&path);
+        } else {
+            assert_eq!(mode(&path), 0o600, "file is not private: {path:?}");
+        }
     }
 }
 
@@ -341,5 +385,269 @@ fn suffix_path_is_inside_config_dir() {
     let config = crate::session::storage::config_path();
     let suffix = suffix_path();
     assert_eq!(suffix, config.join("SUFFIX.md"));
+    drop(env);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_storage_permissions_ignore_permissive_umask() {
+    const CHILD_STATE_DIR: &str = "ZS_SESSION_PERMISSION_UMASK_CHILD";
+    const SESSION_ID: &str = "session-storage-permission-umask";
+
+    if let Some(state_dir) = std::env::var_os(CHILD_STATE_DIR) {
+        unsafe { env::set_var("ZS_STATE_DIR", &state_dir) };
+        let mut session = Session::new("openai", "gpt-4", 128000, "");
+        session.id = SESSION_ID.into();
+        save_session(&session).unwrap();
+
+        let sessions = Path::new(&state_dir).join("sessions");
+        atomic_write(
+            &sessions.join(format!("{SESSION_ID}.json.lock")),
+            "private lock",
+        )
+        .unwrap();
+        save_tool_output(SESSION_ID, "bash", "private tool output").unwrap();
+        return;
+    }
+
+    use std::os::unix::process::CommandExt;
+
+    let env = setup_test_env();
+    std::fs::remove_dir_all(&env.dir).unwrap();
+    let state_dir = env.dir.join("nested").join("state");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "tests::session_storage_tests::session_storage_permissions_ignore_permissive_umask",
+            "--nocapture",
+        ])
+        .env(CHILD_STATE_DIR, &state_dir);
+    #[allow(unsafe_code)]
+    unsafe {
+        child.pre_exec(|| {
+            unsafe extern "C" {
+                fn umask(mask: std::os::raw::c_uint) -> std::os::raw::c_uint;
+            }
+            umask(0);
+            Ok(())
+        });
+    }
+    assert!(child.status().unwrap().success());
+
+    assert_eq!(mode(&env.dir), 0o700);
+    assert_private_unix_tree(&env.dir);
+    assert_eq!(private_temp_residue(&env.dir), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_storage_permissions_repair_owned_regular_paths_before_read_and_replace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const SESSION_ID: &str = "session-storage-permission-repair";
+    let env = setup_test_env();
+    let sessions = env.dir.join("sessions");
+    let session_path = sessions.join(format!("{SESSION_ID}.json"));
+    let mut session = Session::new("openai", "gpt-4", 128000, "");
+    session.id = SESSION_ID.into();
+    save_session(&session).unwrap();
+
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(find_sessions_by_prefix(SESSION_ID).unwrap().len(), 1);
+    assert_eq!(mode(&sessions), 0o700);
+    assert_eq!(mode(&session_path), 0o600);
+
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    session.name = "replaced privately".into();
+    save_session(&session).unwrap();
+    assert_eq!(mode(&sessions), 0o700);
+    assert_eq!(mode(&session_path), 0o600);
+    assert_eq!(private_temp_residue(&sessions), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_storage_permissions_reject_symlinks_and_non_regular_targets_without_mutation() {
+    use std::os::unix::fs::symlink;
+
+    const SESSION_ID: &str = "session-storage-permission-target";
+    let env = setup_test_env();
+    let sessions = env.dir.join("sessions");
+    let target = sessions.join(format!("{SESSION_ID}.json"));
+    let outside = env.dir.join("outside.json");
+    std::fs::write(&outside, "unchanged").unwrap();
+    symlink(&outside, &target).unwrap();
+
+    let mut session = Session::new("openai", "gpt-4", 128000, "");
+    session.id = SESSION_ID.into();
+    let error = save_session(&session).expect_err("session symlink must be rejected");
+    assert!(error.to_string().contains("owned regular file"));
+    let error =
+        find_sessions_by_prefix(SESSION_ID).expect_err("session symlink read must be rejected");
+    assert!(error.to_string().contains("refusing unsafe session file"));
+    assert!(delete_session(SESSION_ID).is_err());
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+    assert!(
+        std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(private_temp_residue(&sessions), 0);
+
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    assert!(save_session(&session).is_err());
+    assert!(delete_session(SESSION_ID).is_err());
+    assert!(target.is_dir());
+    assert_eq!(private_temp_residue(&sessions), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_storage_permissions_reject_symlinked_directory_without_writing_outside() {
+    use std::os::unix::fs::symlink;
+
+    const SESSION_ID: &str = "session-storage-permission-parent";
+    let env = setup_test_env();
+    let sessions = env.dir.join("sessions");
+    let outside = env.dir.join("outside");
+    std::fs::remove_dir(&sessions).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    symlink(&outside, &sessions).unwrap();
+
+    let mut session = Session::new("openai", "gpt-4", 128000, "");
+    session.id = SESSION_ID.into();
+    assert!(save_session(&session).is_err());
+    assert!(!outside.join(format!("{SESSION_ID}.json")).exists());
+    assert!(
+        std::fs::symlink_metadata(&sessions)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_storage_permissions_clean_failure_residue_and_preserve_prior_file() {
+    use crate::session::storage::atomic_write_with_failure;
+
+    const SESSION_ID: &str = "session-storage-permission-failure";
+    let env = setup_test_env();
+    let sessions = env.dir.join("sessions");
+    let target = sessions.join(format!("{SESSION_ID}.json"));
+    let mut session = Session::new("openai", "gpt-4", 128000, "");
+    session.id = SESSION_ID.into();
+    save_session(&session).unwrap();
+    let prior = std::fs::read_to_string(&target).unwrap();
+
+    for fail_rename in [false, true] {
+        let error = atomic_write_with_failure(
+            &target,
+            "SENTINEL-INCOMPLETE-SESSION-CONTENT",
+            fail_rename,
+        )
+        .expect_err("injected failure must be surfaced");
+        assert!(
+            !error
+                .to_string()
+                .contains("SENTINEL-INCOMPLETE-SESSION-CONTENT")
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), prior);
+        assert_eq!(mode(&target), 0o600);
+        assert_eq!(private_temp_residue(&sessions), 0);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn session_storage_permissions_windows_dacls_exclude_broad_principals() {
+    const SESSION_ID: &str = "session-storage-permission-windows";
+    let env = setup_test_env();
+    let sessions = env.dir.join("sessions");
+    let session_path = sessions.join(format!("{SESSION_ID}.json"));
+    let lock_path = sessions.join(format!("{SESSION_ID}.json.lock"));
+    let mut session = Session::new("openai", "gpt-4", 128000, "");
+    session.id = SESSION_ID.into();
+    save_session(&session).unwrap();
+    atomic_write(&lock_path, "private lock").unwrap();
+    let output_path = save_tool_output(SESSION_ID, "bash", "private tool output").unwrap();
+
+    for (path, directory) in [
+        (sessions, true),
+        (session_path, false),
+        (lock_path, false),
+        (output_path.parent().unwrap().to_path_buf(), true),
+        (output_path, false),
+    ] {
+        let dacl = crate::fs::private_dacl_sddl(&path, directory).unwrap();
+        assert!(
+            dacl.starts_with("D:P"),
+            "DACL inherits broad grants: {dacl}"
+        );
+        assert!(
+            !dacl.contains(";;;WD)") && !dacl.contains("S-1-1-0"),
+            "Everyone can access session content: {dacl}"
+        );
+        assert!(
+            !dacl.contains(";;;BU)") && !dacl.contains("S-1-5-32-545"),
+            "ordinary Users can access session content: {dacl}"
+        );
+    }
+    assert_eq!(private_temp_residue(&env.dir), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn session_storage_permissions_windows_reject_reparse_paths_without_mutation() {
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "test fixture must create a real junction");
+    }
+
+    const SESSION_ID: &str = "session-storage-permission-reparse";
+    let env = setup_test_env();
+    let sessions = env.dir.join("sessions");
+    let outside = env.dir.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+
+    let mut session = Session::new("openai", "gpt-4", 128000, "");
+    session.id = SESSION_ID.into();
+    let session_path = sessions.join(format!("{SESSION_ID}.json"));
+    junction(&session_path, &outside);
+    assert!(save_session(&session).is_err());
+    std::fs::remove_dir(&session_path).unwrap();
+
+    let lock_path = sessions.join(format!("{SESSION_ID}.json.lock"));
+    junction(&lock_path, &outside);
+    assert!(atomic_write(&lock_path, "private lock").is_err());
+    std::fs::remove_dir(&lock_path).unwrap();
+
+    std::fs::remove_dir(&sessions).unwrap();
+    junction(&sessions, &outside);
+    assert!(save_session(&session).is_err());
+    assert!(!outside.join(format!("{SESSION_ID}.json")).exists());
+    std::fs::remove_dir(&sessions).unwrap();
+}
+
+#[cfg(not(any(unix, windows)))]
+#[test]
+fn session_storage_permissions_unsupported_platform_fails_closed() {
+    let env = setup_test_env();
+    let session = Session::new("openai", "gpt-4", 128000, "");
+    assert!(save_session(&session).is_err());
     drop(env);
 }
