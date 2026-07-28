@@ -289,10 +289,7 @@ async fn resolve_write_target(path: &str) -> rquickjs::Result<ResolvedWriteTarge
     })
 }
 
-async fn write_approved_file(
-    target: ResolvedWriteTarget,
-    content: String,
-) -> rquickjs::Result<()> {
+async fn write_approved_file(target: ResolvedWriteTarget, content: String) -> rquickjs::Result<()> {
     match target.mode {
         WriteMode::Create => {
             crate::fs::atomic_create_resolved_checked(
@@ -686,14 +683,13 @@ mod tests {
         std::fs::write(&oversized, vec![b'x'; READ_FILE_MAX_BYTES + 1]).unwrap();
         std::fs::write(&non_utf8, [0xff, 0xfe]).unwrap();
 
-        let error = call_read_file(
-            standard_permission(working_dir.clone()),
-            None,
-            oversized,
-        )
-        .await
-        .expect_err("oversized read should fail");
-        assert!(error.contains("resource limit"), "unexpected error: {error}");
+        let error = call_read_file(standard_permission(working_dir.clone()), None, oversized)
+            .await
+            .expect_err("oversized read should fail");
+        assert!(
+            error.contains("resource limit"),
+            "unexpected error: {error}"
+        );
 
         let error = call_read_file(standard_permission(working_dir), None, non_utf8)
             .await
@@ -791,11 +787,8 @@ mod tests {
         std::fs::create_dir_all(&working_dir).unwrap();
         let target = working_dir.join("oversized.txt");
         let runtime = tokio::runtime::Handle::current();
-        let owner = PermissionBridgeOwner::new(
-            Some(standard_permission(working_dir)),
-            None,
-            STEP_TIMEOUT,
-        );
+        let owner =
+            PermissionBridgeOwner::new(Some(standard_permission(working_dir)), None, STEP_TIMEOUT);
         let bridge = owner.bridge();
         let target_for_call = target.clone();
 
@@ -1139,7 +1132,9 @@ mod tests {
             .await
             .expect_err("replaced read target must fail");
         assert!(
-            error.to_string().contains("Path changed after permission check"),
+            error
+                .to_string()
+                .contains("Path changed after permission check"),
             "unexpected read swap error: {error}"
         );
 

@@ -24,7 +24,10 @@ impl Drop for TestEnv {
 
 fn setup_test_env() -> TestEnv {
     let lock = STORAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir().join(format!("zs_test_{}", std::process::id()));
+    let dir = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("zs_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let data_dir = dir.to_str().unwrap().to_string();
@@ -148,7 +151,10 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
 #[test]
 fn long_tool_result_save_failure_keeps_full_output() {
     let lock = STORAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let path = std::env::temp_dir().join(format!("zs_data_file_{}", std::process::id()));
+    let path = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("zs_data_file_{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, b"not a directory").unwrap();
     unsafe { env::set_var("ZS_DATA_DIR", path.to_str().unwrap()) };
@@ -214,7 +220,10 @@ fn save_session_preserves_cost_fields() {
 #[test]
 fn find_sessions_by_prefix_empty_for_nonexistent_dir() {
     let lock = STORAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir().join(format!("zs_nodir_{}", std::process::id()));
+    let dir = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("zs_nodir_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     unsafe { env::set_var("ZS_DATA_DIR", dir.to_str().unwrap()) };
     // Don't create the directory at all

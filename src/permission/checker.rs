@@ -759,11 +759,14 @@ mod tests {
         fn new() -> Self {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "zerostack_permission_checker_test_{}_{}",
-                std::process::id(),
-                sequence
-            ));
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!(
+                    "zerostack_permission_checker_test_{}_{}",
+                    std::process::id(),
+                    sequence
+                ));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }

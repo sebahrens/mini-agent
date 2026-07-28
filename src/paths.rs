@@ -1770,8 +1770,10 @@ mod tests {
 
     #[test]
     fn app_paths_matrix_routes_startup_config_to_resolved_root() {
-        let root =
-            std::env::temp_dir().join(format!("zerostack-app-paths-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zerostack-app-paths-{}", uuid::Uuid::new_v4()));
         let environment = PathEnvironment {
             platform: PathPlatform::current().unwrap(),
             home_dir: Some(root.join("home")),
@@ -1797,8 +1799,10 @@ mod tests {
     }
 
     fn isolated_paths() -> (PathBuf, AppPaths) {
-        let root =
-            std::env::temp_dir().join(format!("zerostack-path-owner-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zerostack-path-owner-{}", uuid::Uuid::new_v4()));
         let paths = AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
