@@ -98,11 +98,7 @@ impl PermissionBridge {
         self.check_sync(PermissionCheckKind::Input, tool, key)
     }
 
-    pub(crate) fn check_path(
-        &self,
-        tool: &str,
-        key: &str,
-    ) -> Result<(), PermissionBridgeError> {
+    pub(crate) fn check_path(&self, tool: &str, key: &str) -> Result<(), PermissionBridgeError> {
         self.check_sync(PermissionCheckKind::Path, tool, key)
     }
 
@@ -448,9 +444,7 @@ async fn resolve_permission(
 
     match check {
         CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => PermOutcome::Allowed,
-        CheckResult::Denied(reason) => {
-            PermOutcome::Denied(PermissionDenial::Policy(reason))
-        }
+        CheckResult::Denied(reason) => PermOutcome::Denied(PermissionDenial::Policy(reason)),
         CheckResult::Ask => {
             let Some(ask_tx) = ask_tx else {
                 return PermOutcome::Denied(PermissionDenial::NonInteractive);
@@ -478,9 +472,7 @@ async fn resolve_permission(
                     PermOutcome::Allowed
                 }
                 Ok(UserDecision::Deny) => PermOutcome::Denied(PermissionDenial::User),
-                Err(_) => {
-                    PermOutcome::BackendFailure(PermissionBackendFailure::AskResponseDropped)
-                }
+                Err(_) => PermOutcome::BackendFailure(PermissionBackendFailure::AskResponseDropped),
             }
         }
     }
@@ -495,13 +487,8 @@ pub struct JsTool {
 }
 
 impl JsTool {
-    pub fn new(
-        sandbox: Sandbox,
-        permission: Option<PermCheck>,
-        ask_tx: Option<AskSender>,
-    ) -> Self {
-        let permission_bridge =
-            PermissionBridgeOwner::new(permission, ask_tx, STEP_TIMEOUT);
+    pub fn new(sandbox: Sandbox, permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
+        let permission_bridge = PermissionBridgeOwner::new(permission, ask_tx, STEP_TIMEOUT);
         let bridge = permission_bridge.bridge();
         let (tx, rx) = mpsc::channel();
         let runtime = tokio::runtime::Handle::current();
@@ -616,12 +603,8 @@ impl Tool for JsTool {
             JsOutcome::Value(value) => Ok(value),
             JsOutcome::Void => Ok(String::new()),
             JsOutcome::Error(error) => Ok(format!("JS error:\n{error}")),
-            JsOutcome::Timeout => {
-                Ok("JS error: execution timed out (30s limit exceeded)".into())
-            }
-            JsOutcome::OomKilled => {
-                Ok("JS error: out of memory (64 MiB limit exceeded)".into())
-            }
+            JsOutcome::Timeout => Ok("JS error: execution timed out (30s limit exceeded)".into()),
+            JsOutcome::OomKilled => Ok("JS error: out of memory (64 MiB limit exceeded)".into()),
         }
     }
 }
@@ -636,10 +619,8 @@ mod js_permission_bridge {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::permission::{
-        Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm,
-    };
     use crate::permission::checker::PermissionChecker;
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
     fn permission(action: Action) -> PermCheck {
         let config = PermissionConfig {
@@ -672,9 +653,7 @@ mod js_permission_bridge {
 
     fn reply(envelope: PermissionEnvelope, outcome: PermOutcome) {
         let request_id = envelope.request.id();
-        envelope
-            .reply
-            .send(PermResponse::new(request_id, outcome));
+        envelope.reply.send(PermResponse::new(request_id, outcome));
     }
 
     #[tokio::test]
@@ -695,22 +674,16 @@ mod js_permission_bridge {
                     .bridge()
                     .check_async("bash", "printf denied")
                     .await,
-                Err(PermissionBridgeError::Denied(
-                    PermissionDenial::Policy(_)
-                ))
+                Err(PermissionBridgeError::Denied(PermissionDenial::Policy(_)))
             ),
             "configured denial should stay typed as a policy denial"
         );
 
         let (ask_tx, mut ask_rx) = tokio_mpsc::channel(1);
-        let ask_owner = PermissionBridgeOwner::new(
-            Some(permission(Action::Ask)),
-            Some(ask_tx),
-            STEP_TIMEOUT,
-        );
+        let ask_owner =
+            PermissionBridgeOwner::new(Some(permission(Action::Ask)), Some(ask_tx), STEP_TIMEOUT);
         let bridge = ask_owner.bridge();
-        let approval =
-            tokio::spawn(async move { bridge.check_async("bash", "printf ask").await });
+        let approval = tokio::spawn(async move { bridge.check_async("bash", "printf ask").await });
         let request = ask_rx.recv().await.expect("ask request should arrive");
         request
             .reply
@@ -748,14 +721,8 @@ mod js_permission_bridge {
             STEP_TIMEOUT,
         );
         let bridge = dropped_owner.bridge();
-        let check =
-            tokio::spawn(async move { bridge.check_async("bash", "printf dropped").await });
-        drop(
-            dropped_rx
-                .recv()
-                .await
-                .expect("ask request should arrive"),
-        );
+        let check = tokio::spawn(async move { bridge.check_async("bash", "printf dropped").await });
+        drop(dropped_rx.recv().await.expect("ask request should arrive"));
         assert_eq!(
             check.await.expect("check task should not panic"),
             Err(PermissionBridgeError::BackendFailure(
@@ -768,8 +735,7 @@ mod js_permission_bridge {
     async fn js_permission_bridge_timeout_is_bounded() {
         let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_millis(30));
         let started = Instant::now();
-        let check =
-            tokio::task::spawn_blocking(move || bridge.check("bash", "sleep forever"));
+        let check = tokio::task::spawn_blocking(move || bridge.check("bash", "sleep forever"));
         let _request = rx.recv().await.expect("permission request should arrive");
 
         assert_eq!(
@@ -804,9 +770,8 @@ mod js_permission_bridge {
     #[tokio::test]
     async fn js_permission_bridge_dropped_response_sender_is_deterministic() {
         let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_secs(1));
-        let check = tokio::task::spawn_blocking(move || {
-            bridge.check("bash", "printf disconnected")
-        });
+        let check =
+            tokio::task::spawn_blocking(move || bridge.check("bash", "printf disconnected"));
         let envelope = rx.recv().await.expect("permission request should arrive");
         drop(envelope);
 
@@ -819,8 +784,7 @@ mod js_permission_bridge {
     #[tokio::test]
     async fn js_permission_bridge_dropped_response_receiver_discards_late_reply() {
         let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_millis(30));
-        let check =
-            tokio::task::spawn_blocking(move || bridge.check("bash", "printf late"));
+        let check = tokio::task::spawn_blocking(move || bridge.check("bash", "printf late"));
         let envelope = rx.recv().await.expect("permission request should arrive");
         assert_eq!(
             check.await.expect("permission task should not panic"),
@@ -836,8 +800,7 @@ mod js_permission_bridge {
         let invocation = PermCancellation::new();
         let invocation_for_thread = invocation.clone();
         let bridge = bridge.for_invocation(invocation_for_thread);
-        let check =
-            tokio::task::spawn_blocking(move || bridge.check("bash", "printf cancelled"));
+        let check = tokio::task::spawn_blocking(move || bridge.check("bash", "printf cancelled"));
         let _request = rx.recv().await.expect("permission request should arrive");
         invocation.cancel();
 
@@ -851,8 +814,7 @@ mod js_permission_bridge {
     async fn js_permission_bridge_late_reply_cannot_satisfy_repeated_call() {
         let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_millis(40));
         let first_bridge = bridge.clone();
-        let first =
-            tokio::task::spawn_blocking(move || first_bridge.check("bash", "first"));
+        let first = tokio::task::spawn_blocking(move || first_bridge.check("bash", "first"));
         let first_envelope = rx.recv().await.expect("first request should arrive");
         let first_id = first_envelope.request.id();
         assert_eq!(
@@ -867,28 +829,30 @@ mod js_permission_bridge {
         reply(first_envelope, PermOutcome::Allowed);
         reply(second_envelope, PermOutcome::Allowed);
 
-        assert_eq!(second.await.expect("second request should not panic"), Ok(()));
+        assert_eq!(
+            second.await.expect("second request should not panic"),
+            Ok(())
+        );
     }
 
     #[tokio::test]
     async fn js_permission_bridge_out_of_order_replies_remain_correlated() {
         let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_secs(1));
         let first_bridge = bridge.clone();
-        let first =
-            tokio::task::spawn_blocking(move || first_bridge.check("bash", "first"));
+        let first = tokio::task::spawn_blocking(move || first_bridge.check("bash", "first"));
         let second = tokio::task::spawn_blocking(move || bridge.check("bash", "second"));
         let first_envelope = rx.recv().await.expect("first request should arrive");
         let second_envelope = rx.recv().await.expect("second request should arrive");
-        assert_ne!(
-            first_envelope.request.id(),
-            second_envelope.request.id()
-        );
+        assert_ne!(first_envelope.request.id(), second_envelope.request.id());
 
         reply(second_envelope, PermOutcome::Allowed);
         reply(first_envelope, PermOutcome::Allowed);
 
         assert_eq!(first.await.expect("first request should not panic"), Ok(()));
-        assert_eq!(second.await.expect("second request should not panic"), Ok(()));
+        assert_eq!(
+            second.await.expect("second request should not panic"),
+            Ok(())
+        );
     }
 
     #[tokio::test]

@@ -107,9 +107,9 @@ pub(crate) fn make_read_file(
             "js/read_file",
             STEP_TIMEOUT,
             async move {
-            tokio::fs::read_to_string(path)
-                .await
-                .map_err(rquickjs::Error::Io)
+                tokio::fs::read_to_string(path)
+                    .await
+                    .map_err(rquickjs::Error::Io)
             },
         )
     }
@@ -213,19 +213,13 @@ pub(crate) fn register_host_globals(
         globals
             .set(
                 "read_file",
-                Func::from(make_read_file(
-                    permission_bridge.clone(),
-                    runtime.clone(),
-                )),
+                Func::from(make_read_file(permission_bridge.clone(), runtime.clone())),
             )
             .expect("register read_file");
         globals
             .set(
                 "write_file",
-                Func::from(make_write_file(
-                    permission_bridge.clone(),
-                    runtime.clone(),
-                )),
+                Func::from(make_write_file(permission_bridge.clone(), runtime.clone())),
             )
             .expect("register write_file");
         globals
@@ -361,7 +355,7 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let _owner = owner;
             make_spawn(Sandbox::new(false, "bwrap"), bridge, runtime)(cmd.to_string(), args)
-            .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())
         })
         .await
         .expect("spawn test task panicked")

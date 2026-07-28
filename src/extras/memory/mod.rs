@@ -88,35 +88,38 @@ pub fn append_memory_block(preamble: &mut String, memory: Option<&str>) {
     }
 }
 
-/// Filesystem-safe, collision-resistant slug for a project path:
-/// "<sanitized-basename>-<8 hex of full-path hash>". Two different absolute
-/// paths that share a basename still get distinct slugs.
+/// Opaque, collision-resistant identity for a project path.
 ///
-/// Uses FNV-1a 64-bit (stable across all Rust versions and platforms) so slugs
-/// survive compiler upgrades.
+/// The project basename remains display metadata and never becomes a persistent
+/// component. Native path bytes are encoded explicitly before hashing.
 pub fn project_slug(path: &Path) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-    for &byte in path.as_os_str().as_encoded_bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
-    }
-    let short = hash as u32;
-    let base = path.file_name().and_then(|s| s.to_str()).unwrap_or("root");
-    let mut slug: String = base
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
+    let (encoding, identity) = project_path_identity(path);
+    crate::paths::opaque_name("memory-project", &[encoding, identity.as_slice()])
+}
+
+#[cfg(unix)]
+fn project_path_identity(path: &Path) -> (&'static [u8], Vec<u8>) {
+    use std::os::unix::ffi::OsStrExt;
+    (b"unix-bytes", path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn project_path_identity(path: &Path) -> (&'static [u8], Vec<u8>) {
+    use std::os::windows::ffi::OsStrExt;
+    let bytes = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
         .collect();
-    slug.truncate(40);
-    if slug.is_empty() {
-        slug.push_str("root");
-    }
-    format!("{slug}-{short:08x}")
+    (b"windows-utf16le", bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn project_path_identity(path: &Path) -> (&'static [u8], Vec<u8>) {
+    (
+        b"rust-encoded-bytes",
+        path.as_os_str().as_encoded_bytes().to_vec(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +170,7 @@ impl Mem {
         // cwd zerostack injects into the preamble.
         let project = std::env::current_dir()
             .map(|p| project_slug(&p))
-            .unwrap_or_else(|_| "default".to_string());
+            .unwrap_or_else(|_| crate::paths::opaque_name("memory-project", &[b"default"]));
         let today = Local::now().format("%Y-%m-%d").to_string();
         tracing::debug!("memory open: root={}, project={}", root.display(), project);
         Mem {

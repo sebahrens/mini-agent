@@ -5,8 +5,9 @@
 **Target platforms**: Linux, macOS, and Windows MSVC
 
 **Foundation implementation**: `src/paths.rs` provides the host-independent `AppPaths` resolver
-and injected `PathEnvironment` fixtures. Startup constructs the immutable roots once; artifact
-owner migration remains staged in the follow-up delivery tasks.
+and injected `PathEnvironment` fixtures. `src/paths/portable.rs` provides the shared portable
+component, collision-key, opaque digest-name, and containment policy. Startup constructs the
+immutable roots once; artifact owner migration remains staged in the follow-up delivery tasks.
 
 ---
 

@@ -69,13 +69,37 @@ fn default_redirect_uri_uses_loopback() {
 }
 
 #[test]
-fn token_filename_sanitizes_server_name() {
-    assert_eq!(
-        oauth::token_filename("Exa Web Search"),
-        "Exa_Web_Search.json"
+fn token_filename_uses_complete_canonical_server_identity() {
+    let first = oauth::token_filename(
+        "Exa Web Search",
+        "HTTPS://EXAMPLE.COM:443/mcp#ignored",
+        Some("client"),
+    )
+    .unwrap();
+    let equivalent =
+        oauth::token_filename("Exa Web Search", "https://example.com/mcp", Some("client")).unwrap();
+    assert_eq!(first, equivalent);
+    assert_eq!(first.len(), 69);
+    assert!(first.ends_with(".json"));
+    assert!(first[..64].bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    assert_ne!(
+        first,
+        oauth::token_filename("Exa/Web Search", "https://example.com/mcp", Some("client")).unwrap()
     );
-    assert_eq!(oauth::token_filename("../etc/passwd"), "___etc_passwd.json");
-    assert_eq!(oauth::token_filename("plain-name_1"), "plain-name_1.json");
+    assert_ne!(
+        first,
+        oauth::token_filename(
+            "Exa Web Search",
+            "https://example.com/other",
+            Some("client")
+        )
+        .unwrap()
+    );
+    assert_ne!(
+        first,
+        oauth::token_filename("Exa Web Search", "https://example.com/mcp", Some("other")).unwrap()
+    );
 }
 
 #[test]

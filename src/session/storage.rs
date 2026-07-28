@@ -11,7 +11,10 @@ fn session_dir() -> PathBuf {
 pub fn tool_output_dir(session_id: &str) -> PathBuf {
     dirs_path()
         .join("tool-outputs")
-        .join(safe_path_component(session_id))
+        .join(crate::paths::opaque_name(
+            "session-tool-output-directory",
+            &[session_id.as_bytes()],
+        ))
 }
 
 fn home_fallback() -> PathBuf {
@@ -57,6 +60,7 @@ pub fn atomic_write(path: &std::path::Path, content: &str) -> anyhow::Result<()>
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
     let dir = session_dir();
     std::fs::create_dir_all(&dir)?;
+    crate::paths::validate_portable_component(&session.id)?;
     let path = dir.join(format!("{}.json", session.id));
     let json = serde_json::to_string(session)?;
     let json_len = json.len();
@@ -77,37 +81,20 @@ pub fn save_tool_output(
 ) -> anyhow::Result<PathBuf> {
     let dir = tool_output_dir(session_id);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!(
-        "{}-{}.txt",
-        Uuid::new_v4(),
-        safe_path_component(tool_name)
-    ));
+    let nonce = Uuid::new_v4().to_string();
+    let filename = crate::paths::digest_filename(
+        "session-tool-output",
+        &[session_id.as_bytes(), tool_name.as_bytes(), nonce.as_bytes()],
+        "txt",
+    )?;
+    let path = dir.join(filename);
     std::fs::write(&path, output)?;
     Ok(path)
 }
 
-fn safe_path_component(value: &str) -> String {
-    let safe: String = value
-        .chars()
-        .take(64)
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if safe.is_empty() {
-        "tool".to_string()
-    } else {
-        safe
-    }
-}
-
 pub fn delete_session(id: &str) -> anyhow::Result<()> {
     let dir = session_dir();
+    crate::paths::validate_portable_component(id)?;
     let path = dir.join(format!("{}.json", id));
     if path.exists() {
         std::fs::remove_file(&path)?;

@@ -493,7 +493,14 @@ fn handle_mcp_logout(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         write_error(ctx.renderer, "usage: /mcp logout <server>");
         return Ok(());
     };
-    match crate::extras::mcp::oauth::logout(name) {
+    let (url, settings) = match resolve_oauth_server(ctx, name) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            write_error(ctx.renderer, error);
+            return Ok(());
+        }
+    };
+    match crate::extras::mcp::oauth::logout(name, &url, &settings) {
         Ok(true) => write_ok(
             ctx.renderer,
             format!("removed stored OAuth token for '{name}' (effective next start)"),

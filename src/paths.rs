@@ -1,6 +1,15 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+pub mod portable;
+
+pub use portable::{
+    MAX_PORTABLE_COMPONENT_BYTES, MAX_PORTABLE_COMPONENT_UTF16_UNITS, MAX_PORTABLE_PATH_BYTES,
+    MAX_PORTABLE_PATH_UTF16_UNITS, PortablePathError, collision_key, contained_join,
+    digest_filename, ensure_contained, ensure_no_link_traversal, opaque_name,
+    validate_portable_component, validate_portable_relative_path,
+};
+
 const APP_COMPONENT: &str = "zerostack";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

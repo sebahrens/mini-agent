@@ -21,13 +21,7 @@ pub(crate) fn js_thread_main(
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
-        let outcome = run_step(
-            &req.code,
-            &sandbox,
-            &bridge,
-            &req.cancellation,
-            &runtime,
-        );
+        let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
         let _ = req.reply.send(JsResponse { outcome });
     }
 }

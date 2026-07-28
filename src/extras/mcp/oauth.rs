@@ -24,23 +24,59 @@ fn oauth_dir() -> PathBuf {
     crate::session::storage::data_dir().join("mcp-oauth")
 }
 
-/// Sanitize a server name into a single safe filename component.
-pub(crate) fn token_filename(server_name: &str) -> String {
-    let sanitized: String = server_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{sanitized}.json")
+/// Build the opaque credential filename for an exact MCP server identity.
+///
+/// The configured map key is display metadata only. Its exact bytes, normalized
+/// endpoint, and explicit client id are length-prefixed into a versioned digest.
+pub(crate) fn token_filename(
+    server_name: &str,
+    url: &str,
+    client_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let normalized_url = normalize_http_url(url)?;
+    Ok(crate::paths::digest_filename(
+        "mcp-oauth-server",
+        &[
+            server_name.as_bytes(),
+            normalized_url.as_bytes(),
+            client_id.unwrap_or("").as_bytes(),
+        ],
+        "json",
+    )?)
 }
 
-fn token_path(server_name: &str) -> PathBuf {
-    oauth_dir().join(token_filename(server_name))
+fn token_path(
+    server_name: &str,
+    url: &str,
+    settings: &OAuthSettings,
+) -> anyhow::Result<PathBuf> {
+    Ok(oauth_dir().join(token_filename(
+        server_name,
+        url,
+        settings.client_id.as_deref(),
+    )?))
+}
+
+fn normalize_http_url(value: &str) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(value)
+        .map_err(|error| anyhow::anyhow!("invalid MCP OAuth endpoint: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        anyhow::bail!("MCP OAuth endpoint must be an absolute HTTP(S) URL");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("MCP OAuth endpoint must not contain user information");
+    }
+    url.set_fragment(None);
+    let default_port = match url.scheme() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    if url.port() == default_port {
+        url.set_port(None)
+            .map_err(|()| anyhow::anyhow!("could not normalize MCP OAuth endpoint port"))?;
+    }
+    Ok(url.to_string())
 }
 
 /// File-backed credential store. One JSON file per MCP server.
@@ -49,10 +85,10 @@ struct FileCredentialStore {
 }
 
 impl FileCredentialStore {
-    fn new(server_name: &str) -> Self {
-        Self {
-            path: token_path(server_name),
-        }
+    fn new(server_name: &str, url: &str, settings: &OAuthSettings) -> anyhow::Result<Self> {
+        Ok(Self {
+            path: token_path(server_name, url, settings)?,
+        })
     }
 
     fn read_blocking(&self) -> Result<Option<StoredCredentials>, AuthError> {
@@ -142,8 +178,8 @@ impl CredentialStore for FileCredentialStore {
 }
 
 /// Delete the stored token for a server. Returns whether a file was removed.
-pub fn logout(server_name: &str) -> anyhow::Result<bool> {
-    let path = token_path(server_name);
+pub fn logout(server_name: &str, url: &str, settings: &OAuthSettings) -> anyhow::Result<bool> {
+    let path = token_path(server_name, url, settings)?;
     if !path.exists() {
         return Ok(false);
     }
@@ -158,12 +194,12 @@ pub fn logout(server_name: &str) -> anyhow::Result<bool> {
 pub async fn build_auth_client(
     server_name: &str,
     url: &str,
-    _settings: &OAuthSettings,
+    settings: &OAuthSettings,
 ) -> anyhow::Result<AuthClient<reqwest::Client>> {
     let mut manager = AuthorizationManager::new(url)
         .await
         .map_err(|e| anyhow::anyhow!("OAuth init failed: {e}"))?;
-    manager.set_credential_store(FileCredentialStore::new(server_name));
+    manager.set_credential_store(FileCredentialStore::new(server_name, url, settings)?);
 
     let restored = manager
         .initialize_from_store()
@@ -194,7 +230,7 @@ pub async fn begin_login(
     let mut manager = AuthorizationManager::new(url)
         .await
         .map_err(|e| anyhow::anyhow!("OAuth init failed: {e}"))?;
-    manager.set_credential_store(FileCredentialStore::new(server_name));
+    manager.set_credential_store(FileCredentialStore::new(server_name, url, settings)?);
 
     let metadata = manager
         .discover_metadata()
