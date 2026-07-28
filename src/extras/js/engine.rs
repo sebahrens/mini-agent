@@ -200,14 +200,18 @@ pub(crate) fn js_thread_main(
 ) {
     while let Ok(req) = rx.recv() {
         if req.cancellation.is_cancelled() {
-            let _ = req.reply.send(JsResponse {
+            if let Err(error) = req.reply.send(JsResponse {
                 outcome: JsOutcome::Error("execution cancelled".to_string()),
-            });
+            }) {
+                tracing::debug!("JS engine reply channel closed: {}", error);
+            }
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        let _ = req.reply.send(JsResponse { outcome });
+        if let Err(error) = req.reply.send(JsResponse { outcome }) {
+            tracing::debug!("JS engine reply channel closed: {}", error);
+        }
     }
 }
 
