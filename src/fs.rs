@@ -133,30 +133,91 @@ async fn resolve_symlink_target(path: &Path) -> PathBuf {
 }
 
 pub fn expand_tilde(s: &str) -> String {
-    let home = || dirs::home_dir().map(|p| p.to_string_lossy().to_string());
+    let Some(home) = dirs::home_dir() else {
+        return s.to_string();
+    };
 
     if s == "~" || s == "$HOME" {
-        if let Some(h) = home() {
-            return h;
-        }
-        return s.to_string();
+        return home.to_string_lossy().to_string();
     }
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(h) = home() {
-            return std::path::Path::new(&h)
-                .join(rest)
-                .to_string_lossy()
-                .to_string();
-        }
-        return s.to_string();
+        return expand_home_relative(&home, rest)
+            .to_string_lossy()
+            .to_string();
     }
-    if let Some(rest) = s.strip_prefix("$HOME/")
-        && let Some(h) = home()
-    {
-        return std::path::Path::new(&h)
-            .join(rest)
+    if let Some(rest) = s.strip_prefix("$HOME/") {
+        return expand_home_relative(&home, rest)
             .to_string_lossy()
             .to_string();
     }
     s.to_string()
+}
+
+/// Resolve a path relative to `home` without allowing parent components to
+/// traverse above it.
+fn expand_home_relative(home: &Path, relative: &str) -> PathBuf {
+    let mut expanded = home.to_path_buf();
+    let mut depth = 0;
+
+    for component in Path::new(relative).components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                expanded.push(part);
+                depth += 1;
+            }
+            std::path::Component::ParentDir if depth > 0 => {
+                expanded.pop();
+                depth -= 1;
+            }
+            std::path::Component::ParentDir
+            | std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
+
+    expanded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_tilde_keeps_parent_traversal_within_home() {
+        let home = dirs::home_dir().expect("test requires a home directory");
+
+        assert_eq!(
+            PathBuf::from(expand_tilde("~/../../etc/passwd")),
+            home.join("etc/passwd")
+        );
+        assert_eq!(
+            PathBuf::from(expand_tilde("~/../../../root/.ssh/id_rsa")),
+            home.join("root/.ssh/id_rsa")
+        );
+        assert_eq!(
+            PathBuf::from(expand_tilde("$HOME/../../../root/.ssh/id_rsa")),
+            home.join("root/.ssh/id_rsa")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_normalizes_parent_components_below_home() {
+        let home = dirs::home_dir().expect("test requires a home directory");
+
+        assert_eq!(
+            PathBuf::from(expand_tilde("~/projects/mini-agent/../notes")),
+            home.join("projects/notes")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_does_not_treat_repeated_separator_as_absolute() {
+        let home = dirs::home_dir().expect("test requires a home directory");
+
+        assert_eq!(
+            PathBuf::from(expand_tilde("~//etc/passwd")),
+            home.join("etc/passwd")
+        );
+    }
 }
