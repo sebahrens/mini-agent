@@ -4,9 +4,7 @@ use regex::Regex;
 use rig::tool::Tool;
 
 use super::find_files::BoundDirectory;
-use crate::agent::tools::{
-    AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_path,
-};
+use crate::agent::tools::{AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_path};
 
 pub struct GrepTool {
     pub permission: Option<PermCheck>,

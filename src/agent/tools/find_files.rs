@@ -511,8 +511,11 @@ impl BoundWalker {
         }
         matchers.extend(parent_ignore_matchers(&approved_root));
         if let Ok(exclude) = open_relative(&root, Path::new(".git/info/exclude"))
-            && let Some(matcher) =
-                ignore_matcher(exclude, &approved_root, approved_root.join(".git/info/exclude"))
+            && let Some(matcher) = ignore_matcher(
+                exclude,
+                &approved_root,
+                approved_root.join(".git/info/exclude"),
+            )
         {
             matchers.push(matcher);
         }
@@ -545,9 +548,7 @@ impl Iterator for BoundWalker {
             };
             let approved_path = self.approved_root.join(&relative_path);
             let is_directory = metadata.is_dir();
-            if is_directory
-                && is_skip_dir(name.to_str().unwrap_or(""))
-            {
+            if is_directory && is_skip_dir(name.to_str().unwrap_or("")) {
                 continue;
             }
             if is_ignored(&frame.matchers, &approved_path, is_directory) {
@@ -555,12 +556,9 @@ impl Iterator for BoundWalker {
             }
             if is_directory {
                 let matchers = frame.matchers.clone();
-                if let Ok(child_frame) = DirectoryFrame::new(
-                    child,
-                    relative_path,
-                    matchers,
-                    &self.approved_root,
-                ) {
+                if let Ok(child_frame) =
+                    DirectoryFrame::new(child, relative_path, matchers, &self.approved_root)
+                {
                     self.stack.push(child_frame);
                 }
                 continue;

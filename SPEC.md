@@ -144,60 +144,78 @@ fn run_step(code: &str) -> JsOutcome {
 }
 ```
 
-**Note on host globals:** `register_host_globals` is called inside `ctx.with()` scope in Phase 1. In Phase 1 the host functions are synchronous (file I/O is blocking on the JS thread, which is acceptable — it is not the tokio thread). The `spawn()` global requires a channel back to tokio for permission checks; see §1.4.
+**Note on host globals:** `register_host_globals` is called inside `ctx.with()` scope in Phase 1. Host functions are synchronous from JavaScript's perspective and block only the dedicated JS thread. File operations and `spawn()` use `PermissionBridge` to route permission checks back to tokio; finite host-call and permission deadlines prevent the JS thread from waiting indefinitely.
 
 ### 1.4 Host functions — `src/extras/js/host.rs`
 
-Phase 1 host functions run synchronously on the JS thread. `spawn()` permission checks route back through a secondary channel to tokio (the `ask_tx` plumbing from `BashTool`).
+Phase 1 exposes four globals:
+
+| Global | Implementation | Permission check |
+|--------|----------------|-----------------|
+| `read_file(path)` | stable bounded read, at most 1 MiB | `"js/read_file"` + canonical target |
+| `write_file(path, content)` | descriptor-relative atomic create or replace, at most 1 MiB | `"js/write_file"` + resolved final target |
+| `spawn(cmd, args)` | `Sandbox::wrap_command` | `"js/spawn"` + command |
+| `console.log(...)` | `eprintln!` / `tracing::info!` | none |
+
+`read_file` canonicalizes the target and captures its identity before requesting
+permission for the exact canonical UTF-8 path. After approval, it rejects non-regular
+or oversized files, opens without following a final symlink, verifies that the opened
+file still has the approved identity, and performs a bounded UTF-8 read.
+
+`write_file` rejects oversized content before mutation and rejects existing final
+symlinks. For a new file, it canonicalizes the nearest existing parent and requires
+the missing suffix to be one normal filename component. It requests permission for
+the derived final UTF-8 path, then uses the descriptor-relative atomic helpers in
+`src/fs.rs` to revalidate the approved parent identity and create or replace without
+following symlinks.
+
+The host closures enforce that ordering explicitly:
 
 ```rust
-// read_file: blocking std::fs::read_to_string on JS thread
-// write_file: blocking std::fs::write on JS thread
-// spawn: std::process::Command (blocking) — permission check via channel before exec
-// console.log: eprintln! or tracing::info!
-```
-
-Full signatures:
-
-```rust
-pub fn make_read_file() -> impl Fn(String) -> rquickjs::Result<String> {
-    move |path: String| {
-        std::fs::read_to_string(&path)
-            .map_err(|e| rquickjs::Error::new_from_js("read_file", &e.to_string()))
+pub(crate) fn make_read_file(
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+) -> impl Fn(String) -> rquickjs::Result<String> {
+    move |path| {
+        let target = block_on_host_call(&runtime, resolve_read_target(&path))?;
+        let canonical = permission_path("js/read_file", &target.path)?;
+        permission_bridge.check_path("js/read_file", &canonical)?;
+        block_on_host_call(&runtime, read_approved_file(target))
     }
 }
 
-pub fn make_write_file() -> impl Fn(String, String) -> rquickjs::Result<()> {
-    move |path: String, content: String| {
-        std::fs::write(&path, content)
-            .map_err(|e| rquickjs::Error::new_from_js("write_file", &e.to_string()))
+pub(crate) fn make_write_file(
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+) -> impl Fn(String, String) -> rquickjs::Result<()> {
+    move |path, content| {
+        reject_oversized_write(&content)?;
+        let target = block_on_host_call(&runtime, resolve_write_target(&path))?;
+        let resolved = permission_path("js/write_file", &target.path)?;
+        permission_bridge.check_path("js/write_file", &resolved)?;
+        block_on_host_call(&runtime, write_approved_file(target, content))
     }
 }
 ```
 
-`spawn()` implementation:
+Denial, failed interactive approval, timeout, cancellation, or channel closure returns
+a JS error and performs no content read or mutation. Permission is always required;
+later filesystem allow-lists may only narrow an approved operation.
+
+`spawn()` uses the same bridge rather than constructing an ad hoc permission channel:
 
 ```rust
-// JS thread receives a channel sender to tokio for permission checks.
-// The JS thread blocks on a sync channel until tokio resolves the permission.
-// This is acceptable because the JS thread is dedicated and not holding other work.
-pub struct SpawnContext {
-    pub sandbox: crate::sandbox::Sandbox,
-    pub perm_sync_tx: std::sync::mpsc::SyncSender<PermRequest>,
-}
-
-pub fn make_spawn(ctx: SpawnContext) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
+pub(crate) fn make_spawn(
+    sandbox: Sandbox,
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
     move |cmd: String, args: Vec<String>| {
-        // 1. Send permission request to tokio via sync channel
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        ctx.perm_sync_tx.send(PermRequest { tool: "js/spawn".into(), key: cmd.clone(), reply: reply_tx }).ok();
-        match reply_rx.recv() {
-            Ok(PermResponse::Denied(msg)) => return Err(rquickjs::Error::new_from_js("spawn", &msg)),
-            Ok(PermResponse::Allowed) => {}
-            Err(_) => return Err(rquickjs::Error::new_from_js("spawn", "permission channel closed")),
-        }
-        // 2. Execute via Sandbox::wrap_command
-        // ...
+        let command = format_permission_command(&cmd, &args);
+        permission_bridge.check("js/spawn", &command)?;
+        let mut child = sandbox.wrap_command(r#"exec "$0" "$@""#);
+        child.arg(cmd).args(args);
+        runtime.block_on(run_with_timeout_and_cancellation(child))
     }
 }
 ```
@@ -346,7 +364,11 @@ read  = ["/home/**", "/tmp/**"]
 write = ["/tmp/**"]
 ```
 
-Checked in `read_file`/`write_file` host functions before `std::fs` call. Violations: `Err("path not in allow-list")` returned to JS.
+Applied only after secure path resolution and before the mandatory permission request.
+Allow-lists may narrow access but never bypass interactive authorization. Approved
+reads still use the bounded stable-read path, and approved writes still use the
+descriptor-relative atomic-write path. Violations return a typed JS error without
+reading content or mutating the filesystem.
 
 ### 2.3 birdcage integration
 
