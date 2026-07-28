@@ -201,10 +201,7 @@ async fn test_timeout() {
         .await
         .expect("timeout call failed");
 
-    assert_eq!(
-        result,
-        "JS error: execution timed out (30s limit exceeded)"
-    );
+    assert_eq!(result, "JS error: execution timed out (30s limit exceeded)");
 }
 
 #[tokio::test]
@@ -264,8 +261,8 @@ async fn test_oom() {
         .await
         .expect("OOM call failed");
 
-    assert!(
-        result.contains("out of memory"),
-        "memory limit did not produce an OOM response: {result}"
+    assert_eq!(
+        result, "JS error: out of memory (64 MiB limit exceeded)",
+        "memory limit did not produce the classified OOM response"
     );
 }

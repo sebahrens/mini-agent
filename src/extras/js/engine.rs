@@ -12,10 +12,11 @@ fn exception_details(
 ) -> Result<(String, String), JsOutcome> {
     let exception =
         exception.ok_or_else(|| JsOutcome::Error("Failed to extract exception".to_string()))?;
-    Ok((
-        exception.message().unwrap_or_default(),
-        exception.stack().unwrap_or_default(),
-    ))
+    let message = exception.message().unwrap_or_default();
+    if message.contains("out of memory") {
+        return Err(JsOutcome::OomKilled);
+    }
+    Ok((message, exception.stack().unwrap_or_default()))
 }
 
 pub(crate) fn js_thread_main(
@@ -87,6 +88,7 @@ pub(crate) fn run_step(
                     JsOutcome::Error(format!("{msg}\n{stack}"))
                 }
             }
+            Err(rquickjs::Error::Allocation) => JsOutcome::OomKilled,
             Err(e) => JsOutcome::Error(e.to_string()),
             Ok(v) => {
                 if v.is_undefined() || v.is_null() {
