@@ -329,10 +329,15 @@ permission mode, and escalates to deny in non-interactive contexts (`-p`,
 interactive prompt for that one call only — it can never override a deny
 from a rule, security mode, managed policy, or another hook. `PreToolUse` may
 also set `"updatedInput"` to rewrite the tool's arguments before it runs, and
-`PostToolUse` may set `"result"` to rewrite the model-visible output.
+`PostToolUse` may set `"redactions"` to an array of exact, non-empty strings.
+Every occurrence is replaced with the fixed marker `[REDACTED]`. Hook-authored
+`"result"` replacements are ignored so a hook cannot substitute arbitrary
+model-visible output.
 
-`UserPromptSubmit` and `SubagentStart` can set `"additionalContext"` to
-prepend text to the prompt. `Stop` and `SubagentStop` can set
+`SubagentStart` can set `"additionalContext"` to prepend text to the child
+prompt. `UserPromptSubmit` cannot alter the submitted prompt; an
+`"additionalContext"` field from that event is ignored. `Stop` and
+`SubagentStop` can set
 `"decision": "block"` with a `"reason"` to force the agent (or subagent) to
 continue instead of finishing, using `reason` as the next instruction; `Stop`
 gives up after 8 consecutive blocks without progress.

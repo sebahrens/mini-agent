@@ -11,6 +11,7 @@ use super::{Decision, HookCtx, PreDecision, Verdict};
 
 /// Default per-hook timeout when a handler doesn't declare one.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const REDACTION_MARKER: &str = "[REDACTED]";
 
 enum CompiledMatcher {
     All,
@@ -146,9 +147,9 @@ impl HookDispatcher {
         result
     }
 
-    /// Generic dispatch for non-permission events: lifecycle events and
-    /// `PostToolUse` result rewrite. Returns `Decision::Continue` after only
-    /// an index lookup when nothing matches (the zero-cost invariant).
+    /// Generic dispatch for non-permission lifecycle events. Returns
+    /// `Decision::Continue` after only an index lookup when nothing matches
+    /// (the zero-cost invariant).
     pub(crate) async fn dispatch(
         &self,
         event: &str,
@@ -164,7 +165,7 @@ impl HookDispatcher {
         let outputs = self
             .run_handlers(event, &handlers, &envelope, &ctx.cwd)
             .await;
-        merge_decisions(&outputs)
+        merge_decisions(event, &outputs)
     }
 
     /// Dispatches `PreToolUse`: the only blockable-by-default tool event.
@@ -198,7 +199,8 @@ impl HookDispatcher {
         merge_pre_decisions(&tool_input, &parts)
     }
 
-    /// Dispatches `PostToolUse`: may rewrite the model-visible result.
+    /// Dispatches `PostToolUse`: may redact exact strings from the
+    /// model-visible result, but cannot replace it with hook-authored content.
     pub(crate) async fn dispatch_post_tool_use(
         &self,
         ctx: &HookCtx,
@@ -223,7 +225,7 @@ impl HookDispatcher {
         let outputs = self
             .run_handlers("PostToolUse", &handlers, &envelope, &ctx.cwd)
             .await;
-        merge_decisions(&outputs)
+        merge_post_tool_use_decisions(&outputs, tool_response)
     }
 
     /// Dispatches `PostToolUseFailure`: observation only, never blockable.
@@ -416,7 +418,7 @@ fn merge_pre_decisions(
     }
 }
 
-fn parse_decision(output: &HookOutput) -> Decision {
+fn parse_decision(event: &str, output: &HookOutput) -> Decision {
     match interpret_hook_output(output) {
         ChannelResult::Block { stderr } => Decision::Block { reason: stderr },
         ChannelResult::NoObjection { json: Some(value) } => {
@@ -428,15 +430,18 @@ fn parse_decision(output: &HookOutput) -> Decision {
                     .to_string();
                 return Decision::Block { reason };
             }
-            if let Some(content) = value.get("additionalContext").and_then(|v| v.as_str()) {
+            if event == "SubagentStart"
+                && let Some(content) = value.get("additionalContext").and_then(|v| v.as_str())
+            {
                 return Decision::Rewrite {
                     content: content.to_string(),
                 };
             }
-            if let Some(content) = value.get("result").and_then(|v| v.as_str()) {
-                return Decision::Rewrite {
-                    content: content.to_string(),
-                };
+            if value.get("additionalContext").is_some() || value.get("result").is_some() {
+                tracing::warn!(
+                    event = event,
+                    "hooks: ignored unsafe hook-authored model context or result replacement"
+                );
             }
             Decision::Continue
         }
@@ -446,11 +451,11 @@ fn parse_decision(output: &HookOutput) -> Decision {
 }
 
 /// Merges multiple hooks' generic decisions: any `Block` wins outright; else
-/// the first declared `Rewrite` wins; else `Continue`.
-fn merge_decisions(outputs: &[HookOutput]) -> Decision {
+/// the first event-permitted `Rewrite` wins; else `Continue`.
+fn merge_decisions(event: &str, outputs: &[HookOutput]) -> Decision {
     let mut rewrite = None;
     for output in outputs {
-        match parse_decision(output) {
+        match parse_decision(event, output) {
             Decision::Block { reason } => return Decision::Block { reason },
             Decision::Rewrite { content } if rewrite.is_none() => {
                 rewrite = Some(Decision::Rewrite { content });
@@ -459,4 +464,77 @@ fn merge_decisions(outputs: &[HookOutput]) -> Decision {
         }
     }
     rewrite.unwrap_or(Decision::Continue)
+}
+
+fn merge_post_tool_use_decisions(outputs: &[HookOutput], tool_response: &str) -> Decision {
+    let mut redacted = tool_response.to_string();
+    let mut changed = false;
+
+    for output in outputs {
+        let ChannelResult::NoObjection { json: Some(value) } = interpret_hook_output(output) else {
+            continue;
+        };
+        if value.get("result").is_some() || value.get("additionalContext").is_some() {
+            tracing::warn!(
+                event = "PostToolUse",
+                "hooks: ignored unsafe hook-authored model context or result replacement"
+            );
+        }
+        changed |= apply_redactions(&mut redacted, &value);
+    }
+
+    if changed {
+        Decision::Rewrite { content: redacted }
+    } else {
+        Decision::Continue
+    }
+}
+
+fn apply_redactions(tool_response: &mut String, value: &serde_json::Value) -> bool {
+    let Some(redactions) = value.get("redactions").and_then(|value| value.as_array()) else {
+        return false;
+    };
+    let mut changed = false;
+    for literal in redactions
+        .iter()
+        .filter_map(|value| value.as_str())
+        .filter(|literal| !literal.is_empty())
+    {
+        if tool_response.contains(literal) {
+            *tool_response = tool_response.replace(literal, REDACTION_MARKER);
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_redactions;
+
+    #[test]
+    fn redactions_replace_only_requested_non_empty_literals() {
+        let mut response = "token=secret; status=ok".to_string();
+
+        let changed = apply_redactions(
+            &mut response,
+            &serde_json::json!({"redactions": ["secret", "", 42]}),
+        );
+
+        assert!(changed);
+        assert_eq!(response, "token=[REDACTED]; status=ok");
+    }
+
+    #[test]
+    fn missing_redactions_leave_the_response_unchanged() {
+        let mut response = "authoritative result".to_string();
+
+        let changed = apply_redactions(
+            &mut response,
+            &serde_json::json!({"result": "injected content"}),
+        );
+
+        assert!(!changed);
+        assert_eq!(response, "authoritative result");
+    }
 }

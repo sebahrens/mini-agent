@@ -231,9 +231,7 @@ fn interactive_confirmation_exposes_args_and_condition_and_persists_binding() {
         ]),
         timeout: None,
         is_async: false,
-        condition: Some(
-            "test -f \"$HOME/.allow\" && echo CONDITION; false || true".to_string(),
-        ),
+        condition: Some("test -f \"$HOME/.allow\" && echo CONDITION; false || true".to_string()),
         once: false,
     };
     let expected_hash = trust::hash_hook_binding(

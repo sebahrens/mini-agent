@@ -97,16 +97,9 @@ pub(crate) fn confirm_untrusted_hook(description: &str) -> bool {
 
 fn hook_confirmation_description(handler: &HookHandler) -> String {
     let argv = std::iter::once(handler.command.as_deref())
-        .chain(
-            handler
-                .args
-                .iter()
-                .flatten()
-                .map(|arg| Some(arg.as_str())),
-        )
+        .chain(handler.args.iter().flatten().map(|arg| Some(arg.as_str())))
         .collect::<Vec<_>>();
-    let argv =
-        serde_json::to_string(&argv).expect("serializing hook argv strings cannot fail");
+    let argv = serde_json::to_string(&argv).expect("serializing hook argv strings cannot fail");
 
     match handler.condition.as_deref() {
         Some(condition) => {

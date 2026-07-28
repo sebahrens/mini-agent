@@ -9,7 +9,8 @@ pub(crate) mod trust;
 
 /// Outcome of a non-tool-permission hook dispatch: lifecycle events (`Stop`,
 /// `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `SubagentStart`,
-/// `SubagentStop`) and `PostToolUse` result rewrite. Carries no rig type.
+/// `SubagentStop`) and constrained `PostToolUse` redaction. Carries no rig
+/// type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// No hook expressed an opinion (or none matched); proceed unchanged.
@@ -17,7 +18,7 @@ pub enum Decision {
     /// Block the action; `reason` is surfaced as user feedback or as the next
     /// instruction to the model.
     Block { reason: String },
-    /// Replace model-visible content: injected context or a rewritten result.
+    /// Replace model-visible content through an event-specific safe mechanism.
     Rewrite { content: String },
 }
 
@@ -110,8 +111,7 @@ pub(crate) fn wrap_from_global(
 
 /// Outcome of gating a user prompt through `UserPromptSubmit` hooks.
 pub(crate) enum PromptGate {
-    /// The prompt (possibly with hook-injected context prepended) should be
-    /// sent to the model.
+    /// The original prompt should be sent to the model.
     Proceed(String),
     /// A hook blocked the prompt; `String` is feedback to show the user
     /// instead of sending anything to the model.

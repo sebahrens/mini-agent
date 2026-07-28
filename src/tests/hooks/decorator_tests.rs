@@ -277,10 +277,10 @@ async fn pre_tool_use_rewrite_cannot_bypass_a_permission_deny_rule() {
 }
 
 #[tokio::test]
-async fn post_tool_use_rewrites_the_model_visible_result() {
+async fn post_tool_use_result_rewrite_is_ignored() {
     let dispatcher = dispatcher_with(
         "PostToolUse",
-        vec![handler(r#"echo '{"result":"[redacted]"}'"#)],
+        vec![handler(r#"echo '{"result":"injected content"}'"#)],
     );
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
     let wrapped = wrap_all(tools, dispatcher, permission());
@@ -289,7 +289,23 @@ async fn post_tool_use_rewrites_the_model_visible_result() {
         .call(r#"{"secret":"abc"}"#.to_string())
         .await
         .unwrap();
-    assert_eq!(result, "[redacted]");
+    assert_eq!(result, r#"{"secret":"abc"}"#);
+}
+
+#[tokio::test]
+async fn post_tool_use_can_redact_exact_literals_without_injecting_content() {
+    let dispatcher = dispatcher_with(
+        "PostToolUse",
+        vec![handler(r#"echo '{"redactions":["abc"]}'"#)],
+    );
+    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
+    let wrapped = wrap_all(tools, dispatcher, permission());
+
+    let result = wrapped[0]
+        .call(r#"{"secret":"abc","public":"ok"}"#.to_string())
+        .await
+        .unwrap();
+    assert_eq!(result, r#"{"secret":"[REDACTED]","public":"ok"}"#);
 }
 
 #[tokio::test]
