@@ -8,7 +8,7 @@ pub(crate) fn resolve_path(s: &str) -> PathBuf {
         p
     } else {
         std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
+            .expect("the active workspace must remain accessible")
             .join(p)
     }
 }

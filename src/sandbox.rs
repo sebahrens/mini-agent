@@ -211,8 +211,9 @@ impl Sandbox {
         cmd.args(["--ro-bind", "/", "/", "--bind"]);
         cmd.arg(cwd.as_os_str());
         cmd.arg(cwd.as_os_str());
-        // Bind ~/.cache (or $XDG_CACHE_HOME) as writable after "/" bind
-        if let Some(cache_dir) = dirs::cache_dir() {
+        // Bind the resolved application cache as writable after "/" bind.
+        if let Ok(paths) = crate::paths::process_paths() {
+            let cache_dir = paths.cache_dir;
             if let Err(e) = std::fs::create_dir_all(&cache_dir) {
                 tracing::warn!(
                     "sandbox: failed to create cache dir {}: {e}",

@@ -302,7 +302,9 @@ fn basename(dir: &str) -> String {
 
 /// Full working-directory path with `$HOME` shortened to `~`.
 fn contract_home(dir: &str) -> String {
-    if let Some(home) = dirs::home_dir().and_then(|h| h.to_str().map(|s| s.to_string())) {
+    if let Some(home) =
+        crate::paths::process_home_dir().and_then(|h| h.to_str().map(|s| s.to_string()))
+    {
         if dir == home {
             return "~".to_string();
         }

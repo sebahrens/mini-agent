@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use chrono::Utc;
 
 fn transcript_dir(session_id: &str) -> PathBuf {
-    crate::session::storage::data_dir()
-        .join("loops")
+    crate::paths::process_paths()
+        .expect("startup must initialize application paths")
+        .transcripts_dir()
         .join(session_id)
 }
 
@@ -16,6 +17,9 @@ pub fn save_iteration(
     validation_output: Option<&str>,
     summary: &str,
 ) -> anyhow::Result<()> {
+    if crate::paths::artifact_disabled("loop transcripts") {
+        return Ok(());
+    }
     let dir = transcript_dir(session_id);
     std::fs::create_dir_all(&dir)?;
 

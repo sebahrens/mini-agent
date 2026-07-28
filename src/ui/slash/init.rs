@@ -59,7 +59,7 @@ fn build_question(label: &str, desc: &str, exists: bool, cwd: &std::path::Path) 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let force = parts.len() >= 2 && parts[1] == "force";
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cwd = std::env::current_dir()?;
     let agents_path = cwd.join("AGENTS.md");
     let arch_path = cwd.join("ARCHITECTURE.md");
 

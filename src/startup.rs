@@ -142,7 +142,7 @@ pub(crate) async fn connect_headless_mcp(
 pub(crate) struct Startup {
     pub cli: Cli,
     pub cfg: Config,
-    // Retained as the startup-owned source of truth while storage owners migrate to AppPaths.
+    // Startup-owned source of truth shared by persistent artifact owners.
     #[allow(dead_code)]
     pub paths: AppPaths,
     pub is_first_startup: bool,

@@ -150,18 +150,16 @@ impl<'a> App<'a> {
             crate::agent::builder::estimate_overhead(ui.context, slash.reasoning_enabled);
 
         render_session(&mut renderer, ui.session, ui.cli, ui.cfg, ui.context)?;
-        let marker_path = crate::session::storage::data_dir().join("shown_welcome_msg");
+        let marker_path = crate::paths::process_paths()
+            .expect("startup must initialize application paths")
+            .welcome_marker_file();
         if ui.cfg.resolve_always_show_welcome() || !marker_path.exists() {
             crate::ui::events::show_welcome(&mut renderer)?;
-            if !ui.cfg.resolve_always_show_welcome() {
-                if let Some(dir) = marker_path.parent()
-                    && let Err(e) = std::fs::create_dir_all(dir)
-                {
-                    tracing::warn!("failed to create data dir for welcome marker: {e}");
-                }
-                if let Err(e) = std::fs::write(&marker_path, "") {
-                    tracing::warn!("failed to write welcome marker (welcome will show again): {e}");
-                }
+            if !ui.cfg.resolve_always_show_welcome()
+                && !crate::paths::artifact_disabled("welcome marker")
+                && let Err(e) = crate::session::storage::atomic_write(&marker_path, "")
+            {
+                tracing::warn!("failed to write welcome marker (welcome will show again): {e}");
             }
         }
         refresh_display(

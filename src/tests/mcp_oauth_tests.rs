@@ -146,7 +146,9 @@ fn token_filename_uses_complete_canonical_server_identity() {
 
 #[test]
 fn mcp_oauth_identity_reserved_colliding_and_unicode_names_are_opaque() {
-    let names = ["CON", "server.", "server ", "a/b", "a\\b", "Straße", "STRASSE"];
+    let names = [
+        "CON", "server.", "server ", "a/b", "a\\b", "Straße", "STRASSE",
+    ];
     let mut filenames = std::collections::HashSet::new();
     for name in names {
         let filename =
@@ -163,8 +165,13 @@ fn mcp_oauth_identity_maps_only_to_the_credentials_root() {
     let root = TempDir::new("root-map");
     let paths = test_paths(root.path());
     let settings = OAuthSettings::default();
-    let path =
-        oauth::token_path(&paths, "../display-name", "https://example.com/mcp", &settings).unwrap();
+    let path = oauth::token_path(
+        &paths,
+        "../display-name",
+        "https://example.com/mcp",
+        &settings,
+    )
+    .unwrap();
     let expected_parent = paths.credentials_dir.join("mcp-oauth");
     assert_eq!(path.parent(), Some(expected_parent.as_path()));
     assert!(!path.to_string_lossy().contains("display-name"));
@@ -195,11 +202,7 @@ fn mcp_oauth_storage_security_creates_private_root_final_and_lock() {
         0o700
     );
     assert_eq!(
-        std::fs::metadata(directory)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
+        std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
         0o700
     );
     assert_eq!(
@@ -233,7 +236,10 @@ fn mcp_oauth_storage_security_windows_dacls_exclude_broad_principals() {
         (&lock, false),
     ] {
         let dacl = oauth::windows_private_dacl_sddl(path, is_directory).unwrap();
-        assert!(dacl.starts_with("D:P"), "DACL inherits broad grants: {dacl}");
+        assert!(
+            dacl.starts_with("D:P"),
+            "DACL inherits broad grants: {dacl}"
+        );
         assert!(
             !dacl.contains(";;;WD)") && !dacl.contains("S-1-1-0"),
             "Everyone can access credential content: {dacl}"
@@ -248,7 +254,7 @@ fn mcp_oauth_storage_security_windows_dacls_exclude_broad_principals() {
 #[cfg(unix)]
 #[test]
 fn mcp_oauth_storage_security_rejects_symlink_and_repairs_owned_mode() {
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let root = TempDir::new("symlink");
     let paths = test_paths(root.path());
@@ -289,11 +295,7 @@ fn mcp_oauth_storage_security_bounds_records_and_redacts_diagnostics() {
     assert!(store.read_blocking().is_err());
 
     let secret = "refresh-secret-must-not-appear";
-    std::fs::write(
-        &token,
-        format!(r#"{{"refresh_token":"{secret}","broken":"#),
-    )
-    .unwrap();
+    std::fs::write(&token, format!(r#"{{"refresh_token":"{secret}","broken":"#)).unwrap();
     let diagnostic = store.read_blocking().unwrap_err().to_string();
     assert!(!diagnostic.contains(secret));
 }
@@ -389,8 +391,7 @@ fn mcp_oauth_migration_is_idempotent_and_retains_legacy_source() {
             .unwrap();
 
     assert!(store.read_blocking().unwrap().is_some());
-    let canonical =
-        oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
+    let canonical = oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
     assert!(canonical.is_file());
     assert!(legacy.is_file());
     assert!(store.read_blocking().unwrap().is_some());
@@ -418,8 +419,7 @@ fn mcp_oauth_migration_logout_does_not_reimport_retained_source() {
     assert!(store.clear_blocking().unwrap());
     assert!(store.read_blocking().unwrap().is_none());
     assert!(legacy.exists());
-    let canonical =
-        oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
+    let canonical = oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
     assert!(!canonical.exists());
     assert!(canonical.with_extension("migration.json").is_file());
 }
@@ -468,8 +468,7 @@ fn mcp_oauth_migration_rejects_a_different_explicit_client_identity() {
             .unwrap();
 
     assert!(store.read_blocking().is_err());
-    let canonical =
-        oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
+    let canonical = oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
     assert!(!canonical.exists());
 }
 
@@ -488,8 +487,7 @@ fn mcp_oauth_migration_malformed_source_never_publishes_canonical_content() {
 
     let diagnostic = store.read_blocking().unwrap_err().to_string();
     assert!(!diagnostic.contains("do-not-log"));
-    let canonical =
-        oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
+    let canonical = oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
     assert!(!canonical.exists());
     assert!(legacy.exists());
 }
@@ -512,8 +510,7 @@ fn mcp_oauth_migration_fails_closed_on_nonportable_legacy_name() {
             .unwrap();
 
     assert!(store.read_blocking().is_err());
-    let canonical =
-        oauth::token_path(&paths, "CON", "https://example.com", &settings).unwrap();
+    let canonical = oauth::token_path(&paths, "CON", "https://example.com", &settings).unwrap();
     assert!(!canonical.exists());
 }
 
@@ -539,8 +536,7 @@ fn mcp_oauth_migration_never_follows_a_legacy_root_symlink() {
             .unwrap();
 
     assert!(store.read_blocking().is_err());
-    let canonical =
-        oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
+    let canonical = oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
     assert!(!canonical.exists());
 }
 

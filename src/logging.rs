@@ -10,10 +10,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::cli::Cli;
-use crate::session::storage;
 
 pub fn crash_log_dir() -> PathBuf {
-    storage::data_dir().join("logs").join("crashes")
+    crate::paths::process_paths()
+        .expect("startup must initialize application paths")
+        .crash_logs_dir()
 }
 
 pub fn resolve_crash_log_path() -> PathBuf {
@@ -34,9 +35,12 @@ pub fn install_panic_hook() {
 }
 
 fn write_crash_report(info: &std::panic::PanicHookInfo) -> Option<PathBuf> {
+    if crate::paths::artifact_disabled("logs") {
+        return None;
+    }
     let path = resolve_crash_log_path();
     if let Some(parent) = path.parent()
-        && fs::create_dir_all(parent).is_err()
+        && ensure_private_log_directory(parent).is_err()
     {
         return None;
     }
@@ -68,16 +72,23 @@ fn write_crash_report(info: &std::panic::PanicHookInfo) -> Option<PathBuf> {
     content.push('\n');
     content.push_str(&format!("{:?}", Backtrace::capture()));
 
-    fs::write(&path, content).ok().map(|_| path)
+    crate::fs::atomic_create_sync(&path, content.as_bytes())
+        .ok()
+        .map(|_| path)
 }
 
 pub fn resolve_log_path(cli: &Cli) -> Option<PathBuf> {
     if let Some(ref path) = cli.log_file {
         return Some(path.clone());
     }
+    if crate::paths::artifact_disabled("logs") {
+        return None;
+    }
     if cli.verbose {
-        let logs_dir = storage::data_dir().join("logs");
-        fs::create_dir_all(&logs_dir).ok();
+        let logs_dir = crate::paths::process_paths()
+            .expect("startup must initialize application paths")
+            .logs_dir();
+        ensure_private_log_directory(&logs_dir).ok();
         let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
         let pid = std::process::id();
         return Some(logs_dir.join(format!("zerostack-{ts}_{pid}.log")));
@@ -109,7 +120,7 @@ pub fn init(cli: &Cli) {
 
     let log_path = resolve_log_path(cli);
     if let Some(ref path) = log_path {
-        match fs::File::create(path) {
+        match open_private_log(path, cli.log_file.is_none()) {
             Ok(file) => {
                 let file_layer = tracing_subscriber::fmt::layer()
                     .with_writer(Mutex::new(file))
@@ -128,4 +139,71 @@ pub fn init(cli: &Cli) {
     }
 
     registry.init();
+}
+
+fn ensure_private_log_directory(path: &std::path::Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    const OPEN_NOFOLLOW: std::os::raw::c_int = if cfg!(target_os = "macos") {
+        0x100
+    } else {
+        0x2_0000
+    };
+    if prepare_parent
+        && let Some(parent) = path.parent()
+    {
+        ensure_private_log_directory(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(OPEN_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    if prepare_parent
+        && let Some(parent) = path.parent()
+    {
+        ensure_private_log_directory(parent)?;
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<fs::File> {
+    if prepare_parent
+        && let Some(parent) = path.parent()
+    {
+        ensure_private_log_directory(parent)?;
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
 }

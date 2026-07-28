@@ -6,11 +6,16 @@ use include_dir::{Dir, include_dir};
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/data/prompts");
 
 pub fn global_dir() -> PathBuf {
-    crate::session::storage::data_dir().join("prompts")
+    crate::paths::process_paths()
+        .expect("startup must initialize application paths")
+        .prompts_dir()
 }
 
 pub fn zerostack_dir() -> PathBuf {
-    PathBuf::from(".zerostack/prompts")
+    crate::paths::process_paths()
+        .expect("startup must initialize application paths")
+        .project_prompts_dir()
+        .expect("startup workspace must have a project path")
 }
 
 pub fn load() -> HashMap<String, String> {
@@ -20,9 +25,6 @@ pub fn load() -> HashMap<String, String> {
         prompts.entry(name).or_insert(content);
     }
     for (name, content) in crate::context::load_dir_files(&global_dir(), "md") {
-        prompts.insert(name, content);
-    }
-    for (name, content) in crate::context::load_dir_files(&PathBuf::from("data/prompts"), "md") {
         prompts.insert(name, content);
     }
     for (name, content) in crate::context::load_dir_files(&zerostack_dir(), "md") {
@@ -136,26 +138,24 @@ mod tests {
     }
 
     #[test]
-    fn test_prompts_dir_overrides_global() {
+    fn test_project_prompts_override_global() {
         let _td = TestDir::new();
         let global = global_dir();
-        let prompts_dir = PathBuf::from("data/prompts");
+        let project_dir = zerostack_dir();
         write_prompt(&global, "custom", "from global/");
-        write_prompt(&prompts_dir, "custom", "from prompts/");
+        write_prompt(&project_dir, "custom", "from project/");
 
         let prompts = load();
-        assert_eq!(prompts["custom"], "from prompts/");
+        assert_eq!(prompts["custom"], "from project/");
     }
 
     #[test]
     fn test_full_priority_chain() {
         let _td = TestDir::new();
         let global = global_dir();
-        let prompts_dir = PathBuf::from("data/prompts");
         let zs_dir = zerostack_dir();
 
         write_prompt(&global, "code", "from global/");
-        write_prompt(&prompts_dir, "custom", "from prompts/");
         write_prompt(&zs_dir, "custom", "from .zerostack/");
         write_prompt(&zs_dir, "code", "from .zerostack/code");
 

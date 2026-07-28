@@ -135,7 +135,7 @@ async fn atomic_write_resolved_inner(
     );
     let root = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
+        _ => PathBuf::new(),
     };
     let path = path.to_path_buf();
     let contents = contents.to_vec();
@@ -886,7 +886,7 @@ pub(crate) async fn resolve_symlink_target(path: &Path) -> PathBuf {
 }
 
 pub fn expand_tilde(s: &str) -> String {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::paths::process_home_dir() else {
         return s.to_string();
     };
 

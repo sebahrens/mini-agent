@@ -10,7 +10,9 @@ use crate::ui::utils::{parse_color, to_ansi_256};
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/data/themes");
 
 pub fn global_dir() -> PathBuf {
-    crate::session::storage::data_dir().join("themes")
+    crate::paths::process_paths()
+        .expect("startup must initialize application paths")
+        .themes_dir()
 }
 
 pub fn load() -> HashMap<String, String> {
@@ -22,10 +24,6 @@ pub fn load() -> HashMap<String, String> {
     for (name, content) in crate::context::load_dir_files(&global_dir(), "json") {
         themes.insert(name, content);
     }
-    for (name, content) in crate::context::load_dir_files(&PathBuf::from("data/themes"), "json") {
-        themes.insert(name, content);
-    }
-
     themes
 }
 

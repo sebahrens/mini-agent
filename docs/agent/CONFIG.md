@@ -4,17 +4,17 @@ description: "Full zerostack configuration reference: config file locations, pro
 
 # Configuration
 
-zerostack reads an optional config file. It supports TOML, YAML and JSON
-formats. The file is resolved by priority:
+zerostack reads an optional TOML, YAML, or JSON config from one canonical
+configuration root. `ZS_CONFIG_DIR` overrides that root. Otherwise it is
+`~/.config/zerostack` on Linux, `~/Library/Application Support/zerostack` on
+macOS, and `%APPDATA%\zerostack` on Windows. Within that directory the filename
+priority is `config.toml`, `config.yaml`, `config.yml`, then `config.json`.
+If none exists, zerostack creates `config.toml` in that same directory.
 
-- If `ZS_CONFIG_DIR` is set: `$ZS_CONFIG_DIR/config.toml` (preferred), `config.yaml`/`config.yml`, or `config.json`
-- Otherwise: `~/.config/zerostack/config.toml` (preferred), `config.yaml`/`.yml`, or `config.json`
-- Otherwise: `~/.local/share/zerostack/config.toml` (preferred), `config.yaml`/`.yml`, or `config.json`
-
-If a `config.toml` exists at a higher priority, it is used. If none exists
-at any priority, a default `config.toml` is created in the lowest-priority
-directory (`~/.local/share/zerostack/`). On macOS the XDG config path above
-resolves to `~/Library/Application Support/zerostack/`.
+`ZS_DATA_DIR` does not redirect configuration. Set both `ZS_CONFIG_DIR` and
+`ZS_DATA_DIR` when a hermetic installation needs one physical root. A config
+left under the former data-root location is migrated before config creation.
+The source is retained for rollback.
 
 **Project-local override**: if `.zerostack/config.toml` exists in the
 current working directory, it is merged over the global config at startup.
@@ -42,19 +42,40 @@ overriding earlier ones for same-named files:
 
 **Prompts** (priority low to high):
 1. Embedded at compile time
-2. `~/.local/share/zerostack/prompts/` (global, user-level)
-3. `prompts/` (project-local, relative to CWD)
-4. `.zerostack/prompts/` (project-level config, highest priority)
+2. The platform data root's `zerostack/prompts/` (global, user-level)
+3. `<startup-workspace>/.zerostack/prompts/` (project-level, highest priority)
 
 **Themes** (priority low to high):
 1. Embedded at compile time
-2. `~/.local/share/zerostack/themes/` (global, user-level)
-3. `themes/` (project-local, relative to CWD)
+2. The platform data root's `zerostack/themes/` (global, user-level)
 
-If `ZS_CONFIG_DIR` is set, it overrides the data directory for the config file
-location only (prompts and themes still use `ZS_DATA_DIR` / the default data
-dir). Set `ZS_CONFIG_DIR` when you want the config in a separate path from the
-data files.
+`ZS_CONFIG_DIR` changes only the config root; prompts and themes continue to
+use `ZS_DATA_DIR` or the platform data root.
+
+Persistent storage uses separate platform roots:
+
+| Content | Linux default | macOS default | Windows default |
+| --- | --- | --- | --- |
+| Config | `~/.config/zerostack` | `~/Library/Application Support/zerostack` | `%APPDATA%\zerostack` |
+| Portable data | `~/.local/share/zerostack` | `~/Library/Application Support/zerostack` | `%APPDATA%\zerostack` |
+| State, sessions, transcripts, logs | `~/.local/state/zerostack` | `~/Library/Application Support/zerostack/state` | `%LOCALAPPDATA%\zerostack\state` |
+| Cache | `~/.cache/zerostack` | `~/Library/Caches/zerostack` | `%LOCALAPPDATA%\zerostack\cache` |
+| Credentials | `<local-data>/credentials` | `<local-data>/credentials` | `%LOCALAPPDATA%\zerostack\credentials` |
+
+The corresponding overrides are `ZS_CONFIG_DIR`, `ZS_DATA_DIR`,
+`ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`, and
+`ZS_CREDENTIALS_DIR`. Overrides must be absolute (a leading `~` is expanded).
+zerostack never uses the current directory as a fallback for user-global
+state.
+
+On startup, known legacy content is copied through a private, no-follow,
+content-verified migration and the original is retained. Identical candidates
+are safe to converge. Differing candidates require an explicit numbered
+selection in an interactive startup. Headless and ACP startup never select:
+a config conflict stops startup, while an optional feature conflict disables
+only that feature. To recover non-interactively, compare the reported files,
+move the intended source to the reported canonical path, then restart; do not
+delete the retained legacy tree until rollback is no longer needed.
 
 All config keys are optional. CLI flags and their environment-backed values
 (such as `ZS_PROVIDER` and `ZS_MODEL`) take precedence where both exist.
@@ -361,10 +382,10 @@ hooks are trusted automatically) require interactive confirmation the first
 time they'd run, keyed by a hash of the handler's definition (event +
 matcher + command/args/timeout/etc.); changing the definition changes the
 hash and requires re-confirmation. Confirmations persist to
-`$XDG_DATA_HOME/zerostack/trusted-hooks.json` (a user-level file, so child
+the state root at `hooks/trusted-hooks.json` (a user-level file, so child
 processes/orchestrated subagents sharing it inherit trust automatically). In
-headless contexts (`-p`, `--loop`) an unconfirmed project hook is skipped
-with a warning rather than prompting.
+headless contexts (`-p`, `--loop`) an unconfirmed project hook is skipped with
+a warning rather than prompting.
 
 ### Global switches
 
@@ -1234,10 +1255,10 @@ crate silenced). Full debug and trace output is available via CLI flags.
 zerostack -v
 ```
 
-Enables full trace-level logging to a timestamped log file under
-`~/.local/share/zerostack/logs/` (or `$ZS_DATA_DIR/logs/`). The log file is
-named `zerostack-YYYY-MM-DD_HH-MM-SS_<pid>.log`. A new file is created per
-instance — previous runs are never overwritten.
+Enables full trace-level logging to a timestamped log file below the state
+root's `logs/` directory (`ZS_STATE_DIR` overrides the state root). The log
+file is named `zerostack-YYYY-MM-DD_HH-MM-SS_<pid>.log`. A new file is created
+per instance — previous runs are never overwritten.
 
 With `-v`, stderr output stays at the default `warn` level so the TUI remains
 clean. The log file captures everything at `trace` level for all zerostack

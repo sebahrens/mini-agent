@@ -5,43 +5,28 @@ use uuid::Uuid;
 use crate::session::Session;
 
 fn session_dir() -> PathBuf {
-    dirs_path().join("sessions")
+    app_paths().sessions_dir()
 }
 
 pub fn tool_output_dir(session_id: &str) -> PathBuf {
-    dirs_path()
-        .join("tool-outputs")
+    app_paths()
+        .tool_outputs_dir()
         .join(crate::paths::opaque_name(
             "session-tool-output-directory",
             &[session_id.as_bytes()],
         ))
 }
 
-fn home_fallback() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+fn app_paths() -> crate::paths::AppPaths {
+    crate::paths::process_paths().expect("startup must initialize application paths")
 }
 
-fn dirs_path() -> PathBuf {
-    data_dir()
-}
-
-pub fn data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("ZS_DATA_DIR") {
-        let expanded = crate::fs::expand_tilde(&dir.to_string_lossy());
-        return PathBuf::from(expanded);
-    }
-    let base = dirs::data_dir().unwrap_or_else(home_fallback);
-    base.join("zerostack")
+fn disabled(artifact: &'static str) -> bool {
+    crate::paths::artifact_disabled(artifact)
 }
 
 pub(crate) fn config_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("ZS_CONFIG_DIR") {
-        let expanded = crate::fs::expand_tilde(&dir.to_string_lossy());
-        return PathBuf::from(expanded);
-    }
-    data_dir()
+    app_paths().config_dir
 }
 
 /// Write `content` to `path` atomically: write to a temp file in the same
@@ -49,15 +34,18 @@ pub(crate) fn config_path() -> PathBuf {
 /// the previous version intact.
 pub fn atomic_write(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::paths::ensure_private_directory(parent)?;
     }
     crate::fs::atomic_write_sync(path, content.as_bytes())?;
     Ok(())
 }
 
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
+    if disabled("sessions") {
+        return Ok(());
+    }
     let dir = session_dir();
-    std::fs::create_dir_all(&dir)?;
+    crate::paths::ensure_private_directory(&dir)?;
     crate::paths::validate_portable_component(&session.id)?;
     let path = dir.join(format!("{}.json", session.id));
     let json = serde_json::to_string(session)?;
@@ -77,8 +65,11 @@ pub fn save_tool_output(
     tool_name: &str,
     output: &str,
 ) -> anyhow::Result<PathBuf> {
+    if disabled("tool outputs") {
+        anyhow::bail!("tool-output persistence is disabled by a legacy-path conflict");
+    }
     let dir = tool_output_dir(session_id);
-    std::fs::create_dir_all(&dir)?;
+    crate::paths::ensure_private_directory(&dir)?;
     let nonce = Uuid::new_v4().to_string();
     let filename = crate::paths::digest_filename(
         "session-tool-output",
@@ -95,6 +86,9 @@ pub fn save_tool_output(
 }
 
 pub fn delete_session(id: &str) -> anyhow::Result<()> {
+    if disabled("sessions") {
+        return Ok(());
+    }
     let dir = session_dir();
     crate::paths::validate_portable_component(id)?;
     let path = dir.join(format!("{}.json", id));
@@ -108,6 +102,9 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
 }
 
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
+    if disabled("sessions") {
+        return Ok(Vec::new());
+    }
     let dir = session_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -137,6 +134,9 @@ pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
 }
 
 pub fn find_session_by_name(name: &str) -> anyhow::Result<Option<Session>> {
+    if disabled("sessions") {
+        return Ok(None);
+    }
     let dir = session_dir();
     if !dir.exists() {
         return Ok(None);
@@ -157,6 +157,9 @@ pub fn find_session_by_name(name: &str) -> anyhow::Result<Option<Session>> {
 }
 
 pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
+    if disabled("sessions") {
+        return Ok(Vec::new());
+    }
     let dir = session_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -192,16 +195,16 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
 }
 
 pub fn agents_path() -> PathBuf {
-    config_path().join("agent").join("AGENTS.md")
+    app_paths().global_agents_file()
 }
 
 #[cfg(feature = "archmd")]
 pub fn architecture_path() -> PathBuf {
-    config_path().join("agent").join("ARCHITECTURE.md")
+    app_paths().global_architecture_file()
 }
 
 pub fn suffix_path() -> PathBuf {
-    config_path().join("SUFFIX.md")
+    app_paths().suffix_file()
 }
 
 pub fn load_suffix() -> Option<String> {
@@ -216,13 +219,13 @@ pub fn load_suffix() -> Option<String> {
 }
 
 fn theme_file_path() -> PathBuf {
-    data_dir().join("theme.json")
+    app_paths().theme_selection_file()
 }
 
 pub fn save_theme_name(name: Option<&str>) -> anyhow::Result<()> {
     let path = theme_file_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::paths::ensure_private_directory(parent)?;
     }
     let value = match name {
         Some(n) => serde_json::json!({ "theme": n }),

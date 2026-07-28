@@ -160,8 +160,7 @@ impl FileCredentialStore {
     pub(crate) fn clear_blocking(&self) -> Result<bool, AuthError> {
         self.with_lock(|| {
             self.write_migration_marker(None)?;
-            secure_remove_file(&self.path)
-                .map_err(|error| storage_error("remove", error.kind()))
+            secure_remove_file(&self.path).map_err(|error| storage_error("remove", error.kind()))
         })
     }
 
@@ -169,12 +168,13 @@ impl FileCredentialStore {
         &self,
         operation: impl FnOnce() -> Result<T, AuthError>,
     ) -> Result<T, AuthError> {
-        let directory = self.path.parent().ok_or_else(|| {
-            storage_error("resolve", std::io::ErrorKind::InvalidInput)
-        })?;
-        let credential_root = directory.parent().ok_or_else(|| {
-            storage_error("resolve", std::io::ErrorKind::InvalidInput)
-        })?;
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| storage_error("resolve", std::io::ErrorKind::InvalidInput))?;
+        let credential_root = directory
+            .parent()
+            .ok_or_else(|| storage_error("resolve", std::io::ErrorKind::InvalidInput))?;
         ensure_private_directory(credential_root)
             .map_err(|error| storage_error("prepare", error.kind()))?;
         ensure_private_directory(directory)
@@ -195,11 +195,9 @@ impl FileCredentialStore {
         if self.migration_was_handled()? {
             return Ok(None);
         }
-        let Some(candidate) = unambiguous_legacy_candidate(
-            &self.legacy_dir,
-            &self.legacy_server_name,
-        )
-        .map_err(|error| storage_error("migrate", error.kind()))?
+        let Some(candidate) =
+            unambiguous_legacy_candidate(&self.legacy_dir, &self.legacy_server_name)
+                .map_err(|error| storage_error("migrate", error.kind()))?
         else {
             return Ok(None);
         };
@@ -213,18 +211,12 @@ impl FileCredentialStore {
             .as_ref()
             .is_some_and(|expected| credentials.client_id.as_str() != expected.as_str())
         {
-            return Err(storage_error(
-                "migrate",
-                std::io::ErrorKind::InvalidData,
-            ));
+            return Err(storage_error("migrate", std::io::ErrorKind::InvalidData));
         }
         let canonical = serde_json::to_vec_pretty(&credentials)
             .map_err(|_| storage_error("migrate", std::io::ErrorKind::InvalidData))?;
         if canonical.len() as u64 > MAX_CREDENTIAL_BYTES {
-            return Err(storage_error(
-                "migrate",
-                std::io::ErrorKind::FileTooLarge,
-            ));
+            return Err(storage_error("migrate", std::io::ErrorKind::FileTooLarge));
         }
         secure_atomic_write(&self.path, &canonical)
             .map_err(|error| storage_error("migrate", error.kind()))?;
@@ -242,18 +234,12 @@ impl FileCredentialStore {
         let marker: MigrationMarker = serde_json::from_slice(&bytes)
             .map_err(|_| storage_error("migrate", std::io::ErrorKind::InvalidData))?;
         if marker.version != MIGRATION_MARKER_VERSION {
-            return Err(storage_error(
-                "migrate",
-                std::io::ErrorKind::InvalidData,
-            ));
+            return Err(storage_error("migrate", std::io::ErrorKind::InvalidData));
         }
         if marker.legacy_digest.as_ref().is_some_and(|digest| {
             digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         }) {
-            return Err(storage_error(
-                "migrate",
-                std::io::ErrorKind::InvalidData,
-            ));
+            return Err(storage_error("migrate", std::io::ErrorKind::InvalidData));
         }
         Ok(true)
     }
@@ -270,7 +256,9 @@ impl FileCredentialStore {
 }
 
 fn storage_error(operation: &str, kind: std::io::ErrorKind) -> AuthError {
-    AuthError::InternalError(format!("MCP OAuth credential {operation} failed ({kind:?})"))
+    AuthError::InternalError(format!(
+        "MCP OAuth credential {operation} failed ({kind:?})"
+    ))
 }
 
 fn path_kind(path: &Path) -> std::io::Result<Option<std::fs::FileType>> {
@@ -334,10 +322,7 @@ fn unambiguous_legacy_candidate(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) => return Err(error),
-    };
+    let entries = std::fs::read_dir(directory)?;
     let mut exact = None;
     let mut ambiguous = false;
     for entry in entries {
@@ -379,8 +364,7 @@ fn unambiguous_legacy_candidate(
 }
 
 fn read_private_bounded(path: &Path) -> Result<Option<Vec<u8>>, AuthError> {
-    let Some(file_type) =
-        path_kind(path).map_err(|error| storage_error("read", error.kind()))?
+    let Some(file_type) = path_kind(path).map_err(|error| storage_error("read", error.kind()))?
     else {
         return Ok(None);
     };
@@ -555,8 +539,10 @@ fn current_uid() -> u32 {
 fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     unsafe extern "C" {
-        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
-        -> std::os::raw::c_int;
+        fn flock(
+            file_descriptor: std::os::raw::c_int,
+            operation: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
     }
     loop {
         // SAFETY: the descriptor remains owned by `file` for the duration of the call.
@@ -575,8 +561,10 @@ fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
 fn unlock_file(file: &std::fs::File) {
     use std::os::fd::AsRawFd;
     unsafe extern "C" {
-        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
-        -> std::os::raw::c_int;
+        fn flock(
+            file_descriptor: std::os::raw::c_int,
+            operation: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
     }
     // SAFETY: the descriptor remains valid while the lock is released.
     let _ = unsafe { flock(file.as_raw_fd(), 8) };
@@ -613,10 +601,7 @@ fn unlock_file(file: &std::fs::File) {
 }
 
 #[cfg(all(test, windows))]
-pub(crate) fn windows_private_dacl_sddl(
-    path: &Path,
-    directory: bool,
-) -> std::io::Result<String> {
+pub(crate) fn windows_private_dacl_sddl(path: &Path, directory: bool) -> std::io::Result<String> {
     windows_private::dacl_sddl(path, directory)
 }
 
@@ -666,7 +651,7 @@ fn unlock_file(_file: &std::fs::File) {}
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_private {
-    use std::ffi::{c_void, OsStr};
+    use std::ffi::{OsStr, c_void};
     use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -891,12 +876,7 @@ mod windows_private {
             let mut defaulted = 0;
             let mut dacl = null_mut();
             let result = unsafe {
-                GetSecurityDescriptorDacl(
-                    self.0,
-                    &mut present,
-                    &mut dacl,
-                    &mut defaulted,
-                )
+                GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted)
             };
             if result == 0 || present == 0 || dacl.is_null() {
                 Err(std::io::Error::last_os_error())
@@ -928,13 +908,7 @@ mod windows_private {
         let result = (|| {
             let mut required = 0;
             let _ = unsafe {
-                GetTokenInformation(
-                    token,
-                    TOKEN_USER_CLASS,
-                    null_mut(),
-                    0,
-                    &mut required,
-                )
+                GetTokenInformation(token, TOKEN_USER_CLASS, null_mut(), 0, &mut required)
             };
             if required == 0 {
                 return Err(std::io::Error::last_os_error());
@@ -970,15 +944,14 @@ mod windows_private {
             while unsafe { *string_sid.add(length) } != 0 {
                 length += 1;
             }
-            let string = String::from_utf16(unsafe {
-                std::slice::from_raw_parts(string_sid, length)
-            })
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "current-user SID is not valid UTF-16",
-                )
-            });
+            let string =
+                String::from_utf16(unsafe { std::slice::from_raw_parts(string_sid, length) })
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "current-user SID is not valid UTF-16",
+                        )
+                    });
             let _ = unsafe { LocalFree(string_sid.cast()) };
             string
         })
@@ -1105,13 +1078,7 @@ mod windows_private {
             } else {
                 FILE_ATTRIBUTE_NORMAL
             };
-        let handle = open_handle(
-            path,
-            READ_CONTROL | WRITE_DAC,
-            OPEN_EXISTING,
-            flags,
-            None,
-        )?;
+        let handle = open_handle(path, READ_CONTROL | WRITE_DAC, OPEN_EXISTING, flags, None)?;
         let result = apply_private_dacl(handle, directory);
         let _ = unsafe { CloseHandle(handle) };
         result
@@ -1233,10 +1200,7 @@ mod windows_private {
             )
         })?;
         ensure_directory(parent)?;
-        let temp = parent.join(format!(
-            ".oauth-{}.tmp",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let temp = parent.join(format!(".oauth-{}.tmp", uuid::Uuid::new_v4().simple()));
         let mut temp_identity = None;
         let write_result = (|| {
             let mut file = create_private_file(&temp, CREATE_NEW)?;
@@ -1304,15 +1268,8 @@ mod windows_private {
 
     pub(super) fn unlock(file: &std::fs::File) {
         let mut overlapped = Overlapped::default();
-        let _ = unsafe {
-            UnlockFileEx(
-                file.as_raw_handle(),
-                0,
-                u32::MAX,
-                u32::MAX,
-                &mut overlapped,
-            )
-        };
+        let _ =
+            unsafe { UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, &mut overlapped) };
     }
 
     #[cfg(test)]

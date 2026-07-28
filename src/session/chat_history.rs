@@ -12,10 +12,15 @@ pub struct ChatHistoryEntry {
 }
 
 fn chat_history_path() -> PathBuf {
-    storage::data_dir().join("chat_history.json")
+    crate::paths::process_paths()
+        .expect("startup must initialize application paths")
+        .chat_history_file()
 }
 
 pub fn append_entry(entry: &ChatHistoryEntry) -> anyhow::Result<()> {
+    if crate::paths::artifact_disabled("chat history") {
+        return Ok(());
+    }
     let path = chat_history_path();
     let mut entries: Vec<ChatHistoryEntry> = if path.exists() {
         let content = std::fs::read_to_string(&path)?;
@@ -40,6 +45,9 @@ pub fn append_entry(entry: &ChatHistoryEntry) -> anyhow::Result<()> {
 }
 
 pub fn load_history() -> anyhow::Result<Vec<ChatHistoryEntry>> {
+    if crate::paths::artifact_disabled("chat history") {
+        return Ok(Vec::new());
+    }
     let path = chat_history_path();
     if !path.exists() {
         return Ok(Vec::new());

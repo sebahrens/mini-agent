@@ -11,7 +11,6 @@ use crate::config::{
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
 use crate::paths::AppPaths;
-use crate::session::storage;
 
 /// Write `content` to `path` atomically via temp-file + rename.
 fn atomic_config_write(path: &Path, content: &str) -> io::Result<()> {
@@ -43,19 +42,9 @@ pub(crate) fn pick_existing(dir: &Path) -> PathBuf {
 }
 
 fn resolve_config_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("ZS_CONFIG_DIR") {
-        return pick_existing(&PathBuf::from(dir));
-    }
-
-    if let Some(config_dir) = dirs::config_dir() {
-        let dir = config_dir.join("zerostack");
-        let picked = pick_existing(&dir);
-        if picked.exists() {
-            return picked;
-        }
-    }
-
-    pick_existing(&storage::data_dir())
+    let paths =
+        crate::paths::process_paths().expect("startup must initialize application paths");
+    pick_existing(&paths.config_dir)
 }
 
 pub fn config_file_path() -> PathBuf {
@@ -317,19 +306,11 @@ fn rich_default_config() -> Config {
 }
 
 pub fn load_with_paths(paths: &AppPaths) -> (Config, bool) {
-    let local_config_path = paths
-        .project_dir
-        .as_deref()
-        .map(|directory| directory.join("config.toml"));
-    load_from_path(
-        pick_existing(&paths.config_dir),
-        local_config_path
-            .as_deref()
-            .unwrap_or_else(|| Path::new(LOCAL_CONFIG_PATH)),
-    )
+    let local_config_path = paths.project_config_file();
+    load_from_path(pick_existing(&paths.config_dir), local_config_path.as_deref())
 }
 
-fn load_from_path(path: PathBuf, local_config_path: &Path) -> (Config, bool) {
+fn load_from_path(path: PathBuf, local_config_path: Option<&Path>) -> (Config, bool) {
     let is_first_startup = !path.exists();
     #[allow(unused_mut)]
     let mut cfg: Config = if is_first_startup {
@@ -386,19 +367,15 @@ fn load_from_path(path: PathBuf, local_config_path: &Path) -> (Config, bool) {
         cfg.custom_providers.as_ref().map(|m| m.len()).unwrap_or(0),
     );
 
-    apply_local_override(&mut cfg, local_config_path);
+    if let Some(local_config_path) = local_config_path {
+        apply_local_override(&mut cfg, local_config_path);
+    }
 
     #[cfg(feature = "mcp")]
     inject_mcp_defaults(&mut cfg);
 
     (cfg, is_first_startup)
 }
-
-/// Legacy relative spelling for the project-local config override.
-///
-/// Production startup resolves this beneath `AppPaths::project_dir`; the
-/// relative path remains for direct library-style callers during migration.
-pub const LOCAL_CONFIG_PATH: &str = ".zerostack/config.toml";
 
 /// Merge `.zerostack/config.toml` over the global config when it exists.
 /// The local file is trusted exactly like the global one — it can set any

@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 const DIRS_ASKED_FILE: &str = "dirs_asked_architecture.txt";
 
 fn dirs_asked_path() -> PathBuf {
-    let dir = crate::session::storage::data_dir();
+    let dir = crate::paths::process_paths()
+        .expect("startup must initialize application paths")
+        .archmd_state_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!("archmd: failed to create data dir: {e}");
+        tracing::warn!("archmd: failed to create state dir: {e}");
     }
     dir.join(DIRS_ASKED_FILE)
 }
@@ -41,10 +43,16 @@ with the full picture. Keep the document under ~300 lines
 // ---------------------------------------------------------------------------
 
 pub(crate) fn record_asked_dir(dir: &Path) -> anyhow::Result<()> {
+    if crate::paths::artifact_disabled("architecture prompt state") {
+        return Ok(());
+    }
     record_asked_dir_with_path(dir, &dirs_asked_path())
 }
 
 pub fn should_ask(dir: &Path) -> bool {
+    if crate::paths::artifact_disabled("architecture prompt state") {
+        return false;
+    }
     should_ask_with_path(dir, &dirs_asked_path())
 }
 
@@ -118,9 +126,7 @@ pub(crate) fn record_asked_dir_with_path(dir: &Path, asked_path: &Path) -> anyho
     }
     content.push_str(&dir_str);
     content.push('\n');
-    let tmp = asked_path.with_extension("tmp");
-    std::fs::write(&tmp, &content)?;
-    std::fs::rename(&tmp, asked_path)?;
+    crate::session::storage::atomic_write(asked_path, &content)?;
     Ok(())
 }
 

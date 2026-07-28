@@ -48,6 +48,16 @@ async fn run() -> anyhow::Result<()> {
     let workspace_root =
         std::env::current_dir().context("failed to resolve the startup workspace root")?;
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
+    paths::install_process_paths(&app_paths)?;
+    paths::prepare_storage_roots(&app_paths)?;
+
+    let is_interactive = !cli.print;
+    #[cfg(feature = "acp")]
+    let is_interactive = is_interactive && !cli.acp_enabled;
+    #[cfg(feature = "loop")]
+    let is_interactive = is_interactive && !cli.loop_mode;
+
+    paths::converge_legacy_artifacts(&app_paths, is_interactive)?;
     logging::install_panic_hook();
     logging::init(&cli);
 
@@ -80,12 +90,6 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let version_changed = docs::ensure_global()?;
-    let is_interactive = !cli.print;
-    #[cfg(feature = "acp")]
-    let is_interactive = is_interactive && !cli.acp_enabled;
-    #[cfg(feature = "loop")]
-    let is_interactive = is_interactive && !cli.loop_mode;
-
     // ── Hooks: load settings.json config, apply trust, install dispatcher ──
     // Done this early (before provider/API-key resolution) so `--hooks-test`
     // is a pure config/dispatch dry run that needs no API key and makes no
@@ -93,6 +97,7 @@ async fn run() -> anyhow::Result<()> {
     #[cfg(feature = "hooks")]
     {
         crate::extras::hooks::init_dispatcher(crate::extras::hooks::trust::load_dispatcher(
+            &app_paths,
             cli.no_hooks,
             !is_interactive,
         ));

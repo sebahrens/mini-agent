@@ -271,12 +271,12 @@ fn inspect_link(path: &Path) -> Result<(), PortablePathError> {
 }
 
 #[cfg(not(windows))]
-fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
 #[cfg(windows)]
-fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
     metadata.file_type().is_symlink()

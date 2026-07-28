@@ -5,7 +5,9 @@ use include_dir::{Dir, include_dir};
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/docs");
 
 pub fn global_docs_dir() -> PathBuf {
-    crate::session::storage::data_dir().join("docs")
+    crate::paths::process_paths()
+        .expect("startup must initialize application paths")
+        .docs_dir()
 }
 
 pub fn show_get_started() -> anyhow::Result<()> {

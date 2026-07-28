@@ -157,17 +157,18 @@ struct Section {
 }
 
 impl Mem {
-    /// Open the store rooted at `<config_dir>/agent/memory/`, using today's date
-    /// and a project slug derived from the current working directory.
+    /// Open the store rooted at `<data_dir>/memory/`, using today's date
+    /// and a project slug derived from the startup workspace.
     pub fn open() -> Self {
-        let root = crate::session::storage::config_path()
-            .join("agent")
-            .join("memory");
-        // Scope per-project files by the current working directory, matching the
-        // cwd zerostack injects into the preamble.
-        let project = std::env::current_dir()
-            .map(|p| project_slug(&p))
-            .unwrap_or_else(|_| crate::paths::opaque_name("memory-project", &[b"default"]));
+        let paths =
+            crate::paths::process_paths().expect("startup must initialize application paths");
+        let root = paths.memory_dir();
+        let project_root = paths
+            .project_dir
+            .as_deref()
+            .and_then(Path::parent)
+            .expect("startup workspace must have a project path");
+        let project = project_slug(project_root);
         let today = Local::now().format("%Y-%m-%d").to_string();
         tracing::debug!("memory open: root={}, project={}", root.display(), project);
         Mem {
@@ -307,6 +308,12 @@ impl Mem {
         mode: WriteMode,
         name: Option<&str>,
     ) -> std::io::Result<String> {
+        if crate::paths::artifact_disabled("memory") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "memory is disabled by a legacy-path conflict",
+            ));
+        }
         let original_len = content.len();
         tracing::debug!(
             "memory write: target={:?}, bytes={}, mode={:?}",
@@ -454,6 +461,12 @@ impl Mem {
         old_str: Option<&str>,
         new_str: &str,
     ) -> std::io::Result<String> {
+        if crate::paths::artifact_disabled("memory") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "memory is disabled by a legacy-path conflict",
+            ));
+        }
         tracing::debug!(
             "memory edit: target={:?}, has_old={}",
             target,

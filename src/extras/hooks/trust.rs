@@ -26,8 +26,8 @@ pub(crate) fn hash_hook_binding(
     format!("{:016x}", hasher.finish())
 }
 
-fn default_trust_store_path() -> PathBuf {
-    crate::session::storage::data_dir().join("trusted-hooks.json")
+fn default_trust_store_path(paths: &crate::paths::AppPaths) -> PathBuf {
+    paths.hook_trust_file()
 }
 
 pub(crate) fn load_trust_store(path: &Path) -> HashSet<String> {
@@ -38,6 +38,9 @@ pub(crate) fn load_trust_store(path: &Path) -> HashSet<String> {
 }
 
 pub(crate) fn save_trust_store(path: &Path, trusted: &HashSet<String>) {
+    if crate::paths::artifact_disabled("hook trust") {
+        return;
+    }
     let Ok(json) = serde_json::to_string_pretty(trusted) else {
         return;
     };
@@ -47,20 +50,19 @@ pub(crate) fn save_trust_store(path: &Path, trusted: &HashSet<String>) {
         tracing::warn!("hooks: failed to create trust store directory: {e}");
         return;
     }
-    if let Err(e) = std::fs::write(path, json) {
+    if let Err(e) = crate::session::storage::atomic_write(path, &json) {
         tracing::warn!("hooks: failed to save trust store (trust decisions won't persist): {e}");
     }
 }
 
-fn global_settings_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("zerostack")
-        .join("settings.json")
+fn global_settings_path(paths: &crate::paths::AppPaths) -> PathBuf {
+    paths.global_hook_settings_file()
 }
 
-fn project_settings_path() -> PathBuf {
-    PathBuf::from(".zerostack").join("settings.json")
+fn project_settings_path(paths: &crate::paths::AppPaths) -> PathBuf {
+    paths
+        .project_hook_settings_file()
+        .expect("startup workspace must have a project path")
 }
 
 #[cfg(target_os = "linux")]
@@ -245,26 +247,33 @@ pub(crate) fn build_dispatcher_from_paths(
     })
 }
 
-/// Best-effort current project root for trust hashing: the canonicalized
-/// current directory, falling back to the non-canonical current directory,
-/// then to `.` if even that is unavailable. Never panics.
-fn current_project_root() -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    cwd.canonicalize().unwrap_or(cwd)
+fn current_project_root(paths: &crate::paths::AppPaths) -> PathBuf {
+    let project_dir = paths
+        .project_dir
+        .as_ref()
+        .expect("startup workspace must have a project path");
+    let root = project_dir
+        .parent()
+        .expect("project application directory must have a parent");
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
 /// Top-level entry point: builds the process dispatcher from the real
 /// global/project/managed settings locations, the real trust store, and the
 /// current directory as the project root for trust hashing.
-pub(crate) fn load_dispatcher(no_hooks_flag: bool, headless: bool) -> HookDispatcher {
+pub(crate) fn load_dispatcher(
+    paths: &crate::paths::AppPaths,
+    no_hooks_flag: bool,
+    headless: bool,
+) -> HookDispatcher {
     build_dispatcher_from_paths(
-        &global_settings_path(),
-        &project_settings_path(),
+        &global_settings_path(paths),
+        &project_settings_path(paths),
         &managed_settings_path(),
-        &current_project_root(),
-        no_hooks_flag,
+        &current_project_root(paths),
+        no_hooks_flag || crate::paths::artifact_disabled("hook trust"),
         headless,
-        &default_trust_store_path(),
+        &default_trust_store_path(paths),
         &confirm_untrusted_hook,
     )
 }

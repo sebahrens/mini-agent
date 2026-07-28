@@ -29,6 +29,7 @@ fn setup_test_env() -> TestEnv {
     std::fs::create_dir_all(&dir).unwrap();
     let data_dir = dir.to_str().unwrap().to_string();
     unsafe { env::set_var("ZS_DATA_DIR", &data_dir) };
+    unsafe { env::set_var("ZS_CONFIG_DIR", &data_dir) };
     std::fs::create_dir_all(format!("{}/sessions", data_dir)).unwrap();
     TestEnv {
         dir,
