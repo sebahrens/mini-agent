@@ -358,12 +358,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         }
 
         #[cfg(feature = "js")]
-        register_js_tool(
-            &mut all_tools,
-            sandbox,
-            permission.clone(),
-            ask_tx.clone(),
-        );
+        register_js_tool(&mut all_tools, sandbox, permission.clone(), ask_tx.clone());
 
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
 
@@ -382,12 +377,7 @@ mod js_tests {
     #[tokio::test]
     async fn registers_and_executes_js_tool() {
         let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
-        register_js_tool(
-            &mut tools,
-            Sandbox::new(false, "bwrap"),
-            None,
-            None,
-        );
+        register_js_tool(&mut tools, Sandbox::new(false, "bwrap"), None, None);
 
         assert_eq!(
             tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
