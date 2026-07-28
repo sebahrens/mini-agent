@@ -15,9 +15,9 @@ use tokio::task::{AbortHandle, JoinSet};
 use crate::agent::tools::ToolError;
 use crate::extras::js::engine::js_thread_main;
 use crate::extras::js::types::{
-    JsOutcome, JsRequest, PermCancellation, PermOutcome, PermRequest, PermRequestBuildError,
-    PermResponse, PermResponseRejection, PermissionBackendFailure, PermissionDenial, STEP_TIMEOUT,
-    THREAD_STACK,
+    JsOutcome, JsRequest, JsResponse, PermCancellation, PermOutcome, PermRequest,
+    PermRequestBuildError, PermResponse, PermResponseRejection, PermissionBackendFailure,
+    PermissionDenial, STEP_TIMEOUT, THREAD_STACK,
 };
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 use crate::permission::checker::{CheckResult, PermCheck};
@@ -545,6 +545,19 @@ impl Drop for JsTool {
     }
 }
 
+async fn await_js_response(
+    reply_rx: oneshot::Receiver<JsResponse>,
+    timeout: Duration,
+) -> Result<JsResponse, ToolError> {
+    match tokio::time::timeout(timeout, reply_rx).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err(ToolError::Msg(
+            "JS engine reply channel closed".into(),
+        )),
+        Err(_) => Err(ToolError::Msg("JS engine reply timeout".into())),
+    }
+}
+
 impl Tool for JsTool {
     const NAME: &'static str = "js";
     type Error = ToolError;
@@ -588,15 +601,7 @@ impl Tool for JsTool {
             })
             .map_err(|_| ToolError::Msg("JS engine thread disconnected".into()))?;
 
-        let response = match tokio::time::timeout(STEP_TIMEOUT, reply_rx).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => {
-                return Err(ToolError::Msg("JS engine reply channel closed".into()));
-            }
-            Err(_) => {
-                return Ok("JS error: execution timed out (30s limit exceeded)".into());
-            }
-        };
+        let response = await_js_response(reply_rx, STEP_TIMEOUT).await?;
         cancel_on_drop.disarm();
 
         match response.outcome {
@@ -612,6 +617,27 @@ impl Tool for JsTool {
 #[derive(Deserialize)]
 pub struct JsArgs {
     pub code: String,
+}
+
+#[cfg(test)]
+mod js_tool_reply {
+    use super::*;
+
+    #[tokio::test]
+    async fn stalled_js_engine_reply_returns_timeout_error() {
+        let (_reply_tx, reply_rx) = oneshot::channel();
+        let started = Instant::now();
+
+        let error = await_js_response(reply_rx, Duration::from_millis(30))
+            .await
+            .expect_err("stalled reply should time out");
+
+        assert!(matches!(
+            error,
+            ToolError::Msg(message) if message == "JS engine reply timeout"
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }
 
 #[cfg(test)]

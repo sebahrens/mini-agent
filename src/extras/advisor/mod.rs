@@ -155,8 +155,7 @@ conversation, so focus your question on the specific decision you need help with
 
         tracing::debug!("advisor call: question_len={}", args.question.len());
 
-        let cfg =
-            with_config(|c| c.clone()).map_err(|e| ToolError::Msg(e.to_string()))?;
+        let cfg = with_config(|c| c.clone()).map_err(|e| ToolError::Msg(e.to_string()))?;
 
         if let Some(max) = cfg.max_uses {
             self.uses
