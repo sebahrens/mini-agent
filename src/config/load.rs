@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use compact_str::CompactString;
 
-use std::io;
+use std::io::{self, Read};
 
 use crate::config::{
     Config, EditSystem, QuickModelConfig, StatusLineConfig, StatusLineLine, StatusLineSegment,
@@ -13,11 +13,57 @@ use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
 use crate::paths::AppPaths;
 
 /// Write `content` to `path` atomically via temp-file + rename.
-fn atomic_config_write(path: &Path, content: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+pub(crate) fn atomic_config_write(path: &Path, content: &str) -> io::Result<()> {
+    crate::fs::private_atomic_write_sync(path, content.as_bytes())
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn atomic_config_write_with_failure(
+    path: &Path,
+    content: &str,
+    fail_rename: bool,
+) -> io::Result<()> {
+    crate::fs::private_atomic_write_with_failure_sync(
+        path,
+        content.as_bytes(),
+        fail_rename,
+    )
+}
+
+pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "config file must have a parent directory",
+        )
+    })?;
+    crate::fs::ensure_private_directory(parent)?;
+    let mut file = crate::fs::open_private_file(path)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("toml") => toml::from_str(content).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "config is not valid TOML")
+        }),
+        _ => serde_yaml_ng::from_str(content).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "config is not valid YAML or JSON",
+            )
+        }),
     }
-    crate::fs::atomic_write_sync(path, content.as_bytes())
+}
+
+fn path_entry_exists(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Candidate config filenames, in priority order within each search dir.
@@ -93,14 +139,8 @@ pub fn save_quick_model(
     output_token_cost: f64,
 ) -> std::io::Result<()> {
     let path = resolve_config_path();
-    let mut cfg: Config = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("toml") => toml::from_str(&content).map_err(std::io::Error::other)?,
-            // YAML is a superset of JSON, so this also accepts legacy
-            // `config.json` files transparently.
-            _ => serde_yaml_ng::from_str::<Config>(&content).map_err(std::io::Error::other)?,
-        }
+    let mut cfg: Config = if path_entry_exists(&path)? {
+        parse_config_content(&path, &read_config_content(&path)?)?
     } else {
         Config::default()
     };
@@ -120,10 +160,6 @@ pub fn save_quick_model(
         },
     );
 
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid config path")
-    })?;
-    std::fs::create_dir_all(parent)?;
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => {
             let content = toml::to_string(&cfg).map_err(std::io::Error::other)?;
@@ -313,25 +349,38 @@ pub fn load_with_paths(paths: &AppPaths) -> (Config, bool) {
 }
 
 fn load_from_path(path: PathBuf, local_config_path: Option<&Path>) -> (Config, bool) {
-    let is_first_startup = !path.exists();
+    let is_first_startup = !path_entry_exists(&path).unwrap_or_else(|error| {
+        eprintln!(
+            "error: failed to inspect config path ({}): {}\n\
+             Fix the path or remove it to use defaults.",
+            path.display(),
+            error,
+        );
+        std::process::exit(1);
+    });
     #[allow(unused_mut)]
     let mut cfg: Config = if is_first_startup {
         tracing::info!(
             "first startup, writing default config to {}",
             path.display()
         );
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
         let default = rich_default_config();
         if path.extension().and_then(|e| e.to_str()) == Some("toml")
             && let Ok(content) = toml::to_string(&default)
         {
-            atomic_config_write(&path, &content).ok();
+            atomic_config_write(&path, &content).unwrap_or_else(|error| {
+                eprintln!(
+                    "error: failed to create private config file ({}): {}\n\
+                     Fix the path or its permissions, then restart.",
+                    path.display(),
+                    error,
+                );
+                std::process::exit(1);
+            });
         }
         default
     } else {
-        let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        let content = read_config_content(&path).unwrap_or_else(|e| {
             eprintln!(
                 "error: failed to read config file ({}): {}\n\
                  Fix the file or remove it to use defaults.",
@@ -340,26 +389,15 @@ fn load_from_path(path: PathBuf, local_config_path: Option<&Path>) -> (Config, b
             );
             std::process::exit(1);
         });
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("toml") => toml::from_str(&content).unwrap_or_else(|e| {
-                eprintln!(
-                    "error: {} is not a valid config: {}\n\
-                      Fix the file or remove it to use defaults.",
-                    path.display(),
-                    e,
-                );
-                std::process::exit(1);
-            }),
-            _ => serde_yaml_ng::from_str(&content).unwrap_or_else(|e| {
-                eprintln!(
-                    "error: {} is not a valid config: {}\n\
-                      Fix the file or remove it to use defaults.",
-                    path.display(),
-                    e,
-                );
-                std::process::exit(1);
-            }),
-        }
+        parse_config_content(&path, &content).unwrap_or_else(|error| {
+            eprintln!(
+                "error: {} is not a valid config: {}\n\
+                 Fix the file or remove it to use defaults.",
+                path.display(),
+                error,
+            );
+            std::process::exit(1);
+        })
     };
 
     tracing::debug!(
@@ -423,14 +461,18 @@ fn apply_local_override(cfg: &mut Config, path: &Path) {
 /// `local_toml` win, tables (`quick_models`, `mcp_servers`, ...) merge per
 /// key, scalars and arrays replace, and absent keys keep the base value.
 pub fn merge_config_override(base: &Config, local_toml: &str) -> Result<Config, String> {
-    let local: toml::Value = toml::from_str(local_toml).map_err(|e| e.to_string())?;
-    let local_json = serde_json::to_value(&local).map_err(|e| e.to_string())?;
+    let local: toml::Value =
+        toml::from_str(local_toml).map_err(|_| "project config is not valid TOML".to_string())?;
+    let local_json = serde_json::to_value(&local)
+        .map_err(|_| "project config could not be normalized".to_string())?;
     // `Config` skips `None` fields when serializing, so the base JSON holds
     // exactly the keys that are set and the local JSON exactly the keys the
     // project file sets.
-    let mut base_json = serde_json::to_value(base).map_err(|e| e.to_string())?;
+    let mut base_json = serde_json::to_value(base)
+        .map_err(|_| "base config could not be normalized".to_string())?;
     deep_merge_json(&mut base_json, local_json);
-    serde_json::from_value(base_json).map_err(|e| e.to_string())
+    serde_json::from_value(base_json)
+        .map_err(|_| "merged project config has an invalid value".to_string())
 }
 
 /// Deep-merge `over` into `base`: objects merge recursively per key, any
@@ -506,10 +548,6 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
         }
     }
     let path = resolve_config_path();
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid config path"))?;
-    std::fs::create_dir_all(parent)?;
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => {
             let content = toml::to_string(&cfg).map_err(io::Error::other)?;

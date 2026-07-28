@@ -68,6 +68,32 @@ The corresponding overrides are `ZS_CONFIG_DIR`, `ZS_DATA_DIR`,
 zerostack never uses the current directory as a fallback for user-global
 state.
 
+## Config-file privacy
+
+The global config can contain plaintext API keys, authorization headers, and
+other credentials. Its containing configuration directory is therefore a
+private persistence root:
+
+- On Unix, zerostack creates configuration directories as `0700` and config
+  files and atomic-write temporary files as `0600`, independent of the process
+  umask. An existing current-user-owned real directory or regular file with
+  broader mode bits is repaired through an opened handle before it is read or
+  replaced.
+- On Windows, Unix mode bits are not considered protection. The config
+  directory, final file, and atomic-write temporary file receive a protected
+  DACL with inheritance disabled. Full access is limited to the current user
+  and `SYSTEM`; inherited `Everyone` and ordinary `Users` access is removed.
+- A symbolic link, Windows reparse point, wrong file type, or path not owned by
+  the current user is rejected. zerostack does not chmod or rewrite through
+  such a path. Unsupported platforms fail closed instead of saving secrets
+  with process-default permissions.
+
+Atomic replacement publishes only a fully written private temporary file and
+revalidates the resulting config file. Save and parse errors report the path
+and error category but omit config source excerpts, which could contain stored
+secrets. Config persistence currently creates no lock or backup file; any
+future lock or backup artifact must use the same `0600`/protected-DACL policy.
+
 On startup, known legacy content is copied through a private, no-follow,
 content-verified migration and the original is retained. Identical candidates
 are safe to converge. Differing candidates require an explicit numbered

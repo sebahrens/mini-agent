@@ -1281,31 +1281,7 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
     reject_link_components(path)?;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if portable::is_link_or_reparse(&metadata) || !metadata.is_dir() => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "migration directory must be a real directory",
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    std::fs::create_dir_all(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if portable::is_link_or_reparse(&metadata) || !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "migration directory changed while it was prepared",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    crate::fs::ensure_private_directory(path)
 }
 
 fn reject_link_components(path: &Path) -> io::Result<()> {

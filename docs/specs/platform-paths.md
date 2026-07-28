@@ -196,10 +196,11 @@ shared validator. Collision checks use Unicode normalization plus case folding e
 case-sensitive host so an artifact remains portable to Windows and default macOS filesystems.
 
 On Unix, private roots are created as `0700` and credential/config/session files and all temporary
-files as `0600` from creation. On Windows, credential files disable inherited broad access and use
-a DACL that grants the current user (and the minimum operating-system principal required for
-normal operation) access while excluding `Everyone` and ordinary `Users`. Unix mode-bit calls are
-not treated as Windows protection.
+files as `0600` from creation. On Windows, credential and global-config roots, final files, and
+atomic-write intermediates disable inherited broad access and use a protected DACL that grants the
+current user and `SYSTEM` access while excluding `Everyone` and ordinary `Users`. Unix mode-bit
+calls are not treated as Windows protection. Existing owned real paths may be repaired through an
+opened handle; symbolic links, reparse points, wrong file types, and non-owned paths fail closed.
 
 For MCP OAuth, `canonical-server-identity` is the versioned, length-prefixed tuple of the exact
 UTF-8 config map key, normalized absolute HTTP(S) URL, and explicit OAuth client ID (or empty).

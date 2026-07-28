@@ -1,5 +1,13 @@
 use std::path::{Path, PathBuf};
 
+mod private;
+
+pub(crate) use private::{atomic_write as private_atomic_write_sync, ensure_directory as ensure_private_directory, open_existing as open_private_file};
+#[cfg(all(test, unix))]
+pub(crate) use private::atomic_write_with_failure as private_atomic_write_with_failure_sync;
+#[cfg(all(test, windows))]
+pub(crate) use private::dacl_sddl as private_dacl_sddl;
+
 fn path_changed_error(path: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,

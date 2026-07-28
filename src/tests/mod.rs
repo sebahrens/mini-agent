@@ -21,6 +21,8 @@ mod checker_tests;
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]
+mod config_persistence_permissions_tests;
+#[cfg(test)]
 mod convert_history_tests;
 #[cfg(test)]
 mod crc_tests;
