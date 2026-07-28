@@ -158,37 +158,55 @@ Platform backends abstracted through the `birdcage` crate:
 
 ## 9. Skill library (Phase 3)
 
-Voyager-model substrate for self-evolving agent capabilities:
+Voyager-model substrate for self-evolving agent capabilities. The normative design is
+[`docs/specs/phase-3-skill-library.md`](docs/specs/phase-3-skill-library.md).
 
 ```
-[skill store]
-  key:   sha256(source_bytes)   ← content-addressed; mutation invalidates
-  value: { source, description, tests: Vec<String>, created_at, usage_count }
+[immutable skill artifact]
+  key: sha256(versioned canonical execution + discovery payload)
+  payload: { source, exports, description, tags, tests, capability tier }
 
-[embedding index]
-  field:   description (embedded at write time)
-  retrieval: cosine similarity on agent's current step context
+[turn-time retrieval]
+  query: current user prompt + bounded task context, before model generation
+  dense: pre-normalized in-memory exact cosine index (up to 100,000 local skills)
+  lexical: SQLite FTS5/BM25 over descriptions, signatures, tags, and identifiers
+  fusion: reciprocal-rank fusion, similarity floor, dedupe, and source/token budget
 
-[Rust verification gate]
-  tests array: JS expressions each evaluating to `true`
-  runner: outside sandbox — Rust runs the test assertions
-  auto-admission (Phase 4): held-out Rust integration check must pass
+[turn skill bundle]
+  model sees: ids, descriptions, signatures, and capability tiers
+  JS runtime receives: exactly the immutable sources selected for that turn
 ```
 
-Retrieval at step start: top-K skills by cosine similarity are injected as preamble into the JS context:
+Retrieval occurs once per user turn in the runner/session layer, where the prompt exists. The
+JS thread never embeds text or queries SQLite. The selected bundle is frozen for the turn and
+is reused by every JS call. Skill source and model-authored code are evaluated as separate
+scripts in one fresh context, preserving model-authored stack-trace line numbers.
 
-```javascript
-// Injected by zerostack before agent code:
-function parseJson(s) { return JSON.parse(s); }  // skill sha256:abc123
-function readLines(path) { return read_file(path).split('\n'); }  // skill sha256:def456
-// --- agent code follows ---
-```
+The default index is an immutable contiguous in-memory exact scan. SQLite is authoritative
+persistence, not a per-query vector reader. A replaceable `SkillIndex` boundary permits ANN
+only after a 100,000-skill benchmark shows the exact implementation misses its p99 latency
+budget. Query embeddings and active-index generations are cached; skill embeddings are
+computed at admission or migration, never lazily on the request path.
 
 ## 10. Evaluator integrity
 
-Skills ship with `tests: Vec<String>` (JS expressions → `true`). Content hash = `sha256(source)`. Mutating the tests array changes the hash and invalidates the skill — integrity is structurally enforced, not by policy.
+The canonical identity includes source, ordered tests, exports/signatures, retrieval metadata,
+and declared capabilities. Mutating any execution- or discovery-bearing field changes the ID.
+Operational status, telemetry, timestamps, and embedding bytes are outside the identity.
 
-Phase 4 adds a held-out Rust integration test for auto-admission: agents can propose new skills, but human review + integration test pass is required for promotion to the shared store.
+Candidate source and tests run in a fresh, bounded **no-effect** context. Tier 0 gets no host
+globals; Tier 1/2 get only declared, deterministic in-memory record/replay fakes that cannot touch
+real files, processes, permissions, or networks. Tests must be nonempty and each must evaluate to
+exact JavaScript boolean `true`. Mutation checks replace exports with throwing stubs and reject
+suites that still pass. Held-out golden/property cases and fake responses are content-addressed
+data approved outside the proposing agent; adding a new case does not require recompiling zerostack.
+
+[`docs/specs/phase-4-auto-admission.md`](docs/specs/phase-4-auto-admission.md) defines human-gated
+candidate admission. [`docs/specs/phase-5-evidence-learning.md`](docs/specs/phase-5-evidence-learning.md)
+defines the evidence-based lifecycle: deterministic canaries, directly attributed invocation
+telemetry, automatic quarantine, immutable repair revisions, supersession, and transactional
+rollback. Automatic promotion is limited to pure/read-only replacements with sufficient
+held-out and canary evidence; write/process/network skills always require human approval.
 
 ## 11. Platform independence summary
 

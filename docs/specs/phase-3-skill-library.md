@@ -2,15 +2,27 @@
 
 **Status**: Pre-implementation  
 **Prerequisite**: Phase 1 complete and passing (Phase 2 is NOT required)  
-**Delivers**: A content-addressed SQLite skill store with embedding-based retrieval. Top-K skills are injected as a JS preamble before each agent step.
+**Delivers**: An immutable content-addressed skill store, prompt-time hybrid retrieval, a
+turn-scoped model manifest, and exact source binding for JS execution.
+**Target scale**: up to 100,000 local/shared skill revisions.
 
 ---
 
 ## Overview
 
-Implements the Voyager model: the agent accumulates reusable JavaScript functions ("skills") that survive across sessions. Before each JS step the store retrieves the top-3 most relevant skills by cosine similarity and injects them as a preamble block. Skills are content-addressed by `sha256(source)` — mutating the source invalidates the skill structurally, not by policy.
+Implements the Voyager model: the agent accumulates reusable JavaScript functions that survive
+across sessions. Retrieval occurs once when the current user prompt arrives, before model
+generation. The LLM receives a compact manifest containing selected IDs, descriptions, exports,
+signatures, and capability tiers. Every JS tool invocation in that turn receives exactly the
+same immutable source snapshot.
 
-This is the substrate for Phase 4 auto-admission. In Phase 3, skills are added manually (via CLI or direct store API). Auto-admission from successful agent steps is Phase 4.
+Retrieving inside `engine::run_step` from model-generated JavaScript is prohibited. At that point
+the model has already written its code and cannot discover an injected function, and embedding
+raw JS against English descriptions produces a cross-domain query. Embedding and retrieval live
+in the tokio runner/session layer; the dedicated JS thread only evaluates a resolved bundle.
+
+Phase 3 supports manual admission after verification. Agent proposals and human-gated canary
+admission are Phase 4. Evidence-driven promotion, quarantine, repair, and rollback are Phase 5.
 
 ---
 
@@ -19,14 +31,19 @@ This is the substrate for Phase 4 auto-admission. In Phase 3, skills are added m
 ```toml
 # Cargo.toml additions
 [features]
-skills = ["dep:fastembed", "dep:rusqlite"]
+skills = ["js", "dep:fastembed", "dep:rusqlite", "dep:sha2"]
 
 [dependencies]
-fastembed  = { version = "3", optional = true }
-rusqlite   = { version = "0.31", features = ["bundled"], optional = true }
+fastembed = { version = "3", optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+sha2 = { version = "0.10", optional = true }
 ```
 
-Gate all skill code behind `#[cfg(feature = "skills")]`. The binary without `--features skills` must compile and all Phase 1/2 tests must pass. `rusqlite` uses `features = ["bundled"]` so no system SQLite is required.
+`skills` implies `js`; a selectable skills-without-JS state is invalid. Gate skill code behind
+`#[cfg(feature = "skills")]`. Default and `js`-only builds must remain unchanged. `rusqlite` uses
+bundled SQLite and must verify that FTS5 is enabled in the pinned build. If it is unavailable,
+the lexical retriever must fail clearly at startup or use an explicitly tested fallback; it must
+not silently claim hybrid retrieval.
 
 ---
 
@@ -36,29 +53,72 @@ All new files go in `src/extras/js/skills/` (to be created):
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `src/extras/js/skills/mod.rs` | TO BE CREATED | Module entry, `Skill` struct, `verify_skill` |
-| `src/extras/js/skills/store.rs` | TO BE CREATED | SQLite store, content-addressed CRUD |
-| `src/extras/js/skills/embed.rs` | TO BE CREATED | fastembed wrapper, cosine similarity, top-K retrieval |
+| `src/extras/js/skills/mod.rs` | TO BE CREATED | Immutable artifact, canonical identity, capability types |
+| `src/extras/js/skills/store.rs` | TO BE CREATED | SQLite schema, identity-validating persistence, lifecycle filters |
+| `src/extras/js/skills/embed.rs` | TO BE CREATED | Cached fastembed model and versioned embedding generation |
+| `src/extras/js/skills/index.rs` | TO BE CREATED | Immutable dense snapshot, FTS ranking, fusion, budgets |
+| `src/extras/js/skills/verify.rs` | TO BE CREATED | Fresh no-effect verifier used by Phases 3–5 |
 | `src/extras/js/mod.rs` | Phase 1 creates | Add `#[cfg(feature = "skills")] pub mod skills;` |
+| `src/extras/js/types.rs` | Phase 1 creates | Add `ResolvedSkill`/`TurnSkillBundle` to `JsRequest` |
+| `src/extras/js/engine.rs` | Phase 1 creates | Evaluate selected skills and agent code as separate scripts |
+| `src/extras/js/tool.rs` | Phase 1 creates | Snapshot the current bundle when a JS call starts |
+| `src/agent/runner.rs` | EXISTS | Retrieve from the user prompt before the first model call |
 
 ---
 
-## Skill struct — `src/extras/js/skills/mod.rs`
+## Immutable skill artifact — `src/extras/js/skills/mod.rs`
 
 ```rust
-pub struct Skill {
-    pub id:          String,      // sha256(source) hex — first 16 chars used as store key
-    pub source:      String,      // JS function source (the actual code)
-    pub description: String,      // embedded for retrieval; human-readable
-    pub tests:       Vec<String>, // JS expressions each evaluating to true
-    pub created_at:  u64,         // Unix timestamp
-    pub usage_count: u64,
+pub struct SkillArtifact {
+    pub id: String,
+    pub identity_version: u32,
+    pub source: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub exports: Vec<SkillExport>,
+    pub tests: Vec<String>,
+    pub capability: CapabilityManifest,
+}
+
+pub struct SkillExport {
+    pub name: String,
+    pub signature: String,
+}
+
+pub struct CapabilityManifest {
+    pub tier: CapabilityTier,
+    pub allowed_hosts: Vec<HostCapability>,
+}
+
+pub enum CapabilityTier {
+    Pure,
+    ReadOnly,
+    SideEffecting,
+}
+
+pub enum HostCapability {
+    ReadFile,
+    WriteFile,
+    Spawn,
+    Fetch,
 }
 ```
 
-**Content-addressing invariant**: `id = sha256(source)[..16]` (first 16 hex chars of the SHA-256 hash of the source bytes). Changing `source` changes `id` and the old skill record is unreachable. There is no `UPDATE source` operation — content is immutable.
+`id` is the full 64-character SHA-256 of a versioned canonical serialization containing source,
+ordered tests, ordered exports/signatures, description, normalized ordered tags, and the full
+capability manifest.
+Exact UTF-8 bytes are preserved for source/tests/description; no implicit whitespace or newline
+normalization occurs. Length-prefix every field and list item to avoid ambiguous concatenation.
 
-**Schema conflict resolved**: `SPEC.md §3.2` lists a `name TEXT NOT NULL` column that is absent from the `Skill` struct in `SPEC.md §3.1`. The spec below matches the struct exactly — no `name` column.
+Manifest validation enforces tier consistency: `Pure` has no allowed hosts; `ReadOnly` may declare
+only read-only operations; `SideEffecting` may declare only the supported Tier 0–2 hosts. Unknown,
+duplicate, or administrative/security-sensitive capabilities are rejected. Runtime and verifier
+checks use the exact list, never a broad tier-wide ambient grant.
+
+Changing any execution- or discovery-bearing field creates a new ID. Timestamps, status,
+telemetry, lineage, row version, and embedding bytes are operational data outside identity. There
+is no update operation for identity-bearing columns. The store recomputes identity on insert and
+every active read; caller-provided IDs are never trusted.
 
 ---
 
@@ -67,166 +127,249 @@ pub struct Skill {
 Database path: `~/.config/zerostack/skills.db` (respects `$XDG_CONFIG_HOME`).
 
 ```sql
-CREATE TABLE IF NOT EXISTS skills (
-    id          TEXT    PRIMARY KEY,
-    source      TEXT    NOT NULL,
-    description TEXT    NOT NULL,
-    tests       TEXT    NOT NULL,   -- JSON array of strings
-    created_at  INTEGER NOT NULL,
-    usage_count INTEGER NOT NULL DEFAULT 0,
-    embedding   BLOB                -- NULL until embed() is called; f32 LE bytes
+CREATE TABLE IF NOT EXISTS skill_revisions (
+    id               TEXT PRIMARY KEY,
+    identity_version INTEGER NOT NULL,
+    source           TEXT NOT NULL,
+    description      TEXT NOT NULL,
+    tags_json        TEXT NOT NULL,
+    exports_json     TEXT NOT NULL,
+    tests_json       TEXT NOT NULL,
+    capability_json  TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    supersedes_id    TEXT,
+    superseded_by_id TEXT,
+    row_version      INTEGER NOT NULL DEFAULT 1,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    CHECK (status IN (
+        'pending','verified','canary','active','quarantined','superseded','retired','rejected'
+    ))
+);
+
+CREATE TABLE IF NOT EXISTS skill_embeddings (
+    skill_id       TEXT NOT NULL,
+    model_id       TEXT NOT NULL,
+    model_revision TEXT NOT NULL,
+    dimensions     INTEGER NOT NULL,
+    normalized     INTEGER NOT NULL,
+    embedding      BLOB NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (skill_id, model_id, model_revision)
 );
 ```
+
+FTS5 indexes description, tags, export signatures, and identifiers extracted from source. The
+source itself is not copied wholesale into model-visible retrieval output.
 
 ### CRUD operations
 
 ```rust
-pub struct SkillStore {
-    conn: rusqlite::Connection,
-}
-
 impl SkillStore {
     pub fn open() -> anyhow::Result<Self>;
-
-    /// Insert a skill. Returns Err if id already exists (content-addressed — no update).
-    pub fn insert(&mut self, skill: &Skill) -> anyhow::Result<()>;
-
-    pub fn get(&self, id: &str) -> anyhow::Result<Option<Skill>>;
-
-    pub fn list(&self) -> anyhow::Result<Vec<Skill>>;
-
-    pub fn increment_usage(&mut self, id: &str) -> anyhow::Result<()>;
-
-    pub fn delete(&mut self, id: &str) -> anyhow::Result<()>;
+    pub fn insert_verified(&mut self, artifact: &SkillArtifact) -> anyhow::Result<()>;
+    pub fn get(&self, id: &str) -> anyhow::Result<Option<SkillArtifact>>;
+    pub fn list_retrievable(&self) -> anyhow::Result<Vec<SkillArtifact>>;
+    pub fn store_embedding(&mut self, record: &EmbeddingRecord) -> anyhow::Result<()>;
+    pub fn retire(&mut self, id: &str, expected_version: u64) -> anyhow::Result<()>;
+    pub fn purge(&mut self, id: &str) -> anyhow::Result<()>;
 }
 ```
 
+In Phase 3, manual insertion verifies the artifact first and stores it as active. `get`, index
+loading, and later promotion paths recompute canonical identity and reject or quarantine invalid
+rows before returning source. In Phase 3, `list_retrievable` returns only `active` rows. The schema
+reserves `canary` for Phase 4, but canaries remain non-retrievable until the Phase 5 router can
+attach them as alternatives to an active lineage. They are never independent search competitors.
+Pending, quarantined, superseded, retired, and rejected rows never enter an index snapshot.
+
+`retire` is the normal reversible removal path. `purge` is an explicit privacy operation and must
+delete dependent embeddings/index data transactionally. Not-found, collision, stale-version,
+corruption, and database errors return typed errors and never panic.
+
 ---
 
-## Embedding index — `src/extras/js/skills/embed.rs`
+## Embedding generation — `src/extras/js/skills/embed.rs`
 
 **Model**: `BAAI/bge-small-en-v1.5` via `fastembed` crate (~30 MiB download, cached locally). No API call required — fully local inference.
 
-### Embedding a skill
+The fastembed model is initialized once and reused. The retrieval document is deterministic:
+
+```text
+<description>\nExports: <signature>; ...\nTags: <tag>, ...\nIdentifiers: <bounded sorted identifiers>
+```
+
+Persist model ID, model revision, dimensions, normalization flag, and bytes. A model or dimension
+change never mixes vectors: build a new generation and atomically switch after all retrievable
+skills have embeddings. Skill embeddings are computed at insert/promotion or migration, never
+lazily in the request path.
+
+Query embedding runs in a bounded blocking worker because local model inference is CPU-bound. A
+cache keyed by `(model_revision, sha256(retrieval_query))` avoids repeated inference for retries
+and tool continuations. Cache entries are bounded by count/bytes and have explicit eviction.
+
+### Embedding API
 
 ```rust
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-pub fn embed_description(description: &str) -> anyhow::Result<Vec<f32>> {
-    let model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::BGESmallENV15)
-    )?;
-    let embeddings = model.embed(vec![description], None)?;
-    Ok(embeddings.into_iter().next().unwrap_or_default())
+pub struct Embedder { /* lazily initialized model + immutable metadata */ }
+
+impl Embedder {
+    pub fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>>;
+    pub fn embed_documents(&self, documents: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
 }
 ```
 
-### Storing embeddings
-
-After inserting a skill, compute its embedding and store it:
-
-```rust
-pub fn store_embedding(conn: &rusqlite::Connection, id: &str, embedding: &[f32]) -> anyhow::Result<()> {
-    let blob: Vec<u8> = embedding.iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect();
-    conn.execute("UPDATE skills SET embedding = ?1 WHERE id = ?2", (blob, id))?;
-    Ok(())
-}
-```
-
-### Retrieval — cosine similarity
-
-```rust
-pub fn top_k_skills(
-    conn: &rusqlite::Connection,
-    query_embedding: &[f32],
-    k: usize,
-) -> anyhow::Result<Vec<Skill>> {
-    // Load all skills with non-null embeddings from SQLite
-    // Compute cosine similarity in Rust for each
-    // Return top-k sorted by similarity descending
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
-    dot / (norm_a * norm_b)
-}
-```
-
-For Phase 3 scale (tens to hundreds of skills), linear scan is sufficient. A vector index (HNSW etc.) is a stretch concern.
+Empty output, non-finite values, dimension mismatch, or model initialization/download failure is a
+normal error. Retrieval then returns no learned skills and surfaces a diagnostic; it never injects
+an unscored fallback.
 
 ---
 
-## Preamble injection — `src/extras/js/engine.rs`
+## `SkillIndex` and hybrid retrieval — `src/extras/js/skills/index.rs`
 
-Before evaluating agent code, retrieve top-3 skills and prepend as a preamble. Modify `run_step` (or add a wrapper) to accept optional skills:
+```rust
+pub trait SkillIndex: Send + Sync {
+    fn search(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        policy: &RetrievalPolicy,
+    ) -> anyhow::Result<Vec<ScoredSkill>>;
+}
+```
+
+The default implementation loads active, identity-valid rows into one immutable snapshot. Phase 5
+extends a logical lineage entry with eligible canary alternatives after retrieval; it does not add
+candidate/predecessor near-duplicates to the search corpus.
+
+- IDs/metadata and pre-normalized equal-dimension f32 vectors are contiguous and deterministic.
+- Exact cosine ranking is a dot product; a bounded heap selects candidates without sorting every
+  row.
+- SQLite BLOBs are read only when building a new generation, never per query.
+- FTS5/BM25 produces lexical candidates from exact identifiers, exports, descriptions, and tags.
+- Dense and lexical ranks are combined with reciprocal-rank fusion.
+- A dense similarity floor may reduce the result to zero; top-k is a maximum, not a quota.
+- Semantic near-duplicates are collapsed before applying source/manifest budgets.
+- Final ordering is deterministic by fused score then full skill ID.
+
+Initial policy defaults are `max_skills = 3`, a configurable dense score floor, a compact manifest
+budget, and a separate JS source-byte budget. Threshold calibration must use checked-in retrieval
+fixtures; a magic score may not be accepted only because one model happened to emit it.
+
+At the 100,000-skill target, benchmark query embedding separately from index search. The exact
+in-memory implementation must meet a 5 ms p99 search target on a documented reference machine,
+excluding embedding inference. ANN/HNSW is not a Phase 3 dependency. It may replace the trait
+implementation only when a checked-in 100,000-skill benchmark demonstrates a missed p99 budget
+and includes recall, memory, build, update, quarantine, and deletion measurements.
+
+---
+
+## Prompt-time retrieval and turn-scoped binding
+
+### Retrieval query
+
+The current user prompt is always the primary query. To resolve references such as “do the same
+for the other file,” append a deterministic bounded suffix from recent task context. Do not call a
+second LLM to summarize the query. Do not include unbounded conversation history, tool output,
+timestamps, random IDs, or generated JS.
+
+### Turn context
+
+```rust
+pub struct TurnSkillBundle {
+    pub query_fingerprint: String,
+    pub embedding_model_revision: String,
+    pub index_generation: u64,
+    pub skills: Vec<ResolvedSkill>,
+}
+
+pub struct ResolvedSkill {
+    pub id: String,
+    pub score: f32,
+    pub rank: usize,
+    pub description: String,
+    pub exports: Vec<SkillExport>,
+    pub capability: CapabilityManifest,
+    pub source: String,
+}
+```
+
+The runner resolves one bundle before its initial `stream_chat(prompt, history)` call and stores
+it in a per-agent `SkillTurnContext`. Retries reuse the same bundle. Continuations within the same
+user turn do not re-embed or rerank. A new user prompt creates a new generation-stamped bundle.
+
+The model-visible prompt is prefixed with a compact non-user-spoofable manifest when the provider
+supports such a channel; otherwise use a clearly delimited trusted context block inserted by the
+runner. The manifest contains no source:
+
+```text
+<available_js_skills index_generation="42">
+- id: <full id>
+  exports: parseJson(text: string): unknown | null
+  capability: pure
+  description: Parse JSON safely and return null on syntax error.
+</available_js_skills>
+```
+
+The JS tool snapshots the exact bundle when the tool call begins and includes it in `JsRequest`.
+The JS thread performs no database access, embedding, or ranking.
+
+### Runtime binding
+
+Evaluate selected skill sources as script 1, validate and wrap the declared exports, then evaluate
+model-authored code as script 2 in the same fresh context:
 
 ```javascript
-// === Skill library (auto-injected) ===
-// skill:abc123def456 — parse JSON safely
-function parseJson(s) { try { return JSON.parse(s); } catch(e) { return null; } }
-// skill:789012345678 — read lines from file
-function readLines(path) { return read_file(path).split('\n').filter(l => l.length > 0); }
-// === End skill library ===
+// Script 1, generated by zerostack from the frozen bundle
+function parseJson(s) { /* immutable selected source */ }
 
-// Agent code:
-<agent JS code here>
+// Script 2, exactly the model-authored code
+parseJson(input)
 ```
 
-Implementation:
-
-```rust
-fn build_full_code(agent_code: &str, skills: &[Skill]) -> String {
-    if skills.is_empty() {
-        return agent_code.to_string();
-    }
-    let mut preamble = String::from("// === Skill library (auto-injected) ===\n");
-    for skill in skills {
-        preamble.push_str(&format!("// skill:{} — {}\n", skill.id, skill.description));
-        preamble.push_str(&skill.source);
-        preamble.push('\n');
-    }
-    preamble.push_str("// === End skill library ===\n\n// Agent code:\n");
-    preamble.push_str(agent_code);
-    preamble
-}
-```
-
-Retrieval uses the agent step's current context (last N tokens of the conversation) as the embedding query. Default `k = 3`.
+Separate scripts preserve agent-code line numbers. Skill-source failures identify the full skill ID
+and never rewrite the agent script. Missing/duplicate exports, source exceptions, capability
+violations, and bundle identity mismatches fail closed. If the bundle is empty, evaluate only the
+agent script and add no manifest.
 
 ---
 
-## Skill verification — `src/extras/js/skills/mod.rs`
-
-**Prerequisite**: Phase 1 must declare `run_step` as `pub(crate)` (not private). The Phase 1 spec already annotates this — verify before implementing Phase 3.
+## No-effect skill verification — `src/extras/js/skills/verify.rs`
 
 ```rust
-pub fn verify_skill(skill: &Skill) -> Result<(), String> {
-    for test_expr in &skill.tests {
-        // Run each test expression in a fresh sandbox Runtime (reuses run_step machinery)
-        // Prepend the skill source so the test can call its functions
-        let code = format!("({}); {}", skill.source, test_expr);
-        let result = crate::extras::js::engine::run_step(&code);
-        match result {
-            JsOutcome::Value(v) if v == "true" => {}
-            JsOutcome::Void => {}
-            other => {
-                return Err(format!(
-                    "test failed: `{}` → {:?}",
-                    test_expr, other
-                ));
-            }
-        }
-    }
-    Ok(())
+pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, VerificationError> {
+    // One fresh bounded Runtime/Context for this verification.
+    // Register no real-effect host globals. Tier 0 gets none; Tier 1/2 get only declared fakes.
+    // Evaluate source as one script, then each test as a separate script in the same context.
+    // Require at least one test and exact JavaScript boolean true for every test.
 }
 ```
 
-Tests must pass before a skill is inserted into the store. Violation: `insert()` returns `Err`.
+Reject empty tests, false, undefined/void, numeric/string/object truthy values, source/test syntax or
+runtime errors, Promise rejection, timeout, OOM, endless jobs, undeclared exports, and any host
+access outside the declared capability. Tier 0 receives no host symbols. Tier 1 and Tier 2 receive
+only verifier-owned deterministic record/replay fakes for declared operations. The fakes are
+versioned, bounded, and backed by in-memory virtual state; they never call the real filesystem,
+permission service, process launcher, or network. Unconfigured operations fail deterministically.
+Trusted held-out cases may supply hidden fake responses and assert the recorded call transcript.
+Embedded tests cannot inspect hidden fixtures or replace fake implementations.
+
+Verification errors include the stage/test index and bounded stack information but never activate
+or persist the artifact. Each skill verification gets a new runtime and new fake state; tests
+within that verification may see the source and prior test/fake effects only if the implementation
+documents and tests that ordering.
+
+The verifier also performs an anti-vacuity mutation pass. For each declared export, rerun the suite
+with that export replaced by a throwing stub; at least one embedded test must then fail for the
+expected reason. This proves that every public export is exercised, not that its behavior is fully
+correct. Mutation runs use fresh contexts and the same resource bounds. An empty, always-true, or
+unrelated suite cannot verify an artifact.
+
+Manual Phase 3 insertion calls the verifier before identity-validating persistence. Store APIs do
+not accept an “already verified” caller assertion without a corresponding trusted verification
+report tied to the full artifact ID.
 
 ---
 
@@ -234,15 +377,30 @@ Tests must pass before a skill is inserted into the store. Violation: `insert()`
 
 All must pass under `cargo test --features js,skills`:
 
-- [ ] `SkillStore::insert` stores a skill and `SkillStore::get` retrieves it by id
-- [ ] Inserting two skills with different `source` strings creates two distinct records (different ids)
-- [ ] Inserting a skill with identical `source` returns `Err` (content-addressed — no duplicates)
-- [ ] `embed_description` returns a non-empty `Vec<f32>` for any non-empty string
-- [ ] `top_k_skills` returns at most `k` skills, sorted by cosine similarity descending
-- [ ] `build_full_code` prepends the preamble and the agent's code follows after it
-- [ ] `verify_skill` returns `Ok(())` when all test expressions evaluate to `true`
-- [ ] `verify_skill` returns `Err` when any test expression evaluates to a non-true value
-- [ ] `cargo test --features js` (without `skills`) passes unchanged
+- [ ] Identity changes when source, test/order, export/signature, description/tag, capability, or
+      identity version changes; operational metadata does not affect identity.
+- [ ] Caller ID mismatch, row tampering, legacy short IDs, dimensions/model mismatch, and a
+      simulated collision are rejected without returning source to retrieval.
+- [ ] No-effect verification requires nonempty exact-boolean tests, gives Tier 0 no host globals,
+      gives Tier 1/2 only declared deterministic in-memory fakes, and mutation checks prove every
+      declared export affects at least one test.
+- [ ] Embeddings are generated at admission/migration and tagged with model revision/dimensions.
+- [ ] The fastembed model and bounded query cache are reused; request-time retrieval never lazily
+      embeds a stored skill.
+- [ ] The current user prompt is the primary query and retrieval completes before the first model
+      output; generated JS is not present in the query.
+- [ ] Exact dense + FTS ranking, RRF fusion, threshold, dedupe, deterministic order, and manifest/
+      source budgets have fixture tests.
+- [ ] The model-visible manifest contains only the frozen selected bundle's metadata and is present
+      before the model emits a JS tool call.
+- [ ] Every JS call in one turn receives the same immutable bundle and retries do not re-embed.
+- [ ] Skill source and agent source run as separate scripts; an agent error on line N reports line N
+      with zero, one, or three selected skills.
+- [ ] Pending/canary/quarantined/superseded/retired/rejected rows never appear as independent Phase
+      3 search results; only Phase 5 may route an eligible canary after selecting its active lineage.
+- [ ] A 100,000-skill benchmark reports query-embedding and index-search latency separately and
+      exact search meets the documented p99 target or blocks Phase 3 closure.
+- [ ] `cargo test --features js` without `skills` passes unchanged.
 
 ---
 
@@ -250,6 +408,6 @@ All must pass under `cargo test --features js,skills`:
 
 - UI for browsing or editing skills
 - Cross-agent skill sharing (single-user local store only)
-- LLM-assisted skill description generation (manual description required)
 - Auto-admission from successful agent steps (Phase 4)
-- Vector index / ANN search (linear scan is sufficient at Phase 3 scale)
+- Evidence-driven promotion, quarantine, repair, and rollback (Phase 5)
+- ANN/HNSW unless the 100,000-skill exact-index benchmark misses its p99 budget

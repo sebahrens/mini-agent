@@ -343,89 +343,68 @@ Wrap `spawn()` subprocess with birdcage cage. Configuration mirrors existing `Sa
 
 ## Phase 3 — Skill library
 
-### 3.1 Skill schema
+Phase 3 is defined normatively in
+[`docs/specs/phase-3-skill-library.md`](docs/specs/phase-3-skill-library.md).
 
-```rust
-pub struct Skill {
-    pub id:          String,          // sha256(source) hex
-    pub source:      String,          // JS function source
-    pub description: String,          // embedded for retrieval
-    pub tests:       Vec<String>,     // JS expressions → true
-    pub created_at:  u64,             // Unix timestamp
-    pub usage_count: u64,
-}
-```
-
-### 3.2 Skill store
-
-SQLite via `rusqlite` (optional dep). One row per skill, indexed by `id`. Path: `~/.config/zerostack/skills.db` (respects `$XDG_CONFIG_HOME`).
-
-```sql
-CREATE TABLE skills (
-    id          TEXT PRIMARY KEY,
-    source      TEXT NOT NULL,
-    description TEXT NOT NULL,
-    tests       TEXT NOT NULL,  -- JSON array of strings
-    created_at  INTEGER NOT NULL,
-    usage_count INTEGER NOT NULL DEFAULT 0
-);
-```
-
-### 3.3 Embedding index
-
-Embedding model: `fastembed` crate (local, no API call required). Model: `BAAI/bge-small-en-v1.5` (~30 MiB). Embeddings stored in SQLite as BLOB (f32 array). Cosine similarity computed in Rust at retrieval time.
-
-Add to `Cargo.toml`:
-```toml
-[dependencies]
-fastembed = { version = "3", optional = true }
-```
-
-### 3.4 Retrieval at step start
-
-Top-3 skills by cosine similarity are injected as a preamble block before agent JS code:
-
-```javascript
-// === Skill library (auto-injected) ===
-// skill:abc123 — parse JSON safely
-function parseJson(s) { try { return JSON.parse(s); } catch(e) { return null; } }
-// skill:def456 — read lines from file
-function readLines(path) { return read_file(path).split('\n').filter(l => l.length > 0); }
-// === End skill library ===
-\n// Agent code:
-```
-
-### 3.5 Skill verification
-
-```rust
-pub fn verify_skill(skill: &Skill) -> Result<(), String> {
-    // Run each test expression in a fresh sandbox Runtime
-    // Each must eval to true (JS boolean)
-    // Failure: return Err with the failing test expression + actual value
-}
-```
+- Skills are immutable, fully content-addressed artifacts. Identity covers source, ordered
+  tests, public exports/signatures, retrieval description/tags, capability tier, and identity
+  schema version.
+- Embeddings are generated at admission, tagged with model/revision/dimension, normalized once,
+  and loaded into an immutable in-memory `SkillIndex` snapshot.
+- Retrieval runs once **before model generation**, using the current user prompt plus bounded
+  deterministic task context. Generated JavaScript is never used as the search query.
+- Dense exact cosine ranking and FTS5/BM25 lexical ranking are fused, thresholded, deduplicated,
+  and constrained by an injection budget. The target scale is 100,000 local/shared skills.
+- The LLM sees a compact manifest of selected IDs, descriptions, signatures, and capabilities.
+  `JsTool` binds exactly the corresponding immutable source snapshot for that turn.
+- Skill sources and model-authored code execute as separate scripts in one fresh bounded
+  context so injected code does not shift reported agent-code line numbers.
+- Candidate verification is no-effect: Tier 0 has no host globals; Tier 1/2 have only declared,
+  deterministic in-memory fakes that cannot touch real files, processes, permissions, or networks.
 
 ---
 
 ## Phase 4 — Auto-evolution
 
-### 4.1 Skill proposal protocol
+Phase 4 is defined normatively in
+[`docs/specs/phase-4-auto-admission.md`](docs/specs/phase-4-auto-admission.md).
 
-Agent proposes a new skill by calling a `propose_skill(source, description, tests)` host global.
-zerostack runs verification immediately. If all tests pass, the skill enters a **pending** state.
+- `propose_skill({...})` accepts one structured artifact proposal, including exports,
+  capabilities, tests, and an optional predecessor.
+- Pending source is untrusted. Verification has no real host effects, requires nonempty exact
+  boolean tests, performs mutation checks, and runs immutable held-out cases with hidden fakes.
+- Held-out cases are data, not a compile-time Rust registry, so a learned skill does not require
+  rebuilding the binary.
+- Near-duplicate proposals are redirected toward replacement rather than crowding retrieval.
+- One public promotion service reloads current pending data, recomputes identity, reruns every
+  gate, obtains explicit human approval, and performs an atomic lifecycle transition.
+- Initial admission enters durable canary state. Without the Phase 5 deterministic router, canary
+  revisions remain absent from model manifests and JS bundles.
+- The proposal loop is bounded per session and by source/test/output sizes and evaluation time.
 
-Pending skills are NOT injected into future steps until promoted.
+---
 
-### 4.2 Promotion gate
+## Phase 5 — Evidence-based self-learning
 
-Promotion requires:
-1. All `tests` pass in a fresh sandbox Runtime
-2. A held-out Rust integration test in `src/extras/js/skills/verify.rs` passes (Phase 4 adds a harness)
-3. Human approval (interactive `Ask` prompt) — auto-approval is disabled until evaluator gaming is studied
+Phase 5 is defined normatively in
+[`docs/specs/phase-5-evidence-learning.md`](docs/specs/phase-5-evidence-learning.md).
 
-### 4.3 Loop-until-improvement
-
-The agent can iterate on a skill proposal: propose → test fails → LLM receives failure → agent revises JS → proposes again. Max 5 iterations per skill per session.
+- Instrumented wrappers distinguish selected, injected, invoked, succeeded, and directly failed
+  skills. Overall task failure is not automatically blamed on every injected skill.
+- Automatic promotion is evidence-gated and limited to Tier 0 pure and Tier 1 read-only
+  replacements. Tier 2 write/process/network revisions always require human approval.
+- New revisions begin with human-approved canaries. Mature replacements may enter canary
+  automatically only after inherited regressions, held-out cases, anti-gaming checks, and
+  capability checks pass.
+- A lineage-root canary cannot be retrieved and requires a second human decision to become active;
+  production canary evidence and predecessor comparisons apply only to replacements.
+- Integrity/policy violations quarantine immediately. Behavioral quarantine requires directly
+  attributed failures and a minimum evidence window.
+- Repair creates an immutable candidate linked to its predecessor. Promotion atomically
+  supersedes the predecessor; rollback atomically quarantines the replacement and reactivates
+  the predecessor.
+- Every automatic decision stores its policy version and evidence snapshot. Raw telemetry is
+  bounded and compacted into durable aggregates without retaining raw prompts or arguments.
 
 ---
 
@@ -440,9 +419,10 @@ The agent can iterate on a skill proposal: propose → test fails → LLM receiv
 | Interrupt scope | Fires only during JS bytecode — blocking host calls need per-call `tokio::time::timeout` |
 | Sandbox abstraction | `birdcage` crate — single swap point for macOS Seatbelt deprecation |
 | fetch() permissions | `PermissionChecker` with `"js/fetch"` + URL as `input_key`, glob allow rules in config |
-| Skill integrity | Content-addressed by `sha256(source)` — mutating tests changes hash, structurally enforced |
-| Skill retrieval | `fastembed` local model, cosine similarity, top-K preamble injection |
-| Auto-admission | Phase 4 only, held-out Rust test required, human approval until evaluator gaming studied |
+| Skill integrity | Full SHA-256 over versioned canonical execution and discovery fields; operational data excluded |
+| Skill retrieval | Prompt-time dense + lexical fusion, in-memory exact index, thresholded turn bundle |
+| Admission | No-effect verifier, mutation checks, data-driven held-out cases, human-gated initial canary |
+| Self-learning | Evidence-gated Tier 0/1 replacement, automatic quarantine, immutable repair, transactional rollback |
 
 ---
 
