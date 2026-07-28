@@ -1,10 +1,20 @@
 # Phase 5 — Evidence-Based Self-Learning
 
-**Status**: Pre-implementation
-**Prerequisites**: Phases 1–4 complete and passing
-**Target scale**: up to 100,000 local/shared skill revisions
+- **Document role**: normative phase specification
+- **Specification version**: 1.0.0
+- **Delivery status**: planned
+- **Owner**: mini-agent maintainers
+- **Last reconciled**: 2026-07-29
+- **Entry dependencies**: Foundation and Phases 1–4 complete
+- **Exit dependency**: every acceptance criterion below and every Phase 5 blocker
+- **Target scale**: up to 100,000 local/shared skill revisions
+
 **Delivers**: directly attributed skill telemetry, evidence-gated canary promotion, automatic
 quarantine, immutable repair revisions, supersession, rollback, and bounded audit history.
+
+The corpus authority and conflict rules are defined in
+[`00-index.md`](00-index.md). Phase 5 owns evidence-based lifecycle automation. It cannot bypass
+Phase 4 verification, held-out evaluation, immutable identity, or required human gates.
 
 ---
 

@@ -1,54 +1,71 @@
 # mini-agent / JS Engine Integration
 
-Research and implementation workspace for integrating QuickJS into **zerostack** as a cross-platform action primitive replacing bash.
+Research and implementation workspace for a minimal coding agent with a bounded embedded
+JavaScript engine.
 
-## What lives here
+## Repository layout
 
 | Path | Purpose |
 |------|---------|
-| `main.rs` | Proof-of-concept QuickJS spike — 5 host globals, fresh Runtime per step, timeout via interrupt handler |
-| `zerostack/` | The coding agent itself — where the production integration goes |
-| `zerostack/docs/superpowers/specs/2026-07-27-js-engine-blueprint.md` | Full architecture blueprint with all resolved decisions |
+| `src/` | Production mini-agent source |
+| `src/extras/js/` | Phase 1 JS engine integration |
+| `spike/` | QuickJS proof-of-concept research |
+| `docs/specs/` | Normative phased JS specifications and superseded research |
+| `ARCHITECTURE.md` | Non-normative architecture overview |
+| `SPEC.md` | Non-normative implementation overview |
 
-## The core idea
+The old nested `zerostack/` layout was flattened. Production source and the workspace
+`Cargo.toml` are at the repository root.
 
-Bash is unavailable on Windows. Rather than shipping two tool implementations, zerostack gets a **tiny built-in JavaScript engine** (QuickJS-NG via rquickjs 0.12.x) as its primary action primitive. The agent writes JS instead of shell commands; the engine runs it natively with hard memory + CPU limits.
+## Documentation authority
 
-CodeAct research shows ~20% higher task success vs JSON tool calling. The JS engine also doubles as a **skill library runtime** — agents accumulate reusable JS functions that future agent steps retrieve via embedding search (Voyager model).
+Start with the [normative specification index](docs/specs/00-index.md). It defines corpus
+authority, feature relationships, phase dependencies, and exit semantics.
 
-## Quick start
+- [Foundation: paths and persistent storage](docs/specs/platform-paths.md)
+- [Phase 1: core JS engine](docs/specs/phase-1-js-engine.md)
+- [Phase 2: sandbox hardening](docs/specs/phase-2-sandbox.md)
+- [Phase 3: skill library](docs/specs/phase-3-skill-library.md)
+- [Phase 4: agent proposals and human-gated admission](docs/specs/phase-4-auto-admission.md)
+- [Phase 5: evidence-based self-learning](docs/specs/phase-5-evidence-learning.md)
 
-```bash
-# Build the PoC spike
-cd /Users/ahrens/projects/mini-agent
-rustup target add x86_64-pc-windows-msvc  # if you need Windows testing
-cargo run --manifest-path Cargo.toml 2>/dev/null
+[ARCHITECTURE.md](ARCHITECTURE.md) and [SPEC.md](SPEC.md) are maintained overviews only. The
+[dated JS blueprint](docs/specs/2026-07-27-js-engine-blueprint.md) is a superseded research
+artifact retained for history and must not guide implementation.
 
-# Build zerostack (development mode)
-cd zerostack
-cargo fmt
-cargo test
-cargo install --path . --debug
-```
+## Core boundaries
 
-## Key constraints
+- One dedicated 8 MiB OS thread per `JsTool`; QuickJS state stays on that thread.
+- A fresh runtime for every step, with hard heap/stack limits, an interrupt deadline, and bounded
+  pending-job drain.
+- File globals always use secure target resolution and mandatory permissions.
+- Process spawn always uses the existing permission policy and `Sandbox::wrap_command`.
+- VM isolation is distinct from child-process isolation; Windows process isolation is not
+  delivered by Phases 1 or 2.
+- Learned-skill identity covers the full versioned execution/discovery payload, including ordered
+  tests; only exact JavaScript boolean `true` passes a test.
+- Phase 4 requires human approval into non-retrievable canary state. Phase 5 owns the limited,
+  evidence-based automatic lifecycle.
 
-- **Fresh Runtime per step** — QuickJS allocator is poisoned after OOM; recovery requires allocation. ~500μs overhead, accepted.
-- **Dedicated OS thread** — QuickJS `Context` is `!Send`. `JsTool` holds only `mpsc::Sender<JsRequest>`.
-- **8 MiB stack via `std::thread::Builder::stack_size`** — not `.cargo/config.toml` which `cargo install` ignores.
-- **rquickjs only** — Boa/Brimstone/Nova lack hard resource limits. No alternative survives the audit.
-
-## Documentation
-
-- [ARCHITECTURE.md](ARCHITECTURE.md) — threading model, host API, sandbox backends, skill library
-- [SPEC.md](SPEC.md) — module layout, exact types, phase-by-phase implementation
-- [Blueprint (HTML artifact)](https://claude.ai/code/artifact/9904fa51-2b70-41e5-8c7f-a449842b407c) — full design doc with all resolved decisions
-
-## Phases
+## Phase status
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 1 | Core JS engine: JsTool, threading, host globals, permissions | Planned |
-| 2 | Sandbox hardening: birdcage, fetch(), file allow-lists | Planned |
-| 3 | Skill library: content-addressed store, embedding retrieval | Planned |
-| 4 | Auto-evolution: held-out test gate, Voyager loop | Planned |
+| Foundation | Typed paths, ownership, migration, platform security | In progress |
+| 1 | Core JS engine, host globals, permissions, process wrapper | In progress |
+| 2 | `fetch`, narrowing allow-lists, Linux/macOS process isolation | Planned |
+| 3 | Immutable learned skills and prompt-time retrieval | Planned |
+| 4 | Agent proposals, held-out evaluation, human-gated canary | Planned |
+| 5 | Evidence, promotion, quarantine, repair, rollback | Planned |
+
+## Development commands
+
+From the repository root:
+
+```bash
+cargo fmt
+cargo test --features js
+cargo install --path . --debug
+```
+
+Do not use `cargo build`, `cargo check`, or development `--release` builds.

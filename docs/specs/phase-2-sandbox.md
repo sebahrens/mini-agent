@@ -1,190 +1,141 @@
 # Phase 2 — Sandbox Hardening
 
-**Status**: Pre-implementation  
-**Prerequisite**: Phase 1 complete and passing  
-**Delivers**: `fetch()` host global with URL allow-lists, file path allow-lists enforced in `read_file`/`write_file`, and `birdcage` process-level isolation wrapping `spawn()`.
+- **Document role**: normative phase specification
+- **Specification version**: 1.0.0
+- **Delivery status**: planned
+- **Owner**: mini-agent maintainers
+- **Last reconciled**: 2026-07-29
+- **Entry dependency**: Phase 1 complete
+- **Exit dependency**: every acceptance criterion below and every Phase 2 blocker
 
----
+The corpus authority and conflict rules are defined in
+[`00-index.md`](00-index.md). Phase 2 extends Phase 1; it does not weaken Phase 1 permissions,
+resource bounds, secure file resolution, or `Sandbox::wrap_command` routing.
 
 ## Overview
 
-Phase 1 `spawn()` routes through `Sandbox::wrap_command` but only applies bubblewrap/zerobox on Linux. Phase 2 adds:
+Phase 2 adds:
 
-1. **`fetch(url, opts?)`** — HTTP from JS, permission-gated by URL glob pattern
-2. **File allow-lists** — per-config path restrictions on `read_file`/`write_file`
-3. **`birdcage` integration** — Landlock (Linux) + Seatbelt (macOS) abstraction wrapping `spawn()` subprocesses
+1. permission-gated `fetch(url, opts?)` with URL allow-lists and bounded responses;
+2. read/write path allow-lists that can only narrow Phase 1 file authorization; and
+3. effective child-process isolation on Linux and macOS through the shared `Sandbox` abstraction.
 
----
+Phase 2 does not deliver Windows process isolation. JavaScript VM limits are not a substitute for
+child-process isolation on any platform.
 
 ## Cargo.toml additions
 
+The features are independent:
+
 ```toml
 [features]
-# Add — keep separate from js; phases are independent feature flags
 sandbox = ["dep:birdcage"]
 
 [dependencies]
 birdcage = { version = "0.7", optional = true }
 ```
 
-**reqwest note**: `reqwest = "0.13"` is already a mandatory dep at `Cargo.toml:67`. To enable `reqwest/blocking` (needed for the JS-thread `fetch()` implementation), add `features = ["blocking"]` to the existing entry rather than adding a second `reqwest` entry. Do NOT add a duplicate dep.
+- `sandbox` without `js` extends the shared process sandbox and must compile.
+- `js` without `sandbox` retains the Phase 1 wrapper and permission behavior.
+- `js,sandbox` adds the Phase 2 JS integrations.
+- `skills` does not implicitly enable `sandbox`.
 
-The `sandbox` and `js` features are **independent**. Enabling `sandbox` without `js` must compile (it only extends `src/sandbox.rs`). Enabling `js` without `sandbox` must compile (Phase 1 behavior, unsandboxed spawn).
+Cargo features express compiled capabilities, not proof that an OS backend is installed or
+effective. Runtime diagnostics continue to report the actual backend state.
 
----
+### reqwest note
+
+The repository has one `reqwest` dependency. Enable its blocking client feature on that existing
+entry; do not add another version. `fetch()` runs from the dedicated JS thread but all waits still
+have finite deadlines and cancellation.
 
 ## Target files
 
-| File | Status | Change |
-|------|--------|--------|
-| `src/sandbox.rs` | EXISTS (10.0 KB) | Add `birdcage`-backed `wrap_spawn_sandboxed` method |
-| `src/extras/js/host.rs` | TO BE CREATED in Phase 1 | Add `make_fetch()` and file allow-list checks |
-| `Cargo.toml` | EXISTS | Add `sandbox` feature, `birdcage` optional dep, `reqwest/blocking` feature |
+| Concern | Location |
+|---------|----------|
+| Shared process isolation | `src/sandbox.rs` |
+| Fetch and file allow-lists | `src/extras/js/host.rs` |
+| Phase 2 feature/dependencies | `Cargo.toml` |
+| Configuration schema | existing typed config modules |
+| Integration tests | colocated tests and `src/extras/js/tests/` |
 
----
+## `fetch()` host global
 
-## Current state of `src/sandbox.rs`
+`fetch(url, opts?)` is registered only for the Phase 2 feature combination. It:
 
-The `Sandbox` struct (defined at `src/sandbox.rs:9`; `#[derive(Debug, Clone)]`) currently wraps two Linux backends:
+1. parses and normalizes an absolute HTTP(S) URL;
+2. checks a configured URL allow-list as a narrowing policy;
+3. always obtains `js/fetch` permission for the normalized URL;
+4. applies a finite request deadline and cancellation; and
+5. returns `{status, text}` or a typed JS error.
 
-- **bwrap** (`bubblewrap`) — checked via `bwrap_exists()` at line 18
-- **zerobox** — checked via `zerobox_exists()` at line 24
-- `Sandbox::wrap_command` at line 109 returns `tokio::process::Command`; applies bubblewrap or zerobox on Linux, falls back to unsandboxed on macOS/Windows
-- `Sandbox::output_command` at line 205 (async) — calls `wrap_command` and awaits the output
-- `kill_process_group` at line 294 is `#[cfg(unix)]` with empty Windows arm — keep this pattern
+When an allow-list exists, an unmatched URL is rejected before I/O. Without an additional
+allow-list restriction, an unknown URL follows the normal permission policy: interactive `Ask`
+when available and fail-closed in non-interactive mode. Redirects are disabled or each target
+repeats normalization, allow-list, and permission checks before redirected I/O.
 
-**macOS/Windows**: No sandbox backend in Phase 1. `is_effectively_sandboxed()` returns `false` on both.
-
----
-
-## fetch() host global
-
-### Permission routing
-
-```toml
-# User config (config.toml)
-[js.fetch.allow]
-patterns = ["https://api.github.com/**", "https://*.openai.com/**"]
-```
-
-Permission check call pattern (mirrors `check_perm` at `src/agent/tools/mod.rs:199`):
-
-```rust
-check_perm(&self.permission, &self.ask_tx, "js/fetch", &url).await?
-```
-
-Unknown URLs fall to `Ask` — user approves interactively.
-
-### Implementation sketch
-
-```rust
-pub fn make_fetch() -> impl Fn(String, Option<serde_json::Value>) -> rquickjs::Result<FetchResult> {
-    move |url: String, _opts: Option<serde_json::Value>| {
-        // Permission is checked via sync channel before this executes
-        // (same SpawnContext pattern as spawn() in Phase 1)
-        let client = reqwest::blocking::Client::new();
-        let resp = client.get(&url).send()
-            .map_err(|e| rquickjs::Error::new_from_js("fetch", &e.to_string()))?;
-        Ok(FetchResult {
-            status: resp.status().as_u16(),
-            text: resp.text().unwrap_or_default(),
-        })
-    }
-}
-
-pub struct FetchResult {
-    pub status: u16,
-    pub text: String,
-}
-```
-
-Response visible to JS: `{ status: number, text: string }`.
-
-`reqwest::blocking` is used because `fetch()` runs on the dedicated JS thread, which has no tokio runtime. Using `reqwest::blocking` avoids tokio-inside-tokio issues.
-
----
+The host never exposes ambient `fetch`, a general socket API, or an authorization path independent
+of the existing permission service.
 
 ## File allow-list
 
-Config format:
+Configuration supplies separate read and write patterns. Matching occurs against the same
+canonical/resolved UTF-8 target used by Phase 1 permission checks, using component-aware semantics.
+It never matches the caller’s unresolved spelling.
 
-```toml
-[js.file.allow]
-read  = ["/home/**", "/tmp/**"]
-write = ["/tmp/**"]
-```
+The decision order is:
 
-Enforcement in `host.rs` before `std::fs` calls:
+1. securely resolve the target without reading content or mutating;
+2. reject when the applicable allow-list is configured and does not match;
+3. obtain the mandatory Phase 1 permission for the exact resolved target; and
+4. perform the Phase 1 stable read or atomic no-follow write.
 
-```rust
-fn check_file_allow(path: &str, allow_patterns: &[String]) -> rquickjs::Result<()> {
-    let allowed = allow_patterns.iter().any(|pat| glob_match(pat, path));
-    if !allowed {
-        return Err(rquickjs::Error::new_from_js("file", "path not in allow-list"));
-    }
-    Ok(())
-}
-```
-
-When no allow-list is configured, all paths are permitted (same default-open policy as `BashTool`).
-
----
+An absent allow-list means “no additional Phase 2 restriction,” not “no permission required.”
+Allow-list failure, permission denial, races, timeout, and I/O errors have no read/write effect.
 
 ## birdcage integration
 
-### Why birdcage
+Phase 2 extends the existing `Sandbox` implementation rather than creating a JS-only subprocess
+path. `spawn()` continues to use `Sandbox::wrap_command`; the wrapper selects and configures the
+effective backend.
 
-`birdcage` is a single crate that abstracts:
-- **Linux**: Landlock + seccomp
-- **macOS**: `sandbox-exec` (Seatbelt)
+| Platform | Phase 2 process guarantee |
+|----------|---------------------------|
+| Linux | Effective configured isolation using the supported Linux backend, verified by escape/denial tests |
+| macOS | Effective Seatbelt isolation while the supported backend is available, verified by escape/denial tests |
+| Windows | No Phase 2 process-isolation guarantee; execution is disabled or explicitly reported as non-isolated according to product policy |
 
-It provides a single swap point if Apple removes `sandbox-exec` in a future macOS release.
+Backend absence or setup failure never masquerades as isolation. Whether fallback execution is
+allowed is an explicit user/product policy decision and remains visible to the caller. Phase 2
+does not claim Job Objects, AppContainer, `rappct`, or Windows child termination.
 
-### Integration point
+The implementation must not add a parallel raw `std::process::Command` path for JS. Any blocking
+adapter remains behind the shared wrapper and preserves Phase 1 permission, argument, timeout,
+cancellation, and output bounds.
 
-`spawn()` in `host.rs` currently calls `Sandbox::wrap_command` (at `src/sandbox.rs:109`). With birdcage, a new method is added to `Sandbox`:
+## Windows behavior
 
-```rust
-// src/sandbox.rs — new method, gated behind #[cfg(feature = "sandbox")]
-#[cfg(feature = "sandbox")]
-pub fn wrap_spawn_sandboxed(&self, cmd: &str, args: &[String]) -> std::process::Command {
-    use birdcage::{Birdcage, Sandbox as BirdcageSandbox};
-    // Configure birdcage with read/write access matching Sandbox parameters
-    // Returns a std::process::Command (blocking — JS thread acceptable)
-}
-```
-
-`Sandbox::wrap_command` (existing, at line 109) returns `tokio::process::Command`. `wrap_spawn_sandboxed` returns `std::process::Command` for use on the JS thread. The two are parallel paths.
-
-### Platform matrix
-
-| Platform | Mechanism | Status |
-|----------|-----------|--------|
-| Linux | Landlock + seccomp (via birdcage) | Phase 2 |
-| macOS | Seatbelt / `sandbox-exec` (via birdcage) | Phase 2 |
-| Windows | Unsandboxed (same as Phase 1) | Phase 2 fallback |
-| Windows enforcement | Job Objects + AppContainer (`rappct`) | Out of scope for Phase 2 |
-
-Follow the `#[cfg(unix)]` pattern from `src/sandbox.rs:294` (`kill_process_group`): Windows arms are empty stubs, not absent.
-
----
+The in-process QuickJS engine may compile and run on Windows, but Phase 2 does not make the full
+action primitive secure or release-ready there. No document may describe Windows spawn as
+sandboxed until a later normative specification defines the backend, lifecycle/termination
+semantics, ACL interactions, CI, and release gate.
 
 ## Acceptance criteria
 
-All must pass under `cargo test --features js,sandbox`:
-
-- [ ] `fetch("https://example.com")` returns `{ status: 200, text: "..." }` in an integration test
-- [ ] `fetch()` with a URL not matching the allow-list returns a JS error string, not a panic
-- [ ] `read_file("/etc/shadow")` returns a JS error when the allow-list excludes `/etc/**`
-- [ ] `spawn("ls", ["/tmp"])` on Linux runs inside a birdcage cage (Landlock-enforced)
-- [ ] `cargo test --features js` (without `sandbox`) still passes unchanged — features are independent
-- [ ] macOS: `spawn()` runs inside Seatbelt when `sandbox` feature is enabled
-
----
+- [ ] `sandbox`, `js`, and `js,sandbox` feature combinations compile and retain their documented
+      relationships.
+- [ ] `fetch()` validates URLs, rechecks redirects, enforces bounds/deadlines/cancellation, applies
+      the narrowing allow-list, and always obtains `js/fetch` permission.
+- [ ] File allow-lists match resolved targets and never bypass Phase 1 permissions or secure I/O.
+- [ ] Linux and macOS process escape/denial tests prove an effective backend before Phase 2 closes.
+- [ ] Backend absence/failure and Windows non-isolation are visible and never reported as
+      sandboxed.
+- [ ] JS process spawn still uses the one shared `Sandbox::wrap_command` path.
+- [ ] Default and `js`-only behavior remain unchanged except for explicitly fixed Phase 1 defects.
 
 ## Out of scope for Phase 2
 
-- Windows sandbox enforcement (Job Objects / AppContainer)
-- UI for viewing/editing the URL allow-list
-- Skill library (Phase 3)
-- Auto-admission (Phase 4)
+- Windows process isolation and Windows child-process lifecycle enforcement
+- UI for editing allow-lists
+- portable/learned skill libraries (Phase 3)
+- proposal/admission or evidence lifecycle (Phases 4–5)

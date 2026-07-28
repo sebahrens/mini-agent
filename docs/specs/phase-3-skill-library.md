@@ -1,11 +1,21 @@
 # Phase 3 — Skill Library
 
-**Status**: Pre-implementation  
-**Prerequisite**: Phase 1 complete and passing (Phase 2 is NOT required)  
+- **Document role**: normative phase specification
+- **Specification version**: 1.0.0
+- **Delivery status**: planned
+- **Owner**: mini-agent maintainers
+- **Last reconciled**: 2026-07-29
+- **Entry dependencies**: Foundation and Phase 1 complete; Phase 2 is optional
+- **Exit dependency**: every acceptance criterion below and every Phase 3 blocker
+
 **Delivers**: Open Agent Skills directory/ZIP import, an immutable content-addressed JS skill
 store, prompt-time hybrid retrieval, a turn-scoped model manifest, and exact source binding for JS
 execution.
 **Target scale**: up to 100,000 local/shared skill revisions.
+
+The corpus authority and conflict rules are defined in
+[`00-index.md`](00-index.md). Phase 3 owns learned-skill identity, manual admission, retrieval, and
+no-effect verification. It does not own agent proposal admission or evidence-based promotion.
 
 ---
 
@@ -36,19 +46,19 @@ respects Linux XDG variables while placing SQLite under configuration storage.
 ```toml
 # Cargo.toml additions
 [features]
-skills = ["js", "dep:fastembed", "dep:rusqlite", "dep:sha2"]
+skills = ["js", "dep:fastembed", "dep:rusqlite"]
 
 [dependencies]
 fastembed = { version = "3", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
-sha2 = { version = "0.10", optional = true }
 ```
 
 `skills` implies `js`; a selectable skills-without-JS state is invalid. Gate skill code behind
 `#[cfg(feature = "skills")]`. Default and `js`-only builds must remain unchanged. `rusqlite` uses
 bundled SQLite and must verify that FTS5 is enabled in the pinned build. If it is unavailable,
 the lexical retriever must fail clearly at startup or use an explicitly tested fallback; it must
-not silently claim hybrid retrieval.
+not silently claim hybrid retrieval. The existing mandatory `sha2` dependency is reused; do not
+add a second optional declaration.
 
 ---
 
@@ -202,7 +212,9 @@ CREATE TABLE IF NOT EXISTS skill_embeddings (
 FTS5 indexes description, tags, export signatures, and identifiers extracted from source. The
 source itself is not copied wholesale into model-visible retrieval output.
 
-### CRUD operations
+### `SkillStore`
+
+#### CRUD operations
 
 ```rust
 impl SkillStore {
@@ -230,6 +242,8 @@ corruption, and database errors return typed errors and never panic.
 ---
 
 ## Embedding generation — `src/extras/js/skills/embed.rs`
+
+### `embed.rs`
 
 **Model**: `BAAI/bge-small-en-v1.5` via `fastembed` crate (~30 MiB download, cached locally). No API call required — fully local inference.
 
@@ -340,6 +354,8 @@ The runner resolves one bundle before its initial `stream_chat(prompt, history)`
 it in a per-agent `SkillTurnContext`. Retries reuse the same bundle. Continuations within the same
 user turn do not re-embed or rerank. A new user prompt creates a new generation-stamped bundle.
 
+### Preamble injection
+
 The model-visible prompt is prefixed with a compact non-user-spoofable manifest when the provider
 supports such a channel; otherwise use a clearly delimited trusted context block inserted by the
 runner. The manifest contains no source:
@@ -398,8 +414,10 @@ Embedded tests cannot inspect hidden fixtures or replace fake implementations.
 
 Verification errors include the stage/test index and bounded stack information but never activate
 or persist the artifact. Each skill verification gets a new runtime and new fake state; tests
-within that verification may see the source and prior test/fake effects only if the implementation
-documents and tests that ordering.
+within one verification run execute in declared order in the same fresh context and may observe
+source state and earlier deterministic fake effects. Mutation passes and every new artifact
+verification use new contexts and new fake state. No test can observe a hidden fixture or a prior
+verification run.
 
 The verifier also performs an anti-vacuity mutation pass. For each declared export, rerun the suite
 with that export replaced by a throwing stub; at least one embedded test must then fail for the
@@ -457,6 +475,6 @@ All must pass under `cargo test --features js,skills`:
 
 - UI for browsing or editing skills
 - Cross-agent skill sharing (single-user local store only)
-- Auto-admission from successful agent steps (Phase 4)
+- Agent proposals and human-gated canary admission (Phase 4)
 - Evidence-driven promotion, quarantine, repair, and rollback (Phase 5)
 - ANN/HNSW unless the 100,000-skill exact-index benchmark misses its p99 budget

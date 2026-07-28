@@ -1,9 +1,20 @@
 # Phase 4 — Agent Proposals and Human-Gated Admission
 
-**Status**: Pre-implementation  
-**Prerequisite**: Phase 1 and Phase 3 complete and passing  
+- **Document role**: normative phase specification
+- **Specification version**: 1.0.0
+- **Delivery status**: planned
+- **Owner**: mini-agent maintainers
+- **Last reconciled**: 2026-07-29
+- **Entry dependencies**: Foundation, Phase 1, and Phase 3 complete; Phase 2 is optional
+- **Exit dependency**: every acceptance criterion below and every Phase 4 blocker
+
 **Delivers**: a bounded `propose_skill()` host function, durable evaluation queue, independent
 held-out cases, and human approval into canary state.
+
+The corpus authority and conflict rules are defined in
+[`00-index.md`](00-index.md). The filename is retained for stable links, but Phase 4 does **not**
+auto-admit or auto-activate agent-authored code. It owns proposal evaluation and explicit human
+approval into a non-retrievable canary. Phase 5 alone owns evidence-based automatic transitions.
 
 ---
 
@@ -46,7 +57,7 @@ mutable copy of canonical source that could drift from the final artifact.
 
 ---
 
-## Files
+## Target files
 
 | File | Status | Purpose |
 |------|--------|---------|
@@ -56,10 +67,13 @@ mutable copy of canonical source that could drift from the final artifact.
 | `src/extras/js/skills/store.rs` | Phase 3 creates | Proposal/report schema and lifecycle transactions |
 | `src/extras/js/host.rs` | Phase 1 creates | Register bounded `propose_skill` |
 | `src/extras/js/types.rs` | Phase 1 creates | Proposal request/response channel types |
+| `src/extras/js/engine.rs` | Phase 1 creates | Register the host only in normal `skills` execution mode; verifier modes omit it |
 
 ---
 
 ## Durable proposal records
+
+### Pending state
 
 ```sql
 CREATE TABLE IF NOT EXISTS skill_proposals (
@@ -107,7 +121,7 @@ existing rejection/report idempotently; only changed identity-bearing content cr
 
 ---
 
-## `propose_skill()` host contract
+## `propose_skill()` host global
 
 ```javascript
 propose_skill({
@@ -243,6 +257,15 @@ Expected values, fixture responses, and transcripts are never included in agent 
 If no suitable suite matches, the proposal remains verified with
 `held_out_suite_required`. It cannot enter canary until a human imports or approves a suite and
 requests reevaluation. Agent-authored embedded tests alone never satisfy this gate.
+
+## Promotion gate
+
+### Promotion gate — held-out Rust integration test
+
+At least one applicable trusted held-out suite must pass through the Rust-owned generic evaluator
+before human approval can create a canary. Checked-in Rust integration tests exercise this full
+loader/selector/no-effect execution path with trusted fixtures. There is no compiled per-skill ID
+registry, and an empty registry or agent-authored tests alone never satisfies the gate.
 
 ---
 

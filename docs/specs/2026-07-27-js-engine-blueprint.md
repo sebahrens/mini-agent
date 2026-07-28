@@ -1,8 +1,16 @@
 # Blueprint: Embedded JavaScript Engine — zerostack
 
-**Date**: 2026-07-27  
-**Status**: Design (pre-implementation)  
-**Scope**: Replace the `bash` tool with a built-in, cross-platform JS execution primitive; lay the substrate for a self-evolving skill library.
+- **Document role**: superseded research artifact
+- **Artifact version**: 2026-07-27
+- **Status**: archival; not valid for implementation
+- **Owner**: mini-agent maintainers
+- **Superseded on**: 2026-07-29
+- **Authoritative replacement**: [`00-index.md`](00-index.md) and its indexed normative phase specs
+
+> **Historical content only.** The text below intentionally preserves the exploration that led to
+> the current design. It contains obsolete host globals, short/source-only identity, phase
+> ownership, feature relationships, paths, and unsupported platform/sandbox claims. None of its
+> examples or “decisions” are normative. Do not cite this artifact in implementation tasks.
 
 ---
 

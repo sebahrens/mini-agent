@@ -1,529 +1,247 @@
 # Phase 1 — Core JS Engine Integration
 
-**Status**: Pre-implementation  
-**Prerequisite**: None  
-**Delivers**: `JsTool` registered in the agent, executing JavaScript in a sandboxed QuickJS runtime with host globals for file I/O and process spawning.
+- **Document role**: normative phase specification
+- **Specification version**: 1.0.0
+- **Delivery status**: implementation in progress
+- **Owner**: mini-agent maintainers
+- **Last reconciled**: 2026-07-29
+- **Entry dependency**: none for the non-persistent engine
+- **Exit dependency**: every acceptance criterion below and every Phase 1 blocker
 
----
+The corpus authority and conflict rules are defined in
+[`00-index.md`](00-index.md). Overview documents and dated blueprints cannot override this file.
 
 ## Overview
 
-Phase 1 embeds a QuickJS JavaScript engine (via `rquickjs 0.12`) as a cross-platform action primitive. The agent writes JavaScript; the engine executes it natively with hard resource limits (64 MiB heap, 512 KiB JS stack, 30 s wall-clock timeout). This replaces the platform-specific bash/PowerShell split and lays the substrate for the Phase 3 skill library.
+Phase 1 adds a bounded in-process QuickJS action primitive. It delivers portable JavaScript
+evaluation, file globals, process spawning through the existing `Sandbox` abstraction, and the
+permission bridge needed by synchronous host functions.
 
-Without this phase: agent can only run bash, which is unavailable on Windows and sandboxed only on Linux.
+“Sandbox” has two distinct meanings:
 
----
+- The QuickJS VM is isolated from Node.js and ambient Rust APIs and is bounded by memory, stack,
+  wall-clock, and pending-job limits.
+- A child process is isolated only when `Sandbox::wrap_command` reports an effective backend.
+  Phase 1 does not claim process isolation on macOS or Windows, and it must surface a configured
+  backend that is unavailable rather than describing the child as sandboxed.
+
+Phase 1 supplements the existing action tools. It does not remove Bash, make hooks portable, or
+establish an unqualified Windows release claim.
 
 ## Feature gate
 
-The feature and dependency are **already declared** in `Cargo.toml` (lines 37 and 80). No edits needed.
+`js = ["dep:rquickjs"]` enables the engine and remains non-default until this phase exits.
+All JS-specific production code is gated by `#[cfg(feature = "js")]`; the default build remains
+unchanged.
 
-```toml
-# Cargo.toml — already present, DO NOT duplicate
-[features]
-js = ["dep:rquickjs"]
-
-[dependencies]
-rquickjs = { version = "0.12", features = ["full"], optional = true }
-```
-
-Gate any new code behind `#[cfg(feature = "js")]`. The binary compiles and all existing tests pass without `--features js`.
-
----
+The `sandbox` feature belongs to Phase 2 and is independent. A `js`-only build still routes
+`spawn()` through the existing `Sandbox::wrap_command`; whether that wrapper provides effective
+OS isolation is a runtime/platform fact, not a Cargo-feature inference.
 
 ## File placement
 
-All new files go in `src/` at the repo root. The `zerostack/` directory no longer exists (monorepo flattened). The `src/extras/js/` directory does not exist yet and must be created.
+Production files live at the repository root:
 
-| File | Status | Purpose |
-|------|--------|---------|
-| `src/extras/js/types.rs` | TO BE CREATED | Channel types, constants |
-| `src/extras/js/engine.rs` | TO BE CREATED | Runtime lifecycle, JS thread main loop |
-| `src/extras/js/tool.rs` | TO BE CREATED | `JsTool` — `rig::tool::Tool` impl |
-| `src/extras/js/host.rs` | TO BE CREATED | Host global implementations |
-| `src/extras/js/mod.rs` | TO BE CREATED | Module re-exports |
-| `src/extras/mod.rs` | EXISTS (40 lines) | Append `#[cfg(feature = "js")] pub mod js;` after line 40 |
-| `src/agent/builder.rs` | EXISTS | Add `#[cfg(feature = "js")]` block at lines 333–334 (see §Builder registration) |
+| Concern | Location |
+|---------|----------|
+| Runtime lifecycle and JS thread | `src/extras/js/engine.rs` |
+| `JsTool` implementation | `src/extras/js/tool.rs` |
+| Host globals and secure file operations | `src/extras/js/host.rs` |
+| Request/response and permission-bridge types | `src/extras/js/types.rs` |
+| Module registration | `src/extras/js/mod.rs`, `src/extras/mod.rs` |
+| Agent tool registration | `src/agent/builder.rs` |
+| JS integration tests | `src/extras/js/tests/` |
 
----
+Paths under `zerostack/` are historical and must not be used by new tracker tasks.
 
-## Exact types — `src/extras/js/types.rs`
+## Exact types
 
-Copy verbatim; do not alter the constants.
+The exact Rust representation may evolve without changing this contract, but the type boundary is
+fixed:
 
-```rust
-use std::time::Duration;
+- requests own source text, cancellation, a one-shot reply, and any frozen turn bundle;
+- responses contain one bounded `JsOutcome`;
+- permission requests carry a JS-facing operation, exact key/path, deadline, cancellation, and a
+  reply channel;
+- process results contain bounded stdout/stderr, exit status, and truncation/timeout metadata; and
+- all channel payloads are `Send`; no payload contains a QuickJS value or context.
 
-pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
-pub const MEMORY_LIMIT: usize = 64 * 1024 * 1024;   // 64 MiB
-pub const STACK_LIMIT: usize = 512 * 1024;            // 512 KiB JS stack
-pub const THREAD_STACK: usize = 8 * 1024 * 1024;      // 8 MiB OS thread stack
-
-#[derive(Debug)]
-pub struct JsRequest {
-    pub code: String,
-    pub reply: tokio::sync::oneshot::Sender<JsResponse>,
-}
-
-#[derive(Debug)]
-pub struct JsResponse {
-    pub outcome: JsOutcome,
-}
-
-#[derive(Debug)]
-pub enum JsOutcome {
-    Value(String),
-    Void,
-    Error(String),
-    Timeout,
-    OomKilled,
-}
-
-/// Sent from the JS thread to tokio to request permission for a host call.
-/// The JS thread blocks on `reply_rx.recv()` while tokio resolves the check.
-#[derive(Debug)]
-pub struct PermRequest {
-    pub tool:  String,
-    pub key:   String,
-    pub reply: std::sync::mpsc::Sender<PermResponse>,
-}
-
-#[derive(Debug)]
-pub enum PermResponse {
-    Allowed,
-    Denied(String),
-}
-
-/// Returned to JS by `spawn(cmd, args)`.
-/// Visible in JS as `{ stdout: string, stderr: string, code: number }`.
-#[derive(Debug, serde::Serialize)]
-pub struct SpawnResult {
-    pub stdout: String,
-    pub stderr: String,
-    pub code:   i32,
-}
-```
-
----
+The Phase 1 limits are 30 seconds per step/host call, 64 MiB heap, 512 KiB JS stack, 8 MiB OS thread
+stack, and 1 MiB per file read/write. One shared constants module owns these values.
 
 ## Threading model
 
-QuickJS `Context` and `Runtime` are `!Send`. The `rig::tool::Tool::call` method returns `impl Future + Send` on native targets. A `JsTool` that holds a `Context` will not compile.
-
-**Solution**: dedicated OS thread with `std::sync::mpsc` channel.
-
-```
-[tokio runtime]                      [dedicated OS thread — "js-engine"]
-JsTool::call()
-  └─ tx.send(JsRequest) ──────────→  js_thread_main(rx)
-  └─ await oneshot_rx  ←──────────   handler sends JsResponse via oneshot_tx
-                                       ├─ for host calls needing async perm:
-                                       │  sends back to tokio via ask_tx
-                                       └─ returns JsResponse via oneshot_tx
-```
-
-`JsTool` holds only `Send + Sync` types — verified by the compiler:
-
-```rust
-pub struct JsTool {
-    tx:         std::sync::mpsc::Sender<JsRequest>,  // Send + Sync ✓
-    permission: Option<PermCheck>,                    // Send + Sync ✓
-    ask_tx:     Option<AskSender>,                    // Send + Sync ✓
-}
-```
-
-**Thread spawn** (in `src/agent/builder.rs` — see §Builder registration below):
+Each `JsTool` instance owns exactly one dedicated OS thread. That thread owns every QuickJS
+`Runtime`, `Context`, and value derived from them. QuickJS types, `Rc`, and `RefCell` never cross
+the channel and are never fields of `JsTool`.
 
 ```rust
 std::thread::Builder::new()
     .name("js-engine".into())
-    .stack_size(THREAD_STACK)   // 8 MiB — portable across Linux glibc/musl/Windows
-    .spawn(move || js_thread_main(js_rx))
-    .expect("failed to spawn JS thread");
+    .stack_size(8 * 1024 * 1024)
 ```
 
-`.cargo/config.toml` link flags are NOT honored by `cargo install`. `Builder::stack_size` is the only portable fix.
+## `JsTool`
 
----
+Every `JsTool` field must be `Send + Sync`. The tool may own channel endpoints, permission-bridge
+state, a Tokio handle, cancellation state, and the JS thread join handle.
 
-## Runtime lifecycle — `src/extras/js/engine.rs`
-
-**Every JS step creates a fresh `Runtime` and drops it after eval.** OOM poisons the QuickJS allocator; cleanup code that runs post-OOM itself requires allocation and panics. This is not optional.
-
-Exact implementation:
-
-```rust
-use rquickjs::{Context, Func, Runtime, Value};
-use std::sync::mpsc;
-use std::time::Instant;
-use crate::extras::js::types::*;
-
-pub fn js_thread_main(rx: mpsc::Receiver<JsRequest>) {
-    while let Ok(req) = rx.recv() {
-        let outcome = run_step(&req.code);
-        let _ = req.reply.send(JsResponse { outcome });
-    }
-}
-
-// pub(crate) required: Phase 3's verify_skill() calls this across modules
-pub(crate) fn run_step(code: &str) -> JsOutcome {
-    // Fresh Runtime EVERY step — OOM poisons allocator; never reuse
-    let rt = match Runtime::new() {
-        Ok(r) => r,
-        Err(e) => return JsOutcome::Error(format!("Runtime::new failed: {e}")),
-    };
-    rt.set_memory_limit(MEMORY_LIMIT);
-    rt.set_max_stack_size(STACK_LIMIT);
-
-    let deadline = Instant::now() + STEP_TIMEOUT;
-    rt.set_interrupt_handler(Some(Box::new(move || {
-        Instant::now() >= deadline  // true = interrupt JS execution
-    })));
-
-    let ctx = match Context::full(&rt) {
-        Ok(c) => c,
-        Err(e) => return JsOutcome::Error(format!("Context::full failed: {e}")),
-    };
-
-    register_host_globals(&ctx);
-
-    let result = ctx.with(|ctx| {
-        match ctx.eval::<Value, _>(code) {
-            Err(rquickjs::Error::Exception) => {
-                let exc = ctx.catch();
-                let exc = exc.as_exception().expect("exception type");
-                let msg = exc.message().unwrap_or_default();
-                let stack = exc.stack().unwrap_or_default();
-                if msg.contains("interrupted") || Instant::now() >= deadline {
-                    JsOutcome::Timeout
-                } else {
-                    JsOutcome::Error(format!("{msg}\n{stack}"))
-                }
-            }
-            Err(e) => JsOutcome::Error(e.to_string()),
-            Ok(v) => {
-                if v.is_undefined() || v.is_null() {
-                    JsOutcome::Void
-                } else if let Some(s) = v.as_string() {
-                    JsOutcome::Value(s.to_string().unwrap_or_default())
-                } else {
-                    JsOutcome::Value(format!("{v:?}"))
-                }
-            }
-        }
-    });
-
-    // Drain microtask queue — required for Promise resolution
-    while rt.execute_pending_job() == Ok(true) {}
-
-    result
-    // rt drops here — RAII; Context must be dropped before Runtime
-}
-```
-
-**Critical**: always use `eval::<Value, _>`, never `eval::<(), _>`. The `()` form loses the return value and the exception stack trace needed for LLM self-correction.
-
----
-
-## Host globals — `src/extras/js/host.rs`
-
-Five globals exposed to JS. Phase 1 includes four; `fetch()` is Phase 2.
-
-| Global | JS signature | Rust impl | Permission check |
-|--------|-------------|-----------|-----------------|
-| `read_file(path)` | `string → string` | stable bounded read (blocking on JS thread) | `"js/read_file"` + canonical target |
-| `write_file(path, content)` | `(string, string) → void` | descriptor-relative atomic write | `"js/write_file"` + resolved final target |
-| `spawn(cmd, args)` | `(string, string[]) → {stdout, stderr, code}` | `std::process::Command` (blocking) | `"js/spawn"` + cmd |
-| `console.log(...)` | variadic | `eprintln!` / `tracing::info!` | none |
-
-**No** `require()`, `import()`, `final_answer`, or `fetch()` in Phase 1.
-
-### read_file and write_file
-
-Before reading content, `read_file` canonicalizes the target, captures its identity, and
-requests `js/read_file` permission for the exact canonical UTF-8 path. After approval it
-rejects non-regular or oversized files, opens the canonical path without following a
-final symlink, verifies that the opened file has the pre-approval identity, and reads at
-most 1 MiB. Invalid UTF-8 and content that grows beyond the cap are typed JS errors.
-
-`write_file` rejects content over 1 MiB before mutation. Existing final symlinks are
-rejected. For a new file, the nearest existing parent is canonicalized and the missing
-suffix must be exactly one normal filename component. Permission is requested for
-`js/write_file` and the derived final UTF-8 path. Creation and replacement use the
-descriptor-relative atomic helpers in `src/fs.rs`, with the approved parent identity
-revalidated immediately before mutation and no-follow traversal throughout. Resolved
-parent symlinks are allowed only because permission is bound to their resulting target.
-
-Both globals use finite 30-second host-call and permission deadlines. Denial, failed
-interactive approval, timeout, cancellation, or channel closure returns a JS error and
-performs no content read or mutation. Permission is always required even when later
-phases add filesystem allow-lists; those lists may only narrow the approved operation.
-
-### spawn() — permission routing
-
-`spawn()` permission checks must route back to tokio before execution. The JS thread blocks on a `std::sync::mpsc` sync channel while tokio resolves the permission. This is acceptable because the JS thread is dedicated and holds no other work.
-
-```rust
-pub struct SpawnContext {
-    pub sandbox: crate::sandbox::Sandbox,
-    pub perm_sync_tx: std::sync::mpsc::SyncSender<PermRequest>,
-}
-
-pub fn make_spawn(ctx: SpawnContext) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
-    move |cmd: String, args: Vec<String>| {
-        // 1. Request permission from tokio via sync channel
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        ctx.perm_sync_tx.send(PermRequest {
-            tool: "js/spawn".into(),
-            key: cmd.clone(),
-            reply: reply_tx,
-        }).ok();
-        match reply_rx.recv() {
-            Ok(PermResponse::Denied(msg)) =>
-                return Err(rquickjs::Error::new_from_js("spawn", &msg)),
-            Ok(PermResponse::Allowed) => {}
-            Err(_) =>
-                return Err(rquickjs::Error::new_from_js("spawn", "permission channel closed")),
-        }
-        // 2. Execute via std::process::Command (blocking — JS thread acceptable)
-        //    Apply Sandbox parameters manually or call ctx.sandbox.wrap_command(&cmd)
-        //    and convert the tokio::process::Command to blocking via .into_std().
-        //    src/sandbox.rs:109 Sandbox::wrap_command returns tokio::process::Command.
-        // ...
-    }
-}
-```
-
-**Reference pattern**: the `BashTool` permission call at `src/agent/tools/bash.rs:137` shows the exact idiom to mirror (from inside a tokio async context):
-
-```rust
-// src/agent/tools/bash.rs:137 — reference implementation (async path)
-if let Some(msg) = check_perm(&self.permission, &self.ask_tx, "bash", cmd).await? {
-    coaching = Some(msg);
-}
-```
-
-For `JsTool`'s async `call()` method (before sending to the JS thread), replace `"bash"` with the JS-specific tool key (e.g. `"js/spawn"`, `"js/read_file"`, `"js/write_file"`) and `cmd` with the relevant input string. The sync-channel `SpawnContext` approach is used when the permission check must be made from the non-async JS thread side.
-
-### Interrupt handler scope
-
-`set_interrupt_handler` fires only during **JS bytecode execution**, not during blocking Rust host calls. A `spawn()` call that hangs will not be interrupted by the JS timeout. Mitigation is a per-call timeout on the tokio side (Phase 2 concern; see `ARCHITECTURE.md §5`).
-
----
-
-## Error surfacing
-
-Errors are returned verbatim to the LLM for self-correction (not surfaced as `Err`):
-
-```rust
-JsOutcome::Error(e) => Ok(format!("JS error:\n{e}")),  // LLM self-corrects
-JsOutcome::Timeout => Ok("JS error: execution timed out (30s limit exceeded)".into()),
-JsOutcome::OomKilled => Ok("JS error: out of memory (64 MiB limit exceeded)".into()),
-```
-
-Exception format includes the stack trace:
-
-```
-ReferenceError: 'foo' is not defined
-    at <eval> (eval_script):3:5
-```
-
-The LLM uses this to revise its JS on the next step.
-
----
-
-## JsTool — `src/extras/js/tool.rs`
+The tool shuts down its permission bridge, closes the request channel, and joins a finished thread
+without leaving new work able to enter a shutting-down instance.
 
 ### Import paths
 
-`AskSender` and `PermCheck` are **NOT** re-exported via `pub use` from `crate::agent::tools`. They appear in `src/agent/tools/mod.rs` as private `use` items (lines 84–85), accessible to child modules of `tools` (like `bash.rs`) but NOT from `crate::extras::js::tool`. Use the direct module paths:
+JS code imports permission types directly from `crate::permission`, tool errors from
+`crate::agent::tools`, and engine/host/types through `crate::extras::js`. It must not depend on a
+private sibling-module import that happens to be visible to `BashTool`.
 
-| Type | Direct path | Declared at |
-|------|-------------|-------------|
-| `AskSender` | `crate::permission::ask::AskSender` | `src/permission/ask.rs:5` |
-| `PermCheck` | `crate::permission::checker::PermCheck` | `src/permission/checker.rs:10` |
-| `ToolError` | `crate::agent::tools::ToolError` | `src/agent/tools/mod.rs:88` |
-| `check_perm` | `crate::agent::tools::check_perm` | `src/agent/tools/mod.rs:199` |
+### `JsTool` — Full implementation
 
-### Full implementation
+The implementation is authoritative only as code under test; this specification defines its
+required boundary and behavior. Do not copy a second complete `JsTool` implementation into a
+tracker issue or overview document.
 
-```rust
-use rig::tool::Tool;
-use crate::permission::ask::AskSender;
-use crate::permission::checker::PermCheck;
-use crate::agent::tools::{ToolError, check_perm};
-use crate::extras::js::types::*;
+## Runtime lifecycle
 
-pub struct JsTool {
-    tx:         std::sync::mpsc::Sender<JsRequest>,
-    permission: Option<PermCheck>,
-    ask_tx:     Option<AskSender>,
-}
+Every JS step creates a new `Runtime` and drops it after evaluation. Runtime reuse is forbidden,
+including after a successful step, because an OOM can poison allocator state.
 
-impl JsTool {
-    pub fn new(
-        tx: std::sync::mpsc::Sender<JsRequest>,
-        permission: Option<PermCheck>,
-        ask_tx: Option<AskSender>,
-    ) -> Self {
-        Self { tx, permission, ask_tx }
-    }
-}
-
-impl Tool for JsTool {
-    const NAME: &'static str = "js";
-    type Error = ToolError;
-    type Args = JsArgs;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Execute JavaScript code. Available globals: read_file(path), write_file(path, content), \
-         spawn(cmd, args), console.log(...). Returns the last expression value as a string. \
-         Errors include the stack trace for self-correction.".to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "code": { "type": "string", "description": "JavaScript code to execute" }
-            },
-            "required": ["code"]
-        })
-    }
-
-    async fn call(&self, args: JsArgs) -> Result<String, ToolError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx.send(JsRequest { code: args.code, reply: reply_tx })
-            .map_err(|_| ToolError::Msg("JS engine thread disconnected".into()))?;
-        let response = reply_rx.await
-            .map_err(|_| ToolError::Msg("JS engine reply channel closed".into()))?;
-        match response.outcome {
-            JsOutcome::Value(v) => Ok(v),
-            JsOutcome::Void => Ok(String::new()),
-            JsOutcome::Error(e) => Ok(format!("JS error:\n{e}")),
-            JsOutcome::Timeout => Ok("JS error: execution timed out (30s limit exceeded)".into()),
-            JsOutcome::OomKilled => Ok("JS error: out of memory (64 MiB limit exceeded)".into()),
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub struct JsArgs {
-    pub code: String,
-}
-```
-
----
-
-## Module entry — `src/extras/js/mod.rs`
+Every new runtime applies these limits before evaluation:
 
 ```rust
-pub mod engine;
-pub mod host;
-pub mod tool;
-pub mod types;
+rt.set_memory_limit(64 * 1024 * 1024);
+rt.set_max_stack_size(512 * 1024);
+rt.set_interrupt_handler(/* deadline/cancellation handler */);
 ```
 
----
+The interrupt deadline is installed before `ctx.eval(...)`. Evaluation uses
+`eval::<Value, _>`, never `eval::<(), _>`.
 
-## Module declaration — `src/extras/mod.rs`
-
-Append after the last existing line (line 40, which is `pub(crate) mod truncate;`):
+After every evaluation attempt, the engine drains pending jobs. The baseline rule is:
 
 ```rust
-#[cfg(feature = "js")]
-pub mod js;
+while rt.execute_pending_job() == Ok(true) {}
 ```
 
----
+An implementation may add a deadline and finite job-count guard, but it may not skip the drain or
+allow a self-replenishing microtask chain to monopolize the JS thread. Promise rejection, job
+errors, timeout, cancellation, and OOM are returned as bounded outcomes.
 
-## Builder registration — `src/agent/builder.rs`
+## Host globals
 
-`all_tools` is created at **line 279**. Existing feature-gated tool blocks occupy lines 281–333 (subagents, memory, mcp, advisor, lsp). The JS block must be inserted **after the `#[cfg(feature = "lsp")]` block (which ends at line 333) and before `filter_tools_by_allowlist` (line 335)**.
+Phase 1 exposes only:
 
-Existing `BashTool` injection is at lines 242–247 inside `base_tools` (a fixed-size `SmallVec`). JS goes into `all_tools` after construction because it is feature-gated and cannot be included in the fixed-size array.
+| Global | Contract | Authorization/effect boundary |
+|--------|----------|-------------------------------|
+| `read_file(path)` | UTF-8 regular-file read, at most 1 MiB | mandatory `js/read_file` permission for the canonical target |
+| `write_file(path, content)` | atomic no-follow create/replace, at most 1 MiB | mandatory `js/write_file` permission for the resolved final target |
+| `spawn(cmd, args)` | bounded child result | mandatory process permission and `Sandbox::wrap_command` |
+| `console.log(...)` | bounded diagnostic output | no external effect permission |
 
-```rust
-// Insert at lines 333–334, before: let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
+There is no `require()`, `import()`, `fetch()`, or `final_answer()` global.
 
-#[cfg(feature = "js")]
-{
-    use crate::extras::js::{engine::js_thread_main, tool::JsTool, types::THREAD_STACK};
-    let (js_tx, js_rx) = std::sync::mpsc::channel::<crate::extras::js::types::JsRequest>();
-    std::thread::Builder::new()
-        .name("js-engine".into())
-        .stack_size(THREAD_STACK)
-        .spawn(move || js_thread_main(js_rx))
-        .expect("failed to spawn JS thread");
-    all_tools.push(Box::new(JsTool::new(js_tx, permission.clone(), ask_tx.clone())));
-}
-```
+### `read_file` and `write_file`
 
----
+Permission is mandatory on every file operation. A configured Phase 2 allow-list may narrow an
+operation but can never authorize it or bypass the permission service.
 
-## Tests — `src/extras/js/tests/`
+`read_file`:
 
-Create `src/extras/js/tests/mod.rs` with the following integration tests. All are `#[tokio::test]`, all require `--features js`.
+1. resolves and canonicalizes the target without reading content;
+2. captures target identity and derives an exact UTF-8 permission path;
+3. obtains `js/read_file` permission with a finite deadline;
+4. opens without following a final symlink, revalidates identity and regular-file type; and
+5. reads no more than 1 MiB.
 
-```rust
-#[tokio::test]
-async fn test_return_value() {
-    // eval "1 + 1" via JsTool → Ok("2")
-}
+`write_file`:
 
-#[tokio::test]
-async fn test_read_write_roundtrip() {
-    // write_file("/tmp/zs_test.txt", "hello") then read_file("/tmp/zs_test.txt") → "hello"
-}
+1. rejects oversized content before mutation;
+2. rejects an existing final symlink;
+3. resolves the nearest existing parent and permits only one missing normal component;
+4. obtains `js/write_file` permission for the resolved final UTF-8 target; and
+5. revalidates the approved parent before descriptor-relative, no-follow atomic publication.
 
-#[tokio::test]
-async fn test_timeout() {
-    // eval "while(true){}" → response contains "timed out"
-}
+Denial, non-interactive `Ask`, approval-channel failure, timeout, cancellation, path race, invalid
+UTF-8, or I/O failure returns a typed JS error and performs no content read or mutation.
 
-#[tokio::test]
-async fn test_oom() {
-    // allocate until OOM → response contains "out of memory"; NOT a panic
-}
+### `spawn()` permission routing and sandbox boundary
 
-#[tokio::test]
-async fn test_syntax_error_includes_line() {
-    // eval "let x = ;" → error message contains a line number
-}
+The synchronous host closure routes authorization through the same permission policy used by the
+Bash process primitive. It must preserve the JS-facing operation identity in errors and audit
+events. Approval alone is insufficient: the command must then be created through
+`Sandbox::wrap_command`, with the executable and arguments passed without interpolation.
 
-#[tokio::test]
-async fn test_fresh_runtime_after_oom() {
-    // step 1: OOM → error; step 2: eval "1+1" → "2"; proves Runtime recreation works
-}
-```
+`Sandbox::wrap_command` is the single Phase 1 process path. Direct
+`std::process::Command::new(user_cmd)` execution is forbidden. The wrapper may run without an
+effective isolation backend when sandboxing is disabled or unavailable; that state must remain
+observable. Phase 2 adds Linux/macOS process hardening and does not retroactively make Phase 1
+Windows-isolated.
 
----
+### Interrupt handler scope and host-call deadlines
+
+The QuickJS interrupt handler runs only during JS bytecode. Every blocking host operation,
+permission wait, child wait, and shutdown wait therefore has its own finite timeout and
+cancellation path in Phase 1. Host calls do not inherit safety merely from the eval deadline.
+Timeout/cancellation kills the child process group where the platform supports it and returns a
+bounded JS error.
+
+## Error surfacing
+
+Exceptions are returned to the model for self-correction and include bounded message and stack
+text, including line information when QuickJS supplies it. Syntax errors, host errors, Promise
+rejections, timeout, cancellation, OOM, and pending-job exhaustion are distinguished. Error
+formatting never panics because an exception lacks a message or stack.
+
+## Builder registration
+
+`src/agent/builder.rs` registers one `JsTool` under `#[cfg(feature = "js")]` before the tool
+allow-list is applied. `JsTool::new` owns creation of its dedicated thread so one tool cannot
+accidentally share a QuickJS runtime with another.
+
+Registration does not remove or silently replace another action tool. Windows availability is
+controlled by verified platform support in code and CI, not by an overview-document claim.
+
+## Module entry
+
+`src/extras/js/mod.rs` declares and exposes the Phase 1 engine, host, tool, types, and test modules.
+Later-phase modules remain behind their own feature gates.
+
+## Module declaration
+
+`src/extras/mod.rs` declares `pub mod js` only under `#[cfg(feature = "js")]`.
+
+## Tests
+
+Tests cover, at minimum:
+
+- return values, void, syntax errors, and stack-bearing runtime errors;
+- fresh runtime state after success, timeout, and OOM;
+- exact memory/stack/deadline setup and bounded pending jobs;
+- mandatory allow/deny/ask behavior for both file globals and process spawn;
+- canonical permission paths, symlink races, non-regular files, UTF-8, and 1 MiB boundaries;
+- atomic/no-follow write behavior and “no effect on denial/failure”;
+- process argument safety, wrapper use, output bounds, timeout, cancellation, and shutdown;
+- one dedicated 8 MiB thread per `JsTool` and clean tool drop; and
+- default and `js` feature builds, plus every platform configuration for which support is claimed.
 
 ## Acceptance criteria
 
-All must pass under `cargo test --features js`:
-
-- [ ] `cargo test --features js` compiles and all tests pass
-- [ ] `JsTool` implements `rig::tool::Tool` and is `Send + Sync` (verified by compiler)
-- [ ] A fresh `Runtime` is created and dropped for every `run_step()` call — never reused
-- [ ] `set_memory_limit(64 * 1024 * 1024)` called on every new `Runtime`
-- [ ] `set_max_stack_size(512 * 1024)` called on every new `Runtime`
-- [ ] `set_interrupt_handler` deadline is set before `ctx.eval(...)` is called
-- [ ] Interrupt fires and returns `JsOutcome::Timeout` for an infinite JS loop
-- [ ] OOM returns `JsOutcome::OomKilled`, does not panic the engine thread
-- [ ] `spawn()` calls route through `Sandbox::wrap_command` (`src/sandbox.rs:109`)
-- [ ] Microtask queue is drained after every eval: `while rt.execute_pending_job() == Ok(true) {}`
-- [ ] Exception messages include JS stack traces (line numbers visible to LLM)
-- [ ] Binary compiled without `--features js` passes all existing tests unchanged
-
----
+- [ ] All threading, runtime, limit, eval, microtask, and exception invariants above are tested.
+- [ ] `JsTool` and all of its fields satisfy `Send + Sync`; QuickJS state stays on its thread.
+- [ ] Every file operation is permission-gated on the resolved target and fails without effects.
+- [ ] Every process spawn is permission-gated, argument-safe, bounded, and created by
+      `Sandbox::wrap_command`.
+- [ ] Documentation and runtime diagnostics distinguish VM isolation from effective child-process
+      isolation.
+- [ ] No Phase 2 or later host global is registered in a `js`-only Phase 1 build.
+- [ ] The default build remains unchanged and the `js` feature test suite passes.
 
 ## Out of scope for Phase 1
 
-- `fetch()` host global (Phase 2)
-- File allow-list enforcement (Phase 2)
-- birdcage process isolation (Phase 2)
-- Skill library (Phase 3)
-- Auto-admission (Phase 4)
-- `require()`, `import()`, `final_answer` host global — forbidden permanently
+- `fetch()` and file allow-lists (Phase 2)
+- Linux/macOS process-isolation hardening (Phase 2)
+- Windows process isolation (not delivered by Phase 2)
+- portable Agent Skills and learned JS skills (Phase 3)
+- agent proposals and human-gated canaries (Phase 4)
+- evidence-based promotion and lifecycle automation (Phase 5)
+- hook-language migration or removal of Bash

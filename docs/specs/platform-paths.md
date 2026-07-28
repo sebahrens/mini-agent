@@ -1,8 +1,17 @@
 # Cross-Platform Paths and Persistent Storage
 
-**Status**: Pre-implementation
-**Scope**: Normative foundation for every phase and every feature that persists files
-**Target platforms**: Linux, macOS, and Windows MSVC
+- **Document role**: normative cross-phase foundation
+- **Specification version**: 1.0.0
+- **Delivery status**: implementation in progress
+- **Owner**: mini-agent maintainers
+- **Last reconciled**: 2026-07-29
+- **Entry dependency**: none
+- **Exit dependency**: every required test below and every Foundation blocker
+- **Target platforms**: Linux, macOS, and Windows MSVC
+
+The corpus authority and conflict rules are defined in
+[`00-index.md`](00-index.md). This file overrides phase-local text for storage classes, persistent
+paths, archive handling, migration, and credential protection.
 
 **Foundation implementation**: `src/paths.rs` provides the host-independent `AppPaths` resolver
 and injected `PathEnvironment` fixtures. `src/paths/portable.rs` provides the shared portable
