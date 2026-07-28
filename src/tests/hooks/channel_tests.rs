@@ -1,12 +1,7 @@
 use crate::extras::hooks::channel::{ChannelResult, interpret_hook_output};
 use crate::extras::hooks::subprocess::{HookOutput, HookStatus, OutputLimit};
 
-fn output(
-    exit_code: Option<i32>,
-    stdout: &[u8],
-    stderr: &[u8],
-    status: HookStatus,
-) -> HookOutput {
+fn output(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8], status: HookStatus) -> HookOutput {
     HookOutput {
         exit_code,
         stdout: stdout.to_vec(),

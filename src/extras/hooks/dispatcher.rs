@@ -303,7 +303,7 @@ impl HookDispatcher {
                                 "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
                             );
                         }
-                    }
+                    },
                 }
             }
 

@@ -1,9 +1,10 @@
 use std::collections::HashSet;
-use std::process::{Output, Stdio};
+use std::process::{ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub struct Sandbox {
@@ -11,6 +12,48 @@ pub struct Sandbox {
     backend: String,
     shell: String,
     active_groups: Arc<Mutex<HashSet<u32>>>,
+    cancelled_groups: Arc<Mutex<HashSet<u32>>>,
+}
+
+/// Hard bounds for one captured subprocess.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommandLimits {
+    pub timeout: std::time::Duration,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    pub combined_bytes: usize,
+}
+
+pub(crate) const DEFAULT_COMMAND_LIMITS: CommandLimits = CommandLimits {
+    timeout: std::time::Duration::from_secs(30),
+    stdout_bytes: 1024 * 1024,
+    stderr_bytes: 1024 * 1024,
+    combined_bytes: 1536 * 1024,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandOutputLimit {
+    Stdout,
+    Stderr,
+    Combined,
+}
+
+/// Why a captured subprocess stopped. `Completed` is the only status whose
+/// stdout and stderr represent complete streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandStatus {
+    Completed,
+    TimedOut,
+    Cancelled,
+    OutputLimitExceeded(CommandOutputLimit),
+    Failed,
+}
+
+pub(crate) struct CommandOutput {
+    pub exit_status: Option<ExitStatus>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub status: CommandStatus,
 }
 
 static BWRAP_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -82,6 +125,7 @@ impl Sandbox {
             backend: backend.to_string(),
             shell: "bash".to_string(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
+            cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -203,32 +247,170 @@ impl Sandbox {
     }
 
     pub async fn output_command(&self, command: &str) -> std::io::Result<Output> {
-        let mut cmd = self.wrap_command(command);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn()?;
-        let (stdout_handle, stdout) = spawn_pipe_reader(child.stdout.take());
-        let (stderr_handle, stderr) = spawn_pipe_reader(child.stderr.take());
-        let mut guard = ProcessGroupGuard::new(child.id(), self.active_groups.clone());
-        let status = child.wait().await?;
-
-        if tokio::time::timeout(std::time::Duration::from_millis(100), async {
-            join_reader(stdout_handle).await?;
-            join_reader(stderr_handle).await
-        })
-        .await
-        .is_err()
-            && let Some(pid) = guard.pid
-        {
-            kill_process_group(pid);
+        let output = self
+            .output_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await?;
+        if output.status != CommandStatus::Completed {
+            return Err(std::io::Error::other(format!(
+                "command did not complete: {:?}",
+                output.status
+            )));
         }
-        let stdout = stdout.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let stderr = stderr.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        guard.disarm();
+        let status = output
+            .exit_status
+            .ok_or_else(|| std::io::Error::other("completed command had no exit status"))?;
         Ok(Output {
             status,
-            stdout,
-            stderr,
+            stdout: output.stdout,
+            stderr: output.stderr,
         })
+    }
+
+    /// Runs a command on a background task so dropping the receiver is an
+    /// observable cancellation event. The worker owns the child until it has
+    /// killed the process group and reaped the direct child.
+    pub(crate) async fn output_command_with_limits(
+        &self,
+        command: &str,
+        limits: CommandLimits,
+    ) -> std::io::Result<CommandOutput> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let sandbox = self.clone();
+        let command = command.to_string();
+        tokio::spawn(async move {
+            sandbox
+                .run_output_command(command, limits, response_tx)
+                .await;
+        });
+        response_rx.await.map_err(|_| {
+            std::io::Error::other("command output worker stopped before returning a result")
+        })
+    }
+
+    async fn run_output_command(
+        &self,
+        command: String,
+        limits: CommandLimits,
+        mut response_tx: oneshot::Sender<CommandOutput>,
+    ) {
+        let mut cmd = self.wrap_command(&command);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = response_tx.send(CommandOutput {
+                    exit_status: None,
+                    stdout: Vec::new(),
+                    stderr: format!("failed to spawn command: {error}").into_bytes(),
+                    status: CommandStatus::Failed,
+                });
+                return;
+            }
+        };
+        let pid = child.id();
+        let mut guard = ProcessGroupGuard::new(child.id(), self.active_groups.clone());
+        let captured = Arc::new(Mutex::new(CapturedCommandOutput::default()));
+        let (reader_error_tx, mut reader_error_rx) = mpsc::unbounded_channel();
+        let stdout_handle = spawn_bounded_pipe_reader(
+            child.stdout.take(),
+            CommandOutputStream::Stdout,
+            captured.clone(),
+            limits,
+            reader_error_tx.clone(),
+        );
+        let stderr_handle = spawn_bounded_pipe_reader(
+            child.stderr.take(),
+            CommandOutputStream::Stderr,
+            captured.clone(),
+            limits,
+            reader_error_tx,
+        );
+
+        let termination = tokio::select! {
+            status = child.wait() => CommandTermination::Exited(status),
+            Some(error) = reader_error_rx.recv() => CommandTermination::ReaderError(error),
+            _ = tokio::time::sleep(limits.timeout) => CommandTermination::TimedOut,
+            _ = response_tx.closed() => CommandTermination::Cancelled,
+        };
+
+        let (mut exit_status, mut command_status) = match termination {
+            CommandTermination::Exited(Ok(status)) => {
+                // A descendant may inherit a pipe after the shell exits. End
+                // the process group before joining readers so it cannot hold
+                // the command open or continue running in the background.
+                if let Some(pid) = pid {
+                    kill_process_group(pid);
+                }
+                let command_status = if self.take_cancelled(pid) {
+                    CommandStatus::Cancelled
+                } else {
+                    CommandStatus::Completed
+                };
+                (Some(status), command_status)
+            }
+            CommandTermination::Exited(Err(error)) => {
+                tracing::warn!("sandbox: failed to wait for command: {error}");
+                terminate_and_reap(&mut child, pid).await;
+                (None, CommandStatus::Failed)
+            }
+            CommandTermination::ReaderError(error) => {
+                let status = match error {
+                    CommandRunError::OutputLimit(limit) => {
+                        CommandStatus::OutputLimitExceeded(limit)
+                    }
+                    CommandRunError::Read(error) => {
+                        tracing::warn!("sandbox: failed to consume command output: {error}");
+                        CommandStatus::Failed
+                    }
+                };
+                terminate_and_reap(&mut child, pid).await;
+                (None, status)
+            }
+            CommandTermination::TimedOut => {
+                terminate_and_reap(&mut child, pid).await;
+                (None, CommandStatus::TimedOut)
+            }
+            CommandTermination::Cancelled => {
+                terminate_and_reap(&mut child, pid).await;
+                (None, CommandStatus::Cancelled)
+            }
+        };
+
+        if finish_pipe_readers(stdout_handle, stderr_handle)
+            .await
+            .is_err()
+            && command_status == CommandStatus::Completed
+        {
+            command_status = CommandStatus::Failed;
+        }
+        if command_status == CommandStatus::Completed
+            && let Ok(error) = reader_error_rx.try_recv()
+        {
+            command_status = match error {
+                CommandRunError::OutputLimit(limit) => {
+                    CommandStatus::OutputLimitExceeded(limit)
+                }
+                CommandRunError::Read(error) => {
+                    tracing::warn!("sandbox: failed to consume command output: {error}");
+                    CommandStatus::Failed
+                }
+            };
+        }
+        if command_status != CommandStatus::Completed {
+            exit_status = None;
+        }
+        guard.disarm();
+        self.take_cancelled(pid);
+
+        let mut captured = captured.lock().unwrap_or_else(|e| e.into_inner());
+        let output = CommandOutput {
+            exit_status,
+            stdout: std::mem::take(&mut captured.stdout),
+            stderr: std::mem::take(&mut captured.stderr),
+            status: command_status,
+        };
+        drop(captured);
+        let _ = response_tx.send(output);
     }
 
     pub fn kill_active(&self) {
@@ -238,6 +420,10 @@ impl Sandbox {
             .unwrap_or_else(|e| e.into_inner())
             .drain()
             .collect();
+        self.cancelled_groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(groups.iter().copied());
         for pid in groups {
             kill_process_group(pid);
         }
@@ -250,39 +436,152 @@ impl Sandbox {
             .unwrap_or_else(|e| e.into_inner())
             .len()
     }
+
+    fn take_cancelled(&self, pid: Option<u32>) -> bool {
+        pid.is_some_and(|pid| {
+            self.cancelled_groups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&pid)
+        })
+    }
 }
 
-fn spawn_pipe_reader(
-    pipe: Option<impl tokio::io::AsyncRead + Send + Unpin + 'static>,
-) -> (
-    tokio::task::JoinHandle<std::io::Result<()>>,
-    Arc<Mutex<Vec<u8>>>,
-) {
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let reader_output = output.clone();
-    let handle = tokio::spawn(async move {
-        if let Some(mut pipe) = pipe {
-            let mut buf = [0; 8192];
-            loop {
-                let read = pipe.read(&mut buf).await?;
-                if read == 0 {
-                    break;
+#[derive(Default)]
+struct CapturedCommandOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    combined_bytes: usize,
+}
+
+impl CapturedCommandOutput {
+    fn push(
+        &mut self,
+        stream: CommandOutputStream,
+        bytes: &[u8],
+        limits: CommandLimits,
+    ) -> Result<(), CommandOutputLimit> {
+        let (output, stream_limit, stream_error) = match stream {
+            CommandOutputStream::Stdout => (
+                &mut self.stdout,
+                limits.stdout_bytes,
+                CommandOutputLimit::Stdout,
+            ),
+            CommandOutputStream::Stderr => (
+                &mut self.stderr,
+                limits.stderr_bytes,
+                CommandOutputLimit::Stderr,
+            ),
+        };
+        let stream_remaining = stream_limit.saturating_sub(output.len());
+        let combined_remaining = limits.combined_bytes.saturating_sub(self.combined_bytes);
+        let accepted = bytes.len().min(stream_remaining).min(combined_remaining);
+        output.extend_from_slice(&bytes[..accepted]);
+        self.combined_bytes += accepted;
+
+        if accepted == bytes.len() {
+            Ok(())
+        } else if stream_remaining <= combined_remaining {
+            Err(stream_error)
+        } else {
+            Err(CommandOutputLimit::Combined)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CommandOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug)]
+enum CommandRunError {
+    OutputLimit(CommandOutputLimit),
+    Read(std::io::Error),
+}
+
+enum CommandTermination {
+    Exited(std::io::Result<ExitStatus>),
+    ReaderError(CommandRunError),
+    TimedOut,
+    Cancelled,
+}
+
+fn spawn_bounded_pipe_reader<R>(
+    pipe: Option<R>,
+    stream: CommandOutputStream,
+    captured: Arc<Mutex<CapturedCommandOutput>>,
+    limits: CommandLimits,
+    error_tx: mpsc::UnboundedSender<CommandRunError>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        let Some(mut pipe) = pipe else {
+            return;
+        };
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = match pipe.read(&mut buffer).await {
+                Ok(0) => return,
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = error_tx.send(CommandRunError::Read(error));
+                    return;
                 }
-                reader_output
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(&buf[..read]);
+            };
+            let result = captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(stream, &buffer[..read], limits);
+            if let Err(limit) = result {
+                let _ = error_tx.send(CommandRunError::OutputLimit(limit));
+                return;
             }
         }
-        Ok(())
-    });
-    (handle, output)
+    })
 }
 
-async fn join_reader(reader: tokio::task::JoinHandle<std::io::Result<()>>) -> std::io::Result<()> {
-    reader
-        .await
-        .map_err(|e| std::io::Error::other(format!("pipe reader task failed: {e}")))?
+async fn finish_pipe_readers(
+    mut stdout: tokio::task::JoinHandle<()>,
+    mut stderr: tokio::task::JoinHandle<()>,
+) -> std::io::Result<()> {
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        (&mut stdout)
+            .await
+            .map_err(|error| std::io::Error::other(format!("stdout reader failed: {error}")))?;
+        (&mut stderr)
+            .await
+            .map_err(|error| std::io::Error::other(format!("stderr reader failed: {error}")))
+    })
+    .await;
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            stdout.abort();
+            stderr.abort();
+            Err(error)
+        }
+        Err(_) => {
+            stdout.abort();
+            stderr.abort();
+            Err(std::io::Error::other(
+                "command pipe readers did not stop after process termination",
+            ))
+        }
+    }
+}
+
+async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        kill_process_group(pid);
+    }
+    let _ = child.start_kill();
+    if let Err(error) = child.wait().await {
+        tracing::warn!("sandbox: failed to reap terminated command: {error}");
+    }
 }
 
 pub(crate) fn configure_child_lifetime(cmd: &mut Command) {

@@ -698,6 +698,18 @@ start with `echo`. Bash `ask` and `deny` entries remain pattern-based so broad
 safeguards still work. An unmatched Bash script asks in `guarded` and
 `standard`; `yolo` remains the explicit allow-all mode subject to deny rules.
 
+Bash commands have a mandatory 30-second deadline. A tool call's optional
+`timeout` value is milliseconds and can only lower that deadline. Captured raw
+output is limited to 1 MiB of stdout, 1 MiB of stderr, and 1.5 MiB combined;
+both pipes are drained concurrently. Timeout, cancellation, or any output cap
+kills and reaps the command's process group and returns an explicit non-success
+status, with any retained prefix labelled as partial.
+
+For a completed command, stdout and stderr preserve byte order within their own
+streams. They are decoded independently using UTF-8 replacement, then rendered
+as all stdout followed by all stderr with a newline separator. Interleaving
+between the two OS pipes is intentionally not reconstructed.
+
 There are two config fields for controlling permissions by pattern:
 
 - **`permission`** — patterns are treated as globs (e.g. `**/*.rs`, `src/**`).

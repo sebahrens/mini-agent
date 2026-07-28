@@ -117,9 +117,8 @@ async fn hook_subprocess_limits_stderr_fill_does_not_deadlock() {
 
 #[tokio::test]
 async fn hook_subprocess_limits_stdout_cap_is_a_hard_failure() {
-    let args = shell_args(
-        "i=0; while [ \"$i\" -lt 1000 ]; do printf 0123456789; i=$((i + 1)); done",
-    );
+    let args =
+        shell_args("i=0; while [ \"$i\" -lt 1000 ]; do printf 0123456789; i=$((i + 1)); done");
     let output = run_hook_with_limits(
         "sh",
         Some(&args),
@@ -141,9 +140,8 @@ async fn hook_subprocess_limits_stdout_cap_is_a_hard_failure() {
 
 #[tokio::test]
 async fn hook_subprocess_limits_stderr_cap_is_a_hard_failure() {
-    let args = shell_args(
-        "i=0; while [ \"$i\" -lt 1000 ]; do printf 0123456789 >&2; i=$((i + 1)); done",
-    );
+    let args =
+        shell_args("i=0; while [ \"$i\" -lt 1000 ]; do printf 0123456789 >&2; i=$((i + 1)); done");
     let output = run_hook_with_limits(
         "sh",
         Some(&args),

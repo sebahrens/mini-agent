@@ -65,23 +65,12 @@ impl CapturedOutput {
         limits: HookLimits,
     ) -> Result<(), OutputLimit> {
         let (output, stream_limit, stream_error) = match stream {
-            OutputStream::Stdout => (
-                &mut self.stdout,
-                limits.stdout_bytes,
-                OutputLimit::Stdout,
-            ),
-            OutputStream::Stderr => (
-                &mut self.stderr,
-                limits.stderr_bytes,
-                OutputLimit::Stderr,
-            ),
+            OutputStream::Stdout => (&mut self.stdout, limits.stdout_bytes, OutputLimit::Stdout),
+            OutputStream::Stderr => (&mut self.stderr, limits.stderr_bytes, OutputLimit::Stderr),
         };
         let stream_remaining = stream_limit.saturating_sub(output.len());
         let combined_remaining = limits.combined_bytes.saturating_sub(self.combined_bytes);
-        let accepted = bytes
-            .len()
-            .min(stream_remaining)
-            .min(combined_remaining);
+        let accepted = bytes.len().min(stream_remaining).min(combined_remaining);
         output.extend_from_slice(&bytes[..accepted]);
         self.combined_bytes += accepted;
 
@@ -207,26 +196,10 @@ pub(crate) async fn run_hook_with_limits(
             }
             Ok::<(), RunError>(())
         };
-        let read_stdout = capture_pipe(
-            stdout_pipe,
-            OutputStream::Stdout,
-            captured.clone(),
-            limits,
-        );
-        let read_stderr = capture_pipe(
-            stderr_pipe,
-            OutputStream::Stderr,
-            captured.clone(),
-            limits,
-        );
-        let wait = async {
-            child
-                .wait()
-                .await
-                .map_err(RunError::Wait)
-        };
-        let (_, _, _, status) =
-            tokio::try_join!(write_stdin, read_stdout, read_stderr, wait)?;
+        let read_stdout = capture_pipe(stdout_pipe, OutputStream::Stdout, captured.clone(), limits);
+        let read_stderr = capture_pipe(stderr_pipe, OutputStream::Stderr, captured.clone(), limits);
+        let wait = async { child.wait().await.map_err(RunError::Wait) };
+        let (_, _, _, status) = tokio::try_join!(write_stdin, read_stdout, read_stderr, wait)?;
         Ok::<_, RunError>(status)
     };
 
