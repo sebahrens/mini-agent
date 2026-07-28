@@ -199,10 +199,7 @@ fn format_task_summary(obj: &serde_json::Map<String, serde_json::Value>) -> Stri
 /// Suggests a permission allow pattern for a tool+input combination.
 pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
     match tool {
-        "bash" => {
-            let first = input.split_whitespace().next().unwrap_or("*");
-            format!("{} *", first)
-        }
+        "bash" => input.to_string(),
         "read" | "write" | "edit" | "list_dir" => {
             let expanded = crate::fs::expand_tilde(input);
             let path = std::path::Path::new(&expanded);
@@ -221,5 +218,17 @@ pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
             format!("{}*", first)
         }
         _ => "*".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::suggest_pattern;
+
+    #[test]
+    fn bash_suggestion_is_the_exact_complete_script() {
+        let script = "echo  hello\nprintf 'done\\n'";
+
+        assert_eq!(suggest_pattern("bash", script), script);
     }
 }
