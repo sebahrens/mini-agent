@@ -283,9 +283,10 @@ setup_codex_home() {
         for d in skills prompts rules; do
             [ -d "$source_home/$d" ] && [ ! -e "$CODEX_HOME/$d" ] && \
                 { ln -s "$source_home/$d" "$CODEX_HOME/$d" 2>/dev/null || \
-                  cp -R "$source_home/$d" "$CODEX_HOME/$d" 2>/dev/null || true; }
+                  cp -R "$source_home/$d" "$CODEX_HOME/$d" 2>/dev/null || true; } || true
         done
     fi
+    return 0
 }
 
 # run_with_codex_exec <prompt_content> <temp_out> [model]
