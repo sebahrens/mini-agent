@@ -253,7 +253,15 @@ impl PermissionChecker {
                     Action::Ask
                 }
             }),
-            SecurityMode::Standard => base.unwrap_or(self.default_action),
+            SecurityMode::Standard => base.unwrap_or_else(|| {
+                if tool == "bash" {
+                    // Bash scripts are opaque permission keys. An unmatched
+                    // script must never inherit a permissive default.
+                    Action::Ask
+                } else {
+                    self.default_action
+                }
+            }),
             SecurityMode::Yolo => match base {
                 Some(Action::Deny) => Action::Deny,
                 Some(other) => other,
@@ -410,7 +418,15 @@ impl PermissionChecker {
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
-                if pattern.matches(input) {
+                let matches = if tool == "bash" && *action == Action::Allow {
+                    // Model B: allow only the exact, complete script. Ask and
+                    // deny rules remain pattern-based so broad safeguards keep
+                    // working, but globs/regexes cannot widen Bash execution.
+                    pattern.original == input
+                } else {
+                    pattern.matches(input)
+                };
+                if matches {
                     matched.push(*action);
                 }
             }
@@ -475,7 +491,12 @@ impl PermissionChecker {
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
         for (allowed_tool, pattern) in &self.session_allowlist {
-            if allowed_tool == tool && pattern.matches(input) {
+            let matches = if tool == "bash" {
+                pattern.original == input
+            } else {
+                pattern.matches(input)
+            };
+            if allowed_tool == tool && matches {
                 return true;
             }
         }

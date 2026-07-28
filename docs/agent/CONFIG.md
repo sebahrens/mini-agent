@@ -673,7 +673,18 @@ permission tool keys are `bash`, `read`, `write`, `edit`, `grep`, `find_files`,
 `mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the default action,
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
-omitted, zerostack installs its built-in safe bash allow/deny rules.
+omitted, zerostack installs built-in exact-script allows (for commands such as
+`pwd`, `git status`, and `cargo test`) plus pattern-based deny rules.
+
+Bash uses a fail-closed, opaque full-script permission model. The exact string
+passed to `bash -c` is also the permission key. An `allow` entry authorizes Bash
+only when the entry is byte-for-byte equal to the complete script; glob and
+regex expansion never widens a Bash allow. For example, an allow entry
+`echo *` authorizes the literal script `echo *`, but not `echo hello`, pipelines,
+redirects, substitutions, command lists, subshells, or background jobs that
+start with `echo`. Bash `ask` and `deny` entries remain pattern-based so broad
+safeguards still work. An unmatched Bash script asks in `guarded` and
+`standard`; `yolo` remains the explicit allow-all mode subject to deny rules.
 
 There are two config fields for controlling permissions by pattern:
 
@@ -715,8 +726,18 @@ permission-regex:
     "\\.md$": allow
     "\\.rs$": ask
   bash:
-    "^cargo (test|check|build)$": allow
+    "^cargo (test|check|build)$": ask
     "^rm ": deny
+```
+
+Because Bash allows are exact-script only, use the non-regex permission field
+for explicit allowed scripts:
+
+```yaml
+permission:
+  bash:
+    "cargo test": allow
+    "git status": allow
 ```
 
 When compiled with MCP support, `mcp_servers` accepts local stdio and remote

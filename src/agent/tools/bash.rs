@@ -5,77 +5,6 @@ use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError, check_perm}
 use crate::extras::truncate::head_lines;
 use crate::sandbox::Sandbox;
 
-pub(crate) fn split_bash_commands(input: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            current.push(ch);
-            if let Some(next) = chars.next() {
-                current.push(next);
-            }
-        } else if ch == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            current.push(ch);
-        } else if ch == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            current.push(ch);
-        } else if (ch == ';' || ch == '\n') && !in_single_quote && !in_double_quote {
-            let trimmed = current.trim().to_string();
-            if !trimmed.is_empty() {
-                result.push(trimmed);
-            }
-            current = String::new();
-        } else if ch == '&' && !in_single_quote && !in_double_quote {
-            if chars.peek() == Some(&'&') {
-                chars.next();
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    result.push(trimmed);
-                }
-                current = String::new();
-            } else {
-                current.push(ch);
-            }
-        } else if ch == '|' && !in_single_quote && !in_double_quote {
-            if chars.peek() == Some(&'|') {
-                chars.next();
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    result.push(trimmed);
-                }
-                current = String::new();
-            } else {
-                current.push(ch);
-            }
-        } else if ch == '>' && !in_single_quote && !in_double_quote {
-            if chars.peek() == Some(&'>') {
-                chars.next();
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    result.push(trimmed);
-                }
-                current = String::new();
-            } else {
-                current.push(ch);
-            }
-        } else {
-            current.push(ch);
-        }
-    }
-
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        result.push(trimmed);
-    }
-
-    result
-}
-
 pub struct BashTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -125,19 +54,16 @@ impl Tool for BashTool {
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
-        let commands = split_bash_commands(&args.command);
         tracing::debug!(
-            "tool bash start: cmd_len={}, timeout={:?}, num_commands={}",
+            "tool bash start: cmd_len={}, timeout={:?}",
             args.command.len(),
             args.timeout,
-            commands.len(),
         );
-        let mut coaching: Option<String> = None;
-        for cmd in &commands {
-            if let Some(msg) = check_perm(&self.permission, &self.ask_tx, "bash", cmd).await? {
-                coaching = Some(msg);
-            }
-        }
+        // The complete script is the permission key and is passed unchanged to
+        // the shell. Never split or tokenize it: Bash can execute nested
+        // programs from syntax that ad-hoc command splitting cannot classify.
+        let coaching =
+            check_perm(&self.permission, &self.ask_tx, "bash", &args.command).await?;
 
         let output = if let Some(secs) = args.timeout {
             match timeout(
