@@ -81,8 +81,7 @@ impl Tool for FindFilesTool {
             .build();
 
         let max_results = self.max_results as usize;
-        let mut results: Vec<String> =
-            Vec::with_capacity(max_results.saturating_add(1).min(64));
+        let mut results: Vec<String> = Vec::with_capacity(max_results.saturating_add(1).min(64));
         let mut limit_hit = false;
 
         for entry in walker

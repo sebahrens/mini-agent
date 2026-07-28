@@ -118,12 +118,14 @@ impl Tool for GrepTool {
         let mut file_count = 0;
         let mut files_with_matches: usize = 0;
         let mut all_results: Vec<String> = Vec::with_capacity(max_results.min(64));
+        let mut limit_hit = false;
 
         for entry in walker
             .flatten()
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         {
             if all_results.len() >= max_results {
+                limit_hit = true;
                 break;
             }
 
@@ -165,9 +167,10 @@ impl Tool for GrepTool {
                     files_with_matches += 1;
 
                     if context == 0 {
-                        for &ml in &match_lines {
+                        for (match_index, &ml) in match_lines.iter().enumerate() {
                             all_results.push(format!("{}:{}:{}", path_str, ml + 1, lines[ml]));
                             if all_results.len() >= max_results {
+                                limit_hit = match_index + 1 < match_lines.len();
                                 break;
                             }
                         }
@@ -205,9 +208,20 @@ impl Tool for GrepTool {
                                 i += 1;
                             }
                         }
+
+                        if all_results.len() >= max_results
+                            && i < total
+                            && shown[i..].iter().any(|&is_shown| is_shown)
+                        {
+                            limit_hit = true;
+                        }
                     }
                 }
                 Err(_) => continue,
+            }
+
+            if limit_hit {
+                break;
             }
         }
 
@@ -220,16 +234,15 @@ impl Tool for GrepTool {
         }
 
         let total = all_results.len();
-        let truncated = total >= max_results;
+        let truncated = limit_hit;
         let result = if truncated {
             format!(
-                "{} results (showing first {}, searched {} files):\n{}\n\n[truncated after {} matches — {} more matches; narrow the pattern or restrict to a path]",
+                "{} results (showing first {}, searched {} files):\n{}\n\n[truncated after {} matches — unknown number of additional matches; narrow the pattern or restrict to a path]",
                 total,
                 max_results,
                 file_count,
                 all_results.join("\n"),
-                max_results,
-                total - max_results
+                max_results
             )
         } else {
             format!(
@@ -271,13 +284,42 @@ impl Tool for GrepTool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::permission::ask::UserDecision;
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "zerostack-grep-test-{}-{}-{unique}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&path).expect("failed to create grep test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn restrictive_permission_allowing_pattern() -> PermCheck {
         let config = PermissionConfig {
@@ -327,5 +369,47 @@ mod tests {
             result,
             Err(ToolError::Msg(ref msg)) if msg == "Permission denied by user"
         ));
+    }
+
+    #[tokio::test]
+    async fn reports_unknown_additional_matches_when_limit_is_hit() {
+        let dir = TempDir::new("truncated");
+        std::fs::write(dir.path().join("matches.txt"), "needle\nneedle\nneedle\n")
+            .expect("failed to write grep test file");
+        let tool = GrepTool::new(None, None, 2);
+
+        let output = tool
+            .call(GrepArgs {
+                pattern: "needle".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                include: None,
+                context_lines: None,
+            })
+            .await
+            .expect("grep failed");
+
+        assert!(output.contains("unknown number of additional matches"));
+        assert!(!output.contains("0 more matches"));
+    }
+
+    #[tokio::test]
+    async fn does_not_report_truncation_when_walker_is_exhausted_at_limit() {
+        let dir = TempDir::new("exact-limit");
+        std::fs::write(dir.path().join("matches.txt"), "needle\nneedle\n")
+            .expect("failed to write grep test file");
+        let tool = GrepTool::new(None, None, 2);
+
+        let output = tool
+            .call(GrepArgs {
+                pattern: "needle".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                include: None,
+                context_lines: None,
+            })
+            .await
+            .expect("grep failed");
+
+        assert!(!output.contains("[truncated after"));
+        assert!(output.starts_with("2 results (searched 1 files):"));
     }
 }
