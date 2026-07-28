@@ -5,10 +5,10 @@ use crate::cli::Cli;
 use crate::config::{self, Config};
 use crate::context::{self, ContextFiles};
 use crate::extras::status_signals::StatusSignals;
+use crate::paths::AppPaths;
 use crate::permission::SecurityMode;
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::{PermCheck, PermissionChecker};
-use crate::paths::AppPaths;
 use crate::provider::{self, AnyClient};
 use crate::sandbox::Sandbox;
 use crate::session::{self, MessageRole, Session};
@@ -142,6 +142,8 @@ pub(crate) async fn connect_headless_mcp(
 pub(crate) struct Startup {
     pub cli: Cli,
     pub cfg: Config,
+    // Retained as the startup-owned source of truth while storage owners migrate to AppPaths.
+    #[allow(dead_code)]
     pub paths: AppPaths,
     pub is_first_startup: bool,
     pub context: ContextFiles,

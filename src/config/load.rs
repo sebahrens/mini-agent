@@ -309,10 +309,6 @@ fn rich_default_config() -> Config {
     }
 }
 
-pub fn load() -> (Config, bool) {
-    load_from_path(resolve_config_path(), Path::new(LOCAL_CONFIG_PATH))
-}
-
 pub fn load_with_paths(paths: &AppPaths) -> (Config, bool) {
     let local_config_path = paths
         .project_dir

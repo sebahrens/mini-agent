@@ -256,11 +256,7 @@ fn default_root(
     base: &Option<PathBuf>,
 ) -> Result<PathBuf, AppPathError> {
     let base = required_base(environment.platform, root, base.as_deref())?;
-    Ok(join_component(
-        environment.platform,
-        base,
-        APP_COMPONENT,
-    ))
+    Ok(join_component(environment.platform, base, APP_COMPONENT))
 }
 
 fn required_base(
@@ -322,12 +318,12 @@ fn expand_tilde(
         return Ok(home_dir.to_path_buf());
     }
     match platform {
-        PathPlatform::Windows => {
-            Ok(join_component(platform, home_dir, &suffix.replace('/', "\\")))
-        }
-        PathPlatform::Linux | PathPlatform::MacOs => {
-            Ok(join_component(platform, home_dir, suffix))
-        }
+        PathPlatform::Windows => Ok(join_component(
+            platform,
+            home_dir,
+            &suffix.replace('/', "\\"),
+        )),
+        PathPlatform::Linux | PathPlatform::MacOs => Ok(join_component(platform, home_dir, suffix)),
     }
 }
 
@@ -530,10 +526,7 @@ mod tests {
             "long-segment\\".repeat(30)
         )));
         let paths = AppPaths::resolve(&environment).unwrap();
-        assert_eq!(
-            paths.data_dir,
-            PathBuf::from(r"\\server\share\portable")
-        );
+        assert_eq!(paths.data_dir, PathBuf::from(r"\\server\share\portable"));
         assert_eq!(paths.local_data_dir, paths.data_dir);
         assert_eq!(paths.state_dir, paths.data_dir);
         assert!(paths.cache_dir.to_string_lossy().len() > 260);
@@ -575,10 +568,7 @@ mod tests {
         let paths = AppPaths::resolve(&environment).unwrap();
         assert_eq!(paths.local_data_dir, PathBuf::from("/legacy"));
         assert_eq!(paths.state_dir, PathBuf::from("/legacy"));
-        assert_eq!(
-            paths.credentials_dir,
-            PathBuf::from("/legacy/credentials")
-        );
+        assert_eq!(paths.credentials_dir, PathBuf::from("/legacy/credentials"));
         assert_eq!(
             paths.config_dir,
             PathBuf::from("/home/alice/config"),
@@ -702,10 +692,8 @@ mod tests {
 
     #[test]
     fn app_paths_matrix_routes_startup_config_to_resolved_root() {
-        let root = std::env::temp_dir().join(format!(
-            "zerostack-app-paths-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("zerostack-app-paths-{}", uuid::Uuid::new_v4()));
         let environment = PathEnvironment {
             platform: PathPlatform::current().unwrap(),
             home_dir: Some(root.join("home")),
