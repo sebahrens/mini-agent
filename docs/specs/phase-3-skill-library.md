@@ -2,8 +2,9 @@
 
 **Status**: Pre-implementation  
 **Prerequisite**: Phase 1 complete and passing (Phase 2 is NOT required)  
-**Delivers**: An immutable content-addressed skill store, prompt-time hybrid retrieval, a
-turn-scoped model manifest, and exact source binding for JS execution.
+**Delivers**: Open Agent Skills directory/ZIP import, an immutable content-addressed JS skill
+store, prompt-time hybrid retrieval, a turn-scoped model manifest, and exact source binding for JS
+execution.
 **Target scale**: up to 100,000 local/shared skill revisions.
 
 ---
@@ -23,6 +24,10 @@ in the tokio runner/session layer; the dedicated JS thread only evaluates a reso
 
 Phase 3 supports manual admission after verification. Agent proposals and human-gated canary
 admission are Phase 4. Evidence-driven promotion, quarantine, repair, and rollback are Phase 5.
+
+All persistent paths and storage classes follow
+[`platform-paths.md`](platform-paths.md). A Phase 3 implementation is not portable if it merely
+respects Linux XDG variables while placing SQLite under configuration storage.
 
 ---
 
@@ -49,7 +54,8 @@ not silently claim hybrid retrieval.
 
 ## File placement
 
-All new files go in `src/extras/js/skills/` (to be created):
+Learned JS files go in `src/extras/js/skills/` (to be created). Portable instruction-skill import
+is a sibling feature so its resources are never mistaken for verified JS globals:
 
 | File | Status | Purpose |
 |------|--------|---------|
@@ -58,6 +64,8 @@ All new files go in `src/extras/js/skills/` (to be created):
 | `src/extras/js/skills/embed.rs` | TO BE CREATED | Cached fastembed model and versioned embedding generation |
 | `src/extras/js/skills/index.rs` | TO BE CREATED | Immutable dense snapshot, FTS ranking, fusion, budgets |
 | `src/extras/js/skills/verify.rs` | TO BE CREATED | Fresh no-effect verifier used by Phases 3–5 |
+| `src/extras/skills/import.rs` | TO BE CREATED | Agent Skills directory/ZIP validation and content-addressed installation |
+| `src/extras/skills/index.rs` | TO BE CREATED | Progressive metadata discovery for instruction skills |
 | `src/extras/js/mod.rs` | Phase 1 creates | Add `#[cfg(feature = "skills")] pub mod skills;` |
 | `src/extras/js/types.rs` | Phase 1 creates | Add `ResolvedSkill`/`TurnSkillBundle` to `JsRequest` |
 | `src/extras/js/engine.rs` | Phase 1 creates | Evaluate selected skills and agent code as separate scripts |
@@ -122,9 +130,41 @@ every active read; caller-provided IDs are never trusted.
 
 ---
 
+## Open Agent Skills interoperability
+
+Phase 3 also loads the open Agent Skills format without conflating instruction packages with
+learned JS functions. A valid portable skill is a directory containing `SKILL.md` with the
+normative `name` and `description` frontmatter and optional scripts, references, assets, and other
+resources. Installation accepts that directory or a `.zip` containing one such tree. The archive
+filename is arbitrary; `skill.zip` is supported but is not itself the semantic standard.
+
+Import, storage roots, tree identity, cross-platform filename validation, archive limits, and
+zip-slip/symlink/reparse protections are defined in `platform-paths.md`. The importer validates
+without executing any resource. The experimental `allowed-tools` field is retained as metadata but
+does not grant permission or capability.
+
+Discovery follows progressive disclosure:
+
+1. Parse, validate, and pre-embed only the name/description and bounded discovery metadata.
+2. Reuse the current turn's single query embedding to rank Agent Skills and learned JS skills in
+   typed indexes with separate result/context budgets.
+3. Load a selected `SKILL.md` body only when activated and load referenced resources on demand.
+4. Keep bundled JavaScript as an ordinary Agent Skill resource. It is not inserted into
+   `SkillStore`, injected as a global, or made self-learning without the normal immutable proposal,
+   verification, capability, and evidence gates.
+
+MCP remains composable. Agent Skill instructions may tell the model to use configured MCP tools,
+but neither frontmatter nor bundled resources can forge built-in MCP trust or bypass the existing
+`mcp_tool:{server}:{tool}` permission path. The `mcp,js,skills` feature row must preserve both MCP
+tool discovery and prompt-time skill discovery.
+
+---
+
 ## SQL schema — `src/extras/js/skills/store.rs`
 
-Database path: `~/.config/zerostack/skills.db` (respects `$XDG_CONFIG_HOME`).
+Database path: `<AppPaths.local_data_dir>/skills/skills.db`. Model downloads and rebuildable index
+snapshots use `AppPaths.cache_dir`; no skill database is stored under configuration or the current
+directory.
 
 ```sql
 CREATE TABLE IF NOT EXISTS skill_revisions (
@@ -379,6 +419,13 @@ All must pass under `cargo test --features js,skills`:
 
 - [ ] Identity changes when source, test/order, export/signature, description/tag, capability, or
       identity version changes; operational metadata does not affect identity.
+- [ ] Agent Skills directories and ZIPs load according to the open `SKILL.md` format, preserve
+      progressive disclosure, and reject traversal, links, archive bombs, reserved filenames, and
+      cross-platform normalized collisions without executing resources.
+- [ ] `allowed-tools` and Agent Skill scripts never bypass permission/capability checks or enter the
+      learned JS store without independent proposal and verification.
+- [ ] The skill database, model cache, import tree, and index snapshots resolve to the storage
+      classes in `platform-paths.md` on Linux, macOS, and Windows.
 - [ ] Caller ID mismatch, row tampering, legacy short IDs, dimensions/model mismatch, and a
       simulated collision are rejected without returning source to retrieval.
 - [ ] No-effect verification requires nonempty exact-boolean tests, gives Tier 0 no host globals,
@@ -400,6 +447,8 @@ All must pass under `cargo test --features js,skills`:
       3 search results; only Phase 5 may route an eligible canary after selecting its active lineage.
 - [ ] A 100,000-skill benchmark reports query-embedding and index-search latency separately and
       exact search meets the documented p99 target or blocks Phase 3 closure.
+- [ ] One query embedding is reused for typed Agent Skill and learned-JS indexes, with separate
+      injection budgets; `mcp,js,skills` retains normal MCP discovery and permission checks.
 - [ ] `cargo test --features js` without `skills` passes unchanged.
 
 ---

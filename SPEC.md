@@ -1,6 +1,24 @@
 # JS Engine — Implementation Specification
 
-Detailed implementation spec for Phases 1–4. All architecture decisions are resolved; this is the build guide.
+**Document status**: implementation overview. The indexed specifications under `docs/specs/` are
+normative and override this summary. Detailed implementation spec for Phases 1–5.
+
+## Foundation — platform paths and storage
+
+[`docs/specs/platform-paths.md`](docs/specs/platform-paths.md) defines the mandatory Linux, macOS,
+and Windows path contract. One typed `AppPaths` resolver owns config, portable data, local data,
+state, cache, credentials, and project-local roots. Modules do not call `dirs::*` or fall back to
+the current directory independently.
+
+- Linux follows XDG config/data/state/cache roots.
+- macOS uses Application Support for config/data/state and Library/Caches for rebuildable data.
+- Windows uses Roaming AppData for user configuration/portable data and Local AppData for SQLite,
+  state, cache, and ACL-protected credentials.
+- The learned `skills.db` is local data, embedding models/index snapshots are cache, and MCP OAuth
+  tokens live in the credential root.
+- Legacy paths migrate explicitly and atomically; conflicting candidates never silently win.
+- Phase 3 must support the standard Agent Skills `SKILL.md` directory format and validated ZIP
+  transport, while keeping imported scripts separate from verified learned JS functions.
 
 ## Phase 1 — Core engine
 
@@ -355,6 +373,9 @@ Phase 3 is defined normatively in
   deterministic task context. Generated JavaScript is never used as the search query.
 - Dense exact cosine ranking and FTS5/BM25 lexical ranking are fused, thresholded, deduplicated,
   and constrained by an injection budget. The target scale is 100,000 local/shared skills.
+- Portable Agent Skills load from a validated directory or ZIP using the open `SKILL.md` format.
+  Their metadata participates in progressive prompt-time discovery, but bundled JS is not trusted
+  or injected into the learned-function runtime without the normal admission gates.
 - The LLM sees a compact manifest of selected IDs, descriptions, signatures, and capabilities.
   `JsTool` binds exactly the corresponding immutable source snapshot for that turn.
 - Skill sources and model-authored code execute as separate scripts in one fresh bounded
@@ -423,6 +444,9 @@ Phase 5 is defined normatively in
 | Skill retrieval | Prompt-time dense + lexical fusion, in-memory exact index, thresholded turn bundle |
 | Admission | No-effect verifier, mutation checks, data-driven held-out cases, human-gated initial canary |
 | Self-learning | Evidence-gated Tier 0/1 replacement, automatic quarantine, immutable repair, transactional rollback |
+| Persistent paths | Typed Linux/macOS/Windows roots with explicit Roaming/Local storage classes and migration |
+| Agent Skills | Open `SKILL.md` directory format; validated ZIP transport; progressive disclosure |
+| MCP composition | Existing MCP transport/tool support remains independent and is tested with `js,skills` |
 
 ---
 

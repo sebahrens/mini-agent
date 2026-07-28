@@ -1,10 +1,12 @@
 # JS Engine Integration — Architecture
 
+**Document status**: architecture overview. Normative requirements live in `docs/specs/`.
+
 QuickJS embedded in zerostack as a cross-platform action primitive, replacing bash on all platforms.
 
 ## 1. Problem statement
 
-Bash is unavailable on Windows. A platform-specific bash/PowerShell split would double the tool surface and diverge behavior. Instead, zerostack embeds a **tiny JavaScript engine** as its primary action primitive. The agent writes JavaScript; the engine executes it natively with hard resource limits. This is portable across Windows, Linux, and macOS with a single code path.
+Bash is unavailable on Windows. A platform-specific bash/PowerShell split would double the tool surface and diverge behavior. Instead, zerostack embeds a **tiny JavaScript engine** as its primary action primitive. The agent writes JavaScript; the engine executes it natively with hard resource limits. The execution path is designed to be portable across Windows, Linux, and macOS; storage and sandbox support require the separate platform gates below before an unqualified Windows support claim.
 
 Research basis: the CodeAct paradigm (executable code as actions) shows ~20% higher task success vs JSON tool calling. The engine doubles as a skill library runtime (Voyager model).
 
@@ -208,7 +210,26 @@ telemetry, automatic quarantine, immutable repair revisions, supersession, and t
 rollback. Automatic promotion is limited to pure/read-only replacements with sufficient
 held-out and canary evidence; write/process/network skills always require human approval.
 
-## 11. Platform independence summary
+## 11. Cross-platform paths and portable skills
+
+[`docs/specs/platform-paths.md`](docs/specs/platform-paths.md) is the normative storage contract.
+Startup constructs one typed resolver for configuration, roaming/portable data, machine-local
+data, state, cache, credentials, and `.zerostack` project state. Linux uses XDG roots; macOS uses
+Application Support and Caches; Windows deliberately splits Roaming AppData configuration from
+Local AppData databases, cache, state, and credentials. No durable module falls back to CWD.
+
+The learned JS database is machine-local. Embeddings are generated before request-time retrieval,
+and immutable contiguous index snapshots keep exact cosine search independent of filesystem
+latency. Model downloads and rebuildable snapshots are cache. MCP OAuth material is stored under a
+separate private credential root with Unix modes or Windows ACLs.
+
+Portable instruction skills follow the open Agent Skills directory format (`SKILL.md` plus optional
+scripts/references/assets). A validated ZIP is accepted as transport, regardless of archive
+filename. These packages use progressive disclosure and may compose with configured MCP tools, but
+their `allowed-tools` metadata grants nothing and their bundled JS never becomes an injected
+learned function without Phases 3–5 verification.
+
+## 12. Platform capability summary
 
 | Concern | Mechanism | Platform-specific? |
 |---------|-----------|-------------------|
@@ -218,9 +239,16 @@ held-out and canary evidence; write/process/network skills always require human 
 | Process spawn | `Sandbox::wrap_command` | Abstracted |
 | Filesystem sandbox | `birdcage` | Abstracted |
 | Network sandbox | `birdcage` / Job Objects | Abstracted |
+| Persistent storage | Typed `AppPaths` + explicit artifact classes | Linux XDG / macOS / Windows Known Folders |
+| Credentials | Private files + platform protection | Unix modes / Windows ACL |
+| Agent Skills transport | Validated directory or ZIP | Portable filename policy enforced everywhere |
+| MCP | `rmcp` command/HTTP/OAuth transports and permission-wrapped tools | Path resolver owns OAuth credentials |
 | Bash tool | `#[cfg(not(target_os = "windows"))]` | Yes — compiled out on Windows |
 
-## 12. Feature gate
+The table describes the selected architecture, not current delivery. Windows readiness requires
+the resolver, ACL, filename/archive, migration, CI, and release-smoke Beads to be closed.
+
+## 13. Feature gate
 
 ```toml
 # zerostack/Cargo.toml
@@ -233,7 +261,7 @@ rquickjs = { version = "0.12", features = ["full"], optional = true }
 
 Initially non-default. Graduates to `default = ["js"]` when Phase 1 passes full coverage. `bash` feature kept on non-Windows, compiled out on Windows via `#[cfg(not(target_os = "windows"))]`.
 
-## 13. Module structure
+## 14. Module structure
 
 ```
 zerostack/src/extras/js/
@@ -248,7 +276,8 @@ zerostack/src/extras/js/
     └── verify.rs # test runner (Rust, outside sandbox)
 ```
 
-Registration in `src/agent/builder.rs` (alongside bash at lines 230–265):
+Registration in `src/agent/builder.rs` occurs after feature-gated tool collection and before the
+allow-list filter (currently the `register_js_tool` call at line 361):
 
 ```rust
 #[cfg(feature = "js")]

@@ -8,9 +8,10 @@ this index. Tracker issues must link to a normative phase section.
 
 | Phase | Spec file | Status | Delivers |
 |-------|-----------|--------|---------|
+| Foundation | [platform-paths.md](platform-paths.md) | Pre-implementation | Typed Linux/macOS/Windows roots, artifact ownership, secure migration |
 | 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | Pre-implementation | Core QuickJS integration, JsTool, host globals |
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Pre-implementation | `fetch()`, file allow-lists, birdcage process isolation |
-| 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Pre-implementation | Immutable skill store, prompt-time hybrid retrieval, turn-scoped injection |
+| 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Pre-implementation | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Pre-implementation | No-effect candidate verification, held-out cases, human-gated canary admission |
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Pre-implementation | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
 
@@ -23,8 +24,9 @@ Prior research artifacts superseded by this index:
 
 | Dependency | Produces | Consumed by |
 |-----------|---------|------------|
+| Typed `AppPaths`, storage-class ownership, and secure migration | Foundation | Every phase and persistent feature |
 | Bounded QuickJS runtime builder with explicit host mode | Phase 1/2 | Phase 3 no-effect verification and turn execution |
-| `SkillStore`, immutable `SkillArtifact`, and `SkillIndex` | Phase 3 | Phase 4 proposal/admission and Phase 5 lifecycle |
+| Agent Skills catalog, `SkillStore`, immutable `SkillArtifact`, and typed indexes | Phase 3 | Prompt-time discovery, Phase 4 proposal/admission, and Phase 5 lifecycle |
 | `SkillTurnContext` + `TurnSkillBundle` | Phase 3 | Model manifest, exact runtime binding, Phase 5 attribution |
 | Pending/verified/canary states and held-out evaluation cases | Phase 4 | Phase 5 evidence policy |
 | Invocation events and lineage transitions | Phase 5 | Automatic quarantine, repair, promotion, and rollback |
@@ -36,20 +38,26 @@ Prior research artifacts superseded by this index:
 - Schema creation, compilation, or issue decomposition does not satisfy a phase exit gate.
 - New defects discovered during implementation must be linked as blockers before closing the
   affected phase epic.
+- Persistent modules may not define independent `dirs::*`, environment-variable, current-directory,
+  or Windows Roaming/Local policy. They must consume the foundation resolver.
 - Phase 3 retrieval must be driven by the current user prompt before model generation. Generated
   JavaScript is never the retrieval query.
+- Standard Agent Skills use the open `SKILL.md` directory format; ZIP is a validated transport.
+  Imported scripts do not become trusted learned JS and `allowed-tools` never bypasses permissions.
 - Phase 4 candidate code is untrusted and must execute in a no-effect verifier before approval:
   Tier 0 receives no host globals, while Tier 1/2 receive only declared deterministic in-memory
   fakes that can never touch the real filesystem, process table, or network.
 - Phase 5 never mutates active source in place. Repair creates a new immutable revision and all
   automatic decisions retain evidence and a reversible predecessor link.
 
-## Confirmed source locations (re-verified 2026-07-27)
+## Confirmed source locations (re-verified 2026-07-28)
 
 The monorepo was flattened (old `zerostack/` → repo root). All source is under `src/` at the repo root.
 References to `zerostack/src/` in older docs mean `src/`.
 
-**Verification method**: `narsil-mcp` does not index this repo. Use `grep -n <pattern> <file>` directly to confirm line numbers before implementing.
+**Verification method**: the repository is indexed as `mini-agent` by `narsil-mcp`; use its symbol,
+reference, path-flow, and security queries for cross-module review, then confirm edit context and
+line numbers directly because the source continues to change.
 
 | Symbol | Location | Line |
 |--------|----------|------|
@@ -68,12 +76,15 @@ References to `zerostack/src/` in older docs mean `src/`.
 | `pub fn wrap_command` | `src/sandbox.rs` | 109 |
 | `pub async fn output_command` | `src/sandbox.rs` | 205 |
 | `pub(crate) fn kill_process_group` | `src/sandbox.rs` | 294 |
-| `let mut all_tools` | `src/agent/builder.rs` | 279 |
-| `filter_tools_by_allowlist` call | `src/agent/builder.rs` | 335 |
-| `pub(crate) mod truncate` (last line) | `src/extras/mod.rs` | 40 |
+| `let mut all_tools` | `src/agent/builder.rs` | 304 |
+| `register_js_tool` call | `src/agent/builder.rs` | 361 |
+| `filter_tools_by_allowlist` call | `src/agent/builder.rs` | 363 |
+| `pub(crate) mod truncate` | `src/extras/mod.rs` | 40 |
+| `pub mod js` | `src/extras/mod.rs` | 43 |
 
-**Current status**: the Phase 1 JS substrate exists under `src/extras/js/`, but the skill store,
-retrieval index, admission pipeline, and evidence-learning lifecycle are not implemented.
+**Current status**: the Phase 1 JS substrate exists under `src/extras/js/`, but the Agent Skills
+importer/catalog, learned-JS skill store, retrieval indexes, admission pipeline, and
+evidence-learning lifecycle are not implemented.
 
 **Import path note**: `AskSender` and `PermCheck` are private `use` items in `src/agent/tools/mod.rs` (lines 84–85) — not `pub use`. Child modules of `tools/` (like `bash.rs`) can reach them, but `src/extras/js/tool.rs` cannot. Use the direct paths: `crate::permission::ask::AskSender` and `crate::permission::checker::PermCheck`.
 
