@@ -2,7 +2,9 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use rig::tool::Tool;
 
-use crate::agent::tools::{AskSender, GrepArgs, PermCheck, ToolError, check_perm, is_skip_dir};
+use crate::agent::tools::{
+    AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_path, is_skip_dir,
+};
 
 pub struct GrepTool {
     pub permission: Option<PermCheck>,
@@ -89,6 +91,8 @@ impl Tool for GrepTool {
             .map_err(|e| ToolError::Msg(format!("Invalid regex pattern: {}", e)))?;
 
         let search_path = crate::fs::expand_tilde(args.path.as_deref().unwrap_or("."));
+        let _ =
+            check_perm_path(&self.permission, &self.ask_tx, "grep", &search_path).await?;
         let context = args.context_lines.unwrap_or(0);
 
         let include_re = args.include.as_ref().map(|g| {
@@ -263,5 +267,68 @@ impl Tool for GrepTool {
             Some(c) => format!("{}\n\n{}", c, result),
             None => result,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::permission::ask::UserDecision;
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{
+        Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm,
+    };
+
+    fn restrictive_permission_allowing_pattern() -> PermCheck {
+        let config = PermissionConfig {
+            grep: Some(ToolPerm::Granular(
+                [("needle".to_string(), Action::Allow)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        Arc::new(Mutex::new(PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Restrictive,
+            Some(std::path::PathBuf::from("/workspace")),
+            Some(vec!["restrictive".to_string()]),
+        )))
+    }
+
+    #[tokio::test]
+    async fn prompts_before_searching_external_path() {
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let tool = GrepTool::new(
+            Some(restrictive_permission_allowing_pattern()),
+            Some(ask_tx),
+            10,
+        );
+
+        let call = tool.call(GrepArgs {
+            pattern: "needle".to_string(),
+            path: Some("/etc".to_string()),
+            include: None,
+            context_lines: None,
+        });
+        let respond = async {
+            let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
+                .await
+                .expect("grep did not request path permission")
+                .expect("grep permission channel closed");
+            assert_eq!(request.tool.as_str(), "grep");
+            assert_eq!(request.input, "/etc");
+            request
+                .reply
+                .send(UserDecision::Deny)
+                .expect("grep dropped the permission reply");
+        };
+
+        let (result, ()) = tokio::join!(call, respond);
+        assert!(matches!(
+            result,
+            Err(ToolError::Msg(ref msg)) if msg == "Permission denied by user"
+        ));
     }
 }

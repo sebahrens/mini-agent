@@ -3,7 +3,7 @@ use regex::Regex;
 use rig::tool::Tool;
 
 use crate::agent::tools::{
-    AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, is_skip_dir,
+    AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, check_perm_path, is_skip_dir,
 };
 
 pub struct FindFilesTool {
@@ -63,6 +63,8 @@ impl Tool for FindFilesTool {
             .map_err(|e| ToolError::Msg(format!("Invalid regex: {}", e)))?;
 
         let search_path = args.path.as_deref().unwrap_or(".");
+        let _ =
+            check_perm_path(&self.permission, &self.ask_tx, "find_files", search_path).await?;
 
         let walker = WalkBuilder::new(search_path)
             .git_ignore(true)
@@ -128,5 +130,66 @@ impl Tool for FindFilesTool {
             Some(c) => format!("{}\n\n{}", c, result),
             None => result,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::permission::ask::UserDecision;
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{
+        Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm,
+    };
+
+    fn restrictive_permission_allowing_pattern() -> PermCheck {
+        let config = PermissionConfig {
+            find_files: Some(ToolPerm::Granular(
+                [("needle".to_string(), Action::Allow)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        Arc::new(Mutex::new(PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Restrictive,
+            Some(std::path::PathBuf::from("/workspace")),
+            Some(vec!["restrictive".to_string()]),
+        )))
+    }
+
+    #[tokio::test]
+    async fn prompts_before_searching_external_path() {
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let tool = FindFilesTool::new(
+            Some(restrictive_permission_allowing_pattern()),
+            Some(ask_tx),
+            10,
+        );
+
+        let call = tool.call(FindFilesArgs {
+            pattern: "needle".to_string(),
+            path: Some("/etc".to_string()),
+        });
+        let respond = async {
+            let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
+                .await
+                .expect("find_files did not request path permission")
+                .expect("find_files permission channel closed");
+            assert_eq!(request.tool.as_str(), "find_files");
+            assert_eq!(request.input, "/etc");
+            request
+                .reply
+                .send(UserDecision::Deny)
+                .expect("find_files dropped the permission reply");
+        };
+
+        let (result, ()) = tokio::join!(call, respond);
+        assert!(matches!(
+            result,
+            Err(ToolError::Msg(ref msg)) if msg == "Permission denied by user"
+        ));
     }
 }
