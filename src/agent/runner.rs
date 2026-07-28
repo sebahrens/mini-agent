@@ -1,7 +1,6 @@
 use compact_str::CompactString;
 use futures::StreamExt;
 use rig::agent::{Agent, MultiTurnStreamItem, StreamingResult};
-#[cfg(feature = "subagents")]
 use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
@@ -44,6 +43,19 @@ fn streamed_reasoning_text<R>(content: &StreamedAssistantContent<R>) -> Option<C
         }
         _ => None,
     }
+}
+
+fn observed_tokens(usage: Usage) -> u64 {
+    usage
+        .input_tokens
+        .saturating_add(usage.output_tokens)
+        .max(usage.total_tokens)
+}
+
+fn exhausted_token_budget(usage: Usage, budget: Option<u64>) -> Option<(u64, u64)> {
+    let budget = budget?;
+    let used = observed_tokens(usage);
+    (used >= budget).then_some((used, budget))
 }
 
 /// Spawn an isolated, single-turn, tool-less side-question run. The full result
@@ -351,6 +363,7 @@ where
         const MAX_EMPTY_RESPONSES: u32 = 3;
         let max_turns = agent.default_max_turns.unwrap_or(1);
         let mut turns_used = 0usize;
+        let mut cumulative_usage = Usage::new();
         // Overrides the next continuation message (bottom of the outer
         // `loop`); set when a `Stop` hook forces continuation instead of the
         // default re-injected `retry_prompt`.
@@ -532,10 +545,12 @@ where
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
                         turns_used = turns_used.saturating_add(1);
                         let usage = call.usage;
+                        cumulative_usage += usage;
                         tracing::debug!(
-                            "agent completion: input_tokens={}, output_tokens={}",
+                            "agent completion: input_tokens={}, output_tokens={}, cumulative_tokens={}",
                             usage.input_tokens,
                             usage.output_tokens,
+                            observed_tokens(cumulative_usage),
                         );
                         let _ = event_tx
                             .send(AgentEvent::CompletionCall {
@@ -569,6 +584,20 @@ where
                 let _ = event_tx
                     .send(AgentEvent::Error(CompactString::from(format!(
                         "Agent exhausted its maximum turn budget ({max_turns}) before completing."
+                    ))))
+                    .await;
+                return;
+            }
+            if let Some((used, budget)) =
+                exhausted_token_budget(cumulative_usage, agent.max_tokens)
+            {
+                tracing::warn!(
+                    "agent: cumulative token budget exhausted before continuation ({used}/{budget})"
+                );
+                let _ = event_tx
+                    .send(AgentEvent::Error(CompactString::from(format!(
+                        "Agent exhausted its cumulative token budget ({used}/{budget}) before \
+                         completing. Compact the session or increase max_tokens before retrying."
                     ))))
                     .await;
                 return;
@@ -643,6 +672,7 @@ where
     let mut full_response = String::new();
     let mut last_tool_name: Option<String> = None;
     let mut usage = rig::completion::Usage::new();
+    let mut cumulative_usage = Usage::new();
     let mut turns_used = 0usize;
     // Set true only when a `Stop` hook forces another turn; drives the outer
     // loop. Stays false (single pass, no continuation) in the hooks-off build.
@@ -722,10 +752,12 @@ where
                 }
                 Ok(MultiTurnStreamItem::CompletionCall(call)) => {
                     turns_used = turns_used.saturating_add(1);
+                    cumulative_usage += call.usage;
                     tracing::debug!(
-                        "agent completion: input_tokens={}, output_tokens={}",
+                        "agent completion: input_tokens={}, output_tokens={}, cumulative_tokens={}",
                         call.usage.input_tokens,
                         call.usage.output_tokens,
+                        observed_tokens(cumulative_usage),
                     );
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
@@ -772,6 +804,14 @@ where
             if remaining_turns == 0 {
                 anyhow::bail!(
                     "Agent exhausted its maximum turn budget ({max_turns}) before completing."
+                );
+            }
+            if let Some((used, budget)) =
+                exhausted_token_budget(cumulative_usage, agent.max_tokens)
+            {
+                anyhow::bail!(
+                    "Agent exhausted its cumulative token budget ({used}/{budget}) before \
+                     completing. Compact the session or increase max_tokens before retrying."
                 );
             }
             let injected_prompt = next_instruction
@@ -935,6 +975,7 @@ where
 mod tests {
     use super::streamed_reasoning_text;
     use rig::agent::AgentBuilder;
+    use rig::completion::Usage;
     use rig::streaming::StreamedAssistantContent;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
     use rig::tool::Tool;
@@ -1122,6 +1163,60 @@ mod tests {
             calls.load(Ordering::SeqCst),
             3,
             "only tool calls within the original budget may execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_stops_when_cumulative_token_budget_is_exhausted() {
+        fn usage(input_tokens: u64, output_tokens: u64) -> Usage {
+            Usage {
+                input_tokens,
+                output_tokens,
+                total_tokens: input_tokens + output_tokens,
+                ..Usage::new()
+            }
+        }
+
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![MockStreamEvent::final_response(usage(40, 15))],
+            vec![MockStreamEvent::final_response(usage(40, 15))],
+            vec![MockStreamEvent::final_response(usage(40, 15))],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .max_tokens(100)
+            .default_max_turns(5)
+            .build();
+
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut error = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Error(message) => {
+                    error = Some(message);
+                    break;
+                }
+                crate::event::AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            model.requests().len(),
+            2,
+            "the third continuation must not start after 110/100 cumulative tokens"
+        );
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("110/100")),
+            "the runner must report cumulative token-budget exhaustion"
         );
     }
 
