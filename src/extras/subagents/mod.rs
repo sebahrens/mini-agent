@@ -22,6 +22,10 @@ static CONFIG: Mutex<Option<SubagentConfig>> = Mutex::new(None);
 
 static SUBAGENT_EVENT_TX: Mutex<Option<mpsc::Sender<AgentEvent>>> = Mutex::new(None);
 
+#[derive(Debug, thiserror::Error)]
+#[error("subagents: SubagentConfig not initialized (call init() in main.rs)")]
+pub(crate) struct ConfigNotInitialized;
+
 pub(crate) fn set_subagent_event_tx(tx: mpsc::Sender<AgentEvent>) {
     let mut guard = SUBAGENT_EVENT_TX.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(tx);
@@ -32,15 +36,13 @@ pub(crate) fn clone_subagent_event_tx() -> Option<mpsc::Sender<AgentEvent>> {
     guard.clone()
 }
 
-pub(crate) fn with_config<F, R>(f: F) -> R
+pub(crate) fn with_config<F, R>(f: F) -> Result<R, ConfigNotInitialized>
 where
     F: FnOnce(&SubagentConfig) -> R,
 {
     let guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
-    let cfg = guard
-        .as_ref()
-        .expect("subagents: SubagentConfig not initialized (call init() in main.rs)");
-    f(cfg)
+    let cfg = guard.as_ref().ok_or(ConfigNotInitialized)?;
+    Ok(f(cfg))
 }
 
 pub fn init(
@@ -73,5 +75,20 @@ pub fn set_model_name(model_name: String) {
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cfg) = guard.as_mut() {
         cfg.model_name = model_name;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_config_without_init_returns_error() {
+        let previous = CONFIG.lock().unwrap_or_else(|e| e.into_inner()).take();
+
+        let result = with_config(|_| ());
+
+        *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = previous;
+        assert!(matches!(result, Err(ConfigNotInitialized)));
     }
 }

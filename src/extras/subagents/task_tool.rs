@@ -92,12 +92,14 @@ editing in a known location, grepping for a literal you will act on immediately.
                 cfg.max_turns,
                 cfg.config.clone(),
             )
-        });
+        })
+        .map_err(|err| ToolError::Msg(err.to_string()))?;
 
         let subagent_event_tx = clone_subagent_event_tx();
 
         #[cfg(feature = "archmd")]
-        let architecture = with_config(|cfg| cfg.architecture.clone());
+        let architecture = with_config(|cfg| cfg.architecture.clone())
+            .map_err(|err| ToolError::Msg(err.to_string()))?;
         #[cfg(not(feature = "archmd"))]
         let architecture: Option<String> = None;
 
