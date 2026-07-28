@@ -1,6 +1,7 @@
 use rquickjs::{prelude::Func, Context, Ctx, IntoJs, Object, Value};
 
 use crate::extras::js::types::SpawnResult;
+use crate::sandbox::Sandbox;
 
 impl<'js> IntoJs<'js> for SpawnResult {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
@@ -22,9 +23,13 @@ pub fn make_write_file() -> impl Fn(String, String) -> rquickjs::Result<()> {
     }
 }
 
-pub fn make_spawn() -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
+pub fn make_spawn(
+    sandbox: Sandbox,
+) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
     move |cmd: String, args: Vec<String>| {
-        let output = std::process::Command::new(&cmd)
+        let mut command = sandbox.wrap_command(r#"exec "$0" "$@""#).into_std();
+        let output = command
+            .arg(&cmd)
             .args(&args)
             .output()
             .map_err(rquickjs::Error::Io)?;
@@ -36,7 +41,7 @@ pub fn make_spawn() -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnRes
     }
 }
 
-pub fn register_host_globals(ctx: &Context) {
+pub fn register_host_globals(ctx: &Context, sandbox: Sandbox) {
     ctx.with(|ctx| {
         let globals = ctx.globals();
 
@@ -47,7 +52,7 @@ pub fn register_host_globals(ctx: &Context) {
             .set("write_file", Func::from(make_write_file()))
             .expect("register write_file");
         globals
-            .set("spawn", Func::from(make_spawn()))
+            .set("spawn", Func::from(make_spawn(sandbox)))
             .expect("register spawn");
 
         let console = Object::new(ctx.clone()).expect("console object");

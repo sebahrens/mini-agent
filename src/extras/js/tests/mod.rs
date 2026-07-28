@@ -5,13 +5,18 @@ use crate::extras::js::{
     tool::JsTool,
     types::THREAD_STACK,
 };
+use crate::sandbox::Sandbox;
 
 fn make_test_tool() -> JsTool {
+    make_test_tool_with_sandbox(Sandbox::new(false, "bwrap"))
+}
+
+fn make_test_tool_with_sandbox(sandbox: Sandbox) -> JsTool {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("js-engine-test".into())
         .stack_size(THREAD_STACK)
-        .spawn(move || js_thread_main(rx))
+        .spawn(move || js_thread_main(rx, sandbox))
         .expect("failed to spawn JS test thread");
     JsTool::new(tx, None, None)
 }
@@ -56,4 +61,37 @@ async fn test_read_write_roundtrip() {
         read_result, "hello from js",
         "read_file returned: {read_result}"
     );
+}
+
+#[tokio::test]
+async fn test_spawn_captures_output_and_exit_code() {
+    use rig::tool::Tool;
+    let tool = make_test_tool();
+
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: r#"JSON.stringify(spawn("sh", ["-c", "printf out; printf err >&2; exit 7"]))"#
+                .to_string(),
+        })
+        .await
+        .expect("spawn call failed");
+
+    assert_eq!(result, r#"{"stdout":"out","stderr":"err","code":7}"#);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_spawn_uses_configured_sandbox_wrapper() {
+    use rig::tool::Tool;
+    let sandbox = Sandbox::new(false, "bwrap").with_shell("false");
+    let tool = make_test_tool_with_sandbox(sandbox);
+
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: r#"JSON.stringify(spawn("printf", ["must not run"]))"#.to_string(),
+        })
+        .await
+        .expect("spawn call failed");
+
+    assert_eq!(result, r#"{"stdout":"","stderr":"","code":1}"#);
 }
