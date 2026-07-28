@@ -594,6 +594,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_restricted_command_is_denied_before_execution() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let target = working_dir.join("must-not-exist.txt");
+        let permission = host_permission(working_dir, Action::Deny, Action::Deny);
+
+        let error = call_spawn(
+            permission,
+            None,
+            "touch",
+            vec![target.to_string_lossy().into_owned()],
+        )
+        .await
+        .expect_err("restricted spawn must fail");
+
+        assert!(
+            error.contains("Permission denied"),
+            "unexpected permission error: {error}"
+        );
+        assert!(!target.exists(), "denied spawn created the target");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_preserves_output_and_exit_code_through_sandbox_wrapper() {
+        let runtime = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            make_spawn(Sandbox::new(false, "bwrap"), None, None, runtime)(
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "printf stdout; printf stderr >&2; exit 7".to_string(),
+                ],
+            )
+        })
+        .await
+        .expect("spawn output test task panicked")
+        .expect("wrapped spawn should succeed");
+
+        assert_eq!(result.stdout, "stdout");
+        assert_eq!(result.stderr, "stderr");
+        assert_eq!(result.code, 7);
+    }
+
+    #[tokio::test]
     async fn repeated_js_read_calls_trigger_doom_loop_detection() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
