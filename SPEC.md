@@ -160,14 +160,16 @@ Phase 1 exposes four globals:
 `read_file` canonicalizes the target and captures its identity before requesting
 permission for the exact canonical UTF-8 path. After approval, it rejects non-regular
 or oversized files, opens without following a final symlink, verifies that the opened
-file still has the approved identity, and performs a bounded UTF-8 read.
+file still has the approved identity, and reads at most 1 MiB. Invalid UTF-8 paths or
+content, and content that grows beyond the cap, return typed JS errors.
 
 `write_file` rejects oversized content before mutation and rejects existing final
 symlinks. For a new file, it canonicalizes the nearest existing parent and requires
 the missing suffix to be one normal filename component. It requests permission for
 the derived final UTF-8 path, then uses the descriptor-relative atomic helpers in
-`src/fs.rs` to revalidate the approved parent identity and create or replace without
-following symlinks.
+`src/fs.rs` to revalidate the approved parent identity immediately before mutation
+and create or replace with no-follow traversal throughout. Resolved parent symlinks
+are allowed only because permission is bound to their resulting target.
 
 The host closures enforce that ordering explicitly:
 
