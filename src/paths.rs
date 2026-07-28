@@ -1,11 +1,12 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+// These shared path-policy primitives are exercised by the acceptance suite
+// before all of their production consumers land.
+#[allow(dead_code)]
 pub mod portable;
 
 pub use portable::{digest_filename, opaque_name, validate_portable_component};
-// These shared path-policy primitives are exercised by the acceptance suite
-// before all of their production consumers land.
 #[allow(unused_imports)]
 pub use portable::{
     MAX_PORTABLE_COMPONENT_BYTES, MAX_PORTABLE_COMPONENT_UTF16_UNITS, MAX_PORTABLE_PATH_BYTES,
