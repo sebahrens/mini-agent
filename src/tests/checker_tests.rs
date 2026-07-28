@@ -532,6 +532,33 @@ fn standard_asks_external_path_even_for_path_tools() {
 }
 
 #[test]
+fn grep_external_path_permission_pattern_allow_does_not_authorize_root() {
+    let config = PermissionConfig {
+        grep: Some(ToolPerm::Granular(
+            [("needle".to_string(), Action::Allow)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Restrictive,
+        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(vec!["restrictive".to_string()]),
+    );
+
+    assert_eq!(checker.check("grep", "needle"), CheckResult::Allowed);
+    let external = if cfg!(windows) {
+        r"D:\outside\secret.txt"
+    } else {
+        "/outside/secret.txt"
+    };
+    assert_eq!(
+        checker.check_path("grep", external),
+        CheckResult::Ask
+    );
+}
+
+#[test]
 fn standard_deny_still_works_for_non_path_tools() {
     // Non-path checks such as bash should still respect deny rules.
     let mut checker = make_checker(SecurityMode::Standard);

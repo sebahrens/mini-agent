@@ -78,11 +78,7 @@ impl Tool for FindFilesTool {
         )
         .await?;
         let traversal_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        crate::fs::ensure_same_file(
-            &traversal_root,
-            &authorized_metadata,
-            &traversal_metadata,
-        )?;
+        crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &traversal_metadata)?;
 
         let walker = WalkBuilder::new(&traversal_root)
             .git_ignore(true)
@@ -117,11 +113,7 @@ impl Tool for FindFilesTool {
             }
         }
         let current_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        crate::fs::ensure_same_file(
-            &traversal_root,
-            &authorized_metadata,
-            &current_metadata,
-        )?;
+        crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &current_metadata)?;
 
         if results.is_empty() {
             let msg = "No files found matching the pattern.".to_string();
@@ -278,10 +270,7 @@ mod tests {
                 .expect("find_files did not request path permission")
                 .expect("find_files permission channel closed");
             assert_eq!(request.tool.as_str(), "find_files");
-            assert_eq!(
-                PathBuf::from(request.input.as_str()),
-                canonical_external
-            );
+            assert_eq!(PathBuf::from(request.input.as_str()), canonical_external);
             request
                 .reply
                 .send(UserDecision::Deny)
@@ -429,11 +418,7 @@ mod tests {
         std::os::unix::fs::symlink(&authorized, &link).unwrap();
         let canonical_authorized = std::fs::canonicalize(&authorized).unwrap();
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
-        let tool = FindFilesTool::new(
-            Some(standard_permission(&workspace)),
-            Some(ask_tx),
-            10,
-        );
+        let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
             pattern: "marker".to_string(),
@@ -441,10 +426,7 @@ mod tests {
         });
         let swap = async {
             let request = ask_rx.recv().await.expect("permission request");
-            assert_eq!(
-                PathBuf::from(request.input.as_str()),
-                canonical_authorized
-            );
+            assert_eq!(PathBuf::from(request.input.as_str()), canonical_authorized);
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&swapped, &link).unwrap();
             request.reply.send(UserDecision::AllowOnce).unwrap();
@@ -470,11 +452,7 @@ mod tests {
         std::fs::write(swapped.join("must_not_be_returned.txt"), "").unwrap();
         let canonical_authorized = std::fs::canonicalize(&authorized).unwrap();
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
-        let tool = FindFilesTool::new(
-            Some(standard_permission(&workspace)),
-            Some(ask_tx),
-            10,
-        );
+        let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let call = tool.call(FindFilesArgs {
             pattern: "must_not_be_returned".to_string(),
@@ -482,10 +460,7 @@ mod tests {
         });
         let replace = async {
             let request = ask_rx.recv().await.expect("permission request");
-            assert_eq!(
-                PathBuf::from(request.input.as_str()),
-                canonical_authorized
-            );
+            assert_eq!(PathBuf::from(request.input.as_str()), canonical_authorized);
             std::fs::rename(&authorized, &moved).unwrap();
             std::os::unix::fs::symlink(&swapped, &authorized).unwrap();
             request.reply.send(UserDecision::AllowOnce).unwrap();
@@ -567,8 +542,7 @@ mod tests {
         std::fs::write(external.join(marker), "").unwrap();
         let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(1);
         drop(ask_rx);
-        let tool =
-            FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
+        let tool = FindFilesTool::new(Some(standard_permission(&workspace)), Some(ask_tx), 10);
 
         let result = tool
             .call(FindFilesArgs {
