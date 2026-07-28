@@ -289,49 +289,90 @@ setup_codex_home() {
     return 0
 }
 
-# show_codex_progress — reads codex --json JSONL from stdin, prints tool calls
-# line by line (mirrors show_agent_progress for the claude path).
-# Returns 0 iff "task_complete" event was seen (agent finished cleanly).
-# Event shapes (from codex exec --json JSONL):
-#   {"type":"function_call","name":"<tool>",...}  — tool invoked
-#   {"type":"task_complete",...}                   — session done
+# show_codex_progress — reads codex --json JSONL from stdin, prints ONLY tool-call
+# activity (shell commands, file edits, MCP/web-search calls) with wall-clock
+# timestamps and the turn they belong to. Reasoning and agent prose are dropped so
+# codex output doesn't bury the loop's own banners.
+#
+# DISPLAY ONLY: always returns 0. Codex's real exit code is captured via PIPESTATUS
+# in run_with_codex_exec and is the authoritative success signal.
 show_codex_progress() {
-    local tool_count=0 saw_result=0
-    local start_time elapsed
-    start_time=$(date +%s)
+    local turn=0 tool_count=0 printed=" " have_jq=false
+    command -v jq >/dev/null 2>&1 && have_jq=true
 
     while IFS= read -r line; do
-        elapsed=$(( $(date +%s) - start_time ))
         case "$line" in
-            *'"type":"function_call"'*)
-                local tool_name
-                tool_name=$(printf '%s' "$line" \
-                    | grep -o '"name":"[^"]*"' | head -1 \
-                    | sed 's/"name":"//;s/"//') || true
-                [ -n "$tool_name" ] || tool_name="(tool)"
-                tool_count=$((tool_count + 1))
-                echo -e "  ${DIM}[$(printf '%02d:%02d' $((elapsed/60)) $((elapsed%60)))] #${tool_count} ${tool_name}${NC}"
-                ;;
-            *'"type":"task_complete"'*|*'"type":"session_complete"'*)
-                saw_result=1
-                echo -e "\n  ${GREEN}Codex finished — ${tool_count} tool calls in ${elapsed}s${NC}"
-                ;;
+            *'"type":"turn.started"'*)  turn=$((turn + 1)); continue ;;
+            *'"type":"turn.completed"'*)
+                if [ "$have_jq" = true ]; then
+                    local toks
+                    toks=$(printf '%s' "$line" \
+                        | jq -r '.usage | "\(.input_tokens)in/\(.output_tokens)out"' \
+                        2>/dev/null) || true
+                    [ -n "$toks" ] && [ "$toks" != "null in/null out" ] \
+                        && echo -e "  ${DIM}turn $turn done · ${toks} tok${NC}"
+                fi
+                continue ;;
+            # Pre-gate: only pass lines that might contain actionable tool items.
+            *'"command_execution"'*|*'"file_change"'*|*'"mcp_tool_call"'*|*'"web_search"'*) ;;
+            *) continue ;;
         esac
+
+        if [ "$have_jq" != true ]; then
+            echo -e "  ${DIM}[$(date '+%H:%M:%S')] turn $turn${NC} ${CYAN}tool call${NC}"
+            continue
+        fi
+
+        # One jq pass per actionable line → "<id>\t<itype>\t<summary>" or nothing.
+        local parsed id itype summary
+        parsed=$(printf '%s' "$line" | jq -r '
+            (.item // empty) as $i
+            | select($i.type == "command_execution" or $i.type == "file_change"
+                     or $i.type == "mcp_tool_call" or $i.type == "web_search")
+            | ( if $i.type == "command_execution" then
+                    (if ($i.command | type) == "array" then ($i.command | join(" "))
+                     else ($i.command // "") end)
+                elif $i.type == "file_change" then
+                    ([$i.changes[]? | "\(.kind) \(.path | split("/") | last)"] | join(", "))
+                elif $i.type == "mcp_tool_call" then
+                    (($i.server // "?") + "/" + ($i.tool // "?"))
+                elif $i.type == "web_search" then
+                    ($i.query // "")
+                else "" end ) as $summary
+            | [ ($i.id // "?"), $i.type, $summary ] | @tsv
+        ' 2>/dev/null) || continue
+        [ -n "$parsed" ] || continue
+
+        IFS=$'\t' read -r id itype summary <<< "$parsed"
+        # item.started and item.completed carry the same id — print once.
+        case "$printed" in *" $id "*) continue ;; esac
+        printed="$printed$id "
+        tool_count=$((tool_count + 1))
+
+        # Tidy the shell preamble and clamp to a single readable line.
+        summary=${summary#/bin/zsh -lc }
+        summary=${summary#/bin/bash -lc }
+        summary=$(printf '%s' "$summary" | tr '\n' ' ')
+        [ "${#summary}" -gt 100 ] && summary="${summary:0:99}…"
+
+        echo -e "  ${DIM}[$(date '+%H:%M:%S')] turn $turn${NC} ${CYAN}${itype}${NC} ${summary}"
     done
 
-    [ "$saw_result" -eq 1 ]
+    [ "$tool_count" -gt 0 ] && echo -e "  ${DIM}codex: ${tool_count} tool call(s)${NC}"
+    return 0
 }
 
 # run_with_codex_exec <prompt_content> <temp_out> [model]
-# Streams --json JSONL events through show_codex_progress (live tool-call
-# display) while writing the final message to temp_out via -o.
+# Streams --json JSONL events through show_codex_progress (live tool-call display)
+# while writing the final message to temp_out via -o. Codex's exit code is the
+# authoritative success signal (captured via PIPESTATUS); show_codex_progress is
+# display-only and always returns 0.
+# Set MINI_LOOP_CODEX_RAW=1 to bypass the filter and see raw codex output.
 run_with_codex_exec() {
     local prompt_content="$1"
     local temp_out="$2"
     local model="${3:-}"
-    local err_log="${temp_out}.err"
 
-    > "$temp_out"; > "$err_log"
     mkdir -p "$CODEX_HOME/sessions"
 
     local -a codex_cmd=(
@@ -339,36 +380,30 @@ run_with_codex_exec() {
         --dangerously-bypass-approvals-and-sandbox
         --skip-git-repo-check
         --ephemeral
-        --json
         -C "$PWD"
         -o "$temp_out"
     )
     [ -n "$model" ] && codex_cmd+=(--model "$model")
-    codex_cmd+=(-)
 
-    # Mirror the claude pipe pattern: timeout prefix + pipe through progress parser.
-    # show_codex_progress returns 0 iff task_complete was seen (success signal).
     local agent_prefix=()
     if [ -n "$TIMEOUT_BIN" ] && [ "${HARD_TIMEOUT:-0}" -gt 0 ] 2>/dev/null; then
         agent_prefix=("$TIMEOUT_BIN" "--kill-after=30" "$HARD_TIMEOUT")
     fi
 
-    local agent_ok=true
-    if ! { echo "$prompt_content" \
-            | { "${agent_prefix[@]}" "${codex_cmd[@]}" 2>"$err_log" || true; } \
-            | show_codex_progress; }; then
-        agent_ok=false
+    if [ "${MINI_LOOP_CODEX_RAW:-0}" = "1" ]; then
+        # Raw mode: stream codex's full human-readable output for debugging.
+        printf '%s' "$prompt_content" | "${agent_prefix[@]}" "${codex_cmd[@]}"
+        return $?
     fi
 
-    if [ "$agent_ok" = false ]; then
-        [ -s "$err_log" ] && { echo "  stderr:"; head -5 "$err_log" | sed 's/^/    /'; }
-        echo "  (codex exec: no task_complete event — timed out or failed)"
-        rm -f "$err_log"
-        return 1
-    fi
-
-    rm -f "$err_log"
-    return 0
+    # JSON mode: pipe through show_codex_progress (display-only, always returns 0).
+    # Pipe stages: [0] printf (always 0) | [1] codex (real exit) | [2] show_codex_progress (0).
+    # PIPESTATUS[1] is codex's real exit code.
+    codex_cmd+=(--json -)
+    printf '%s' "$prompt_content" \
+        | "${agent_prefix[@]}" "${codex_cmd[@]}" \
+        | show_codex_progress
+    return "${PIPESTATUS[1]}"
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
