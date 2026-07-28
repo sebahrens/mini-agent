@@ -12,9 +12,9 @@ use compact_str::CompactString;
 use rig::tool::ToolDyn;
 
 use crate::config::{Config, merge_config_override};
+use crate::extras::mcp::McpClientManager;
 use crate::extras::mcp::client::McpClientHandle;
 use crate::extras::mcp::config::McpServerConfig;
-use crate::extras::mcp::McpClientManager;
 use crate::permission::checker::PermissionChecker;
 use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
@@ -163,10 +163,8 @@ struct FixtureBuild {
 impl FixtureBuild {
     fn compile() -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "mini agent mcp stdio {} {id}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("mini agent mcp stdio {} {id}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let source = root.join("fixture.rs");
         fs::write(&source, FIXTURE_SOURCE).unwrap();
@@ -175,15 +173,14 @@ impl FixtureBuild {
         } else {
             "mcp-stdio-fixture"
         });
-        let output = Command::new(
-            std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc")),
-        )
-        .arg("--edition=2024")
-        .arg(&source)
-        .arg("-o")
-        .arg(&executable)
-        .output()
-        .expect("Rust toolchain must compile the repository-owned MCP fixture");
+        let output =
+            Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc")))
+                .arg("--edition=2024")
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .expect("Rust toolchain must compile the repository-owned MCP fixture");
         assert!(
             output.status.success(),
             "fixture compilation failed:\n{}",
@@ -297,7 +294,12 @@ async fn wait_for_lease(path: &Path) -> SocketAddr {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("fixture never published its process lease: {}", path.display()))
+    .unwrap_or_else(|_| {
+        panic!(
+            "fixture never published its process lease: {}",
+            path.display()
+        )
+    })
 }
 
 async fn assert_lease_released(address: SocketAddr) {
@@ -435,7 +437,10 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
     assert_eq!(payload["args"][1], metacharacter);
     assert_eq!(payload["configured_env"], "configured exactly");
     assert_eq!(payload["inherited_env"], true);
-    assert!(!marker.exists(), "configured arguments must not be parsed by a shell");
+    assert!(
+        !marker.exists(),
+        "configured arguments must not be parsed by a shell"
+    );
     let absolute_address = wait_for_lease(&absolute_lease).await;
     shutdown(absolute_manager).await;
     assert_lease_released(absolute_address).await;
@@ -456,7 +461,10 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
             handles: vec![path_handle],
             notices: Vec::new(),
         };
-        assert_eq!(call_fixture_tool(&path_manager).await["args"][0], "from-path");
+        assert_eq!(
+            call_fixture_tool(&path_manager).await["args"][0],
+            "from-path"
+        );
         let path_address = wait_for_lease(&path_lease).await;
         shutdown(path_manager).await;
         assert_lease_released(path_address).await;
@@ -469,10 +477,9 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
         "normal",
         &denied_lease,
     );
-    let denied_handle =
-        McpClientHandle::connect(CompactString::new("fixture"), &denied_config)
-            .await
-            .unwrap();
+    let denied_handle = McpClientHandle::connect(CompactString::new("fixture"), &denied_config)
+        .await
+        .unwrap();
     let denied_manager = McpClientManager {
         handles: vec![denied_handle],
         notices: Vec::new(),
@@ -551,10 +558,7 @@ async fn mcp_stdio_failure_cleanup_is_bounded_and_leaves_no_child() {
             &lease,
         );
         if let McpServerConfig::Command { env, .. } = &mut config {
-            env.insert(
-                "MCP_FIXTURE_STDERR_BYTES".to_string(),
-                "20000".to_string(),
-            );
+            env.insert("MCP_FIXTURE_STDERR_BYTES".to_string(), "20000".to_string());
         }
         let error = McpClientHandle::connect_with_timeout(
             CompactString::new(name),
@@ -603,7 +607,10 @@ async fn mcp_stdio_failure_cleanup_is_bounded_and_leaves_no_child() {
     });
     let cancel_address = wait_for_lease(&cancel_lease).await;
     connect_task.abort();
-    assert!(connect_task.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        connect_task.await,
+        Err(error) if error.is_cancelled()
+    ));
     assert_lease_released(cancel_address).await;
 
     for (name, mode) in [("graceful", "normal"), ("forced", "hang-eof")] {

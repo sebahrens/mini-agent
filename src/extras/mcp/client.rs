@@ -61,7 +61,8 @@ impl McpClientHandle {
                 let stderr_task =
                     stderr.map(|stderr| capture_stderr(stderr, Arc::clone(&stderr_buffer)));
                 let running_service =
-                    match tokio::time::timeout(initialize_timeout, serve_client((), transport)).await
+                    match tokio::time::timeout(initialize_timeout, serve_client((), transport))
+                        .await
                     {
                         Ok(Ok(service)) => service,
                         Ok(Err(error)) => {
@@ -202,9 +203,7 @@ async fn stdio_connect_error(
     if diagnostic.is_empty() {
         anyhow::anyhow!("MCP connection failed for '{server_name}': {reason}")
     } else {
-        anyhow::anyhow!(
-            "MCP connection failed for '{server_name}': {reason}; stderr: {diagnostic}"
-        )
+        anyhow::anyhow!("MCP connection failed for '{server_name}': {reason}; stderr: {diagnostic}")
     }
 }
 
