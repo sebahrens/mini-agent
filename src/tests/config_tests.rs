@@ -541,14 +541,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 fn mcp_read_only_exemption_trust_is_not_deserialized_or_inferred_from_endpoint() {
     use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
 
-    let custom: McpServerConfig = serde_json::from_str(
-        r#"{"url":"https://mcp.context7.com/mcp","headers":{}}"#,
-    )
-    .unwrap();
+    let custom: McpServerConfig =
+        serde_json::from_str(r#"{"url":"https://mcp.context7.com/mcp","headers":{}}"#).unwrap();
     assert_eq!(custom.trusted_identity(), None);
 
-    let built_in =
-        McpServerConfig::built_in(TrustedMcpServer::CONTEXT7, HashMap::new());
+    let built_in = McpServerConfig::built_in(TrustedMcpServer::CONTEXT7, HashMap::new());
     assert_eq!(
         built_in.trusted_identity(),
         Some(TrustedMcpServer::CONTEXT7)

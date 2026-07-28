@@ -66,12 +66,10 @@ impl ToolDyn for McpTool {
                 trusted_identity,
                 &tool_name,
             )
-                .await
-                .map_err(|e| {
-                    ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(
-                        e.to_string(),
-                    ))))
-                })?;
+            .await
+            .map_err(|e| {
+                ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(e.to_string()))))
+            })?;
 
             let arguments: Option<JsonObject> = serde_json::from_str(&args).unwrap_or_default();
             let params = arguments

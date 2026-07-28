@@ -81,10 +81,10 @@ use std::io;
 use compact_str::CompactString;
 use serde::Deserialize;
 
-use crate::permission::ask::{AskRequest, AskSender, UserDecision};
-use crate::permission::checker::{CheckResult, PermCheck};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::TrustedMcpServer;
+use crate::permission::ask::{AskRequest, AskSender, UserDecision};
+use crate::permission::checker::{CheckResult, PermCheck};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {

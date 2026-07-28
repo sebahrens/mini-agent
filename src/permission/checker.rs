@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use smallvec::SmallVec;
 
-use crate::permission::pattern::Pattern;
-use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::TrustedMcpServer;
+use crate::permission::pattern::Pattern;
+use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
 pub type PermCheck = Arc<Mutex<PermissionChecker>>;
 
@@ -373,8 +373,8 @@ impl PermissionChecker {
         trusted_identity: Option<TrustedMcpServer>,
         mcp_tool_name: &str,
     ) -> CheckResult {
-        let read_only_exempt = trusted_identity
-            .is_some_and(|identity| identity.exempts_read_only_tool(mcp_tool_name));
+        let read_only_exempt =
+            trusted_identity.is_some_and(|identity| identity.exempts_read_only_tool(mcp_tool_name));
         self.check_inner("mcp_tool", input, read_only_exempt)
     }
 

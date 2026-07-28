@@ -35,7 +35,7 @@ impl TrustedMcpServer {
     /// These tools only retrieve public web, documentation, or source-search
     /// results. Unknown or newly added server tools must use normal permission
     /// rules until they are deliberately reviewed and added here.
-    pub(crate) const fn exempts_read_only_tool(self, tool_name: &str) -> bool {
+    pub(crate) fn exempts_read_only_tool(self, tool_name: &str) -> bool {
         match self.0 {
             TrustedMcpServerKind::Exa => matches!(tool_name, "websearch" | "webfetch"),
             TrustedMcpServerKind::Context7 => {
@@ -76,10 +76,7 @@ pub enum McpServerConfig {
 }
 
 impl McpServerConfig {
-    pub(crate) fn built_in(
-        identity: TrustedMcpServer,
-        headers: HashMap<String, String>,
-    ) -> Self {
+    pub(crate) fn built_in(identity: TrustedMcpServer, headers: HashMap<String, String>) -> Self {
         Self::BuiltIn { identity, headers }
     }
 

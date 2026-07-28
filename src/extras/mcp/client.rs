@@ -87,8 +87,7 @@ impl McpClientHandle {
                 let custom_headers = parse_headers(headers)?;
                 let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url)
                     .custom_headers(custom_headers);
-                type HttpClient =
-                    rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
+                type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
                 let transport = HttpClient::from_config(cfg);
                 let running_service = serve_client((), transport).await.map_err(|e| {
                     anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
