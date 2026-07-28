@@ -266,6 +266,7 @@ async fn continue_prompt_injector<M>(
     retry_history: &[Message],
     tool_interactions: &[Message],
     retry_config: &RetryConfig,
+    max_turns: usize,
 ) -> StreamingResult<M::StreamingResponse>
 where
     M: CompletionModel + 'static,
@@ -277,7 +278,12 @@ where
     new_history.push(Message::assistant(String::new()));
     match retry::retry_stream_chat(retry_config, || {
         let h = new_history.clone();
-        async move { agent.stream_chat("Please continue.", h).await }
+        async move {
+            agent
+                .stream_chat("Please continue.", h)
+                .max_turns(max_turns)
+                .await
+        }
     })
     .await
     {
@@ -341,6 +347,8 @@ where
         let mut last_tool_name: Option<String> = None;
         let mut empty_response_count: u32 = 0;
         const MAX_EMPTY_RESPONSES: u32 = 3;
+        let max_turns = agent.default_max_turns.unwrap_or(1);
+        let mut turns_used = 0usize;
         // Overrides the next continuation message (bottom of the outer
         // `loop`); set when a `Stop` hook forces continuation instead of the
         // default re-injected `retry_prompt`.
@@ -358,7 +366,10 @@ where
             let max_backoff = std::time::Duration::from_millis(retry_config.max_backoff_ms);
             loop {
                 attempt += 1;
-                let mut s = agent.stream_chat(prompt.clone(), history.clone()).await;
+                let mut s = agent
+                    .stream_chat(prompt.clone(), history.clone())
+                    .max_turns(max_turns)
+                    .await;
                 let first = s.next().await;
                 match first {
                     Some(Ok(item)) => {
@@ -517,6 +528,7 @@ where
                         break;
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                        turns_used = turns_used.saturating_add(1);
                         let usage = call.usage;
                         tracing::debug!(
                             "agent completion: input_tokens={}, output_tokens={}",
@@ -547,6 +559,18 @@ where
                 "agent injecting continue prompt, tool_interactions={}",
                 tool_interactions.len(),
             );
+            let remaining_turns = max_turns.saturating_sub(turns_used);
+            if remaining_turns == 0 {
+                tracing::warn!(
+                    "agent: maximum turn budget ({max_turns}) exhausted before continuation"
+                );
+                let _ = event_tx
+                    .send(AgentEvent::Error(CompactString::from(format!(
+                        "Agent exhausted its maximum turn budget ({max_turns}) before completing."
+                    ))))
+                    .await;
+                return;
+            }
             let injected_prompt = next_instruction
                 .take()
                 .unwrap_or_else(|| retry_prompt.clone());
@@ -556,6 +580,7 @@ where
                 &retry_history,
                 &tool_interactions,
                 &retry_config,
+                remaining_turns,
             )
             .await;
         }
@@ -572,10 +597,9 @@ where
 /// `.max_turns(max_turns)` combinator: `max_turns` is an opaque black box
 /// that only ever yields a single terminal `FinalResponse` for the whole
 /// session, with no seam to inject "one more turn" after it — exactly what a
-/// `Stop` hook needs to do. The agent's own `default_max_turns` (set at
-/// construction, see `agent::builder::build_agent_inner`) still bounds
-/// internal tool-call round trips per call, same as [`spawn_agent`], which
-/// never used `.max_turns()` either.
+/// `Stop` hook needs to do. Each stream is explicitly bounded to the unused
+/// portion of the agent's `default_max_turns`, so hook continuations share one
+/// model-call budget with the initial stream.
 pub async fn run_print<M>(
     agent: &Agent<M>,
     prompt: &str,
@@ -595,10 +619,11 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let max_turns = agent.default_max_turns.unwrap_or(1);
     let mut stream = retry::retry_stream_chat(retry_config, || {
         let p = prompt.to_string();
         let h = history.clone();
-        async move { agent.stream_chat(p, h).await }
+        async move { agent.stream_chat(p, h).max_turns(max_turns).await }
     })
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -610,6 +635,7 @@ where
     let mut full_response = String::new();
     let mut last_tool_name: Option<String> = None;
     let mut usage = rig::completion::Usage::new();
+    let mut turns_used = 0usize;
     // Set true only when a `Stop` hook forces another turn; drives the outer
     // loop. Stays false (single pass, no continuation) in the hooks-off build.
     let mut continue_turn = true;
@@ -686,6 +712,14 @@ where
                     #[cfg(feature = "hooks")]
                     tool_interactions.push(tool_result.clone().into());
                 }
+                Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                    turns_used = turns_used.saturating_add(1);
+                    tracing::debug!(
+                        "agent completion: input_tokens={}, output_tokens={}",
+                        call.usage.input_tokens,
+                        call.usage.output_tokens,
+                    );
+                }
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                     usage = res.usage();
                     #[cfg(feature = "hooks")]
@@ -726,6 +760,12 @@ where
 
         #[cfg(feature = "hooks")]
         if continue_turn {
+            let remaining_turns = max_turns.saturating_sub(turns_used);
+            if remaining_turns == 0 {
+                anyhow::bail!(
+                    "Agent exhausted its maximum turn budget ({max_turns}) before completing."
+                );
+            }
             let injected_prompt = next_instruction
                 .take()
                 .unwrap_or_else(|| prompt.to_string());
@@ -739,6 +779,7 @@ where
                 &retry_history,
                 &tool_interactions,
                 retry_config,
+                remaining_turns,
             )
             .await;
         }
@@ -854,7 +895,90 @@ where
 #[cfg(test)]
 mod tests {
     use super::streamed_reasoning_text;
+    use rig::agent::AgentBuilder;
     use rig::streaming::StreamedAssistantContent;
+    use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
+    use rig::tool::Tool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct CountingTool(Arc<AtomicUsize>);
+
+    impl Tool for CountingTool {
+        const NAME: &'static str = "count";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Count one invocation".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("counted".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_streams_share_the_original_turn_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool = CountingTool(calls.clone());
+        let mut turns = Vec::new();
+        for turn in 0..10 {
+            let events = if matches!(turn, 2 | 4 | 9) {
+                vec![MockStreamEvent::final_response_with_default_usage()]
+            } else {
+                vec![
+                    MockStreamEvent::tool_call(
+                        format!("tool-{turn}"),
+                        CountingTool::NAME,
+                        serde_json::json!({}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ]
+            };
+            turns.push(events);
+        }
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(tool)
+            .default_max_turns(5)
+            .build();
+
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        while let Some(event) = runner.event_rx.recv().await {
+            if matches!(
+                event,
+                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error(_)
+            ) {
+                break;
+            }
+        }
+
+        assert_eq!(
+            model.requests().len(),
+            5,
+            "continuations must not reset the five-call model budget"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "only tool calls within the original budget may execute"
+        );
+    }
 
     #[test]
     fn streamed_reasoning_delta_is_forwardable_as_reasoning_text() {

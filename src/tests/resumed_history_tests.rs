@@ -84,7 +84,9 @@ async fn resumed_session_history_survives_stop_hook_continuation() {
     // continuation (guarding the `retry_history` seed wired in 3.2); the
     // second is the real final answer released after the hook stands down.
     let model = text_turns([["partial answer"], ["final answer"]]);
-    let agent = AgentBuilder::new(model.clone()).build();
+    let agent = AgentBuilder::new(model.clone())
+        .default_max_turns(2)
+        .build();
 
     // Blocks exactly once: the envelope's `stop_hook_active` is `false` on
     // the first `Stop` dispatch, so the hook forces a continuation; on the
