@@ -91,8 +91,7 @@ impl Tool for GrepTool {
             .map_err(|e| ToolError::Msg(format!("Invalid regex pattern: {}", e)))?;
 
         let search_path = crate::fs::expand_tilde(args.path.as_deref().unwrap_or("."));
-        let _ =
-            check_perm_path(&self.permission, &self.ask_tx, "grep", &search_path).await?;
+        let _ = check_perm_path(&self.permission, &self.ask_tx, "grep", &search_path).await?;
         let context = args.context_lines.unwrap_or(0);
 
         let include_re = args.include.as_ref().map(|g| {
@@ -278,9 +277,7 @@ mod tests {
     use super::*;
     use crate::permission::ask::UserDecision;
     use crate::permission::checker::PermissionChecker;
-    use crate::permission::{
-        Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm,
-    };
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
     fn restrictive_permission_allowing_pattern() -> PermCheck {
         let config = PermissionConfig {

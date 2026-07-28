@@ -27,12 +27,7 @@ pub fn make_read_file(
 ) -> impl Fn(String) -> rquickjs::Result<String> {
     move |path: String| {
         runtime
-            .block_on(check_perm_path(
-                &permission,
-                &ask_tx,
-                "js/read_file",
-                &path,
-            ))
+            .block_on(check_perm_path(&permission, &ask_tx, "js/read_file", &path))
             .map_err(|error| permission_error("js/read_file", error))?;
         std::fs::read_to_string(&path).map_err(rquickjs::Error::Io)
     }

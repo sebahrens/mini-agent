@@ -63,8 +63,7 @@ impl Tool for FindFilesTool {
             .map_err(|e| ToolError::Msg(format!("Invalid regex: {}", e)))?;
 
         let search_path = args.path.as_deref().unwrap_or(".");
-        let _ =
-            check_perm_path(&self.permission, &self.ask_tx, "find_files", search_path).await?;
+        let _ = check_perm_path(&self.permission, &self.ask_tx, "find_files", search_path).await?;
 
         let walker = WalkBuilder::new(search_path)
             .git_ignore(true)
@@ -141,9 +140,7 @@ mod tests {
     use super::*;
     use crate::permission::ask::UserDecision;
     use crate::permission::checker::PermissionChecker;
-    use crate::permission::{
-        Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm,
-    };
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
     fn restrictive_permission_allowing_pattern() -> PermCheck {
         let config = PermissionConfig {

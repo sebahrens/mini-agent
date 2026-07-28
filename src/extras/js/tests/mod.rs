@@ -128,11 +128,8 @@ async fn test_host_globals_enforce_restrictive_permissions() {
     use rig::tool::Tool;
 
     let permission = restrictive_permission_allowing_js_entrypoint();
-    let tool = make_test_tool_with_permissions(
-        Sandbox::new(false, "bwrap"),
-        Some(permission),
-        None,
-    );
+    let tool =
+        make_test_tool_with_permissions(Sandbox::new(false, "bwrap"), Some(permission), None);
     let path = std::env::temp_dir().join(format!(
         "zs_js_permission_{}_{}.txt",
         std::process::id(),
@@ -161,7 +158,11 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         write_result.contains("Permission denied"),
         "write_file bypassed permissions: {write_result}"
     );
-    assert!(!path.exists(), "denied write_file created {}", path.display());
+    assert!(
+        !path.exists(),
+        "denied write_file created {}",
+        path.display()
+    );
 
     let spawn_result = tool
         .call(crate::extras::js::tool::JsArgs {

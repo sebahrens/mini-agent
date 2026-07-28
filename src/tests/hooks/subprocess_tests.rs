@@ -42,14 +42,7 @@ async fn run_hook_echoes_stdin_and_completes() {
 #[tokio::test]
 async fn run_hook_reports_nonzero_exit_code() {
     let args = vec!["-c".to_string(), "exit 7".to_string()];
-    let output = run_hook(
-        "sh",
-        Some(&args),
-        b"",
-        Duration::from_secs(2),
-        "/repo",
-    )
-    .await;
+    let output = run_hook("sh", Some(&args), b"", Duration::from_secs(2), "/repo").await;
     assert_eq!(output.exit_code, Some(7));
     assert!(!output.timed_out);
 }
@@ -67,14 +60,7 @@ async fn run_hook_times_out_and_kills_group() {
     );
     let args = vec!["-c".to_string(), command];
 
-    let output = run_hook(
-        "sh",
-        Some(&args),
-        b"",
-        Duration::from_millis(100),
-        "/repo",
-    )
-    .await;
+    let output = run_hook("sh", Some(&args), b"", Duration::from_millis(100), "/repo").await;
     assert!(output.timed_out);
 
     tokio::time::sleep(Duration::from_millis(2300)).await;

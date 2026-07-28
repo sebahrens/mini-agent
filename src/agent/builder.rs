@@ -165,6 +165,31 @@ pub(crate) fn filter_tools_by_allowlist(
         .collect()
 }
 
+#[cfg(feature = "js")]
+fn register_js_tool(
+    tools: &mut Vec<Box<dyn rig::tool::ToolDyn>>,
+    sandbox: Sandbox,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+) {
+    use crate::extras::js::{
+        engine::js_thread_main,
+        tool::JsTool,
+        types::{JsRequest, THREAD_STACK},
+    };
+
+    let (js_tx, js_rx) = std::sync::mpsc::channel::<JsRequest>();
+    let js_permission = permission.clone();
+    let js_ask_tx = ask_tx.clone();
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("js-engine".into())
+        .stack_size(THREAD_STACK)
+        .spawn(move || js_thread_main(js_rx, sandbox, js_permission, js_ask_tx, runtime))
+        .expect("failed to spawn JS thread");
+    tools.push(Box::new(JsTool::new(js_tx, permission, ask_tx)));
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_agent_inner<M: CompletionModel + 'static>(
     model: M,
@@ -333,29 +358,12 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         }
 
         #[cfg(feature = "js")]
-        {
-            use crate::extras::js::{
-                engine::js_thread_main,
-                tool::JsTool,
-                types::{JsRequest, THREAD_STACK},
-            };
-            let (js_tx, js_rx) = std::sync::mpsc::channel::<JsRequest>();
-            let js_permission = permission.clone();
-            let js_ask_tx = ask_tx.clone();
-            let runtime = tokio::runtime::Handle::current();
-            std::thread::Builder::new()
-                .name("js-engine".into())
-                .stack_size(THREAD_STACK)
-                .spawn(move || {
-                    js_thread_main(js_rx, sandbox, js_permission, js_ask_tx, runtime)
-                })
-                .expect("failed to spawn JS thread");
-            all_tools.push(Box::new(JsTool::new(
-                js_tx,
-                permission.clone(),
-                ask_tx.clone(),
-            )));
-        }
+        register_js_tool(
+            &mut all_tools,
+            sandbox,
+            permission.clone(),
+            ask_tx.clone(),
+        );
 
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
 
@@ -363,6 +371,33 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let all_tools = crate::extras::hooks::wrap_from_global(all_tools, permission.clone());
 
         builder.tools(all_tools).build()
+    }
+}
+
+#[cfg(all(test, feature = "js"))]
+mod js_tests {
+    use super::register_js_tool;
+    use crate::sandbox::Sandbox;
+
+    #[tokio::test]
+    async fn registers_and_executes_js_tool() {
+        let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+        register_js_tool(
+            &mut tools,
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            vec!["js"]
+        );
+        let result = tools[0]
+            .call(r#"{"code":"1 + 1"}"#.to_string())
+            .await
+            .expect("registered JS tool call failed");
+        assert_eq!(result, "2");
     }
 }
 
