@@ -555,8 +555,7 @@ impl Tool for EditTool {
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {
         let expanded = crate::fs::expand_tilde(&args.path);
-        let resolved =
-            crate::fs::resolve_symlink_target(std::path::Path::new(&expanded)).await;
+        let resolved = crate::fs::resolve_symlink_target(std::path::Path::new(&expanded)).await;
         let path = resolved.to_string_lossy().into_owned();
         let es = edit_system();
         tracing::debug!(

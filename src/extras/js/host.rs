@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -48,6 +49,41 @@ fn block_on_host_call<T>(
     runtime.block_on(timeout_host_call(tool, duration, call))
 }
 
+async fn resolve_write_target(path: &str) -> PathBuf {
+    let expanded = crate::fs::expand_tilde(path);
+    let resolved = crate::fs::resolve_symlink_target(Path::new(&expanded)).await;
+    let absolute = if resolved.is_absolute() {
+        resolved
+    } else if let Ok(working_dir) = std::env::current_dir() {
+        working_dir.join(resolved)
+    } else {
+        resolved
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing_components = Vec::new();
+
+    loop {
+        match tokio::fs::canonicalize(ancestor).await {
+            Ok(mut canonical) => {
+                for component in missing_components.iter().rev() {
+                    canonical.push(component);
+                }
+                return canonical;
+            }
+            Err(_) => {
+                let Some(file_name) = ancestor.file_name() else {
+                    return absolute;
+                };
+                let Some(parent) = ancestor.parent() else {
+                    return absolute;
+                };
+                missing_components.push(file_name.to_os_string());
+                ancestor = parent;
+            }
+        }
+    }
+}
+
 pub fn make_read_file(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
@@ -71,12 +107,14 @@ pub fn make_write_file(
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String, String) -> rquickjs::Result<()> {
     move |path: String, content: String| {
+        let path = runtime.block_on(resolve_write_target(&path));
+        let permission_path = path.to_string_lossy();
         runtime
             .block_on(check_perm_path(
                 &permission,
                 &ask_tx,
-                "js/write_file",
-                &path,
+                "write",
+                &permission_path,
             ))
             .map_err(|error| permission_error("js/write_file", error))?;
         block_on_host_call(&runtime, "js/write_file", STEP_TIMEOUT, async move {
@@ -186,7 +224,67 @@ pub fn register_host_globals(
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::permission::ask::UserDecision;
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{PermissionConfigs, SecurityMode};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "zerostack_js_write_permission_test_{}_{}",
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn standard_permission(working_dir: PathBuf) -> PermCheck {
+        Arc::new(Mutex::new(PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(working_dir),
+            Some(vec!["standard".to_string()]),
+        )))
+    }
+
+    async fn call_write_file(
+        permission: PermCheck,
+        ask_tx: Option<AskSender>,
+        path: PathBuf,
+        content: &'static str,
+    ) -> Result<(), String> {
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            make_write_file(Some(permission), ask_tx, runtime)(
+                path.to_string_lossy().into_owned(),
+                content.to_string(),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .expect("write_file test task panicked")
+    }
 
     #[tokio::test]
     async fn file_host_call_timeout_reports_execution_timed_out() {
@@ -204,6 +302,151 @@ mod tests {
                 "unexpected {tool} timeout error: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn write_file_allows_paths_within_working_directory() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let target = working_dir.join("created.txt");
+
+        call_write_file(
+            standard_permission(working_dir),
+            None,
+            target.clone(),
+            "allowed",
+        )
+        .await
+        .expect("workspace write should be allowed");
+
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "allowed");
+    }
+
+    #[tokio::test]
+    async fn write_file_denies_external_path_without_permission_response() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let target = external_dir.join("denied.txt");
+
+        let error = call_write_file(
+            standard_permission(working_dir),
+            None,
+            target.clone(),
+            "forbidden",
+        )
+        .await
+        .expect_err("external write should require permission");
+
+        assert!(
+            error.to_string().contains("Permission denied"),
+            "unexpected permission error: {error}"
+        );
+        assert!(!target.exists(), "denied external target was written");
+    }
+
+    #[tokio::test]
+    async fn write_file_prompts_for_external_directory_permission() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let target = external_dir.join("approved.txt");
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+
+        let write = tokio::spawn(call_write_file(
+            standard_permission(working_dir),
+            Some(ask_tx),
+            target.clone(),
+            "approved",
+        ));
+        let request = ask_rx
+            .recv()
+            .await
+            .expect("external write should request permission");
+        assert_eq!(request.tool.as_str(), "write");
+        assert_eq!(request.input.as_str(), target.to_string_lossy().as_ref());
+        request
+            .reply
+            .send(UserDecision::AllowOnce)
+            .expect("permission request receiver dropped");
+
+        write
+            .await
+            .expect("write task panicked")
+            .expect("approved external write should succeed");
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "approved");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_denies_broken_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let external_target = external_dir.join("created-through-link.txt");
+        let allowed_link = working_dir.join("safe-link.txt");
+        symlink(&external_target, &allowed_link).unwrap();
+
+        let error = call_write_file(
+            standard_permission(working_dir),
+            None,
+            allowed_link,
+            "forbidden",
+        )
+        .await
+        .expect_err("resolved external symlink target should require permission");
+
+        assert!(
+            error.to_string().contains("Permission denied"),
+            "unexpected permission error: {error}"
+        );
+        assert!(
+            !external_target.exists(),
+            "permission denial must happen before the symlink target is written"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_denies_symlinked_parent_escape_for_new_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let linked_dir = working_dir.join("linked-dir");
+        symlink(&external_dir, &linked_dir).unwrap();
+        let allowed_path = linked_dir.join("created-through-parent-link.txt");
+        let external_target = external_dir.join("created-through-parent-link.txt");
+
+        let error = call_write_file(
+            standard_permission(working_dir),
+            None,
+            allowed_path,
+            "forbidden",
+        )
+        .await
+        .expect_err("external target beneath symlinked parent should require permission");
+
+        assert!(
+            error.to_string().contains("Permission denied"),
+            "unexpected permission error: {error}"
+        );
+        assert!(
+            !external_target.exists(),
+            "permission denial must happen before the symlinked parent target is written"
+        );
     }
 
     #[cfg(unix)]
