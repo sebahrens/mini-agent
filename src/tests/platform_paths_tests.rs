@@ -117,9 +117,9 @@ fn assert_default_root_contract(platform: PathPlatform, paths: &AppPaths) -> Res
                 return Err("Windows Local data mapped to Roaming".to_string());
             }
             let local = paths.local_data_dir.to_string_lossy();
-            if paths.state_dir != PathBuf::from(format!(r"{local}\state"))
-                || paths.cache_dir != PathBuf::from(format!(r"{local}\cache"))
-                || paths.credentials_dir != PathBuf::from(format!(r"{local}\credentials"))
+            if paths.state_dir != format!(r"{local}\state")
+                || paths.cache_dir != format!(r"{local}\cache")
+                || paths.credentials_dir != format!(r"{local}\credentials")
             {
                 return Err("Windows Local child-root mapping is incorrect".to_string());
             }
@@ -139,17 +139,14 @@ fn app_paths_matrix_acceptance_defaults_on_all_platforms() {
             local_data_dir: PathBuf::from("/home/alice/.local/share/zerostack"),
             state_dir: PathBuf::from("/home/alice/.local/state/zerostack"),
             cache_dir: PathBuf::from("/home/alice/.cache/zerostack"),
-            credentials_dir: PathBuf::from(
-                "/home/alice/.local/share/zerostack/credentials"
-            ),
+            credentials_dir: PathBuf::from("/home/alice/.local/share/zerostack/credentials"),
             project_dir: Some(PathBuf::from("/work/project/.zerostack")),
         }
     );
     assert_default_root_contract(PathPlatform::Linux, &linux).unwrap();
 
     let macos = AppPaths::resolve(&macos_environment()).unwrap();
-    let application_support =
-        PathBuf::from("/Users/alice/Library/Application Support/zerostack");
+    let application_support = PathBuf::from("/Users/alice/Library/Application Support/zerostack");
     assert_eq!(macos.config_dir, application_support);
     assert_eq!(macos.data_dir, application_support);
     assert_eq!(macos.local_data_dir, application_support);
@@ -422,11 +419,7 @@ fn persistent_artifact_ownership_acceptance_covers_every_typed_owner() {
     ] {
         assert_owned_by(path, &paths.state_dir, artifact);
     }
-    assert_owned_by(
-        paths.mcp_oauth_dir(),
-        &paths.credentials_dir,
-        "MCP OAuth",
-    );
+    assert_owned_by(paths.mcp_oauth_dir(), &paths.credentials_dir, "MCP OAuth");
 }
 
 #[test]
@@ -440,7 +433,9 @@ fn legacy_path_migration_acceptance_proves_restart_retention_and_conflicts() {
         artifact: "acceptance-sessions",
         canonical: paths.sessions_dir(),
         candidates: vec![legacy.clone()],
-        marker: paths.migration_markers_dir().join("acceptance-sessions.json"),
+        marker: paths
+            .migration_markers_dir()
+            .join("acceptance-sessions.json"),
         requirement: LegacyArtifactRequirement::Required,
         kind: LegacyArtifactKind::Directory,
         selected: None,
@@ -495,15 +490,7 @@ fn legacy_path_migration_acceptance_proves_restart_retention_and_conflicts() {
 #[test]
 fn portable_filename_policy_acceptance_proves_reserved_and_collision_contract() {
     for reserved in [
-        "CON",
-        "con.txt",
-        "PRN",
-        "AUX.json",
-        "NUL",
-        "COM1",
-        "com9.log",
-        "LPT1",
-        "lpt9.txt",
+        "CON", "con.txt", "PRN", "AUX.json", "NUL", "COM1", "com9.log", "LPT1", "lpt9.txt",
     ] {
         assert!(matches!(
             validate_portable_component(reserved),
@@ -572,7 +559,8 @@ fn platform_paths_acceptance_real_platform_private_roots() {
 
 #[test]
 fn platform_paths_acceptance_real_host_uses_native_base_classes() {
-    let environment = PathEnvironment::from_process(None).unwrap();
+    let mut environment = PathEnvironment::from_process(None).unwrap();
+    environment.overrides = PathOverrides::default();
     let paths = AppPaths::resolve(&environment).unwrap();
     assert!(paths.config_dir.is_absolute());
     assert!(paths.data_dir.is_absolute());

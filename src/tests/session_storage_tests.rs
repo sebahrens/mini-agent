@@ -237,23 +237,31 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
 #[test]
 fn long_tool_result_save_failure_keeps_full_output() {
     let lock = STORAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let previous_state_dir = env::var_os("ZS_STATE_DIR");
     let path = std::env::temp_dir()
         .canonicalize()
         .unwrap()
-        .join(format!("zs_data_file_{}", std::process::id()));
+        .join(format!("zs_state_file_{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, b"not a directory").unwrap();
-    unsafe { env::set_var("ZS_DATA_DIR", path.to_str().unwrap()) };
+    unsafe { env::set_var("ZS_STATE_DIR", path.to_str().unwrap()) };
 
     let mut s = Session::new("anthropic", "claude", 200000, "");
     let output = "x".repeat(TOOL_RESULT_SAVE_THRESHOLD + 1);
     s.add_tool_result("bash", &output);
 
-    let content = s.messages[0].content.as_str();
-    assert!(content.contains(&output));
-    assert!(content.contains("failed to save long tool output separately"));
+    let content = s.messages[0].content.to_string();
+    unsafe {
+        match previous_state_dir {
+            Some(value) => env::set_var("ZS_STATE_DIR", value),
+            None => env::remove_var("ZS_STATE_DIR"),
+        }
+    }
     let _ = std::fs::remove_file(path);
     drop(lock);
+
+    assert!(content.contains(&output));
+    assert!(content.contains("failed to save long tool output separately"));
 }
 
 #[test]
