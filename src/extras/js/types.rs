@@ -42,6 +42,7 @@ impl fmt::Debug for JsResponse {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub enum JsOutcome {
     Value(String),
     Void,

@@ -1,22 +1,207 @@
-use rquickjs::{Context, Runtime, Value};
+use rquickjs::promise::PromiseState;
+use rquickjs::{Coerced, Context, Ctx, Error, FromJs, Persistent, Runtime, Value};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::extras::js::host::register_host_globals;
 use crate::extras::js::tool::PermissionBridge;
 use crate::extras::js::types::*;
 use crate::sandbox::Sandbox;
 
-fn exception_details(
-    exception: Option<&rquickjs::Exception<'_>>,
-) -> Result<(String, String), JsOutcome> {
-    let exception =
-        exception.ok_or_else(|| JsOutcome::Error("Failed to extract exception".to_string()))?;
-    let message = exception.message().unwrap_or_default();
-    if message.contains("out of memory") {
-        return Err(JsOutcome::OomKilled);
+const MAX_PENDING_JOBS: usize = 10_000;
+
+#[derive(Clone, Copy)]
+struct ExecutionPolicy {
+    timeout: Duration,
+    max_pending_jobs: usize,
+}
+
+fn interruption_outcome(
+    deadline: Instant,
+    cancellation: &PermCancellation,
+    permission_bridge: &PermissionBridge,
+) -> Option<JsOutcome> {
+    if Instant::now() >= deadline {
+        Some(JsOutcome::Timeout)
+    } else if cancellation.is_cancelled() {
+        Some(JsOutcome::Error("execution cancelled".to_string()))
+    } else if permission_bridge.is_shutdown() {
+        Some(JsOutcome::Error(
+            "permission bridge shut down".to_string(),
+        ))
+    } else {
+        None
     }
-    Ok((message, exception.stack().unwrap_or_default()))
+}
+
+fn stringify_thrown_value(ctx: &Ctx<'_>, value: &Value<'_>) -> String {
+    if value.is_null() {
+        return "null".to_string();
+    }
+    if value.is_undefined() {
+        return "undefined".to_string();
+    }
+
+    match Coerced::<String>::from_js(ctx, value.clone()) {
+        Ok(value) => value.0,
+        Err(_) => {
+            // String coercion may itself throw (for example, a hostile toString).
+            // Clear that secondary exception and return a stable, non-panicking fallback.
+            let _ = ctx.catch();
+            format!("<unstringifiable {}>", value.type_name())
+        }
+    }
+}
+
+fn thrown_value_outcome(
+    ctx: &Ctx<'_>,
+    value: Value<'_>,
+    deadline: Instant,
+    cancellation: &PermCancellation,
+    permission_bridge: &PermissionBridge,
+) -> JsOutcome {
+    if let Some(outcome) = interruption_outcome(deadline, cancellation, permission_bridge) {
+        return outcome;
+    }
+
+    if let Some(exception) = value.as_exception() {
+        let message = exception.message().unwrap_or_default();
+        let name = exception
+            .as_object()
+            .get::<_, Option<Coerced<String>>>("name")
+            .ok()
+            .flatten()
+            .map(|name| name.0)
+            .unwrap_or_default();
+
+        // rquickjs 0.12 maps a JS_EXCEPTION return from eval to Error::Exception.
+        // QuickJS-NG's JS_ThrowOutOfMemory creates exactly this InternalError
+        // (quickjs.c: JS_ThrowOutOfMemory); there is no distinct public OOM tag.
+        // Exact name/message matching avoids misclassifying unrelated errors that
+        // merely mention memory, while Error::Allocation is handled separately.
+        if name == "InternalError" && message == "out of memory" {
+            return JsOutcome::OomKilled;
+        }
+
+        let stack = exception.stack().unwrap_or_default();
+        return match (message.is_empty(), stack.is_empty()) {
+            (false, false) => JsOutcome::Error(format!("{message}\n{stack}")),
+            (false, true) => JsOutcome::Error(message),
+            (true, false) => JsOutcome::Error(stack),
+            (true, true) => JsOutcome::Error(stringify_thrown_value(ctx, &value)),
+        };
+    }
+
+    JsOutcome::Error(stringify_thrown_value(ctx, &value))
+}
+
+fn error_outcome(
+    ctx: &Ctx<'_>,
+    error: Error,
+    deadline: Instant,
+    cancellation: &PermCancellation,
+    permission_bridge: &PermissionBridge,
+) -> JsOutcome {
+    match error {
+        Error::Allocation => JsOutcome::OomKilled,
+        Error::Exception => thrown_value_outcome(
+            ctx,
+            ctx.catch(),
+            deadline,
+            cancellation,
+            permission_bridge,
+        ),
+        error => JsOutcome::Error(error.to_string()),
+    }
+}
+
+fn value_outcome(value: Value<'_>) -> JsOutcome {
+    if value.is_undefined() || value.is_null() {
+        JsOutcome::Void
+    } else if let Some(value) = value.as_string() {
+        match value.to_string() {
+            Ok(value) => JsOutcome::Value(value),
+            Err(error) => JsOutcome::Error(error.to_string()),
+        }
+    } else if let Some(value) = value.as_int() {
+        JsOutcome::Value(value.to_string())
+    } else if let Some(value) = value.as_float() {
+        JsOutcome::Value(value.to_string())
+    } else if let Some(value) = value.as_bool() {
+        JsOutcome::Value(value.to_string())
+    } else {
+        JsOutcome::Value(format!("{value:?}"))
+    }
+}
+
+fn settled_value_outcome(
+    ctx: &Ctx<'_>,
+    value: Value<'_>,
+    deadline: Instant,
+    cancellation: &PermCancellation,
+    permission_bridge: &PermissionBridge,
+) -> JsOutcome {
+    let Some(promise) = value.as_promise() else {
+        return value_outcome(value);
+    };
+
+    match promise.state() {
+        PromiseState::Pending => JsOutcome::Error(
+            "Promise remained pending after the JavaScript job queue drained".to_string(),
+        ),
+        PromiseState::Resolved => match promise.result::<Value>() {
+            Some(Ok(value)) => value_outcome(value),
+            Some(Err(error)) => {
+                error_outcome(ctx, error, deadline, cancellation, permission_bridge)
+            }
+            None => JsOutcome::Error("Resolved Promise had no result".to_string()),
+        },
+        PromiseState::Rejected => match promise.result::<Value>() {
+            Some(Err(error)) => {
+                error_outcome(ctx, error, deadline, cancellation, permission_bridge)
+            }
+            Some(Ok(_)) => JsOutcome::Error("Rejected Promise returned a value".to_string()),
+            None => JsOutcome::Error("Rejected Promise had no reason".to_string()),
+        },
+    }
+}
+
+fn drain_pending_jobs(
+    rt: &Runtime,
+    deadline: Instant,
+    max_pending_jobs: usize,
+    cancellation: &PermCancellation,
+    permission_bridge: &PermissionBridge,
+) -> Option<JsOutcome> {
+    let mut executed = 0;
+
+    loop {
+        if let Some(outcome) = interruption_outcome(deadline, cancellation, permission_bridge) {
+            return Some(outcome);
+        }
+
+        if executed >= max_pending_jobs {
+            return rt.is_job_pending().then_some(JsOutcome::Timeout);
+        }
+
+        match rt.execute_pending_job() {
+            Ok(true) => executed += 1,
+            Ok(false) => return None,
+            Err(job_exception) => {
+                let outcome = job_exception.0.with(|ctx| {
+                    let value = ctx.catch();
+                    thrown_value_outcome(
+                        &ctx,
+                        value,
+                        deadline,
+                        cancellation,
+                        permission_bridge,
+                    )
+                });
+                return Some(outcome);
+            }
+        }
+    }
 }
 
 pub(crate) fn js_thread_main(
@@ -46,6 +231,27 @@ pub(crate) fn run_step(
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
 ) -> JsOutcome {
+    run_step_with_policy(
+        code,
+        sandbox,
+        permission_bridge,
+        cancellation,
+        runtime,
+        ExecutionPolicy {
+            timeout: STEP_TIMEOUT,
+            max_pending_jobs: MAX_PENDING_JOBS,
+        },
+    )
+}
+
+fn run_step_with_policy(
+    code: &str,
+    sandbox: &Sandbox,
+    permission_bridge: &PermissionBridge,
+    cancellation: &PermCancellation,
+    runtime: &tokio::runtime::Handle,
+    policy: ExecutionPolicy,
+) -> JsOutcome {
     // Fresh Runtime EVERY step — OOM poisons allocator; never reuse
     let rt = match Runtime::new() {
         Ok(r) => r,
@@ -54,7 +260,7 @@ pub(crate) fn run_step(
     rt.set_memory_limit(MEMORY_LIMIT);
     rt.set_max_stack_size(STACK_LIMIT);
 
-    let deadline = Instant::now() + STEP_TIMEOUT;
+    let deadline = Instant::now() + policy.timeout;
     let interrupt_cancellation = cancellation.clone();
     let interrupt_bridge = permission_bridge.clone();
     rt.set_interrupt_handler(Some(Box::new(move || {
@@ -65,6 +271,7 @@ pub(crate) fn run_step(
 
     let ctx = match Context::full(&rt) {
         Ok(c) => c,
+        Err(Error::Allocation) => return JsOutcome::OomKilled,
         Err(e) => return JsOutcome::Error(format!("Context::full failed: {e}")),
     };
 
@@ -74,59 +281,82 @@ pub(crate) fn run_step(
         permission_bridge.clone(),
         runtime.clone(),
     ) {
-        return JsOutcome::Error(format!("Failed to register host globals: {error}"));
+        return match error {
+            Error::Allocation => JsOutcome::OomKilled,
+            error => JsOutcome::Error(format!("Failed to register host globals: {error}")),
+        };
     }
 
-    let result = ctx.with(|ctx| {
-        let outcome = match ctx.eval::<Value, _>(code) {
-            Err(rquickjs::Error::Exception) => {
-                let exc = ctx.catch();
-                let (msg, stack) = exception_details(exc.as_exception())?;
-                if msg.contains("interrupted") || Instant::now() >= deadline {
-                    JsOutcome::Timeout
-                } else {
-                    JsOutcome::Error(format!("{msg}\n{stack}"))
-                }
-            }
-            Err(rquickjs::Error::Allocation) => JsOutcome::OomKilled,
-            Err(e) => JsOutcome::Error(e.to_string()),
-            Ok(v) => {
-                if v.is_undefined() || v.is_null() {
-                    JsOutcome::Void
-                } else if let Some(s) = v.as_string() {
-                    JsOutcome::Value(s.to_string().unwrap_or_default())
-                } else if let Some(n) = v.as_int() {
-                    JsOutcome::Value(n.to_string())
-                } else if let Some(f) = v.as_float() {
-                    JsOutcome::Value(f.to_string())
-                } else if let Some(b) = v.as_bool() {
-                    JsOutcome::Value(b.to_string())
-                } else {
-                    JsOutcome::Value(format!("{v:?}"))
-                }
-            }
-        };
-        Ok::<JsOutcome, JsOutcome>(outcome)
+    let evaluated: Result<Persistent<Value<'static>>, JsOutcome> = ctx.with(|ctx| {
+        ctx.eval::<Value, _>(code)
+            .map(|value| Persistent::save(&ctx, value))
+            .map_err(|error| {
+                error_outcome(
+                    &ctx,
+                    error,
+                    deadline,
+                    cancellation,
+                    permission_bridge,
+                )
+            })
     });
 
-    // Drain microtask queue — required for Promise resolution
-    while matches!(rt.execute_pending_job(), Ok(true)) {}
+    // rquickjs executes one Promise job per call. Use the eval deadline for the
+    // whole queue and cap turns so a self-replenishing microtask chain cannot
+    // monopolize the dedicated JS thread before the wall-clock deadline.
+    let job_outcome = drain_pending_jobs(
+        &rt,
+        deadline,
+        policy.max_pending_jobs,
+        cancellation,
+        permission_bridge,
+    );
 
-    result.unwrap_or_else(|error| error)
+    match evaluated {
+        Err(JsOutcome::Timeout) => JsOutcome::Timeout,
+        Err(JsOutcome::OomKilled) => JsOutcome::OomKilled,
+        Err(error) => match job_outcome {
+            Some(JsOutcome::Timeout) => JsOutcome::Timeout,
+            Some(JsOutcome::OomKilled) => JsOutcome::OomKilled,
+            _ => error,
+        },
+        Ok(value) => match job_outcome {
+            Some(outcome) => outcome,
+            None => ctx.with(|ctx| match value.restore(&ctx) {
+                Ok(value) => settled_value_outcome(
+                    &ctx,
+                    value,
+                    deadline,
+                    cancellation,
+                    permission_bridge,
+                ),
+                Err(Error::Allocation) => JsOutcome::OomKilled,
+                Err(error) => JsOutcome::Error(format!("Failed to restore JS result: {error}")),
+            }),
+        },
+    }
     // rt drops here — RAII; Context must be dropped before Runtime
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_caught_exception_returns_error() {
-        match exception_details(None) {
-            Err(JsOutcome::Error(message)) => {
-                assert_eq!(message, "Failed to extract exception");
-            }
-            outcome => panic!("unexpected outcome: {outcome:?}"),
-        }
-    }
+pub(crate) fn run_step_for_test(
+    code: &str,
+    sandbox: &Sandbox,
+    permission_bridge: &PermissionBridge,
+    cancellation: &PermCancellation,
+    runtime: &tokio::runtime::Handle,
+    timeout: Duration,
+    max_pending_jobs: usize,
+) -> JsOutcome {
+    run_step_with_policy(
+        code,
+        sandbox,
+        permission_bridge,
+        cancellation,
+        runtime,
+        ExecutionPolicy {
+            timeout,
+            max_pending_jobs,
+        },
+    )
 }

@@ -1,4 +1,5 @@
 use crate::extras::js::tool::JsTool;
+use crate::extras::js::types::{JsOutcome, PermCancellation, STEP_TIMEOUT};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
@@ -265,4 +266,152 @@ async fn test_oom() {
         result, "JS error: out of memory (64 MiB limit exceeded)",
         "memory limit did not produce the classified OOM response"
     );
+}
+
+#[tokio::test]
+async fn js_outcome_mapping() {
+    use std::time::Duration;
+
+    use crate::extras::js::engine::run_step_for_test;
+    use crate::extras::js::tool::PermissionBridgeOwner;
+
+    let sandbox = Sandbox::new(false, "bwrap");
+    let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+    let bridge = owner.bridge();
+    let runtime = tokio::runtime::Handle::current();
+
+    let run = |code: &str, timeout: Duration, max_pending_jobs: usize| {
+        run_step_for_test(
+            code,
+            &sandbox,
+            &bridge,
+            &PermCancellation::new(),
+            &runtime,
+            timeout,
+            max_pending_jobs,
+        )
+    };
+    let normal_timeout = Duration::from_secs(2);
+    let assert_recovers = || {
+        assert_eq!(
+            run("1 + 1", normal_timeout, 10_000),
+            JsOutcome::Value("2".to_string())
+        );
+    };
+
+    assert_eq!(
+        run(
+            "const chunks = []; while (true) { chunks.push(new ArrayBuffer(1024 * 1024)); }",
+            STEP_TIMEOUT,
+            10_000,
+        ),
+        JsOutcome::OomKilled
+    );
+    assert_recovers();
+
+    assert_eq!(
+        run("while (true) {}", Duration::from_millis(50), 10_000),
+        JsOutcome::Timeout
+    );
+    assert_recovers();
+
+    assert_eq!(
+        run(
+            "function spin() { Promise.resolve().then(spin); } spin();",
+            normal_timeout,
+            1_000,
+        ),
+        JsOutcome::Timeout
+    );
+    assert_recovers();
+
+    for (code, expected) in [
+        ("throw 'x'", "x"),
+        ("throw 1", "1"),
+        ("throw null", "null"),
+    ] {
+        assert_eq!(
+            run(code, normal_timeout, 10_000),
+            JsOutcome::Error(expected.to_string())
+        );
+        assert_recovers();
+    }
+
+    let object_error = match run(
+        "throw new Error('object failure')",
+        normal_timeout,
+        10_000,
+    ) {
+        JsOutcome::Error(error) => error,
+        outcome => panic!("object throw did not return JsOutcome::Error: {outcome:?}"),
+    };
+    assert!(object_error.starts_with("object failure\n"));
+    assert!(object_error.lines().any(|line| line.trim().starts_with("at ")));
+    assert_recovers();
+
+    match run(
+        "throw new Error('out of memory')",
+        normal_timeout,
+        10_000,
+    ) {
+        JsOutcome::Error(_) => {}
+        outcome => {
+            panic!("ordinary errors mentioning memory were misclassified as OOM: {outcome:?}")
+        }
+    }
+    assert_recovers();
+
+    let syntax_error = match run("function (", normal_timeout, 10_000) {
+        JsOutcome::Error(error) => error,
+        outcome => panic!("syntax error did not return JsOutcome::Error: {outcome:?}"),
+    };
+    assert!(!syntax_error.is_empty());
+    assert_recovers();
+
+    assert_eq!(
+        run("Promise.reject('rejected')", normal_timeout, 10_000),
+        JsOutcome::Error("rejected".to_string())
+    );
+    assert_recovers();
+
+    let rejected_object = match run(
+        "Promise.reject(new Error('rejected object'))",
+        normal_timeout,
+        10_000,
+    ) {
+        JsOutcome::Error(error) => error,
+        outcome => panic!("object rejection did not return JsOutcome::Error: {outcome:?}"),
+    };
+    assert!(rejected_object.starts_with("rejected object\n"));
+    assert!(
+        rejected_object
+            .lines()
+            .any(|line| line.trim().starts_with("at "))
+    );
+    assert_recovers();
+
+    assert_eq!(
+        run(
+            "Promise.resolve().then(() => { throw 7; })",
+            normal_timeout,
+            10_000,
+        ),
+        JsOutcome::Error("7".to_string())
+    );
+    assert_recovers();
+
+    assert_eq!(
+        run(
+            "globalThis.leaked = 42; throw 'failed'",
+            normal_timeout,
+            10_000,
+        ),
+        JsOutcome::Error("failed".to_string())
+    );
+    assert_eq!(
+        run("typeof globalThis.leaked", normal_timeout, 10_000),
+        JsOutcome::Value("undefined".to_string())
+    );
+
+    owner.shutdown();
 }
