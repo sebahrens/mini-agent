@@ -312,20 +312,18 @@ run_with_codex_exec() {
     [ -n "$model" ] && codex_cmd+=(--model "$model")
     codex_cmd+=(-)
 
-    local codex_pid watchdog_pid run_exit=0
+    local codex_pid watchdog_pid tail_pid run_exit=0
     echo "$prompt_content" | "${codex_cmd[@]}" >"$run_log" 2>"$err_log" &
     codex_pid=$!
     ( sleep "$HARD_TIMEOUT"; kill "$codex_pid" 2>/dev/null ) &
     watchdog_pid=$!
+    # Stream codex stdout live so tool calls are visible as they happen
+    tail -f "$run_log" &
+    tail_pid=$!
 
     wait "$codex_pid" 2>/dev/null || run_exit=$?
-    kill "$watchdog_pid" 2>/dev/null || true
-    wait "$watchdog_pid" 2>/dev/null || true
-
-    if [ -s "$temp_out" ]; then
-        head -c 2000 "$temp_out"
-        echo ""
-    fi
+    kill "$watchdog_pid" "$tail_pid" 2>/dev/null || true
+    wait "$watchdog_pid" "$tail_pid" 2>/dev/null || true
 
     if [ "$run_exit" -eq 0 ]; then
         rm -f "$err_log" "$run_log"
@@ -333,7 +331,6 @@ run_with_codex_exec() {
     fi
 
     [ -s "$err_log" ] && { echo "  stderr:"; head -5 "$err_log" | sed 's/^/    /'; }
-    [ -s "$run_log" ] && { echo "  stdout:"; head -5 "$run_log" | sed 's/^/    /'; }
     if [ "$run_exit" -eq 143 ] || [ "$run_exit" -eq 137 ]; then
         echo "  (codex exec timed out after ${HARD_TIMEOUT}s)"
     else
