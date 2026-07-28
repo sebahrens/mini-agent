@@ -792,7 +792,11 @@ URL-based servers. A local stdio entry launches `command` directly, passes
 an executable available on `PATH` or an absolute executable path; zerostack
 resolves platform shims such as Windows `.cmd`/`.exe` launchers before spawn.
 The server must reserve stdout for MCP protocol messages and write diagnostics
-to stderr.
+to stderr. Local servers must complete the MCP initialization handshake within
+10 seconds. Resolution, spawn, handshake, malformed-output, and early-exit
+failures identify the configured server and include at most 8 KiB of captured
+stderr so startup diagnostics stay useful and bounded. A server that does not
+exit after stdin closes is force-terminated during shutdown.
 
 Servers can also be added per project via `.zerostack/config.toml` (see
 *Project-local override* above); project servers merge with — and can override

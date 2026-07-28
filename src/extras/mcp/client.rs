@@ -1,12 +1,21 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use compact_str::CompactString;
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use rmcp::transport::{child_process::TokioChildProcess, which_command};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use super::config::{McpServerConfig, TrustedMcpServer};
+
+const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const MCP_STDERR_LIMIT: usize = 8 * 1024;
+const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct McpClientHandle {
     pub server_name: CompactString,
@@ -19,6 +28,14 @@ impl McpClientHandle {
         server_name: CompactString,
         config: &McpServerConfig,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_timeout(server_name, config, MCP_INITIALIZE_TIMEOUT).await
+    }
+
+    pub(crate) async fn connect_with_timeout(
+        server_name: CompactString,
+        config: &McpServerConfig,
+        initialize_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         match config {
             McpServerConfig::Command { command, args, env } => {
                 tracing::debug!(
@@ -27,11 +44,48 @@ impl McpClientHandle {
                     args,
                     env.len(),
                 );
-                let cmd = stdio_command(command, args, env)?;
-                let transport = TokioChildProcess::new(cmd)?;
-                let running_service = serve_client((), transport).await.map_err(|e| {
-                    anyhow::anyhow!("MCP connection failed for '{server_name}': {e}")
+                let cmd = stdio_command(command, args, env).map_err(|error| {
+                    anyhow::anyhow!(
+                        "MCP command resolution failed for '{server_name}' ({command}): {error}"
+                    )
                 })?;
+                let (transport, stderr) = TokioChildProcess::builder(cmd)
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "MCP command spawn failed for '{server_name}' ({command}): {error}"
+                        )
+                    })?;
+                let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+                let stderr_task =
+                    stderr.map(|stderr| capture_stderr(stderr, Arc::clone(&stderr_buffer)));
+                let running_service =
+                    match tokio::time::timeout(initialize_timeout, serve_client((), transport)).await
+                    {
+                        Ok(Ok(service)) => service,
+                        Ok(Err(error)) => {
+                            return Err(stdio_connect_error(
+                                &server_name,
+                                format!("initialization failed: {error}"),
+                                stderr_task,
+                                stderr_buffer,
+                            )
+                            .await);
+                        }
+                        Err(_) => {
+                            return Err(stdio_connect_error(
+                                &server_name,
+                                format!(
+                                    "initialization timed out after {} ms",
+                                    initialize_timeout.as_millis()
+                                ),
+                                stderr_task,
+                                stderr_buffer,
+                            )
+                            .await);
+                        }
+                    };
                 Ok(Self {
                     server_name,
                     trusted_identity: config.trusted_identity(),
@@ -109,6 +163,48 @@ impl McpClientHandle {
 
     pub async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>, rmcp::ServiceError> {
         self.running_service.peer().list_all_tools().await
+    }
+}
+
+fn capture_stderr(
+    mut stderr: tokio::process::ChildStderr,
+    buffer: Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let mut captured = buffer.lock().unwrap_or_else(|error| error.into_inner());
+            let remaining = MCP_STDERR_LIMIT.saturating_sub(captured.len());
+            captured.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+    })
+}
+
+async fn stdio_connect_error(
+    server_name: &str,
+    reason: String,
+    stderr_task: Option<JoinHandle<()>>,
+    stderr_buffer: Arc<Mutex<Vec<u8>>>,
+) -> anyhow::Error {
+    if let Some(task) = stderr_task {
+        let _ = tokio::time::timeout(MCP_STDERR_DRAIN_TIMEOUT, task).await;
+    }
+    let diagnostic = {
+        let captured = stderr_buffer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        String::from_utf8_lossy(&captured).trim().to_owned()
+    };
+    if diagnostic.is_empty() {
+        anyhow::anyhow!("MCP connection failed for '{server_name}': {reason}")
+    } else {
+        anyhow::anyhow!(
+            "MCP connection failed for '{server_name}': {reason}; stderr: {diagnostic}"
+        )
     }
 }
 

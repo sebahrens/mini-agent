@@ -58,6 +58,27 @@ jobs:
       - name: Test (${{ matrix.features }})
         run: cargo test --locked ${{ matrix.features }}
 
+  mcp-stdio:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Test MCP stdio config wiring
+        run: cargo test --locked --no-default-features --features mcp mcp_stdio_config
+
+      - name: Test MCP stdio end to end
+        run: cargo test --locked --no-default-features --features mcp mcp_stdio_end_to_end
+
+      - name: Test MCP stdio failure cleanup
+        run: cargo test --locked --no-default-features --features mcp mcp_stdio_failure_cleanup
+
   install:
     strategy:
       fail-fast: false
