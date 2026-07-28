@@ -515,23 +515,25 @@ fn standard_respects_deny_rules_for_write_in_cwd() {
 #[test]
 fn standard_asks_external_path_even_for_path_tools() {
     // External paths should still trigger Ask in Standard mode
-    let mut checker = make_checker(SecurityMode::Standard);
     let external = if cfg!(windows) {
         "D:\\outside\\file.txt"
     } else {
         "/etc/config.conf"
     };
-    let result = checker.check_path("read", external);
-    assert!(
-        matches!(result, CheckResult::Ask),
-        "expected Ask for external path, got {:?}",
-        result,
-    );
+    for tool in ["read", "grep", "find_files"] {
+        let mut checker = make_checker(SecurityMode::Standard);
+        let result = checker.check_path(tool, external);
+        assert!(
+            matches!(result, CheckResult::Ask),
+            "expected Ask for external {tool} path, got {:?}",
+            result,
+        );
+    }
 }
 
 #[test]
 fn standard_deny_still_works_for_non_path_tools() {
-    // Non-path tools (bash, grep, etc.) should still respect deny rules
+    // Non-path checks such as bash should still respect deny rules.
     let mut checker = make_checker(SecurityMode::Standard);
     let result = checker.check("bash", "rm -rf /home/user/project");
     assert!(

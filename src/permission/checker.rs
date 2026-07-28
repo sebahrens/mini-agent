@@ -568,7 +568,14 @@ impl PermissionChecker {
     fn is_path_tool(&self, tool: &str) -> bool {
         matches!(
             tool,
-            "read" | "write" | "edit" | "list_dir" | "js/read_file" | "js/write_file"
+            "read"
+                | "write"
+                | "edit"
+                | "grep"
+                | "find_files"
+                | "list_dir"
+                | "js/read_file"
+                | "js/write_file"
         )
     }
 
