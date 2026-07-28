@@ -482,8 +482,7 @@ mod windows {
         attributes: Option<&SecurityAttributes>,
     ) -> std::io::Result<Handle> {
         let path = wide(path.as_os_str());
-        let attributes =
-            attributes.map_or(null(), |value| value as *const SecurityAttributes);
+        let attributes = attributes.map_or(null(), |value| value as *const SecurityAttributes);
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),

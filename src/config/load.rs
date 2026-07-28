@@ -23,11 +23,7 @@ pub(crate) fn atomic_config_write_with_failure(
     content: &str,
     fail_rename: bool,
 ) -> io::Result<()> {
-    crate::fs::private_atomic_write_with_failure_sync(
-        path,
-        content.as_bytes(),
-        fail_rename,
-    )
+    crate::fs::private_atomic_write_with_failure_sync(path, content.as_bytes(), fail_rename)
 }
 
 pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
@@ -46,9 +42,8 @@ pub(crate) fn read_config_content(path: &Path) -> io::Result<String> {
 
 pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Config> {
     match path.extension().and_then(|extension| extension.to_str()) {
-        Some("toml") => toml::from_str(content).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "config is not valid TOML")
-        }),
+        Some("toml") => toml::from_str(content)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "config is not valid TOML")),
         _ => serde_yaml_ng::from_str(content).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

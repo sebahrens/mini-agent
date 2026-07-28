@@ -53,11 +53,7 @@ fn mode(path: &Path) -> u32 {
 fn config_persistence_permissions_ignore_permissive_umask() {
     const CHILD_PATH: &str = "ZS_CONFIG_PERMISSION_UMASK_CHILD";
     if let Some(config) = std::env::var_os(CHILD_PATH) {
-        atomic_config_write(
-            Path::new(&config),
-            "api_keys = { openai = \"secret\" }\n",
-        )
-        .unwrap();
+        atomic_config_write(Path::new(&config), "api_keys = { openai = \"secret\" }\n").unwrap();
         return;
     }
 

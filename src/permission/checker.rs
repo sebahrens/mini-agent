@@ -76,7 +76,9 @@ impl PermissionChecker {
                     let pat = if is_regex {
                         Pattern::new_regex(".*")
                     } else {
-                        Pattern::new("*")
+                        // A simple permission applies to every input, including
+                        // file paths whose components are separated by `/`.
+                        Pattern::new("**")
                     };
                     entries.push((pat, *action));
                 }
