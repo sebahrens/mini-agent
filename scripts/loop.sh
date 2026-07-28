@@ -289,16 +289,49 @@ setup_codex_home() {
     return 0
 }
 
+# show_codex_progress — reads codex --json JSONL from stdin, prints tool calls
+# line by line (mirrors show_agent_progress for the claude path).
+# Returns 0 iff "task_complete" event was seen (agent finished cleanly).
+# Event shapes (from codex exec --json JSONL):
+#   {"type":"function_call","name":"<tool>",...}  — tool invoked
+#   {"type":"task_complete",...}                   — session done
+show_codex_progress() {
+    local tool_count=0 saw_result=0
+    local start_time elapsed
+    start_time=$(date +%s)
+
+    while IFS= read -r line; do
+        elapsed=$(( $(date +%s) - start_time ))
+        case "$line" in
+            *'"type":"function_call"'*)
+                local tool_name
+                tool_name=$(printf '%s' "$line" \
+                    | grep -o '"name":"[^"]*"' | head -1 \
+                    | sed 's/"name":"//;s/"//') || true
+                [ -n "$tool_name" ] || tool_name="(tool)"
+                tool_count=$((tool_count + 1))
+                echo -e "  ${DIM}[$(printf '%02d:%02d' $((elapsed/60)) $((elapsed%60)))] #${tool_count} ${tool_name}${NC}"
+                ;;
+            *'"type":"task_complete"'*|*'"type":"session_complete"'*)
+                saw_result=1
+                echo -e "\n  ${GREEN}Codex finished — ${tool_count} tool calls in ${elapsed}s${NC}"
+                ;;
+        esac
+    done
+
+    [ "$saw_result" -eq 1 ]
+}
+
 # run_with_codex_exec <prompt_content> <temp_out> [model]
-# Writes agent output to temp_out; returns codex exit code.
+# Streams --json JSONL events through show_codex_progress (live tool-call
+# display) while writing the final message to temp_out via -o.
 run_with_codex_exec() {
     local prompt_content="$1"
     local temp_out="$2"
     local model="${3:-}"
     local err_log="${temp_out}.err"
-    local run_log="${temp_out}.log"
 
-    > "$temp_out"; > "$err_log"; > "$run_log"
+    > "$temp_out"; > "$err_log"
     mkdir -p "$CODEX_HOME/sessions"
 
     local -a codex_cmd=(
@@ -306,39 +339,36 @@ run_with_codex_exec() {
         --dangerously-bypass-approvals-and-sandbox
         --skip-git-repo-check
         --ephemeral
+        --json
         -C "$PWD"
         -o "$temp_out"
     )
     [ -n "$model" ] && codex_cmd+=(--model "$model")
     codex_cmd+=(-)
 
-    local codex_pid watchdog_pid tail_pid run_exit=0
-    echo "$prompt_content" | "${codex_cmd[@]}" >"$run_log" 2>"$err_log" &
-    codex_pid=$!
-    ( sleep "$HARD_TIMEOUT"; kill "$codex_pid" 2>/dev/null ) &
-    watchdog_pid=$!
-    # Stream codex stdout live so tool calls are visible as they happen
-    tail -f "$run_log" &
-    tail_pid=$!
-
-    wait "$codex_pid" 2>/dev/null || run_exit=$?
-    kill "$watchdog_pid" "$tail_pid" 2>/dev/null || true
-    wait "$watchdog_pid" "$tail_pid" 2>/dev/null || true
-
-    if [ "$run_exit" -eq 0 ]; then
-        rm -f "$err_log" "$run_log"
-        return 0
+    # Mirror the claude pipe pattern: timeout prefix + pipe through progress parser.
+    # show_codex_progress returns 0 iff task_complete was seen (success signal).
+    local agent_prefix=()
+    if [ -n "$TIMEOUT_BIN" ] && [ "${HARD_TIMEOUT:-0}" -gt 0 ] 2>/dev/null; then
+        agent_prefix=("$TIMEOUT_BIN" "--kill-after=30" "$HARD_TIMEOUT")
     fi
 
-    [ -s "$err_log" ] && { echo "  stderr:"; head -5 "$err_log" | sed 's/^/    /'; }
-    if [ "$run_exit" -eq 143 ] || [ "$run_exit" -eq 137 ]; then
-        echo "  (codex exec timed out after ${HARD_TIMEOUT}s)"
-    else
-        echo "  (codex exec exited $run_exit)"
+    local agent_ok=true
+    if ! { echo "$prompt_content" \
+            | { "${agent_prefix[@]}" "${codex_cmd[@]}" 2>"$err_log" || true; } \
+            | show_codex_progress; }; then
+        agent_ok=false
     fi
 
-    rm -f "$err_log" "$run_log"
-    return "$run_exit"
+    if [ "$agent_ok" = false ]; then
+        [ -s "$err_log" ] && { echo "  stderr:"; head -5 "$err_log" | sed 's/^/    /'; }
+        echo "  (codex exec: no task_complete event — timed out or failed)"
+        rm -f "$err_log"
+        return 1
+    fi
+
+    rm -f "$err_log"
+    return 0
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
