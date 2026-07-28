@@ -84,7 +84,11 @@ pub fn save_tool_output(
     let nonce = Uuid::new_v4().to_string();
     let filename = crate::paths::digest_filename(
         "session-tool-output",
-        &[session_id.as_bytes(), tool_name.as_bytes(), nonce.as_bytes()],
+        &[
+            session_id.as_bytes(),
+            tool_name.as_bytes(),
+            nonce.as_bytes(),
+        ],
         "txt",
     )?;
     let path = dir.join(filename);

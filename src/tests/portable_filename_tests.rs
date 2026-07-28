@@ -97,10 +97,22 @@ fn portable_filename_policy_has_deterministic_length_errors() {
 
 #[test]
 fn portable_filename_policy_detects_normalized_and_case_folded_collisions() {
-    assert_eq!(collision_key("Résumé").unwrap(), collision_key("RE\u{301}SUME\u{301}").unwrap());
-    assert_eq!(collision_key("Straße").unwrap(), collision_key("STRASSE").unwrap());
-    assert_eq!(collision_key("Provider").unwrap(), collision_key("provider").unwrap());
-    assert_ne!(collision_key("provider-a").unwrap(), collision_key("provider-b").unwrap());
+    assert_eq!(
+        collision_key("Résumé").unwrap(),
+        collision_key("RE\u{301}SUME\u{301}").unwrap()
+    );
+    assert_eq!(
+        collision_key("Straße").unwrap(),
+        collision_key("STRASSE").unwrap()
+    );
+    assert_eq!(
+        collision_key("Provider").unwrap(),
+        collision_key("provider").unwrap()
+    );
+    assert_ne!(
+        collision_key("provider-a").unwrap(),
+        collision_key("provider-b").unwrap()
+    );
 }
 
 #[test]

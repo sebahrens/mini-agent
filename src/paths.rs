@@ -3,11 +3,14 @@ use std::path::{Path, PathBuf};
 
 pub mod portable;
 
+pub use portable::{digest_filename, opaque_name, validate_portable_component};
+// These shared path-policy primitives are exercised by the acceptance suite
+// before all of their production consumers land.
+#[allow(unused_imports)]
 pub use portable::{
     MAX_PORTABLE_COMPONENT_BYTES, MAX_PORTABLE_COMPONENT_UTF16_UNITS, MAX_PORTABLE_PATH_BYTES,
     MAX_PORTABLE_PATH_UTF16_UNITS, PortablePathError, collision_key, contained_join,
-    digest_filename, ensure_contained, ensure_no_link_traversal, opaque_name,
-    validate_portable_component, validate_portable_relative_path,
+    ensure_contained, ensure_no_link_traversal, validate_portable_relative_path,
 };
 
 const APP_COMPONENT: &str = "zerostack";

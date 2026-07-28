@@ -45,11 +45,7 @@ pub(crate) fn token_filename(
     )?)
 }
 
-fn token_path(
-    server_name: &str,
-    url: &str,
-    settings: &OAuthSettings,
-) -> anyhow::Result<PathBuf> {
+fn token_path(server_name: &str, url: &str, settings: &OAuthSettings) -> anyhow::Result<PathBuf> {
     Ok(oauth_dir().join(token_filename(
         server_name,
         url,

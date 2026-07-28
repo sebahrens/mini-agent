@@ -76,8 +76,7 @@ pub fn validate_portable_component(component: &str) -> Result<(), PortablePathEr
 
     let utf8_bytes = component.len();
     let utf16_units = component.encode_utf16().count();
-    if utf8_bytes > MAX_PORTABLE_COMPONENT_BYTES
-        || utf16_units > MAX_PORTABLE_COMPONENT_UTF16_UNITS
+    if utf8_bytes > MAX_PORTABLE_COMPONENT_BYTES || utf16_units > MAX_PORTABLE_COMPONENT_UTF16_UNITS
     {
         return Err(PortablePathError::ComponentTooLong {
             utf8_bytes,
@@ -229,10 +228,7 @@ pub fn ensure_contained(root: &Path, candidate: &Path) -> Result<(), PortablePat
 ///
 /// Mutation code must combine this policy with the race-resistant secure
 /// filesystem contract; this preflight helper alone is not a write primitive.
-pub fn ensure_no_link_traversal(
-    root: &Path,
-    candidate: &Path,
-) -> Result<(), PortablePathError> {
+pub fn ensure_no_link_traversal(root: &Path, candidate: &Path) -> Result<(), PortablePathError> {
     ensure_contained(root, candidate)?;
     let mut current = root.to_path_buf();
     inspect_link(&current)?;
@@ -263,11 +259,9 @@ pub fn ensure_no_link_traversal(
 
 fn inspect_link(path: &Path) -> Result<(), PortablePathError> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if is_link_or_reparse(&metadata) => {
-            Err(PortablePathError::LinkTraversal {
-                path: path.to_path_buf(),
-            })
-        }
+        Ok(metadata) if is_link_or_reparse(&metadata) => Err(PortablePathError::LinkTraversal {
+            path: path.to_path_buf(),
+        }),
         Ok(_) => Ok(()),
         Err(error) => Err(PortablePathError::Filesystem {
             path: path.to_path_buf(),
@@ -312,7 +306,5 @@ fn is_windows_device(component: &str) -> bool {
     ) || upper
         .strip_prefix("COM")
         .or_else(|| upper.strip_prefix("LPT"))
-        .is_some_and(|suffix| {
-            suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
-        })
+        .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
 }
