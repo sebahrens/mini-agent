@@ -7,6 +7,17 @@ use crate::extras::js::tool::PermissionBridge;
 use crate::extras::js::types::*;
 use crate::sandbox::Sandbox;
 
+fn exception_details(
+    exception: Option<&rquickjs::Exception<'_>>,
+) -> Result<(String, String), JsOutcome> {
+    let exception = exception
+        .ok_or_else(|| JsOutcome::Error("Failed to extract exception".to_string()))?;
+    Ok((
+        exception.message().unwrap_or_default(),
+        exception.stack().unwrap_or_default(),
+    ))
+}
+
 pub(crate) fn js_thread_main(
     rx: mpsc::Receiver<JsRequest>,
     sandbox: Sandbox,
@@ -65,39 +76,55 @@ pub(crate) fn run_step(
         return JsOutcome::Error(format!("Failed to register host globals: {error}"));
     }
 
-    let result = ctx.with(|ctx| match ctx.eval::<Value, _>(code) {
-        Err(rquickjs::Error::Exception) => {
-            let exc = ctx.catch();
-            let exc = exc.as_exception().expect("exception type");
-            let msg = exc.message().unwrap_or_default();
-            let stack = exc.stack().unwrap_or_default();
-            if msg.contains("interrupted") || Instant::now() >= deadline {
-                JsOutcome::Timeout
-            } else {
-                JsOutcome::Error(format!("{msg}\n{stack}"))
+    let result = ctx.with(|ctx| {
+        let outcome = match ctx.eval::<Value, _>(code) {
+            Err(rquickjs::Error::Exception) => {
+                let exc = ctx.catch();
+                let (msg, stack) = exception_details(exc.as_exception())?;
+                if msg.contains("interrupted") || Instant::now() >= deadline {
+                    JsOutcome::Timeout
+                } else {
+                    JsOutcome::Error(format!("{msg}\n{stack}"))
+                }
             }
-        }
-        Err(e) => JsOutcome::Error(e.to_string()),
-        Ok(v) => {
-            if v.is_undefined() || v.is_null() {
-                JsOutcome::Void
-            } else if let Some(s) = v.as_string() {
-                JsOutcome::Value(s.to_string().unwrap_or_default())
-            } else if let Some(n) = v.as_int() {
-                JsOutcome::Value(n.to_string())
-            } else if let Some(f) = v.as_float() {
-                JsOutcome::Value(f.to_string())
-            } else if let Some(b) = v.as_bool() {
-                JsOutcome::Value(b.to_string())
-            } else {
-                JsOutcome::Value(format!("{v:?}"))
+            Err(e) => JsOutcome::Error(e.to_string()),
+            Ok(v) => {
+                if v.is_undefined() || v.is_null() {
+                    JsOutcome::Void
+                } else if let Some(s) = v.as_string() {
+                    JsOutcome::Value(s.to_string().unwrap_or_default())
+                } else if let Some(n) = v.as_int() {
+                    JsOutcome::Value(n.to_string())
+                } else if let Some(f) = v.as_float() {
+                    JsOutcome::Value(f.to_string())
+                } else if let Some(b) = v.as_bool() {
+                    JsOutcome::Value(b.to_string())
+                } else {
+                    JsOutcome::Value(format!("{v:?}"))
+                }
             }
-        }
+        };
+        Ok::<JsOutcome, JsOutcome>(outcome)
     });
 
     // Drain microtask queue — required for Promise resolution
     while matches!(rt.execute_pending_job(), Ok(true)) {}
 
-    result
+    result.unwrap_or_else(|error| error)
     // rt drops here — RAII; Context must be dropped before Runtime
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_caught_exception_returns_error() {
+        match exception_details(None) {
+            Err(JsOutcome::Error(message)) => {
+                assert_eq!(message, "Failed to extract exception");
+            }
+            outcome => panic!("unexpected outcome: {outcome:?}"),
+        }
+    }
 }
