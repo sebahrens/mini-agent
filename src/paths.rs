@@ -2106,9 +2106,7 @@ mod tests {
             artifact: "linked parent",
             canonical: canonical.clone(),
             candidates: vec![root.join("legacy-root").join("legacy")],
-            marker: paths
-                .migration_markers_dir()
-                .join("linked-parent.json"),
+            marker: paths.migration_markers_dir().join("linked-parent.json"),
             requirement: LegacyArtifactRequirement::Required,
             kind: LegacyArtifactKind::File,
             selected: None,

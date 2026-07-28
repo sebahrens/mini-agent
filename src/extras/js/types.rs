@@ -8,6 +8,8 @@ pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MEMORY_LIMIT: usize = 64 * 1024 * 1024; // 64 MiB
 pub const STACK_LIMIT: usize = 512 * 1024; // 512 KiB JS stack
 pub const THREAD_STACK: usize = 8 * 1024 * 1024; // 8 MiB OS thread stack
+pub const READ_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+pub const WRITE_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 
 static NEXT_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 

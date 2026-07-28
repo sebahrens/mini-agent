@@ -4,10 +4,13 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
+use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
-use crate::extras::js::types::{STEP_TIMEOUT, SpawnResult};
+use crate::extras::js::types::{
+    READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
+};
 use crate::sandbox::{Sandbox, kill_process_group};
 
 impl<'js> IntoJs<'js> for SpawnResult {
@@ -29,6 +32,14 @@ fn permission_error(tool: &'static str, error: PermissionBridgeError) -> rquickj
 
 fn timeout_error(tool: &'static str) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("host call", tool, "execution timed out")
+}
+
+fn file_error(
+    tool: &'static str,
+    kind: &'static str,
+    message: impl Into<String>,
+) -> rquickjs::Error {
+    rquickjs::Error::new_from_js_message(kind, tool, message.into())
 }
 
 async fn timeout_host_call<T>(
@@ -58,39 +69,249 @@ fn block_on_host_call<T>(
     })
 }
 
-async fn resolve_write_target(path: &str) -> PathBuf {
-    let expanded = crate::fs::expand_tilde(path);
-    let resolved = crate::fs::resolve_symlink_target(Path::new(&expanded)).await;
-    let absolute = if resolved.is_absolute() {
-        resolved
-    } else if let Ok(working_dir) = std::env::current_dir() {
-        working_dir.join(resolved)
-    } else {
-        resolved
-    };
-    let mut ancestor = absolute.as_path();
-    let mut missing_components = Vec::new();
+struct ResolvedReadTarget {
+    path: PathBuf,
+    identity: std::fs::Metadata,
+}
 
-    loop {
-        match tokio::fs::canonicalize(ancestor).await {
-            Ok(mut canonical) => {
-                for component in missing_components.iter().rev() {
-                    canonical.push(component);
-                }
-                return canonical;
+#[derive(Clone, Copy)]
+enum WriteMode {
+    Create,
+    Replace,
+}
+
+struct ResolvedWriteTarget {
+    path: PathBuf,
+    parent_identity: std::fs::Metadata,
+    mode: WriteMode,
+}
+
+fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    let source = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in source.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
             }
-            Err(_) => {
-                let Some(file_name) = ancestor.file_name() else {
-                    return absolute;
-                };
-                let Some(parent) = ancestor.parent() else {
-                    return absolute;
-                };
-                missing_components.push(file_name.to_os_string());
-                ancestor = parent;
-            }
+            Component::Normal(part) => normalized.push(part),
         }
     }
+    Ok(normalized)
+}
+
+fn permission_path(tool: &'static str, path: &Path) -> rquickjs::Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| file_error(tool, "invalid path", "resolved path is not valid UTF-8"))
+}
+
+async fn resolve_read_target(path: &str) -> rquickjs::Result<ResolvedReadTarget> {
+    let expanded = crate::fs::expand_tilde(path);
+    let absolute = absolute_lexical(Path::new(&expanded)).map_err(rquickjs::Error::Io)?;
+    let canonical = tokio::fs::canonicalize(absolute)
+        .await
+        .map_err(rquickjs::Error::Io)?;
+    permission_path("js/read_file", &canonical)?;
+    let identity = crate::fs::stable_path_metadata(&canonical)
+        .await
+        .map_err(rquickjs::Error::Io)?;
+    Ok(ResolvedReadTarget {
+        path: canonical,
+        identity,
+    })
+}
+
+async fn read_approved_file(target: ResolvedReadTarget) -> rquickjs::Result<String> {
+    if !target.identity.is_file() {
+        return Err(file_error(
+            "js/read_file",
+            "invalid file type",
+            "read_file only accepts regular files",
+        ));
+    }
+    if target.identity.len() > READ_FILE_MAX_BYTES as u64 {
+        return Err(file_error(
+            "js/read_file",
+            "resource limit",
+            format!("file exceeds {READ_FILE_MAX_BYTES} byte read limit"),
+        ));
+    }
+    let file = crate::fs::open_stable_file(&target.path)
+        .await
+        .map_err(rquickjs::Error::Io)?;
+    let opened = file.metadata().await.map_err(rquickjs::Error::Io)?;
+    crate::fs::ensure_same_file(&target.path, &target.identity, &opened)
+        .map_err(rquickjs::Error::Io)?;
+    if !opened.is_file() {
+        return Err(file_error(
+            "js/read_file",
+            "invalid file type",
+            "read_file only accepts regular files",
+        ));
+    }
+    if opened.len() > READ_FILE_MAX_BYTES as u64 {
+        return Err(file_error(
+            "js/read_file",
+            "resource limit",
+            format!("file exceeds {READ_FILE_MAX_BYTES} byte read limit"),
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take((READ_FILE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(rquickjs::Error::Io)?;
+    if bytes.len() > READ_FILE_MAX_BYTES {
+        return Err(file_error(
+            "js/read_file",
+            "resource limit",
+            format!("file exceeds {READ_FILE_MAX_BYTES} byte read limit"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        file_error(
+            "js/read_file",
+            "invalid encoding",
+            "file content is not valid UTF-8",
+        )
+    })
+}
+
+async fn resolve_write_target(path: &str) -> rquickjs::Result<ResolvedWriteTarget> {
+    use std::path::Component;
+
+    let expanded = crate::fs::expand_tilde(path);
+    let absolute = absolute_lexical(Path::new(&expanded)).map_err(rquickjs::Error::Io)?;
+    let (path, mode) = match tokio::fs::symlink_metadata(&absolute).await {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(file_error(
+                    "js/write_file",
+                    "invalid file type",
+                    "write_file does not follow final symlinks",
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(file_error(
+                    "js/write_file",
+                    "invalid file type",
+                    "write_file only replaces regular files",
+                ));
+            }
+            (
+                tokio::fs::canonicalize(&absolute)
+                    .await
+                    .map_err(rquickjs::Error::Io)?,
+                WriteMode::Replace,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut ancestor = absolute.as_path();
+            let mut missing = Vec::new();
+            let canonical_parent = loop {
+                match tokio::fs::canonicalize(ancestor).await {
+                    Ok(canonical) => break canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let name = ancestor.file_name().ok_or_else(|| {
+                            file_error(
+                                "js/write_file",
+                                "invalid path",
+                                "write target must name a file",
+                            )
+                        })?;
+                        missing.push(name.to_os_string());
+                        ancestor = ancestor.parent().ok_or_else(|| {
+                            file_error(
+                                "js/write_file",
+                                "invalid path",
+                                "write target has no existing parent",
+                            )
+                        })?;
+                    }
+                    Err(error) => return Err(rquickjs::Error::Io(error)),
+                }
+            };
+            if missing.len() != 1 {
+                return Err(file_error(
+                    "js/write_file",
+                    "invalid path",
+                    "write target parent directory does not exist",
+                ));
+            }
+            let relative = Path::new(&missing[0]);
+            if relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(file_error(
+                    "js/write_file",
+                    "invalid path",
+                    "write target contains an invalid path component",
+                ));
+            }
+            (canonical_parent.join(relative), WriteMode::Create)
+        }
+        Err(error) => return Err(rquickjs::Error::Io(error)),
+    };
+    permission_path("js/write_file", &path)?;
+    let parent = path.parent().ok_or_else(|| {
+        file_error(
+            "js/write_file",
+            "invalid path",
+            "write target has no parent directory",
+        )
+    })?;
+    let parent_identity = crate::fs::stable_path_metadata(parent)
+        .await
+        .map_err(rquickjs::Error::Io)?;
+    if !parent_identity.is_dir() {
+        return Err(file_error(
+            "js/write_file",
+            "invalid file type",
+            "write target parent is not a directory",
+        ));
+    }
+    Ok(ResolvedWriteTarget {
+        path,
+        parent_identity,
+        mode,
+    })
+}
+
+async fn write_approved_file(
+    target: ResolvedWriteTarget,
+    content: String,
+) -> rquickjs::Result<()> {
+    match target.mode {
+        WriteMode::Create => {
+            crate::fs::atomic_create_resolved_checked(
+                target.path,
+                content.as_bytes(),
+                target.parent_identity,
+            )
+            .await
+        }
+        WriteMode::Replace => {
+            crate::fs::atomic_write_resolved_checked(
+                target.path,
+                content.as_bytes(),
+                target.parent_identity,
+            )
+            .await
+        }
+    }
+    .map_err(rquickjs::Error::Io)
 }
 
 pub(crate) fn make_read_file(
@@ -98,19 +319,23 @@ pub(crate) fn make_read_file(
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String) -> rquickjs::Result<String> {
     move |path: String| {
+        let target = block_on_host_call(
+            &runtime,
+            &permission_bridge,
+            "js/read_file",
+            STEP_TIMEOUT,
+            resolve_read_target(&path),
+        )?;
+        let permission_path = permission_path("js/read_file", &target.path)?;
         permission_bridge
-            .check_path("read", &path)
+            .check_path("js/read_file", &permission_path)
             .map_err(|error| permission_error("js/read_file", error))?;
         block_on_host_call(
             &runtime,
             &permission_bridge,
             "js/read_file",
             STEP_TIMEOUT,
-            async move {
-                tokio::fs::read_to_string(path)
-                    .await
-                    .map_err(rquickjs::Error::Io)
-            },
+            read_approved_file(target),
         )
     }
 }
@@ -120,21 +345,30 @@ pub(crate) fn make_write_file(
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String, String) -> rquickjs::Result<()> {
     move |path: String, content: String| {
-        let path = runtime.block_on(resolve_write_target(&path));
-        let permission_path = path.to_string_lossy();
+        if content.len() > WRITE_FILE_MAX_BYTES {
+            return Err(file_error(
+                "js/write_file",
+                "resource limit",
+                format!("content exceeds {WRITE_FILE_MAX_BYTES} byte write limit"),
+            ));
+        }
+        let target = block_on_host_call(
+            &runtime,
+            &permission_bridge,
+            "js/write_file",
+            STEP_TIMEOUT,
+            resolve_write_target(&path),
+        )?;
+        let permission_path = permission_path("js/write_file", &target.path)?;
         permission_bridge
-            .check_path("write", &permission_path)
+            .check_path("js/write_file", &permission_path)
             .map_err(|error| permission_error("js/write_file", error))?;
         block_on_host_call(
             &runtime,
             &permission_bridge,
             "js/write_file",
             STEP_TIMEOUT,
-            async move {
-                tokio::fs::write(path, content)
-                    .await
-                    .map_err(rquickjs::Error::Io)
-            },
+            write_approved_file(target, content),
         )
     }
 }
@@ -375,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_host_call_timeout_reports_execution_timed_out() {
+    async fn js_file_host_permissions_host_call_timeout_reports_execution_timed_out() {
         for tool in ["js/read_file", "js/write_file"] {
             let error = timeout_host_call(
                 tool,
@@ -393,7 +627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_allows_paths_within_working_directory() {
+    async fn js_file_host_permissions_read_allows_paths_within_working_directory() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -408,7 +642,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_denies_external_absolute_path_without_permission_response() {
+    async fn js_file_host_permissions_read_ask_uses_exact_canonical_permission_key() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        let external_dir = temp.path().join("external");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+        let source = external_dir.join("source.txt");
+        std::fs::write(&source, "approved").unwrap();
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+
+        let read = tokio::spawn(call_read_file(
+            standard_permission(working_dir),
+            Some(ask_tx),
+            source.clone(),
+        ));
+        let request = ask_rx.recv().await.expect("read should request permission");
+        assert_eq!(request.tool.as_str(), "js/read_file");
+        assert_eq!(
+            request.input.as_str(),
+            source.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        request
+            .reply
+            .send(UserDecision::AllowOnce)
+            .expect("permission request receiver dropped");
+
+        assert_eq!(
+            read.await
+                .expect("read task panicked")
+                .expect("approved read should succeed"),
+            "approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn js_file_host_permissions_read_rejects_oversized_and_non_utf8_content() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let oversized = working_dir.join("oversized.txt");
+        let non_utf8 = working_dir.join("non-utf8.txt");
+        std::fs::write(&oversized, vec![b'x'; READ_FILE_MAX_BYTES + 1]).unwrap();
+        std::fs::write(&non_utf8, [0xff, 0xfe]).unwrap();
+
+        let error = call_read_file(
+            standard_permission(working_dir.clone()),
+            None,
+            oversized,
+        )
+        .await
+        .expect_err("oversized read should fail");
+        assert!(error.contains("resource limit"), "unexpected error: {error}");
+
+        let error = call_read_file(standard_permission(working_dir), None, non_utf8)
+            .await
+            .expect_err("non-UTF-8 read should fail");
+        assert!(
+            error.contains("invalid encoding"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn js_file_host_permissions_read_denies_external_path_without_response() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
@@ -429,7 +726,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn read_file_denies_relative_parent_traversal_without_permission_response() {
+    async fn js_file_host_permissions_read_denies_relative_parent_traversal() {
         let working_dir = std::env::current_dir().unwrap();
         let path = PathBuf::from("../".repeat(32)).join("etc/passwd");
 
@@ -445,7 +742,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn read_file_denies_symlink_escape_without_permission_response() {
+    async fn js_file_host_permissions_read_denies_symlink_escape() {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new();
@@ -469,7 +766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_allows_paths_within_working_directory() {
+    async fn js_file_host_permissions_write_allows_paths_within_working_directory() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -488,7 +785,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_denies_external_path_without_permission_response() {
+    async fn js_file_host_permissions_write_rejects_oversized_content_before_mutation() {
+        let temp = TempDir::new();
+        let working_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let target = working_dir.join("oversized.txt");
+        let runtime = tokio::runtime::Handle::current();
+        let owner = PermissionBridgeOwner::new(
+            Some(standard_permission(working_dir)),
+            None,
+            STEP_TIMEOUT,
+        );
+        let bridge = owner.bridge();
+        let target_for_call = target.clone();
+
+        let error = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            make_write_file(bridge, runtime)(
+                target_for_call.to_string_lossy().into_owned(),
+                "x".repeat(WRITE_FILE_MAX_BYTES + 1),
+            )
+            .expect_err("oversized write should fail")
+            .to_string()
+        })
+        .await
+        .expect("write task panicked");
+
+        assert!(
+            error.contains("resource limit"),
+            "unexpected error: {error}"
+        );
+        assert!(!target.exists(), "oversized write created the target");
+    }
+
+    #[tokio::test]
+    async fn js_file_host_permissions_write_denies_external_path_without_response() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
@@ -513,7 +844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_prompts_for_external_directory_permission() {
+    async fn js_file_host_permissions_write_prompts_for_external_directory() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
         let external_dir = temp.path().join("external");
@@ -532,8 +863,17 @@ mod tests {
             .recv()
             .await
             .expect("external write should request permission");
-        assert_eq!(request.tool.as_str(), "write");
-        assert_eq!(request.input.as_str(), target.to_string_lossy().as_ref());
+        assert_eq!(request.tool.as_str(), "js/write_file");
+        let expected_target = target
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(target.file_name().unwrap());
+        assert_eq!(
+            request.input.as_str(),
+            expected_target.to_string_lossy().as_ref()
+        );
         request
             .reply
             .send(UserDecision::AllowOnce)
@@ -547,7 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_calls_prompt_with_standard_tool_names_and_honor_denial() {
+    async fn js_file_host_permissions_use_js_tool_names_and_honor_denial() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -563,8 +903,11 @@ mod tests {
             source.clone(),
         ));
         let request = ask_rx.recv().await.expect("read should request permission");
-        assert_eq!(request.tool, "read");
-        assert_eq!(request.input.as_str(), source.to_string_lossy().as_ref());
+        assert_eq!(request.tool, "js/read_file");
+        assert_eq!(
+            request.input.as_str(),
+            source.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
         request
             .reply
             .send(UserDecision::Deny)
@@ -585,8 +928,17 @@ mod tests {
             .recv()
             .await
             .expect("write should request permission");
-        assert_eq!(request.tool, "write");
-        assert_eq!(request.input.as_str(), target.to_string_lossy().as_ref());
+        assert_eq!(request.tool, "js/write_file");
+        let expected_target = target
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(target.file_name().unwrap());
+        assert_eq!(
+            request.input.as_str(),
+            expected_target.to_string_lossy().as_ref()
+        );
         request
             .reply
             .send(UserDecision::Deny)
@@ -672,7 +1024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_js_read_calls_trigger_doom_loop_detection() {
+    async fn js_file_host_permissions_repeated_reads_trigger_doom_loop_detection() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
         std::fs::create_dir_all(&working_dir).unwrap();
@@ -698,7 +1050,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn write_file_denies_broken_symlink_escape() {
+    async fn js_file_host_permissions_write_rejects_broken_final_symlink() {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new();
@@ -717,10 +1069,10 @@ mod tests {
             "forbidden",
         )
         .await
-        .expect_err("resolved external symlink target should require permission");
+        .expect_err("final symlink should be rejected");
 
         assert!(
-            error.to_string().contains("Permission denied"),
+            error.to_string().contains("does not follow final symlinks"),
             "unexpected permission error: {error}"
         );
         assert!(
@@ -731,7 +1083,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn write_file_denies_symlinked_parent_escape_for_new_file() {
+    async fn js_file_host_permissions_write_denies_symlinked_parent_escape() {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new();
@@ -760,6 +1112,52 @@ mod tests {
         assert!(
             !external_target.exists(),
             "permission denial must happen before the symlinked parent target is written"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn js_file_host_permissions_reject_target_and_parent_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let workspace = temp.path().join("workspace");
+        let parent = workspace.join("parent");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+
+        let source = workspace.join("source.txt");
+        let original = workspace.join("original.txt");
+        std::fs::write(&source, "approved identity").unwrap();
+        let approved_read = resolve_read_target(source.to_str().unwrap())
+            .await
+            .expect("resolve read target");
+        std::fs::rename(&source, &original).unwrap();
+        std::fs::write(&source, "replacement").unwrap();
+        let error = read_approved_file(approved_read)
+            .await
+            .expect_err("replaced read target must fail");
+        assert!(
+            error.to_string().contains("Path changed after permission check"),
+            "unexpected read swap error: {error}"
+        );
+
+        let target = parent.join("created.txt");
+        let external_target = external.join("created.txt");
+        let approved_write = resolve_write_target(target.to_str().unwrap())
+            .await
+            .expect("resolve write target");
+        let original_parent = workspace.join("original-parent");
+        std::fs::rename(&parent, &original_parent).unwrap();
+        symlink(&external, &parent).unwrap();
+        let error = write_approved_file(approved_write, "must not escape".to_string())
+            .await
+            .expect_err("swapped parent must fail");
+        assert!(!error.to_string().is_empty(), "parent swap error was empty");
+        assert!(
+            !external_target.exists(),
+            "parent swap redirected the approved write"
         );
     }
 

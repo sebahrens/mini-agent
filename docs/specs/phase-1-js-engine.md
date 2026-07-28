@@ -231,8 +231,8 @@ Five globals exposed to JS. Phase 1 includes four; `fetch()` is Phase 2.
 
 | Global | JS signature | Rust impl | Permission check |
 |--------|-------------|-----------|-----------------|
-| `read_file(path)` | `string → string` | `std::fs::read_to_string` (blocking on JS thread) | `"js/read_file"` + path |
-| `write_file(path, content)` | `(string, string) → void` | `std::fs::write` (blocking on JS thread) | `"js/write_file"` + path |
+| `read_file(path)` | `string → string` | stable bounded read (blocking on JS thread) | `"js/read_file"` + canonical target |
+| `write_file(path, content)` | `(string, string) → void` | descriptor-relative atomic write | `"js/write_file"` + resolved final target |
 | `spawn(cmd, args)` | `(string, string[]) → {stdout, stderr, code}` | `std::process::Command` (blocking) | `"js/spawn"` + cmd |
 | `console.log(...)` | variadic | `eprintln!` / `tracing::info!` | none |
 
@@ -240,23 +240,24 @@ Five globals exposed to JS. Phase 1 includes four; `fetch()` is Phase 2.
 
 ### read_file and write_file
 
-```rust
-pub fn make_read_file() -> impl Fn(String) -> rquickjs::Result<String> {
-    move |path: String| {
-        std::fs::read_to_string(&path)
-            .map_err(|e| rquickjs::Error::new_from_js("read_file", &e.to_string()))
-    }
-}
+Before reading content, `read_file` canonicalizes the target, captures its identity, and
+requests `js/read_file` permission for the exact canonical UTF-8 path. After approval it
+rejects non-regular or oversized files, opens the canonical path without following a
+final symlink, verifies that the opened file has the pre-approval identity, and reads at
+most 1 MiB. Invalid UTF-8 and content that grows beyond the cap are typed JS errors.
 
-pub fn make_write_file() -> impl Fn(String, String) -> rquickjs::Result<()> {
-    move |path: String, content: String| {
-        std::fs::write(&path, content)
-            .map_err(|e| rquickjs::Error::new_from_js("write_file", &e.to_string()))
-    }
-}
-```
+`write_file` rejects content over 1 MiB before mutation. Existing final symlinks are
+rejected. For a new file, the nearest existing parent is canonicalized and the missing
+suffix must be exactly one normal filename component. Permission is requested for
+`js/write_file` and the derived final UTF-8 path. Creation and replacement use the
+descriptor-relative atomic helpers in `src/fs.rs`, with the approved parent identity
+revalidated immediately before mutation and no-follow traversal throughout. Resolved
+parent symlinks are allowed only because permission is bound to their resulting target.
 
-Blocking file I/O on the JS thread is acceptable — the JS thread is dedicated and not competing with tokio tasks.
+Both globals use finite 30-second host-call and permission deadlines. Denial, failed
+interactive approval, timeout, cancellation, or channel closure returns a JS error and
+performs no content read or mutation. Permission is always required even when later
+phases add filesystem allow-lists; those lists may only narrow the approved operation.
 
 ### spawn() — permission routing
 

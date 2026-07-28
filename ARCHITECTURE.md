@@ -122,6 +122,15 @@ check_perm(&self.permission, &self.ask_tx, "js/read_file", &path).await?
 
 Permission config uses the existing allow/deny/ask system. Unknown paths fall to `Ask` — user approves interactively.
 
+File permissions are bound to canonical UTF-8 targets, never the caller's unresolved
+spelling. Reads capture the target identity before approval and use a stable, no-final-
+symlink open afterward. Writes reject final symlinks, canonicalize the nearest existing
+parent for new files, and use descriptor-relative no-follow atomic create/replace
+operations that revalidate the approved parent immediately before mutation. Parent
+symlinks may be resolved, but approval is requested for the resulting final path.
+Containment checks compare path components, so a sibling prefix cannot satisfy a root.
+Both file globals have a 30-second host-call deadline and a 1 MiB content limit.
+
 ## 7. Error surfacing
 
 Errors are returned verbatim to the LLM for self-correction:

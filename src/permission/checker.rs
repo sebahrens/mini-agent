@@ -91,7 +91,10 @@ impl PermissionChecker {
                     }
                 }
             }
-            rules.insert(tool_name.to_string(), entries);
+            rules.insert(tool_name.to_string(), entries.clone());
+            if let Some(alias) = js_file_tool_alias(tool_name) {
+                rules.insert(alias.to_string(), entries);
+            }
         }
         rules
     }
@@ -127,9 +130,12 @@ impl PermissionChecker {
         ) {
             if let Some(map) = entries {
                 for (tool, patterns) in map {
-                    let entry = rules.entry(tool.clone()).or_default();
-                    for pat in patterns {
-                        entry.push((Pattern::new(pat), action));
+                    let aliases = [Some(tool.as_str()), js_file_tool_alias(tool)];
+                    for alias in aliases.into_iter().flatten() {
+                        let entry = rules.entry(alias.to_string()).or_default();
+                        for pat in patterns {
+                            entry.push((Pattern::new(pat), action));
+                        }
                     }
                 }
             }
@@ -232,7 +238,10 @@ impl PermissionChecker {
     }
 
     fn is_read_tool(&self, tool: &str) -> bool {
-        matches!(tool, "read" | "grep" | "find_files" | "list_dir" | "task")
+        matches!(
+            tool,
+            "read" | "js/read_file" | "grep" | "find_files" | "list_dir" | "task"
+        )
     }
 
     fn resolve_check_action(&self, tool: &str, matched: &SmallVec<[Action; 4]>) -> Action {
@@ -288,7 +297,8 @@ impl PermissionChecker {
             }),
             SecurityMode::PlanWrite => base.unwrap_or_else(|| {
                 if self.is_read_tool(tool)
-                    || (matches!(tool, "write" | "edit") && is_plan_file(abs_path))
+                    || (matches!(tool, "write" | "edit" | "js/write_file")
+                        && is_plan_file(abs_path))
                 {
                     Action::Allow
                 } else {
@@ -554,7 +564,10 @@ impl PermissionChecker {
     }
 
     fn is_path_tool(&self, tool: &str) -> bool {
-        matches!(tool, "read" | "write" | "edit" | "list_dir")
+        matches!(
+            tool,
+            "read" | "write" | "edit" | "list_dir" | "js/read_file" | "js/write_file"
+        )
     }
 
     fn is_external_path(&self, path_str: &str) -> bool {
@@ -612,6 +625,14 @@ impl PermissionChecker {
 
     fn count_doom_loop(&self) -> usize {
         self.consecutive_repeat_count
+    }
+}
+
+fn js_file_tool_alias(tool: &str) -> Option<&'static str> {
+    match tool {
+        "read" => Some("js/read_file"),
+        "write" => Some("js/write_file"),
+        _ => None,
     }
 }
 
@@ -784,6 +805,52 @@ mod tests {
         assert!(
             matches!(result, CheckResult::Ask),
             "resolved external target must not match the workspace allow rule, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn js_file_tools_inherit_path_rules_and_component_containment() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("safe");
+        let sibling = temp.0.join("safe-a");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Simple(Action::Allow)),
+            write: Some(ToolPerm::Simple(Action::Deny)),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["standard".to_string()]),
+        );
+
+        assert_eq!(
+            checker.check_path(
+                "js/read_file",
+                &workspace.join("inside.txt").to_string_lossy()
+            ),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check_path(
+                "js/write_file",
+                &workspace.join("inside.txt").to_string_lossy()
+            ),
+            CheckResult::Denied("Blocked by deny rule".to_string())
+        );
+
+        let default_checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace),
+            Some(vec!["standard".to_string()]),
+        );
+        assert!(
+            default_checker.is_external_path(&sibling.join("outside.txt").to_string_lossy()),
+            "sibling-prefix path must remain outside the workspace"
         );
     }
 }
