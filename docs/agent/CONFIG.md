@@ -833,11 +833,27 @@ prints an authorization URL and copies it to your clipboard; open it in a
 browser, approve access, and the redirect is caught on the loopback port. The
 browser wait runs in the background, so the TUI stays responsive (you can keep
 working or select the URL with the mouse to copy it). The token is saved to
-`<data_dir>/mcp-oauth/<server>.json` (mode 0600 on unix), and the server
-reconnects automatically once authorization completes. Later sessions reuse the
-stored refresh token and reconnect without a browser. Use
-`/mcp logout <server>` to remove a stored token. A server with OAuth enabled but
-no stored token fails to connect until you log in.
+`<credentials_dir>/mcp-oauth/<opaque-server-identity>.json`; server display
+names never become filenames. `credentials_dir` defaults to
+`<local_data_dir>/credentials` (including `%LOCALAPPDATA%\zerostack\credentials`
+on Windows) and can be set explicitly with the absolute `ZS_CREDENTIALS_DIR`
+override.
+
+The credential directory and every final, temporary, and lock file are private
+from creation: `0700`/`0600` on Unix and a protected current-user/SYSTEM DACL
+on Windows. Existing owned regular paths are repaired to that policy; symlinks,
+reparse points, wrong-type paths, oversized records, and ambiguous legacy names
+fail closed. zerostack imports an unambiguous legacy
+`<data_dir>/mcp-oauth/<server>.json` only when the canonical record is absent,
+leaves the legacy source in place for recovery, and can safely retry after an
+interruption. A private, non-secret migration marker prevents an explicit logout
+from re-importing that retained source. Resolve a migration conflict by moving
+aside the unrelated legacy candidate, then reconnect or log in again.
+
+Later sessions reuse the stored refresh token and reconnect without a browser.
+Use `/mcp logout <server>` to remove only that canonical identity's stored
+token. A server with OAuth enabled but no stored token fails to connect until
+you log in.
 
 ### Recommended MCP servers
 
