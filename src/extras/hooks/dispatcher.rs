@@ -6,7 +6,7 @@ use super::channel::{ChannelResult, interpret_hook_output};
 use super::envelope::{EventFields, build_envelope};
 use super::normalize::canonical_tool_name;
 use super::settings::{HookHandler, HooksConfig};
-use super::subprocess::{HookOutput, run_hook};
+use super::subprocess::{HookOutput, run_hook, run_shell_condition};
 use super::{Decision, HookCtx, PreDecision, Verdict};
 
 /// Default per-hook timeout when a handler doesn't declare one.
@@ -281,7 +281,7 @@ impl HookDispatcher {
                 let cond_timeout =
                     std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
                 let cond_output =
-                    run_hook(condition, None, &stdin, cond_timeout, project_dir).await;
+                    run_shell_condition(condition, &stdin, cond_timeout, project_dir).await;
                 if cond_output.timed_out {
                     tracing::warn!(
                         "hooks: `if` condition for {command:?} timed out; failing closed (running the handler)"

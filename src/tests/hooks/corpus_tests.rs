@@ -32,8 +32,8 @@ fn ctx() -> HookCtx {
 fn dispatcher_for(event: &str, hook_path: &Path) -> HookDispatcher {
     let handler = HookHandler {
         kind: "command".to_string(),
-        command: Some(format!("sh {}", hook_path.display())),
-        args: None,
+        command: Some("sh".to_string()),
+        args: Some(vec![hook_path.display().to_string()]),
         timeout: Some(5),
         is_async: false,
         condition: None,

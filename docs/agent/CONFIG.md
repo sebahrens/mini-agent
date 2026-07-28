@@ -273,13 +273,12 @@ or project file) or the `--no-hooks` CLI flag suppresses every non-managed
 hook; managed hooks still run regardless. A missing or invalid file is not an
 error — it just contributes nothing.
 
-**Compatible with Claude Code's `.claude/settings.json`**: zerostack does not
-read that file directly, but its own `settings.json` uses the identical
-`hooks` schema, so copying or symlinking the `hooks` key from
-`.claude/settings.json` into `.zerostack/settings.json` works as-is. Scripts
-themselves may still need a change: zerostack sets `$ZEROSTACK_PROJECT_DIR`
-rather than `$CLAUDE_PROJECT_DIR`, so a script that reads the latter must be
-updated to read the former.
+**Largely compatible with Claude Code's `.claude/settings.json`**: zerostack
+does not read that file directly, but its own `settings.json` uses the same
+basic `hooks` schema. For security, every command handler must add an `args`
+array (use `[]` when the executable takes no arguments); zerostack never
+implicitly passes `command` to a shell. Scripts may also need a change because
+zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 
 ### Handler schema
 
@@ -290,7 +289,7 @@ updated to read the former.
       {
         "matcher": "Bash|Write",
         "hooks": [
-          { "type": "command", "command": "./guard.sh", "timeout": 30 }
+          { "type": "command", "command": "./guard.sh", "args": [], "timeout": 30 }
         ]
       }
     ]
@@ -301,8 +300,8 @@ updated to read the former.
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `type` | string | Only `"command"` is supported. |
-| `command` | string | Shell command, run via `sh -c` on Unix (`powershell -Command` on Windows, experimental). Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set in its environment. |
-| `args` | array of strings | When present, bypasses the shell entirely: `command` is executed directly as the program with `args` as its argv (no shell metacharacter expansion). |
+| `command` | string | Executable to run directly. Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set in its environment. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
+| `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
 | `timeout` | integer (seconds) | Per-hook timeout; the whole process group is killed on expiry. Default: 60. |
 | `async` | boolean | When `true`, the hook runs in the background and its decision is ignored. Default: `false`. |
 | `if` | string | A shell command evaluated (with the same stdin envelope) before the handler runs; the handler only runs if it exits `0`. Fails closed: a broken/unparseable/timed-out condition still runs the handler, with a warning. |
@@ -1211,4 +1210,3 @@ With `-v`, the following subsystems produce debug/trace output:
 - **Memory**: store open, write operations (target/bytes), searches, tool entry points
 - **Advisor**: initialization (model, enabled, max uses), tool call prompts
 - **Filesystem**: atomic write paths and byte counts
-

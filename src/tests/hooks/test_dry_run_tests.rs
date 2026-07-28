@@ -7,8 +7,8 @@ use crate::extras::hooks::{HookCtx, hooks_test_dry_run_with};
 fn handler(command: &str) -> HookHandler {
     HookHandler {
         kind: "command".to_string(),
-        command: Some(command.to_string()),
-        args: None,
+        command: Some("sh".to_string()),
+        args: Some(vec!["-c".to_string(), command.to_string()]),
         timeout: Some(5),
         is_async: false,
         condition: None,

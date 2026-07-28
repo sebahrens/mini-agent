@@ -92,11 +92,12 @@ async fn resumed_session_history_survives_stop_hook_continuation() {
     // decision, releasing the final response.
     let handler = HookHandler {
         kind: "command".to_string(),
-        command: Some(
+        command: Some("sh".to_string()),
+        args: Some(vec![
+            "-c".to_string(),
             r#"if grep -q '"stop_hook_active":false'; then echo '{"decision":"block","reason":"resume once more"}'; fi"#
                 .to_string(),
-        ),
-        args: None,
+        ]),
         timeout: Some(5),
         is_async: false,
         condition: None,

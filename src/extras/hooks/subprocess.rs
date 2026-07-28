@@ -15,28 +15,21 @@ pub(crate) struct HookOutput {
     pub timed_out: bool,
 }
 
-/// Pure: builds the invocation for a hook command. When `args` is present,
-/// uses the exec form: `command` is the program itself, run directly with
-/// `args` as its argv, bypassing the shell entirely (no metacharacter
-/// expansion). When absent, falls back to the shell form (`sh -c command` on
-/// Unix, `powershell -Command command` on Windows).
-pub(crate) fn build_shell_invocation(
+const MISSING_ARGS_ERROR: &str =
+    "hook command requires an `args` field (use an empty array for no arguments)";
+
+/// Pure: builds the direct exec-form invocation for a hook command.
+///
+/// Requiring `args` prevents `command` from being interpreted by a shell.
+/// Callers that intentionally need shell behavior must make that explicit by
+/// setting `command` to the shell executable and passing the script in `args`.
+pub(crate) fn build_hook_invocation(
     command: &str,
     args: Option<&[String]>,
-) -> (String, Vec<String>) {
+) -> Result<(String, Vec<String>), &'static str> {
     match args {
-        Some(args) => (command.to_string(), args.to_vec()),
-        None => {
-            let (shell, flag) = if cfg!(windows) {
-                ("powershell", "-Command")
-            } else {
-                ("sh", "-c")
-            };
-            (
-                shell.to_string(),
-                vec![flag.to_string(), command.to_string()],
-            )
-        }
+        Some(args) => Ok((command.to_string(), args.to_vec())),
+        None => Err(MISSING_ARGS_ERROR),
     }
 }
 
@@ -45,7 +38,8 @@ pub(crate) fn build_shell_invocation(
 /// timeout kills the whole process group. `async: true` handling (run in the
 /// background, ignore the decision) is the caller's responsibility.
 /// `project_dir` is exposed to the hook as `$ZEROSTACK_PROJECT_DIR`. `args`
-/// selects the exec form (see [`build_shell_invocation`]) when present.
+/// is required so the command always uses direct exec form (see
+/// [`build_hook_invocation`]).
 pub(crate) async fn run_hook(
     command: &str,
     args: Option<&[String]>,
@@ -53,7 +47,17 @@ pub(crate) async fn run_hook(
     timeout: std::time::Duration,
     project_dir: &str,
 ) -> HookOutput {
-    let (program, args) = build_shell_invocation(command, args);
+    let (program, args) = match build_hook_invocation(command, args) {
+        Ok(invocation) => invocation,
+        Err(message) => {
+            return HookOutput {
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: message.as_bytes().to_vec(),
+                timed_out: false,
+            };
+        }
+    };
     let mut cmd = Command::new(program);
     cmd.args(args);
     cmd.env("ZEROSTACK_PROJECT_DIR", project_dir);
@@ -127,4 +131,20 @@ pub(crate) async fn run_hook(
             }
         }
     }
+}
+
+/// Runs an `if` condition using its documented shell-command semantics.
+pub(crate) async fn run_shell_condition(
+    condition: &str,
+    stdin_json: &[u8],
+    timeout: std::time::Duration,
+    project_dir: &str,
+) -> HookOutput {
+    let (shell, flag) = if cfg!(windows) {
+        ("powershell", "-Command")
+    } else {
+        ("sh", "-c")
+    };
+    let args = vec![flag.to_string(), condition.to_string()];
+    run_hook(shell, Some(&args), stdin_json, timeout, project_dir).await
 }
