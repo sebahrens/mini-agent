@@ -95,10 +95,30 @@ echo "$$" > "$LOOP_LOCK_DIR/pid"
 # Also flushes dolt — the per-iteration push is now batched (every N iters)
 # to reduce GC churn, so the final flush guarantees nothing is left unsynced.
 _loop_exit_cleanup() {
+    local exit_status=$?
+    # This handler exits explicitly to preserve the original status (or turn a
+    # failed safety reopen into failure), so prevent recursive EXIT handling.
+    trap - EXIT
+    set +e
+
+    if [ "${MODE:-}" = build ] \
+            && [ -n "${PICKED_ID:-}" ] \
+            && [ "${BUILD_ACCEPTANCE_ENFORCED:-true}" != true ]; then
+        echo "[loop] exit during acceptance window — reopening ${PICKED_ID}" >&2
+        if declare -F reopen_build_bead >/dev/null 2>&1 \
+                && reopen_build_bead "$PICKED_ID" 1 unavailable; then
+            BUILD_ACCEPTANCE_ENFORCED=true
+        else
+            echo "[loop] EXIT SAFETY FAILURE: could not confirm ${PICKED_ID} open" >&2
+            [ "$exit_status" -ne 0 ] || exit_status=1
+        fi
+    fi
+
     if command -v bd >/dev/null 2>&1; then
         bd dolt push 2>/dev/null || true
     fi
     rm -rf "$LOOP_LOCK_DIR"
+    exit "$exit_status"
 }
 trap _loop_exit_cleanup EXIT
 
@@ -703,8 +723,23 @@ sign_test_binaries() {
     echo -e "${BOLD}│${NC}  ${DIM}codesign: signed=${signed} reused=${reused} failed=${failed}${NC}"
 }
 
+report_verification_failure() {
+    local errors="$1" source_bead="${PICKED_ID:-unknown}"
+    [ ${#errors} -gt 3000 ] && errors="[truncated]..${errors: -3000}"
+
+    if bd create --title="Fix build errors from iteration $CURRENT_ITERATION ($source_bead)" \
+            --type=bug --priority=0 \
+            --description="Post-agent verification failed. Fix before any other work.$'\n\n'$errors" \
+            >/dev/null 2>&1; then
+        echo -e "${RED}  Filed P0 bug bead — next iteration will pick it up${NC}"
+    else
+        echo -e "${RED}  Failed to file P0 verification bead; original build bead will remain open${NC}" >&2
+    fi
+}
+
 run_verification() {
-    local range_base="${1:-}" range_head="${2:-}"
+    local range_base="${1:-}" range_head="${2:-}" profile="${3:-headless}" surfaces="${4:-rust}"
+    [ "$profile" = packaged-artifact ] && [ "$surfaces" = rust ] && surfaces="rust,packaging"
     # Only verify in build mode — review/plan don't write code
     if [ "$MODE" != "build" ]; then return 0; fi
 
@@ -739,19 +774,154 @@ run_verification() {
     echo -e "${BOLD}│  POST-AGENT VERIFICATION                                         │${NC}"
     echo -e "${BOLD}├──────────────────────────────────────────────────────────────────┤${NC}"
 
-    # Fast path: skip verification entirely if the iteration didn't touch any
-    # Rust source or Cargo metadata.
-    if git rev-parse "$range_base" "$range_head" >/dev/null 2>&1; then
-        local rust_changed=false
-        if git diff --name-only "$range_base" "$range_head" 2>/dev/null \
-            | grep -qE '\.(rs|toml)$|^Cargo\.lock$'; then
-            rust_changed=true
+    # Every accepted implementation range gets syntax checks plus the complete
+    # Cargo verification suite, including non-Rust packaging/script changes.
+    local changed_files="" diff_check_output="" relevant_files=0
+    if ! git rev-parse "$range_base" "$range_head" >/dev/null 2>&1 \
+            || ! changed_files=$(git diff --name-only "$range_base" "$range_head" 2>/dev/null); then
+        failed=1
+        errors+="=== verification range ===$'\n'Unable to inspect $range_base..$range_head$'\n\n'"
+    elif [ -z "$changed_files" ]; then
+        failed=1
+        errors+="=== verification range ===$'\n'No files changed in $range_base..$range_head$'\n\n'"
+    fi
+
+    echo -e "${BOLD}│${NC}  ${CYAN}git diff --check...${NC}"
+    if diff_check_output=$(git diff --check "$range_base" "$range_head" 2>&1); then
+        echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} git diff --check"
+    else
+        failed=1
+        echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} git diff --check"
+        errors+="=== diff errors ===$'\n'${diff_check_output}$'\n\n'"
+    fi
+
+    local changed_file syntax_output first_line relevant shell_file
+    while IFS= read -r changed_file; do
+        [ -n "$changed_file" ] && [ -f "$changed_file" ] || continue
+        relevant=false
+        if path_is_relevant_for_profile "$changed_file" "$profile" "$surfaces"; then
+            relevant=true
+            relevant_files=$((relevant_files + 1))
         fi
-        if [ "$rust_changed" = false ]; then
-            echo -e "${BOLD}│${NC}  ${DIM}SKIP${NC} no .rs/.toml/Cargo.lock changes in verification range — verification not needed"
-            echo -e "${BOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
-            return 0
+
+        shell_file=false
+        case "$changed_file" in
+            *.sh) shell_file=true ;;
+            *)
+                IFS= read -r first_line < "$changed_file" || first_line=""
+                [[ "$first_line" =~ ^'#!'.*(bash|/sh|zsh|ksh) ]] && shell_file=true
+                ;;
+        esac
+        if [ "$shell_file" = true ]; then
+            echo -e "${BOLD}│${NC}  ${CYAN}bash -n ${changed_file}...${NC}"
+            if syntax_output=$(bash -n "$changed_file" 2>&1); then
+                echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} bash -n ${changed_file}"
+            else
+                failed=1
+                echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} bash -n ${changed_file}"
+                errors+="=== shell syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+            fi
+            continue
         fi
+
+        case "$changed_file" in
+            *.rs|*.toml|Cargo.lock)
+                ;;
+            *.json)
+                if ! command -v jq >/dev/null 2>&1; then
+                    failed=1
+                    errors+="=== JSON verification unavailable ===$'\n'jq is required for ${changed_file}$'\n\n'"
+                elif ! syntax_output=$(jq empty "$changed_file" 2>&1); then
+                    failed=1
+                    errors+="=== JSON syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                fi
+                ;;
+            *.yaml|*.yml)
+                if command -v ruby >/dev/null 2>&1; then
+                    syntax_output=$(ruby -e 'require "psych"; Psych.parse_file(ARGV.fetch(0))' "$changed_file" 2>&1) || {
+                        failed=1
+                        errors+="=== YAML syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                    }
+                elif command -v python3 >/dev/null 2>&1 \
+                        && python3 -c 'import yaml' >/dev/null 2>&1; then
+                    syntax_output=$(python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1], encoding="utf-8"))' "$changed_file" 2>&1) || {
+                        failed=1
+                        errors+="=== YAML syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                    }
+                else
+                    failed=1
+                    errors+="=== YAML verification unavailable ===$'\n'No Ruby Psych or Python PyYAML for ${changed_file}$'\n\n'"
+                fi
+                ;;
+            *.js|*.mjs|*.cjs)
+                if ! command -v node >/dev/null 2>&1; then
+                    failed=1
+                    errors+="=== JavaScript verification unavailable ===$'\n'node is required for ${changed_file}$'\n\n'"
+                elif ! syntax_output=$(node --check "$changed_file" 2>&1); then
+                    failed=1
+                    errors+="=== JavaScript syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                fi
+                ;;
+            *.rb)
+                if ! command -v ruby >/dev/null 2>&1; then
+                    failed=1
+                    errors+="=== Ruby verification unavailable ===$'\n'ruby is required for ${changed_file}$'\n\n'"
+                elif ! syntax_output=$(ruby -c "$changed_file" 2>&1); then
+                    failed=1
+                    errors+="=== Ruby syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                fi
+                ;;
+            *.py)
+                if ! command -v python3 >/dev/null 2>&1; then
+                    failed=1
+                    errors+="=== Python verification unavailable ===$'\n'python3 is required for ${changed_file}$'\n\n'"
+                else
+                    mkdir -p target/.loop-pycache
+                    if ! syntax_output=$(PYTHONPYCACHEPREFIX="$PWD/target/.loop-pycache" python3 -m py_compile "$changed_file" 2>&1); then
+                        failed=1
+                        errors+="=== Python syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                    fi
+                fi
+                ;;
+            *.ps1)
+                if ! command -v pwsh >/dev/null 2>&1; then
+                    failed=1
+                    errors+="=== PowerShell verification unavailable ===$'\n'pwsh is required for ${changed_file}$'\n\n'"
+                elif ! syntax_output=$(pwsh -NoProfile -Command '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$null, [ref]$errors); if ($errors) { $errors | Out-String | Write-Error; exit 1 }' "$changed_file" 2>&1); then
+                    failed=1
+                    errors+="=== PowerShell syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                fi
+                ;;
+            *.nix)
+                if ! command -v nix-instantiate >/dev/null 2>&1; then
+                    failed=1
+                    errors+="=== Nix verification unavailable ===$'\n'nix-instantiate is required for ${changed_file}$'\n\n'"
+                elif ! syntax_output=$(nix-instantiate --parse "$changed_file" 2>&1); then
+                    failed=1
+                    errors+="=== Nix syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                fi
+                ;;
+            justfile)
+                if ! command -v just >/dev/null 2>&1; then
+                    failed=1
+                    errors+="=== justfile verification unavailable ===$'\n'just is required for ${changed_file}$'\n\n'"
+                elif ! syntax_output=$(just --summary --justfile "$changed_file" 2>&1); then
+                    failed=1
+                    errors+="=== justfile syntax errors ===$'\n'${syntax_output}$'\n\n'"
+                fi
+                ;;
+            *)
+                if [ "$relevant" = true ]; then
+                    failed=1
+                    errors+="=== verifier missing ===$'\n'No automated checker is configured for relevant file ${changed_file} (profile=${profile})$'\n\n'"
+                fi
+                ;;
+        esac
+    done <<< "$changed_files"
+
+    if [ "$relevant_files" -eq 0 ]; then
+        failed=1
+        errors+="=== relevance allowlist ===$'\n'No ${profile} production implementation file changed for declared surfaces: ${surfaces}$'\n\n'"
     fi
 
     # mini-agent workspace: root package (mini-agent) and spike/.
@@ -821,26 +991,15 @@ run_verification() {
         errors+="=== cargo clippy errors ===$'\n'${clippy_output}$'\n\n'"
     fi
 
-    # Tier-by-iteration test policy:
-    #   every iter:        check    (skip test step entirely; clippy covered it)
-    #   iter % 3 == 0:     libbins  (cargo test --bins)
-    #   iter % 10 == 0:    full     (cargo test --bins --tests)
+    # Every accepted Rust iteration executes all unit and integration tests for
+    # the affected package. Acceptance never uses a type-check-only tier.
     # Both workspace packages are binary-only, so requesting --lib makes Cargo
     # fail with "no library targets found" before it can build any tests.
-    # Override via env: LOOP_TEST_TIER=check|libbins|full
-    local test_tier="${LOOP_TEST_TIER:-}"
-    if [ -z "$test_tier" ]; then
-        if [ "$((CURRENT_ITERATION % 10))" = "0" ]; then
-            test_tier="full"
-        elif [ "$((CURRENT_ITERATION % 3))" = "0" ]; then
-            test_tier="libbins"
-        else
-            test_tier="check"
-        fi
-    fi
-
-    if [ "$test_tier" = "check" ]; then
-        echo -e "${BOLD}│${NC}  ${DIM}tests skipped — tier=check, iter=${CURRENT_ITERATION} (clippy --all-targets already type-checked)${NC}"
+    local test_tier="full"
+    if [ "${LOOP_TEST_TIER:-full}" != full ]; then
+        echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} LOOP_TEST_TIER may not skip integration tests"
+        failed=1
+        errors+="=== test policy ===$'\n'Every Rust acceptance requires the full test tier$'\n\n'"
     else
         local test_log="$cargo_dir/target/.loop-test.log"
         mkdir -p "$(dirname "$test_log")"
@@ -900,10 +1059,12 @@ run_verification() {
             fi
         fi
 
-        # Phase 1.5: filter binaries to those without a current PASS entry.
-        # Cache busts on touched test fixtures or entries older than cache TTL.
+        # Phase 1.5: enumerate every built test binary for execution.
         local pass_cache="$cargo_dir/target/.loop-test-pass-cache"
-        local cache_ttl="${LOOP_TEST_CACHE_TTL_SECS:-86400}"
+        # Execute every freshly built test binary. Hash caching previously let
+        # runtime regressions escape acceptance when an integration binary was
+        # unchanged or a cached test became flaky.
+        local cache_ttl=0
         local bins_to_run="$cargo_dir/target/.loop-test-bins-to-run.txt"
         local cached=0 to_run_count=0
         local now_ts
@@ -929,7 +1090,7 @@ run_verification() {
                     continue
                 fi
                 _cached_line=$(grep -F -- "$_bin"$'\t'"$_cur"$'\t' "$pass_cache" 2>/dev/null | head -1)
-                if [ -n "$_cached_line" ]; then
+                if [ "$cache_ttl" -gt 0 ] && [ -n "$_cached_line" ]; then
                     _cached_ts=$(printf '%s' "$_cached_line" | cut -f4)
                     if [ -n "$_cached_ts" ] && [ $((now_ts - _cached_ts)) -lt "$cache_ttl" ]; then
                         cached=$((cached + 1))
@@ -1000,19 +1161,12 @@ run_verification() {
     echo -e "${BOLD}│${NC}  ${RED}Verification FAILED — filing P0 bug bead${NC}"
     echo -e "${BOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
 
-    [ ${#errors} -gt 3000 ] && errors="[truncated]..${errors: -3000}"
-
-    local source_bead="${PICKED_ID:-unknown}"
-    bd create --title="Fix build errors from iteration $CURRENT_ITERATION ($source_bead)" \
-        --type=bug --priority=0 \
-        --description="Post-agent verification failed. Fix before any other work.$'\n\n'$errors"
-
-    echo -e "${RED}  Filed P0 bug bead — next iteration will pick it up${NC}"
+    report_verification_failure "$errors"
     return 1
 }
 
 show_agent_progress() {
-    local tool_count=0 start_time saw_result=0
+    local tool_count=0 start_time result_status=missing
     start_time=$(date +%s)
 
     while IFS= read -r line; do
@@ -1027,21 +1181,47 @@ show_agent_progress() {
                 fi
                 ;;
             *'"type":"result"'*)
-                saw_result=1
                 local elapsed=$(( $(date +%s) - start_time ))
-                echo -e "\n  ${GREEN}Agent finished — ${tool_count} tool calls in ${elapsed}s${NC}"
-                if command -v jq &>/dev/null; then
-                    local cost turns
-                    cost=$(echo "$line" | jq -r '.cost_usd // empty' 2>/dev/null) || true
-                    turns=$(echo "$line" | jq -r '.num_turns // empty' 2>/dev/null) || true
-                    [ -n "$cost" ] && [ "$cost" != "null" ] && echo -e "  ${DIM}Cost: \$${cost} · Turns: ${turns}${NC}"
+                if command -v jq >/dev/null 2>&1 \
+                        && printf '%s\n' "$line" \
+                            | jq -e '.type == "result"
+                                    and ((.is_error // false) == false)
+                                    and ((.subtype // "success") == "success")' >/dev/null 2>&1; then
+                    result_status=success
+                    echo -e "\n  ${GREEN}Agent finished — ${tool_count} tool calls in ${elapsed}s${NC}"
+                else
+                    result_status=error
+                    echo -e "\n  ${RED}Agent returned a terminal error — ${tool_count} tool calls in ${elapsed}s${NC}" >&2
                 fi
+                local cost turns
+                cost=$(printf '%s\n' "$line" | jq -r '.cost_usd // empty' 2>/dev/null) || true
+                turns=$(printf '%s\n' "$line" | jq -r '.num_turns // empty' 2>/dev/null) || true
+                [ -n "$cost" ] && [ "$cost" != "null" ] && echo -e "  ${DIM}Cost: \$${cost} · Turns: ${turns}${NC}"
                 break
                 ;;
         esac
     done
-    # Return non-zero only if the agent never emitted a final "result" event.
-    [ "$saw_result" = "1" ]
+    # A terminal frame is necessary but not sufficient: explicit error and
+    # malformed result frames fail just like a missing terminal frame.
+    [ "$result_status" = success ]
+}
+
+run_with_claude_agent() {
+    local prompt_content="$1"
+    shift
+    local -a agent_prefix=("$@") pipeline_status
+
+    printf '%s\n' "$prompt_content" \
+        | env -u ANTHROPIC_API_KEY "${agent_prefix[@]}" $AGENT_CMD \
+            --dangerously-skip-permissions --verbose --output-format stream-json \
+            "${AGENT_MODEL_ARGS[@]}" -p - \
+        | show_agent_progress
+    pipeline_status=("${PIPESTATUS[@]}")
+
+    [ "${#pipeline_status[@]}" -eq 3 ] \
+        && [ "${pipeline_status[0]}" -eq 0 ] \
+        && [ "${pipeline_status[1]}" -eq 0 ] \
+        && [ "${pipeline_status[2]}" -eq 0 ]
 }
 
 generate_evidence_token() {
@@ -1056,45 +1236,738 @@ generate_evidence_token() {
     printf '%s\n' "$token"
 }
 
-real_binary_evidence_status() {
-    local issue_id="$1" token="$2" comments_file parsed
-    command -v jq >/dev/null 2>&1 || { echo unavailable; return; }
-    comments_file=$(mktemp) || { echo unavailable; return; }
+bead_verification_profile() {
+    local issue_id="$1" issue_file profile
+    command -v jq >/dev/null 2>&1 || return 1
+    issue_file=$(mktemp) || return 1
+    if ! bd show "$issue_id" --json > "$issue_file" 2>/dev/null; then
+        rm -f "$issue_file"
+        return 1
+    fi
+    profile=$(jq -er '
+        (if type == "array" then .[0] else . end) as $bead
+        | select(($bead | type) == "object")
+        | (($bead.labels // []) | map(tostring | ascii_downcase)) as $labels
+        | ([ $bead.title // "", $bead.description // "", $bead.acceptance_criteria // "" ]
+            | map(tostring) | join(" ") | ascii_downcase) as $scope
+        | (($bead.title // "") | tostring | ascii_downcase) as $title
+        | if (($labels | any(. == "packaging" or . == "release" or . == "release-archive" or . == "distribution-archive"))
+              or ($title | test("\\b(packag(e|ed|ing)|release|installer|homebrew)\\b"))
+              or ($scope | test("\\b(cargo package|release archive|distribution archive|packaged binary|package artifact)\\b"))) then
+              "packaged-artifact"
+          elif (($labels | any(. == "tui" or . == "terminal-ui" or . == "interactive"))
+                or ($scope | test("\\b(tui|terminal ui|tmux|interactive (ui|flow|picker))\\b"))) then
+              "tmux-tui"
+          elif (($labels | any(. == "connectivity" or . == "provider-connectivity"))
+                or ($title | test("\\b(openrouter|provider|api)?[ -]*(connectivity|connection) smoke\\b|\\bbasic provider connectivity\\b"))) then
+              "connectivity"
+          else "headless"
+          end
+    ' "$issue_file" 2>/dev/null) || profile=""
+    rm -f "$issue_file"
+    case "$profile" in
+        headless|connectivity|tmux-tui|packaged-artifact) printf '%s\n' "$profile" ;;
+        *) return 1 ;;
+    esac
+}
+
+bead_implementation_surfaces() {
+    local issue_id="$1" profile="$2" issue_file surfaces
+    command -v jq >/dev/null 2>&1 || return 1
+    issue_file=$(mktemp) || return 1
+    if ! bd show "$issue_id" --json > "$issue_file" 2>/dev/null; then
+        rm -f "$issue_file"
+        return 1
+    fi
+    surfaces=$(jq -er --arg profile "$profile" '
+        (if type == "array" then .[0] else . end) as $bead
+        | select(($bead | type) == "object")
+        | (($bead.labels // []) | map(tostring | ascii_downcase)) as $labels
+        | ([ $bead.title // "", $bead.description // "", $bead.acceptance_criteria // "" ]
+            | map(tostring) | join(" ") | ascii_downcase) as $scope
+        | (($bead.title // "") | tostring | ascii_downcase) as $title
+        | (["rust"]
+            + (if $profile == "packaged-artifact" then ["packaging"] else [] end)
+            + (if (($labels | any(. == "script" or . == "shell" or . == "automation" or . == "loop"))
+                    or ($title | test("\\b(loop(\\.sh)?|shell|automation|script)\\b"))
+                    or ($scope | test("\\b(shell script|build script|agent loop|loop\\.sh|prompt file)\\b")))
+                then ["script"] else [] end)
+            + (if (($labels | any(. == "data" or . == "fixture" or . == "catalog"))
+                    or ($title | test("\\b(data|fixture|catalog|registry)\\b")))
+                then ["data"] else [] end)
+            + (if (($labels | any(. == "asset" or . == "image" or . == "icon"))
+                    or ($title | test("\\b(asset|image|icon|logo|banner)\\b")))
+                then ["asset"] else [] end)
+            + (if (($labels | any(. == "cargo-config" or . == "build-config"))
+                    or ($title | test("\\b(cargo config|build config|rust toolchain)\\b")))
+                then ["cargo-config"] else [] end))
+        | unique | join(",")
+        | select(length > 0)
+    ' "$issue_file" 2>/dev/null) || surfaces=""
+    rm -f "$issue_file"
+    [ -n "$surfaces" ] || return 1
+    printf '%s\n' "$surfaces"
+}
+
+real_binary_evidence_payload() {
+    local issue_id="$1" token="$2" comments_file payload
+    command -v jq >/dev/null 2>&1 || { printf '{"state":"unavailable"}\n'; return; }
+    comments_file=$(mktemp) || { printf '{"state":"unavailable"}\n'; return; }
     if ! bd comments "$issue_id" --json > "$comments_file" 2>/dev/null; then
-        rm -f "$comments_file"; echo unavailable; return
+        rm -f "$comments_file"
+        printf '{"state":"unavailable"}\n'
+        return
     fi
-    if ! jq -e 'if type == "array" then . elif (.comments? | type) == "array" then .comments else error("unexpected comments JSON") end' "$comments_file" >/dev/null 2>&1; then
-        rm -f "$comments_file"; echo invalid; return
-    fi
-    parsed=$(jq -r --arg token "$token" '
-        (if type == "array" then . else .comments end)
+    payload=$(jq -c --arg token "$token" '
+        (if type == "array" then .
+         elif (.comments? | type) == "array" then .comments
+         else error("unexpected comments JSON") end)
         | to_entries
-        | map({index: .key, created_at: (.value.created_at // ""),
+        | map({index: .key,
                text: ((.value.text // .value.body // .value.comment // .value.content // "") | tostring)})
         | map(select(.text | contains("Token: " + $token))) as $mentions
-        | $mentions
-        | map(. as $comment
-              | ($comment.text | capture("\\A\\[REAL-BINARY EVIDENCE\\]\\nToken: (?<token>[0-9a-f]{32})\\nScenario: (?<scenario>[^\\n]+)\\nInterface: (?<interface>[^\\n]+)\\nCommands: (?<commands>[^\\n]+)\\nExpected: (?<expected>[^\\n]+)\\nObserved: (?<observed>[^\\n]+)\\nResult: (?<result>PASS|FAIL|BLOCKED)\\z"; "") // empty)
-              + {index: $comment.index, created_at: $comment.created_at})
-        | map(select(.token == $token)
-              | select(([ .scenario, .interface, .commands, .expected, .observed ]
-                        | any(test("^\\s*$")) | not))) as $structured
-        # Beads returns comments in insertion order; use the final structured
-        # current-token block so missing/mixed timestamps cannot reorder evidence.
-        | if ($structured | length) > 0 then
-              (($structured | sort_by(.index))[-1].result | ascii_downcase)
-          elif ($mentions | length) > 0 then "invalid"
-          else "missing"
+        | if ($mentions | length) == 0 then {state: "missing"}
+          else ($mentions | sort_by(.index) | .[-1]) as $comment
+          | (($comment.text
+              | capture("\\A\\[REAL-BINARY EVIDENCE\\]\\nToken: (?<token>[0-9a-f]{32})\\nScenario: (?<scenario>[^\\n]+)\\nInterface: (?<interface>[^\\n]+)\\nArtifact: (?<artifact>[^\\n]+)\\nCommands: (?<commands>[^\\n]+)\\nExpected: (?<expected>[^\\n]+)\\nObserved: (?<observed>[^\\n]+)\\nResult: (?<result>PASS|FAIL|BLOCKED)\\z"; "")) // null) as $e
+          | if $e == null or $e.token != $token then {state: "invalid"}
+            else {state: "structured", evidence: $e}
+            end
           end
-    ' "$comments_file" 2>/dev/null) || parsed="invalid"
+    ' "$comments_file" 2>/dev/null) || payload='{"state":"invalid"}'
     rm -f "$comments_file"
-    case "$parsed" in pass|fail|blocked|missing|invalid) echo "$parsed" ;; *) echo invalid ;; esac
+    printf '%s\n' "$payload"
+}
+
+stdin_assertion_is_safe() {
+    local assertion="$1"
+    # The fixed-string assertion receives only the producer's stdout. `--` is
+    # mandatory so agent-controlled text cannot be interpreted as an option.
+    printf '%s\n' "$assertion" \
+        | grep -Eq "^grep[[:space:]]+-Fq[[:space:]]+--[[:space:]]+('[^']{3,}'|\"[^\"]{3,}\"|[A-Za-z0-9_.:/-]{3,})$"
+}
+
+single_driver_pipeline_is_safe() {
+    local commands="$1" executable="$2" driver assertion remainder
+    driver=${commands%%|*}
+    [ "$driver" != "$commands" ] || return 1
+    assertion=${commands#*|}
+    [[ "$assertion" != *'|'* ]] || return 1
+    driver=$(printf '%s' "$driver" | sed 's/[[:space:]]*$//')
+    assertion=$(printf '%s' "$assertion" | sed 's/^[[:space:]]*//')
+    remainder=${driver#"$executable"}
+    [ "$remainder" != "$driver" ] || return 1
+    [ -z "$remainder" ] || [[ "$remainder" == ' '* ]] || return 1
+    stdin_assertion_is_safe "$assertion"
+}
+
+tmux_driver_is_safe() {
+    local commands="$1" session="" segment assertion assertion_literal i count
+    local -a parts=()
+    while IFS= read -r segment; do
+        parts+=("$(printf '%s' "$segment" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')")
+    done < <(printf '%s\n' "$commands" | sed 's/[[:space:]]*&&[[:space:]]*/\
+/g')
+    count=${#parts[@]}
+    [ "$count" -ge 4 ] || return 1
+
+    session=$(printf '%s\n' "${parts[0]}" \
+        | sed -nE 's/^tmux new-session -d -s ([A-Za-z0-9_-]+)( -x [0-9]+ -y [0-9]+)?$/\1/p')
+    [ -n "$session" ] || return 1
+    printf '%s\n' "${parts[1]}" \
+        | grep -Eq "^tmux send-keys -t ${session} ('mini-agent([^']*)'|\"mini-agent([^\"]*)\") Enter$" \
+        || return 1
+    [[ "${parts[1]}" != *'|'* ]] || return 1
+
+    i=2
+    while [ "$i" -lt "$((count - 2))" ]; do
+        segment=${parts[$i]}
+        if printf '%s\n' "$segment" | grep -Eq '^sleep [1-9][0-9]?$'; then
+            :
+        elif printf '%s\n' "$segment" \
+                | grep -Eq "^tmux send-keys -t ${session} ('[^']+'|\"[^\"]+\"|([A-Za-z]+[[:space:]]*)+) Enter$"; then
+            :
+        else
+            return 1
+        fi
+        i=$((i + 1))
+    done
+
+    segment=${parts[$((count - 2))]}
+    [ "${segment%%|*}" != "$segment" ] || return 1
+    [ "$(printf '%s' "${segment%%|*}" | sed 's/[[:space:]]*$//')" = "tmux capture-pane -t $session -p" ] || return 1
+    assertion=$(printf '%s' "${segment#*|}" | sed 's/^[[:space:]]*//')
+    stdin_assertion_is_safe "$assertion" || return 1
+    assertion_literal=${assertion#grep -Fq -- }
+    case "$assertion_literal" in
+        \'*\') assertion_literal=${assertion_literal#\'}; assertion_literal=${assertion_literal%\'} ;;
+        \"*\") assertion_literal=${assertion_literal#\"}; assertion_literal=${assertion_literal%\"} ;;
+    esac
+    i=2
+    while [ "$i" -lt "$((count - 2))" ]; do
+        segment=${parts[$i]}
+        case "$segment" in
+            tmux\ send-keys\ *) [[ "$segment" != *"$assertion_literal"* ]] || return 1 ;;
+        esac
+        i=$((i + 1))
+    done
+    [ "${parts[$((count - 1))]}" = "tmux kill-session -t $session" ]
+}
+
+rewrite_tmux_scenario() {
+    local commands="$1" original_session="$2" session_name="$3" tmux_path="$4"
+    local socket_label="$5" installed_canonical="$6" segment launch i count rewritten=""
+    local -a parts=()
+    while IFS= read -r segment; do
+        parts+=("$(printf '%s' "$segment" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')")
+    done < <(printf '%s\n' "$commands" | sed 's/[[:space:]]*&&[[:space:]]*/\
+/g')
+    count=${#parts[@]}
+    [ "$count" -ge 4 ] || return 1
+
+    launch=${parts[1]#"tmux send-keys -t $original_session "}
+    launch=${launch% Enter}
+    case "$launch" in
+        "'mini-agent"*|\"mini-agent*) ;;
+        *) return 1 ;;
+    esac
+    launch=${launch/mini-agent/exec $installed_canonical}
+
+    segment=${parts[0]/" -s $original_session"/" -s $session_name"}
+    segment=${segment/"tmux new-session"/"$tmux_path -L $socket_label -f /dev/null new-session"}
+    rewritten="$segment $launch && sleep 1"
+
+    # The declarative initial send-keys segment is intentionally consumed: the
+    # loop starts the app as the pane command so its command text cannot satisfy
+    # the later pane assertion. Remaining send-keys are feature interactions.
+    i=2
+    while [ "$i" -lt "$count" ]; do
+        segment=${parts[$i]/" -t $original_session"/" -t $session_name"}
+        case "$segment" in
+            tmux\ send-keys\ *)
+                segment=${segment/"tmux send-keys"/"$tmux_path -L $socket_label send-keys"}
+                rewritten="$rewritten && $segment && sleep 1"
+                ;;
+            tmux\ capture-pane\ *)
+                segment=${segment/"tmux capture-pane"/"$tmux_path -L $socket_label capture-pane"}
+                rewritten="$rewritten && $segment"
+                ;;
+            tmux\ kill-session\ *)
+                segment=${segment/"tmux kill-session"/"$tmux_path -L $socket_label kill-session"}
+                rewritten="$rewritten && $segment"
+                ;;
+            sleep\ *) rewritten="$rewritten && $segment" ;;
+            *) return 1 ;;
+        esac
+        i=$((i + 1))
+    done
+    printf '%s\n' "$rewritten"
+}
+
+evidence_commands_are_safe() {
+    local commands="$1" profile="$2" artifact="$3" without_and
+    [ -n "$commands" ] || return 1
+
+    # The loop accepts only a literal feature-driving pipeline (or a strictly
+    # shaped tmux chain). It does not execute setup commands supplied by an
+    # agent. This keeps installation, executable identity, and assertions under
+    # loop ownership.
+    case "$commands" in
+        *$'\n'*|*';'*|*'||'*|*'`'*|*'$'*|*'('*|*')'*|*'{'*|*'}'*|*'<'*|*'>'*|*'#'*|*'!'*|*'*'*|*'?'*|*'['*) return 1 ;;
+    esac
+    printf '%s' "$commands" | grep -F '\' >/dev/null && return 1
+    without_and=${commands//&&/}
+    [[ "$without_and" == *'&'* ]] && return 1
+    printf '%s\n' "$commands" | grep -Eq '(^|[[:space:]|&])[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=' && return 1
+
+    case "$profile" in
+        headless|connectivity)
+            [[ "$commands" != *'&&'* ]] && [[ "$commands" != *"$PWD"* ]] \
+                && single_driver_pipeline_is_safe "$commands" mini-agent
+            ;;
+        tmux-tui)
+            [[ "$commands" != *"$PWD"* ]] && tmux_driver_is_safe "$commands"
+            ;;
+        packaged-artifact)
+            printf '%s' "$artifact" | grep -Eq '^(\./|/)[A-Za-z0-9._/-]+/mini-agent(\.exe)?$' \
+                && [[ "$commands" != *'&&'* ]] \
+                && [[ "${commands#"$artifact"}" != *"$PWD"* ]] \
+                && single_driver_pipeline_is_safe "$commands" "$artifact"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+real_binary_evidence_status() {
+    local issue_id="$1" token="$2" profile="$3" payload state result artifact commands combined
+    case "$profile" in
+        headless|connectivity|tmux-tui|packaged-artifact) ;;
+        *) echo invalid; return ;;
+    esac
+    payload=$(real_binary_evidence_payload "$issue_id" "$token")
+    state=$(printf '%s\n' "$payload" | jq -r '.state // "invalid"' 2>/dev/null) || state=invalid
+    case "$state" in
+        missing|invalid|unavailable) echo "$state"; return ;;
+        structured) ;;
+        *) echo invalid; return ;;
+    esac
+
+    result=$(printf '%s\n' "$payload" | jq -r '.evidence.result' 2>/dev/null) || { echo invalid; return; }
+    if [ "$result" != PASS ]; then
+        printf '%s\n' "$result" | tr '[:upper:]' '[:lower:]'
+        return
+    fi
+    if printf '%s\n' "$payload" | jq -e '
+            [.evidence.scenario, .evidence.interface,
+             .evidence.commands, .evidence.expected, .evidence.observed]
+            | any(ascii_downcase
+                  | test("^\\s*(<[^>]*>|todo|tbd|n/?a|none|unknown|pass|passed|success|works?|feature output)\\s*$"))
+        ' >/dev/null 2>&1; then
+        echo invalid
+        return
+    fi
+
+    artifact=$(printf '%s\n' "$payload" | jq -r '.evidence.artifact')
+    commands=$(printf '%s\n' "$payload" | jq -r '.evidence.commands')
+    combined=$(printf '%s\n' "$payload" | jq -r '[.evidence.scenario, .evidence.commands, .evidence.expected, .evidence.observed] | join(" ") | ascii_downcase')
+    if printf '%s\n' "$combined" | grep -Eq '\bhello\b|hello world|generic hello|one[- ]word' \
+            && [ "$profile" != connectivity ]; then
+        echo invalid
+        return
+    fi
+    case "$profile" in
+        headless|connectivity) [ "$(printf '%s\n' "$payload" | jq -r '.evidence.interface')" = headless ] && [ "$artifact" = none ] || { echo invalid; return; } ;;
+        tmux-tui) [ "$(printf '%s\n' "$payload" | jq -r '.evidence.interface')" = tmux-tui ] && [ "$artifact" = none ] || { echo invalid; return; } ;;
+        packaged-artifact) [ "$(printf '%s\n' "$payload" | jq -r '.evidence.interface')" = packaged-artifact ] && [ "$artifact" != none ] || { echo invalid; return; } ;;
+    esac
+    if evidence_commands_are_safe "$commands" "$profile" "$artifact"; then echo pass; else echo invalid; fi
+}
+
+run_with_hard_timeout() {
+    local seconds="$1"
+    shift
+    if [ -n "${TIMEOUT_BIN:-}" ]; then
+        "$TIMEOUT_BIN" --kill-after=30 "$seconds" "$@"
+        return $?
+    fi
+
+    local marker command_pid watchdog_pid status
+    marker=$(mktemp) || return 1
+    "$@" &
+    command_pid=$!
+    (
+        sleep "$seconds"
+        if kill -0 "$command_pid" 2>/dev/null; then
+            printf timeout > "$marker"
+            command -v pkill >/dev/null 2>&1 && pkill -TERM -P "$command_pid" 2>/dev/null || true
+            kill -TERM "$command_pid" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$command_pid" 2>/dev/null || true
+        fi
+    ) &
+    watchdog_pid=$!
+    if wait "$command_pid"; then status=0; else status=$?; fi
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    if [ -s "$marker" ]; then status=124; fi
+    rm -f "$marker"
+    return "$status"
+}
+
+hash_file_sha256() {
+    local path="$1" digest
+    if command -v shasum >/dev/null 2>&1; then
+        digest=$(shasum -a 256 "$path" 2>/dev/null | awk '{print $1}') || return 1
+    elif command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum "$path" 2>/dev/null | awk '{print $1}') || return 1
+    else
+        return 1
+    fi
+    printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    printf '%s\n' "$digest"
+}
+
+hash_text_sha256() {
+    local text="$1" digest
+    if command -v shasum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$text" | shasum -a 256 2>/dev/null | awk '{print $1}') || return 1
+    elif command -v sha256sum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$text" | sha256sum 2>/dev/null | awk '{print $1}') || return 1
+    else
+        return 1
+    fi
+    printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    printf '%s\n' "$digest"
+}
+
+canonical_existing_path() {
+    local path="$1" dir base
+    [ -e "$path" ] || return 1
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$path" 2>/dev/null
+        return $?
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$path" 2>/dev/null
+        return $?
+    fi
+    dir=$(dirname "$path")
+    base=$(basename "$path")
+    dir=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "$dir" "$base"
+}
+
+file_mtime_epoch() {
+    local path="$1" mtime
+    mtime=$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null) || return 1
+    printf '%s\n' "$mtime"
+}
+
+repository_state_digest() {
+    local snapshot path file_sha
+    snapshot=$(mktemp) || return 1
+    {
+        git rev-parse HEAD || exit 1
+        git diff --binary HEAD -- . ':(exclude).beads/**' || exit 1
+        # Build outputs are intentionally ignored here because Cargo mutates
+        # target/. The feature scenario itself runs from a private HEAD archive,
+        # so it cannot rely on or normally mutate those repository-local files.
+        while IFS= read -r path; do
+            case "$path" in .beads|.beads/*) continue ;; esac
+            [ -f "$path" ] || continue
+            file_sha=$(hash_file_sha256 "$path") || exit 1
+            printf 'untracked %s %s\n' "$path" "$file_sha"
+        done < <(git ls-files --others --exclude-standard | LC_ALL=C sort)
+        while IFS= read -r path; do
+            case "$path" in
+                target|target/*|.beads|.beads/*|.dolt|.dolt/*|.codex|.codex/*|.superpowers|.superpowers/*) continue ;;
+            esac
+            [ -f "$path" ] || continue
+            file_sha=$(hash_file_sha256 "$path") || exit 1
+            printf 'ignored %s %s\n' "$path" "$file_sha"
+        done < <(git ls-files --others --ignored --exclude-standard | LC_ALL=C sort)
+    } > "$snapshot" 2>/dev/null || { rm -f "$snapshot"; return 1; }
+    file_sha=$(hash_file_sha256 "$snapshot") || { rm -f "$snapshot"; return 1; }
+    rm -f "$snapshot"
+    printf '%s\n' "$file_sha"
+}
+
+run_in_clean_replay_environment() {
+    local runtime_path="$1" name value
+    shift
+    local -a clean_env=(env -i)
+    while IFS='=' read -r name value; do
+        case "$name" in
+            HOME|USER|USERNAME|LOGNAME|HOST|HOSTNAME|TERM|COLORTERM|LANG|LC_*|TZ|NO_COLOR|EDITOR|VISUAL|\
+            XDG_RUNTIME_DIR|XDG_CACHE_HOME|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|\
+            *_API_KEY|*_TOKEN|OPENROUTER_MODEL|MCP_FIXTURE_*|ZS_*|\
+            HTTPS_PROXY|HTTP_PROXY|ALL_PROXY|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR)
+                clean_env+=("$name=$value")
+                ;;
+        esac
+    done < <(env)
+    clean_env+=("PATH=$runtime_path" "SHELL=/bin/bash")
+    "${clean_env[@]}" "$@"
+}
+
+run_in_clean_install_environment() {
+    local install_root="$1" cargo_path="$2" rustc_path="$3" name
+    shift 3
+    local -a clean_env=(env -i)
+    mkdir -p "$install_root/cargo-home" "$install_root/cargo-target" || return 1
+    for name in HOME USER LOGNAME TMPDIR TMP TEMP \
+            HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY SSL_CERT_FILE SSL_CERT_DIR \
+            CARGO_NET_OFFLINE MACOSX_DEPLOYMENT_TARGET SDKROOT DEVELOPER_DIR; do
+        if [ "${!name+x}" = x ]; then
+            clean_env+=("$name=${!name}")
+        fi
+    done
+    clean_env+=("PATH=$(dirname "$cargo_path"):$(dirname "$rustc_path"):/usr/bin:/bin:/usr/sbin:/sbin")
+    clean_env+=("CARGO_INSTALL_ROOT=$install_root" "CARGO_HOME=$install_root/cargo-home")
+    clean_env+=("CARGO_TARGET_DIR=$install_root/cargo-target" "RUSTC=$rustc_path" "SHELL=/bin/bash")
+    "${clean_env[@]}" "$cargo_path" "$@"
+}
+
+cargo_config_free_ancestor_chain() {
+    local directory="$1" parent
+    directory=$(canonical_existing_path "$directory") || return 1
+    while :; do
+        [ ! -e "$directory/.cargo/config" ] && [ ! -e "$directory/.cargo/config.toml" ] || return 1
+        [ "$directory" = / ] && break
+        parent=$(dirname "$directory")
+        [ "$parent" != "$directory" ] || break
+        directory="$parent"
+    done
+}
+
+artifact_path_is_link_free() {
+    local artifact="$1" root="$2"
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$artifact" "$root" <<'PY'
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+root = os.path.abspath(sys.argv[2])
+try:
+    if os.path.commonpath([path, root]) != root:
+        raise ValueError("outside repository")
+    relative = os.path.relpath(path, root)
+    current = root
+    for component in relative.split(os.sep):
+        current = os.path.join(current, component)
+        if stat.S_ISLNK(os.lstat(current).st_mode):
+            raise ValueError("symlink component")
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+record_replay_attestation() {
+    local issue_id="$1" evidence_nonce="$2" profile="$3" result="$4" reason="$5"
+    local binary_sha="$6" artifact_sha="$7" commands_sha="$8" transcript_sha="$9"
+    bd comments add "$issue_id" "[LOOP REAL-BINARY REPLAY]
+Evidence nonce: $evidence_nonce
+Profile: $profile
+Result: $result
+Reason: $reason
+Installed SHA-256: ${binary_sha:-unavailable}
+Artifact SHA-256: ${artifact_sha:-none}
+Commands SHA-256: ${commands_sha:-unavailable}
+Transcript SHA-256: ${transcript_sha:-unavailable}" >/dev/null 2>&1
+}
+
+replay_real_binary_evidence() {
+    local issue_id="$1" token="$2" profile="$3" iteration_start_epoch="$4"
+    local cargo_path="$5" trusted_cargo_sha="$6"
+    local rustc_path="$7" trusted_rustc_sha="$8"
+    local trusted_tmux_path="${9:-}" trusted_tmux_sha="${10:-}"
+    local payload commands artifact commands_sha transcript="" scenario_file="" trace_nonce replay_status=1
+    local install_root="" install_workspace="" runtime_path installed_canonical="" installed_mtime installed_sha=""
+    local artifact_canonical="" artifact_mtime artifact_sha="none" artifact_copy=""
+    local transcript_sha="" reason="replay-failed" repo_before repo_after scenario_commands=""
+    local original_session="" session_name="" socket_label="" scenario_workspace="" repo_canonical=""
+    payload=$(real_binary_evidence_payload "$issue_id" "$token")
+    commands=$(printf '%s\n' "$payload" | jq -er 'select(.state == "structured") | .evidence.commands' 2>/dev/null) || return 1
+    artifact=$(printf '%s\n' "$payload" | jq -er '.evidence.artifact' 2>/dev/null) || return 1
+    evidence_commands_are_safe "$commands" "$profile" "$artifact" || return 1
+    if [ "$profile" = tmux-tui ]; then
+        original_session=$(printf '%s\n' "$commands" \
+            | sed -nE 's/^tmux new-session -d -s ([A-Za-z0-9_-]+).*/\1/p')
+        [ -n "$original_session" ] || return 1
+        session_name="rb-${token:0:12}-$$"
+    fi
+    commands_sha=$(hash_text_sha256 "$commands") || return 1
+    case "$cargo_path" in /*) ;; *) return 1 ;; esac
+    [ -x "$cargo_path" ] && [ "$(hash_file_sha256 "$cargo_path" 2>/dev/null || true)" = "$trusted_cargo_sha" ] \
+        || return 1
+    case "$rustc_path" in /*) ;; *) return 1 ;; esac
+    [ -x "$rustc_path" ] && [ "$(hash_file_sha256 "$rustc_path" 2>/dev/null || true)" = "$trusted_rustc_sha" ] \
+        || return 1
+    if [ "$profile" = tmux-tui ]; then
+        case "$trusted_tmux_path" in /*) ;; *) return 1 ;; esac
+        [ -x "$trusted_tmux_path" ] \
+            && [ "$(hash_file_sha256 "$trusted_tmux_path" 2>/dev/null || true)" = "$trusted_tmux_sha" ] \
+            || return 1
+    fi
+    transcript=$(mktemp) || return 1
+    install_root=$(mktemp -d) || { rm -f "$transcript"; return 1; }
+    install_root=$(canonical_existing_path "$install_root") \
+        || { rm -f "$transcript"; return 1; }
+    runtime_path="$install_root/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    repo_before=$(repository_state_digest) || reason="repository-snapshot-failed"
+    if [ "$reason" = replay-failed ]; then
+        install_workspace=$(mktemp -d) || reason="install-workspace-failed"
+    fi
+    if [ "$reason" = replay-failed ] \
+            && ! (set -o pipefail
+                git archive --format=tar HEAD | tar -xf - -C "$install_workspace"); then
+        reason="install-workspace-copy-failed"
+    fi
+    if [ "$reason" = replay-failed ]; then
+        # Acceptance pins Cargo/rustc itself. Do not let committed project Cargo
+        # config reintroduce wrappers, runners, aliases, or source replacement.
+        rm -f "$install_workspace/.cargo/config" "$install_workspace/.cargo/config.toml" \
+            || reason="install-config-sanitization-failed"
+        if [ "$reason" = replay-failed ] \
+                && ! cargo_config_free_ancestor_chain "$install_workspace"; then
+            reason="install-ancestor-cargo-config"
+        fi
+    fi
+
+    if [ "$reason" = replay-failed ] \
+            && ! (cd "$install_workspace" || exit 1
+                ulimit -f 4096 2>/dev/null || true
+                run_with_hard_timeout "${LOOP_INSTALL_TIMEOUT_SECS:-900}" \
+                    run_in_clean_install_environment "$install_root" "$cargo_path" "$rustc_path" \
+                        install --path . --debug) > "$transcript" 2>&1; then
+        reason="cargo-install-failed"
+    elif [ "$reason" = replay-failed ]; then
+        if ! cargo_config_free_ancestor_chain "$install_workspace"; then
+            reason="install-ancestor-cargo-config-changed"
+        elif [ "$(hash_file_sha256 "$cargo_path" 2>/dev/null || true)" != "$trusted_cargo_sha" ]; then
+            reason="cargo-executable-changed"
+        elif [ "$(hash_file_sha256 "$rustc_path" 2>/dev/null || true)" != "$trusted_rustc_sha" ]; then
+            reason="rustc-executable-changed"
+        fi
+        repo_after=$(repository_state_digest) || reason="repository-post-install-snapshot-failed"
+        if [ "$reason" = replay-failed ] && [ "$repo_before" != "$repo_after" ]; then
+            reason="cargo-install-mutated-repository"
+        fi
+    fi
+
+    if [ "$reason" = replay-failed ]; then
+        installed_canonical=$(canonical_existing_path "$install_root/bin/mini-agent" 2>/dev/null || true)
+        installed_mtime=$(file_mtime_epoch "$installed_canonical" 2>/dev/null || echo 0)
+        if [ "$installed_canonical" != "$install_root/bin/mini-agent" ] || [ ! -x "$installed_canonical" ]; then
+            reason="installed-binary-unavailable"
+        elif [ "$installed_mtime" -lt "$iteration_start_epoch" ] 2>/dev/null; then
+            reason="installed-binary-stale"
+        elif ! installed_sha=$(hash_file_sha256 "$installed_canonical"); then
+            reason="installed-binary-hash-failed"
+        else
+            reason="preflight-passed"
+        fi
+    fi
+
+    if [ "$reason" = preflight-passed ] && [ "$profile" = packaged-artifact ]; then
+        repo_canonical=$(canonical_existing_path "$PWD" 2>/dev/null || true)
+        artifact_canonical=$(canonical_existing_path "$artifact" 2>/dev/null || true)
+        artifact_mtime=$(file_mtime_epoch "$artifact_canonical" 2>/dev/null || echo 0)
+        case "$artifact_canonical" in
+            "$repo_canonical"/*) ;;
+            *) reason="artifact-outside-repository" ;;
+        esac
+        if [ "$reason" = preflight-passed ] \
+                && ! artifact_path_is_link_free "$artifact" "$PWD" >/dev/null 2>&1; then
+            reason="artifact-path-has-symlink"
+        elif [ "$reason" = preflight-passed ] && [ "$artifact_canonical" = "$installed_canonical" ]; then
+            reason="artifact-is-installed-binary"
+        elif [ "$reason" = preflight-passed ] && [ ! -x "$artifact_canonical" ]; then
+            reason="artifact-not-executable"
+        elif [ "$reason" = preflight-passed ] && [ "$artifact_mtime" -lt "$iteration_start_epoch" ] 2>/dev/null; then
+            reason="artifact-stale"
+        elif [ "$reason" = preflight-passed ] && ! artifact_sha=$(hash_file_sha256 "$artifact_canonical"); then
+            reason="artifact-hash-failed"
+        elif [ "$reason" = preflight-passed ]; then
+            artifact_copy="$install_root/artifact-mini-agent"
+            if ! cp "$artifact_canonical" "$artifact_copy" || ! chmod 500 "$artifact_copy" \
+                    || [ "$(hash_file_sha256 "$artifact_copy" 2>/dev/null || true)" != "$artifact_sha" ]; then
+                reason="artifact-copy-failed"
+            fi
+        fi
+    fi
+
+    if [ "$reason" = preflight-passed ]; then
+        trace_nonce=$(generate_evidence_token) || reason="trace-nonce-failed"
+        [ "$profile" = tmux-tui ] && socket_label="rb-${trace_nonce:0:16}"
+    fi
+    if [ "$reason" = preflight-passed ]; then
+        scenario_file=$(mktemp) || reason="scenario-file-failed"
+    fi
+    if [ "$reason" = preflight-passed ]; then
+        scenario_workspace=$(mktemp -d) || reason="scenario-workspace-failed"
+    fi
+    if [ "$reason" = preflight-passed ] \
+            && ! (set -o pipefail
+                git archive --format=tar HEAD | tar -xf - -C "$scenario_workspace"); then
+        reason="scenario-workspace-copy-failed"
+    fi
+    if [ "$reason" = preflight-passed ]; then
+        case "$profile" in
+            headless|connectivity)
+                scenario_commands="$installed_canonical${commands#mini-agent}"
+                ;;
+            packaged-artifact)
+                scenario_commands="$artifact_copy${commands#"$artifact"}"
+                ;;
+            tmux-tui)
+                scenario_commands=$(rewrite_tmux_scenario "$commands" "$original_session" \
+                    "$session_name" "$trusted_tmux_path" "$socket_label" "$installed_canonical") \
+                    || reason="tmux-scenario-rewrite-failed"
+                ;;
+        esac
+        {
+            printf "PS4='+RB%s+ '\n" "$trace_nonce"
+            printf 'readonly PS4 PATH\nhash -r\nset -o pipefail\nset -x\n'
+            printf '%s\n' "$scenario_commands"
+        } > "$scenario_file"
+        if ! bash -n "$scenario_file" >> "$transcript" 2>&1; then
+            replay_status=1
+            reason="scenario-syntax-invalid"
+        elif (cd "$scenario_workspace" || exit 1
+            ulimit -f 4096 2>/dev/null || true
+            run_with_hard_timeout "${LOOP_EVIDENCE_TIMEOUT_SECS:-300}" \
+                run_in_clean_replay_environment "$runtime_path" \
+                    bash --noprofile --norc "$scenario_file") >> "$transcript" 2>&1; then
+            replay_status=0
+        else
+            replay_status=$?
+            reason="scenario-exit-${replay_status}"
+        fi
+        repo_after=$(repository_state_digest) || {
+            replay_status=1
+            reason="repository-post-replay-snapshot-failed"
+        }
+        if [ -n "$repo_after" ] && [ "$repo_before" != "$repo_after" ]; then
+            replay_status=1
+            reason="scenario-mutated-repository"
+        fi
+
+        if [ "$replay_status" = 0 ]; then
+            case "$profile" in
+                headless|connectivity)
+                    grep -F "+RB${trace_nonce}+ ${installed_canonical}" "$transcript" >/dev/null \
+                        || { replay_status=1; reason="installed-binary-not-traced"; }
+                    ;;
+                tmux-tui)
+                    for verb in new-session capture-pane kill-session; do
+                        grep -F "+RB${trace_nonce}+ ${trusted_tmux_path} -L ${socket_label}" "$transcript" \
+                            | grep -F "${verb}" >/dev/null \
+                            || { replay_status=1; reason="tmux-${verb}-not-traced"; break; }
+                    done
+                    grep -F "exec ${installed_canonical}" "$transcript" >/dev/null \
+                        || { replay_status=1; reason="tmux-installed-binary-not-sent"; }
+                    grep -F -- "-t ${session_name}" "$transcript" >/dev/null \
+                        || { replay_status=1; reason="tmux-session-not-correlated"; }
+                    ;;
+                packaged-artifact)
+                    grep -F "+RB${trace_nonce}+ ${artifact_copy}" "$transcript" >/dev/null \
+                        || { replay_status=1; reason="artifact-not-traced"; }
+                    ;;
+            esac
+        fi
+    fi
+
+    if [ -n "$socket_label" ] && [ -x "$trusted_tmux_path" ]; then
+        "$trusted_tmux_path" -L "$socket_label" kill-server 2>/dev/null || true
+        if [ "$(hash_file_sha256 "$trusted_tmux_path" 2>/dev/null || true)" != "$trusted_tmux_sha" ]; then
+            replay_status=1
+            reason="tmux-executable-changed"
+        fi
+    fi
+    transcript_sha=$(hash_file_sha256 "$transcript" 2>/dev/null || true)
+    if [ "$replay_status" = 0 ]; then reason="passed"; fi
+    if ! record_replay_attestation "$issue_id" "$token" "$profile" \
+            "$([ "$replay_status" = 0 ] && echo PASS || echo FAIL)" "$reason" \
+            "$installed_sha" "$artifact_sha" "$commands_sha" "$transcript_sha"; then
+        replay_status=1
+    fi
+    rm -f "$transcript" "$scenario_file"
+    rm -rf "$install_root" "$install_workspace" "$scenario_workspace"
+    [ "$replay_status" = 0 ]
 }
 
 decide_build_outcome() {
     local closed="$1" verify_status="$2" evidence="$3" committed="$4" code_changed="$5"
     if [ "$closed" = true ]; then
-        if [ "$verify_status" = "0" ] && [ "$evidence" = pass ]; then echo accept; else echo reopen; fi
+        if [ "$verify_status" = "0" ] && [ "$evidence" = pass ] \
+                && [ "$committed" = true ] && [ "$code_changed" = true ]; then
+            echo accept
+        else
+            echo reopen
+        fi
     elif [ "$verify_status" = "0" ] && [ "$evidence" = pass ] && [ "$committed" = true ] && [ "$code_changed" = true ]; then
         echo auto-close
     else
@@ -1102,11 +1975,39 @@ decide_build_outcome() {
     fi
 }
 
+path_is_relevant_for_profile() {
+    local path="$1" profile="$2" surfaces="${3:-rust}"
+    case "$path" in
+        src/*|Cargo.toml|Cargo.lock|build.rs) return 0 ;;
+    esac
+    case ",$surfaces," in
+        *,script,*) case "$path" in scripts/*) return 0 ;; esac ;;
+    esac
+    case ",$surfaces," in
+        *,data,*) case "$path" in data/*) return 0 ;; esac ;;
+    esac
+    case ",$surfaces," in
+        *,asset,*) case "$path" in assets/*) return 0 ;; esac ;;
+    esac
+    case ",$surfaces," in
+        *,cargo-config,*) case "$path" in .cargo/*) return 0 ;; esac ;;
+    esac
+    if [ "$profile" = packaged-artifact ] && [[ ",$surfaces," == *,packaging,* ]]; then
+        case "$path" in
+            packaging/*|nix/*|tap/*|.github/*|scripts/*|install.sh|justfile|default.nix|release.nix|shell.nix) return 0 ;;
+        esac
+    fi
+    return 1
+}
+
 current_iteration_has_relevant_changes() {
-    local start_commit="$1" end_commit="$2"
+    local start_commit="$1" end_commit="$2" profile="${3:-headless}" surfaces="${4:-rust}" path
+    [ "$profile" = packaged-artifact ] && [ "$surfaces" = rust ] && surfaces="rust,packaging"
     [ -n "$start_commit" ] && [ -n "$end_commit" ] || return 1
-    git diff --name-only "$start_commit" "$end_commit" 2>/dev/null \
-        | grep -qE '(^|/)Cargo\.lock$|\.(rs|toml|sh)$'
+    while IFS= read -r path; do
+        path_is_relevant_for_profile "$path" "$profile" "$surfaces" && return 0
+    done < <(git diff --name-only "$start_commit" "$end_commit" 2>/dev/null)
+    return 1
 }
 
 reopen_build_bead() {
@@ -1235,9 +2136,59 @@ run_iteration() {
     fi
 
     # --- Run agent (fresh context window) ---
-    local evidence_token="" iteration_start_commit
+    local evidence_token="" verification_profile="" verification_surfaces="" profile_instruction=""
+    local iteration_start_commit iteration_start_epoch trusted_cargo_path="" trusted_cargo_sha=""
+    local trusted_rustc_path="" trusted_rustc_sha="" trusted_tmux_path="" trusted_tmux_sha="" rustup_path=""
     iteration_start_commit=$(git rev-parse HEAD 2>/dev/null || echo "")
+    iteration_start_epoch=$(date +%s)
     if [ "$MODE" = "build" ] && [ -n "$PICKED_ID" ]; then
+        rustup_path=$(type -P rustup 2>/dev/null || true)
+        if [[ "$rustup_path" = /* ]] && [ -x "$rustup_path" ]; then
+            trusted_cargo_path=$("$rustup_path" which cargo 2>/dev/null || true)
+            trusted_rustc_path=$("$rustup_path" which rustc 2>/dev/null || true)
+        else
+            trusted_cargo_path=$(type -P cargo 2>/dev/null || true)
+            trusted_rustc_path=$(type -P rustc 2>/dev/null || true)
+        fi
+        if [[ "$trusted_cargo_path" != /* ]] || [ ! -x "$trusted_cargo_path" ] \
+                || ! trusted_cargo_sha=$(hash_file_sha256 "$trusted_cargo_path") \
+                || [[ "$trusted_rustc_path" != /* ]] || [ ! -x "$trusted_rustc_path" ] \
+                || ! trusted_rustc_sha=$(hash_file_sha256 "$trusted_rustc_path"); then
+            echo -e "${RED}Cannot pin Cargo and rustc before the agent run — leaving $PICKED_ID open${NC}"
+            if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                BUILD_ACCEPTANCE_ENFORCED=true
+                return 0
+            fi
+            return 1
+        fi
+        if ! verification_profile=$(bead_verification_profile "$PICKED_ID"); then
+            echo -e "${RED}Cannot derive a verification profile for $PICKED_ID — leaving it open${NC}"
+            if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                BUILD_ACCEPTANCE_ENFORCED=true
+                return 0
+            fi
+            return 1
+        fi
+        if ! verification_surfaces=$(bead_implementation_surfaces "$PICKED_ID" "$verification_profile"); then
+            echo -e "${RED}Cannot derive implementation surfaces for $PICKED_ID — leaving it open${NC}"
+            if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                BUILD_ACCEPTANCE_ENFORCED=true
+                return 0
+            fi
+            return 1
+        fi
+        if [ "$verification_profile" = tmux-tui ]; then
+            trusted_tmux_path=$(type -P tmux 2>/dev/null || true)
+            if [[ "$trusted_tmux_path" != /* ]] || [ ! -x "$trusted_tmux_path" ] \
+                    || ! trusted_tmux_sha=$(hash_file_sha256 "$trusted_tmux_path"); then
+                echo -e "${RED}Cannot pin tmux before the agent run — leaving $PICKED_ID open${NC}"
+                if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                    BUILD_ACCEPTANCE_ENFORCED=true
+                    return 0
+                fi
+                return 1
+            fi
+        fi
         if ! evidence_token=$(generate_evidence_token); then
             echo -e "${RED}Cannot generate real-binary evidence token — leaving $PICKED_ID open${NC}"
             # Reuse the checked enforcement path; never launch without a token.
@@ -1249,6 +2200,20 @@ run_iteration() {
             fi
             return 1
         fi
+        case "$verification_profile" in
+            connectivity)
+                profile_instruction="Use \`Interface: headless\` and \`Artifact: none\`. This bead is explicitly connectivity-specific, so a one-word hello scenario is permitted only if it exercises the changed connectivity path."
+                ;;
+            tmux-tui)
+                profile_instruction="Use \`Interface: tmux-tui\` and \`Artifact: none\`. Commands must be one \`&&\` chain in this strict order: \`tmux new-session -d -s <name>\` (optional \`-x <n> -y <n>\`), \`tmux send-keys -t <same-name> 'mini-agent ...' Enter\`, optional bounded \`sleep <1-99>\` and same-session \`send-keys ... Enter\` interactions, \`tmux capture-pane -t <same-name> -p | grep -Fq -- '<feature-specific literal>'\`, then \`tmux kill-session -t <same-name>\`. The loop pins tmux before the agent, uses a post-agent secret private socket with no user config, replaces the session name, and replaces the initial command with \`exec <fresh-installed-path>\`."
+                ;;
+            packaged-artifact)
+                profile_instruction="Use \`Interface: packaged-artifact\`. Set \`Artifact:\` to a non-symlink executable produced this iteration under this repository (for example \`./target/loop-artifacts/<name>/mini-agent\`). Commands must be exactly that literal path plus feature-driving arguments, piped directly to \`grep -Fq -- '<feature-specific literal>'\`. The loop copies verified bytes to a private path and executes that copy."
+                ;;
+            *)
+                profile_instruction="Use \`Interface: headless\` and \`Artifact: none\`. Commands must be exactly \`mini-agent\` plus feature-driving arguments, piped directly to \`grep -Fq -- '<feature-specific literal>'\`. Generic hello or one-word output is invalid."
+                ;;
+        esac
     fi
     echo -e "${BLUE}Running agent...${NC}"
     local prompt_content
@@ -1267,15 +2232,18 @@ Work on bead \`${PICKED_ID}\`. Run \`bd show ${PICKED_ID}\` to read the details,
 Before closing this bead, test-drive its actual feature using evidence token \`${evidence_token}\`:
 1. Derive a concrete end-to-end scenario from the bead outcome and acceptance criteria.
 2. Run \`cargo install --path . --debug\`.
-3. Invoke the installed \`mini-agent\` from PATH—not \`cargo run\`, a test, or \`target/debug/mini-agent\`.
+3. Run \`command -v mini-agent\`, then invoke that installed \`mini-agent\` from PATH—not \`cargo run\`, a test, or \`target/debug/mini-agent\`.
 4. Force the implemented feature through its public CLI path. For TUI behavior use tmux; for packaging/release behavior execute the exact produced artifact.
 5. Compare one specific expected result with the observed result. Generic hello or one-word output is valid only when this is a connectivity-specific bead.
-6. Add exactly one bounded, secret-free Beads comment in this shape (replace every placeholder, but preserve labels and token):
+6. Follow this bead-derived evidence profile: ${profile_instruction}
+7. Make \`Commands:\` a replayable one-line scenario only; do not include installation or setup/mutation commands. Outside the required tmux chain, it must be one producer piped directly to exactly \`grep -Fq -- '<feature-specific literal>'\`; grep cannot have file operands. Do not use variables, substitutions, redirections, globbing, escapes, subshells, semicolons, \`||\`, nested shells, or PATH changes. The loop independently installs into a private root, substitutes the verified executable path, replays under a private trace nonce and clean shell environment, and requires the assertion to exit zero without mutating the repository.
+8. Add exactly one bounded, secret-free Beads comment in this shape (replace every placeholder, but preserve labels and token):
 [REAL-BINARY EVIDENCE]
 Token: ${evidence_token}
 Scenario: <non-empty>
-Interface: <non-empty>
-Commands: <non-empty>
+Interface: <headless | tmux-tui | packaged-artifact, exactly as required above>
+Artifact: <none or literal current-iteration packaged executable path>
+Commands: <one replayable line that drives the feature and mechanically asserts its output>
 Expected: <non-empty>
 Observed: <non-empty>
 Result: PASS
@@ -1297,10 +2265,7 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
         fi
         rm -f "$codex_out"
     elif [ "$AGENT_CMD" = "claude" ]; then
-        if ! { echo "$prompt_content" \
-                | { env -u ANTHROPIC_API_KEY "${agent_prefix[@]}" $AGENT_CMD --dangerously-skip-permissions --verbose --output-format stream-json "${AGENT_MODEL_ARGS[@]}" -p - \
-                    || true; } \
-                | show_agent_progress; }; then
+        if ! run_with_claude_agent "$prompt_content" "${agent_prefix[@]}"; then
             agent_ok=false
         fi
     else
@@ -1308,7 +2273,7 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
     fi
 
     if [ "$agent_ok" = false ]; then
-        echo -e "${RED}Agent invocation failed (no result event in stream)${NC}"
+        echo -e "${RED}Agent invocation failed (process error or no successful result event)${NC}"
 
         if [ -n "$(git status --porcelain)" ]; then
             local partial_changes
@@ -1362,7 +2327,8 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
     [ -n "$iteration_start_commit" ] && [ -n "$commit_after" ] && [ "$iteration_start_commit" != "$commit_after" ] \
         && iteration_committed=true
 
-    run_verification "$iteration_start_commit" "$commit_after" && local verify_ok=0 || local verify_ok=$?
+    run_verification "$iteration_start_commit" "$commit_after" "$verification_profile" "$verification_surfaces" \
+        && local verify_ok=0 || local verify_ok=$?
 
     # Verification may apply rustfmt/clippy fixes. Never accept those changes
     # uncommitted, and ensure the final commit still passes the whole range.
@@ -1373,7 +2339,8 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
         commit_after=$(git rev-parse HEAD 2>/dev/null || echo "")
         [ -n "$iteration_start_commit" ] && [ "$iteration_start_commit" != "$commit_after" ] \
             && iteration_committed=true
-        run_verification "$iteration_start_commit" "$commit_after" && verify_ok=0 || verify_ok=$?
+        run_verification "$iteration_start_commit" "$commit_after" "$verification_profile" "$verification_surfaces" \
+            && verify_ok=0 || verify_ok=$?
         if [ -n "$(git status --porcelain | grep -v '\.beads/' || true)" ]; then
             echo -e "${RED}FAIL: verification mutated tracked non-Beads files twice${NC}" >&2
             verify_ok=1
@@ -1382,6 +2349,28 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
 
     if [ "$MODE" = "build" ] && [ -n "$PICKED_ID" ]; then
         local bead_state bead_closed=false code_changed=false evidence_status outcome
+        if [ "$iteration_committed" = true ] \
+                && current_iteration_has_relevant_changes "$iteration_start_commit" "$commit_after" \
+                    "$verification_profile" "$verification_surfaces"; then
+            code_changed=true
+        fi
+        evidence_status=$(real_binary_evidence_status "$PICKED_ID" "$evidence_token" "$verification_profile")
+        if [ "$verify_ok" = 0 ] && [ "$iteration_committed" = true ] \
+                && [ "$code_changed" = true ] && [ "$evidence_status" = pass ]; then
+            echo -e "${CYAN}Replaying nonce-bound feature scenario through the freshly installed app...${NC}"
+            if replay_real_binary_evidence "$PICKED_ID" "$evidence_token" \
+                    "$verification_profile" "$iteration_start_epoch" \
+                    "$trusted_cargo_path" "$trusted_cargo_sha" \
+                    "$trusted_rustc_path" "$trusted_rustc_sha" \
+                    "$trusted_tmux_path" "$trusted_tmux_sha"; then
+                evidence_status=pass
+            else
+                evidence_status=replay-fail
+            fi
+        fi
+
+        # Replay runs agent-authored commands, so state is authoritative only
+        # after replay and its loop-owned attestation have completed.
         bead_state=$(bead_enforcement_status "$PICKED_ID")
         if [ "$bead_state" = unavailable ]; then
             echo -e "${RED}Cannot enforce acceptance: bead state unavailable${NC}" >&2
@@ -1389,11 +2378,6 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
             bead_state=open
         fi
         [ "$bead_state" = closed ] && bead_closed=true
-        if [ "$iteration_committed" = true ] \
-                && current_iteration_has_relevant_changes "$iteration_start_commit" "$commit_after"; then
-            code_changed=true
-        fi
-        evidence_status=$(real_binary_evidence_status "$PICKED_ID" "$evidence_token")
         outcome=$(decide_build_outcome "$bead_closed" "$verify_ok" "$evidence_status" "$iteration_committed" "$code_changed")
         echo -e "${BOLD}Real-binary evidence:${NC} ${evidence_status}"
 
@@ -1633,10 +2617,7 @@ race to deeper layers; the next round's fresh context will pick that up.
             fi
             rm -f "$codex_out"
         elif [ "$AGENT_CMD" = "claude" ]; then
-            if ! { echo "$prompt_content" \
-                    | { env -u ANTHROPIC_API_KEY $AGENT_CMD --dangerously-skip-permissions --verbose --output-format stream-json "${AGENT_MODEL_ARGS[@]}" -p - \
-                        || true; } \
-                    | show_agent_progress; }; then
+            if ! run_with_claude_agent "$prompt_content"; then
                 agent_ok=false
             fi
         else
@@ -1768,7 +2749,13 @@ handle_interrupt() {
     exit 130
 }
 
+handle_termination() {
+    echo -e "\n${YELLOW}── Terminated at $(timestamp); EXIT safety will reopen any unenforced build bead ──${NC}" >&2
+    exit 143
+}
+
 trap handle_interrupt SIGINT
+trap handle_termination SIGTERM
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Startup                                                         ║
