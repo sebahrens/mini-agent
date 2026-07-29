@@ -2021,7 +2021,9 @@ stage_non_beads_changes() {
 
 reopen_build_bead() {
     local issue_id="$1" verify_status="$2" evidence_status="$3" state
-    if bd update "$issue_id" --status=open 2>/dev/null; then
+    # Beads 1.0.2 treats --claim by an existing assignee as a successful no-op,
+    # even when the issue is open. Clear assignment so the next claim can start it.
+    if bd update "$issue_id" --status=open --assignee "" 2>/dev/null; then
         state=$(bead_enforcement_status "$issue_id")
     else
         state=unavailable

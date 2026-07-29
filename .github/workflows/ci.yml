@@ -30,6 +30,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Test loop lifecycle
+        run: python3 -m unittest scripts.tests.test_loop_lifecycle
+
   clippy:
     if: github.event_name != 'schedule'
     strategy:
