@@ -678,7 +678,10 @@ run_verification() {
 
     # mini-agent: Cargo.toml is at repo root (no rust/ subdirectory)
     local failed=0 errors="" cargo_dir="."
-    [ ! -f "Cargo.toml" ] && return 0
+    if [ ! -f "Cargo.toml" ]; then
+        echo -e "${RED}FAIL: verification requires root Cargo.toml${NC}" >&2
+        return 1
+    fi
 
     # Ensure cargo is on PATH — try multiple sources
     if ! command -v cargo &>/dev/null; then
@@ -688,8 +691,8 @@ run_verification() {
     local CARGO
     CARGO=$(command -v cargo 2>/dev/null || echo "$HOME/.cargo/bin/cargo")
     if [ ! -x "$CARGO" ]; then
-        echo -e "${BOLD}│${NC}  ${YELLOW}SKIP${NC} cargo not found — install Rust toolchain to enable verification"
-        return 0
+        echo -e "${RED}FAIL: verification requires an executable cargo command${NC}" >&2
+        return 1
     fi
 
     echo ""
@@ -1027,13 +1030,15 @@ real_binary_evidence_status() {
     parsed=$(jq -r --arg token "$token" '
         (if type == "array" then . else .comments end)
         | map((.text // .body // .comment // .content // "") | tostring)
-        | map(select(contains("Token: " + $token)))
-        | if length == 0 then "missing"
-          else .[-1] as $c
-          | ($c | capture("\\A\\[REAL-BINARY EVIDENCE\\]\\nToken: (?<token>[0-9a-f]{32})\\nScenario: (?<scenario>[^\\n]+)\\nInterface: (?<interface>[^\\n]+)\\nCommands: (?<commands>[^\\n]+)\\nExpected: (?<expected>[^\\n]+)\\nObserved: (?<observed>[^\\n]+)\\nResult: (?<result>PASS|FAIL|BLOCKED)\\z"; "") // null) as $e
-          | if $e == null or $e.token != $token then "invalid"
-            elif ([ $e.scenario, $e.interface, $e.commands, $e.expected, $e.observed ] | any(test("^\\s*$"))) then "invalid"
-            else ($e.result | ascii_downcase) end
+        | map(select(contains("Token: " + $token))) as $mentions
+        | $mentions
+        | map(capture("\\A\\[REAL-BINARY EVIDENCE\\]\\nToken: (?<token>[0-9a-f]{32})\\nScenario: (?<scenario>[^\\n]+)\\nInterface: (?<interface>[^\\n]+)\\nCommands: (?<commands>[^\\n]+)\\nExpected: (?<expected>[^\\n]+)\\nObserved: (?<observed>[^\\n]+)\\nResult: (?<result>PASS|FAIL|BLOCKED)\\z"; "") // empty)
+        | map(select(.token == $token)
+              | select(([ .scenario, .interface, .commands, .expected, .observed ]
+                        | any(test("^\\s*$")) | not))) as $structured
+        | if ($structured | length) > 0 then ($structured[-1].result | ascii_downcase)
+          elif ($mentions | length) > 0 then "invalid"
+          else "missing"
           end
     ' "$comments_file" 2>/dev/null) || parsed="invalid"
     rm -f "$comments_file"
@@ -1049,6 +1054,30 @@ decide_build_outcome() {
     else
         echo partial
     fi
+}
+
+reopen_build_bead() {
+    local issue_id="$1" verify_status="$2" evidence_status="$3"
+    if bd update "$issue_id" --status=open 2>/dev/null && ! bead_is_closed "$issue_id"; then
+        bd comments add "$issue_id" \
+            "[LOOP] Reopened after iteration $CURRENT_ITERATION: verification=$([ "$verify_status" = 0 ] && echo pass || echo fail), evidence=$evidence_status." \
+            2>/dev/null || true
+        return 0
+    fi
+    echo -e "${RED}ERROR: failed to reopen and confirm $issue_id; stopping this iteration${NC}" >&2
+    bd comments add "$issue_id" "[LOOP] Failed to reopen bead after acceptance gates failed." 2>/dev/null || true
+    return 1
+}
+
+auto_close_build_bead() {
+    local issue_id="$1" commit="$2"
+    if bd close "$issue_id" --reason "Auto-closed by loop: both gates passed, commit $commit" 2>/dev/null \
+            && bead_is_closed "$issue_id"; then
+        return 0
+    fi
+    echo -e "${RED}ERROR: failed to close and confirm $issue_id; leaving iteration partial${NC}" >&2
+    bd comments add "$issue_id" "[LOOP] Auto-close failed after acceptance gates passed; bead remains partial." 2>/dev/null || true
+    return 1
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1258,17 +1287,20 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
 
         if [ "$outcome" = reopen ]; then
             echo -e "${YELLOW}Reopening $PICKED_ID — acceptance gates did not both pass${NC}"
-            bd update "$PICKED_ID" --status=open 2>/dev/null \
-                && bd comments add "$PICKED_ID" \
-                    "[LOOP] Reopened after iteration $CURRENT_ITERATION: verification=$([ "$verify_ok" = 0 ] && echo pass || echo fail), evidence=$evidence_status." 2>/dev/null \
-                || true
+            if ! reopen_build_bead "$PICKED_ID" "$verify_ok" "$evidence_status"; then
+                print_completed "$PICKED_ID" "$PICKED_TITLE" "partial"
+                return 1
+            fi
             bead_closed=false
         fi
 
         if [ "$outcome" = auto-close ]; then
             echo -e "${YELLOW}Auto-closing $PICKED_ID (verification and real-binary evidence passed)${NC}"
-            bd close "$PICKED_ID" --reason "Auto-closed by loop: both gates passed, commit $(git log -1 --pretty=%h)" 2>/dev/null || true
-            bead_closed=true
+            if auto_close_build_bead "$PICKED_ID" "$(git log -1 --pretty=%h)"; then
+                bead_closed=true
+            else
+                outcome=partial
+            fi
         fi
 
         if [ "$outcome" = accept ] || [ "$outcome" = auto-close ]; then
