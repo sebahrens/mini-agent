@@ -19,6 +19,41 @@ def extract_function(source: str, name: str, next_name: str) -> str:
 
 
 class LoopLifecycleTests(unittest.TestCase):
+    def test_clean_install_uses_resilient_cargo_network_settings(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+        install_function = extract_function(
+            source,
+            "run_in_clean_install_environment",
+            "cargo_config_free_ancestor_chain",
+        )
+        harness = f"""
+set -eu
+
+install_root=$(mktemp -d)
+trap 'rm -rf "$install_root"' EXIT
+
+{install_function}
+
+run_in_clean_install_environment "$install_root" /usr/bin/env /usr/bin/true
+"""
+
+        completed = subprocess.run(
+            ["bash", "-c", harness],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        environment = dict(
+            line.split("=", 1)
+            for line in completed.stdout.splitlines()
+            if "=" in line
+        )
+        self.assertEqual("false", environment.get("CARGO_HTTP_MULTIPLEXING"))
+        self.assertEqual("10", environment.get("CARGO_NET_RETRY"))
+
     def test_hard_timeout_runs_shell_functions_when_timeout_binary_exists(self) -> None:
         source = LOOP_SCRIPT.read_text()
         timeout_function = extract_function(

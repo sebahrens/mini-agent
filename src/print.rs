@@ -8,6 +8,7 @@ use crate::session;
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
+const CHAT_HISTORY_PATH_POLICY: &str = "reject symlinked parents";
 
 fn chat_history_limit_entry() -> (&'static str, String) {
     (
@@ -22,7 +23,7 @@ fn chat_history_limit_entry() -> (&'static str, String) {
 fn chat_history_path_policy_entry() -> (&'static str, String) {
     (
         CHAT_HISTORY_PATH_POLICY_LABEL,
-        "reject symlinked parents".to_string(),
+        CHAT_HISTORY_PATH_POLICY.to_string(),
     )
 }
 
@@ -272,8 +273,8 @@ mod tests {
     use std::io;
 
     use super::{
-        CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        write_output,
+        CHAT_HISTORY_FILE_LABEL, CHAT_HISTORY_PATH_POLICY, chat_history_limit_entry,
+        chat_history_path_policy_entry, write_output,
     };
 
     struct BrokenPipeWriter;
@@ -324,7 +325,7 @@ mod tests {
             chat_history_path_policy_entry(),
             (
                 "chat history path policy",
-                "reject symlinked parents".to_string()
+                CHAT_HISTORY_PATH_POLICY.to_string()
             )
         );
     }

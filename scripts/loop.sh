@@ -1689,6 +1689,9 @@ run_in_clean_install_environment() {
     clean_env+=("PATH=$(dirname "$cargo_path"):$(dirname "$rustc_path"):/usr/bin:/bin:/usr/sbin:/sbin")
     clean_env+=("CARGO_INSTALL_ROOT=$install_root" "CARGO_HOME=$install_root/cargo-home")
     clean_env+=("CARGO_TARGET_DIR=$install_root/cargo-target" "RUSTC=$rustc_path" "SHELL=/bin/bash")
+    # Every evidence replay starts with an empty Cargo home, so transient registry
+    # failures must not make an otherwise valid installed-binary scenario flaky.
+    clean_env+=("CARGO_HTTP_MULTIPLEXING=false" "CARGO_NET_RETRY=10")
     "${clean_env[@]}" "$cargo_path" "$@"
 }
 
