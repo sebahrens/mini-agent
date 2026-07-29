@@ -136,6 +136,9 @@ HARD_TIMEOUT="${HARD_TIMEOUT:-$AGENT_TIMEOUT_SECS}"
 CONSEC_FAILURES=0
 LAST_FAILED_PICKED_ID=""
 STUCK_LOOP_THRESHOLD="${STUCK_LOOP_THRESHOLD:-3}"
+# Interrupts must reopen a selected build bead until its acceptance state has
+# been explicitly enforced after the agent returns.
+BUILD_ACCEPTANCE_ENFORCED=true
 
 # Pick a `timeout` binary. macOS doesn't ship one; Homebrew coreutils provides
 # either /usr/local/bin/timeout (alias) or gtimeout. If neither is installed,
@@ -691,8 +694,16 @@ sign_test_binaries() {
 }
 
 run_verification() {
+    local range_base="${1:-}" range_head="${2:-}"
     # Only verify in build mode — review/plan don't write code
     if [ "$MODE" != "build" ]; then return 0; fi
+
+    # Callers should provide the whole iteration range. Retain the historical
+    # one-commit range only for standalone/legacy calls.
+    if [ -z "$range_base" ] || [ -z "$range_head" ]; then
+        range_base="HEAD~1"
+        range_head="HEAD"
+    fi
 
     # mini-agent: Cargo.toml is at repo root (no rust/ subdirectory)
     local failed=0 errors="" cargo_dir="."
@@ -720,14 +731,14 @@ run_verification() {
 
     # Fast path: skip verification entirely if the iteration didn't touch any
     # Rust source or Cargo metadata.
-    if git rev-parse HEAD~1 >/dev/null 2>&1; then
+    if git rev-parse "$range_base" "$range_head" >/dev/null 2>&1; then
         local rust_changed=false
-        if git diff --name-only HEAD~1 HEAD 2>/dev/null \
+        if git diff --name-only "$range_base" "$range_head" 2>/dev/null \
             | grep -qE '\.(rs|toml)$|^Cargo\.lock$'; then
             rust_changed=true
         fi
         if [ "$rust_changed" = false ]; then
-            echo -e "${BOLD}│${NC}  ${DIM}SKIP${NC} no .rs/.toml/Cargo.lock changes since HEAD~1 — verification not needed"
+            echo -e "${BOLD}│${NC}  ${DIM}SKIP${NC} no .rs/.toml/Cargo.lock changes in verification range — verification not needed"
             echo -e "${BOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
             return 0
         fi
@@ -736,11 +747,11 @@ run_verification() {
     # mini-agent workspace: root package (mini-agent) and spike/.
     # Determine which packages were touched so we scope clippy/test tightly.
     local existing_crates=""
-    if git diff --name-only HEAD~1 HEAD 2>/dev/null \
+    if git diff --name-only "$range_base" "$range_head" 2>/dev/null \
             | grep -vE '^spike/' | grep -qE '\.(rs|toml)$|^Cargo\.lock$'; then
         existing_crates+="mini-agent"$'\n'
     fi
-    if git diff --name-only HEAD~1 HEAD 2>/dev/null \
+    if git diff --name-only "$range_base" "$range_head" 2>/dev/null \
             | grep -qE '^spike/.*\.(rs|toml)$'; then
         if [ -f "spike/Cargo.toml" ]; then
             existing_crates+="spike"$'\n'
@@ -892,7 +903,7 @@ run_verification() {
             : > "$bins_to_run"
 
             local fixtures_touched=false
-            if git diff --name-only HEAD~1 HEAD 2>/dev/null \
+            if git diff --name-only "$range_base" "$range_head" 2>/dev/null \
                 | grep -qE '/tests/(fixtures|data)/|/testdata/|\.snap$'; then
                 fixtures_touched=true
                 : > "$pass_cache"
@@ -1058,8 +1069,10 @@ real_binary_evidence_status() {
         | map(select(.token == $token)
               | select(([ .scenario, .interface, .commands, .expected, .observed ]
                         | any(test("^\\s*$")) | not))) as $structured
+        # Beads returns comments in insertion order; use the final structured
+        # current-token block so missing/mixed timestamps cannot reorder evidence.
         | if ($structured | length) > 0 then
-              (([$structured[] | select(.created_at != "")] | if length > 0 then sort_by(.created_at) else ($structured | sort_by(.index)) end)[-1].result | ascii_downcase)
+              (($structured | sort_by(.index))[-1].result | ascii_downcase)
           elif ($mentions | length) > 0 then "invalid"
           else "missing"
           end
@@ -1170,12 +1183,22 @@ run_iteration() {
         fi
 
         if [ -n "$PICKED_ID" ]; then
-            if bead_is_closed "$PICKED_ID"; then
-                echo -e "${YELLOW}Skipping $PICKED_ID — already closed${NC}"
-                return 0
-            fi
-            bd update "$PICKED_ID" --claim 2>/dev/null || \
-                echo -e "${DIM}  (claim failed — proceeding anyway)${NC}"
+            local initial_state
+            initial_state=$(bead_enforcement_status "$PICKED_ID")
+            case "$initial_state" in
+                open)
+                    bd update "$PICKED_ID" --claim 2>/dev/null || \
+                        echo -e "${DIM}  (claim failed — proceeding anyway)${NC}"
+                    ;;
+                closed)
+                    # A selected closed bead still participates in the normal
+                    # acceptance/reopen decision after the agent run.
+                    ;;
+                unavailable)
+                    echo -e "${RED}Cannot confirm initial state for $PICKED_ID; attempting checked reopen${NC}"
+                    reopen_build_bead "$PICKED_ID" 1 unavailable || return 1
+                    ;;
+            esac
             print_picking_up "$PICKED_ID" "$PICKED_TITLE"
 
             if [ "${CONSEC_FAILURES:-0}" -ge "$STUCK_LOOP_THRESHOLD" ] \
@@ -1205,6 +1228,7 @@ run_iteration() {
             fi
             return 1
         fi
+        BUILD_ACCEPTANCE_ENFORCED=false
     fi
     echo -e "${BLUE}Running agent...${NC}"
     local prompt_content
@@ -1276,8 +1300,13 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
             fi
         fi
 
+        local selected_reopen_ok=true
+        if [ "$MODE" = build ] && [ -n "$PICKED_ID" ]; then
+            reopen_build_bead "$PICKED_ID" 1 unavailable || selected_reopen_ok=false
+        fi
         while IFS= read -r stuck_id; do
-            [ -n "$stuck_id" ] && bd update "$stuck_id" --status=open 2>/dev/null || true
+            [ -n "$stuck_id" ] && [ "$stuck_id" != "$PICKED_ID" ] \
+                && bd update "$stuck_id" --status=open 2>/dev/null || true
         done < <(bd list --status=in_progress 2>/dev/null \
                   | grep -oE "$BEAD_ID_RE" | sort -u)
 
@@ -1286,6 +1315,8 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
 
         bd dolt push 2>/dev/null || true
         sleep 2
+        [ "$selected_reopen_ok" = true ] || return 1
+        BUILD_ACCEPTANCE_ENFORCED=true
         return 0
     fi
 
@@ -1311,11 +1342,33 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
     [ -n "$iteration_start_commit" ] && [ -n "$commit_after" ] && [ "$iteration_start_commit" != "$commit_after" ] \
         && iteration_committed=true
 
-    run_verification && local verify_ok=0 || local verify_ok=$?
+    run_verification "$iteration_start_commit" "$commit_after" && local verify_ok=0 || local verify_ok=$?
+
+    # Verification may apply rustfmt/clippy fixes. Never accept those changes
+    # uncommitted, and ensure the final commit still passes the whole range.
+    if [ "$verify_ok" = "0" ] && [ -n "$(git status --porcelain | grep -v '\.beads/' || true)" ]; then
+        echo -e "${GREEN}Committing verification fixes...${NC}"
+        git add -A
+        git commit -m "loop($label): iteration $iter verification fixes" --no-verify 2>/dev/null || true
+        commit_after=$(git rev-parse HEAD 2>/dev/null || echo "")
+        [ -n "$iteration_start_commit" ] && [ "$iteration_start_commit" != "$commit_after" ] \
+            && iteration_committed=true
+        run_verification "$iteration_start_commit" "$commit_after" && verify_ok=0 || verify_ok=$?
+        if [ -n "$(git status --porcelain | grep -v '\.beads/' || true)" ]; then
+            echo -e "${RED}FAIL: verification mutated tracked non-Beads files twice${NC}" >&2
+            verify_ok=1
+        fi
+    fi
 
     if [ "$MODE" = "build" ] && [ -n "$PICKED_ID" ]; then
-        local bead_closed=false code_changed=false evidence_status outcome
-        bead_is_closed "$PICKED_ID" && bead_closed=true
+        local bead_state bead_closed=false code_changed=false evidence_status outcome
+        bead_state=$(bead_enforcement_status "$PICKED_ID")
+        if [ "$bead_state" = unavailable ]; then
+            echo -e "${RED}Cannot enforce acceptance: bead state unavailable${NC}" >&2
+            reopen_build_bead "$PICKED_ID" 1 unavailable || return 1
+            bead_state=open
+        fi
+        [ "$bead_state" = closed ] && bead_closed=true
         if [ "$iteration_committed" = true ] \
                 && current_iteration_has_relevant_changes "$iteration_start_commit" "$commit_after"; then
             code_changed=true
@@ -1338,13 +1391,18 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
             if auto_close_build_bead "$PICKED_ID" "$(git log -1 --pretty=%h)"; then
                 bead_closed=true
             else
+                # A failed close is not a confirmed partial/open state.
+                reopen_build_bead "$PICKED_ID" 1 unavailable || return 1
                 outcome=partial
             fi
         fi
 
         if [ "$outcome" = accept ] || [ "$outcome" = auto-close ]; then
+            BUILD_ACCEPTANCE_ENFORCED=true
             print_completed "$PICKED_ID" "$PICKED_TITLE" "closed"
         else
+            # Reopen and partial paths have both explicitly confirmed OPEN.
+            BUILD_ACCEPTANCE_ENFORCED=true
             print_completed "$PICKED_ID" "$PICKED_TITLE" "partial"
         fi
     fi
@@ -1669,6 +1727,13 @@ handle_interrupt() {
             bd comments add "$PICKED_ID" \
                 "[INTERRUPTED] iteration $CURRENT_ITERATION domain=$CURRENT_DOMAIN ($(timestamp))" \
                 2>/dev/null || true
+            if [ "$MODE" = build ] && [ "${BUILD_ACCEPTANCE_ENFORCED:-true}" != true ]; then
+                if ! reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                    echo -e "${RED}${BOLD}INTERRUPT SAFETY FAILURE: could not confirm $PICKED_ID open${NC}" >&2
+                else
+                    BUILD_ACCEPTANCE_ENFORCED=true
+                fi
+            fi
         fi
         bd dolt push 2>/dev/null || true
     fi
