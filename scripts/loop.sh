@@ -1002,6 +1002,55 @@ show_agent_progress() {
     [ "$saw_result" = "1" ]
 }
 
+generate_evidence_token() {
+    local token=""
+    if [ -r /dev/urandom ]; then
+        token=$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || token=""
+    fi
+    if ! printf '%s' "$token" | grep -Eq '^[0-9a-f]{32}$'; then
+        token=$(openssl rand -hex 16 2>/dev/null || true)
+    fi
+    printf '%s' "$token" | grep -Eq '^[0-9a-f]{32}$' || return 1
+    printf '%s\n' "$token"
+}
+
+real_binary_evidence_status() {
+    local issue_id="$1" token="$2" comments_file parsed
+    command -v jq >/dev/null 2>&1 || { echo unavailable; return; }
+    comments_file=$(mktemp) || { echo unavailable; return; }
+    if ! bd comments "$issue_id" --json > "$comments_file" 2>/dev/null; then
+        rm -f "$comments_file"; echo unavailable; return
+    fi
+    if ! jq -e 'if type == "array" then . elif (.comments? | type) == "array" then .comments else error("unexpected comments JSON") end' "$comments_file" >/dev/null 2>&1; then
+        rm -f "$comments_file"; echo invalid; return
+    fi
+    parsed=$(jq -r --arg token "$token" '
+        (if type == "array" then . else .comments end)
+        | map((.text // .body // .comment // .content // "") | tostring)
+        | map(select(contains("Token: " + $token)))
+        | if length == 0 then "missing"
+          else .[-1] as $c
+          | ($c | capture("\\A\\[REAL-BINARY EVIDENCE\\]\\nToken: (?<token>[0-9a-f]{32})\\nScenario: (?<scenario>[^\\n]+)\\nInterface: (?<interface>[^\\n]+)\\nCommands: (?<commands>[^\\n]+)\\nExpected: (?<expected>[^\\n]+)\\nObserved: (?<observed>[^\\n]+)\\nResult: (?<result>PASS|FAIL|BLOCKED)\\z"; "") // null) as $e
+          | if $e == null or $e.token != $token then "invalid"
+            elif ([ $e.scenario, $e.interface, $e.commands, $e.expected, $e.observed ] | any(test("^\\s*$"))) then "invalid"
+            else ($e.result | ascii_downcase) end
+          end
+    ' "$comments_file" 2>/dev/null) || parsed="invalid"
+    rm -f "$comments_file"
+    case "$parsed" in pass|fail|blocked|missing|invalid) echo "$parsed" ;; *) echo invalid ;; esac
+}
+
+decide_build_outcome() {
+    local closed="$1" verify_status="$2" evidence="$3" committed="$4" code_changed="$5"
+    if [ "$closed" = true ]; then
+        if [ "$verify_status" = "0" ] && [ "$evidence" = pass ]; then echo accept; else echo reopen; fi
+    elif [ "$verify_status" = "0" ] && [ "$evidence" = pass ] && [ "$committed" = true ] && [ "$code_changed" = true ]; then
+        echo auto-close
+    else
+        echo partial
+    fi
+}
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  Core: Run One Agent Iteration                                   ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -1078,6 +1127,17 @@ run_iteration() {
     fi
 
     # --- Run agent (fresh context window) ---
+    local evidence_token="" iteration_start_commit
+    iteration_start_commit=$(git rev-parse HEAD 2>/dev/null || echo "")
+    if [ "$MODE" = "build" ] && [ -n "$PICKED_ID" ]; then
+        if ! evidence_token=$(generate_evidence_token); then
+            echo -e "${RED}Cannot generate real-binary evidence token — leaving $PICKED_ID open${NC}"
+            bd update "$PICKED_ID" --status=open 2>/dev/null || true
+            bd comments add "$PICKED_ID" \
+                "[LOOP] Iteration $CURRENT_ITERATION did not run: evidence token generation failed." 2>/dev/null || true
+            return 0
+        fi
+    fi
     echo -e "${BLUE}Running agent...${NC}"
     local prompt_content
     prompt_content=$(cat "$prompt_file")
@@ -1088,6 +1148,27 @@ run_iteration() {
 
 ## Pre-selected task
 Work on bead \`${PICKED_ID}\`. Run \`bd show ${PICKED_ID}\` to read the details, then implement. Do not pick a different task."
+
+        prompt_content="${prompt_content}
+
+## Required current-iteration installed-app evidence
+Before closing this bead, test-drive its actual feature using evidence token \`${evidence_token}\`:
+1. Derive a concrete end-to-end scenario from the bead outcome and acceptance criteria.
+2. Run \`cargo install --path . --debug\`.
+3. Invoke the installed \`mini-agent\` from PATH—not \`cargo run\`, a test, or \`target/debug/mini-agent\`.
+4. Force the implemented feature through its public CLI path. For TUI behavior use tmux; for packaging/release behavior execute the exact produced artifact.
+5. Compare one specific expected result with the observed result. Generic hello or one-word output is valid only when this is a connectivity-specific bead.
+6. Add exactly one bounded, secret-free Beads comment in this shape (replace every placeholder, but preserve labels and token):
+[REAL-BINARY EVIDENCE]
+Token: ${evidence_token}
+Scenario: <non-empty>
+Interface: <non-empty>
+Commands: <non-empty>
+Expected: <non-empty>
+Observed: <non-empty>
+Result: PASS
+
+If the scenario fails, cannot run, has no production path, or lacks credentials/platform support, record \`Result: FAIL\` or \`Result: BLOCKED\` in that same shape and leave the bead open."
     fi
 
     local agent_ok=true
@@ -1144,8 +1225,7 @@ Work on bead \`${PICKED_ID}\`. Run \`bd show ${PICKED_ID}\` to read the details,
     LAST_FAILED_PICKED_ID=""
 
     # --- Post-iteration: commit, verify, then handle bead status ---
-    local commit_before commit_after iteration_committed=false
-    commit_before=$(git rev-parse HEAD 2>/dev/null || echo "")
+    local commit_after iteration_committed=false
 
     if [ -n "$(git status --porcelain)" ]; then
         local real_changes
@@ -1160,35 +1240,38 @@ Work on bead \`${PICKED_ID}\`. Run \`bd show ${PICKED_ID}\` to read the details,
     fi
 
     commit_after=$(git rev-parse HEAD 2>/dev/null || echo "")
-    [ -n "$commit_before" ] && [ -n "$commit_after" ] && [ "$commit_before" != "$commit_after" ] \
+    [ -n "$iteration_start_commit" ] && [ -n "$commit_after" ] && [ "$iteration_start_commit" != "$commit_after" ] \
         && iteration_committed=true
 
     run_verification && local verify_ok=0 || local verify_ok=$?
 
     if [ "$MODE" = "build" ] && [ -n "$PICKED_ID" ]; then
-        local bead_closed=false
+        local bead_closed=false code_changed=false evidence_status outcome
         bead_is_closed "$PICKED_ID" && bead_closed=true
+        if [ "$iteration_committed" = true ]; then
+            git diff --name-only "$iteration_start_commit" "$commit_after" 2>/dev/null \
+                | grep -qvE '^(\.beads/|$)' && code_changed=true
+        fi
+        evidence_status=$(real_binary_evidence_status "$PICKED_ID" "$evidence_token")
+        outcome=$(decide_build_outcome "$bead_closed" "$verify_ok" "$evidence_status" "$iteration_committed" "$code_changed")
+        echo -e "${BOLD}Real-binary evidence:${NC} ${evidence_status}"
 
-        if [ "$bead_closed" = true ] && [ "$verify_ok" != "0" ]; then
-            echo -e "${YELLOW}Reopening $PICKED_ID — agent closed it but verification failed${NC}"
+        if [ "$outcome" = reopen ]; then
+            echo -e "${YELLOW}Reopening $PICKED_ID — acceptance gates did not both pass${NC}"
             bd update "$PICKED_ID" --status=open 2>/dev/null \
                 && bd comments add "$PICKED_ID" \
-                    "[LOOP] Reopened by loop: verification failed after agent closed (iter $CURRENT_ITERATION)" 2>/dev/null \
+                    "[LOOP] Reopened after iteration $CURRENT_ITERATION: verification=$([ "$verify_ok" = 0 ] && echo pass || echo fail), evidence=$evidence_status." 2>/dev/null \
                 || true
             bead_closed=false
         fi
 
-        if [ "$bead_closed" = false ] && [ "$verify_ok" = "0" ] && [ "$iteration_committed" = true ]; then
-            local code_changed=false
-            git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -qE '\.(rs|toml)$' && code_changed=true
-            if [ "$code_changed" = true ]; then
-                echo -e "${YELLOW}Auto-closing $PICKED_ID (verification passed, code changed)${NC}"
-                bd close "$PICKED_ID" --reason "Auto-closed by loop: verification passed, commit $(git log -1 --pretty=%h)" 2>/dev/null || true
-                bead_closed=true
-            fi
+        if [ "$outcome" = auto-close ]; then
+            echo -e "${YELLOW}Auto-closing $PICKED_ID (verification and real-binary evidence passed)${NC}"
+            bd close "$PICKED_ID" --reason "Auto-closed by loop: both gates passed, commit $(git log -1 --pretty=%h)" 2>/dev/null || true
+            bead_closed=true
         fi
 
-        if [ "$bead_closed" = true ] && [ "$verify_ok" = "0" ]; then
+        if [ "$outcome" = accept ] || [ "$outcome" = auto-close ]; then
             print_completed "$PICKED_ID" "$PICKED_TITLE" "closed"
         else
             print_completed "$PICKED_ID" "$PICKED_TITLE" "partial"
