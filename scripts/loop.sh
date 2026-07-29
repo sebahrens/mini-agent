@@ -464,6 +464,7 @@ bead_enforcement_status() {
             2>/dev/null) || status=""
     case "$status" in
         open) echo open ;;
+        in_progress) echo in_progress ;;
         closed) echo closed ;;
         *) echo unavailable ;;
     esac
@@ -2010,6 +2011,14 @@ current_iteration_has_relevant_changes() {
     return 1
 }
 
+# Stage automatic loop commits without sweeping tracked Beads exports into
+# product history. Return success only when a non-Beads change is staged.
+stage_non_beads_changes() {
+    git add -A || return 1
+    git reset -q -- .beads 2>/dev/null || return 1
+    ! git diff --cached --quiet
+}
+
 reopen_build_bead() {
     local issue_id="$1" verify_status="$2" evidence_status="$3" state
     if bd update "$issue_id" --status=open 2>/dev/null; then
@@ -2103,16 +2112,31 @@ run_iteration() {
             initial_state=$(bead_enforcement_status "$PICKED_ID")
             case "$initial_state" in
                 open)
-                    bd update "$PICKED_ID" --claim 2>/dev/null || \
-                        echo -e "${DIM}  (claim failed — proceeding anyway)${NC}"
+                    if ! bd update "$PICKED_ID" --claim 2>/dev/null; then
+                        echo -e "${RED}Cannot claim $PICKED_ID; attempting checked reopen${NC}"
+                        if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                            BUILD_ACCEPTANCE_ENFORCED=true
+                        fi
+                        return 1
+                    fi
+                    if [ "$(bead_enforcement_status "$PICKED_ID")" != in_progress ]; then
+                        echo -e "${RED}Cannot confirm claim for $PICKED_ID; attempting checked reopen${NC}"
+                        if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                            BUILD_ACCEPTANCE_ENFORCED=true
+                        fi
+                        return 1
+                    fi
                     ;;
-                closed)
-                    # A selected closed bead still participates in the normal
-                    # acceptance/reopen decision after the agent run.
+                in_progress)
+                    # pick_ready_bead intentionally resumes active work first.
+                    # It is already claimed, so continue without rewriting it.
                     ;;
-                unavailable)
-                    echo -e "${RED}Cannot confirm initial state for $PICKED_ID; attempting checked reopen${NC}"
-                    reopen_build_bead "$PICKED_ID" 1 unavailable || return 1
+                closed|unavailable)
+                    echo -e "${RED}Cannot safely start $PICKED_ID from state=$initial_state; attempting checked reopen${NC}"
+                    if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                        BUILD_ACCEPTANCE_ENFORCED=true
+                    fi
+                    return 1
                     ;;
             esac
             print_picking_up "$PICKED_ID" "$PICKED_TITLE"
@@ -2215,7 +2239,6 @@ run_iteration() {
                 ;;
         esac
     fi
-    echo -e "${BLUE}Running agent...${NC}"
     local prompt_content
     prompt_content=$(cat "$prompt_file")
 
@@ -2251,6 +2274,19 @@ Result: PASS
 If the scenario fails, cannot run, has no production path, or lacks credentials/platform support, record \`Result: FAIL\` or \`Result: BLOCKED\` in that same shape and leave the bead open."
     fi
 
+    if [ "$MODE" = build ] && [ -n "$PICKED_ID" ]; then
+        local launch_state
+        launch_state=$(bead_enforcement_status "$PICKED_ID")
+        if [ "$launch_state" != in_progress ]; then
+            echo -e "${RED}Cannot launch for $PICKED_ID from state=$launch_state; attempting checked reopen${NC}"
+            if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                BUILD_ACCEPTANCE_ENFORCED=true
+            fi
+            return 1
+        fi
+    fi
+
+    echo -e "${BLUE}Running agent...${NC}"
     local agent_ok=true
     local agent_prefix=()
     if [ -n "$TIMEOUT_BIN" ] && [ "$AGENT_TIMEOUT_SECS" -gt 0 ] 2>/dev/null; then
@@ -2280,8 +2316,9 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
             partial_changes=$(git status --porcelain | grep -v '\.beads/' | head -1)
             if [ -n "$partial_changes" ]; then
                 echo -e "${YELLOW}Committing partial progress so the next iteration starts clean...${NC}"
-                git add -A
-                git commit -m "loop($label): iteration $iter (timed out — partial)" --no-verify 2>/dev/null || true
+                if stage_non_beads_changes; then
+                    git commit -m "loop($label): iteration $iter (timed out — partial)" --no-verify 2>/dev/null || true
+                fi
             fi
         fi
 
@@ -2289,11 +2326,6 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
         if [ "$MODE" = build ] && [ -n "$PICKED_ID" ]; then
             reopen_build_bead "$PICKED_ID" 1 unavailable || selected_reopen_ok=false
         fi
-        while IFS= read -r stuck_id; do
-            [ -n "$stuck_id" ] && [ "$stuck_id" != "$PICKED_ID" ] \
-                && bd update "$stuck_id" --status=open 2>/dev/null || true
-        done < <(bd list --status=in_progress 2>/dev/null \
-                  | grep -oE "$BEAD_ID_RE" | sort -u)
 
         LAST_FAILED_PICKED_ID="${PICKED_ID:-}"
         CONSEC_FAILURES=$((CONSEC_FAILURES + 1))
@@ -2316,8 +2348,9 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
         real_changes=$(git status --porcelain | grep -v '\.beads/' | head -1)
         if [ -n "$real_changes" ]; then
             echo -e "${GREEN}Committing changes...${NC}"
-            git add -A
-            git commit -m "loop($label): iteration $iter" --no-verify 2>/dev/null || true
+            if stage_non_beads_changes; then
+                git commit -m "loop($label): iteration $iter" --no-verify 2>/dev/null || true
+            fi
         else
             echo -e "${DIM}Only beads DB changed — skipping git commit${NC}"
         fi
@@ -2334,8 +2367,9 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
     # uncommitted, and ensure the final commit still passes the whole range.
     if [ "$verify_ok" = "0" ] && [ -n "$(git status --porcelain | grep -v '\.beads/' || true)" ]; then
         echo -e "${GREEN}Committing verification fixes...${NC}"
-        git add -A
-        git commit -m "loop($label): iteration $iter verification fixes" --no-verify 2>/dev/null || true
+        if stage_non_beads_changes; then
+            git commit -m "loop($label): iteration $iter verification fixes" --no-verify 2>/dev/null || true
+        fi
         commit_after=$(git rev-parse HEAD 2>/dev/null || echo "")
         [ -n "$iteration_start_commit" ] && [ "$iteration_start_commit" != "$commit_after" ] \
             && iteration_committed=true
@@ -2388,6 +2422,15 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
                 return 1
             fi
             bead_closed=false
+        fi
+
+        if [ "$outcome" = partial ] && [ "$bead_state" = in_progress ]; then
+            echo -e "${YELLOW}Reopening $PICKED_ID — resumed work did not pass acceptance gates${NC}"
+            if ! reopen_build_bead "$PICKED_ID" "$verify_ok" "$evidence_status"; then
+                print_completed "$PICKED_ID" "$PICKED_TITLE" "partial"
+                return 1
+            fi
+            bead_state=open
         fi
 
         if [ "$outcome" = auto-close ]; then
@@ -2629,9 +2672,10 @@ race to deeper layers; the next round's fresh context will pick that up.
             break
         fi
 
-        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-            git add -A
-            git commit -m "loop(decompose): round $round" --no-verify 2>/dev/null || true
+        if [ -n "$(git status --porcelain 2>/dev/null | grep -v '\.beads/' | head -1)" ]; then
+            if stage_non_beads_changes; then
+                git commit -m "loop(decompose): round $round" --no-verify 2>/dev/null || true
+            fi
         fi
 
         local ids_after new_ids new_ids_inline
@@ -2720,6 +2764,9 @@ race to deeper layers; the next round's fresh context will pick that up.
 # ╚══════════════════════════════════════════════════════════════════╝
 
 handle_interrupt() {
+    # Cleanup must be single-entry: a second terminal signal during Beads or
+    # Git operations must not nest another handler invocation.
+    trap '' SIGINT SIGTERM
     echo ""
     echo -e "${YELLOW}── Interrupted at $(timestamp) ──${NC}"
 
@@ -2739,10 +2786,13 @@ handle_interrupt() {
         bd dolt push 2>/dev/null || true
     fi
 
-    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    local partial_changes
+    partial_changes=$(git status --porcelain 2>/dev/null | grep -v '\.beads/' | head -1)
+    if [ -n "$partial_changes" ]; then
         echo -e "${YELLOW}Committing partial changes...${NC}"
-        git add -A
-        git commit -m "loop: interrupted at iteration $CURRENT_ITERATION" --no-verify 2>/dev/null || true
+        if stage_non_beads_changes; then
+            git commit -m "loop: interrupted at iteration $CURRENT_ITERATION" --no-verify 2>/dev/null || true
+        fi
     fi
 
     echo -e "${YELLOW}Run ./scripts/loop.sh again to resume.${NC}"
@@ -2750,6 +2800,7 @@ handle_interrupt() {
 }
 
 handle_termination() {
+    trap '' SIGINT SIGTERM
     echo -e "\n${YELLOW}── Terminated at $(timestamp); EXIT safety will reopen any unenforced build bead ──${NC}" >&2
     exit 143
 }
