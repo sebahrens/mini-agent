@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::storage;
 
-const MAX_CHAT_HISTORY_ENTRIES: usize = 10_000;
+pub(crate) const MAX_CHAT_HISTORY_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatHistoryEntry {

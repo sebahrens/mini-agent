@@ -6,6 +6,14 @@ use crate::config;
 use crate::session;
 
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
+const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat-history-entry-limit";
+
+fn chat_history_limit_entry() -> (&'static str, String) {
+    (
+        CHAT_HISTORY_ENTRY_LIMIT_LABEL,
+        session::chat_history::MAX_CHAT_HISTORY_ENTRIES.to_string(),
+    )
+}
 
 fn append_section(output: &mut String, title: &str, entries: &[(&str, String)]) {
     writeln!(output, "{}:", title).expect("writing configuration output to a String cannot fail");
@@ -152,6 +160,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
 
     #[cfg_attr(not(feature = "subagents"), allow(unused_mut))]
     let mut limit_entries: Vec<(&str, String)> = vec![
+        chat_history_limit_entry(),
         ("max-tokens", max_tokens.to_string()),
         ("max-agent-turns", max_agent_turns.to_string()),
         ("context-window", context_window.to_string()),
@@ -250,7 +259,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
 mod tests {
     use std::io;
 
-    use super::{CHAT_HISTORY_FILE_LABEL, write_output};
+    use super::{
+        CHAT_HISTORY_ENTRY_LIMIT_LABEL, CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry,
+        write_output,
+    };
 
     struct BrokenPipeWriter;
 
@@ -284,5 +296,13 @@ mod tests {
     #[test]
     fn flushing_config_output_treats_a_closed_pipe_as_success() {
         assert!(write_output(FlushBrokenPipeWriter, CHAT_HISTORY_FILE_LABEL).is_ok());
+    }
+
+    #[test]
+    fn config_reports_the_production_chat_history_entry_limit() {
+        assert_eq!(
+            chat_history_limit_entry(),
+            (CHAT_HISTORY_ENTRY_LIMIT_LABEL, "10000".to_string())
+        );
     }
 }
