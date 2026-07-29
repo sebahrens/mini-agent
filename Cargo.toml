@@ -43,7 +43,7 @@ lsp = ["dep:lsp-types"]
 js = ["dep:rquickjs"]
 
 [dependencies]
-rig = { version = "0.40", features = ["rmcp"] }
+rig = { version = "0.41", features = ["rmcp"] }
 rmcp = { version = "2.0", optional = true, default-features = false, features = [
     "client",
     "transport-child-process",
@@ -90,7 +90,7 @@ rquickjs = { version = "0.12", features = ["full"], optional = true }
 mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
-rig = { version = "0.40", features = ["test-utils"] }
+rig = { version = "0.41", features = ["test-utils"] }
 
 [profile.dev]
 opt-level = 1
