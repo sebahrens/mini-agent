@@ -309,6 +309,12 @@ impl Cli {
         if let Some(m) = self.model.as_deref() {
             return CompactString::new(m);
         }
+        // OPENROUTER_MODEL env var (higher priority than config file).
+        if let Ok(m) = std::env::var("OPENROUTER_MODEL")
+            && !m.is_empty()
+        {
+            return CompactString::new(m);
+        }
         // Config model field references a quick model name; resolve it.
         if let Some(m) = cfg.model.as_deref() {
             let qm = config::quick_models_map(cfg);
