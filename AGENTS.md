@@ -67,6 +67,34 @@ Register `JsTool` in `src/agent/builder.rs` under `#[cfg(feature = "js")]`, alon
 - Do not reuse `Runtime` across steps even if no OOM occurred — allocation state is unpredictable
 - Do not add `fetch()` until Phase 2 permission routing is implemented
 
+## Testing the binary
+
+Build and install the debug binary from the repo root:
+
+```bash
+cargo install --path . --debug
+```
+
+**Connectivity smoke test** — use headless `-p` mode (no terminal required):
+
+```bash
+mini-agent -p "say hello in one word"
+```
+
+A one-word reply confirms the binary connects to OpenRouter using `OPENROUTER_API_KEY`.
+Ignore any MCP teardown noise at exit (e.g. Exa session cleanup errors) — those are benign.
+
+**TUI testing** — the interactive UI requires a real terminal; use tmux when running inside
+an agent or CI environment:
+
+```bash
+tmux new-session -d -s test -x 220 -y 50
+tmux send-keys -t test 'mini-agent' Enter
+sleep 3
+tmux capture-pane -t test -p   # inspect rendered output
+tmux kill-session -t test
+```
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
