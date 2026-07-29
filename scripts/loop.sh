@@ -1183,6 +1183,11 @@ run_iteration() {
         fi
 
         if [ -n "$PICKED_ID" ]; then
+            # Selection starts the acceptance-critical window. Set this before
+            # any state query, claim, output, or other interruptible work so
+            # SIGINT always reopens the selected bead unless a terminal state
+            # has subsequently been confirmed.
+            BUILD_ACCEPTANCE_ENFORCED=false
             local initial_state
             initial_state=$(bead_enforcement_status "$PICKED_ID")
             case "$initial_state" in
@@ -1209,6 +1214,11 @@ run_iteration() {
                     --description "loop.sh build mode hit the agent-timeout / no-result-event path on \`$PICKED_ID\` $CONSEC_FAILURES iterations in a row at $(timestamp). Each iteration ran the agent to wall-clock SIGTERM (AGENT_TIMEOUT_SECS=$AGENT_TIMEOUT_SECS) without emitting the terminal stream-json frame. Investigate the bead manually before re-running the loop on it — likely the work needs to be split, the agent is looping on a single failing test, or the timeout needs another bump." \
                     --type=bug \
                     --priority=0 2>/dev/null || true
+                if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                    BUILD_ACCEPTANCE_ENFORCED=true
+                else
+                    return 1
+                fi
                 return 1
             fi
         fi
@@ -1224,11 +1234,11 @@ run_iteration() {
             if reopen_build_bead "$PICKED_ID" 1 unavailable; then
                 bd comments add "$PICKED_ID" \
                     "[LOOP] Iteration $CURRENT_ITERATION did not run: evidence token generation failed." 2>/dev/null || true
+                BUILD_ACCEPTANCE_ENFORCED=true
                 return 0
             fi
             return 1
         fi
-        BUILD_ACCEPTANCE_ENFORCED=false
     fi
     echo -e "${BLUE}Running agent...${NC}"
     local prompt_content
