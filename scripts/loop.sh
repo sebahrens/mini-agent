@@ -520,9 +520,14 @@ pick_ready_bead() {
         picked_json=$(bd --json list --limit 0 --status in_progress 2>/dev/null \
             | jq -c "[.[] | $label_filter] | .[0] // empty" 2>/dev/null || true)
         if [ -n "$picked_json" ] && [ "$picked_json" != "null" ]; then
-            PICKED_ID=$(printf '%s' "$picked_json" | jq -r '.id // empty' 2>/dev/null)
+            local picked_id
+            picked_id=$(printf '%s' "$picked_json" | jq -r '.id // empty' 2>/dev/null)
             PICKED_TITLE=$(printf '%s' "$picked_json" | jq -r '.title // empty' 2>/dev/null)
-            [ -n "$PICKED_ID" ] && return 0
+            if [ -n "$picked_id" ]; then
+                BUILD_ACCEPTANCE_ENFORCED=false
+                PICKED_ID="$picked_id"
+                return 0
+            fi
         fi
 
         # 2) Ready, with label + epic filters.
@@ -543,6 +548,7 @@ pick_ready_bead() {
             if [ "$itype" = "epic" ] && ! _epic_has_in_progress_subwork "$id"; then
                 continue
             fi
+            BUILD_ACCEPTANCE_ENFORCED=false
             PICKED_ID="$id"
             PICKED_TITLE="$title"
             return 0
@@ -569,9 +575,13 @@ pick_ready_bead() {
     fi
 
     [ -z "$picked_line" ] && return 1
-    PICKED_ID=$(echo "$picked_line" | grep -oE "$BEAD_ID_RE" | head -1 || true)
+    local picked_id
+    picked_id=$(echo "$picked_line" | grep -oE "$BEAD_ID_RE" | head -1 || true)
+    [ -z "$picked_id" ] && return 1
+    BUILD_ACCEPTANCE_ENFORCED=false
+    PICKED_ID="$picked_id"
     PICKED_TITLE=$(echo "$picked_line" | sed 's/^.*] - //' | sed 's/^.*] //')
-    [ -n "$PICKED_ID" ]
+    return 0
 }
 
 : "${BEADS_PREVIEW:=8}"  # how many ready beads to preview per banner
