@@ -5,7 +5,7 @@ use crate::cli;
 use crate::config;
 use crate::session;
 
-const CHAT_HISTORY_LABEL: &str = "chat history";
+const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 
 fn append_section(output: &mut String, title: &str, entries: &[(&str, String)]) {
     writeln!(output, "{}:", title).expect("writing configuration output to a String cannot fail");
@@ -127,7 +127,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
             ("credentials", paths.credentials_dir.display().to_string()),
             ("sessions", sessions_dir.display().to_string()),
             (
-                CHAT_HISTORY_LABEL,
+                CHAT_HISTORY_FILE_LABEL,
                 paths.chat_history_file().display().to_string(),
             ),
             ("config file", config_file.display().to_string()),
@@ -250,7 +250,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
 mod tests {
     use std::io;
 
-    use super::{CHAT_HISTORY_LABEL, write_output};
+    use super::{CHAT_HISTORY_FILE_LABEL, write_output};
 
     struct BrokenPipeWriter;
 
@@ -278,11 +278,11 @@ mod tests {
 
     #[test]
     fn writing_config_output_treats_a_closed_pipe_as_success() {
-        assert!(write_output(BrokenPipeWriter, CHAT_HISTORY_LABEL).is_ok());
+        assert!(write_output(BrokenPipeWriter, CHAT_HISTORY_FILE_LABEL).is_ok());
     }
 
     #[test]
     fn flushing_config_output_treats_a_closed_pipe_as_success() {
-        assert!(write_output(FlushBrokenPipeWriter, CHAT_HISTORY_LABEL).is_ok());
+        assert!(write_output(FlushBrokenPipeWriter, CHAT_HISTORY_FILE_LABEL).is_ok());
     }
 }
