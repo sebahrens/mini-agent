@@ -1547,7 +1547,10 @@ real_binary_evidence_status() {
 run_with_hard_timeout() {
     local seconds="$1"
     shift
-    if [ -n "${TIMEOUT_BIN:-}" ]; then
+    # External timeout binaries cannot invoke functions defined in this shell.
+    # Use the watchdog below for function-backed commands such as the clean
+    # install/replay environment wrappers.
+    if [ -n "${TIMEOUT_BIN:-}" ] && ! declare -F "$1" >/dev/null; then
         "$TIMEOUT_BIN" --kill-after=30 "$seconds" "$@"
         return $?
     fi

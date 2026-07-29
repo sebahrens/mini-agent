@@ -19,6 +19,38 @@ def extract_function(source: str, name: str, next_name: str) -> str:
 
 
 class LoopLifecycleTests(unittest.TestCase):
+    def test_hard_timeout_runs_shell_functions_when_timeout_binary_exists(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+        timeout_function = extract_function(
+            source,
+            "run_with_hard_timeout",
+            "hash_file_sha256",
+        )
+        harness = f"""
+set -eu
+
+TIMEOUT_BIN=$(command -v false)
+
+shell_task() {{
+    printf 'shell-function-ran\\n'
+}}
+
+{timeout_function}
+
+run_with_hard_timeout 5 shell_task
+"""
+
+        completed = subprocess.run(
+            ["bash", "-c", harness],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("shell-function-ran\n", completed.stdout)
+
     def test_clean_install_is_not_subject_to_the_scenario_file_limit(self) -> None:
         source = LOOP_SCRIPT.read_text()
         replay_function = extract_function(
