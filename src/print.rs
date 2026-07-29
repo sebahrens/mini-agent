@@ -11,7 +11,10 @@ const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 fn chat_history_limit_entry() -> (&'static str, String) {
     (
         CHAT_HISTORY_ENTRY_LIMIT_LABEL,
-        session::chat_history::MAX_CHAT_HISTORY_ENTRIES.to_string(),
+        format!(
+            "{} entries",
+            session::chat_history::MAX_CHAT_HISTORY_ENTRIES
+        ),
     )
 }
 
@@ -299,7 +302,7 @@ mod tests {
     fn config_reports_the_production_chat_history_entry_limit() {
         assert_eq!(
             chat_history_limit_entry(),
-            ("chat history entry limit", "10000".to_string())
+            ("chat history entry limit", "10000 entries".to_string())
         );
     }
 }
