@@ -80,8 +80,13 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("mini-agent-chat-history-{}", uuid::Uuid::new_v4()));
+            // macOS exposes its temp directory through `/var`, which is a symlink
+            // to `/private/var`; persistence intentionally rejects linked parents.
+            let temp_root = std::env::temp_dir()
+                .canonicalize()
+                .expect("failed to resolve the chat-history test temp root");
+            let path =
+                temp_root.join(format!("mini-agent-chat-history-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
