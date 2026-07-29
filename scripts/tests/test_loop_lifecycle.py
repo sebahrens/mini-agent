@@ -19,6 +19,25 @@ def extract_function(source: str, name: str, next_name: str) -> str:
 
 
 class LoopLifecycleTests(unittest.TestCase):
+    def test_clean_install_is_not_subject_to_the_scenario_file_limit(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+        replay_function = extract_function(
+            source,
+            "replay_real_binary_evidence",
+            "decide_build_outcome",
+        )
+        install_start = replay_function.index('if [ "$reason" = replay-failed ] \\\n'
+                                              '            && ! (cd "$install_workspace"')
+        install_end = replay_function.index(
+            'elif [ "$reason" = replay-failed ]; then',
+            install_start,
+        )
+        install_section = replay_function[install_start:install_end]
+
+        self.assertIn("install --path . --debug", install_section)
+        self.assertNotIn("ulimit -f", install_section)
+        self.assertIn("ulimit -f 4096", replay_function[install_end:])
+
     def test_reopened_bead_can_be_claimed_again(self) -> None:
         source = LOOP_SCRIPT.read_text()
         reopen_function = extract_function(

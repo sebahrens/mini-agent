@@ -1799,7 +1799,8 @@ replay_real_binary_evidence() {
 
     if [ "$reason" = replay-failed ] \
             && ! (cd "$install_workspace" || exit 1
-                ulimit -f 4096 2>/dev/null || true
+                # Cargo registry metadata and compiler artifacts routinely exceed
+                # the evidence scenario's 2 MiB output-file limit.
                 run_with_hard_timeout "${LOOP_INSTALL_TIMEOUT_SECS:-900}" \
                     run_in_clean_install_environment "$install_root" "$cargo_path" "$rustc_path" \
                         install --path . --debug) > "$transcript" 2>&1; then

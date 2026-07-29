@@ -16,7 +16,13 @@ fn append_section(output: &mut String, title: &str, entries: &[(&str, String)]) 
 }
 
 fn write_output(mut writer: impl IoWrite, output: &str) -> io::Result<()> {
-    match writer.write_all(output.as_bytes()) {
+    if let Err(error) = writer.write_all(output.as_bytes()) {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    match writer.flush() {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result,
     }
@@ -256,8 +262,25 @@ mod tests {
         }
     }
 
+    struct FlushBrokenPipeWriter;
+
+    impl io::Write for FlushBrokenPipeWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
     #[test]
     fn writing_config_output_treats_a_closed_pipe_as_success() {
         assert!(write_output(BrokenPipeWriter, "chat history").is_ok());
+    }
+
+    #[test]
+    fn flushing_config_output_treats_a_closed_pipe_as_success() {
+        assert!(write_output(FlushBrokenPipeWriter, "chat history").is_ok());
     }
 }
