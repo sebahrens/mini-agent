@@ -428,6 +428,24 @@ bead_is_closed() {
     bd show "$id" 2>/dev/null | head -1 | grep -qE '·[[:space:]]*CLOSED\]'
 }
 
+# Fail-closed state query for acceptance enforcement. Unlike bead_is_closed,
+# this never treats a failed or ambiguous query as evidence that a bead is open.
+bead_enforcement_status() {
+    local id="$1" status
+    if [ -z "$id" ] || ! command -v jq >/dev/null 2>&1; then
+        echo unavailable
+        return
+    fi
+    status=$(bd show "$id" --json 2>/dev/null \
+        | jq -er 'if type == "array" then .[0].status else .status end | strings | ascii_downcase' \
+            2>/dev/null) || status=""
+    case "$status" in
+        open) echo open ;;
+        closed) echo closed ;;
+        *) echo unavailable ;;
+    esac
+}
+
 # Extract just the bead IDs from whatever bead-listing command is piped in.
 # Used by review-mode delta accounting to diff actual ID sets, not raw counts.
 extract_bead_ids() {
@@ -1029,14 +1047,19 @@ real_binary_evidence_status() {
     fi
     parsed=$(jq -r --arg token "$token" '
         (if type == "array" then . else .comments end)
-        | map((.text // .body // .comment // .content // "") | tostring)
-        | map(select(contains("Token: " + $token))) as $mentions
+        | to_entries
+        | map({index: .key, created_at: (.value.created_at // ""),
+               text: ((.value.text // .value.body // .value.comment // .value.content // "") | tostring)})
+        | map(select(.text | contains("Token: " + $token))) as $mentions
         | $mentions
-        | map(capture("\\A\\[REAL-BINARY EVIDENCE\\]\\nToken: (?<token>[0-9a-f]{32})\\nScenario: (?<scenario>[^\\n]+)\\nInterface: (?<interface>[^\\n]+)\\nCommands: (?<commands>[^\\n]+)\\nExpected: (?<expected>[^\\n]+)\\nObserved: (?<observed>[^\\n]+)\\nResult: (?<result>PASS|FAIL|BLOCKED)\\z"; "") // empty)
+        | map(. as $comment
+              | ($comment.text | capture("\\A\\[REAL-BINARY EVIDENCE\\]\\nToken: (?<token>[0-9a-f]{32})\\nScenario: (?<scenario>[^\\n]+)\\nInterface: (?<interface>[^\\n]+)\\nCommands: (?<commands>[^\\n]+)\\nExpected: (?<expected>[^\\n]+)\\nObserved: (?<observed>[^\\n]+)\\nResult: (?<result>PASS|FAIL|BLOCKED)\\z"; "") // empty)
+              + {index: $comment.index, created_at: $comment.created_at})
         | map(select(.token == $token)
               | select(([ .scenario, .interface, .commands, .expected, .observed ]
                         | any(test("^\\s*$")) | not))) as $structured
-        | if ($structured | length) > 0 then ($structured[-1].result | ascii_downcase)
+        | if ($structured | length) > 0 then
+              (([$structured[] | select(.created_at != "")] | if length > 0 then sort_by(.created_at) else ($structured | sort_by(.index)) end)[-1].result | ascii_downcase)
           elif ($mentions | length) > 0 then "invalid"
           else "missing"
           end
@@ -1056,23 +1079,36 @@ decide_build_outcome() {
     fi
 }
 
+current_iteration_has_relevant_changes() {
+    local start_commit="$1" end_commit="$2"
+    [ -n "$start_commit" ] && [ -n "$end_commit" ] || return 1
+    git diff --name-only "$start_commit" "$end_commit" 2>/dev/null \
+        | grep -qE '(^|/)Cargo\.lock$|\.(rs|toml|sh)$'
+}
+
 reopen_build_bead() {
-    local issue_id="$1" verify_status="$2" evidence_status="$3"
-    if bd update "$issue_id" --status=open 2>/dev/null && ! bead_is_closed "$issue_id"; then
+    local issue_id="$1" verify_status="$2" evidence_status="$3" state
+    if bd update "$issue_id" --status=open 2>/dev/null; then
+        state=$(bead_enforcement_status "$issue_id")
+    else
+        state=unavailable
+    fi
+    if [ "$state" = open ]; then
         bd comments add "$issue_id" \
             "[LOOP] Reopened after iteration $CURRENT_ITERATION: verification=$([ "$verify_status" = 0 ] && echo pass || echo fail), evidence=$evidence_status." \
             2>/dev/null || true
         return 0
     fi
-    echo -e "${RED}ERROR: failed to reopen and confirm $issue_id; stopping this iteration${NC}" >&2
-    bd comments add "$issue_id" "[LOOP] Failed to reopen bead after acceptance gates failed." 2>/dev/null || true
+    # CLOSED and UNAVAILABLE are both enforcement failures: only explicit OPEN is safe.
+    echo -e "${RED}ERROR: failed to explicitly confirm $issue_id open (state=$state); stopping this iteration${NC}" >&2
+    bd comments add "$issue_id" "[LOOP] Failed to confirm bead open after acceptance gates failed (state=$state)." 2>/dev/null || true
     return 1
 }
 
 auto_close_build_bead() {
-    local issue_id="$1" commit="$2"
+    local issue_id="$1" commit="$2" state
     if bd close "$issue_id" --reason "Auto-closed by loop: both gates passed, commit $commit" 2>/dev/null \
-            && bead_is_closed "$issue_id"; then
+            && state=$(bead_enforcement_status "$issue_id") && [ "$state" = closed ]; then
         return 0
     fi
     echo -e "${RED}ERROR: failed to close and confirm $issue_id; leaving iteration partial${NC}" >&2
@@ -1161,10 +1197,13 @@ run_iteration() {
     if [ "$MODE" = "build" ] && [ -n "$PICKED_ID" ]; then
         if ! evidence_token=$(generate_evidence_token); then
             echo -e "${RED}Cannot generate real-binary evidence token — leaving $PICKED_ID open${NC}"
-            bd update "$PICKED_ID" --status=open 2>/dev/null || true
-            bd comments add "$PICKED_ID" \
-                "[LOOP] Iteration $CURRENT_ITERATION did not run: evidence token generation failed." 2>/dev/null || true
-            return 0
+            # Reuse the checked enforcement path; never launch without a token.
+            if reopen_build_bead "$PICKED_ID" 1 unavailable; then
+                bd comments add "$PICKED_ID" \
+                    "[LOOP] Iteration $CURRENT_ITERATION did not run: evidence token generation failed." 2>/dev/null || true
+                return 0
+            fi
+            return 1
         fi
     fi
     echo -e "${BLUE}Running agent...${NC}"
@@ -1277,9 +1316,9 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
     if [ "$MODE" = "build" ] && [ -n "$PICKED_ID" ]; then
         local bead_closed=false code_changed=false evidence_status outcome
         bead_is_closed "$PICKED_ID" && bead_closed=true
-        if [ "$iteration_committed" = true ]; then
-            git diff --name-only "$iteration_start_commit" "$commit_after" 2>/dev/null \
-                | grep -qvE '^(\.beads/|$)' && code_changed=true
+        if [ "$iteration_committed" = true ] \
+                && current_iteration_has_relevant_changes "$iteration_start_commit" "$commit_after"; then
+            code_changed=true
         fi
         evidence_status=$(real_binary_evidence_status "$PICKED_ID" "$evidence_token")
         outcome=$(decide_build_outcome "$bead_closed" "$verify_ok" "$evidence_status" "$iteration_committed" "$code_changed")
