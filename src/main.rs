@@ -64,7 +64,7 @@ async fn run() -> anyhow::Result<()> {
     let (mut cfg, is_first_startup) = config::load_with_paths(&app_paths);
 
     if cli.print_config {
-        print::print_config(&cli, &cfg);
+        print::print_config(&cli, &cfg)?;
         return Ok(());
     }
 

@@ -1,14 +1,25 @@
+use std::fmt::Write as FmtWrite;
+use std::io::{self, Write as IoWrite};
+
 use crate::cli;
 use crate::config;
 use crate::session;
 
-pub(crate) fn print_section(title: &str, entries: &[(&str, String)]) {
-    println!("{}:", title);
+fn append_section(output: &mut String, title: &str, entries: &[(&str, String)]) {
+    writeln!(output, "{}:", title).expect("writing configuration output to a String cannot fail");
     let width = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (k, v) in entries {
-        println!("  {k:<width$}  {v}");
+        writeln!(output, "  {k:<width$}  {v}")
+            .expect("writing configuration output to a String cannot fail");
     }
-    println!();
+    writeln!(output).expect("writing configuration output to a String cannot fail");
+}
+
+fn write_output(mut writer: impl IoWrite, output: &str) -> io::Result<()> {
+    match writer.write_all(output.as_bytes()) {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
 }
 
 pub(crate) fn print_sessions() {
@@ -53,12 +64,13 @@ pub(crate) fn print_sessions() {
     }
 }
 
-pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) {
+pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<()> {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     let config_dir = paths.config_dir.clone();
     let data_dir = paths.data_dir.clone();
     let sessions_dir = paths.sessions_dir();
     let config_file = config::config_file_path();
+    let mut output = String::new();
 
     let model = cli.resolve_model(cfg);
     let provider = cli.resolve_provider(cfg);
@@ -95,7 +107,8 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) {
         cfg.default_permission_mode.as_deref().unwrap_or("standard")
     };
 
-    print_section(
+    append_section(
+        &mut output,
         "Directories",
         &[
             ("config", config_dir.display().to_string()),
@@ -120,7 +133,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) {
     if let Some(temp) = temperature {
         model_entries.push(("temperature", temp.to_string()));
     }
-    print_section("Model", &model_entries);
+    append_section(&mut output, "Model", &model_entries);
 
     let fmt_opt = |v: Option<u64>| -> String {
         match v {
@@ -175,9 +188,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) {
             fmt_opt(cfg.resolve_subagent_max_list_dir_entries()),
         ));
     }
-    print_section("Limits", &limit_entries);
+    append_section(&mut output, "Limits", &limit_entries);
 
-    print_section(
+    append_section(
+        &mut output,
         "Behavior",
         &[
             ("permission-mode", mode.to_string()),
@@ -200,7 +214,8 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) {
             .resolve_advisor_max_uses(cfg)
             .map(|n| n.to_string())
             .unwrap_or_else(|| "unlimited".to_string());
-        print_section(
+        append_section(
+            &mut output,
             "Advisor",
             &[
                 ("enabled", advisor_enabled.to_string()),
@@ -218,5 +233,31 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) {
                 ),
             ],
         );
+    }
+
+    write_output(io::stdout().lock(), &output)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::write_output;
+
+    struct BrokenPipeWriter;
+
+    impl io::Write for BrokenPipeWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn writing_config_output_treats_a_closed_pipe_as_success() {
+        assert!(write_output(BrokenPipeWriter, "chat history").is_ok());
     }
 }
