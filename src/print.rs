@@ -105,6 +105,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) {
             ("cache", paths.cache_dir.display().to_string()),
             ("credentials", paths.credentials_dir.display().to_string()),
             ("sessions", sessions_dir.display().to_string()),
+            (
+                "chat history",
+                paths.chat_history_file().display().to_string(),
+            ),
             ("config file", config_file.display().to_string()),
         ],
     );
