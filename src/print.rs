@@ -6,7 +6,7 @@ use crate::config;
 use crate::session;
 
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
-const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat-history-entry-limit";
+const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 
 fn chat_history_limit_entry() -> (&'static str, String) {
     (
@@ -259,10 +259,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
 mod tests {
     use std::io;
 
-    use super::{
-        CHAT_HISTORY_ENTRY_LIMIT_LABEL, CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry,
-        write_output,
-    };
+    use super::{CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, write_output};
 
     struct BrokenPipeWriter;
 
@@ -302,7 +299,7 @@ mod tests {
     fn config_reports_the_production_chat_history_entry_limit() {
         assert_eq!(
             chat_history_limit_entry(),
-            (CHAT_HISTORY_ENTRY_LIMIT_LABEL, "10000".to_string())
+            ("chat history entry limit", "10000".to_string())
         );
     }
 }
