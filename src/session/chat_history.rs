@@ -85,8 +85,7 @@ mod tests {
             let temp_root = std::env::temp_dir()
                 .canonicalize()
                 .expect("failed to resolve the chat-history test temp root");
-            let path =
-                temp_root.join(format!("mini-agent-chat-history-{}", uuid::Uuid::new_v4()));
+            let path = temp_root.join(format!("mini-agent-chat-history-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
