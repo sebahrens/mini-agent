@@ -7,6 +7,7 @@ use crate::session;
 
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
+const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
 
 fn chat_history_limit_entry() -> (&'static str, String) {
     (
@@ -15,6 +16,13 @@ fn chat_history_limit_entry() -> (&'static str, String) {
             "{} entries",
             session::chat_history::MAX_CHAT_HISTORY_ENTRIES
         ),
+    )
+}
+
+fn chat_history_path_policy_entry() -> (&'static str, String) {
+    (
+        CHAT_HISTORY_PATH_POLICY_LABEL,
+        "reject symlinked parents".to_string(),
     )
 }
 
@@ -214,6 +222,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         &mut output,
         "Behavior",
         &[
+            chat_history_path_policy_entry(),
             ("permission-mode", mode.to_string()),
             ("shell", shell.to_string()),
             ("edit-system", edit_system.to_string()),
@@ -262,7 +271,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
 mod tests {
     use std::io;
 
-    use super::{CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, write_output};
+    use super::{
+        CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
+        write_output,
+    };
 
     struct BrokenPipeWriter;
 
@@ -303,6 +315,17 @@ mod tests {
         assert_eq!(
             chat_history_limit_entry(),
             ("chat history entry limit", "10000 entries".to_string())
+        );
+    }
+
+    #[test]
+    fn config_reports_the_production_chat_history_path_policy() {
+        assert_eq!(
+            chat_history_path_policy_entry(),
+            (
+                "chat history path policy",
+                "reject symlinked parents".to_string()
+            )
         );
     }
 }
