@@ -616,10 +616,7 @@ fn load_project_config_trust(path: &Path) -> std::io::Result<ProjectConfigTrustS
     Ok(store)
 }
 
-fn save_project_config_trust(
-    path: &Path,
-    store: &ProjectConfigTrustStore,
-) -> std::io::Result<()> {
+fn save_project_config_trust(path: &Path, store: &ProjectConfigTrustStore) -> std::io::Result<()> {
     let content = serde_json::to_vec_pretty(store).map_err(std::io::Error::other)?;
     crate::fs::private_atomic_write_sync(path, &content)
 }
@@ -674,10 +671,7 @@ fn redact_sensitive_value(value: &toml::Value, redact_scalar: bool) -> toml::Val
                     || normalized.ends_with("-key")
                     || normalized.ends_with("_token")
                     || normalized.ends_with("-token");
-                redacted.insert(
-                    key.clone(),
-                    redact_sensitive_value(value, redact_child),
-                );
+                redacted.insert(key.clone(), redact_sensitive_value(value, redact_child));
             }
             toml::Value::Table(redacted)
         }
@@ -761,11 +755,7 @@ fn apply_local_override_with_confirmation(
          SHA-256: {}\n\
          Sensitive keys: {}\n\
          Sensitive settings (secret values redacted):\n{}",
-        binding.canonical_project,
-        binding.canonical_config,
-        binding.config_sha256,
-        keys,
-        settings
+        binding.canonical_project, binding.canonical_config, binding.config_sha256, keys, settings
     );
     if !confirm(&description) {
         *cfg = benign_cfg;
@@ -803,13 +793,8 @@ fn apply_local_override(
     if !path.exists() {
         return;
     }
-    match apply_local_override_with_confirmation(
-        cfg,
-        path,
-        trust_store_path,
-        interactive,
-        confirm,
-    ) {
+    match apply_local_override_with_confirmation(cfg, path, trust_store_path, interactive, confirm)
+    {
         Ok(outcome) => {
             tracing::info!(?outcome, path = %path.display(), "processed project-local config");
             if matches!(
@@ -839,6 +824,7 @@ fn apply_local_override(
 /// Merge a project-local TOML config fragment over `base`: keys present in
 /// `local_toml` win, tables (`quick_models`, `mcp_servers`, ...) merge per
 /// key, scalars and arrays replace, and absent keys keep the base value.
+#[cfg(test)]
 pub fn merge_config_override(base: &Config, local_toml: &str) -> Result<Config, String> {
     let local: toml::Value =
         toml::from_str(local_toml).map_err(|_| "project config is not valid TOML".to_string())?;
@@ -910,9 +896,10 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
 /// exercises the same project-config trust path as startup without requiring
 /// a provider credential or launching any configured integration.
 pub fn verify_project_config_trust() -> std::io::Result<()> {
-    let root = std::env::temp_dir()
-        .canonicalize()?
-        .join(format!("mini-agent-project-config-trust-{}", uuid::Uuid::new_v4()));
+    let root = std::env::temp_dir().canonicalize()?.join(format!(
+        "mini-agent-project-config-trust-{}",
+        uuid::Uuid::new_v4()
+    ));
     let project_config = root.join("project/.zerostack/config.toml");
     let trust_store = root.join("state/config/trusted-project-configs.json");
     let result = (|| {
@@ -1020,13 +1007,10 @@ mod project_config_trust_tests {
     use crate::config::Config;
 
     fn fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!(
-                "mini-agent-project-config-trust-{name}-{}",
-                uuid::Uuid::new_v4()
-            ));
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "mini-agent-project-config-trust-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
         let config = root.join("project/.zerostack/config.toml");
         let trust = root.join("state/config/trusted-project-configs.json");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
