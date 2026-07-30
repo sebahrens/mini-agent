@@ -125,7 +125,6 @@ jobs:
   build-static:
     name: ${{ matrix.target }}-static
     needs: create-release
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
