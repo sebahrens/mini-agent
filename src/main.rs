@@ -50,6 +50,18 @@ async fn run() -> anyhow::Result<()> {
     paths::install_process_paths(&app_paths)?;
     paths::prepare_storage_roots(&app_paths)?;
 
+    if let Some(source) = cli.import_agent_skill.as_deref() {
+        let imported = extras::skills::import_agent_skill(source, &app_paths)?;
+        println!(
+            "Agent Skill imported: {} digest={} path={} reimported={}",
+            imported.manifest.name,
+            imported.identity.digest,
+            imported.install_path.display(),
+            imported.reimported
+        );
+        return Ok(());
+    }
+
     if cli.config_preservation_check {
         config::verify_config_preservation(&app_paths)?;
         println!("config preservation check: PASS");

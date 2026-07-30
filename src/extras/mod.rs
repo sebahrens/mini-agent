@@ -39,4 +39,5 @@ pub mod lsp;
 
 #[cfg(feature = "js")]
 pub mod js;
+pub mod skills;
 pub(crate) mod truncate;

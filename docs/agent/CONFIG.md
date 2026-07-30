@@ -68,6 +68,21 @@ The corresponding overrides are `ZS_CONFIG_DIR`, `ZS_DATA_DIR`,
 zerostack never uses the current directory as a fallback for user-global
 state.
 
+## Importing portable Agent Skills
+
+Install one local Agent Skills directory containing `SKILL.md`, or one ZIP
+archive containing a single skill tree:
+
+```bash
+mini-agent --import-agent-skill ./my-skill
+mini-agent --import-agent-skill ./my-skill.zip
+```
+
+Imports are validated without executing bundled scripts. Trees are installed
+by whole-tree digest below `<data-dir>/agent-skills/<name>/<digest>/`.
+`allowed-tools` is retained as non-authoritative metadata and grants no tool
+permission.
+
 ## Config-file privacy
 
 The global config can contain plaintext API keys, authorization headers, and

@@ -44,6 +44,7 @@ advisor = []
 hooks = []
 lsp = ["dep:lsp-types"]
 js = ["dep:rquickjs"]
+skills = ["js"]
 
 [dependencies]
 rig = { package = "rig-core", version = "0.40", default-features = false, features = [
@@ -99,6 +100,7 @@ agent-client-protocol = { version = "1.0.1", optional = true }
 blocking = { version = "1", optional = true }
 lsp-types = { version = "0.97", optional = true }
 rquickjs = { version = "0.12", features = ["full"], optional = true }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }

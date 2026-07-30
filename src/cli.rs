@@ -34,6 +34,13 @@ pub struct Cli {
     )]
     pub project_config_trust_check: bool,
 
+    #[arg(
+        long = "import-agent-skill",
+        value_name = "PATH",
+        help = "Validate and install a local Agent Skills directory or ZIP archive"
+    )]
+    pub import_agent_skill: Option<std::path::PathBuf>,
+
     #[cfg(unix)]
     #[arg(
         long = "memory-editor-preservation-check",
