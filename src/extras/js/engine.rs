@@ -11,10 +11,19 @@ use crate::sandbox::Sandbox;
 
 const MAX_PENDING_JOBS: usize = 10_000;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 enum ReplyPath {
     EarlyCancel,
     Completed,
+}
+
+impl ReplyPath {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EarlyCancel => "early_cancel",
+            Self::Completed => "completed",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +41,7 @@ fn send_reply_or_log_drop(
         Ok(()) => ReplyDelivery::Delivered,
         Err(_) => {
             tracing::debug!(
-                ?reply_path,
+                reply_path = reply_path.as_str(),
                 "JS engine reply receiver dropped before response delivery"
             );
             ReplyDelivery::ReceiverDropped
@@ -376,6 +385,9 @@ mod tests {
 
     #[tokio::test]
     async fn js_reply_delivery_handles_delivered_and_dropped_receivers() {
+        assert_eq!(ReplyPath::EarlyCancel.as_str(), "early_cancel");
+        assert_eq!(ReplyPath::Completed.as_str(), "completed");
+
         let (delivered_reply, delivered_receiver) = oneshot::channel();
         assert_eq!(
             send_reply_or_log_drop(
