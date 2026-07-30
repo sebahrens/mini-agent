@@ -38,12 +38,14 @@ fn log_reply_drop(reply_path: ReplyPath) {
 fn send_reply_or_log_drop<T>(
     reply: oneshot::Sender<T>,
     response: T,
+    cancellation: &PermCancellation,
     reply_path: ReplyPath,
 ) -> bool {
     // A closed receiver is expected when the caller's deadline wins the race.
     // Keep the diagnostic independent of response formatting traits and payload contents.
     let delivered = reply.send(response).is_ok();
     if !delivered {
+        cancellation.cancel();
         log_reply_drop(reply_path);
     }
     delivered
@@ -249,13 +251,19 @@ pub(crate) fn js_thread_main(
                 JsResponse {
                     outcome: JsOutcome::Error("execution cancelled".to_string()),
                 },
+                &req.cancellation,
                 ReplyPath::EarlyCancel,
             );
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        send_reply_or_log_drop(req.reply, JsResponse { outcome }, ReplyPath::Completed);
+        send_reply_or_log_drop(
+            req.reply,
+            JsResponse { outcome },
+            &req.cancellation,
+            ReplyPath::Completed,
+        );
     }
 }
 
@@ -401,14 +409,17 @@ mod tests {
         );
         assert_eq!(ReplyPath::Completed.as_str(), "completed");
 
+        let delivered_cancellation = PermCancellation::new();
         let (delivered_reply, delivered_receiver) = oneshot::channel();
         assert!(send_reply_or_log_drop(
             delivered_reply,
             JsResponse {
                 outcome: JsOutcome::Value("delivered".to_string()),
             },
+            &delivered_cancellation,
             ReplyPath::Completed,
         ));
+        assert!(!delivered_cancellation.is_cancelled());
         assert_eq!(
             delivered_receiver
                 .await
@@ -417,30 +428,39 @@ mod tests {
             JsOutcome::Value("delivered".to_string())
         );
 
+        let cancelled_cancellation = PermCancellation::new();
         let (cancelled_reply, cancelled_receiver) = oneshot::channel::<NoFormattingTraits>();
         drop(cancelled_receiver);
         assert!(!send_reply_or_log_drop(
             cancelled_reply,
             NoFormattingTraits,
+            &cancelled_cancellation,
             ReplyPath::EarlyCancel,
         ));
+        assert!(cancelled_cancellation.is_cancelled());
 
+        let completed_cancellation = PermCancellation::new();
         let (completed_reply, completed_receiver) = oneshot::channel::<NoFormattingTraits>();
         drop(completed_receiver);
         assert!(!send_reply_or_log_drop(
             completed_reply,
             NoFormattingTraits,
+            &completed_cancellation,
             ReplyPath::Completed,
         ));
+        assert!(completed_cancellation.is_cancelled());
 
+        let recovery_cancellation = PermCancellation::new();
         let (recovery_reply, recovery_receiver) = oneshot::channel();
         assert!(send_reply_or_log_drop(
             recovery_reply,
             JsResponse {
                 outcome: JsOutcome::Value("recovered".to_string()),
             },
+            &recovery_cancellation,
             ReplyPath::Completed,
         ));
+        assert!(!recovery_cancellation.is_cancelled());
         assert_eq!(
             recovery_receiver
                 .await
