@@ -615,16 +615,17 @@ mod preservation_check_tests {
 
     #[test]
     fn installed_binary_preservation_check_uses_atomic_round_trip() {
-        let path = std::env::temp_dir().join(format!(
-            "mini-agent-config-preservation-check-{}.toml",
-            std::process::id()
+        let directory = std::env::temp_dir().join(format!(
+            "mini-agent-config-preservation-check-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
         ));
-        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("config.toml");
 
         verify_config_preservation_at(&path).unwrap();
 
-        let saved: toml::Value =
-            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             saved.get("future_scalar").and_then(toml::Value::as_str),
             Some("keep-me")
@@ -636,5 +637,6 @@ mod preservation_check_tests {
         assert!(saved.get("temperature").is_none());
 
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }
