@@ -29,6 +29,7 @@ mod tests;
 
 use anyhow::Context;
 use clap::Parser;
+use std::io::IsTerminal;
 
 #[cfg_attr(
     feature = "multithread",
@@ -52,6 +53,12 @@ async fn run() -> anyhow::Result<()> {
     if cli.config_preservation_check {
         config::verify_config_preservation(&app_paths)?;
         println!("config preservation check: PASS");
+        return Ok(());
+    }
+
+    if cli.project_config_trust_check {
+        config::verify_project_config_trust()?;
+        println!("project config trust check: PASS");
         return Ok(());
     }
 
@@ -80,7 +87,8 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let is_interactive = !cli.print;
+    let is_interactive =
+        !cli.print && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     #[cfg(feature = "acp")]
     let is_interactive = is_interactive && !cli.acp_enabled;
     #[cfg(feature = "loop")]
@@ -90,7 +98,7 @@ async fn run() -> anyhow::Result<()> {
     logging::install_panic_hook();
     logging::init(&cli);
 
-    let (mut cfg, is_first_startup) = config::load_with_paths(&app_paths);
+    let (mut cfg, is_first_startup) = config::load_with_paths(&app_paths, is_interactive);
 
     if cli.print_config {
         print::print_config(&cli, &cfg)?;

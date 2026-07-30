@@ -222,8 +222,15 @@ pub(crate) fn build_dispatcher_from_paths(
     let project = load_settings_file(project_path);
     let managed = load_settings_file(managed_path);
 
-    let disable_non_managed =
-        no_hooks_flag || global.disable_all_hooks || project.disable_all_hooks;
+    // A repository-controlled `disableAllHooks` value must not disable
+    // user-global guard hooks. Project hooks are individually trust-gated
+    // below, so the project-level disable switch is intentionally inert.
+    let disable_non_managed = no_hooks_flag || global.disable_all_hooks;
+    if project.disable_all_hooks {
+        tracing::warn!(
+            "hooks: ignoring project-local disableAllHooks because project settings cannot disable global hooks"
+        );
+    }
 
     let mut merged: HooksConfig = HashMap::new();
 

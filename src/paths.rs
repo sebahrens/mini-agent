@@ -409,6 +409,12 @@ impl AppPaths {
         self.state_dir.join("hooks").join("trusted-hooks.json")
     }
 
+    pub fn project_config_trust_file(&self) -> PathBuf {
+        self.state_dir
+            .join("config")
+            .join("trusted-project-configs.json")
+    }
+
     #[allow(dead_code)]
     pub fn mcp_oauth_dir(&self) -> PathBuf {
         self.credentials_dir.join("mcp-oauth")
@@ -1767,7 +1773,7 @@ mod tests {
         };
         let paths = AppPaths::resolve(&environment).unwrap();
 
-        let (_, is_first_startup) = crate::config::load_with_paths(&paths);
+        let (_, is_first_startup) = crate::config::load_with_paths(&paths, false);
 
         assert!(is_first_startup);
         assert!(root.join("config.toml").is_file());
@@ -1832,6 +1838,11 @@ mod tests {
         assert!(paths.logs_dir().starts_with(&paths.state_dir));
         assert!(paths.chat_history_file().starts_with(&paths.state_dir));
         assert!(paths.hook_trust_file().starts_with(&paths.state_dir));
+        assert!(
+            paths
+                .project_config_trust_file()
+                .starts_with(&paths.state_dir)
+        );
         assert!(paths.mcp_oauth_dir().starts_with(&paths.credentials_dir));
         assert!(paths.credentials_dir.starts_with(root.join("credentials")));
     }
@@ -1852,7 +1863,7 @@ mod tests {
         )
         .unwrap();
 
-        let (config, is_first_startup) = crate::config::load_with_paths(&paths);
+        let (config, is_first_startup) = crate::config::load_with_paths(&paths, false);
 
         assert!(!is_first_startup);
         assert_eq!(config.provider.as_deref(), Some("openai"));

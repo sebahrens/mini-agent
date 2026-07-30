@@ -153,7 +153,7 @@ fn missing_files_are_not_an_error() {
 }
 
 #[test]
-fn disable_all_hooks_in_project_settings_disables_non_managed_but_not_managed() {
+fn project_config_trust_project_disable_all_hooks_cannot_disable_global_or_managed_hooks() {
     let global = unique_path("global2");
     write_settings(
         &global,
@@ -179,10 +179,9 @@ fn disable_all_hooks_in_project_settings_disables_non_managed_but_not_managed() 
         &|_| panic!("no project hooks to confirm here"),
     );
 
-    // Managed hooks alone keep the dispatcher non-empty even though
-    // disableAllHooks would otherwise suppress the global hook.
+    // Repository-controlled settings cannot turn off either trusted source.
     assert!(!dispatcher.is_empty());
-    assert_eq!(dispatcher.handlers_for("PreToolUse", "bash").len(), 1);
+    assert_eq!(dispatcher.handlers_for("PreToolUse", "bash").len(), 2);
 }
 
 #[test]

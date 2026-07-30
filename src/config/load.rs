@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use compact_str::CompactString;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use std::io::{self, Read};
 
@@ -11,6 +13,68 @@ use crate::config::{
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::{McpServerConfig, TrustedMcpServer};
 use crate::paths::AppPaths;
+
+const PROJECT_CONFIG_TRUST_SCHEMA: u32 = 1;
+
+/// Project-local keys that cannot launch a process, select an executable
+/// integration/provider, or weaken an authorization boundary. Every other
+/// top-level key, including unknown future keys, requires explicit trust.
+const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
+    "always_show_welcome",
+    "chain",
+    "chat_left_margin",
+    "colors",
+    "compact_enabled",
+    "context_window",
+    "default_prompt",
+    "edit_system",
+    "keep_recent_tokens",
+    "max_agent_turns",
+    "max_bash_output_lines",
+    "max_find_results",
+    "max_grep_results",
+    "max_list_dir_entries",
+    "max_read_lines",
+    "max_text_file_size",
+    "max_tokens",
+    "mid_turn_compact_threshold",
+    "model",
+    "reserve_tokens",
+    "retry",
+    "show_cost_always",
+    "show_reasoning",
+    "show_tool_details",
+    "statusline",
+    "subagent_max_find_results",
+    "subagent_max_grep_results",
+    "subagent_max_list_dir_entries",
+    "subagent_max_read_lines",
+    "temperature",
+];
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProjectConfigTrustStore {
+    schema: u32,
+    #[serde(default)]
+    bindings: Vec<ProjectConfigTrustBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProjectConfigTrustBinding {
+    canonical_project: String,
+    canonical_config: String,
+    config_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectConfigTrustOutcome {
+    NoSensitiveKeys,
+    AlreadyTrusted,
+    Approved,
+    SkippedHeadless,
+    Declined,
+    TrustUnavailable,
+}
 
 /// Write `content` to `path` atomically via temp-file + rename.
 pub(crate) fn atomic_config_write(path: &Path, content: &str) -> io::Result<()> {
@@ -398,15 +462,22 @@ fn rich_default_config() -> Config {
     }
 }
 
-pub fn load_with_paths(paths: &AppPaths) -> (Config, bool) {
+pub fn load_with_paths(paths: &AppPaths, interactive: bool) -> (Config, bool) {
     let local_config_path = paths.project_config_file();
     load_from_path(
         pick_existing(&paths.config_dir),
         local_config_path.as_deref(),
+        &paths.project_config_trust_file(),
+        interactive,
     )
 }
 
-fn load_from_path(path: PathBuf, local_config_path: Option<&Path>) -> (Config, bool) {
+fn load_from_path(
+    path: PathBuf,
+    local_config_path: Option<&Path>,
+    project_trust_path: &Path,
+    interactive: bool,
+) -> (Config, bool) {
     let is_first_startup = !path_entry_exists(&path).unwrap_or_else(|error| {
         eprintln!(
             "error: failed to inspect config path ({}): {}\n\
@@ -466,7 +537,13 @@ fn load_from_path(path: PathBuf, local_config_path: Option<&Path>) -> (Config, b
     );
 
     if let Some(local_config_path) = local_config_path {
-        apply_local_override(&mut cfg, local_config_path);
+        apply_local_override(
+            &mut cfg,
+            local_config_path,
+            project_trust_path,
+            interactive,
+            &confirm_project_config_trust,
+        );
     }
 
     #[cfg(feature = "mcp")]
@@ -475,40 +552,284 @@ fn load_from_path(path: PathBuf, local_config_path: Option<&Path>) -> (Config, b
     (cfg, is_first_startup)
 }
 
-/// Merge `.zerostack/config.toml` over the global config when it exists.
-/// The local file is trusted exactly like the global one — it can set any
-/// key, including `yolo` or permission rules — so a startup note is printed
-/// whenever an override is applied.
-fn apply_local_override(cfg: &mut Config, path: &Path) {
+fn confirm_project_config_trust(description: &str) -> bool {
+    let mut input = String::new();
+    eprint!("{description}\nTrust these settings for this exact project config? [y/N] ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn project_config_binding(path: &Path, content: &str) -> Result<ProjectConfigTrustBinding, String> {
+    let project_root = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "project config must be inside a project application directory".to_string())?
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize project root: {error}"))?;
+    let canonical_config = path
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize project config: {error}"))?;
+    let canonical_project = project_root
+        .to_str()
+        .ok_or_else(|| "canonical project path is not valid UTF-8".to_string())?
+        .to_string();
+    let canonical_config = canonical_config
+        .to_str()
+        .ok_or_else(|| "canonical project config path is not valid UTF-8".to_string())?
+        .to_string();
+    let digest = Sha256::digest(content.as_bytes());
+    let config_sha256 = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(ProjectConfigTrustBinding {
+        canonical_project,
+        canonical_config,
+        config_sha256,
+    })
+}
+
+fn load_project_config_trust(path: &Path) -> std::io::Result<ProjectConfigTrustStore> {
+    let mut file = match crate::fs::open_private_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProjectConfigTrustStore {
+                schema: PROJECT_CONFIG_TRUST_SCHEMA,
+                bindings: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let store: ProjectConfigTrustStore = serde_json::from_str(&content)
+        .map_err(|_| std::io::Error::other("project config trust store is invalid"))?;
+    if store.schema != PROJECT_CONFIG_TRUST_SCHEMA {
+        return Ok(ProjectConfigTrustStore {
+            schema: PROJECT_CONFIG_TRUST_SCHEMA,
+            bindings: Vec::new(),
+        });
+    }
+    Ok(store)
+}
+
+fn save_project_config_trust(
+    path: &Path,
+    store: &ProjectConfigTrustStore,
+) -> std::io::Result<()> {
+    let content = serde_json::to_vec_pretty(store).map_err(std::io::Error::other)?;
+    crate::fs::private_atomic_write_sync(path, &content)
+}
+
+fn split_project_override(
+    local_toml: &str,
+) -> Result<(toml::Value, toml::Value, BTreeSet<String>), String> {
+    let local: toml::Value =
+        toml::from_str(local_toml).map_err(|_| "project config is not valid TOML".to_string())?;
+    let table = local
+        .as_table()
+        .ok_or_else(|| "project config must contain a TOML table".to_string())?;
+    let mut benign = toml::map::Map::new();
+    let mut sensitive = toml::map::Map::new();
+    let mut sensitive_keys = BTreeSet::new();
+    for (key, value) in table {
+        if BENIGN_PROJECT_CONFIG_KEYS.contains(&key.as_str()) {
+            benign.insert(key.clone(), value.clone());
+        } else {
+            sensitive_keys.insert(key.clone());
+            sensitive.insert(key.clone(), value.clone());
+        }
+    }
+    Ok((
+        toml::Value::Table(benign),
+        toml::Value::Table(sensitive),
+        sensitive_keys,
+    ))
+}
+
+fn merge_config_value(base: &Config, local: toml::Value) -> Result<Config, String> {
+    let mut base_toml = toml::Value::try_from(base)
+        .map_err(|_| "base config could not be normalized".to_string())?;
+    deep_merge_toml(&mut base_toml, local);
+    base_toml
+        .try_into()
+        .map_err(|_| "merged project config has an invalid value".to_string())
+}
+
+fn redact_sensitive_value(value: &toml::Value, redact_scalar: bool) -> toml::Value {
+    match value {
+        toml::Value::Table(table) => {
+            let mut redacted = toml::map::Map::new();
+            for (key, value) in table {
+                let normalized = key.to_ascii_lowercase();
+                let redact_child = redact_scalar
+                    || matches!(
+                        normalized.as_str(),
+                        "api_keys" | "env" | "headers" | "password" | "secret" | "token"
+                    )
+                    || normalized.ends_with("_key")
+                    || normalized.ends_with("-key")
+                    || normalized.ends_with("_token")
+                    || normalized.ends_with("-token");
+                redacted.insert(
+                    key.clone(),
+                    redact_sensitive_value(value, redact_child),
+                );
+            }
+            toml::Value::Table(redacted)
+        }
+        toml::Value::Array(values) => toml::Value::Array(
+            values
+                .iter()
+                .map(|value| redact_sensitive_value(value, redact_scalar))
+                .collect(),
+        ),
+        _ if redact_scalar => toml::Value::String("<redacted>".to_string()),
+        _ => value.clone(),
+    }
+}
+
+fn sensitive_settings_summary(value: &toml::Value) -> String {
+    let redacted = redact_sensitive_value(value, false);
+    toml::to_string_pretty(&redacted)
+        .unwrap_or_else(|_| "<settings could not be rendered>".to_string())
+}
+
+fn apply_local_override_with_confirmation(
+    cfg: &mut Config,
+    path: &Path,
+    trust_store_path: &Path,
+    interactive: bool,
+    confirm: &dyn Fn(&str) -> bool,
+) -> Result<ProjectConfigTrustOutcome, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read project config: {error}"))?;
+    let (benign, sensitive, sensitive_keys) = split_project_override(&content)?;
+    let benign_cfg = merge_config_value(cfg, benign)?;
+    if sensitive_keys.is_empty() {
+        *cfg = benign_cfg;
+        return Ok(ProjectConfigTrustOutcome::NoSensitiveKeys);
+    }
+
+    let binding = match project_config_binding(path, &content) {
+        Ok(binding) => binding,
+        Err(error) => {
+            *cfg = benign_cfg;
+            tracing::warn!(
+                "project config: sensitive settings are inactive because trust identity is unavailable: {error}"
+            );
+            return Ok(ProjectConfigTrustOutcome::TrustUnavailable);
+        }
+    };
+    let mut store = match load_project_config_trust(trust_store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            *cfg = benign_cfg;
+            tracing::warn!(
+                "project config: sensitive settings are inactive because the private trust store is unavailable: {error}"
+            );
+            return Ok(ProjectConfigTrustOutcome::TrustUnavailable);
+        }
+    };
+
+    if store.bindings.contains(&binding) {
+        *cfg = merge_config_value(&benign_cfg, sensitive)?;
+        return Ok(ProjectConfigTrustOutcome::AlreadyTrusted);
+    }
+
+    if !interactive {
+        *cfg = benign_cfg;
+        tracing::warn!(
+            project = %binding.canonical_project,
+            config = %binding.canonical_config,
+            sha256 = %binding.config_sha256,
+            keys = ?sensitive_keys,
+            "project config: ignored untrusted sensitive settings in headless mode"
+        );
+        return Ok(ProjectConfigTrustOutcome::SkippedHeadless);
+    }
+
+    let keys = sensitive_keys.into_iter().collect::<Vec<_>>().join(", ");
+    let settings = sensitive_settings_summary(&sensitive);
+    let description = format!(
+        "Project-local config requests executable or security-sensitive settings.\n\
+         Project: {}\n\
+         Config: {}\n\
+         SHA-256: {}\n\
+         Sensitive keys: {}\n\
+         Sensitive settings (secret values redacted):\n{}",
+        binding.canonical_project,
+        binding.canonical_config,
+        binding.config_sha256,
+        keys,
+        settings
+    );
+    if !confirm(&description) {
+        *cfg = benign_cfg;
+        tracing::warn!("project config: user declined sensitive project-local settings");
+        return Ok(ProjectConfigTrustOutcome::Declined);
+    }
+
+    let trusted_cfg = merge_config_value(&benign_cfg, sensitive)?;
+    store.bindings.retain(|existing| {
+        existing.canonical_project != binding.canonical_project
+            || existing.canonical_config != binding.canonical_config
+    });
+    store.bindings.push(binding);
+    if let Err(error) = save_project_config_trust(trust_store_path, &store) {
+        *cfg = benign_cfg;
+        tracing::warn!(
+            "project config: sensitive settings are inactive because trust could not be persisted privately: {error}"
+        );
+        return Ok(ProjectConfigTrustOutcome::TrustUnavailable);
+    }
+    *cfg = trusted_cfg;
+    Ok(ProjectConfigTrustOutcome::Approved)
+}
+
+/// Merge benign `.zerostack/config.toml` keys immediately and keep all other
+/// keys inert until trust is bound to the canonical project/config paths and
+/// exact config bytes.
+fn apply_local_override(
+    cfg: &mut Config,
+    path: &Path,
+    trust_store_path: &Path,
+    interactive: bool,
+    confirm: &dyn Fn(&str) -> bool,
+) {
     if !path.exists() {
         return;
     }
-    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!(
-            "error: failed to read project config ({}): {}",
-            path.display(),
-            e,
-        );
-        std::process::exit(1);
-    });
-    match merge_config_override(cfg, &content) {
-        Ok(merged) => {
-            tracing::info!(
-                "applied project-local config override from {}",
-                path.display()
-            );
-            eprintln!(
-                "note: applied project-local config override from {}",
-                path.display()
-            );
-            *cfg = merged;
+    match apply_local_override_with_confirmation(
+        cfg,
+        path,
+        trust_store_path,
+        interactive,
+        confirm,
+    ) {
+        Ok(outcome) => {
+            tracing::info!(?outcome, path = %path.display(), "processed project-local config");
+            if matches!(
+                outcome,
+                ProjectConfigTrustOutcome::SkippedHeadless
+                    | ProjectConfigTrustOutcome::Declined
+                    | ProjectConfigTrustOutcome::TrustUnavailable
+            ) {
+                eprintln!(
+                    "note: project-local executable/security settings are inactive; benign settings were applied from {}",
+                    path.display()
+                );
+            }
         }
-        Err(e) => {
+        Err(error) => {
             eprintln!(
                 "error: {} is not a valid config: {}\n\
                  Fix the file or remove it to use defaults.",
                 path.display(),
-                e,
+                error,
             );
             std::process::exit(1);
         }
@@ -521,15 +842,7 @@ fn apply_local_override(cfg: &mut Config, path: &Path) {
 pub fn merge_config_override(base: &Config, local_toml: &str) -> Result<Config, String> {
     let local: toml::Value =
         toml::from_str(local_toml).map_err(|_| "project config is not valid TOML".to_string())?;
-    // `Config` skips `None` fields when serializing, so the base TOML holds
-    // exactly the keys that are set and the local TOML exactly the keys the
-    // project file sets.
-    let mut base_toml = toml::Value::try_from(base)
-        .map_err(|_| "base config could not be normalized".to_string())?;
-    deep_merge_toml(&mut base_toml, local);
-    base_toml
-        .try_into()
-        .map_err(|_| "merged project config has an invalid value".to_string())
+    merge_config_value(base, local)
 }
 
 /// Deep-merge `over` into `base`: objects merge recursively per key, any
@@ -593,6 +906,94 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
     cfg.mcp_servers = Some(servers);
 }
 
+/// Installed-binary security check used by release/automation evidence. It
+/// exercises the same project-config trust path as startup without requiring
+/// a provider credential or launching any configured integration.
+pub fn verify_project_config_trust() -> std::io::Result<()> {
+    let root = std::env::temp_dir()
+        .canonicalize()?
+        .join(format!("mini-agent-project-config-trust-{}", uuid::Uuid::new_v4()));
+    let project_config = root.join("project/.zerostack/config.toml");
+    let trust_store = root.join("state/config/trusted-project-configs.json");
+    let result = (|| {
+        std::fs::create_dir_all(project_config.parent().expect("config has a parent"))?;
+        std::fs::write(&project_config, "chat_left_margin = 9\nyolo = true\n")?;
+
+        let mut headless = Config {
+            chat_left_margin: Some(1),
+            yolo: Some(false),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut headless,
+            &project_config,
+            &trust_store,
+            false,
+            &|_| panic!("headless project config trust must not prompt"),
+        )
+        .map_err(std::io::Error::other)?;
+        if outcome != ProjectConfigTrustOutcome::SkippedHeadless
+            || headless.chat_left_margin != Some(9)
+            || headless.yolo != Some(false)
+            || trust_store.exists()
+        {
+            return Err(std::io::Error::other(
+                "untrusted headless project config did not fail closed",
+            ));
+        }
+
+        let mut approved = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut approved,
+            &project_config,
+            &trust_store,
+            true,
+            &|description| {
+                description.contains("yolo")
+                    && description.contains("SHA-256")
+                    && description.contains("Project:")
+            },
+        )
+        .map_err(std::io::Error::other)?;
+        if outcome != ProjectConfigTrustOutcome::Approved
+            || approved.yolo != Some(true)
+            || !trust_store.is_file()
+        {
+            return Err(std::io::Error::other(
+                "explicit content-bound project config trust was not activated",
+            ));
+        }
+
+        std::fs::write(
+            &project_config,
+            "chat_left_margin = 9\nyolo = true\n# digest changed\n",
+        )?;
+        let mut changed = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut changed,
+            &project_config,
+            &trust_store,
+            false,
+            &|_| panic!("headless changed config must not prompt"),
+        )
+        .map_err(std::io::Error::other)?;
+        if outcome != ProjectConfigTrustOutcome::SkippedHeadless || changed.yolo != Some(false) {
+            return Err(std::io::Error::other(
+                "project config trust survived a content change",
+            ));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
 pub fn save_config(cfg: &Config) -> io::Result<()> {
     #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
     let mut cfg = cfg.clone();
@@ -608,6 +1009,369 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
     atomic_config_write(&path, &serialize_config_content(&path, &cfg)?)?;
     tracing::debug!("config saved to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod project_config_trust_tests {
+    use super::{
+        PROJECT_CONFIG_TRUST_SCHEMA, ProjectConfigTrustOutcome, ProjectConfigTrustStore,
+        apply_local_override_with_confirmation, save_project_config_trust, split_project_override,
+    };
+    use crate::config::Config;
+
+    fn fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!(
+                "mini-agent-project-config-trust-{name}-{}",
+                uuid::Uuid::new_v4()
+            ));
+        let config = root.join("project/.zerostack/config.toml");
+        let trust = root.join("state/config/trusted-project-configs.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        (root, config, trust)
+    }
+
+    #[test]
+    fn project_config_trust_headless_keeps_sensitive_keys_inert_and_merges_benign_keys() {
+        let (root, config_path, trust_path) = fixture("headless");
+        std::fs::write(
+            &config_path,
+            "chat_left_margin = 7\n\
+             yolo = true\n\
+             shell = \"untrusted-shell\"\n\
+             [mcp_servers.sentinel]\n\
+             command = \"untrusted-mcp-sentinel\"\n\
+             [lsp]\n\
+             enabled = true\n\
+             [lsp.servers.sentinel]\n\
+             command = \"untrusted-lsp-sentinel\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            chat_left_margin: Some(1),
+            yolo: Some(false),
+            shell: Some("trusted-shell".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = apply_local_override_with_confirmation(
+            &mut cfg,
+            &config_path,
+            &trust_path,
+            false,
+            &|_| panic!("headless mode must not prompt"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert_eq!(cfg.chat_left_margin, Some(7));
+        assert_eq!(cfg.yolo, Some(false));
+        assert_eq!(cfg.shell.as_deref(), Some("trusted-shell"));
+        #[cfg(feature = "mcp")]
+        assert!(cfg.mcp_servers.is_none());
+        #[cfg(feature = "lsp")]
+        assert!(cfg.lsp.is_none());
+        assert!(!trust_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_config_trust_approval_is_inspectable_persisted_and_reusable() {
+        let (root, config_path, trust_path) = fixture("approval");
+        let secret = "must-not-appear-in-confirmation";
+        std::fs::write(
+            &config_path,
+            format!("yolo = true\n[api_keys]\nopenrouter = \"{secret}\"\n"),
+        )
+        .unwrap();
+        let mut cfg = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+        let displayed = std::cell::RefCell::new(String::new());
+
+        let outcome = apply_local_override_with_confirmation(
+            &mut cfg,
+            &config_path,
+            &trust_path,
+            true,
+            &|description| {
+                displayed.replace(description.to_string());
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ProjectConfigTrustOutcome::Approved);
+        assert_eq!(cfg.yolo, Some(true));
+        let displayed = displayed.borrow();
+        let expected_project = root.join("project").display().to_string();
+        assert!(displayed.contains(expected_project.as_str()));
+        assert!(displayed.contains("api_keys, yolo"));
+        assert!(displayed.contains("SHA-256:"));
+        assert!(displayed.contains("yolo = true"));
+        assert!(displayed.contains("<redacted>"));
+        assert!(!displayed.contains(secret));
+        assert!(trust_path.is_file());
+
+        let mut fresh = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut fresh,
+            &config_path,
+            &trust_path,
+            false,
+            &|_| panic!("an exact persisted binding must not prompt"),
+        )
+        .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::AlreadyTrusted);
+        assert_eq!(fresh.yolo, Some(true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_config_trust_content_change_and_denial_are_side_effect_free() {
+        let (root, config_path, trust_path) = fixture("content-change");
+        std::fs::write(&config_path, "yolo = true\n").unwrap();
+        let mut approved = Config::default();
+        assert_eq!(
+            apply_local_override_with_confirmation(
+                &mut approved,
+                &config_path,
+                &trust_path,
+                true,
+                &|_| true,
+            )
+            .unwrap(),
+            ProjectConfigTrustOutcome::Approved
+        );
+        let before_denial = std::fs::read(&trust_path).unwrap();
+
+        std::fs::write(&config_path, "yolo = true\n# changed\n").unwrap();
+        let mut changed = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut changed,
+            &config_path,
+            &trust_path,
+            true,
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ProjectConfigTrustOutcome::Declined);
+        assert_eq!(changed.yolo, Some(false));
+        assert_eq!(std::fs::read(&trust_path).unwrap(), before_denial);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_config_trust_does_not_persist_approval_for_invalid_sensitive_values() {
+        let (root, config_path, trust_path) = fixture("invalid-approved");
+        std::fs::write(&config_path, "yolo = \"not-a-boolean\"\n").unwrap();
+        let mut cfg = Config::default();
+
+        let error = apply_local_override_with_confirmation(
+            &mut cfg,
+            &config_path,
+            &trust_path,
+            true,
+            &|_| true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("invalid value"));
+        assert!(!trust_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_config_trust_does_not_cross_checkout_paths() {
+        let (root, first_config, trust_path) = fixture("path-binding");
+        std::fs::write(&first_config, "yolo = true\n").unwrap();
+        let mut first = Config::default();
+        apply_local_override_with_confirmation(
+            &mut first,
+            &first_config,
+            &trust_path,
+            true,
+            &|_| true,
+        )
+        .unwrap();
+
+        let second_config = root.join("copied-project/.zerostack/config.toml");
+        std::fs::create_dir_all(second_config.parent().unwrap()).unwrap();
+        std::fs::copy(&first_config, &second_config).unwrap();
+        let mut copied = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut copied,
+            &second_config,
+            &trust_path,
+            false,
+            &|_| panic!("headless copied checkout must not prompt"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert_eq!(copied.yolo, Some(false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_config_trust_schema_change_invalidates_prior_bindings() {
+        let (root, config_path, trust_path) = fixture("schema");
+        std::fs::write(&config_path, "yolo = true\n").unwrap();
+        save_project_config_trust(
+            &trust_path,
+            &ProjectConfigTrustStore {
+                schema: PROJECT_CONFIG_TRUST_SCHEMA + 1,
+                bindings: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut cfg = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+
+        let outcome = apply_local_override_with_confirmation(
+            &mut cfg,
+            &config_path,
+            &trust_path,
+            false,
+            &|_| panic!("headless stale schema must not prompt"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert_eq!(cfg.yolo, Some(false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_config_trust_classifies_executable_security_and_unknown_keys_as_sensitive() {
+        let (_, _, keys) = split_project_override(
+            r#"
+model = "benign-project-model"
+yolo = true
+sandbox = false
+permission-allow = { bash = ["*"] }
+shell = "project-shell"
+custom_providers = {}
+mcp_servers = {}
+lsp = {}
+acp_servers = {}
+future_security_switch = true
+"#,
+        )
+        .unwrap();
+
+        assert!(!keys.contains("model"));
+        for key in [
+            "yolo",
+            "sandbox",
+            "permission-allow",
+            "shell",
+            "custom_providers",
+            "mcp_servers",
+            "lsp",
+            "acp_servers",
+            "future_security_switch",
+        ] {
+            assert!(keys.contains(key), "{key} must require project trust");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_config_trust_symlink_target_change_invalidates_binding() {
+        use std::os::unix::fs::symlink;
+
+        let (root, _, trust_path) = fixture("symlink");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(first.join(".zerostack")).unwrap();
+        std::fs::create_dir_all(second.join(".zerostack")).unwrap();
+        std::fs::write(first.join(".zerostack/config.toml"), "yolo = true\n").unwrap();
+        std::fs::write(second.join(".zerostack/config.toml"), "yolo = true\n").unwrap();
+        let linked_project = root.join("linked-project");
+        symlink(&first, &linked_project).unwrap();
+        let linked_config = linked_project.join(".zerostack/config.toml");
+
+        let mut approved = Config::default();
+        apply_local_override_with_confirmation(
+            &mut approved,
+            &linked_config,
+            &trust_path,
+            true,
+            &|_| true,
+        )
+        .unwrap();
+        std::fs::remove_file(&linked_project).unwrap();
+        symlink(&second, &linked_project).unwrap();
+
+        let mut replaced = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut replaced,
+            &linked_config,
+            &trust_path,
+            false,
+            &|_| panic!("headless replaced symlink must not prompt"),
+        )
+        .unwrap();
+        assert_eq!(outcome, ProjectConfigTrustOutcome::SkippedHeadless);
+        assert_eq!(replaced.yolo, Some(false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_config_trust_rejects_symlinked_persistence() {
+        use std::os::unix::fs::symlink;
+
+        let (root, config_path, trust_path) = fixture("trust-symlink");
+        std::fs::write(&config_path, "yolo = true\n").unwrap();
+        std::fs::create_dir_all(trust_path.parent().unwrap()).unwrap();
+        let attacker_file = root.join("attacker-controlled.json");
+        std::fs::write(
+            &attacker_file,
+            format!(
+                "{{\"schema\":{},\"bindings\":[]}}",
+                PROJECT_CONFIG_TRUST_SCHEMA
+            ),
+        )
+        .unwrap();
+        symlink(&attacker_file, &trust_path).unwrap();
+        let mut cfg = Config {
+            yolo: Some(false),
+            ..Default::default()
+        };
+
+        let outcome = apply_local_override_with_confirmation(
+            &mut cfg,
+            &config_path,
+            &trust_path,
+            true,
+            &|_| panic!("unavailable private trust must not prompt or activate"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ProjectConfigTrustOutcome::TrustUnavailable);
+        assert_eq!(cfg.yolo, Some(false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]

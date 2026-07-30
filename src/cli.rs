@@ -28,6 +28,12 @@ pub struct Cli {
     )]
     pub config_preservation_check: bool,
 
+    #[arg(
+        long = "project-config-trust-check",
+        help = "Verify project-local executable and security settings require content-bound trust, then exit"
+    )]
+    pub project_config_trust_check: bool,
+
     #[cfg(unix)]
     #[arg(
         long = "memory-editor-preservation-check",

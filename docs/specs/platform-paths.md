@@ -84,6 +84,32 @@ hermetic root set both variables. A config found under the old data-root behavio
 migration candidate. This intentional split prevents a fresh config and an existing config from
 using different storage classes.
 
+### Project-local configuration trust
+
+`.zerostack/config.toml` is repository-controlled and is not equivalent to the user-global
+configuration. Before trust, startup may merge only this exhaustive benign top-level allowlist:
+
+`always_show_welcome`, `chain`, `chat_left_margin`, `colors`, `compact_enabled`,
+`context_window`, `default_prompt`, `edit_system`, `keep_recent_tokens`, `max_agent_turns`,
+`max_bash_output_lines`, `max_find_results`, `max_grep_results`, `max_list_dir_entries`,
+`max_read_lines`, `max_text_file_size`, `max_tokens`, `mid_turn_compact_threshold`, `model`,
+`reserve_tokens`, `retry`, `show_cost_always`, `show_reasoning`, `show_tool_details`, `statusline`,
+the four `subagent_max_*` result/read limits, and `temperature`.
+
+Every other key is sensitive, including unknown future keys and all provider/API-key, permission,
+sandbox, shell/editor, MCP, LSP, ACP, worktree, auto-update, and executable integration settings.
+Sensitive keys remain inert until the user approves a prompt that displays their names, the
+canonical project and config paths, and the SHA-256 digest of the exact project-config bytes.
+Approval is persisted under `state_dir/config/trusted-project-configs.json` with a versioned trust
+schema. A content change, canonical path change, checkout copy, symlink retarget, or trust-schema
+change invalidates the decision. Trust records use the private no-follow atomic persistence policy;
+an unavailable or invalid private store fails closed.
+
+Headless, ACP, and other non-interactive startup never prompt. They apply only the benign allowlist
+and emit a diagnostic for ignored sensitive keys. Declining trust does not write a trust record or
+apply a sensitive value. Project hooks remain separately content/project-bound by the hook trust
+store and are never authorized by project-config trust.
+
 ---
 
 ## Platform mapping
