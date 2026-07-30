@@ -8,6 +8,14 @@ use crate::session;
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
+const REAL_BINARY_REPLAY_LABEL: &str = "real binary replay";
+
+fn real_binary_replay_entry() -> (&'static str, String) {
+    (
+        REAL_BINARY_REPLAY_LABEL,
+        "function-aware install timeout".to_string(),
+    )
+}
 
 fn chat_history_limit_entry() -> (&'static str, String) {
     (
@@ -222,6 +230,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         &mut output,
         "Behavior",
         &[
+            real_binary_replay_entry(),
             chat_history_path_policy_entry(),
             ("permission-mode", mode.to_string()),
             ("shell", shell.to_string()),
@@ -272,8 +281,9 @@ mod tests {
     use std::io;
 
     use super::{
-        CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        write_output,
+        CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry,
+        chat_history_path_policy_entry, write_output,
+        real_binary_replay_entry,
     };
 
     struct BrokenPipeWriter;
@@ -308,6 +318,17 @@ mod tests {
     #[test]
     fn flushing_config_output_treats_a_closed_pipe_as_success() {
         assert!(write_output(FlushBrokenPipeWriter, CHAT_HISTORY_FILE_LABEL).is_ok());
+    }
+
+    #[test]
+    fn config_reports_the_function_aware_real_binary_replay() {
+        assert_eq!(
+            real_binary_replay_entry(),
+            (
+                "real binary replay",
+                "function-aware install timeout".to_string()
+            )
+        );
     }
 
     #[test]
