@@ -14,7 +14,7 @@ const INSTALLED_BUILD_PROFILE_LABEL: &str = "installed build profile";
 fn clean_install_registry_entry() -> (&'static str, String) {
     (
         CLEAN_INSTALL_REGISTRY_LABEL,
-        "online (private Cargo home)".to_string(),
+        "online in isolated Cargo home".to_string(),
     )
 }
 
@@ -339,7 +339,7 @@ mod tests {
             clean_install_registry_entry(),
             (
                 "clean install registry",
-                "online (private Cargo home)".to_string()
+                "online in isolated Cargo home".to_string()
             )
         );
     }
