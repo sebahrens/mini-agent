@@ -113,8 +113,9 @@ type = "stdio"
 
 pub(crate) fn verify_config_preservation(paths: &AppPaths) -> io::Result<()> {
     let path = paths.cache_dir.join(format!(
-        ".config-preservation-check-{}.toml",
-        std::process::id()
+        ".config-preservation-check-{}-{}.toml",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
     ));
     let result = verify_config_preservation_at(&path);
     match std::fs::remove_file(&path) {
@@ -611,7 +612,8 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
 
 #[cfg(test)]
 mod preservation_check_tests {
-    use super::verify_config_preservation_at;
+    use super::{verify_config_preservation, verify_config_preservation_at};
+    use crate::paths::AppPaths;
 
     #[test]
     fn installed_binary_preservation_check_uses_atomic_round_trip() {
@@ -637,6 +639,40 @@ mod preservation_check_tests {
         assert!(saved.get("temperature").is_none());
 
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn installed_binary_preservation_check_leaves_stale_pid_file_untouched() {
+        let directory = std::env::temp_dir().join(format!(
+            "mini-agent-config-preservation-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let stale_path = directory.join(format!(
+            ".config-preservation-check-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&stale_path, "stale-user-data").unwrap();
+        let paths = AppPaths {
+            config_dir: directory.clone(),
+            data_dir: directory.clone(),
+            local_data_dir: directory.clone(),
+            state_dir: directory.clone(),
+            cache_dir: directory.clone(),
+            credentials_dir: directory.clone(),
+            project_dir: None,
+        };
+
+        verify_config_preservation(&paths).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&stale_path).unwrap(),
+            "stale-user-data"
+        );
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        std::fs::remove_file(stale_path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
 }
