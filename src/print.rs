@@ -13,7 +13,7 @@ fn chat_history_limit_entry() -> (&'static str, String) {
     (
         CHAT_HISTORY_ENTRY_LIMIT_LABEL,
         format!(
-            "{} entries",
+            "{} entries (bounded retention)",
             session::chat_history::MAX_CHAT_HISTORY_ENTRIES
         ),
     )
@@ -314,7 +314,10 @@ mod tests {
     fn config_reports_the_production_chat_history_entry_limit() {
         assert_eq!(
             chat_history_limit_entry(),
-            ("chat history entry limit", "10000 entries".to_string())
+            (
+                "chat history entry limit",
+                "10000 entries (bounded retention)".to_string()
+            )
         );
     }
 
