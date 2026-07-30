@@ -19,7 +19,7 @@ fn send_reply_or_log_drop(
     // The send error owns JsResponse; keep this diagnostic independent of its formatting traits.
     if reply.send(JsResponse { outcome }).is_err() {
         tracing::debug!(
-            reply_path = reply_path,
+            reply_path = %reply_path,
             "JS engine reply receiver dropped before response delivery"
         );
     }
