@@ -1125,9 +1125,7 @@ mod tests {
             let mut writer = zip::ZipWriter::new(file);
             let options = zip::write::SimpleFileOptions::default();
             writer.start_file("unsafe-path/SKILL.md", options).unwrap();
-            writer
-                .write_all(&skill_markdown("unsafe-path"))
-                .unwrap();
+            writer.write_all(&skill_markdown("unsafe-path")).unwrap();
             writer.start_file(*invalid_path, options).unwrap();
             writer.write_all(b"must be rejected").unwrap();
             writer.finish().unwrap();
@@ -1176,10 +1174,10 @@ mod tests {
         let mismatch_path = temp.0.join("mismatch.zip");
         let file = fs::File::create(&mismatch_path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
-        writer.start_file("directory-name/SKILL.md", options).unwrap();
         writer
-            .write_all(&skill_markdown("manifest-name"))
+            .start_file("directory-name/SKILL.md", options)
             .unwrap();
+        writer.write_all(&skill_markdown("manifest-name")).unwrap();
         writer.finish().unwrap();
         assert!(matches!(
             import_agent_skill(&mismatch_path, &temp.paths()),
@@ -1217,11 +1215,7 @@ mod tests {
         let directory = write_directory_skill(&temp.0, "hard-linked-skill", &marker);
         let outside = temp.0.join("outside.txt");
         fs::write(&outside, b"outside bytes").unwrap();
-        fs::hard_link(
-            &outside,
-            directory.join("assets").join("hard-linked.txt"),
-        )
-        .unwrap();
+        fs::hard_link(&outside, directory.join("assets").join("hard-linked.txt")).unwrap();
 
         assert!(matches!(
             import_agent_skill(&directory, &temp.paths()),
