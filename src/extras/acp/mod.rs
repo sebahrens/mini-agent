@@ -20,8 +20,6 @@ use crate::config::Config;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 use crate::permission::SecurityMode;
-use crate::permission::ask::AskSender;
-use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::sandbox::Sandbox;
 
 const AGENT_VERSION: &str = "1.0.5";
@@ -416,7 +414,9 @@ async fn run_prompt(
 
     let model = client.completion_model(model_str.to_string());
 
-    let (permission, ask_tx) = build_acp_permission(state);
+    let mode = resolve_acp_mode(&state.cli, &state.cfg);
+    let (permission, ask_tx) =
+        crate::permission::build_noninteractive_permission(&state.cli, &state.cfg, mode);
     let sandbox = Sandbox::new(
         state.cli.resolve_sandbox(&state.cfg),
         &state.cli.resolve_sandbox_backend(&state.cfg),
@@ -585,43 +585,6 @@ async fn run_prompt(
 
     let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
     Ok(())
-}
-
-// --- Permission ---
-
-fn build_acp_permission(state: &AcpState) -> (Option<PermCheck>, Option<AskSender>) {
-    use std::sync::Mutex as StdMutex;
-
-    let no_tools = state.cli.resolve_no_tools(&state.cfg);
-    if no_tools || state.cli.dangerously_skip_permissions {
-        return (None, None);
-    }
-
-    let perm_config = state.cfg.build_permission_config();
-
-    let mode = resolve_acp_mode(&state.cli, &state.cfg);
-    let permission_modes = state.cfg.permission_modes.clone();
-    let checker = PermissionChecker::new(&perm_config, mode, None, permission_modes);
-    let perm: PermCheck = Arc::new(StdMutex::new(checker));
-
-    let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel::<crate::permission::ask::AskRequest>(64);
-    // ACP is headless — there is no interactive user to prompt. Auto-approve
-    // Ask requests so tools don't fail with "Permission system unavailable".
-    // Log a warning so the auto-approval is visible in logs.
-    tokio::spawn(async move {
-        while let Some(req) = ask_rx.recv().await {
-            tracing::warn!(
-                "ACP auto-approving tool call: tool={}, input_len={}",
-                req.tool,
-                req.input.len()
-            );
-            let _ = req
-                .reply
-                .send(crate::permission::ask::UserDecision::AllowOnce);
-        }
-    });
-
-    (Some(perm), Some(ask_tx))
 }
 
 pub(crate) fn resolve_acp_mode(cli: &Cli, cfg: &Config) -> SecurityMode {

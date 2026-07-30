@@ -74,6 +74,12 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if cli.acp_permission_policy_check {
+        permission::verify_acp_permission_policy().await?;
+        println!("ACP headless permission policy check: PASS");
+        return Ok(());
+    }
+
     let is_interactive = !cli.print;
     #[cfg(feature = "acp")]
     let is_interactive = is_interactive && !cli.acp_enabled;

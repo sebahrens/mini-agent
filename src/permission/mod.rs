@@ -59,6 +59,64 @@ impl From<PermissionConfig> for PermissionConfigs {
     }
 }
 
+/// Build a permission policy for a frontend that cannot securely prompt.
+///
+/// The checker still preserves explicit allow and deny rules, but `Ask` has
+/// no response channel and therefore fails closed in the shared tool gates.
+pub(crate) fn build_noninteractive_permission(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    mode: SecurityMode,
+) -> (
+    Option<checker::PermCheck>,
+    Option<ask::AskSender>,
+) {
+    if cli.resolve_no_tools(cfg) || cli.dangerously_skip_permissions {
+        return (None, None);
+    }
+
+    let checker = checker::PermissionChecker::new(
+        &cfg.build_permission_config(),
+        mode,
+        None,
+        cfg.permission_modes.clone(),
+    );
+    let permission = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+    (Some(permission), None)
+}
+
+pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
+    let cli = crate::cli::Cli {
+        guarded: true,
+        ..Default::default()
+    };
+    let cfg = crate::config::Config {
+        permission: Some(serde_json::json!({"write": "ask"})),
+        permission_modes: Some(vec!["guarded".to_string()]),
+        ..Default::default()
+    };
+    let (permission, ask_tx) =
+        build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded);
+
+    anyhow::ensure!(
+        ask_tx.is_none(),
+        "ACP non-interactive policy exposed an approval channel"
+    );
+    let error =
+        crate::agent::tools::check_perm(&permission, &ask_tx, "write", "policy-check").await;
+    anyhow::ensure!(
+        matches!(
+            error,
+            Err(crate::agent::tools::ToolError::Msg(ref message))
+                if message == "Permission denied (non-interactive mode)"
+        ),
+        "ACP non-interactive Ask did not fail closed"
+    );
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SecurityMode {
     Standard,
@@ -195,4 +253,154 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
         ("vi **", Action::Deny),
         ("nano **", Action::Deny),
     ]
+}
+
+#[cfg(test)]
+mod acp_permission_policy_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rig::tool::Tool;
+
+    use super::{SecurityMode, build_noninteractive_permission};
+    use crate::agent::tools::{ToolError, WriteArgs, WriteTool, check_perm};
+    use crate::cli::Cli;
+    use crate::config::Config;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mini_agent_acp_permission_policy_{}_{}",
+                std::process::id(),
+                sequence
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn policy(action: &str) -> (
+        Option<crate::permission::checker::PermCheck>,
+        Option<crate::permission::ask::AskSender>,
+    ) {
+        let cli = Cli {
+            guarded: true,
+            ..Default::default()
+        };
+        let cfg = Config {
+            permission: Some(serde_json::json!({"write": action})),
+            permission_modes: Some(vec!["guarded".to_string()]),
+            ..Default::default()
+        };
+        build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded)
+    }
+
+    fn message(result: Result<Option<String>, ToolError>) -> Option<String> {
+        match result {
+            Err(ToolError::Msg(message)) => Some(message),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_permission_policy_preserves_explicit_allow_and_deny() {
+        let (allow_permission, allow_ask_tx) = policy("allow");
+        assert!(allow_ask_tx.is_none());
+        assert!(
+            check_perm(
+                &allow_permission,
+                &allow_ask_tx,
+                "write",
+                "allowed-path"
+            )
+            .await
+            .is_ok()
+        );
+
+        let (deny_permission, deny_ask_tx) = policy("deny");
+        assert!(deny_ask_tx.is_none());
+        let denial = message(
+            check_perm(
+                &deny_permission,
+                &deny_ask_tx,
+                "write",
+                "denied-path",
+            )
+            .await,
+        )
+        .expect("explicit deny must reject the tool call");
+        assert!(denial.starts_with("Permission denied:"));
+    }
+
+    #[tokio::test]
+    async fn acp_permission_policy_ask_fails_closed_without_a_side_effect() {
+        let temp = TempDir::new();
+        let target = temp.path().join("must-not-exist.txt");
+        let (permission, ask_tx) = policy("ask");
+        assert!(ask_tx.is_none());
+        let tool = WriteTool::new(permission, ask_tx, None);
+
+        let error = tool
+            .call(WriteArgs {
+                path: target.to_string_lossy().into_owned(),
+                content: "must not be written".to_string(),
+            })
+            .await
+            .expect_err("unanswered ACP Ask must deny the write");
+
+        assert_eq!(
+            error.to_string(),
+            "Permission denied (non-interactive mode)"
+        );
+        assert!(
+            !target.exists(),
+            "permission denial must happen before the tool side effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_permission_policy_concurrent_asks_are_denied_and_isolated() {
+        let (first_permission, first_ask_tx) = policy("ask");
+        let (second_permission, second_ask_tx) = policy("ask");
+
+        let concurrent = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(
+                check_perm(
+                    &first_permission,
+                    &first_ask_tx,
+                    "write",
+                    "session-one"
+                ),
+                check_perm(
+                    &second_permission,
+                    &second_ask_tx,
+                    "write",
+                    "session-two"
+                )
+            )
+        })
+        .await
+        .expect("headless ACP permission checks must not wait for a responder");
+
+        for result in [concurrent.0, concurrent.1] {
+            assert_eq!(
+                message(result).as_deref(),
+                Some("Permission denied (non-interactive mode)")
+            );
+        }
+    }
 }

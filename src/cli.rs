@@ -76,6 +76,12 @@ pub struct Cli {
     )]
     pub acp_authentication_check: bool,
 
+    #[arg(
+        long = "acp-permission-policy-check",
+        help = "Verify headless ACP Ask permissions fail closed, then exit"
+    )]
+    pub acp_permission_policy_check: bool,
+
     #[arg(long = "name", help = "Name for the session")]
     pub name: Option<String>,
 
