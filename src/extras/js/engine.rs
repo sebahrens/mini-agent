@@ -35,7 +35,7 @@ fn log_reply_drop(reply_path: ReplyPath) {
     );
 }
 
-fn send_reply_or_log_drop<T>(
+fn deliver_reply_or_cancel<T>(
     reply: oneshot::Sender<T>,
     response: T,
     cancellation: &PermCancellation,
@@ -244,7 +244,7 @@ pub(crate) fn js_thread_main(
             continue;
         }
         if req.cancellation.is_cancelled() {
-            send_reply_or_log_drop(
+            deliver_reply_or_cancel(
                 req.reply,
                 JsResponse {
                     outcome: JsOutcome::Error("execution cancelled".to_string()),
@@ -256,7 +256,7 @@ pub(crate) fn js_thread_main(
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        send_reply_or_log_drop(
+        deliver_reply_or_cancel(
             req.reply,
             JsResponse { outcome },
             &req.cancellation,
@@ -397,7 +397,7 @@ mod tests {
     use crate::extras::js::tool::PermissionBridgeOwner;
 
     #[tokio::test]
-    async fn js_reply_delivery_recovers_after_dropped_receivers() {
+    async fn js_reply_delivery_cancels_dropped_receivers_and_recovers() {
         struct NoFormattingTraits;
 
         assert_eq!(ReplyPath::EarlyCancel.as_str(), "early_cancel");
@@ -409,7 +409,7 @@ mod tests {
 
         let delivered_cancellation = PermCancellation::new();
         let (delivered_reply, delivered_receiver) = oneshot::channel();
-        send_reply_or_log_drop(
+        deliver_reply_or_cancel(
             delivered_reply,
             JsResponse {
                 outcome: JsOutcome::Value("delivered".to_string()),
@@ -429,7 +429,7 @@ mod tests {
         let cancelled_cancellation = PermCancellation::new();
         let (cancelled_reply, cancelled_receiver) = oneshot::channel::<NoFormattingTraits>();
         drop(cancelled_receiver);
-        send_reply_or_log_drop(
+        deliver_reply_or_cancel(
             cancelled_reply,
             NoFormattingTraits,
             &cancelled_cancellation,
@@ -440,7 +440,7 @@ mod tests {
         let completed_cancellation = PermCancellation::new();
         let (completed_reply, completed_receiver) = oneshot::channel::<NoFormattingTraits>();
         drop(completed_receiver);
-        send_reply_or_log_drop(
+        deliver_reply_or_cancel(
             completed_reply,
             NoFormattingTraits,
             &completed_cancellation,
@@ -450,7 +450,7 @@ mod tests {
 
         let recovery_cancellation = PermCancellation::new();
         let (recovery_reply, recovery_receiver) = oneshot::channel();
-        send_reply_or_log_drop(
+        deliver_reply_or_cancel(
             recovery_reply,
             JsResponse {
                 outcome: JsOutcome::Value("recovered".to_string()),
