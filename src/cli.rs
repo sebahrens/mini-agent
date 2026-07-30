@@ -28,6 +28,13 @@ pub struct Cli {
     )]
     pub config_preservation_check: bool,
 
+    #[cfg(unix)]
+    #[arg(
+        long = "memory-editor-preservation-check",
+        help = "Verify failed external memory edits preserve existing bytes, then exit"
+    )]
+    pub memory_editor_preservation_check: bool,
+
     #[arg(long = "setup", help = "Interactive setup wizard")]
     pub setup: bool,
 

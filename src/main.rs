@@ -54,6 +54,13 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    #[cfg(unix)]
+    if cli.memory_editor_preservation_check {
+        ui::slash::verify_memory_editor_preservation()?;
+        println!("memory editor preservation check: PASS");
+        return Ok(());
+    }
+
     if cli.resume_provider_safety_check {
         startup::verify_resume_provider_safety()?;
         println!("session resume provider safety check: PASS");

@@ -6,6 +6,10 @@ mod help;
 mod hooks;
 pub(crate) mod init;
 mod memory;
+#[cfg(feature = "memory")]
+pub(crate) use memory::edit_memory_file;
+#[cfg(unix)]
+pub(crate) use memory::verify_memory_editor_preservation;
 mod providers;
 pub(crate) mod review;
 mod session;

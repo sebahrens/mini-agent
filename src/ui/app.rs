@@ -1469,6 +1469,7 @@ impl<'a> App<'a> {
                     ss.send_start();
                 }
             }
+            #[cfg(feature = "memory")]
             Err(e) if e.to_string().starts_with("DEFER_EDITOR:") => {
                 let path = e
                     .to_string()
@@ -1487,12 +1488,8 @@ impl<'a> App<'a> {
                 let _ = stdout.execute(crossterm::event::DisableMouseCapture);
                 let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
                 let _ = stdout.flush();
-                let _ = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(format!("{} \"$1\"", editor))
-                    .arg("sh")
-                    .arg(&path)
-                    .status();
+                let edit_result =
+                    crate::ui::slash::edit_memory_file(std::path::Path::new(&path), &editor);
                 let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
                 let _ = stdout.execute(crossterm::terminal::Clear(
                     crossterm::terminal::ClearType::All,
@@ -1506,8 +1503,18 @@ impl<'a> App<'a> {
                     self.ui.cfg,
                     self.ui.context,
                 )?;
-                self.renderer
-                    .write_line(&format!("returned from editing {}", path), C_AGENT)?;
+                match edit_result {
+                    Ok(true) => self
+                        .renderer
+                        .write_line(&format!("updated memory {}", path), C_AGENT)?,
+                    Ok(false) => self
+                        .renderer
+                        .write_line(&format!("memory unchanged {}", path), C_AGENT)?,
+                    Err(error) => self.renderer.write_line(
+                        &format!("memory editor failed for {}: {}", path, error),
+                        C_ERROR,
+                    )?,
+                }
             }
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
