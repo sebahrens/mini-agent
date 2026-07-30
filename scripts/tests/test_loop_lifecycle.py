@@ -19,7 +19,7 @@ def extract_function(source: str, name: str, next_name: str) -> str:
 
 
 class LoopLifecycleTests(unittest.TestCase):
-    def test_clean_install_uses_resilient_cargo_network_settings(self) -> None:
+    def test_clean_install_uses_online_resilient_cargo_network_settings(self) -> None:
         source = LOOP_SCRIPT.read_text()
         install_function = extract_function(
             source,
@@ -31,6 +31,7 @@ set -eu
 
 install_root=$(mktemp -d)
 trap 'rm -rf "$install_root"' EXIT
+export CARGO_NET_OFFLINE=true
 
 {install_function}
 
@@ -53,6 +54,7 @@ run_in_clean_install_environment "$install_root" /usr/bin/env /usr/bin/true
         )
         self.assertEqual("false", environment.get("CARGO_HTTP_MULTIPLEXING"))
         self.assertEqual("10", environment.get("CARGO_NET_RETRY"))
+        self.assertNotIn("CARGO_NET_OFFLINE", environment)
 
     def test_hard_timeout_runs_shell_functions_when_timeout_binary_exists(self) -> None:
         source = LOOP_SCRIPT.read_text()

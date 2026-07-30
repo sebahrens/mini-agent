@@ -1681,7 +1681,7 @@ run_in_clean_install_environment() {
     mkdir -p "$install_root/cargo-home" "$install_root/cargo-target" || return 1
     for name in HOME USER LOGNAME TMPDIR TMP TEMP \
             HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY SSL_CERT_FILE SSL_CERT_DIR \
-            CARGO_NET_OFFLINE MACOSX_DEPLOYMENT_TARGET SDKROOT DEVELOPER_DIR; do
+            MACOSX_DEPLOYMENT_TARGET SDKROOT DEVELOPER_DIR; do
         if [ "${!name+x}" = x ]; then
             clean_env+=("$name=${!name}")
         fi
@@ -1689,8 +1689,8 @@ run_in_clean_install_environment() {
     clean_env+=("PATH=$(dirname "$cargo_path"):$(dirname "$rustc_path"):/usr/bin:/bin:/usr/sbin:/sbin")
     clean_env+=("CARGO_INSTALL_ROOT=$install_root" "CARGO_HOME=$install_root/cargo-home")
     clean_env+=("CARGO_TARGET_DIR=$install_root/cargo-target" "RUSTC=$rustc_path" "SHELL=/bin/bash")
-    # Every evidence replay starts with an empty Cargo home, so transient registry
-    # failures must not make an otherwise valid installed-binary scenario flaky.
+    # Every evidence replay starts with an empty Cargo home, so it must be able to
+    # populate its private registry even when the parent loop runs offline.
     clean_env+=("CARGO_HTTP_MULTIPLEXING=false" "CARGO_NET_RETRY=10")
     "${clean_env[@]}" "$cargo_path" "$@"
 }

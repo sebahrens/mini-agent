@@ -8,7 +8,15 @@ use crate::session;
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
+const CLEAN_INSTALL_REGISTRY_LABEL: &str = "clean install registry";
 const INSTALLED_BUILD_PROFILE_LABEL: &str = "installed build profile";
+
+fn clean_install_registry_entry() -> (&'static str, String) {
+    (
+        CLEAN_INSTALL_REGISTRY_LABEL,
+        "online (private Cargo home)".to_string(),
+    )
+}
 
 fn installed_build_profile_entry() -> (&'static str, String) {
     (
@@ -235,6 +243,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         &mut output,
         "Behavior",
         &[
+            clean_install_registry_entry(),
             installed_build_profile_entry(),
             chat_history_path_policy_entry(),
             ("permission-mode", mode.to_string()),
@@ -287,7 +296,7 @@ mod tests {
 
     use super::{
         CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        installed_build_profile_entry, write_output,
+        clean_install_registry_entry, installed_build_profile_entry, write_output,
     };
 
     struct BrokenPipeWriter;
@@ -322,6 +331,17 @@ mod tests {
     #[test]
     fn flushing_config_output_treats_a_closed_pipe_as_success() {
         assert!(write_output(FlushBrokenPipeWriter, CHAT_HISTORY_FILE_LABEL).is_ok());
+    }
+
+    #[test]
+    fn config_reports_the_clean_install_registry_policy() {
+        assert_eq!(
+            clean_install_registry_entry(),
+            (
+                "clean install registry",
+                "online (private Cargo home)".to_string()
+            )
+        );
     }
 
     #[test]
