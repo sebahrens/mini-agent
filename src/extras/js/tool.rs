@@ -538,10 +538,9 @@ impl Drop for JsTool {
             let _ = js_thread.join();
         } else {
             // Drop cannot await; retain the task long enough to make the intentional detach explicit.
-            let join_task = self.runtime.spawn_blocking(move || {
+            std::mem::drop(self.runtime.spawn_blocking(move || {
                 let _ = js_thread.join();
-            });
-            std::mem::drop(join_task);
+            }));
         }
     }
 }
