@@ -50,16 +50,25 @@
   "residual_actionable_work": [],
   "advisory_outputs": [
     "Embedded Dolt is single-writer and uses its own local file lock.",
+    "Beads 1.1.2 corrected dependency evaluation from 30 ready / 52 blocked to 20 ready / 62 blocked without changing dependency records.",
     "No relevant docs/solutions learning or agent-native parity gap was found."
   ],
   "validation": {
+    "beads_version": "1.1.2",
+    "schema_version": 53,
     "issues": 212,
     "comments": 276,
+    "ready": 20,
+    "blocked": 62,
     "duplicate_issue_ids": 0,
     "duplicate_comment_ids": 0,
-    "domain_hash_excluding_comment_ids_matches_pre_repair_export": true,
-    "parent_comment_id_mismatches": 0,
-    "new_comment_ids_restored": 4
+    "core_issue_field_mismatches": 0,
+    "comment_record_drift": 0,
+    "label_record_drift": 0,
+    "dependency_record_drift": 0,
+    "remote_history_preserved": true,
+    "remote_schema_and_data_push_succeeded": true,
+    "recoverable_pre_reconcile_snapshot": "/tmp/mini-agent-embedded-reconcile-20260730-1658"
   },
   "verdict": "Ready to merge"
 }
