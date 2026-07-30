@@ -35,7 +35,7 @@ fn send_reply_or_log_drop(
     if let Err(undelivered) = reply.send(JsResponse { outcome }) {
         tracing::debug!(
             reply_path = reply_path.as_str(),
-            outcome_kind = undelivered.outcome.kind(),
+            outcome_kind = undelivered.outcome.telemetry_kind(),
             "JS engine reply receiver dropped before response delivery"
         );
     }
