@@ -200,17 +200,21 @@ pub(crate) fn js_thread_main(
 ) {
     while let Ok(req) = rx.recv() {
         if req.cancellation.is_cancelled() {
-            if let Err(error) = req.reply.send(JsResponse {
-                outcome: JsOutcome::Error("execution cancelled".to_string()),
-            }) {
-                tracing::debug!("JS engine reply channel closed: {:?}", error);
+            if req
+                .reply
+                .send(JsResponse {
+                    outcome: JsOutcome::Error("execution cancelled".to_string()),
+                })
+                .is_err()
+            {
+                tracing::debug!("JS engine reply channel closed");
             }
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        if let Err(error) = req.reply.send(JsResponse { outcome }) {
-            tracing::debug!("JS engine reply channel closed: {:?}", error);
+        if req.reply.send(JsResponse { outcome }).is_err() {
+            tracing::debug!("JS engine reply channel closed");
         }
     }
 }
@@ -339,4 +343,72 @@ pub(crate) fn run_step_for_test(
             max_pending_jobs,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::extras::js::tool::PermissionBridgeOwner;
+
+    #[tokio::test]
+    async fn js_reply_receiver_drop_is_non_fatal_for_cancelled_and_completed_requests() {
+        let permission_owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let permission_bridge = permission_owner.bridge();
+        let (request_tx, request_rx) = mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let js_thread = std::thread::Builder::new()
+            .name("js-engine-reply-drop-test".into())
+            .stack_size(THREAD_STACK)
+            .spawn(move || {
+                js_thread_main(
+                    request_rx,
+                    Sandbox::new(false, "bwrap"),
+                    permission_bridge,
+                    runtime,
+                );
+            })
+            .expect("failed to spawn JS test thread");
+
+        let cancellation = PermCancellation::new();
+        cancellation.cancel();
+        let (cancelled_reply, cancelled_receiver) = oneshot::channel();
+        drop(cancelled_receiver);
+        request_tx
+            .send(JsRequest {
+                code: "unreachable".to_string(),
+                cancellation,
+                reply: cancelled_reply,
+            })
+            .expect("cancelled request should reach JS thread");
+
+        let (completed_reply, completed_receiver) = oneshot::channel();
+        drop(completed_receiver);
+        request_tx
+            .send(JsRequest {
+                code: "40 + 1".to_string(),
+                cancellation: PermCancellation::new(),
+                reply: completed_reply,
+            })
+            .expect("normal request should reach JS thread");
+
+        let (recovery_reply, recovery_receiver) = oneshot::channel();
+        request_tx
+            .send(JsRequest {
+                code: "40 + 2".to_string(),
+                cancellation: PermCancellation::new(),
+                reply: recovery_reply,
+            })
+            .expect("recovery request should reach JS thread");
+
+        let recovery = tokio::time::timeout(Duration::from_secs(5), recovery_receiver)
+            .await
+            .expect("JS thread stopped after a reply receiver was dropped")
+            .expect("JS thread closed the recovery reply channel");
+        assert_eq!(recovery.outcome, JsOutcome::Value("42".to_string()));
+
+        drop(request_tx);
+        js_thread.join().expect("JS test thread panicked");
+    }
 }

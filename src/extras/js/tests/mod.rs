@@ -407,3 +407,29 @@ async fn js_outcome_mapping() {
 
     owner.shutdown();
 }
+
+#[tokio::test]
+async fn test_drop_recovery_after_timeout() {
+    use rig::tool::Tool;
+    let tool = make_test_tool();
+
+    let timeout_result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "while (true) {}".to_string(),
+        })
+        .await
+        .expect("timeout call failed");
+    assert_eq!(
+        timeout_result,
+        "JS error: execution timed out (30s limit exceeded)",
+        "first call should time out: {timeout_result}"
+    );
+
+    let recovery_result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "35411".to_string(),
+        })
+        .await
+        .expect("recovery call failed");
+    assert_eq!(recovery_result, "35411", "recovery should return 35411");
+}
