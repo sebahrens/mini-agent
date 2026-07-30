@@ -13,7 +13,7 @@ fn chat_history_limit_entry() -> (&'static str, String) {
     (
         CHAT_HISTORY_ENTRY_LIMIT_LABEL,
         format!(
-            "keeps newest {} entries",
+            "keeps newest {} entries; discards older entries",
             session::chat_history::MAX_CHAT_HISTORY_ENTRIES
         ),
     )
@@ -316,7 +316,7 @@ mod tests {
             chat_history_limit_entry(),
             (
                 "chat history entry limit",
-                "keeps newest 10000 entries".to_string()
+                "keeps newest 10000 entries; discards older entries".to_string()
             )
         );
     }
