@@ -22,7 +22,15 @@ fn installed_debug_assertions() -> &'static str {
 fn installed_build_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_LABEL,
-        format!("mini-agent {}", env!("CARGO_PKG_VERSION")),
+        format!(
+            "mini-agent {}; debug assertions {} at compile time",
+            env!("CARGO_PKG_VERSION"),
+            if cfg!(debug_assertions) {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
     )
 }
 
@@ -342,7 +350,15 @@ mod tests {
             installed_build_entry(),
             (
                 "installed build",
-                format!("mini-agent {}", env!("CARGO_PKG_VERSION"))
+                format!(
+                    "mini-agent {}; debug assertions {} at compile time",
+                    env!("CARGO_PKG_VERSION"),
+                    if cfg!(debug_assertions) {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                )
             )
         );
         assert_eq!(
