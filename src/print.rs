@@ -14,7 +14,8 @@ fn installed_build_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_LABEL,
         format!(
-            "mini-agent {}; debug assertions {} at compile time; target {}-{}",
+            "{} {}; debug assertions {} at compile time; target {}-{}",
+            env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
             if cfg!(debug_assertions) {
                 "enabled"
@@ -336,7 +337,8 @@ mod tests {
             (
                 "installed binary provenance",
                 format!(
-                    "mini-agent {}; debug assertions {} at compile time; target {}-{}",
+                    "{} {}; debug assertions {} at compile time; target {}-{}",
+                    env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                     if cfg!(debug_assertions) {
                         "enabled"
