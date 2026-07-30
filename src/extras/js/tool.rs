@@ -647,15 +647,19 @@ mod js_permission_bridge {
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
     fn permission(action: Action) -> PermCheck {
+        // Use "read" tool (not "bash") so ToolPerm::Simple's "**" glob matches
+        // any key via normal pattern matching. Bash uses model-B exact-match
+        // for Allow rules, which rejects the "**" wildcard and falls through to
+        // the mode default, causing spurious NonInteractive denials.
         let config = PermissionConfig {
-            bash: Some(ToolPerm::Simple(action)),
+            read: Some(ToolPerm::Simple(action)),
             ..PermissionConfig::default()
         };
         Arc::new(Mutex::new(PermissionChecker::new(
             &PermissionConfigs::from(config),
-            SecurityMode::Standard,
+            SecurityMode::Restrictive,
             std::env::current_dir().ok(),
-            Some(vec!["standard".to_string()]),
+            Some(vec!["restrictive".to_string()]),
         )))
     }
 
@@ -686,7 +690,7 @@ mod js_permission_bridge {
             PermissionBridgeOwner::new(Some(permission(Action::Allow)), None, STEP_TIMEOUT);
         allow_owner
             .bridge()
-            .check_async("bash", "printf allowed")
+            .check_async("read", "allowed-file.txt")
             .await
             .expect("allow should pass");
 
@@ -696,7 +700,7 @@ mod js_permission_bridge {
             matches!(
                 deny_owner
                     .bridge()
-                    .check_async("bash", "printf denied")
+                    .check_async("read", "denied-file.txt")
                     .await,
                 Err(PermissionBridgeError::Denied(PermissionDenial::Policy(_)))
             ),
@@ -707,7 +711,8 @@ mod js_permission_bridge {
         let ask_owner =
             PermissionBridgeOwner::new(Some(permission(Action::Ask)), Some(ask_tx), STEP_TIMEOUT);
         let bridge = ask_owner.bridge();
-        let approval = tokio::spawn(async move { bridge.check_async("bash", "printf ask").await });
+        let approval =
+            tokio::spawn(async move { bridge.check_async("read", "ask-file.txt").await });
         let request = ask_rx.recv().await.expect("ask request should arrive");
         request
             .reply
@@ -731,7 +736,7 @@ mod js_permission_bridge {
         assert_eq!(
             closed_owner
                 .bridge()
-                .check_async("bash", "printf closed")
+                .check_async("read", "closed-file.txt")
                 .await,
             Err(PermissionBridgeError::BackendFailure(
                 PermissionBackendFailure::AskChannelClosed
@@ -745,7 +750,8 @@ mod js_permission_bridge {
             STEP_TIMEOUT,
         );
         let bridge = dropped_owner.bridge();
-        let check = tokio::spawn(async move { bridge.check_async("bash", "printf dropped").await });
+        let check =
+            tokio::spawn(async move { bridge.check_async("read", "dropped-file.txt").await });
         drop(dropped_rx.recv().await.expect("ask request should arrive"));
         assert_eq!(
             check.await.expect("check task should not panic"),

@@ -32,7 +32,7 @@ fn interruption_outcome(
     }
 }
 
-fn stringify_thrown_value(ctx: &Ctx<'_>, value: &Value<'_>) -> String {
+fn stringify_thrown_value<'a>(ctx: &Ctx<'a>, value: &Value<'a>) -> String {
     if value.is_null() {
         return "null".to_string();
     }
@@ -51,9 +51,9 @@ fn stringify_thrown_value(ctx: &Ctx<'_>, value: &Value<'_>) -> String {
     }
 }
 
-fn thrown_value_outcome(
-    ctx: &Ctx<'_>,
-    value: Value<'_>,
+fn thrown_value_outcome<'a>(
+    ctx: &Ctx<'a>,
+    value: Value<'a>,
     deadline: Instant,
     cancellation: &PermCancellation,
     permission_bridge: &PermissionBridge,
@@ -203,14 +203,14 @@ pub(crate) fn js_thread_main(
             if let Err(error) = req.reply.send(JsResponse {
                 outcome: JsOutcome::Error("execution cancelled".to_string()),
             }) {
-                tracing::debug!("JS engine reply channel closed: {}", error);
+                tracing::debug!("JS engine reply channel closed: {:?}", error);
             }
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
         if let Err(error) = req.reply.send(JsResponse { outcome }) {
-            tracing::debug!("JS engine reply channel closed: {}", error);
+            tracing::debug!("JS engine reply channel closed: {:?}", error);
         }
     }
 }

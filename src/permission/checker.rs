@@ -340,22 +340,20 @@ impl PermissionChecker {
         if action != Action::Deny {
             self.track_doom_loop(tool, doom_key);
             if self.is_doom_loop() {
+                // doom_loop_action=Deny must block even allow-listed tools.
+                if self.doom_loop_action == Action::Deny {
+                    tracing::info!("perm doom-loop blocked: tool={}", tool);
+                    return CheckResult::Denied(
+                        "Doom loop: repeated identical tool call".to_string(),
+                    );
+                }
                 if action == Action::Allow {
                     let count = self.count_doom_loop();
                     return CheckResult::allowed_with_coaching(tool, doom_key, count);
                 }
-                match self.doom_loop_action {
-                    Action::Deny => {
-                        tracing::info!("perm doom-loop blocked: tool={}", tool);
-                        return CheckResult::Denied(
-                            "Doom loop: repeated identical tool call".to_string(),
-                        );
-                    }
-                    Action::Ask => {
-                        tracing::info!("perm doom-loop ask: tool={}", tool);
-                        return CheckResult::Ask;
-                    }
-                    Action::Allow => {}
+                if self.doom_loop_action == Action::Ask {
+                    tracing::info!("perm doom-loop ask: tool={}", tool);
+                    return CheckResult::Ask;
                 }
             }
         }
