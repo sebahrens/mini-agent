@@ -20,7 +20,7 @@ fn installed_build_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_LABEL,
         format!(
-            "Cargo-installed package {} version {}, {assertion_mode} at compile time, target {}-{}",
+            "Cargo-installed package {} version {} is runnable; {assertion_mode} at compile time; target {}-{}",
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
             std::env::consts::ARCH,
@@ -338,7 +338,7 @@ mod tests {
             (
                 "installed binary provenance",
                 format!(
-                    "Cargo-installed package {} version {}, debug assertions {} at compile time, target {}-{}",
+                    "Cargo-installed package {} version {} is runnable; debug assertions {} at compile time; target {}-{}",
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                     if cfg!(debug_assertions) {
