@@ -1,5 +1,7 @@
 use crate::extras::js::tool::JsTool;
-use crate::extras::js::types::{JsOutcome, PermCancellation, STEP_TIMEOUT};
+use crate::extras::js::types::{
+    JsOutcome, JsRequest, JsResponse, PermCancellation, STEP_TIMEOUT, THREAD_STACK,
+};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
@@ -409,79 +411,68 @@ async fn js_outcome_mapping() {
 }
 
 #[tokio::test]
-async fn test_drop_recovery_after_timeout() {
-    use rig::tool::Tool;
-    let tool = make_test_tool();
+async fn test_js_reply_receiver_drop_is_non_fatal() {
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    let timeout_result = tool
-        .call(crate::extras::js::tool::JsArgs {
-            code: "while (true) {}".to_string(),
+    use crate::extras::js::engine::js_thread_main;
+    use crate::extras::js::tool::PermissionBridgeOwner;
+
+    let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+    let bridge = owner.bridge();
+    let (request_tx, request_rx) = mpsc::channel();
+    let runtime = tokio::runtime::Handle::current();
+    let js_thread = std::thread::Builder::new()
+        .name("js-reply-drop-test".into())
+        .stack_size(THREAD_STACK)
+        .spawn(move || {
+            js_thread_main(
+                request_rx,
+                Sandbox::new(false, "bwrap"),
+                bridge,
+                runtime,
+            );
         })
-        .await
-        .expect("timeout call failed");
-    assert_eq!(
-        timeout_result, "JS error: execution timed out (30s limit exceeded)",
-        "first call should time out: {timeout_result}"
-    );
+        .expect("failed to spawn JS reply-drop test thread");
 
-    let recovery_result = tool
-        .call(crate::extras::js::tool::JsArgs {
-            code: "35411".to_string(),
+    let (completed_reply, completed_receiver) = tokio::sync::oneshot::channel::<JsResponse>();
+    drop(completed_receiver);
+    request_tx
+        .send(JsRequest {
+            code: "1 + 1".to_string(),
+            cancellation: PermCancellation::new(),
+            reply: completed_reply,
         })
-        .await
-        .expect("recovery call failed");
-    assert_eq!(recovery_result, "35411", "recovery should return 35411");
-}
+        .expect("failed to send normal-completion request");
 
-#[tokio::test]
-async fn test_js_reply_drop_recovery_699() {
-    use rig::tool::Tool;
-    let tool = make_test_tool();
-
-    let timeout_result = tool
-        .call(crate::extras::js::tool::JsArgs {
-            code: "while (true) {}".to_string(),
+    let cancellation = PermCancellation::new();
+    cancellation.cancel();
+    let (cancelled_reply, cancelled_receiver) = tokio::sync::oneshot::channel::<JsResponse>();
+    drop(cancelled_receiver);
+    request_tx
+        .send(JsRequest {
+            code: "throw new Error('must not execute')".to_string(),
+            cancellation,
+            reply: cancelled_reply,
         })
-        .await
-        .expect("timeout call failed");
-    assert_eq!(
-        timeout_result, "JS error: execution timed out (30s limit exceeded)",
-        "first call should time out: {timeout_result}"
-    );
+        .expect("failed to send early-cancel request");
 
-    let recovery_result = tool
-        .call(crate::extras::js::tool::JsArgs {
-            code: "699".to_string(),
+    let (recovery_reply, recovery_receiver) = tokio::sync::oneshot::channel();
+    request_tx
+        .send(JsRequest {
+            code: "42".to_string(),
+            cancellation: PermCancellation::new(),
+            reply: recovery_reply,
         })
-        .await
-        .expect("recovery call failed");
-    assert_eq!(recovery_result, "699", "recovery should return 699");
-}
+        .expect("failed to send recovery request");
 
-#[tokio::test]
-async fn test_js_reply_drop_recovery_70587047() {
-    use rig::tool::Tool;
-    let tool = make_test_tool();
-
-    let timeout_result = tool
-        .call(crate::extras::js::tool::JsArgs {
-            code: "while (true) {}".to_string(),
-        })
+    let recovery = tokio::time::timeout(Duration::from_secs(5), recovery_receiver)
         .await
-        .expect("timeout call failed");
-    assert_eq!(
-        timeout_result, "JS error: execution timed out (30s limit exceeded)",
-        "first call should time out: {timeout_result}"
-    );
+        .expect("JS thread stopped after a dropped receiver")
+        .expect("JS thread closed the recovery reply channel");
+    assert_eq!(recovery.outcome, JsOutcome::Value("42".to_string()));
 
-    let recovery_result = tool
-        .call(crate::extras::js::tool::JsArgs {
-            code: "70587047".to_string(),
-        })
-        .await
-        .expect("recovery call failed");
-    assert_eq!(
-        recovery_result, "70587047",
-        "recovery should return 70587047: {recovery_result}"
-    );
+    drop(request_tx);
+    js_thread.join().expect("JS reply-drop test thread panicked");
+    owner.shutdown();
 }
