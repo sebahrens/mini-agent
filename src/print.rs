@@ -281,9 +281,8 @@ mod tests {
     use std::io;
 
     use super::{
-        CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry,
-        chat_history_path_policy_entry, write_output,
-        real_binary_replay_entry,
+        CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
+        real_binary_replay_entry, write_output,
     };
 
     struct BrokenPipeWriter;
