@@ -637,6 +637,51 @@ pub(crate) fn kill_process_group(pid: u32) {
     }
 }
 
+fn essential_env() -> Vec<(&'static str, String)> {
+    let preserve = [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "SSH_ASKPASS",
+        "GIT_ASKPASS",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "EDITOR",
+        "VISUAL",
+        "LD_LIBRARY_PATH",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GOPATH",
+        "GOROOT",
+        "VIRTUAL_ENV",
+        "JAVA_HOME",
+        "NODE_PATH",
+        "TMPDIR",
+        "XDG_RUNTIME_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "COLORTERM",
+        "NO_COLOR",
+    ];
+    let mut vars = Vec::with_capacity(preserve.len());
+    for name in &preserve {
+        if let Ok(val) = std::env::var(name) {
+            vars.push((*name, val));
+        }
+    }
+    vars
+}
+
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
@@ -701,49 +746,4 @@ mod sandbox_tests {
             "disabled sandbox must always produce a command"
         );
     }
-}
-
-fn essential_env() -> Vec<(&'static str, String)> {
-    let preserve = [
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "TERM",
-        "LANG",
-        "LC_ALL",
-        "SSH_AUTH_SOCK",
-        "SSH_AGENT_PID",
-        "SSH_ASKPASS",
-        "GIT_ASKPASS",
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "EDITOR",
-        "VISUAL",
-        "LD_LIBRARY_PATH",
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "GOPATH",
-        "GOROOT",
-        "VIRTUAL_ENV",
-        "JAVA_HOME",
-        "NODE_PATH",
-        "TMPDIR",
-        "XDG_RUNTIME_DIR",
-        "XDG_CACHE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "COLORTERM",
-        "NO_COLOR",
-    ];
-    let mut vars = Vec::with_capacity(preserve.len());
-    for name in &preserve {
-        if let Ok(val) = std::env::var(name) {
-            vars.push((*name, val));
-        }
-    }
-    vars
 }

@@ -491,9 +491,11 @@ advisor_kilobytes_limit = 128
 fn malformed_owned_config_field_still_fails_closed() {
     use std::path::Path;
 
-    let error =
-        crate::config::load::parse_config_content(Path::new("config.toml"), "max_tokens = \"many\"")
-            .unwrap_err();
+    let error = crate::config::load::parse_config_content(
+        Path::new("config.toml"),
+        "max_tokens = \"many\"",
+    )
+    .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
 
