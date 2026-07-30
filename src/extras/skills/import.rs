@@ -324,7 +324,7 @@ fn collect_directory_recursive(
                     limit: "per-file-bytes",
                 });
             }
-            let bytes = read_stable_file(&path, MAX_FILE_BYTES)?;
+            let bytes = read_stable_file(&path, MAX_FILE_BYTES, true)?;
             *expanded_bytes = expanded_bytes.checked_add(bytes.len() as u64).ok_or(
                 ImportError::LimitExceeded {
                     limit: "expanded-bytes",
@@ -347,7 +347,7 @@ fn collect_directory_recursive(
 }
 
 fn collect_zip(source: &Path) -> Result<SourceTree, ImportError> {
-    let archive_bytes = read_stable_file(source, MAX_ARCHIVE_BYTES)?;
+    let archive_bytes = read_stable_file(source, MAX_ARCHIVE_BYTES, false)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(archive_bytes))?;
     if archive.len() > MAX_ENTRIES {
         return Err(ImportError::LimitExceeded {
@@ -646,9 +646,16 @@ fn portable_relative(root: &Path, path: &Path) -> Result<String, ImportError> {
     Ok(relative)
 }
 
-fn read_stable_file(path: &Path, limit: u64) -> Result<Vec<u8>, ImportError> {
+fn read_stable_file(
+    path: &Path,
+    limit: u64,
+    reject_hard_links: bool,
+) -> Result<Vec<u8>, ImportError> {
     let before = fs::symlink_metadata(path)?;
-    if portable::is_link_or_reparse(&before) || !before.is_file() {
+    if portable::is_link_or_reparse(&before)
+        || !before.is_file()
+        || (reject_hard_links && has_unsafe_link_count(&before))
+    {
         return Err(ImportError::UnsafeEntry(path.display().to_string()));
     }
     if before.len() > limit {
@@ -664,6 +671,9 @@ fn read_stable_file(path: &Path, limit: u64) -> Result<Vec<u8>, ImportError> {
     let file = open_source_file(path)?;
     let opened = file.metadata()?;
     secure_fs::ensure_same_file(path, &before, &opened)?;
+    if reject_hard_links && has_unsafe_link_count(&opened) {
+        return Err(ImportError::UnsafeEntry(path.display().to_string()));
+    }
     let mut bytes = Vec::with_capacity(before.len() as usize);
     file.take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit || bytes.len() as u64 != before.len() {
@@ -671,7 +681,29 @@ fn read_stable_file(path: &Path, limit: u64) -> Result<Vec<u8>, ImportError> {
     }
     let after = fs::symlink_metadata(path)?;
     secure_fs::ensure_same_file(path, &opened, &after)?;
+    if reject_hard_links && has_unsafe_link_count(&after) {
+        return Err(ImportError::UnsafeEntry(path.display().to_string()));
+    }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn has_unsafe_link_count(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.nlink() != 1
+}
+
+#[cfg(windows)]
+fn has_unsafe_link_count(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.number_of_links() != Some(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn has_unsafe_link_count(_metadata: &fs::Metadata) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -1040,6 +1072,163 @@ mod tests {
             import_agent_skill(&zip_path, &temp.paths()),
             Err(ImportError::PathCollision(_))
         ));
+    }
+
+    #[test]
+    fn agent_skill_import_adversarial_rejects_unicode_normalized_collisions() {
+        let temp = TempRoot::new();
+        let zip_path = temp.0.join("unicode-collision.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("unicode-collision/SKILL.md", options)
+            .unwrap();
+        writer
+            .write_all(&skill_markdown("unicode-collision"))
+            .unwrap();
+        writer
+            .start_file("unicode-collision/caf\u{e9}.txt", options)
+            .unwrap();
+        writer.write_all(b"composed").unwrap();
+        writer
+            .start_file("unicode-collision/cafe\u{301}.txt", options)
+            .unwrap();
+        writer.write_all(b"decomposed").unwrap();
+        writer.finish().unwrap();
+
+        assert!(matches!(
+            import_agent_skill(&zip_path, &temp.paths()),
+            Err(ImportError::PathCollision(_))
+        ));
+    }
+
+    #[test]
+    fn agent_skill_import_adversarial_rejects_nonportable_path_matrix() {
+        let temp = TempRoot::new();
+        let invalid_paths = [
+            "../escape",
+            "/absolute",
+            "C:/drive",
+            "//server/share",
+            "unsafe-path/con.txt",
+            "unsafe-path/trailing.",
+            "unsafe-path/ads:stream",
+            "unsafe-path/control\u{1}",
+            "unsafe-path/nul\0byte",
+            "unsafe-path/back\\slash",
+        ];
+
+        for (index, invalid_path) in invalid_paths.iter().enumerate() {
+            let zip_path = temp.0.join(format!("unsafe-{index}.zip"));
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("unsafe-path/SKILL.md", options).unwrap();
+            writer
+                .write_all(&skill_markdown("unsafe-path"))
+                .unwrap();
+            writer.start_file(*invalid_path, options).unwrap();
+            writer.write_all(b"must be rejected").unwrap();
+            writer.finish().unwrap();
+
+            assert!(
+                matches!(
+                    import_agent_skill(&zip_path, &temp.paths()),
+                    Err(ImportError::UnsafePath(_))
+                ),
+                "path should be rejected: {invalid_path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_skill_import_adversarial_rejects_malformed_and_multiple_roots() {
+        let temp = TempRoot::new();
+
+        let malformed_path = temp.0.join("malformed.zip");
+        let file = fs::File::create(&malformed_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("SKILL.md", options).unwrap();
+        writer
+            .write_all(b"---\nname: malformed\ndescription: [\n---\n")
+            .unwrap();
+        writer.finish().unwrap();
+        assert!(matches!(
+            import_agent_skill(&malformed_path, &temp.paths()),
+            Err(ImportError::Manifest(_))
+        ));
+
+        let multiple_path = temp.0.join("multiple.zip");
+        let file = fs::File::create(&multiple_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer.start_file("one/SKILL.md", options).unwrap();
+        writer.write_all(&skill_markdown("one")).unwrap();
+        writer.start_file("two/SKILL.md", options).unwrap();
+        writer.write_all(&skill_markdown("two")).unwrap();
+        writer.finish().unwrap();
+        assert!(matches!(
+            import_agent_skill(&multiple_path, &temp.paths()),
+            Err(ImportError::InvalidSkillRoot)
+        ));
+
+        let mismatch_path = temp.0.join("mismatch.zip");
+        let file = fs::File::create(&mismatch_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer.start_file("directory-name/SKILL.md", options).unwrap();
+        writer
+            .write_all(&skill_markdown("manifest-name"))
+            .unwrap();
+        writer.finish().unwrap();
+        assert!(matches!(
+            import_agent_skill(&mismatch_path, &temp.paths()),
+            Err(ImportError::NameDirectoryMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_skill_import_adversarial_rejects_compression_bomb() {
+        let temp = TempRoot::new();
+        let zip_path = temp.0.join("compression-bomb.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("bomb/SKILL.md", options).unwrap();
+        writer.write_all(&skill_markdown("bomb")).unwrap();
+        writer.start_file("bomb/assets/zeros.bin", options).unwrap();
+        writer.write_all(&vec![0; 1024 * 1024]).unwrap();
+        writer.finish().unwrap();
+
+        assert!(matches!(
+            import_agent_skill(&zip_path, &temp.paths()),
+            Err(ImportError::LimitExceeded {
+                limit: "compression-ratio"
+            })
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn agent_skill_import_adversarial_rejects_hard_links_and_leaves_no_publication() {
+        let temp = TempRoot::new();
+        let marker = temp.0.join("executed");
+        let directory = write_directory_skill(&temp.0, "hard-linked-skill", &marker);
+        let outside = temp.0.join("outside.txt");
+        fs::write(&outside, b"outside bytes").unwrap();
+        fs::hard_link(
+            &outside,
+            directory.join("assets").join("hard-linked.txt"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            import_agent_skill(&directory, &temp.paths()),
+            Err(ImportError::UnsafeEntry(_))
+        ));
+        assert!(!temp.paths().data_dir.join("agent-skills").exists());
+        assert!(!marker.exists());
     }
 
     #[cfg(unix)]
