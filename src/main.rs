@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 
-mod agent;
 mod acp_auth;
+mod agent;
 mod auth;
 mod cli;
 mod config;

@@ -2,9 +2,9 @@ pub mod config;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::on_receive_request;
@@ -104,10 +104,7 @@ fn accept_authenticated_peer(
                     return Ok((stream, peer_addr));
                 }
                 AuthenticationAttempt::Rejected(peer_addr) => {
-                    tracing::warn!(
-                        "ACP TCP peer authentication rejected for {}",
-                        peer_addr
-                    );
+                    tracing::warn!("ACP TCP peer authentication rejected for {}", peer_addr);
                 }
             }
         }
@@ -116,9 +113,7 @@ fn accept_authenticated_peer(
             Ok((mut stream, peer_addr)) => {
                 if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_AUTHENTICATIONS {
                     pending.fetch_sub(1, Ordering::AcqRel);
-                    tracing::warn!(
-                        "ACP TCP peer rejected because authentication capacity is full"
-                    );
+                    tracing::warn!("ACP TCP peer rejected because authentication capacity is full");
                     continue;
                 }
 

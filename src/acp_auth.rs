@@ -31,10 +31,7 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-pub(crate) fn authenticate_peer(
-    stream: &mut TcpStream,
-    api_key: &str,
-) -> Result<(), AuthError> {
+pub(crate) fn authenticate_peer(stream: &mut TcpStream, api_key: &str) -> Result<(), AuthError> {
     authenticate_peer_with_timeout(stream, api_key, AUTH_TIMEOUT)
 }
 
@@ -267,9 +264,7 @@ mod tests {
         let handle = std::thread::spawn(move || authenticate_peer(&mut server, "correct-key"));
 
         let _ = read_challenge(&mut client).unwrap();
-        client
-            .write_all(&vec![b'x'; MAX_RESPONSE_BYTES + 1])
-            .unwrap();
+        client.write_all(&[b'x'; MAX_RESPONSE_BYTES + 1]).unwrap();
 
         assert_eq!(handle.join().unwrap(), Err(AuthError::Oversized));
     }
