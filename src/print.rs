@@ -13,9 +13,9 @@ const INSTALLED_DEBUG_ASSERTIONS_LABEL: &str = "installed debug assertions";
 
 fn installed_debug_assertions() -> &'static str {
     if cfg!(debug_assertions) {
-        "enabled at compile time"
+        "enabled at compile time for this binary"
     } else {
-        "disabled at compile time"
+        "disabled at compile time for this binary"
     }
 }
 
@@ -350,9 +350,9 @@ mod tests {
             (
                 "installed debug assertions",
                 if cfg!(debug_assertions) {
-                    "enabled at compile time".to_string()
+                    "enabled at compile time for this binary".to_string()
                 } else {
-                    "disabled at compile time".to_string()
+                    "disabled at compile time for this binary".to_string()
                 }
             )
         );
