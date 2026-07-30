@@ -895,9 +895,7 @@ fn bak_files_never_surface_in_list_or_search() {
 #[test]
 fn subagent_memory_tool_set_excludes_memory_edit() {
     use crate::extras::memory::MemoryEdit;
-    use crate::extras::subagents::builder::{
-        SubagentAuthorization, subagent_memory_tools,
-    };
+    use crate::extras::subagents::builder::{SubagentAuthorization, subagent_memory_tools};
     use rig::tool::Tool;
     // Exercise the real production assembly of a subagent's memory tools, not a
     // hand-copied list: build_explore_agent_inner grants exactly what this
@@ -922,13 +920,9 @@ fn subagent_memory_tool_set_excludes_memory_edit() {
 async fn subagent_filesystem_permissions_memory_tools_inherit_parent_denial() {
     use std::sync::{Arc, Mutex};
 
-    use crate::extras::subagents::builder::{
-        SubagentAuthorization, subagent_memory_tools,
-    };
+    use crate::extras::subagents::builder::{SubagentAuthorization, subagent_memory_tools};
     use crate::permission::checker::PermissionChecker;
-    use crate::permission::{
-        Action, PermissionConfig, PermissionConfigs, SecurityMode,
-    };
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode};
 
     let config = PermissionConfig {
         default: Some(Action::Deny),
@@ -940,8 +934,7 @@ async fn subagent_filesystem_permissions_memory_tools_inherit_parent_denial() {
         std::env::current_dir().ok(),
         Some(vec!["standard".to_string()]),
     );
-    let authorization =
-        SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), None);
+    let authorization = SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), None);
 
     for tool in subagent_memory_tools(&authorization) {
         let input = match tool.name().as_str() {

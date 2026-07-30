@@ -124,8 +124,7 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     };
 
     #[cfg(feature = "hooks")]
-    let tools =
-        crate::extras::hooks::wrap_from_global(tools, authorization.permission.clone());
+    let tools = crate::extras::hooks::wrap_from_global(tools, authorization.permission.clone());
 
     let mut builder = AgentBuilder::new(model)
         .preamble(&preamble)
@@ -287,9 +286,7 @@ mod tests {
         SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), ask_tx)
     }
 
-    fn filesystem_tools(
-        authorization: &SubagentAuthorization,
-    ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    fn filesystem_tools(authorization: &SubagentAuthorization) -> Vec<Box<dyn rig::tool::ToolDyn>> {
         authorization.filesystem_tools(1024 * 1024, 100, 100, 100, Some(100))
     }
 
@@ -364,7 +361,10 @@ mod tests {
 
         let call = read_tool.call(tool_input("read", &link));
         let answer = async {
-            let request = ask_rx.recv().await.expect("symlink target approval request");
+            let request = ask_rx
+                .recv()
+                .await
+                .expect("symlink target approval request");
             assert_eq!(request.tool.as_str(), "read");
             assert_eq!(
                 PathBuf::from(&request.input),
@@ -375,7 +375,9 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(call, answer);
-        let message = result.expect_err("denied symlink target must not be read").to_string();
+        let message = result
+            .expect_err("denied symlink target must not be read")
+            .to_string();
         assert!(message.contains("Permission denied by user"));
         assert!(!message.contains("SUBAGENT_SECRET"));
     }
@@ -403,7 +405,10 @@ mod tests {
         let second_call = second_read.call(tool_input("read", &denied));
         let answer = async {
             for _ in 0..2 {
-                let request = ask_rx.recv().await.expect("isolated child approval request");
+                let request = ask_rx
+                    .recv()
+                    .await
+                    .expect("isolated child approval request");
                 let request_path = PathBuf::from(&request.input);
                 let decision = if request_path == std::fs::canonicalize(&allowed).unwrap() {
                     UserDecision::AllowOnce
@@ -415,16 +420,13 @@ mod tests {
             }
         };
 
-        let (allowed_result, denied_result, ()) =
-            tokio::join!(first_call, second_call, answer);
+        let (allowed_result, denied_result, ()) = tokio::join!(first_call, second_call, answer);
         assert!(
             allowed_result
                 .expect("allowed child request")
                 .contains("ALLOWED_CHILD_SENTINEL")
         );
-        let denied_message = denied_result
-            .expect_err("denied child request")
-            .to_string();
+        let denied_message = denied_result.expect_err("denied child request").to_string();
         assert!(denied_message.contains("Permission denied by user"));
         assert!(!denied_message.contains("DENIED_CHILD_SENTINEL"));
     }
