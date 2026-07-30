@@ -70,6 +70,18 @@ fn zerobox_exists() -> bool {
     *ZEROBOX_AVAILABLE.get_or_init(|| which_cmd("zerobox"))
 }
 
+/// Explicit three-state sandbox policy — never inferred or collapsed to a bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxPolicy {
+    /// Sandboxing was not requested; commands run unsandboxed intentionally.
+    Disabled,
+    /// Sandboxing was requested and the backend binary is present.
+    RequiredAndAvailable,
+    /// Sandboxing was requested but the backend binary is missing.
+    /// Any launch attempt must be blocked — no silent fallback.
+    RequiredButUnavailable,
+}
+
 fn which_cmd(name: &str) -> bool {
     // Search PATH directly rather than shelling out to `which`, which may not
     // exist on minimal images (Alpine, distroless).
@@ -131,17 +143,21 @@ impl Sandbox {
         }
     }
 
-    /// Returns true if the sandbox is enabled and the backend binary is
-    /// actually available. When false, commands run unsandboxed — the UI
-    /// should surface this to the user.
-    pub fn is_effectively_sandboxed(&self) -> bool {
+    /// Explicit three-state policy derived from the requested configuration
+    /// and the actual availability of the backend binary.
+    pub fn policy(&self) -> SandboxPolicy {
         if !self.enabled {
-            return false;
+            return SandboxPolicy::Disabled;
         }
-        if self.backend == "zerobox" {
+        let available = if self.backend == "zerobox" {
             zerobox_exists()
         } else {
             bwrap_exists()
+        };
+        if available {
+            SandboxPolicy::RequiredAndAvailable
+        } else {
+            SandboxPolicy::RequiredButUnavailable
         }
     }
 
@@ -152,24 +168,26 @@ impl Sandbox {
         self
     }
 
-    pub fn wrap_command(&self, command: &str) -> Command {
-        if !self.enabled {
-            let mut cmd = Command::new(&self.shell);
-            cmd.arg("-c").arg(command);
-            configure_child_lifetime(&mut cmd);
-            return cmd;
+    pub fn wrap_command(&self, command: &str) -> Result<Command, String> {
+        match self.policy() {
+            SandboxPolicy::Disabled => {
+                let mut cmd = Command::new(&self.shell);
+                cmd.arg("-c").arg(command);
+                configure_child_lifetime(&mut cmd);
+                return Ok(cmd);
+            }
+            SandboxPolicy::RequiredButUnavailable => {
+                return Err(format!(
+                    "sandbox backend '{}' is not available — refusing to run unsandboxed (requested-but-unavailable)",
+                    self.backend
+                ));
+            }
+            SandboxPolicy::RequiredAndAvailable => {}
         }
 
         let cwd = std::env::current_dir().unwrap_or_default();
 
         if self.backend == "zerobox" {
-            if !zerobox_exists() {
-                tracing::warn!("sandbox: zerobox not found, running unsandboxed");
-                let mut cmd = Command::new(&self.shell);
-                cmd.arg("-c").arg(command);
-                configure_child_lifetime(&mut cmd);
-                return cmd;
-            }
             let mut cmd = Command::new("zerobox");
             cmd.arg("--allow-write");
             cmd.arg(cwd.as_os_str());
@@ -178,15 +196,7 @@ impl Sandbox {
             cmd.arg("-c");
             cmd.arg(command);
             configure_child_lifetime(&mut cmd);
-            return cmd;
-        }
-
-        if !bwrap_exists() {
-            tracing::warn!("sandbox: bwrap not found, running unsandboxed");
-            let mut cmd = Command::new(&self.shell);
-            cmd.arg("-c").arg(command);
-            configure_child_lifetime(&mut cmd);
-            return cmd;
+            return Ok(cmd);
         }
 
         let mut cmd = Command::new("bwrap");
@@ -246,7 +256,7 @@ impl Sandbox {
             command,
         ]);
         configure_child_lifetime(&mut cmd);
-        cmd
+        Ok(cmd)
     }
 
     #[cfg(test)]
@@ -278,12 +288,30 @@ impl Sandbox {
         command: &str,
         limits: CommandLimits,
     ) -> std::io::Result<CommandOutput> {
+        let cmd = match self.wrap_command(command) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                return Ok(CommandOutput {
+                    exit_status: None,
+                    stdout: Vec::new(),
+                    stderr: error.into_bytes(),
+                    status: CommandStatus::Failed,
+                });
+            }
+        };
+        self.output_built_command_with_limits(cmd, limits).await
+    }
+
+    pub(crate) async fn output_built_command_with_limits(
+        &self,
+        cmd: Command,
+        limits: CommandLimits,
+    ) -> std::io::Result<CommandOutput> {
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
-        let command = command.to_string();
         tokio::spawn(async move {
             sandbox
-                .run_output_command(command, limits, response_tx)
+                .run_built_output_command(cmd, limits, response_tx)
                 .await;
         });
         response_rx.await.map_err(|_| {
@@ -291,13 +319,12 @@ impl Sandbox {
         })
     }
 
-    async fn run_output_command(
+    async fn run_built_output_command(
         &self,
-        command: String,
+        mut cmd: Command,
         limits: CommandLimits,
         mut response_tx: oneshot::Sender<CommandOutput>,
     ) {
-        let mut cmd = self.wrap_command(&command);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -607,6 +634,72 @@ pub(crate) fn kill_process_group(pid: u32) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+
+    fn disabled() -> Sandbox {
+        Sandbox::new(false, "bwrap")
+    }
+
+    fn unavailable() -> Sandbox {
+        Sandbox::new(true, "__no_such_backend_exists__")
+    }
+
+    #[test]
+    fn sandbox_disabled_policy_is_disabled() {
+        assert_eq!(disabled().policy(), SandboxPolicy::Disabled);
+    }
+
+    #[test]
+    fn sandbox_unavailable_policy_is_required_but_unavailable() {
+        assert_eq!(
+            unavailable().policy(),
+            SandboxPolicy::RequiredButUnavailable
+        );
+    }
+
+    #[test]
+    fn sandbox_unavailable_wrap_command_returns_error() {
+        let err = unavailable().wrap_command("echo must not run").unwrap_err();
+        assert!(
+            err.contains("__no_such_backend_exists__"),
+            "error should name the backend: {err}"
+        );
+        assert!(
+            err.contains("unavailable"),
+            "error should mention unavailability: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_unavailable_output_command_fails_without_running() {
+        let output = unavailable()
+            .output_command_with_limits("echo must not run", DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Failed);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unavailable"),
+            "stderr should contain unavailability message: {stderr}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "stdout must be empty for a blocked command"
+        );
+    }
+
+    #[test]
+    fn sandbox_disabled_wrap_command_succeeds() {
+        let cmd = disabled().wrap_command("echo ok");
+        assert!(
+            cmd.is_ok(),
+            "disabled sandbox must always produce a command"
+        );
     }
 }
 

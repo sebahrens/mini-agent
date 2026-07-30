@@ -10,7 +10,7 @@ use crate::permission::SecurityMode;
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::provider::{self, AnyClient};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, SandboxPolicy};
 use crate::session::{self, MessageRole, Session};
 
 #[cfg(feature = "advisor")]
@@ -419,9 +419,9 @@ impl Startup {
             &self.cli.resolve_sandbox_backend(&self.cfg),
         )
         .with_shell(&self.cli.resolve_shell(&self.cfg));
-        if self.cli.resolve_sandbox(&self.cfg) && !self.sandbox.is_effectively_sandboxed() {
-            tracing::warn!(
-                "sandbox is enabled but backend '{}' was not found — commands will run unsandboxed",
+        if self.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
+            anyhow::bail!(
+                "sandbox backend '{}' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)",
                 self.cli.resolve_sandbox_backend(&self.cfg)
             );
         }

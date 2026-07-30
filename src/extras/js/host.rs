@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
@@ -11,7 +10,7 @@ use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::{
     READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
 };
-use crate::sandbox::{Sandbox, kill_process_group};
+use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox};
 
 impl<'js> IntoJs<'js> for SpawnResult {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
@@ -378,6 +377,11 @@ pub(crate) fn make_spawn(
     make_spawn_with_timeout(sandbox, permission_bridge, runtime, STEP_TIMEOUT)
 }
 
+const SPAWN_STDOUT_MAX_BYTES: usize = 1024 * 1024;
+const SPAWN_STDERR_MAX_BYTES: usize = 1024 * 1024;
+const SPAWN_COMBINED_MAX_BYTES: usize = 1536 * 1024;
+const CONSOLE_MAX_BYTES_PER_STEP: usize = 256 * 1024;
+
 fn make_spawn_with_timeout(
     sandbox: Sandbox,
     permission_bridge: PermissionBridge,
@@ -392,42 +396,50 @@ fn make_spawn_with_timeout(
         permission_bridge
             .check("bash", &permission_command)
             .map_err(|error| permission_error("js/spawn", error))?;
-        let mut command = sandbox.wrap_command(r#"exec "$0" "$@""#);
-        command
-            .arg(&cmd)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let cancellation = permission_bridge.clone();
+        let mut command = sandbox.wrap_command(r#"exec "$0" "$@""#).map_err(|e| {
+            permission_error(
+                "js/spawn",
+                PermissionBridgeError::Denied(crate::extras::js::types::PermissionDenial::Policy(
+                    e,
+                )),
+            )
+        })?;
+        command.arg(&cmd).args(&args);
+        let limits = CommandLimits {
+            timeout: duration,
+            stdout_bytes: SPAWN_STDOUT_MAX_BYTES,
+            stderr_bytes: SPAWN_STDERR_MAX_BYTES,
+            combined_bytes: SPAWN_COMBINED_MAX_BYTES,
+        };
+        let bridge = permission_bridge.clone();
         let output = runtime.block_on(async {
-            let child = command.spawn().map_err(rquickjs::Error::Io)?;
-            let pid = child.id();
             tokio::select! {
-                output = child.wait_with_output() => output.map_err(rquickjs::Error::Io),
-                _ = tokio::time::sleep(duration) => {
-                    if let Some(pid) = pid {
-                        kill_process_group(pid);
-                    }
-                    Err(timeout_error("js/spawn"))
+                result = sandbox.output_built_command_with_limits(command, limits) => {
+                    result.map_err(rquickjs::Error::Io)
                 }
-                _ = cancellation.cancelled() => {
-                    if let Some(pid) = pid {
-                        kill_process_group(pid);
-                    }
-                    Err(permission_error(
-                        "js/spawn",
-                        PermissionBridgeError::Cancelled,
-                    ))
+                _ = bridge.cancelled() => {
+                    Err(permission_error("js/spawn", PermissionBridgeError::Cancelled))
                 }
             }
         })?;
+        let timed_out = output.status == CommandStatus::TimedOut;
+        let stdout_truncated = matches!(
+            output.status,
+            CommandStatus::OutputLimitExceeded(CommandOutputLimit::Stdout)
+                | CommandStatus::OutputLimitExceeded(CommandOutputLimit::Combined)
+        );
+        let stderr_truncated = matches!(
+            output.status,
+            CommandStatus::OutputLimitExceeded(CommandOutputLimit::Stderr)
+                | CommandStatus::OutputLimitExceeded(CommandOutputLimit::Combined)
+        );
         Ok(SpawnResult {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            code: output.status.code().unwrap_or(-1),
-            timed_out: false,
-            stdout_truncated: false,
-            stderr_truncated: false,
+            code: output.exit_status.and_then(|s| s.code()).unwrap_or(-1),
+            timed_out,
+            stdout_truncated,
+            stderr_truncated,
         })
     }
 }
@@ -455,10 +467,24 @@ pub(crate) fn register_host_globals(
         )?;
 
         let console = Object::new(ctx.clone())?;
+        let console_bytes_remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            CONSOLE_MAX_BYTES_PER_STEP,
+        ));
         console.set(
             "log",
-            Func::from(|msg: Value| {
-                eprintln!("[js] {:?}", msg);
+            Func::from(move |msg: Value| {
+                let text = format!("{msg:?}");
+                let len = text.len();
+                let remaining = console_bytes_remaining
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |r| r.checked_sub(len),
+                    )
+                    .unwrap_or(0);
+                if remaining > 0 {
+                    eprintln!("[js] {text}");
+                }
             }),
         )?;
         globals.set("console", console)?;
@@ -1162,7 +1188,7 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
         let bridge = owner.bridge();
-        let error = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let _owner = owner;
             let spawn = make_spawn_with_timeout(
                 Sandbox::new(false, "bwrap"),
@@ -1171,15 +1197,15 @@ mod tests {
                 Duration::from_millis(25),
             );
             spawn("sleep".to_string(), vec!["5".to_string()])
-                .expect_err("sleep should time out")
-                .to_string()
+                .expect("spawn should return Ok with timed_out=true, not Err")
         })
         .await
         .expect("spawn timeout test task panicked");
 
         assert!(
-            error.contains("execution timed out"),
-            "unexpected spawn timeout error: {error}"
+            result.timed_out,
+            "timed_out must be true when deadline expires"
         );
+        assert_eq!(result.code, -1, "timed-out process has no exit code");
     }
 }

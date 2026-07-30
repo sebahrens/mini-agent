@@ -242,7 +242,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     ),
                 )
                 .await;
-                let run = match result {
+                let mut run = match result {
                     Ok(run) => run,
                     Err(_) => {
                         let output = Err("timeout: subagent exceeded 300s".to_string());
