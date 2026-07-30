@@ -31,11 +31,12 @@ fn send_reply_or_log_drop(
     outcome: JsOutcome,
     reply_path: ReplyPath,
 ) {
-    // Keep this diagnostic independent of JsResponse's formatting traits:
-    // SendError owns the undelivered protocol value.
-    if reply.send(JsResponse { outcome }).is_err() {
+    // Keep this diagnostic independent of JsResponse's Display implementation.
+    // The bounded Debug implementation redacts Value and Error contents.
+    if let Err(undelivered) = reply.send(JsResponse { outcome }) {
         tracing::debug!(
             reply_path = reply_path.as_str(),
+            outcome = ?undelivered.outcome,
             "JS engine reply receiver dropped before response delivery"
         );
     }
