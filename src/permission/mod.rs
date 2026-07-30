@@ -67,10 +67,7 @@ pub(crate) fn build_noninteractive_permission(
     cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
     mode: SecurityMode,
-) -> (
-    Option<checker::PermCheck>,
-    Option<ask::AskSender>,
-) {
+) -> (Option<checker::PermCheck>, Option<ask::AskSender>) {
     if cli.resolve_no_tools(cfg) || cli.dangerously_skip_permissions {
         return (None, None);
     }
@@ -96,8 +93,7 @@ pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
         permission_modes: Some(vec!["guarded".to_string()]),
         ..Default::default()
     };
-    let (permission, ask_tx) =
-        build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded);
+    let (permission, ask_tx) = build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded);
 
     anyhow::ensure!(
         ask_tx.is_none(),
@@ -293,7 +289,9 @@ mod acp_permission_policy_tests {
         }
     }
 
-    fn policy(action: &str) -> (
+    fn policy(
+        action: &str,
+    ) -> (
         Option<crate::permission::checker::PermCheck>,
         Option<crate::permission::ask::AskSender>,
     ) {
@@ -321,28 +319,16 @@ mod acp_permission_policy_tests {
         let (allow_permission, allow_ask_tx) = policy("allow");
         assert!(allow_ask_tx.is_none());
         assert!(
-            check_perm(
-                &allow_permission,
-                &allow_ask_tx,
-                "write",
-                "allowed-path"
-            )
-            .await
-            .is_ok()
+            check_perm(&allow_permission, &allow_ask_tx, "write", "allowed-path")
+                .await
+                .is_ok()
         );
 
         let (deny_permission, deny_ask_tx) = policy("deny");
         assert!(deny_ask_tx.is_none());
-        let denial = message(
-            check_perm(
-                &deny_permission,
-                &deny_ask_tx,
-                "write",
-                "denied-path",
-            )
-            .await,
-        )
-        .expect("explicit deny must reject the tool call");
+        let denial =
+            message(check_perm(&deny_permission, &deny_ask_tx, "write", "denied-path").await)
+                .expect("explicit deny must reject the tool call");
         assert!(denial.starts_with("Permission denied:"));
     }
 
@@ -379,18 +365,8 @@ mod acp_permission_policy_tests {
 
         let concurrent = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             tokio::join!(
-                check_perm(
-                    &first_permission,
-                    &first_ask_tx,
-                    "write",
-                    "session-one"
-                ),
-                check_perm(
-                    &second_permission,
-                    &second_ask_tx,
-                    "write",
-                    "session-two"
-                )
+                check_perm(&first_permission, &first_ask_tx, "write", "session-one"),
+                check_perm(&second_permission, &second_ask_tx, "write", "session-two")
             )
         })
         .await
