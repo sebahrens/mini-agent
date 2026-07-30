@@ -14,6 +14,7 @@ const MAX_PENDING_JOBS: usize = 10_000;
 #[derive(Clone, Copy)]
 enum ReplyPath {
     EarlyCancel,
+    AbandonedBeforeExecution,
     Completed,
 }
 
@@ -21,9 +22,17 @@ impl ReplyPath {
     const fn as_str(self) -> &'static str {
         match self {
             Self::EarlyCancel => "early_cancel",
+            Self::AbandonedBeforeExecution => "abandoned_before_execution",
             Self::Completed => "completed",
         }
     }
+}
+
+fn log_reply_drop(reply_path: ReplyPath) {
+    tracing::debug!(
+        reply_path = reply_path.as_str(),
+        "JS engine reply receiver dropped before response delivery"
+    );
 }
 
 fn send_reply_or_log_drop<T>(
@@ -37,10 +46,7 @@ fn send_reply_or_log_drop<T>(
         return true;
     }
 
-    tracing::debug!(
-        reply_path = reply_path.as_str(),
-        "JS engine reply receiver dropped before response delivery"
-    );
+    log_reply_drop(reply_path);
     false
 }
 
@@ -243,6 +249,10 @@ pub(crate) fn js_thread_main(
             );
             continue;
         }
+        if req.reply.is_closed() {
+            log_reply_drop(ReplyPath::AbandonedBeforeExecution);
+            continue;
+        }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
         send_reply_or_log_drop(req.reply, JsResponse { outcome }, ReplyPath::Completed);
@@ -385,6 +395,10 @@ mod tests {
         struct NoFormattingTraits;
 
         assert_eq!(ReplyPath::EarlyCancel.as_str(), "early_cancel");
+        assert_eq!(
+            ReplyPath::AbandonedBeforeExecution.as_str(),
+            "abandoned_before_execution"
+        );
         assert_eq!(ReplyPath::Completed.as_str(), "completed");
 
         let (delivered_reply, delivered_receiver) = oneshot::channel();
@@ -447,7 +461,7 @@ mod tests {
         drop(completed_receiver);
         request_tx
             .send(JsRequest {
-                code: "40 + 1".to_string(),
+                code: "while (true) {}".to_string(),
                 cancellation: PermCancellation::new(),
                 reply: completed_reply,
             })
