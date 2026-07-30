@@ -39,9 +39,10 @@ fn send_reply_or_log_drop(
 ) -> ReplyDelivery {
     match reply.send(JsResponse { outcome }) {
         Ok(()) => ReplyDelivery::Delivered,
-        Err(_) => {
+        Err(undelivered_response) => {
             tracing::debug!(
                 reply_path = reply_path.as_str(),
+                response = ?undelivered_response,
                 "JS engine reply receiver dropped before response delivery"
             );
             ReplyDelivery::ReceiverDropped
