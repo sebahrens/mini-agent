@@ -17,16 +17,26 @@ enum ReplyPath {
     Completed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyDelivery {
+    Delivered,
+    ReceiverDropped,
+}
+
 fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
     outcome: JsOutcome,
     reply_path: ReplyPath,
-) {
-    if reply.send(JsResponse { outcome }).is_err() {
-        tracing::debug!(
-            ?reply_path,
-            "JS engine reply receiver dropped before response delivery"
-        );
+) -> ReplyDelivery {
+    match reply.send(JsResponse { outcome }) {
+        Ok(()) => ReplyDelivery::Delivered,
+        Err(_) => {
+            tracing::debug!(
+                ?reply_path,
+                "JS engine reply receiver dropped before response delivery"
+            );
+            ReplyDelivery::ReceiverDropped
+        }
     }
 }
 
@@ -367,10 +377,13 @@ mod tests {
     #[tokio::test]
     async fn js_reply_delivery_handles_delivered_and_dropped_receivers() {
         let (delivered_reply, delivered_receiver) = oneshot::channel();
-        send_reply_or_log_drop(
-            delivered_reply,
-            JsOutcome::Value("delivered".to_string()),
-            ReplyPath::Completed,
+        assert_eq!(
+            send_reply_or_log_drop(
+                delivered_reply,
+                JsOutcome::Value("delivered".to_string()),
+                ReplyPath::Completed,
+            ),
+            ReplyDelivery::Delivered,
         );
         assert_eq!(
             delivered_receiver
@@ -382,10 +395,13 @@ mod tests {
 
         let (dropped_reply, dropped_receiver) = oneshot::channel();
         drop(dropped_receiver);
-        send_reply_or_log_drop(
-            dropped_reply,
-            JsOutcome::Value("undelivered".to_string()),
-            ReplyPath::Completed,
+        assert_eq!(
+            send_reply_or_log_drop(
+                dropped_reply,
+                JsOutcome::Value("undelivered".to_string()),
+                ReplyPath::Completed,
+            ),
+            ReplyDelivery::ReceiverDropped,
         );
     }
 
