@@ -15,14 +15,16 @@ fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
     response: JsResponse,
     reply_path: &'static str,
-) {
-    // JsResponse's Debug implementation redacts value/error bodies, and avoids a Display bound.
-    if let Err(undelivered_response) = reply.send(response) {
-        tracing::debug!(
-            reply_path = %reply_path,
-            response = ?undelivered_response,
-            "JS engine reply receiver dropped before response delivery"
-        );
+) -> bool {
+    match reply.send(response) {
+        Ok(()) => true,
+        Err(_) => {
+            tracing::debug!(
+                reply_path = %reply_path,
+                "JS engine reply receiver dropped before response delivery"
+            );
+            false
+        }
     }
 }
 
@@ -365,13 +367,13 @@ mod tests {
     #[tokio::test]
     async fn js_reply_delivery_reports_delivered_and_dropped_receivers() {
         let (delivered_reply, delivered_receiver) = oneshot::channel();
-        send_reply_or_log_drop(
+        assert!(send_reply_or_log_drop(
             delivered_reply,
             JsResponse {
                 outcome: JsOutcome::Value("delivered".to_string()),
             },
             "test_delivered",
-        );
+        ));
         assert_eq!(
             delivered_receiver
                 .await
@@ -382,13 +384,13 @@ mod tests {
 
         let (dropped_reply, dropped_receiver) = oneshot::channel();
         drop(dropped_receiver);
-        send_reply_or_log_drop(
+        assert!(!send_reply_or_log_drop(
             dropped_reply,
             JsResponse {
                 outcome: JsOutcome::Value("undelivered".to_string()),
             },
             "test_dropped",
-        );
+        ));
     }
 
     #[tokio::test]
