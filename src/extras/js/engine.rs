@@ -13,18 +13,14 @@ const MAX_PENDING_JOBS: usize = 10_000;
 
 fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
-    response: JsResponse,
+    outcome: JsOutcome,
     reply_path: &'static str,
-) -> bool {
-    match reply.send(response) {
-        Ok(()) => true,
-        Err(_) => {
-            tracing::debug!(
-                reply_path = %reply_path,
-                "JS engine reply receiver dropped before response delivery"
-            );
-            false
-        }
+) {
+    if reply.send(JsResponse { outcome }).is_err() {
+        tracing::debug!(
+            reply_path = %reply_path,
+            "JS engine reply receiver dropped before response delivery"
+        );
     }
 }
 
@@ -220,16 +216,14 @@ pub(crate) fn js_thread_main(
         if req.cancellation.is_cancelled() {
             send_reply_or_log_drop(
                 req.reply,
-                JsResponse {
-                    outcome: JsOutcome::Error("execution cancelled".to_string()),
-                },
+                JsOutcome::Error("execution cancelled".to_string()),
                 "early_cancel",
             );
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        send_reply_or_log_drop(req.reply, JsResponse { outcome }, "completed");
+        send_reply_or_log_drop(req.reply, outcome, "completed");
     }
 }
 
@@ -367,13 +361,11 @@ mod tests {
     #[tokio::test]
     async fn js_reply_delivery_reports_delivered_and_dropped_receivers() {
         let (delivered_reply, delivered_receiver) = oneshot::channel();
-        assert!(send_reply_or_log_drop(
+        send_reply_or_log_drop(
             delivered_reply,
-            JsResponse {
-                outcome: JsOutcome::Value("delivered".to_string()),
-            },
+            JsOutcome::Value("delivered".to_string()),
             "test_delivered",
-        ));
+        );
         assert_eq!(
             delivered_receiver
                 .await
@@ -384,13 +376,11 @@ mod tests {
 
         let (dropped_reply, dropped_receiver) = oneshot::channel();
         drop(dropped_receiver);
-        assert!(!send_reply_or_log_drop(
+        send_reply_or_log_drop(
             dropped_reply,
-            JsResponse {
-                outcome: JsOutcome::Value("undelivered".to_string()),
-            },
+            JsOutcome::Value("undelivered".to_string()),
             "test_dropped",
-        ));
+        );
     }
 
     #[tokio::test]
