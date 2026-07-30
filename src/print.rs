@@ -14,9 +14,9 @@ fn installed_build_profile_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_PROFILE_LABEL,
         if cfg!(debug_assertions) {
-            "debug assertions enabled"
+            "debug profile (assertions enabled, fast clean-install codegen)"
         } else {
-            "debug assertions disabled"
+            "release profile (assertions disabled)"
         }
         .to_string(),
     )
@@ -331,9 +331,9 @@ mod tests {
             (
                 "installed build profile",
                 if cfg!(debug_assertions) {
-                    "debug assertions enabled"
+                    "debug profile (assertions enabled, fast clean-install codegen)"
                 } else {
-                    "debug assertions disabled"
+                    "release profile (assertions disabled)"
                 }
                 .to_string()
             )

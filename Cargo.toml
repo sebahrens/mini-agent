@@ -93,7 +93,7 @@ mimalloc = { version = "0.1", default-features = false }
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }
 
 [profile.dev]
-opt-level = 1
+opt-level = 0
 debug = false
 codegen-units = 16
 incremental = true
