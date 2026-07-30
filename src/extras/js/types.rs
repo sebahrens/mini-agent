@@ -51,19 +51,6 @@ pub enum JsOutcome {
     OomKilled,
 }
 
-impl JsOutcome {
-    /// Returns a bounded label for diagnostics without exposing outcome payloads.
-    pub(crate) const fn telemetry_kind(&self) -> &'static str {
-        match self {
-            Self::Value(_) => "value",
-            Self::Void => "void",
-            Self::Error(_) => "error",
-            Self::Timeout => "timeout",
-            Self::OomKilled => "oom_killed",
-        }
-    }
-}
-
 impl fmt::Debug for JsOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -559,18 +546,6 @@ mod js_permission_types {
         assert_send_sync::<PermResponse>();
         assert_send_sync::<PermResponseRejection>();
         assert_send_sync::<SpawnResult>();
-
-        assert_eq!(
-            JsOutcome::Value("secret".to_string()).telemetry_kind(),
-            "value"
-        );
-        assert_eq!(JsOutcome::Void.telemetry_kind(), "void");
-        assert_eq!(
-            JsOutcome::Error("secret".to_string()).telemetry_kind(),
-            "error"
-        );
-        assert_eq!(JsOutcome::Timeout.telemetry_kind(), "timeout");
-        assert_eq!(JsOutcome::OomKilled.telemetry_kind(), "oom_killed");
 
         let request = request("js/write_file", "SECRET_PERMISSION_KEY");
         let request_debug = format!("{request:?}");

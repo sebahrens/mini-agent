@@ -31,11 +31,11 @@ fn send_reply_or_log_drop(
     outcome: JsOutcome,
     reply_path: ReplyPath,
 ) {
-    // Keep this diagnostic independent of JsResponse's Display implementation.
-    if let Err(undelivered) = reply.send(JsResponse { outcome }) {
+    // A closed receiver is expected when the caller's deadline wins the race.
+    // Keep the diagnostic independent of all JsResponse formatting traits.
+    if reply.send(JsResponse { outcome }).is_err() {
         tracing::debug!(
             reply_path = reply_path.as_str(),
-            outcome_kind = undelivered.outcome.telemetry_kind(),
             "JS engine reply receiver dropped before response delivery"
         );
     }
