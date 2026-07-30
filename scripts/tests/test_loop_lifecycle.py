@@ -141,6 +141,35 @@ fi
 
         self.assertEqual(0, completed.returncode, completed.stderr)
 
+    def test_loop_verifier_is_relevant_to_headless_rust_iterations(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+        relevance_function = extract_function(
+            source,
+            "path_is_relevant_for_profile",
+            "current_iteration_has_relevant_changes",
+        )
+        harness = f"""
+set -eu
+
+{relevance_function}
+
+path_is_relevant_for_profile scripts/loop.sh headless rust
+if path_is_relevant_for_profile scripts/tests/test_loop_lifecycle.py headless rust; then
+    exit 42
+fi
+path_is_relevant_for_profile scripts/tests/test_loop_lifecycle.py headless script
+"""
+
+        completed = subprocess.run(
+            ["bash", "-c", harness],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
     def test_reopened_bead_can_be_claimed_again(self) -> None:
         source = LOOP_SCRIPT.read_text()
         reopen_function = extract_function(

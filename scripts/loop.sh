@@ -2030,7 +2030,7 @@ path_is_cargo_verified_fixture() {
 path_is_relevant_for_profile() {
     local path="$1" profile="$2" surfaces="${3:-rust}"
     case "$path" in
-        src/*|Cargo.toml|Cargo.lock|build.rs) return 0 ;;
+        src/*|Cargo.toml|Cargo.lock|build.rs|scripts/loop.sh) return 0 ;;
     esac
     case ",$surfaces," in
         *,script,*) case "$path" in scripts/*) return 0 ;; esac ;;

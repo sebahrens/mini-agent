@@ -940,6 +940,10 @@ mod tests {
             imported.manifest.allowed_tools.as_deref(),
             Some("Bash(example:*)")
         );
+        assert_eq!(
+            fs::read(fixture.join("SKILL.md")).unwrap(),
+            fs::read(imported.install_path.join("SKILL.md")).unwrap()
+        );
         assert!(imported.install_path.join("SKILL.md").is_file());
         assert!(
             imported
