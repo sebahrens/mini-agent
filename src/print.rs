@@ -14,9 +14,9 @@ fn debug_assertions_entry() -> (&'static str, String) {
     (
         DEBUG_ASSERTIONS_LABEL,
         if cfg!(debug_assertions) {
-            "enabled at compile time"
+            "debug profile installed with assertions enabled"
         } else {
-            "disabled at compile time"
+            "release profile installed with assertions disabled"
         }
         .to_string(),
     )
@@ -331,9 +331,9 @@ mod tests {
             (
                 "debug assertions",
                 if cfg!(debug_assertions) {
-                    "enabled at compile time"
+                    "debug profile installed with assertions enabled"
                 } else {
-                    "disabled at compile time"
+                    "release profile installed with assertions disabled"
                 }
                 .to_string()
             )
