@@ -86,7 +86,7 @@ run_with_hard_timeout 5 shell_task
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual("shell-function-ran\n", completed.stdout)
 
-    def test_clean_install_is_not_subject_to_the_scenario_file_limit(self) -> None:
+    def test_clean_install_is_locked_and_not_subject_to_scenario_file_limit(self) -> None:
         source = LOOP_SCRIPT.read_text()
         replay_function = extract_function(
             source,
@@ -101,7 +101,7 @@ run_with_hard_timeout 5 shell_task
         )
         install_section = replay_function[install_start:install_end]
 
-        self.assertIn("install --path . --debug", install_section)
+        self.assertIn("install --path . --debug --locked", install_section)
         self.assertNotIn("ulimit -f", install_section)
         self.assertIn("ulimit -f 4096", replay_function[install_end:])
 

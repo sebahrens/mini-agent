@@ -1809,7 +1809,7 @@ replay_real_binary_evidence() {
                 # the evidence scenario's 2 MiB output-file limit.
                 run_with_hard_timeout "${LOOP_INSTALL_TIMEOUT_SECS:-900}" \
                     run_in_clean_install_environment "$install_root" "$cargo_path" "$rustc_path" \
-                        install --path . --debug) > "$transcript" 2>&1; then
+                        install --path . --debug --locked) > "$transcript" 2>&1; then
         reason="cargo-install-failed"
     elif [ "$reason" = replay-failed ]; then
         if ! cargo_config_free_ancestor_chain "$install_workspace"; then

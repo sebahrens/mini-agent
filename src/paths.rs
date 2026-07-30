@@ -20,6 +20,7 @@ pub use portable::{digest_filename, opaque_name, validate_portable_component};
 
 const APP_COMPONENT: &str = "zerostack";
 const MIGRATION_VERSION: u32 = 1;
+pub(crate) const PRIVATE_PATH_LINK_POLICY: &str = "reject symlinked parents";
 
 static PROCESS_PATHS: OnceLock<AppPaths> = OnceLock::new();
 static DISABLED_ARTIFACTS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
