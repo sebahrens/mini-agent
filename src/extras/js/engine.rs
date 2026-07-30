@@ -11,14 +11,20 @@ use crate::sandbox::Sandbox;
 
 const MAX_PENDING_JOBS: usize = 10_000;
 
+#[derive(Clone, Copy, Debug)]
+enum ReplyPath {
+    EarlyCancel,
+    Completed,
+}
+
 fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
     outcome: JsOutcome,
-    reply_path: &'static str,
+    reply_path: ReplyPath,
 ) {
     if reply.send(JsResponse { outcome }).is_err() {
         tracing::debug!(
-            reply_path = %reply_path,
+            ?reply_path,
             "JS engine reply receiver dropped before response delivery"
         );
     }
@@ -217,13 +223,13 @@ pub(crate) fn js_thread_main(
             send_reply_or_log_drop(
                 req.reply,
                 JsOutcome::Error("execution cancelled".to_string()),
-                "early_cancel",
+                ReplyPath::EarlyCancel,
             );
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        send_reply_or_log_drop(req.reply, outcome, "completed");
+        send_reply_or_log_drop(req.reply, outcome, ReplyPath::Completed);
     }
 }
 
@@ -364,7 +370,7 @@ mod tests {
         send_reply_or_log_drop(
             delivered_reply,
             JsOutcome::Value("delivered".to_string()),
-            "test_delivered",
+            ReplyPath::Completed,
         );
         assert_eq!(
             delivered_receiver
@@ -379,7 +385,7 @@ mod tests {
         send_reply_or_log_drop(
             dropped_reply,
             JsOutcome::Value("undelivered".to_string()),
-            "test_dropped",
+            ReplyPath::Completed,
         );
     }
 
