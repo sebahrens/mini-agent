@@ -8,12 +8,17 @@ use crate::session;
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
-const REAL_BINARY_REPLAY_LABEL: &str = "real binary replay";
+const INSTALLED_BUILD_PROFILE_LABEL: &str = "installed build profile";
 
-fn real_binary_replay_entry() -> (&'static str, String) {
+fn installed_build_profile_entry() -> (&'static str, String) {
     (
-        REAL_BINARY_REPLAY_LABEL,
-        "function-aware install timeout".to_string(),
+        INSTALLED_BUILD_PROFILE_LABEL,
+        if cfg!(debug_assertions) {
+            "debug profile selected"
+        } else {
+            "release profile selected"
+        }
+        .to_string(),
     )
 }
 
@@ -230,7 +235,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         &mut output,
         "Behavior",
         &[
-            real_binary_replay_entry(),
+            installed_build_profile_entry(),
             chat_history_path_policy_entry(),
             ("permission-mode", mode.to_string()),
             ("shell", shell.to_string()),
@@ -282,7 +287,7 @@ mod tests {
 
     use super::{
         CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        real_binary_replay_entry, write_output,
+        installed_build_profile_entry, write_output,
     };
 
     struct BrokenPipeWriter;
@@ -320,12 +325,17 @@ mod tests {
     }
 
     #[test]
-    fn config_reports_the_function_aware_real_binary_replay() {
+    fn config_reports_the_installed_build_profile() {
         assert_eq!(
-            real_binary_replay_entry(),
+            installed_build_profile_entry(),
             (
-                "real binary replay",
-                "function-aware install timeout".to_string()
+                "installed build profile",
+                if cfg!(debug_assertions) {
+                    "debug profile selected"
+                } else {
+                    "release profile selected"
+                }
+                .to_string()
             )
         );
     }
