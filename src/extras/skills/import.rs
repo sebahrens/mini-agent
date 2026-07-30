@@ -930,8 +930,8 @@ mod tests {
     #[test]
     fn agent_skill_import_checked_in_evidence_fixture_installs() {
         let temp = TempRoot::new();
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/extras/skills/fixtures/evidence-skill");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/extras/skills/fixtures/evidence-skill");
 
         let imported = import_agent_skill(&fixture, &temp.paths()).unwrap();
 
