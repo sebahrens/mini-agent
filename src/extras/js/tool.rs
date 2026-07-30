@@ -272,7 +272,6 @@ impl PermissionBridgeError {
             PermOutcome::BackendFailure(reason) => Err(Self::BackendFailure(reason)),
             PermOutcome::Cancelled => Err(Self::Cancelled),
             PermOutcome::TimedOut => Err(Self::TimedOut),
-            PermOutcome::ChannelClosed => Err(Self::ResponseChannelClosed),
         }
     }
 
@@ -538,9 +537,9 @@ impl Drop for JsTool {
         if js_thread.is_finished() {
             let _ = js_thread.join();
         } else {
-            let _ = self.runtime.spawn_blocking(move || {
+            drop(self.runtime.spawn_blocking(move || {
                 let _ = js_thread.join();
-            });
+            }));
         }
     }
 }

@@ -222,10 +222,6 @@ impl PermRequest {
         &self.cancellation
     }
 
-    pub fn is_expired(&self) -> bool {
-        Instant::now() >= self.deadline
-    }
-
     pub fn response_guard(&self) -> PermResponseGuard {
         PermResponseGuard {
             request_id: self.id,
@@ -238,6 +234,7 @@ impl PermRequest {
     ///
     /// Consuming the request prevents a bridge from accepting multiple
     /// responses for the same exchange.
+    #[cfg(test)]
     pub fn accept_response(
         self,
         response: PermResponse,
@@ -321,8 +318,6 @@ pub enum PermissionDenial {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionBackendFailure {
-    CheckerUnavailable,
-    AskUnavailable,
     AskChannelClosed,
     AskResponseDropped,
 }
@@ -334,7 +329,6 @@ pub enum PermOutcome {
     BackendFailure(PermissionBackendFailure),
     Cancelled,
     TimedOut,
-    ChannelClosed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,11 +345,13 @@ impl PermResponse {
         }
     }
 
-    pub fn request_id(&self) -> PermRequestId {
+    #[cfg(test)]
+    fn request_id(&self) -> PermRequestId {
         self.request_id
     }
 
-    pub fn outcome(&self) -> PermOutcome {
+    #[cfg(test)]
+    fn outcome(&self) -> PermOutcome {
         self.outcome.clone()
     }
 }
@@ -495,13 +491,10 @@ mod js_permission_types {
             PermOutcome::Denied(PermissionDenial::Policy("rule denied".to_string())),
             PermOutcome::Denied(PermissionDenial::User),
             PermOutcome::Denied(PermissionDenial::NonInteractive),
-            PermOutcome::BackendFailure(PermissionBackendFailure::CheckerUnavailable),
-            PermOutcome::BackendFailure(PermissionBackendFailure::AskUnavailable),
             PermOutcome::BackendFailure(PermissionBackendFailure::AskChannelClosed),
             PermOutcome::BackendFailure(PermissionBackendFailure::AskResponseDropped),
             PermOutcome::Cancelled,
             PermOutcome::TimedOut,
-            PermOutcome::ChannelClosed,
         ];
 
         for outcome in outcomes {
