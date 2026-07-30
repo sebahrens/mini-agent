@@ -944,6 +944,16 @@ mod tests {
             fs::read(fixture.join("SKILL.md")).unwrap(),
             fs::read(imported.install_path.join("SKILL.md")).unwrap()
         );
+        assert_eq!(
+            fs::read(fixture.join("scripts").join("never-run.sh")).unwrap(),
+            fs::read(
+                imported
+                    .install_path
+                    .join("scripts")
+                    .join("never-run.sh")
+            )
+            .unwrap()
+        );
         assert!(imported.install_path.join("SKILL.md").is_file());
         assert!(
             imported
