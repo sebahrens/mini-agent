@@ -11,7 +11,12 @@ use crate::sandbox::Sandbox;
 
 const MAX_PENDING_JOBS: usize = 10_000;
 
-fn send_reply(reply: oneshot::Sender<JsResponse>, outcome: JsOutcome, request_state: &'static str) {
+fn send_reply_or_log_drop(
+    reply: oneshot::Sender<JsResponse>,
+    outcome: JsOutcome,
+    request_state: &'static str,
+) {
+    // The send error owns JsResponse; keep this diagnostic independent of its formatting traits.
     if reply.send(JsResponse { outcome }).is_err() {
         tracing::debug!(
             request_state = request_state,
@@ -210,7 +215,7 @@ pub(crate) fn js_thread_main(
 ) {
     while let Ok(req) = rx.recv() {
         if req.cancellation.is_cancelled() {
-            send_reply(
+            send_reply_or_log_drop(
                 req.reply,
                 JsOutcome::Error("execution cancelled".to_string()),
                 "cancelled",
@@ -219,7 +224,7 @@ pub(crate) fn js_thread_main(
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        send_reply(req.reply, outcome, "completed");
+        send_reply_or_log_drop(req.reply, outcome, "completed");
     }
 }
 
