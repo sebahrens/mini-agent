@@ -240,6 +240,7 @@ pub(crate) fn js_thread_main(
 ) {
     while let Ok(req) = rx.recv() {
         if req.reply.is_closed() {
+            req.cancellation.cancel();
             log_reply_drop(ReplyPath::AbandonedBeforeExecution);
             continue;
         }
@@ -417,17 +418,25 @@ mod tests {
             JsOutcome::Value("delivered".to_string())
         );
 
-        let (dropped_reply, dropped_receiver) = oneshot::channel::<NoFormattingTraits>();
-        drop(dropped_receiver);
+        let (cancelled_reply, cancelled_receiver) = oneshot::channel::<NoFormattingTraits>();
+        drop(cancelled_receiver);
         assert!(!send_reply_or_log_drop(
-            dropped_reply,
+            cancelled_reply,
+            NoFormattingTraits,
+            ReplyPath::EarlyCancel,
+        ));
+
+        let (completed_reply, completed_receiver) = oneshot::channel::<NoFormattingTraits>();
+        drop(completed_receiver);
+        assert!(!send_reply_or_log_drop(
+            completed_reply,
             NoFormattingTraits,
             ReplyPath::Completed,
         ));
     }
 
     #[tokio::test]
-    async fn js_reply_receiver_drop_skips_abandoned_requests_and_thread_recovers() {
+    async fn js_reply_receiver_drop_cancels_abandoned_request_and_thread_recovers() {
         let permission_owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
         let permission_bridge = permission_owner.bridge();
         let (request_tx, request_rx) = mpsc::channel();
@@ -445,25 +454,15 @@ mod tests {
             })
             .expect("failed to spawn JS test thread");
 
-        let cancellation = PermCancellation::new();
-        cancellation.cancel();
-        let (cancelled_reply, cancelled_receiver) = oneshot::channel();
-        drop(cancelled_receiver);
+        let abandoned_cancellation = PermCancellation::new();
+        let abandoned_cancellation_observer = abandoned_cancellation.clone();
+        let (abandoned_reply, abandoned_receiver) = oneshot::channel();
+        drop(abandoned_receiver);
         request_tx
             .send(JsRequest {
-                code: "cancelled request must not run".to_string(),
-                cancellation,
-                reply: cancelled_reply,
-            })
-            .expect("cancelled request should reach JS thread");
-
-        let (completed_reply, completed_receiver) = oneshot::channel();
-        drop(completed_receiver);
-        request_tx
-            .send(JsRequest {
-                code: "while (true) {}".to_string(),
-                cancellation: PermCancellation::new(),
-                reply: completed_reply,
+                code: "abandoned request must not run".to_string(),
+                cancellation: abandoned_cancellation,
+                reply: abandoned_reply,
             })
             .expect("abandoned request should reach JS thread");
 
@@ -481,6 +480,10 @@ mod tests {
             .expect("JS thread stopped after a reply receiver was dropped")
             .expect("JS thread closed the recovery reply channel");
         assert_eq!(recovery.outcome, JsOutcome::Value("42".to_string()));
+        assert!(
+            abandoned_cancellation_observer.is_cancelled(),
+            "JS thread should cancel an abandoned request before skipping it"
+        );
 
         drop(request_tx);
         js_thread.join().expect("JS test thread panicked");
