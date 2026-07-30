@@ -385,7 +385,7 @@ mod tests {
     use crate::extras::js::tool::PermissionBridgeOwner;
 
     #[tokio::test]
-    async fn js_reply_delivery_handles_delivered_and_dropped_receivers() {
+    async fn js_reply_delivery_recovers_after_dropped_receivers() {
         struct NoFormattingTraits;
 
         assert_eq!(ReplyPath::EarlyCancel.as_str(), "early_cancel");
@@ -418,6 +418,22 @@ mod tests {
         let (completed_reply, completed_receiver) = oneshot::channel::<NoFormattingTraits>();
         drop(completed_receiver);
         send_reply_or_log_drop(completed_reply, NoFormattingTraits, ReplyPath::Completed);
+
+        let (recovery_reply, recovery_receiver) = oneshot::channel();
+        send_reply_or_log_drop(
+            recovery_reply,
+            JsResponse {
+                outcome: JsOutcome::Value("recovered".to_string()),
+            },
+            ReplyPath::Completed,
+        );
+        assert_eq!(
+            recovery_receiver
+                .await
+                .expect("reply delivery should recover after dropped receivers")
+                .outcome,
+            JsOutcome::Value("recovered".to_string())
+        );
     }
 
     #[tokio::test]
