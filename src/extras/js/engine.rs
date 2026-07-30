@@ -11,10 +11,20 @@ use crate::sandbox::Sandbox;
 
 const MAX_PENDING_JOBS: usize = 10_000;
 
-fn send_reply(reply: oneshot::Sender<JsResponse>, outcome: JsOutcome, request_state: &'static str) {
+#[derive(Clone, Copy, Debug)]
+enum ReplyRequestState {
+    Cancelled,
+    Completed,
+}
+
+fn send_reply(
+    reply: oneshot::Sender<JsResponse>,
+    outcome: JsOutcome,
+    request_state: ReplyRequestState,
+) {
     if reply.send(JsResponse { outcome }).is_err() {
         tracing::debug!(
-            request_state = request_state,
+            request_state = ?request_state,
             "JS engine reply receiver dropped before response delivery"
         );
     }
@@ -213,13 +223,13 @@ pub(crate) fn js_thread_main(
             send_reply(
                 req.reply,
                 JsOutcome::Error("execution cancelled".to_string()),
-                "cancelled",
+                ReplyRequestState::Cancelled,
             );
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        send_reply(req.reply, outcome, "completed");
+        send_reply(req.reply, outcome, ReplyRequestState::Completed);
     }
 }
 
