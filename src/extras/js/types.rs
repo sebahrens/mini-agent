@@ -254,10 +254,11 @@ impl PermResponseGuard {
         self,
         response: PermResponse,
     ) -> Result<PermOutcome, PermResponseRejection> {
-        if response.request_id != self.request_id {
+        let actual = response.request_id();
+        if actual != self.request_id {
             return Err(PermResponseRejection::MismatchedRequestId {
                 expected: self.request_id,
-                actual: response.request_id,
+                actual,
             });
         }
         if self.cancellation.is_cancelled() {
@@ -271,7 +272,7 @@ impl PermResponseGuard {
             });
         }
 
-        Ok(response.outcome)
+        Ok(response.into_outcome())
     }
 }
 
@@ -345,14 +346,12 @@ impl PermResponse {
         }
     }
 
-    #[cfg(test)]
     fn request_id(&self) -> PermRequestId {
         self.request_id
     }
 
-    #[cfg(test)]
-    fn outcome(&self) -> PermOutcome {
-        self.outcome.clone()
+    fn into_outcome(self) -> PermOutcome {
+        self.outcome
     }
 }
 
@@ -502,7 +501,6 @@ mod js_permission_types {
             let id = request.id();
             let response = PermResponse::new(id, outcome.clone());
             assert_eq!(response.request_id(), id);
-            assert_eq!(response.outcome(), outcome);
             assert_eq!(request.accept_response(response), Ok(outcome));
         }
     }
