@@ -109,6 +109,34 @@ run_with_hard_timeout 5 shell_task
         self.assertNotIn("ulimit -f", install_section)
         self.assertIn("ulimit -f 4096", replay_function[install_end:])
 
+    def test_checked_in_src_fixtures_use_the_full_cargo_suite(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+        fixture_function = extract_function(
+            source,
+            "path_is_cargo_verified_fixture",
+            "path_is_relevant_for_profile",
+        )
+        harness = f"""
+set -eu
+
+{fixture_function}
+
+path_is_cargo_verified_fixture src/extras/skills/fixtures/evidence-skill/SKILL.md
+if path_is_cargo_verified_fixture docs/fixtures/example.md; then
+    exit 42
+fi
+"""
+
+        completed = subprocess.run(
+            ["bash", "-c", harness],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
     def test_reopened_bead_can_be_claimed_again(self) -> None:
         source = LOOP_SCRIPT.read_text()
         reopen_function = extract_function(

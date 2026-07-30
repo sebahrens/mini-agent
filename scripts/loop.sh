@@ -829,6 +829,13 @@ run_verification() {
             continue
         fi
 
+        # Checked-in product fixtures are inputs to the full Cargo suite below.
+        # Their owning Rust tests are the verifier; executable shell fixtures
+        # still take the bash -n path above.
+        if path_is_cargo_verified_fixture "$changed_file"; then
+            continue
+        fi
+
         case "$changed_file" in
             *.rs|*.toml|Cargo.lock)
                 ;;
@@ -2011,6 +2018,13 @@ decide_build_outcome() {
     else
         echo partial
     fi
+}
+
+path_is_cargo_verified_fixture() {
+    case "$1" in
+        src/*/fixtures/*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 path_is_relevant_for_profile() {

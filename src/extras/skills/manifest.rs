@@ -117,17 +117,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.name, "review-code");
+        assert_eq!(manifest.allowed_tools.as_deref(), Some("Bash(git:*) Read"));
         assert_eq!(
-            manifest.allowed_tools.as_deref(),
-            Some("Bash(git:*) Read")
+            manifest.metadata.get("owner").map(String::as_str),
+            Some("team")
         );
-        assert_eq!(manifest.metadata.get("owner").map(String::as_str), Some("team"));
     }
 
     #[test]
     fn agent_skill_manifest_rejects_invalid_names_and_unknown_fields() {
-        let bad_name =
-            b"---\nname: Bad--Name\ndescription: Invalid name.\n---\nInstructions\n";
+        let bad_name = b"---\nname: Bad--Name\ndescription: Invalid name.\n---\nInstructions\n";
         assert!(parse_skill_markdown(bad_name).is_err());
 
         let unknown =

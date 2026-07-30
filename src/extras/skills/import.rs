@@ -54,10 +54,7 @@ pub enum ImportError {
     #[error("Agent Skill archive must contain only one root skill tree")]
     MultipleRoots,
     #[error("frontmatter name {manifest:?} does not match directory name {directory:?}")]
-    NameDirectoryMismatch {
-        manifest: String,
-        directory: String,
-    },
+    NameDirectoryMismatch { manifest: String, directory: String },
     #[error("installed Agent Skill tree failed content verification")]
     VerificationFailed,
     #[error("installed Agent Skill digest path already contains different content")]
@@ -181,7 +178,6 @@ impl SourceTree {
     fn file(&self, path: &str) -> Option<&[u8]> {
         self.entries.get(path)?.bytes.as_deref()
     }
-
 }
 
 /// Validate and durably install one local Agent Skills directory or ZIP.
@@ -211,10 +207,7 @@ pub fn import_agent_skill(
             .ok_or(ImportError::NonUtf8Path)?
             .to_owned();
         portable::validate_portable_component(&directory_name)?;
-        (
-            collect_directory(source)?,
-            Some(directory_name),
-        )
+        (collect_directory(source)?, Some(directory_name))
     } else if source_metadata.is_file()
         && source
             .extension()
@@ -290,13 +283,7 @@ fn collect_directory(root: &Path) -> Result<SourceTree, ImportError> {
     let mut tree = SourceTree::default();
     let mut raw_entries = 0usize;
     let mut expanded_bytes = 0u64;
-    collect_directory_recursive(
-        root,
-        root,
-        &mut tree,
-        &mut raw_entries,
-        &mut expanded_bytes,
-    )?;
+    collect_directory_recursive(root, root, &mut tree, &mut raw_entries, &mut expanded_bytes)?;
     Ok(tree)
 }
 
@@ -330,13 +317,7 @@ fn collect_directory_recursive(
         }
         if metadata.is_dir() {
             tree.insert_directory(&relative, true)?;
-            collect_directory_recursive(
-                root,
-                &path,
-                tree,
-                raw_entries,
-                expanded_bytes,
-            )?;
+            collect_directory_recursive(root, &path, tree, raw_entries, expanded_bytes)?;
         } else if metadata.is_file() {
             if metadata.len() > MAX_FILE_BYTES {
                 return Err(ImportError::LimitExceeded {
@@ -344,11 +325,11 @@ fn collect_directory_recursive(
                 });
             }
             let bytes = read_stable_file(&path, MAX_FILE_BYTES)?;
-            *expanded_bytes = expanded_bytes
-                .checked_add(bytes.len() as u64)
-                .ok_or(ImportError::LimitExceeded {
+            *expanded_bytes = expanded_bytes.checked_add(bytes.len() as u64).ok_or(
+                ImportError::LimitExceeded {
                     limit: "expanded-bytes",
-                })?;
+                },
+            )?;
             if *expanded_bytes > MAX_EXPANDED_BYTES {
                 return Err(ImportError::LimitExceeded {
                     limit: "expanded-bytes",
@@ -406,16 +387,17 @@ fn collect_zip(source: &Path) -> Result<SourceTree, ImportError> {
         validate_zip_entry_type(&file, normalized_name)?;
         validate_tree_path(normalized_name)?;
 
-        compressed_bytes = compressed_bytes
-            .checked_add(file.compressed_size())
-            .ok_or(ImportError::LimitExceeded {
+        compressed_bytes = compressed_bytes.checked_add(file.compressed_size()).ok_or(
+            ImportError::LimitExceeded {
                 limit: "compressed-bytes",
-            })?;
-        expanded_bytes = expanded_bytes
-            .checked_add(file.size())
-            .ok_or(ImportError::LimitExceeded {
-                limit: "expanded-bytes",
-            })?;
+            },
+        )?;
+        expanded_bytes =
+            expanded_bytes
+                .checked_add(file.size())
+                .ok_or(ImportError::LimitExceeded {
+                    limit: "expanded-bytes",
+                })?;
         if compressed_bytes > MAX_ARCHIVE_BYTES {
             return Err(ImportError::LimitExceeded {
                 limit: "compressed-bytes",
@@ -505,10 +487,8 @@ fn normalize_skill_tree(
             (tree, directory_name.to_owned())
         }
         None if skill_path == "SKILL.md" => {
-            let manifest = parse_skill_markdown(
-                tree.file("SKILL.md")
-                    .ok_or(ImportError::InvalidSkillRoot)?,
-            )?;
+            let manifest =
+                parse_skill_markdown(tree.file("SKILL.md").ok_or(ImportError::InvalidSkillRoot)?)?;
             let directory_name = manifest.name.clone();
             return Ok((tree, manifest_for_directory(manifest, &directory_name)?));
         }
@@ -623,11 +603,8 @@ fn validate_existing(root: &Path, name: &str, digest: &str) -> Result<(), Import
         return Err(ImportError::DigestConflict);
     }
     let tree = collect_directory(root)?;
-    let manifest = parse_skill_markdown(
-        tree.file("SKILL.md")
-            .ok_or(ImportError::DigestConflict)?,
-    )
-    .map_err(|_| ImportError::DigestConflict)?;
+    let manifest = parse_skill_markdown(tree.file("SKILL.md").ok_or(ImportError::DigestConflict)?)
+        .map_err(|_| ImportError::DigestConflict)?;
     if manifest.name != name || identity(&tree).digest != digest {
         return Err(ImportError::DigestConflict);
     }
@@ -951,6 +928,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_skill_import_checked_in_evidence_fixture_installs() {
+        let temp = TempRoot::new();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/extras/skills/fixtures/evidence-skill");
+
+        let imported = import_agent_skill(&fixture, &temp.paths()).unwrap();
+
+        assert_eq!(imported.manifest.name, "evidence-skill");
+        assert_eq!(
+            imported.manifest.allowed_tools.as_deref(),
+            Some("Bash(example:*)")
+        );
+        assert!(imported.install_path.join("SKILL.md").is_file());
+        assert!(
+            imported
+                .install_path
+                .join("scripts")
+                .join("never-run.sh")
+                .is_file()
+        );
+    }
+
+    #[test]
     fn agent_skill_import_directory_and_root_zip_have_identical_identity() {
         let temp = TempRoot::new();
         let marker = temp.0.join("executed");
@@ -986,12 +986,8 @@ mod tests {
         let mut writer = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
         writer.add_directory("nested-skill/", options).unwrap();
-        writer
-            .start_file("nested-skill/SKILL.md", options)
-            .unwrap();
-        writer
-            .write_all(&skill_markdown("nested-skill"))
-            .unwrap();
+        writer.start_file("nested-skill/SKILL.md", options).unwrap();
+        writer.write_all(&skill_markdown("nested-skill")).unwrap();
         writer.finish().unwrap();
 
         let imported = import_agent_skill(&zip_path, &temp.paths()).unwrap();
@@ -1012,13 +1008,7 @@ mod tests {
 
         assert!(import_agent_skill(&zip_path, &temp.paths()).is_err());
         let staging = temp.paths().cache_dir.join("import-staging");
-        assert!(
-            !staging.exists()
-                || fs::read_dir(staging)
-                    .unwrap()
-                    .next()
-                    .is_none()
-        );
+        assert!(!staging.exists() || fs::read_dir(staging).unwrap().next().is_none());
         assert!(!temp.0.join("escape").exists());
     }
 
