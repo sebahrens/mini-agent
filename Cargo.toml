@@ -20,7 +20,7 @@ keywords = ["ai", "cli", "dev"]
 canonical-binary = "mini-agent"
 
 [features]
-default = ['loop', 'git-worktree', 'mcp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export']
+default = ['loop', 'git-worktree', 'mcp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export', 'js']
 status-signals = []
 loop = []
 export = []
