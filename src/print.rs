@@ -11,22 +11,29 @@ const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
 const INSTALLED_BUILD_LABEL: &str = "installed build";
 const INSTALLED_BUILD_PROFILE_LABEL: &str = "installed build profile";
 
+fn installed_build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug profile with assertions enabled"
+    } else {
+        "release profile with assertions disabled"
+    }
+}
+
 fn installed_build_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_LABEL,
-        format!("mini-agent {}", env!("CARGO_PKG_VERSION")),
+        format!(
+            "mini-agent {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            installed_build_profile()
+        ),
     )
 }
 
 fn installed_build_profile_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_PROFILE_LABEL,
-        if cfg!(debug_assertions) {
-            "debug profile with assertions enabled"
-        } else {
-            "release profile with assertions disabled"
-        }
-        .to_string(),
+        installed_build_profile().to_string(),
     )
 }
 
@@ -339,7 +346,15 @@ mod tests {
             installed_build_entry(),
             (
                 "installed build",
-                format!("mini-agent {}", env!("CARGO_PKG_VERSION"))
+                format!(
+                    "mini-agent {} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    if cfg!(debug_assertions) {
+                        "debug profile with assertions enabled"
+                    } else {
+                        "release profile with assertions disabled"
+                    }
+                )
             )
         );
         assert_eq!(
