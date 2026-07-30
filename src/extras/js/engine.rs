@@ -12,9 +12,10 @@ use crate::sandbox::Sandbox;
 const MAX_PENDING_JOBS: usize = 10_000;
 
 fn send_reply(reply: oneshot::Sender<JsResponse>, outcome: JsOutcome, request_state: &'static str) {
-    if reply.send(JsResponse { outcome }).is_err() {
+    if let Err(undelivered_response) = reply.send(JsResponse { outcome }) {
         tracing::debug!(
             request_state = request_state,
+            response = ?undelivered_response,
             "JS engine reply receiver dropped before response delivery"
         );
     }
