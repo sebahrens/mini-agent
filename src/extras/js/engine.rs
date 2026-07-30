@@ -28,12 +28,12 @@ impl ReplyPath {
 
 fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
-    outcome: JsOutcome,
+    response: JsResponse,
     reply_path: ReplyPath,
 ) {
     // A closed receiver is expected when the caller's deadline wins the race.
     // Keep the diagnostic independent of all JsResponse formatting traits.
-    if reply.send(JsResponse { outcome }).is_err() {
+    if reply.send(response).is_err() {
         tracing::debug!(
             reply_path = reply_path.as_str(),
             "JS engine reply receiver dropped before response delivery"
@@ -233,14 +233,16 @@ pub(crate) fn js_thread_main(
         if req.cancellation.is_cancelled() {
             send_reply_or_log_drop(
                 req.reply,
-                JsOutcome::Error("execution cancelled".to_string()),
+                JsResponse {
+                    outcome: JsOutcome::Error("execution cancelled".to_string()),
+                },
                 ReplyPath::EarlyCancel,
             );
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        send_reply_or_log_drop(req.reply, outcome, ReplyPath::Completed);
+        send_reply_or_log_drop(req.reply, JsResponse { outcome }, ReplyPath::Completed);
     }
 }
 
@@ -383,7 +385,9 @@ mod tests {
         let (delivered_reply, delivered_receiver) = oneshot::channel();
         send_reply_or_log_drop(
             delivered_reply,
-            JsOutcome::Value("delivered".to_string()),
+            JsResponse {
+                outcome: JsOutcome::Value("delivered".to_string()),
+            },
             ReplyPath::Completed,
         );
         assert_eq!(
@@ -398,7 +402,9 @@ mod tests {
         drop(dropped_receiver);
         send_reply_or_log_drop(
             dropped_reply,
-            JsOutcome::Value("undelivered".to_string()),
+            JsResponse {
+                outcome: JsOutcome::Value("undelivered".to_string()),
+            },
             ReplyPath::Completed,
         );
     }
