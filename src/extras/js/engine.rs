@@ -17,11 +17,14 @@ fn send_reply_or_log_drop(
     request_state: &'static str,
 ) {
     // The send error owns JsResponse; keep this diagnostic independent of its formatting traits.
-    if reply.send(JsResponse { outcome }).is_err() {
-        tracing::debug!(
-            request_state = request_state,
-            "JS engine reply receiver dropped before response delivery"
-        );
+    match reply.send(JsResponse { outcome }) {
+        Ok(()) => {}
+        Err(_undelivered_response) => {
+            tracing::debug!(
+                request_state = request_state,
+                "JS engine reply receiver dropped before response delivery"
+            );
+        }
     }
 }
 
