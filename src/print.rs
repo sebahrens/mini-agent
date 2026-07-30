@@ -9,19 +9,24 @@ const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
 const INSTALLED_BUILD_LABEL: &str = "installed build";
+const INSTALLED_BUILD_PROFILE_LABEL: &str = "installed build profile";
 
 fn installed_build_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_LABEL,
-        format!(
-            "mini-agent {} ({})",
-            env!("CARGO_PKG_VERSION"),
-            if cfg!(debug_assertions) {
-                "debug profile with assertions enabled"
-            } else {
-                "release profile with assertions disabled"
-            }
-        ),
+        format!("mini-agent {}", env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn installed_build_profile_entry() -> (&'static str, String) {
+    (
+        INSTALLED_BUILD_PROFILE_LABEL,
+        if cfg!(debug_assertions) {
+            "debug profile with assertions enabled"
+        } else {
+            "release profile with assertions disabled"
+        }
+        .to_string(),
     )
 }
 
@@ -239,6 +244,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         "Behavior",
         &[
             installed_build_entry(),
+            installed_build_profile_entry(),
             chat_history_path_policy_entry(),
             ("permission-mode", mode.to_string()),
             ("shell", shell.to_string()),
@@ -290,7 +296,7 @@ mod tests {
 
     use super::{
         CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        installed_build_entry, write_output,
+        installed_build_entry, installed_build_profile_entry, write_output,
     };
 
     struct BrokenPipeWriter;
@@ -333,15 +339,18 @@ mod tests {
             installed_build_entry(),
             (
                 "installed build",
-                format!(
-                    "mini-agent {} ({})",
-                    env!("CARGO_PKG_VERSION"),
-                    if cfg!(debug_assertions) {
-                        "debug profile with assertions enabled"
-                    } else {
-                        "release profile with assertions disabled"
-                    }
-                )
+                format!("mini-agent {}", env!("CARGO_PKG_VERSION"))
+            )
+        );
+        assert_eq!(
+            installed_build_profile_entry(),
+            (
+                "installed build profile",
+                if cfg!(debug_assertions) {
+                    "debug profile with assertions enabled".to_string()
+                } else {
+                    "release profile with assertions disabled".to_string()
+                }
             )
         );
     }
