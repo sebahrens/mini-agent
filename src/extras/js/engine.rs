@@ -15,13 +15,17 @@ fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
     outcome: JsOutcome,
     reply_path: &'static str,
-) {
+) -> bool {
     // The send error owns JsResponse; keep this diagnostic independent of its formatting traits.
-    if reply.send(JsResponse { outcome }).is_err() {
-        tracing::debug!(
-            reply_path = %reply_path,
-            "JS engine reply receiver dropped before response delivery"
-        );
+    match reply.send(JsResponse { outcome }) {
+        Ok(()) => true,
+        Err(_) => {
+            tracing::debug!(
+                reply_path = %reply_path,
+                "JS engine reply receiver dropped before response delivery"
+            );
+            false
+        }
     }
 }
 
@@ -358,6 +362,31 @@ pub(crate) fn run_step_for_test(
 mod tests {
     use super::*;
     use crate::extras::js::tool::PermissionBridgeOwner;
+
+    #[tokio::test]
+    async fn js_reply_delivery_reports_delivered_and_dropped_receivers() {
+        let (delivered_reply, delivered_receiver) = oneshot::channel();
+        assert!(send_reply_or_log_drop(
+            delivered_reply,
+            JsOutcome::Value("delivered".to_string()),
+            "test_delivered",
+        ));
+        assert_eq!(
+            delivered_receiver
+                .await
+                .expect("delivered reply channel should remain open")
+                .outcome,
+            JsOutcome::Value("delivered".to_string())
+        );
+
+        let (dropped_reply, dropped_receiver) = oneshot::channel();
+        drop(dropped_receiver);
+        assert!(!send_reply_or_log_drop(
+            dropped_reply,
+            JsOutcome::Value("undelivered".to_string()),
+            "test_dropped",
+        ));
+    }
 
     #[tokio::test]
     async fn js_reply_receiver_drop_is_non_fatal_for_cancelled_and_completed_requests() {
