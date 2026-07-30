@@ -316,7 +316,8 @@ mod tests {
             chat_history_limit_entry(),
             (
                 "chat history entry limit",
-                "bounded retention keeps newest 10000 entries and discards older entries".to_string()
+                "bounded retention keeps newest 10000 entries and discards older entries"
+                    .to_string()
             )
         );
     }
