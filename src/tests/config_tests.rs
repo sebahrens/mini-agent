@@ -370,6 +370,133 @@ fn yaml_round_trips_scalar_and_nested_fields() {
     assert_eq!(back.default_prompt, cfg.default_prompt);
 }
 
+#[test]
+fn config_cross_feature_round_trip() {
+    use std::path::Path;
+
+    use crate::config::load::{parse_config_content, serialize_config_content};
+
+    let fixture = r#"
+model = "original-model"
+temperature = 0.7
+future_scalar = "keep-me"
+future_integer = 9223372036854775000
+future_datetime = 2026-07-30T12:34:56Z
+future_array = [1, "two", true]
+enable-exa-mcp = false
+enable-context7-mcp = true
+enable-grepapp-mcp = false
+wt-auto-merge = true
+wt-base-dir = "/tmp/worktrees"
+wt-force = true
+task_max_turns = 17
+task_max_prompts = 5
+task_max_concurrency = 2
+task_max_output_bytes = 4096
+task_max_cost_units = 12345
+task_timeout_secs = 90
+task_enabled = true
+subagent_model = "sub-model"
+subagent_provider = "sub-provider"
+acp_host = "127.0.0.1"
+acp_port = 7243
+
+[future_table]
+nested = { flag = true, values = [3, 4] }
+
+[mcp_servers.audit]
+command = "printf"
+args = ["ready"]
+env = { MODE = "audit" }
+
+[acp_servers.worker]
+type = "stdio"
+
+[lsp]
+enabled = true
+
+[lsp.servers.rust]
+command = "rust-analyzer"
+args = []
+extensions = [".rs"]
+env = {}
+disabled = false
+
+[advisor]
+enabled = true
+model = "advisor-model"
+max_uses = 4
+human_handoff = false
+advisor_kilobytes_limit = 128
+"#;
+    let path = Path::new("config.toml");
+    let before: toml::Value = toml::from_str(fixture).unwrap();
+    let mut cfg = parse_config_content(path, fixture).unwrap();
+
+    cfg.model = Some(CompactString::new("updated-model"));
+    cfg.temperature = None;
+
+    let serialized = serialize_config_content(path, &cfg).unwrap();
+    let after: toml::Value = toml::from_str(&serialized).unwrap();
+
+    assert_eq!(
+        after.get("model").and_then(toml::Value::as_str),
+        Some("updated-model")
+    );
+    assert!(
+        after.get("temperature").is_none(),
+        "deleting an owned field must not resurrect its preserved input value"
+    );
+    for key in [
+        "future_scalar",
+        "future_integer",
+        "future_datetime",
+        "future_array",
+        "future_table",
+        "enable-exa-mcp",
+        "enable-context7-mcp",
+        "enable-grepapp-mcp",
+        "wt-auto-merge",
+        "wt-base-dir",
+        "wt-force",
+        "task_max_turns",
+        "task_max_prompts",
+        "task_max_concurrency",
+        "task_max_output_bytes",
+        "task_max_cost_units",
+        "task_timeout_secs",
+        "task_enabled",
+        "subagent_model",
+        "subagent_provider",
+        "mcp_servers",
+        "acp_servers",
+        "acp_host",
+        "acp_port",
+        "lsp",
+        "advisor",
+    ] {
+        assert_eq!(
+            after.get(key),
+            before.get(key),
+            "cross-feature value changed for {key}"
+        );
+    }
+
+    let reloaded = parse_config_content(path, &serialized).unwrap();
+    assert_eq!(reloaded.model.as_deref(), Some("updated-model"));
+    assert_eq!(reloaded.temperature, None);
+}
+
+#[test]
+fn malformed_owned_config_field_still_fails_closed() {
+    use std::path::Path;
+
+    let error =
+        crate::config::load::parse_config_content(Path::new("config.toml"), "max_tokens = \"many\"")
+            .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
 // `pick_existing` is pure (no env/global state), so this priority test is
 // hermetic and safe to run in parallel with everything else.
 #[test]

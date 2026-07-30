@@ -53,6 +53,13 @@ pub(crate) fn parse_config_content(path: &Path, content: &str) -> io::Result<Con
     }
 }
 
+pub(crate) fn serialize_config_content(path: &Path, cfg: &Config) -> io::Result<String> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("toml") => toml::to_string(cfg).map_err(io::Error::other),
+        _ => serde_yaml_ng::to_string(cfg).map_err(io::Error::other),
+    }
+}
+
 fn path_entry_exists(path: &Path) -> io::Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -155,16 +162,7 @@ pub fn save_quick_model(
         },
     );
 
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("toml") => {
-            let content = toml::to_string(&cfg).map_err(std::io::Error::other)?;
-            atomic_config_write(&path, &content)?;
-        }
-        _ => {
-            let content = serde_yaml_ng::to_string(&cfg).map_err(std::io::Error::other)?;
-            atomic_config_write(&path, &content)?;
-        }
-    }
+    atomic_config_write(&path, &serialize_config_content(&path, &cfg)?)?;
     Ok(())
 }
 
@@ -458,26 +456,25 @@ fn apply_local_override(cfg: &mut Config, path: &Path) {
 pub fn merge_config_override(base: &Config, local_toml: &str) -> Result<Config, String> {
     let local: toml::Value =
         toml::from_str(local_toml).map_err(|_| "project config is not valid TOML".to_string())?;
-    let local_json = serde_json::to_value(&local)
-        .map_err(|_| "project config could not be normalized".to_string())?;
-    // `Config` skips `None` fields when serializing, so the base JSON holds
-    // exactly the keys that are set and the local JSON exactly the keys the
+    // `Config` skips `None` fields when serializing, so the base TOML holds
+    // exactly the keys that are set and the local TOML exactly the keys the
     // project file sets.
-    let mut base_json = serde_json::to_value(base)
+    let mut base_toml = toml::Value::try_from(base)
         .map_err(|_| "base config could not be normalized".to_string())?;
-    deep_merge_json(&mut base_json, local_json);
-    serde_json::from_value(base_json)
+    deep_merge_toml(&mut base_toml, local);
+    base_toml
+        .try_into()
         .map_err(|_| "merged project config has an invalid value".to_string())
 }
 
 /// Deep-merge `over` into `base`: objects merge recursively per key, any
 /// other value replaces.
-fn deep_merge_json(base: &mut serde_json::Value, over: serde_json::Value) {
+fn deep_merge_toml(base: &mut toml::Value, over: toml::Value) {
     match (base, over) {
-        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
             for (k, v) in o {
                 match b.get_mut(&k) {
-                    Some(existing) => deep_merge_json(existing, v),
+                    Some(existing) => deep_merge_toml(existing, v),
                     None => {
                         b.insert(k, v);
                     }
@@ -543,16 +540,7 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
         }
     }
     let path = resolve_config_path();
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("toml") => {
-            let content = toml::to_string(&cfg).map_err(io::Error::other)?;
-            atomic_config_write(&path, &content)?;
-        }
-        _ => atomic_config_write(
-            &path,
-            &serde_yaml_ng::to_string(&cfg).map_err(io::Error::other)?,
-        )?,
-    }
+    atomic_config_write(&path, &serialize_config_content(&path, &cfg)?)?;
     tracing::debug!("config saved to {}", path.display());
     Ok(())
 }

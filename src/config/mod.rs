@@ -1,7 +1,7 @@
 pub mod load;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,16 @@ use crate::extras::mcp::config::McpServerConfig;
 
 #[cfg(feature = "acp")]
 use crate::extras::acp::config::AcpServerConfig;
+
+/// Opaque storage for config values not owned by the running build.
+///
+/// The wrapper is public only so existing `Config { ..Default::default() }`
+/// construction remains possible outside this module. Its map is private,
+/// preventing callers from manufacturing conflicts with typed fields.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PreservedConfig(BTreeMap<String, toml::Value>);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -226,6 +236,16 @@ pub struct Config {
     #[cfg(feature = "advisor")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advisor: Option<types::AdvisorConfig>,
+    /// Values not owned by this build, including fields behind disabled Cargo
+    /// features and fields introduced by newer mini-agent versions.
+    ///
+    /// This map is private so callers can only mutate owned typed fields.
+    /// Deserialization removes owned keys before flattening the remainder,
+    /// which makes typed fields authoritative and prevents duplicate-key
+    /// conflicts during serialization.
+    #[serde(flatten)]
+    #[doc(hidden)]
+    pub preserved: PreservedConfig,
 }
 
 impl Config {
