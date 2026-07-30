@@ -70,6 +70,12 @@ pub struct Cli {
     )]
     pub resume_provider_safety_check: bool,
 
+    #[arg(
+        long = "acp-authentication-check",
+        help = "Verify ACP TCP peer authentication rejects missing and replayed credentials, then exit"
+    )]
+    pub acp_authentication_check: bool,
+
     #[arg(long = "name", help = "Name for the session")]
     pub name: Option<String>,
 

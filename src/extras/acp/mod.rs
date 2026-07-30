@@ -1,7 +1,11 @@
 pub mod config;
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_client_protocol::on_receive_request;
 use agent_client_protocol::schema::v1::*;
@@ -10,6 +14,7 @@ use agent_client_protocol::{
 };
 use tokio::sync::Mutex;
 
+use crate::acp_auth::authenticate_peer;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::context::ContextFiles;
@@ -20,6 +25,9 @@ use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::sandbox::Sandbox;
 
 const AGENT_VERSION: &str = "1.0.5";
+const DEFAULT_TCP_HOST: &str = "127.0.0.1";
+const DEFAULT_TCP_PORT: u16 = 7243;
+const MAX_PENDING_AUTHENTICATIONS: usize = 16;
 
 struct SessionState {
     messages: Vec<(String, String)>,
@@ -37,6 +45,7 @@ struct AcpState {
 struct TcpTransport {
     host: String,
     port: u16,
+    api_key: String,
 }
 
 impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
@@ -44,20 +53,22 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         self,
         client: impl ConnectTo<Counterpart::Counterpart>,
     ) -> Result<(), agent_client_protocol::Error> {
-        use std::net::TcpListener;
-
-        let addr = format!("{}:{}", self.host, self.port);
-        let listener = TcpListener::bind(&addr).map_err(|e| {
-            agent_client_protocol::util::internal_error(format!("TCP bind {}: {}", addr, e))
+        let listener = TcpListener::bind((self.host.as_str(), self.port)).map_err(|e| {
+            agent_client_protocol::util::internal_error(format!(
+                "TCP bind {}:{}: {}",
+                self.host, self.port, e
+            ))
+        })?;
+        let local_addr = listener.local_addr().map_err(|e| {
+            agent_client_protocol::util::internal_error(format!("TCP local address: {}", e))
         })?;
 
-        tracing::info!("ACP TCP listening on {}", addr);
-
-        let (stream, peer_addr) = listener.accept().map_err(|e| {
-            agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
-        })?;
-
-        tracing::info!("ACP client connected from {}", peer_addr);
+        tracing::info!("ACP TCP listening on {}", local_addr);
+        let (stream, peer_addr) =
+            accept_authenticated_peer(listener, self.api_key).map_err(|e| {
+                agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
+            })?;
+        tracing::info!("Authenticated ACP client connected from {}", peer_addr);
 
         let read_half = stream.try_clone().map_err(|e| {
             agent_client_protocol::util::internal_error(format!("TCP clone: {}", e))
@@ -72,19 +83,157 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
     }
 }
 
+enum AuthenticationAttempt {
+    Accepted(TcpStream, SocketAddr),
+    Rejected(SocketAddr),
+}
+
+fn accept_authenticated_peer(
+    listener: TcpListener,
+    api_key: String,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    listener.set_nonblocking(true)?;
+    let api_key: Arc<str> = api_key.into();
+    let pending = Arc::new(AtomicUsize::new(0));
+    let (result_tx, result_rx) = mpsc::channel();
+
+    loop {
+        while let Ok(attempt) = result_rx.try_recv() {
+            match attempt {
+                AuthenticationAttempt::Accepted(stream, peer_addr) => {
+                    return Ok((stream, peer_addr));
+                }
+                AuthenticationAttempt::Rejected(peer_addr) => {
+                    tracing::warn!(
+                        "ACP TCP peer authentication rejected for {}",
+                        peer_addr
+                    );
+                }
+            }
+        }
+
+        match listener.accept() {
+            Ok((mut stream, peer_addr)) => {
+                if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_AUTHENTICATIONS {
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                    tracing::warn!(
+                        "ACP TCP peer rejected because authentication capacity is full"
+                    );
+                    continue;
+                }
+
+                let api_key = api_key.clone();
+                let worker_pending = pending.clone();
+                let result_tx = result_tx.clone();
+                let spawn_result = std::thread::Builder::new()
+                    .name("acp-peer-auth".to_owned())
+                    .spawn(move || {
+                        let attempt = if authenticate_peer(&mut stream, &api_key).is_ok() {
+                            AuthenticationAttempt::Accepted(stream, peer_addr)
+                        } else {
+                            AuthenticationAttempt::Rejected(peer_addr)
+                        };
+                        worker_pending.fetch_sub(1, Ordering::AcqRel);
+                        let _ = result_tx.send(attempt);
+                    });
+
+                if spawn_result.is_err() {
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                    tracing::warn!("ACP TCP peer authentication worker could not start");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct TcpServerSettings {
+    host: String,
+    port: u16,
+    api_key: String,
+}
+
+fn resolve_tcp_settings(cli: &Cli, cfg: &Config) -> anyhow::Result<Option<TcpServerSettings>> {
+    let environment_key = std::env::var("MINI_AGENT_ACP_API_KEY").ok();
+    resolve_tcp_settings_with_key(cli, cfg, environment_key)
+}
+
+fn resolve_tcp_settings_with_key(
+    cli: &Cli,
+    cfg: &Config,
+    environment_key: Option<String>,
+) -> anyhow::Result<Option<TcpServerSettings>> {
+    let configured_host = cli.acp_host.clone().or_else(|| cfg.acp_host.clone());
+    let configured_port = cli.acp_port.or(cfg.acp_port);
+    if configured_host.is_none() && configured_port.is_none() {
+        return Ok(None);
+    }
+
+    let host = configured_host.unwrap_or_else(|| DEFAULT_TCP_HOST.to_owned());
+    let port = configured_port.unwrap_or(DEFAULT_TCP_PORT);
+    let api_key = environment_key
+        .filter(|key| !key.is_empty())
+        .or_else(|| configured_tcp_api_key(cfg, &host, port))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "ACP TCP requires authentication; set MINI_AGENT_ACP_API_KEY or configure a matching TCP acp_servers api_key"
+            )
+        })?;
+
+    if !is_loopback_host(&host) {
+        tracing::warn!(
+            "ACP TCP remote bind explicitly enabled for {}; authentication is required",
+            host
+        );
+    }
+
+    Ok(Some(TcpServerSettings {
+        host,
+        port,
+        api_key,
+    }))
+}
+
+fn configured_tcp_api_key(cfg: &Config, host: &str, port: u16) -> Option<String> {
+    let mut matching_keys = cfg
+        .acp_servers
+        .as_ref()?
+        .values()
+        .filter_map(|server| server.tcp_endpoint())
+        .filter(|(configured_host, configured_port, _)| {
+            *configured_host == host && *configured_port == port
+        })
+        .filter_map(|(_, _, api_key)| api_key)
+        .filter(|api_key| !api_key.is_empty());
+
+    let first = matching_keys.next()?.to_owned();
+    if matching_keys.all(|key| key == first.as_str()) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 // --- Server Entry Point ---
 
 pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
-    let transport_mode = if cli.acp_host.is_some() {
+    let tcp_settings = resolve_tcp_settings(&cli, &cfg)?;
+    let transport_mode = if tcp_settings.is_some() {
         "tcp"
     } else {
         "stdio"
     };
     tracing::info!("ACP server starting: transport={}", transport_mode);
-
-    // Extract transport config before moving cli into Arc
-    let acp_host = cli.acp_host.clone();
-    let acp_port = cli.acp_port;
 
     let state = Arc::new(AcpState {
         cli,
@@ -139,11 +288,14 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
             agent_client_protocol::on_receive_dispatch!(),
         );
 
-    // Choose transport: TCP if host is set, otherwise stdio
-    if let Some(host) = acp_host {
-        let port = acp_port.unwrap_or(7243);
+    // Choose transport: TCP if an endpoint is configured, otherwise stdio.
+    if let Some(settings) = tcp_settings {
         builder
-            .connect_to(TcpTransport { host, port })
+            .connect_to(TcpTransport {
+                host: settings.host,
+                port: settings.port,
+                api_key: settings.api_key,
+            })
             .await
             .map_err(|e| anyhow::anyhow!("ACP TCP server error: {}", e))?;
     } else {
@@ -497,5 +649,82 @@ pub(crate) fn resolve_acp_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
         }
     } else {
         SecurityMode::Standard
+    }
+}
+
+#[cfg(test)]
+mod tcp_authentication_tests {
+    use super::*;
+    use crate::acp_auth::{read_challenge, send_response};
+    use crate::extras::acp::config::AcpServerConfig;
+
+    fn tcp_config(host: &str, port: u16, api_key: Option<&str>) -> Config {
+        Config {
+            acp_servers: Some(HashMap::from([(
+                "test".to_owned(),
+                AcpServerConfig::Tcp {
+                    host: host.to_owned(),
+                    port,
+                    api_key: api_key.map(str::to_owned),
+                },
+            )])),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stdio_remains_default_without_tcp_endpoint() {
+        let settings =
+            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None).unwrap();
+        assert!(settings.is_none());
+    }
+
+    #[test]
+    fn port_only_tcp_configuration_defaults_to_loopback() {
+        let cli = Cli {
+            acp_port: Some(8123),
+            ..Default::default()
+        };
+        let cfg = tcp_config(DEFAULT_TCP_HOST, 8123, Some("configured-key"));
+
+        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.host, DEFAULT_TCP_HOST);
+        assert_eq!(settings.port, 8123);
+        assert_eq!(settings.api_key, "configured-key");
+    }
+
+    #[test]
+    fn tcp_configuration_without_authentication_fails_closed() {
+        let cli = Cli {
+            acp_host: Some(DEFAULT_TCP_HOST.to_owned()),
+            ..Default::default()
+        };
+
+        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None)
+            .err()
+            .expect("TCP without authentication must fail");
+        assert!(error.to_string().contains("requires authentication"));
+    }
+
+    #[test]
+    fn racing_valid_peer_is_not_blocked_by_partial_peer() {
+        let listener = TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            accept_authenticated_peer(listener, "configured-key".to_owned()).unwrap()
+        });
+
+        let mut partial = TcpStream::connect(address).unwrap();
+        let _ = read_challenge(&mut partial).unwrap();
+
+        let mut valid = TcpStream::connect(address).unwrap();
+        let nonce = read_challenge(&mut valid).unwrap();
+        send_response(&mut valid, &nonce, "configured-key").unwrap();
+        let valid_address = valid.local_addr().unwrap();
+
+        let (_, authenticated_address) = server.join().unwrap();
+        assert_eq!(authenticated_address, valid_address);
     }
 }

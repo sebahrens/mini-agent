@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod agent;
+mod acp_auth;
 mod auth;
 mod cli;
 mod config;
@@ -64,6 +65,12 @@ async fn run() -> anyhow::Result<()> {
     if cli.resume_provider_safety_check {
         startup::verify_resume_provider_safety()?;
         println!("session resume provider safety check: PASS");
+        return Ok(());
+    }
+
+    if cli.acp_authentication_check {
+        acp_auth::verify_tcp_authentication()?;
+        println!("ACP TCP authentication check: PASS");
         return Ok(());
     }
 

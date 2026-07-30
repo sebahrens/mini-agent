@@ -963,7 +963,7 @@ The following config keys are available:
 | Key           | Type    | Description                                            |
 | ------------- | ------- | ------------------------------------------------------ |
 | `acp_servers` | object  | Named ACP server configurations (see below)            |
-| `acp_host`    | string  | TCP bind host for ACP server (default: stdio mode)     |
+| `acp_host`    | string  | TCP bind host for ACP server (default: loopback when TCP is selected) |
 | `acp_port`    | integer | TCP bind port for ACP server (default: 7243)           |
 
 ACP server configs (in `acp_servers`) support two transport types:
@@ -972,16 +972,67 @@ ACP server configs (in `acp_servers`) support two transport types:
 {
   "acp_servers": {
     "tcp-server": {
+      "type": "tcp",
       "host": "127.0.0.1",
       "port": 7243,
-      "api_key": "optional-key"
+      "api_key": "replace-with-a-long-random-secret"
     }
   }
 }
 ```
 
 When `--acp` is passed without `--acp-host`, zerostack runs in stdio mode
-(the editor spawns it as a subprocess). With `--acp-host`, it listens on TCP.
+(the editor spawns it as a subprocess). Supplying `--acp-host`, `--acp-port`,
+`acp_host`, or `acp_port` selects TCP. If only a port is supplied, the bind
+host defaults to `127.0.0.1`. A non-loopback `acp_host` is an explicit remote
+exposure choice and emits a startup warning.
+
+### ACP TCP peer authentication
+
+TCP mode always fails closed unless an authentication key is available. The
+key is resolved in this order:
+
+1. The non-empty `MINI_AGENT_ACP_API_KEY` environment variable.
+2. The non-empty `api_key` from a TCP entry in `acp_servers` whose `host` and
+   `port` exactly match the resolved listener endpoint.
+
+Environment configuration is recommended so the secret is not stored in the
+configuration file. Restart the server after rotating the key. Stdio mode does
+not use this authentication handshake.
+
+Authentication happens before ACP framing, initialization, or session
+allocation. For each connection the server sends:
+
+```text
+MINI-AGENT-ACP-AUTH/1 CHALLENGE <32-lowercase-hex-nonce>\n
+```
+
+The client responds with:
+
+```text
+MINI-AGENT-ACP-AUTH/1 RESPONSE <hmac-sha256-hex>\n
+```
+
+`hmac-sha256-hex` is lowercase HMAC-SHA-256 using `api_key` as the key and
+the following byte sequence as the message:
+
+```text
+"MINI-AGENT-ACP-AUTH/1" || 0x00 || nonce
+```
+
+Each connection receives a fresh nonce, so a captured response cannot be
+replayed. The comparison is timing-safe; authentication has a five-second
+total deadline, responses are limited to 128 bytes, and at most 16 peers may
+authenticate concurrently. Missing, malformed, oversized, timed-out, invalid,
+and replayed responses are disconnected without entering the ACP parser.
+Authentication errors and configuration debug output never include the key.
+
+The TCP transport does not encrypt ACP traffic or authenticate the server.
+Keep the loopback default where possible. For remote access, use a high-entropy
+key and place the connection inside a trusted TLS, VPN, or SSH tunnel.
+
+`mini-agent --acp-authentication-check` runs a headless loopback check that
+mechanically verifies valid, missing, and replayed credential behavior.
 
 ## TOML configuration
 
