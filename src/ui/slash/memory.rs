@@ -1,13 +1,13 @@
 #[cfg(feature = "memory")]
 use crate::extras::memory::{Mem, WriteMode, WriteTarget};
-use std::io::Read;
-use std::path::{Path, PathBuf};
 use crate::ui::slash::SlashCtx;
 use crate::ui::slash::write_error;
 #[cfg(feature = "memory")]
 use crate::ui::slash::write_ok;
 #[cfg(feature = "memory")]
 use crate::ui::slash::write_result;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     #[cfg(not(feature = "memory"))]
@@ -222,11 +222,7 @@ pub(crate) fn edit_memory_file(path: &Path, editor: &str) -> std::io::Result<boo
     edit_memory_file_with_shell(Path::new("sh"), path, editor)
 }
 
-fn edit_memory_file_with_shell(
-    shell: &Path,
-    path: &Path,
-    editor: &str,
-) -> std::io::Result<bool> {
+fn edit_memory_file_with_shell(shell: &Path, path: &Path, editor: &str) -> std::io::Result<bool> {
     let original = match crate::fs::open_private_file(path) {
         Ok(mut file) => {
             let mut bytes = Vec::new();
@@ -373,7 +369,10 @@ mod tests {
             .map(|entry| entry.file_name())
             .filter(|name| name.to_string_lossy().starts_with(".memory-editor-"))
             .collect::<Vec<_>>();
-        assert!(remaining.is_empty(), "temporary files remain: {remaining:?}");
+        assert!(
+            remaining.is_empty(),
+            "temporary files remain: {remaining:?}"
+        );
     }
 
     fn cleanup(path: &Path) {
