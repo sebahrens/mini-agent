@@ -39,15 +39,12 @@ fn send_reply_or_log_drop<T>(
     reply: oneshot::Sender<T>,
     response: T,
     reply_path: ReplyPath,
-) -> bool {
+) {
     // A closed receiver is expected when the caller's deadline wins the race.
     // Keep the diagnostic independent of response formatting traits and payload contents.
-    if reply.send(response).is_ok() {
-        return true;
+    if reply.send(response).is_err() {
+        log_reply_drop(reply_path);
     }
-
-    log_reply_drop(reply_path);
-    false
 }
 
 #[derive(Clone, Copy)]
@@ -403,13 +400,13 @@ mod tests {
         assert_eq!(ReplyPath::Completed.as_str(), "completed");
 
         let (delivered_reply, delivered_receiver) = oneshot::channel();
-        assert!(send_reply_or_log_drop(
+        send_reply_or_log_drop(
             delivered_reply,
             JsResponse {
                 outcome: JsOutcome::Value("delivered".to_string()),
             },
             ReplyPath::Completed,
-        ));
+        );
         assert_eq!(
             delivered_receiver
                 .await
@@ -420,19 +417,19 @@ mod tests {
 
         let (cancelled_reply, cancelled_receiver) = oneshot::channel::<NoFormattingTraits>();
         drop(cancelled_receiver);
-        assert!(!send_reply_or_log_drop(
+        send_reply_or_log_drop(
             cancelled_reply,
             NoFormattingTraits,
             ReplyPath::EarlyCancel,
-        ));
+        );
 
         let (completed_reply, completed_receiver) = oneshot::channel::<NoFormattingTraits>();
         drop(completed_receiver);
-        assert!(!send_reply_or_log_drop(
+        send_reply_or_log_drop(
             completed_reply,
             NoFormattingTraits,
             ReplyPath::Completed,
-        ));
+        );
     }
 
     #[tokio::test]
