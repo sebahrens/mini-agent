@@ -9,31 +9,27 @@ const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
 const INSTALLED_BUILD_LABEL: &str = "installed build";
-const INSTALLED_BUILD_PROFILE_LABEL: &str = "installed build profile";
+const INSTALLED_DEBUG_ASSERTIONS_LABEL: &str = "installed debug assertions";
 
-fn installed_build_profile() -> &'static str {
+fn installed_debug_assertions() -> &'static str {
     if cfg!(debug_assertions) {
-        "debug profile with assertions enabled"
+        "enabled at compile time"
     } else {
-        "release profile with assertions disabled"
+        "disabled at compile time"
     }
 }
 
 fn installed_build_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_LABEL,
-        format!(
-            "mini-agent {} ({})",
-            env!("CARGO_PKG_VERSION"),
-            installed_build_profile()
-        ),
+        format!("mini-agent {}", env!("CARGO_PKG_VERSION")),
     )
 }
 
-fn installed_build_profile_entry() -> (&'static str, String) {
+fn installed_debug_assertions_entry() -> (&'static str, String) {
     (
-        INSTALLED_BUILD_PROFILE_LABEL,
-        installed_build_profile().to_string(),
+        INSTALLED_DEBUG_ASSERTIONS_LABEL,
+        installed_debug_assertions().to_string(),
     )
 }
 
@@ -251,7 +247,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         "Behavior",
         &[
             installed_build_entry(),
-            installed_build_profile_entry(),
+            installed_debug_assertions_entry(),
             chat_history_path_policy_entry(),
             ("permission-mode", mode.to_string()),
             ("shell", shell.to_string()),
@@ -303,7 +299,7 @@ mod tests {
 
     use super::{
         CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        installed_build_entry, installed_build_profile_entry, write_output,
+        installed_build_entry, installed_debug_assertions_entry, write_output,
     };
 
     struct BrokenPipeWriter;
@@ -341,30 +337,22 @@ mod tests {
     }
 
     #[test]
-    fn config_reports_the_installed_package_version_and_profile() {
+    fn config_reports_the_installed_package_version_and_debug_assertions() {
         assert_eq!(
             installed_build_entry(),
             (
                 "installed build",
-                format!(
-                    "mini-agent {} ({})",
-                    env!("CARGO_PKG_VERSION"),
-                    if cfg!(debug_assertions) {
-                        "debug profile with assertions enabled"
-                    } else {
-                        "release profile with assertions disabled"
-                    }
-                )
+                format!("mini-agent {}", env!("CARGO_PKG_VERSION"))
             )
         );
         assert_eq!(
-            installed_build_profile_entry(),
+            installed_debug_assertions_entry(),
             (
-                "installed build profile",
+                "installed debug assertions",
                 if cfg!(debug_assertions) {
-                    "debug profile with assertions enabled".to_string()
+                    "enabled at compile time".to_string()
                 } else {
-                    "release profile with assertions disabled".to_string()
+                    "disabled at compile time".to_string()
                 }
             )
         );
