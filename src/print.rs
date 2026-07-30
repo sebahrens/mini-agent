@@ -8,16 +8,7 @@ use crate::session;
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
-const INSTALLED_BUILD_LABEL: &str = "installed build";
-const INSTALLED_DEBUG_ASSERTIONS_LABEL: &str = "installed debug assertions";
-
-fn installed_debug_assertions() -> &'static str {
-    if cfg!(debug_assertions) {
-        "enabled at compile time for this binary"
-    } else {
-        "disabled at compile time for this binary"
-    }
-}
+const INSTALLED_BUILD_LABEL: &str = "installed binary provenance";
 
 fn installed_build_entry() -> (&'static str, String) {
     (
@@ -31,13 +22,6 @@ fn installed_build_entry() -> (&'static str, String) {
                 "disabled"
             }
         ),
-    )
-}
-
-fn installed_debug_assertions_entry() -> (&'static str, String) {
-    (
-        INSTALLED_DEBUG_ASSERTIONS_LABEL,
-        installed_debug_assertions().to_string(),
     )
 }
 
@@ -255,7 +239,6 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         "Behavior",
         &[
             installed_build_entry(),
-            installed_debug_assertions_entry(),
             chat_history_path_policy_entry(),
             ("permission-mode", mode.to_string()),
             ("shell", shell.to_string()),
@@ -307,7 +290,7 @@ mod tests {
 
     use super::{
         CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        installed_build_entry, installed_debug_assertions_entry, write_output,
+        installed_build_entry, write_output,
     };
 
     struct BrokenPipeWriter;
@@ -349,7 +332,7 @@ mod tests {
         assert_eq!(
             installed_build_entry(),
             (
-                "installed build",
+                "installed binary provenance",
                 format!(
                     "mini-agent {}; debug assertions {} at compile time",
                     env!("CARGO_PKG_VERSION"),
@@ -359,17 +342,6 @@ mod tests {
                         "disabled"
                     }
                 )
-            )
-        );
-        assert_eq!(
-            installed_debug_assertions_entry(),
-            (
-                "installed debug assertions",
-                if cfg!(debug_assertions) {
-                    "enabled at compile time for this binary".to_string()
-                } else {
-                    "disabled at compile time for this binary".to_string()
-                }
             )
         );
     }
