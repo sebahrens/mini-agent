@@ -936,6 +936,7 @@ mod tests {
         let imported = import_agent_skill(&fixture, &temp.paths()).unwrap();
 
         assert_eq!(imported.manifest.name, "evidence-skill");
+        assert!(!imported.reimported);
         assert_eq!(
             imported.manifest.allowed_tools.as_deref(),
             Some("Bash(example:*)")
