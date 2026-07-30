@@ -559,6 +559,10 @@ async fn model_for_subagent(
         model,
         max_turns,
         ctx.cfg,
+        crate::extras::subagents::builder::SubagentAuthorization::new(
+            ctx.permission.clone(),
+            ctx.ask_tx.clone(),
+        ),
         #[cfg(feature = "archmd")]
         None,
     )

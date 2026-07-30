@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::time::Instant;
 
 use crate::agent::tools::{ToolError, check_perm};
-use crate::extras::subagents::builder;
+use crate::extras::subagents::builder::{self, SubagentAuthorization};
 use crate::extras::subagents::{clone_subagent_event_tx, with_config};
 use crate::extras::truncate::truncate_cjk;
 use crate::permission::ask::AskSender;
@@ -212,12 +212,15 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(not(feature = "archmd"))]
         let architecture: Option<String> = None;
 
+        let authorization =
+            SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone());
         let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
             let client = client.clone();
             let model_name = model_name.clone();
             let event_tx = subagent_event_tx.clone();
             let architecture = architecture.clone();
             let config = config.clone();
+            let authorization = authorization.clone();
             Box::pin(async move {
                 let display_prompt = prompt_text.clone();
                 #[cfg(feature = "hooks")]
@@ -230,8 +233,14 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let execution_prompt = prompt_text;
 
                 let model = client.completion_model(model_name);
-                let agent =
-                    builder::build_explore_agent(model, max_turns, &config, architecture).await;
+                let agent = builder::build_explore_agent(
+                    model,
+                    max_turns,
+                    &config,
+                    authorization,
+                    architecture,
+                )
+                .await;
                 let result = tokio::time::timeout(
                     SUBAGENT_TIMEOUT,
                     agent.run_subagent(

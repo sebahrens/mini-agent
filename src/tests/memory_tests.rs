@@ -895,13 +895,19 @@ fn bak_files_never_surface_in_list_or_search() {
 #[test]
 fn subagent_memory_tool_set_excludes_memory_edit() {
     use crate::extras::memory::MemoryEdit;
-    use crate::extras::subagents::builder::subagent_memory_tools;
+    use crate::extras::subagents::builder::{
+        SubagentAuthorization, subagent_memory_tools,
+    };
     use rig::tool::Tool;
     // Exercise the real production assembly of a subagent's memory tools, not a
     // hand-copied list: build_explore_agent_inner grants exactly what this
     // function returns, so if memory_edit (or any mutating tool) ever leaks into
     // it, this fails.
-    let names: Vec<String> = subagent_memory_tools().iter().map(|t| t.name()).collect();
+    let authorization = SubagentAuthorization::new(None, None);
+    let names: Vec<String> = subagent_memory_tools(&authorization)
+        .iter()
+        .map(|t| t.name())
+        .collect();
     assert!(
         !names.iter().any(|n| n == MemoryEdit::NAME),
         "subagents must not receive memory_edit; got {names:?}"
@@ -910,6 +916,50 @@ fn subagent_memory_tool_set_excludes_memory_edit() {
     // distinct tool that is simply never added.
     assert_eq!(names, vec!["memory_read", "memory_search"]);
     assert_eq!(MemoryEdit::NAME, "memory_edit");
+}
+
+#[tokio::test]
+async fn subagent_filesystem_permissions_memory_tools_inherit_parent_denial() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::extras::subagents::builder::{
+        SubagentAuthorization, subagent_memory_tools,
+    };
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{
+        Action, PermissionConfig, PermissionConfigs, SecurityMode,
+    };
+
+    let config = PermissionConfig {
+        default: Some(Action::Deny),
+        ..PermissionConfig::default()
+    };
+    let checker = PermissionChecker::new(
+        &PermissionConfigs::from(config),
+        SecurityMode::Standard,
+        std::env::current_dir().ok(),
+        Some(vec!["standard".to_string()]),
+    );
+    let authorization =
+        SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), None);
+
+    for tool in subagent_memory_tools(&authorization) {
+        let input = match tool.name().as_str() {
+            "memory_read" => serde_json::json!({ "source": "long_term" }),
+            "memory_search" => serde_json::json!({ "query": "secret" }),
+            other => panic!("unexpected child memory tool: {other}"),
+        };
+        let error = tool
+            .call(input.to_string())
+            .await
+            .expect_err("child memory tool must inherit parent denial")
+            .to_string();
+        assert!(
+            error.contains("Permission denied"),
+            "{} bypassed parent memory policy: {error}",
+            tool.name(),
+        );
+    }
 }
 
 // ---- search -----------------------------------------------------------------
