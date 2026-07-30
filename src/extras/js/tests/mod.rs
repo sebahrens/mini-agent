@@ -426,12 +426,7 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
         .name("js-reply-drop-test".into())
         .stack_size(THREAD_STACK)
         .spawn(move || {
-            js_thread_main(
-                request_rx,
-                Sandbox::new(false, "bwrap"),
-                bridge,
-                runtime,
-            );
+            js_thread_main(request_rx, Sandbox::new(false, "bwrap"), bridge, runtime);
         })
         .expect("failed to spawn JS reply-drop test thread");
 
@@ -473,6 +468,8 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
     assert_eq!(recovery.outcome, JsOutcome::Value("42".to_string()));
 
     drop(request_tx);
-    js_thread.join().expect("JS reply-drop test thread panicked");
+    js_thread
+        .join()
+        .expect("JS reply-drop test thread panicked");
     owner.shutdown();
 }

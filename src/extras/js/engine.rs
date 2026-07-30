@@ -11,10 +11,7 @@ use crate::sandbox::Sandbox;
 
 const MAX_PENDING_JOBS: usize = 10_000;
 
-fn send_reply_or_log_drop(
-    reply: oneshot::Sender<JsResponse>,
-    outcome: JsOutcome,
-) {
+fn send_reply_or_log_drop(reply: oneshot::Sender<JsResponse>, outcome: JsOutcome) {
     // The send error owns JsResponse; keep this diagnostic independent of its formatting traits.
     if reply.send(JsResponse { outcome }).is_err() {
         tracing::debug!("JS engine reply receiver dropped before response delivery");
