@@ -35,7 +35,11 @@ fn log_reply_drop(reply_path: ReplyPath) {
     );
 }
 
-fn send_reply_or_log_drop<T>(reply: oneshot::Sender<T>, response: T, reply_path: ReplyPath) {
+fn send_reply_or_log_drop(
+    reply: oneshot::Sender<JsResponse>,
+    response: JsResponse,
+    reply_path: ReplyPath,
+) {
     // A closed receiver is expected when the caller's deadline wins the race.
     // Keep the diagnostic independent of response formatting traits and payload contents.
     if reply.send(response).is_err() {
@@ -386,8 +390,6 @@ mod tests {
 
     #[tokio::test]
     async fn js_reply_delivery_handles_delivered_and_dropped_receivers() {
-        struct NoFormattingTraits;
-
         assert_eq!(ReplyPath::EarlyCancel.as_str(), "early_cancel");
         assert_eq!(
             ReplyPath::AbandonedBeforeExecution.as_str(),
@@ -411,13 +413,25 @@ mod tests {
             JsOutcome::Value("delivered".to_string())
         );
 
-        let (cancelled_reply, cancelled_receiver) = oneshot::channel::<NoFormattingTraits>();
+        let (cancelled_reply, cancelled_receiver) = oneshot::channel();
         drop(cancelled_receiver);
-        send_reply_or_log_drop(cancelled_reply, NoFormattingTraits, ReplyPath::EarlyCancel);
+        send_reply_or_log_drop(
+            cancelled_reply,
+            JsResponse {
+                outcome: JsOutcome::Error("execution cancelled".to_string()),
+            },
+            ReplyPath::EarlyCancel,
+        );
 
-        let (completed_reply, completed_receiver) = oneshot::channel::<NoFormattingTraits>();
+        let (completed_reply, completed_receiver) = oneshot::channel();
         drop(completed_receiver);
-        send_reply_or_log_drop(completed_reply, NoFormattingTraits, ReplyPath::Completed);
+        send_reply_or_log_drop(
+            completed_reply,
+            JsResponse {
+                outcome: JsOutcome::Value("completed".to_string()),
+            },
+            ReplyPath::Completed,
+        );
     }
 
     #[tokio::test]
