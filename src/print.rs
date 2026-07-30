@@ -324,7 +324,7 @@ mod tests {
             chat_history_path_policy_entry(),
             (
                 "chat history path policy",
-                crate::paths::PRIVATE_PATH_LINK_POLICY.to_string()
+                "reject symlinked path components".to_string()
             )
         );
     }

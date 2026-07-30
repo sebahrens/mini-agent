@@ -20,7 +20,7 @@ pub use portable::{digest_filename, opaque_name, validate_portable_component};
 
 const APP_COMPONENT: &str = "zerostack";
 const MIGRATION_VERSION: u32 = 1;
-pub(crate) const PRIVATE_PATH_LINK_POLICY: &str = "reject symlinked parents";
+pub(crate) const PRIVATE_PATH_LINK_POLICY: &str = "reject symlinked path components";
 
 static PROCESS_PATHS: OnceLock<AppPaths> = OnceLock::new();
 static DISABLED_ARTIFACTS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
@@ -1292,7 +1292,7 @@ fn reject_link_components(path: &Path) -> io::Result<()> {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
-                        "migration path contains a symbolic link or reparse point: {}",
+                        "private paths {PRIVATE_PATH_LINK_POLICY}: {}",
                         component.display()
                     ),
                 ));
@@ -2093,10 +2093,11 @@ mod tests {
             selected: None,
         };
 
-        assert!(matches!(
-            migrate_legacy_path(&request),
-            Err(LegacyMigrationError::Io { .. })
-        ));
+        let error = migrate_legacy_path(&request).unwrap_err();
+        let LegacyMigrationError::Io { source, .. } = error else {
+            panic!("expected an I/O error for a symlinked parent");
+        };
+        assert!(source.to_string().contains(PRIVATE_PATH_LINK_POLICY));
         assert!(!canonical.exists());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
