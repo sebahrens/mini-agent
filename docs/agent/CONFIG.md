@@ -1321,7 +1321,7 @@ modules.
 ### Custom log file (`--log-file`)
 
 ```bash
-zerostack --log-file /tmp/debug.log
+mini-agent --log-file /tmp/debug.log
 ```
 
 Writes full trace-level logs to the specified path instead of the default
@@ -1331,7 +1331,7 @@ effect on the path, since `--log-file` takes precedence).
 ### Custom stderr log level (`--log-level`)
 
 ```bash
-zerostack --log-level debug
+mini-agent --log-level debug
 ```
 
 Sets the minimum level for stderr output. Accepted values: `trace`, `debug`,
@@ -1343,9 +1343,9 @@ The standard `RUST_LOG` environment variable is still supported for backward
 compatibility:
 
 ```bash
-RUST_LOG=zerostack=debug zerostack          # debug level for zerostack
-RUST_LOG=debug,rig=off zerostack             # debug for everything except rig
-RUST_LOG=zerostack::agent::tools=trace zerostack  # trace only tool execution
+RUST_LOG=zerostack=debug mini-agent          # debug level for zerostack
+RUST_LOG=debug,rig=off mini-agent             # debug for everything except rig
+RUST_LOG=zerostack::agent::tools=trace mini-agent  # trace only tool execution
 ```
 
 Priority (highest wins): `--log-level` > `RUST_LOG` env > default `warn,rig=off`.

@@ -116,7 +116,7 @@ impl AuthResolver {
         }
 
         anyhow::bail!(
-            "No API key found. Set the {} environment variable, add it to config.api_keys under '{}' or '{}', pass --api-key, or run `zerostack --setup` to configure interactively.",
+            "No API key found. Set the {} environment variable, add it to config.api_keys under '{}' or '{}', pass --api-key, or run `mini-agent --setup` to configure interactively.",
             env_var,
             self.provider_slug(),
             self.custom_provider_name

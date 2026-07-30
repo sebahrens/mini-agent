@@ -43,7 +43,7 @@ pub fn resolve_provider_config(
     if let Some(custom) = custom_providers.get(name) {
         let kind = ProviderKind::from_name(&custom.provider_type).ok_or_else(|| {
             anyhow::anyhow!(
-                "Unknown provider type: {}. Run `zerostack --setup` to configure providers.",
+                "Unknown provider type: {}. Run `mini-agent --setup` to configure providers.",
                 custom.provider_type
             )
         })?;
@@ -56,7 +56,7 @@ pub fn resolve_provider_config(
     }
     let kind = ProviderKind::from_name(name).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: '{}'. Supported: openrouter, openai, anthropic, gemini, ollama. Run `zerostack --setup` to configure providers.",
+            "Unknown provider: '{}'. Supported: openrouter, openai, anthropic, gemini, ollama. Run `mini-agent --setup` to configure providers.",
             name
         )
     })?;

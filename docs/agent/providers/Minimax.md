@@ -55,10 +55,10 @@ Anthropic client appends `/v1/messages` when it sends a request, so do not add
 Select any route and model with the standard CLI flags:
 
 ```bash
-zerostack --provider minimax-global-openai --model MiniMax-M3
-zerostack --provider minimax-cn-openai --model MiniMax-M2.7
-zerostack --provider minimax-global-anthropic --model MiniMax-M3
-zerostack --provider minimax-cn-anthropic --model MiniMax-M2.7
+mini-agent --provider minimax-global-openai --model MiniMax-M3
+mini-agent --provider minimax-cn-openai --model MiniMax-M2.7
+mini-agent --provider minimax-global-anthropic --model MiniMax-M3
+mini-agent --provider minimax-cn-anthropic --model MiniMax-M2.7
 ```
 
 ## Model Configuration

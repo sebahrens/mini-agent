@@ -25,8 +25,8 @@ requirements:
 
 test:
   commands:
-    - zerostack --help
-    - zerostack --version
+    - mini-agent --help
+    - mini-agent --version
     - test -f ${PREFIX}/THIRDPARTY.yml
 
 about:

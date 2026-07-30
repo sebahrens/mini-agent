@@ -43,7 +43,7 @@ rustPlatform.buildRustPackage {
     description = manifest.description;
     license = lib.licenses.gpl3Only;
     homepage = manifest.homepage;
-    mainProgram = "zerostack";
+    mainProgram = "mini-agent";
     platforms = with lib.platforms; linux ++ darwin;
   };
 }

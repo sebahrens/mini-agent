@@ -17,6 +17,13 @@ JavaScript engine.
 The old nested `zerostack/` layout was flattened. Production source and the workspace
 `Cargo.toml` are at the repository root.
 
+## Canonical executable
+
+The Cargo package, installed CLI, and every release archive use the executable name
+`mini-agent`. Target-specific full and lite archives are named
+`mini-agent[-lite]-<target>.tar.gz`, and each archive contains exactly one executable at
+`mini-agent`.
+
 ## Documentation authority
 
 Start with the [normative specification index](docs/specs/00-index.md). It defines corpus

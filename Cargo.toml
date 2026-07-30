@@ -16,6 +16,9 @@ license = "GPL-3.0-only"
 readme = "README.md"
 keywords = ["ai", "cli", "dev"]
 
+[package.metadata.release]
+canonical-binary = "mini-agent"
+
 [features]
 default = ['loop', 'git-worktree', 'mcp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export']
 status-signals = []

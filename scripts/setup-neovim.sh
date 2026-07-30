@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 #
-# setup-neovim.sh — Configure Neovim with CodeCompanion.nvim + zerostack ACP
+# setup-neovim.sh — Configure Neovim with CodeCompanion.nvim + mini-agent ACP
 #
 # Usage:
 #   bash setup-neovim.sh
 #
-#   # Skip zerostack install check:
-#   bash setup-neovim.sh --skip-zerostack
+#   # Skip mini-agent install check:
+#   bash setup-neovim.sh --skip-mini-agent
 #
 set -euo pipefail
 
-SKIP_ZEROSTACK=false
+SKIP_MINI_AGENT=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-zerostack)
-            SKIP_ZEROSTACK=true
+        --skip-mini-agent|--skip-zerostack)
+            SKIP_MINI_AGENT=true
             shift
             ;;
         --help|-h)
             cat <<EOF
-Usage: setup-neovim.sh [--skip-zerostack]
+Usage: setup-neovim.sh [--skip-mini-agent]
 
 Options:
-  --skip-zerostack   Skip the zerostack installation check
+  --skip-mini-agent  Skip the mini-agent installation check
   --help, -h         Show this message
 EOF
             exit 0
@@ -39,7 +39,7 @@ LAZY_PATH="${NVIM_CONFIG_DIR}/lazy-lock.json"
 CC_DIR="${NVIM_CONFIG_DIR}/lua/plugins"
 CC_FILE="${CC_DIR}/codecompanion.lua"
 
-echo "=== zerostack + Neovim ACP Setup ==="
+echo "=== mini-agent + Neovim ACP Setup ==="
 
 # ---- 1. Check neovim ----
 if ! command -v nvim &>/dev/null; then
@@ -63,18 +63,18 @@ if ! command -v git &>/dev/null; then
     exit 1
 fi
 
-# ---- 3. Check zerostack ----
-if ! $SKIP_ZEROSTACK; then
-    if command -v zerostack &>/dev/null; then
-        echo "Found zerostack at $(which zerostack)"
-        if ! zerostack --help 2>&1 | grep -q '\-\-acp'; then
-            echo "WARNING: This zerostack build does not include ACP support." >&2
-            echo "  Rebuild with: cargo install zerostack --features acp" >&2
+# ---- 3. Check mini-agent ----
+if ! $SKIP_MINI_AGENT; then
+    if command -v mini-agent &>/dev/null; then
+        echo "Found mini-agent at $(which mini-agent)"
+        if ! mini-agent --help 2>&1 | grep -q '\-\-acp'; then
+            echo "WARNING: This mini-agent build does not include ACP support." >&2
+            echo "  Rebuild with: cargo install mini-agent --features acp" >&2
         fi
     else
-        echo "zerostack not found in PATH." >&2
-        echo "  Install from source: cargo install zerostack --features acp" >&2
-        echo "  Or run with --skip-zerostack to skip this check." >&2
+        echo "mini-agent not found in PATH." >&2
+        echo "  Install from source: cargo install mini-agent --features acp" >&2
+        echo "  Or run with --skip-mini-agent to skip this check." >&2
         exit 1
     fi
 fi
@@ -171,7 +171,7 @@ return {
                             },
                             commands = {
                                 default = {
-                                    "zerostack",
+                                    "mini-agent",
                                     "--acp",
                                 },
                             },
@@ -234,8 +234,8 @@ echo "  1. Launch neovim and let lazy.nvim install plugins"
 echo "  2. Open a chat with: <leader>cc (default: \\cc)"
 echo "  3. Select the 'zerostack' adapter in the chat buffer"
 echo ""
-echo "Ensure zerostack is built with ACP support:"
-echo "  cargo install zerostack --features acp"
+echo "Ensure mini-agent is built with ACP support:"
+echo "  cargo install mini-agent --features acp"
 echo ""
 echo "You also need a provider configured (API keys, model, etc.)."
-echo "See: zerostack --help"
+echo "See: mini-agent --help"

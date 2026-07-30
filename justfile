@@ -90,8 +90,8 @@ aur-checksums:
     VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
     echo "Computing SHA256 sums for v${VERSION}..."
 
-    SHA_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/zerostack-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_AARCH64=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/zerostack-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
+    SHA_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
+    SHA_AARCH64=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
     SHA_LICENSE=$(curl -sL "https://raw.githubusercontent.com/gi-dellav/zerostack/v${VERSION}/LICENSE" | sha256sum | cut -d' ' -f1)
 
     sed -i "s/sha256sums_x86_64=('.*' '.*')/sha256sums_x86_64=('${SHA_X86}' '${SHA_LICENSE}')/" packaging/aur/PKGBUILD
@@ -115,12 +115,12 @@ conda-bin-checksums:
     VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
     echo "Computing SHA256 sums for v${VERSION}..."
 
-    SHA_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/zerostack-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_AARCH64=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/zerostack-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
+    SHA_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
+    SHA_AARCH64=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
     SHA_LICENSE=$(curl -sL "https://raw.githubusercontent.com/gi-dellav/zerostack/v${VERSION}/LICENSE" | sha256sum | cut -d' ' -f1)
 
-    sed -i "/zerostack-x86_64-unknown-linux-musl.tar.gz/{n;s/sha256: .*/sha256: ${SHA_X86}/}" packaging/conda/zerostack-bin/meta.yaml
-    sed -i "/zerostack-aarch64-unknown-linux-musl.tar.gz/{n;s/sha256: .*/sha256: ${SHA_AARCH64}/}" packaging/conda/zerostack-bin/meta.yaml
+    sed -i "/mini-agent-x86_64-unknown-linux-musl.tar.gz/{n;s/sha256: .*/sha256: ${SHA_X86}/}" packaging/conda/zerostack-bin/meta.yaml
+    sed -i "/mini-agent-aarch64-unknown-linux-musl.tar.gz/{n;s/sha256: .*/sha256: ${SHA_AARCH64}/}" packaging/conda/zerostack-bin/meta.yaml
     sed -i "/raw.githubusercontent.com.*LICENSE/{n;s/sha256: .*/sha256: ${SHA_LICENSE}/}" packaging/conda/zerostack-bin/meta.yaml
 
     echo "Updated SHA256 sums in packaging/conda/zerostack-bin/meta.yaml"
@@ -132,15 +132,15 @@ homebrew-checksums:
     VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
     echo "Computing SHA256 sums for v${VERSION}..."
 
-    SHA_DARWIN_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/zerostack-x86_64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_DARWIN_ARM=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/zerostack-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_LINUX_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/zerostack-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_LINUX_ARM=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/zerostack-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
+    SHA_DARWIN_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-x86_64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
+    SHA_DARWIN_ARM=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
+    SHA_LINUX_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
+    SHA_LINUX_ARM=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
 
-    sed -i "/zerostack-x86_64-apple-darwin.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_DARWIN_X86}\"/}" packaging/homebrew/zerostack.rb
-    sed -i "/zerostack-aarch64-apple-darwin.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_DARWIN_ARM}\"/}" packaging/homebrew/zerostack.rb
-    sed -i "/zerostack-x86_64-unknown-linux-musl.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_LINUX_X86}\"/}" packaging/homebrew/zerostack.rb
-    sed -i "/zerostack-aarch64-unknown-linux-musl.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_LINUX_ARM}\"/}" packaging/homebrew/zerostack.rb
+    sed -i "/mini-agent-x86_64-apple-darwin.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_DARWIN_X86}\"/}" packaging/homebrew/zerostack.rb
+    sed -i "/mini-agent-aarch64-apple-darwin.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_DARWIN_ARM}\"/}" packaging/homebrew/zerostack.rb
+    sed -i "/mini-agent-x86_64-unknown-linux-musl.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_LINUX_X86}\"/}" packaging/homebrew/zerostack.rb
+    sed -i "/mini-agent-aarch64-unknown-linux-musl.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_LINUX_ARM}\"/}" packaging/homebrew/zerostack.rb
 
     echo "Updated SHA256 sums in packaging/homebrew/zerostack.rb"
 

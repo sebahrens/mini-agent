@@ -36,7 +36,7 @@ use clap::Parser;
 #[cfg_attr(not(feature = "multithread"), tokio::main(flavor = "current_thread"))]
 async fn main() -> anyhow::Result<()> {
     run().await.context(
-        "This error might derive from an incomplete configuration: run `zerostack --setup` to configure your providers and models interactively, or `zerostack --tutor` to see the getting started guide",
+        "This error might derive from an incomplete configuration: run `mini-agent --setup` to configure your providers and models interactively, or `mini-agent --tutor` to see the getting started guide",
     )
 }
 

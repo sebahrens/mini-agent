@@ -21,13 +21,13 @@ Select a provider via the config file, the `--provider` CLI flag, or the
 `ZS_PROVIDER` environment variable:
 
 ```
-zerostack --provider anthropic
+mini-agent --provider anthropic
 ```
 
 The model is set with `--model` or `ZS_MODEL`:
 
 ```
-zerostack --provider openai --model gpt-4o
+mini-agent --provider openai --model gpt-4o
 ```
 
 ## Provider Recipes

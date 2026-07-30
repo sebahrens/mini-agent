@@ -6,6 +6,14 @@ description: "How zerostack releases are published: crates.io, Homebrew, AUR, Co
 
 This guide covers the full release workflow: bumping the version, tagging, publishing to crates.io, and updating downstream package managers.
 
+## Canonical executable and archive layout
+
+Cargo and every package channel install the public executable as `mini-agent`. Full archives are
+named `mini-agent-<target>.tar.gz`; lite archives are named
+`mini-agent-lite-<target>.tar.gz`. Every archive contains exactly one top-level executable named
+`mini-agent`, which the release workflow extracts into a clean directory and runs with
+`--version` before upload.
+
 ## Prerequisites
 
 - [just](https://github.com/casey/just) command runner

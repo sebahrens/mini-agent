@@ -24,7 +24,7 @@ brew install zerostack
 
 # ----
 # Cargo
-cargo install zerostack
+cargo install mini-agent
 ```
 
 ## 2. Setting up the provider
@@ -61,7 +61,7 @@ Then, you can change your configuration file (`~/.local/share/zerostack/config.t
 If you are using a provider that's not your default one, use the `--provider` CLI flag:
 
 ```bash
-zerostack --provider anthropic
+mini-agent --provider anthropic
 ```
 
 See [Providers](PROVIDERS.md) for custom endpoints, header configuration, and prompt caching details.
@@ -87,7 +87,7 @@ From there, you can use the `model` field in the configuration file to set the d
 
 ## 5. Start a Session
 
-You are now ready to launch zerostack! Just run `zerostack` and look at the beautiful TUI; type a message, press Enter and the agent will responds with streaming tokens.
+You are now ready to launch zerostack! Just run `mini-agent` and look at the beautiful TUI; type a message, press Enter and the agent will responds with streaming tokens.
 
 It can read, write, edit, and search your codebase, while giving full control to the user on what it's allowed to do.
 

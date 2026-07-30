@@ -91,7 +91,7 @@ Requires the `hooks` feature (default-off; see [CONFIG.md](CONFIG.md#hooks)).
 | ------- | ----------- |
 | `/hooks` | Show whether a hook dispatcher is installed and, if so, each configured event with its handler count. |
 
-Run `zerostack --hooks-test <tool> [--hooks-test-input <json>]` from the
+Run `mini-agent --hooks-test <tool> [--hooks-test-input <json>]` from the
 shell (not a slash command) to dry-run `PreToolUse` hooks for a tool without
 starting a session or making a model call. See
 [CONFIG.md](CONFIG.md#hooks) for the full hooks configuration reference.

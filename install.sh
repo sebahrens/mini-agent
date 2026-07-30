@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Install zerostack from GitHub Releases.
+# Install mini-agent from GitHub Releases.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/gi-dellav/zerostack/main/install.sh | bash
@@ -11,6 +11,7 @@
 set -euo pipefail
 
 REPO="gi-dellav/zerostack"
+BINARY_NAME="mini-agent"
 DEFAULT_DIR="${HOME}/.local/bin"
 
 usage() {
@@ -72,42 +73,33 @@ case "$ARCH" in
         ;;
 esac
 
-TARGET="zerostack-${ARCH}-${OS}"
+ASSET_NAME="${BINARY_NAME}-${ARCH}-${OS}"
 
 # ---- download ----
-URL="https://github.com/${REPO}/releases/latest/download/${TARGET}.tar.gz"
+URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}.tar.gz"
 
-echo "Downloading zerostack latest (${TARGET})..."
+echo "Downloading ${BINARY_NAME} latest (${ASSET_NAME})..."
 echo "  -> ${URL}"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-curl -fsSL --max-time 300 -o "${TMPDIR}/${TARGET}.tar.gz" "$URL"
+curl -fsSL --max-time 300 -o "${TMPDIR}/${ASSET_NAME}.tar.gz" "$URL"
 
 # ---- install ----
 mkdir -p "$INSTALL_DIR"
 
-tar xzf "${TMPDIR}/${TARGET}.tar.gz" -C "$TMPDIR"
+tar xzf "${TMPDIR}/${ASSET_NAME}.tar.gz" -C "$TMPDIR"
 
-# The tarball may contain just the binary or a prefixed name
-if [[ -f "${TMPDIR}/zerostack" ]]; then
-    cp "${TMPDIR}/zerostack" "${INSTALL_DIR}/zerostack"
-elif [[ -f "${TMPDIR}/${TARGET}" ]]; then
-    cp "${TMPDIR}/${TARGET}" "${INSTALL_DIR}/zerostack"
-else
-    # search for any zerostack binary in the extracted tree
-    BIN="$(find "${TMPDIR}" -type f -name zerostack -o -name "zerostack-*" | head -1)"
-    if [[ -z "$BIN" ]]; then
-        echo "Error: could not find zerostack binary in the archive." >&2
-        exit 1
-    fi
-    cp "$BIN" "${INSTALL_DIR}/zerostack"
+if [[ ! -f "${TMPDIR}/${BINARY_NAME}" ]]; then
+    echo "Error: archive does not contain the canonical ${BINARY_NAME} executable." >&2
+    exit 1
 fi
+cp "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 
-chmod +x "${INSTALL_DIR}/zerostack"
+chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 
-echo "Installed zerostack to ${INSTALL_DIR}/zerostack"
+echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
 
 # ---- path hint ----
 if ! echo "$PATH" | grep -qF "$INSTALL_DIR"; then

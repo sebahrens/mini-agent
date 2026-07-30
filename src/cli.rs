@@ -5,7 +5,7 @@ use crate::config;
 use crate::config::types::EditSystem;
 
 #[derive(Parser, Debug, Default, Clone)]
-#[command(name = "zerostack", version, about = "Minimal coding agent")]
+#[command(name = "mini-agent", version, about = "Minimal coding agent")]
 pub struct Cli {
     #[arg(short = 'p', long = "print", help = "Print response and exit")]
     pub print: bool,
@@ -293,6 +293,18 @@ pub struct Cli {
 
     #[arg(help = "Prompt message(s)")]
     pub message: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn command_name_matches_canonical_cargo_binary() {
+        assert_eq!(Cli::command().get_name(), "mini-agent");
+    }
 }
 
 impl Cli {
