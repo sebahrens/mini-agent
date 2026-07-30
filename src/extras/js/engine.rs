@@ -14,7 +14,7 @@ const MAX_PENDING_JOBS: usize = 10_000;
 fn send_reply(reply: oneshot::Sender<JsResponse>, outcome: JsOutcome, request_state: &'static str) {
     if reply.send(JsResponse { outcome }).is_err() {
         tracing::debug!(
-            request_state,
+            request_state = request_state,
             "JS engine reply receiver dropped before response delivery"
         );
     }
