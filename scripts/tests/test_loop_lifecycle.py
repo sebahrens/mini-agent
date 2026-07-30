@@ -122,8 +122,12 @@ set -eu
 {fixture_function}
 
 path_is_cargo_verified_fixture src/extras/skills/fixtures/evidence-skill/SKILL.md
+path_is_cargo_verified_fixture src/extras/skills/fixtures/evidence-skill/data/example.txt
 if path_is_cargo_verified_fixture docs/fixtures/example.md; then
     exit 42
+fi
+if path_is_cargo_verified_fixture src/other/fixtures/unverified.txt; then
+    exit 43
 fi
 """
 

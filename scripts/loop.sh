@@ -2022,7 +2022,7 @@ decide_build_outcome() {
 
 path_is_cargo_verified_fixture() {
     case "$1" in
-        src/*/fixtures/*) return 0 ;;
+        src/extras/skills/fixtures/*) return 0 ;;
         *) return 1 ;;
     esac
 }
