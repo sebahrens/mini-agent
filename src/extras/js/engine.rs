@@ -26,11 +26,7 @@ impl ReplyPath {
     }
 }
 
-fn send_reply_or_log_drop<T>(
-    reply: oneshot::Sender<T>,
-    response: T,
-    reply_path: ReplyPath,
-) {
+fn send_reply_or_log_drop<T>(reply: oneshot::Sender<T>, response: T, reply_path: ReplyPath) {
     // A closed receiver is expected when the caller's deadline wins the race.
     // Keep the diagnostic independent of response formatting traits and payload contents.
     if reply.send(response).is_err() {
