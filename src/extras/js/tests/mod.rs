@@ -325,11 +325,7 @@ async fn js_outcome_mapping() {
     );
     assert_recovers();
 
-    for (code, expected) in [
-        ("throw 'x'", "x"),
-        ("throw 1", "1"),
-        ("throw null", "null"),
-    ] {
+    for (code, expected) in [("throw 'x'", "x"), ("throw 1", "1"), ("throw null", "null")] {
         assert_eq!(
             run(code, normal_timeout, 10_000),
             JsOutcome::Error(expected.to_string())
@@ -337,23 +333,19 @@ async fn js_outcome_mapping() {
         assert_recovers();
     }
 
-    let object_error = match run(
-        "throw new Error('object failure')",
-        normal_timeout,
-        10_000,
-    ) {
+    let object_error = match run("throw new Error('object failure')", normal_timeout, 10_000) {
         JsOutcome::Error(error) => error,
         outcome => panic!("object throw did not return JsOutcome::Error: {outcome:?}"),
     };
     assert!(object_error.starts_with("object failure\n"));
-    assert!(object_error.lines().any(|line| line.trim().starts_with("at ")));
+    assert!(
+        object_error
+            .lines()
+            .any(|line| line.trim().starts_with("at "))
+    );
     assert_recovers();
 
-    match run(
-        "throw new Error('out of memory')",
-        normal_timeout,
-        10_000,
-    ) {
+    match run("throw new Error('out of memory')", normal_timeout, 10_000) {
         JsOutcome::Error(_) => {}
         outcome => {
             panic!("ordinary errors mentioning memory were misclassified as OOM: {outcome:?}")
