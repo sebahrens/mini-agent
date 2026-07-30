@@ -420,8 +420,7 @@ async fn test_drop_recovery_after_timeout() {
         .await
         .expect("timeout call failed");
     assert_eq!(
-        timeout_result,
-        "JS error: execution timed out (30s limit exceeded)",
+        timeout_result, "JS error: execution timed out (30s limit exceeded)",
         "first call should time out: {timeout_result}"
     );
 
