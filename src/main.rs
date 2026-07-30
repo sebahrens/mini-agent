@@ -48,6 +48,12 @@ async fn run() -> anyhow::Result<()> {
     paths::install_process_paths(&app_paths)?;
     paths::prepare_storage_roots(&app_paths)?;
 
+    if cli.config_preservation_check {
+        config::verify_config_preservation(&app_paths)?;
+        println!("config preservation check: PASS");
+        return Ok(());
+    }
+
     let is_interactive = !cli.print;
     #[cfg(feature = "acp")]
     let is_interactive = is_interactive && !cli.acp_enabled;

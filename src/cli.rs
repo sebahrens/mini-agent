@@ -22,6 +22,12 @@ pub struct Cli {
     #[arg(long = "print-config", help = "Print resolved configuration and exit")]
     pub print_config: bool,
 
+    #[arg(
+        long = "config-preservation-check",
+        help = "Verify config saves preserve unavailable and unknown fields, then exit"
+    )]
+    pub config_preservation_check: bool,
+
     #[arg(long = "setup", help = "Interactive setup wizard")]
     pub setup: bool,
 

@@ -60,6 +60,70 @@ pub(crate) fn serialize_config_content(path: &Path, cfg: &Config) -> io::Result<
     }
 }
 
+fn verify_config_preservation_at(path: &Path) -> io::Result<()> {
+    const FIXTURE: &str = r#"
+model = "before-check"
+temperature = 0.7
+future_scalar = "keep-me"
+future_array = [1, "two", true]
+
+[future_table]
+nested = { flag = true, values = [3, 4] }
+
+[acp_servers.worker]
+type = "stdio"
+"#;
+    const PRESERVED_KEYS: [&str; 4] = [
+        "future_scalar",
+        "future_array",
+        "future_table",
+        "acp_servers",
+    ];
+
+    atomic_config_write(path, FIXTURE)?;
+    let before_content = read_config_content(path)?;
+    let before: toml::Value = toml::from_str(&before_content).map_err(io::Error::other)?;
+    let mut cfg = parse_config_content(path, &before_content)?;
+    cfg.model = Some(CompactString::new("after-check"));
+    cfg.temperature = None;
+
+    atomic_config_write(path, &serialize_config_content(path, &cfg)?)?;
+    let after_content = read_config_content(path)?;
+    let after: toml::Value = toml::from_str(&after_content).map_err(io::Error::other)?;
+
+    let owned_fields_match = after.get("model").and_then(toml::Value::as_str)
+        == Some("after-check")
+        && after.get("temperature").is_none();
+    let preserved_fields_match = PRESERVED_KEYS
+        .iter()
+        .all(|key| after.get(*key) == before.get(*key));
+    let reloaded = parse_config_content(path, &after_content)?;
+    let reload_matches =
+        reloaded.model.as_deref() == Some("after-check") && reloaded.temperature.is_none();
+
+    if owned_fields_match && preserved_fields_match && reload_matches {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config preservation check failed",
+        ))
+    }
+}
+
+pub(crate) fn verify_config_preservation(paths: &AppPaths) -> io::Result<()> {
+    let path = paths.cache_dir.join(format!(
+        ".config-preservation-check-{}.toml",
+        std::process::id()
+    ));
+    let result = verify_config_preservation_at(&path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => result,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => result,
+        Err(cleanup_error) => result.and(Err(cleanup_error)),
+    }
+}
+
 fn path_entry_exists(path: &Path) -> io::Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -543,4 +607,34 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
     atomic_config_write(&path, &serialize_config_content(&path, &cfg)?)?;
     tracing::debug!("config saved to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod preservation_check_tests {
+    use super::verify_config_preservation_at;
+
+    #[test]
+    fn installed_binary_preservation_check_uses_atomic_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-config-preservation-check-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        verify_config_preservation_at(&path).unwrap();
+
+        let saved: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("future_scalar").and_then(toml::Value::as_str),
+            Some("keep-me")
+        );
+        assert_eq!(
+            saved.get("model").and_then(toml::Value::as_str),
+            Some("after-check")
+        );
+        assert!(saved.get("temperature").is_none());
+
+        std::fs::remove_file(path).unwrap();
+    }
 }
