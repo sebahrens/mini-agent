@@ -175,9 +175,10 @@ fn apply_resume_provider_decision(
     session.input_token_cost = 0.0;
     session.output_token_cost = 0.0;
     let qm = config::quick_models_map(cfg);
-    if let Some(model_cfg) = qm.values().find(|model_cfg| {
-        model_cfg.provider == target.provider && model_cfg.model == target.model
-    }) {
+    if let Some(model_cfg) = qm
+        .values()
+        .find(|model_cfg| model_cfg.provider == target.provider && model_cfg.model == target.model)
+    {
         session.input_token_cost = model_cfg.input_token_cost;
         session.output_token_cost = model_cfg.output_token_cost;
     } else if let Some((input_cost, output_cost)) =
@@ -186,11 +187,7 @@ fn apply_resume_provider_decision(
         session.input_token_cost = input_cost;
         session.output_token_cost = output_cost;
     }
-    session.update_context_window(cfg.resolve_context_window(
-        &target.provider,
-        &target.model,
-        &qm,
-    ));
+    session.update_context_window(cfg.resolve_context_window(&target.provider, &target.model, &qm));
 }
 
 pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
@@ -203,8 +200,7 @@ pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
     let cfg = Config::default();
     let restored = resolve_resume_provider_decision(&changed_defaults, &cfg, &saved)?;
     anyhow::ensure!(
-        restored.target().provider == "anthropic"
-            && restored.target().model == "claude-saved",
+        restored.target().provider == "anthropic" && restored.target().model == "claude-saved",
         "changed defaults did not restore the saved provider identity"
     );
 
@@ -1187,8 +1183,7 @@ impl Startup {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResumeProviderDecision, apply_resume_provider_decision,
-        resolve_resume_provider_decision,
+        ResumeProviderDecision, apply_resume_provider_decision, resolve_resume_provider_decision,
     };
     use crate::cli::Cli;
     use crate::config::Config;
@@ -1270,9 +1265,7 @@ mod tests {
             ..Cli::default()
         };
 
-        assert!(
-            resolve_resume_provider_decision(&cli, &Config::default(), &session).is_err()
-        );
+        assert!(resolve_resume_provider_decision(&cli, &Config::default(), &session).is_err());
         assert_eq!(session.provider, original_provider);
         assert_eq!(session.model, original_model);
         assert!(session.provider_override_audit.is_empty());
