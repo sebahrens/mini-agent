@@ -432,3 +432,28 @@ async fn test_drop_recovery_after_timeout() {
         .expect("recovery call failed");
     assert_eq!(recovery_result, "35411", "recovery should return 35411");
 }
+
+#[tokio::test]
+async fn test_js_reply_drop_recovery_699() {
+    use rig::tool::Tool;
+    let tool = make_test_tool();
+
+    let timeout_result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "while (true) {}".to_string(),
+        })
+        .await
+        .expect("timeout call failed");
+    assert_eq!(
+        timeout_result, "JS error: execution timed out (30s limit exceeded)",
+        "first call should time out: {timeout_result}"
+    );
+
+    let recovery_result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "699".to_string(),
+        })
+        .await
+        .expect("recovery call failed");
+    assert_eq!(recovery_result, "699", "recovery should return 699");
+}
