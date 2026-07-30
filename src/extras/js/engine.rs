@@ -11,26 +11,16 @@ use crate::sandbox::Sandbox;
 
 const MAX_PENDING_JOBS: usize = 10_000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReplyDelivery {
-    Delivered,
-    ReceiverDropped,
-}
-
 fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
     outcome: JsOutcome,
     reply_path: &'static str,
-) -> ReplyDelivery {
-    match reply.send(JsResponse { outcome }) {
-        Ok(()) => ReplyDelivery::Delivered,
-        Err(_) => {
-            tracing::debug!(
-                reply_path = %reply_path,
-                "JS engine reply receiver dropped before response delivery"
-            );
-            ReplyDelivery::ReceiverDropped
-        }
+) {
+    if reply.send(JsResponse { outcome }).is_err() {
+        tracing::debug!(
+            reply_path = %reply_path,
+            "JS engine reply receiver dropped before response delivery"
+        );
     }
 }
 
@@ -369,15 +359,12 @@ mod tests {
     use crate::extras::js::tool::PermissionBridgeOwner;
 
     #[tokio::test]
-    async fn js_reply_delivery_reports_delivered_and_dropped_receivers() {
+    async fn js_reply_delivery_handles_delivered_and_dropped_receivers() {
         let (delivered_reply, delivered_receiver) = oneshot::channel();
-        assert_eq!(
-            send_reply_or_log_drop(
-                delivered_reply,
-                JsOutcome::Value("delivered".to_string()),
-                "test_delivered",
-            ),
-            ReplyDelivery::Delivered
+        send_reply_or_log_drop(
+            delivered_reply,
+            JsOutcome::Value("delivered".to_string()),
+            "test_delivered",
         );
         assert_eq!(
             delivered_receiver
@@ -389,13 +376,10 @@ mod tests {
 
         let (dropped_reply, dropped_receiver) = oneshot::channel();
         drop(dropped_receiver);
-        assert_eq!(
-            send_reply_or_log_drop(
-                dropped_reply,
-                JsOutcome::Value("undelivered".to_string()),
-                "test_dropped",
-            ),
-            ReplyDelivery::ReceiverDropped
+        send_reply_or_log_drop(
+            dropped_reply,
+            JsOutcome::Value("undelivered".to_string()),
+            "test_dropped",
         );
     }
 
