@@ -14,7 +14,7 @@ fn installed_build_entry() -> (&'static str, String) {
     (
         INSTALLED_BUILD_LABEL,
         format!(
-            "{} {}; debug assertions {} at compile time; target {}-{}",
+            "Cargo package {} version {}; debug assertions {} at compile time; target {}-{}",
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
             if cfg!(debug_assertions) {
@@ -337,7 +337,7 @@ mod tests {
             (
                 "installed binary provenance",
                 format!(
-                    "{} {}; debug assertions {} at compile time; target {}-{}",
+                    "Cargo package {} version {}; debug assertions {} at compile time; target {}-{}",
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                     if cfg!(debug_assertions) {
