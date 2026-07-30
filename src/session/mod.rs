@@ -57,6 +57,20 @@ pub struct PermissionAllowEntry {
     pub pattern: CompactString,
 }
 
+/// An auditable provider/model identity change made while resuming a saved
+/// session. The acknowledgement records that the caller used the explicit
+/// resume override path after being warned that saved context may be disclosed
+/// to a different provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOverrideAudit {
+    pub from_provider: CompactString,
+    pub from_model: CompactString,
+    pub to_provider: CompactString,
+    pub to_model: CompactString,
+    pub changed_at: CompactString,
+    pub context_disclosure_acknowledged: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: CompactString,
@@ -86,6 +100,8 @@ pub struct Session {
     pub context_window: u64,
     pub model: CompactString,
     pub provider: CompactString,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_override_audit: Vec<ProviderOverrideAudit>,
     pub working_dir: CompactString,
     #[serde(default)]
     pub permission_allowlist: Vec<PermissionAllowEntry>,
@@ -189,6 +205,7 @@ impl Session {
             context_window,
             model: CompactString::new(model),
             provider: CompactString::new(provider),
+            provider_override_audit: Vec::new(),
             working_dir: std::env::current_dir()
                 .map(|p| CompactString::new(p.to_string_lossy()))
                 .unwrap_or_default(),
@@ -202,6 +219,26 @@ impl Session {
             overhead_tokens: 0,
             rewind_undo: None,
         }
+    }
+
+    pub fn record_provider_override(
+        &mut self,
+        to_provider: &str,
+        to_model: &str,
+        context_disclosure_acknowledged: bool,
+    ) {
+        let audit = ProviderOverrideAudit {
+            from_provider: self.provider.clone(),
+            from_model: self.model.clone(),
+            to_provider: CompactString::new(to_provider),
+            to_model: CompactString::new(to_model),
+            changed_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
+            context_disclosure_acknowledged,
+        };
+        self.provider = audit.to_provider.clone();
+        self.model = audit.to_model.clone();
+        self.updated_at = audit.changed_at.clone();
+        self.provider_override_audit.push(audit);
     }
 
     /// Read the current git branch for `dir`, or `None` outside a repo / on a

@@ -87,6 +87,145 @@ fn build_permission_checker(
     (Some(perm), Some(ask_tx), Some(ask_rx))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderIdentity {
+    provider: CompactString,
+    model: CompactString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeProviderDecision {
+    Restore(ProviderIdentity),
+    Override {
+        saved: ProviderIdentity,
+        target: ProviderIdentity,
+    },
+}
+
+impl ResumeProviderDecision {
+    fn target(&self) -> &ProviderIdentity {
+        match self {
+            Self::Restore(identity) => identity,
+            Self::Override { target, .. } => target,
+        }
+    }
+
+    fn override_identities(&self) -> Option<(&ProviderIdentity, &ProviderIdentity)> {
+        match self {
+            Self::Restore(_) => None,
+            Self::Override { saved, target } => Some((saved, target)),
+        }
+    }
+}
+
+fn resolve_resume_provider_decision(
+    cli: &Cli,
+    cfg: &Config,
+    session: &Session,
+) -> anyhow::Result<ResumeProviderDecision> {
+    let saved = ProviderIdentity {
+        provider: session.provider.clone(),
+        model: session.model.clone(),
+    };
+    let target_provider = cli
+        .resume_provider
+        .as_deref()
+        .map(CompactString::new)
+        .unwrap_or_else(|| saved.provider.clone());
+    let target_model = if let Some(model) = cli.resume_model.as_deref() {
+        CompactString::new(model)
+    } else if target_provider != saved.provider {
+        let (model, _) = provider::default_model_for_provider(&target_provider, cfg)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "resume provider/profile '{}' has no configured default model; pass --resume-model explicitly",
+                    target_provider
+                )
+            })?;
+        CompactString::new(model)
+    } else {
+        saved.model.clone()
+    };
+    let target = ProviderIdentity {
+        provider: target_provider,
+        model: target_model,
+    };
+
+    if target == saved {
+        Ok(ResumeProviderDecision::Restore(saved))
+    } else {
+        Ok(ResumeProviderDecision::Override { saved, target })
+    }
+}
+
+fn apply_resume_provider_decision(
+    session: &mut Session,
+    decision: &ResumeProviderDecision,
+    cfg: &Config,
+) {
+    let Some((saved, target)) = decision.override_identities() else {
+        return;
+    };
+
+    session.record_provider_override(
+        &target.provider,
+        &target.model,
+        saved.provider != target.provider,
+    );
+    session.input_token_cost = 0.0;
+    session.output_token_cost = 0.0;
+    let qm = config::quick_models_map(cfg);
+    if let Some(model_cfg) = qm.values().find(|model_cfg| {
+        model_cfg.provider == target.provider && model_cfg.model == target.model
+    }) {
+        session.input_token_cost = model_cfg.input_token_cost;
+        session.output_token_cost = model_cfg.output_token_cost;
+    } else if let Some((input_cost, output_cost)) =
+        Config::catalog_input_output_cost(&target.provider, &target.model)
+    {
+        session.input_token_cost = input_cost;
+        session.output_token_cost = output_cost;
+    }
+    session.update_context_window(cfg.resolve_context_window(
+        &target.provider,
+        &target.model,
+        &qm,
+    ));
+}
+
+pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
+    let saved = Session::new("anthropic", "claude-saved", 200_000, "");
+    let changed_defaults = Cli {
+        provider: Some("openai".to_string()),
+        model: Some("gpt-current-default".to_string()),
+        ..Cli::default()
+    };
+    let cfg = Config::default();
+    let restored = resolve_resume_provider_decision(&changed_defaults, &cfg, &saved)?;
+    anyhow::ensure!(
+        restored.target().provider == "anthropic"
+            && restored.target().model == "claude-saved",
+        "changed defaults did not restore the saved provider identity"
+    );
+
+    let explicit_override = Cli {
+        resume_provider: Some("openai".to_string()),
+        resume_model: Some("gpt-explicit".to_string()),
+        ..Cli::default()
+    };
+    let overridden = resolve_resume_provider_decision(&explicit_override, &cfg, &saved)?;
+    let mut audited = saved;
+    apply_resume_provider_decision(&mut audited, &overridden, &cfg);
+    anyhow::ensure!(
+        audited.provider == "openai"
+            && audited.model == "gpt-explicit"
+            && audited.provider_override_audit.len() == 1
+            && audited.provider_override_audit[0].context_disclosure_acknowledged,
+        "explicit cross-provider resume was not applied and audited consistently"
+    );
+    Ok(())
+}
+
 /// Apply the `[prompt_to_model]` mapping at startup before the TUI is
 /// available. Updates `provider`, `model`, and `session` fields so the
 /// initial agent is built with the correct model.
@@ -163,8 +302,8 @@ pub(crate) struct Startup {
     pub handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
     // Set by resolve_prompts:
     pub arch_msg: Option<String>,
-    #[cfg(feature = "hooks")]
     pub session_resumed: bool,
+    pub resume_override_pending: bool,
 }
 
 impl Startup {
@@ -217,7 +356,6 @@ impl Startup {
             session.output_token_cost = output_cost;
         }
 
-        #[cfg(feature = "hooks")]
         let mut session_resumed = false;
 
         if cli.continue_session
@@ -226,10 +364,7 @@ impl Startup {
             && let Some(s) = sessions.into_iter().next()
         {
             session = s;
-            #[cfg(feature = "hooks")]
-            {
-                session_resumed = true;
-            }
+            session_resumed = true;
         }
 
         if let Some(session_id) = &cli.session {
@@ -238,19 +373,13 @@ impl Startup {
                 // try exact name match as fallback
                 if let Some(s) = session::storage::find_session_by_name(session_id)? {
                     session = s;
-                    #[cfg(feature = "hooks")]
-                    {
-                        session_resumed = true;
-                    }
+                    session_resumed = true;
                 } else {
                     anyhow::bail!("no session matching '{}'", session_id);
                 }
             } else if sessions.len() == 1 {
                 session = sessions.into_iter().next().unwrap();
-                #[cfg(feature = "hooks")]
-                {
-                    session_resumed = true;
-                }
+                session_resumed = true;
             } else {
                 eprintln!("multiple sessions match '{}':", session_id);
                 for s in &sessions {
@@ -282,6 +411,37 @@ impl Startup {
             }
         }
 
+        let resume_decision = if session_resumed {
+            Some(resolve_resume_provider_decision(&cli, &cfg, &session)?)
+        } else {
+            if cli.resume_provider.is_some() || cli.resume_model.is_some() {
+                anyhow::bail!(
+                    "--resume-provider/--resume-model require --continue or --session with an existing saved session"
+                );
+            }
+            None
+        };
+
+        if let Some(decision) = &resume_decision {
+            let target = decision.target();
+            provider = target.provider.clone();
+            model = target.model.clone();
+            if let Some((saved, target)) = decision.override_identities() {
+                if cli.no_session {
+                    anyhow::bail!(
+                        "an explicit resume provider/model override cannot be combined with --no-session because its audit record must be persisted"
+                    );
+                }
+                if saved.provider != target.provider {
+                    eprintln!(
+                        "PRIVACY WARNING: resuming with provider/profile '{}' will send saved conversation and source context previously associated with '{}' to that provider; this explicit override will be recorded in session metadata.",
+                        target.provider, saved.provider
+                    );
+                }
+                apply_resume_provider_decision(&mut session, decision, &cfg);
+            }
+        }
+
         // A resumed session persisted its context_window when first saved, which can
         // be stale if the model's catalog entry has changed since (e.g. a model that
         // grew from 128k to 1M). Re-derive it from the catalog for the session's own
@@ -299,6 +459,10 @@ impl Startup {
             &cfg.custom_providers_map(),
             cfg.api_keys.as_ref(),
         )?;
+
+        let resume_override_pending = resume_decision
+            .as_ref()
+            .is_some_and(|decision| decision.override_identities().is_some());
 
         Ok(Self {
             cli,
@@ -320,8 +484,8 @@ impl Startup {
             #[cfg(feature = "advisor")]
             handoff_rx: None,
             arch_msg: None,
-            #[cfg(feature = "hooks")]
             session_resumed,
+            resume_override_pending,
         })
     }
 
@@ -656,13 +820,15 @@ impl Startup {
                 self.context.current_prompt = Some(prompt_text);
                 self.context.current_prompt_name = Some(default_prompt.to_string());
 
-                apply_startup_prompt_model(
-                    default_prompt,
-                    &self.cfg,
-                    &mut self.provider,
-                    &mut self.model,
-                    &mut self.session,
-                );
+                if !self.session_resumed {
+                    apply_startup_prompt_model(
+                        default_prompt,
+                        &self.cfg,
+                        &mut self.provider,
+                        &mut self.model,
+                        &mut self.session,
+                    );
+                }
             }
         }
 
@@ -692,13 +858,15 @@ impl Startup {
                 self.context.current_prompt = Some(prompt_text);
                 self.context.current_prompt_name = Some(name.clone());
 
-                apply_startup_prompt_model(
-                    name,
-                    &self.cfg,
-                    &mut self.provider,
-                    &mut self.model,
-                    &mut self.session,
-                );
+                if !self.session_resumed {
+                    apply_startup_prompt_model(
+                        name,
+                        &self.cfg,
+                        &mut self.provider,
+                        &mut self.model,
+                        &mut self.session,
+                    );
+                }
             } else {
                 let mut sorted: Vec<&String> = self.context.prompts.keys().collect();
                 sorted.sort();
@@ -777,7 +945,14 @@ impl Startup {
     }
 
     /// Phase 4: mode dispatch — print, loop, or interactive.
-    pub(crate) async fn dispatch(self) -> anyhow::Result<()> {
+    pub(crate) async fn dispatch(mut self) -> anyhow::Result<()> {
+        if self.resume_override_pending {
+            // All fallible startup validation has completed. Persist the
+            // identity/audit update atomically before any agent can receive
+            // saved history.
+            session::storage::save_session(&self.session)?;
+            self.resume_override_pending = false;
+        }
         if self.cli.print {
             self.dispatch_print().await
         } else {
@@ -1006,5 +1181,116 @@ impl Startup {
         crate::extras::hooks::dispatch_session_end("exit").await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ResumeProviderDecision, apply_resume_provider_decision,
+        resolve_resume_provider_decision,
+    };
+    use crate::cli::Cli;
+    use crate::config::Config;
+    use crate::session::Session;
+
+    #[test]
+    fn session_resume_provider_identity_restores_saved_identity_under_changed_defaults() {
+        let session = Session::new("anthropic", "claude-saved", 200_000, "");
+        let cli = Cli {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-current-default".to_string()),
+            ..Cli::default()
+        };
+
+        let decision =
+            resolve_resume_provider_decision(&cli, &Config::default(), &session).unwrap();
+
+        assert_eq!(
+            decision,
+            ResumeProviderDecision::Restore(super::ProviderIdentity {
+                provider: "anthropic".into(),
+                model: "claude-saved".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn session_resume_provider_override_is_explicit_and_auditable() {
+        let mut session = Session::new("anthropic", "claude-saved", 200_000, "");
+        let cli = Cli {
+            resume_provider: Some("openai".to_string()),
+            resume_model: Some("gpt-explicit".to_string()),
+            ..Cli::default()
+        };
+        let cfg = Config::default();
+
+        let decision = resolve_resume_provider_decision(&cli, &cfg, &session).unwrap();
+        apply_resume_provider_decision(&mut session, &decision, &cfg);
+
+        assert_eq!(session.provider, "openai");
+        assert_eq!(session.model, "gpt-explicit");
+        assert_eq!(session.provider_override_audit.len(), 1);
+        let audit = &session.provider_override_audit[0];
+        assert_eq!(audit.from_provider, "anthropic");
+        assert_eq!(audit.from_model, "claude-saved");
+        assert_eq!(audit.to_provider, "openai");
+        assert_eq!(audit.to_model, "gpt-explicit");
+        assert!(audit.context_disclosure_acknowledged);
+    }
+
+    #[test]
+    fn session_resume_same_provider_model_override_is_explicit_without_cross_provider_ack() {
+        let mut session = Session::new("anthropic", "claude-old", 200_000, "");
+        let cli = Cli {
+            resume_model: Some("claude-new".to_string()),
+            ..Cli::default()
+        };
+        let cfg = Config::default();
+
+        let decision = resolve_resume_provider_decision(&cli, &cfg, &session).unwrap();
+        apply_resume_provider_decision(&mut session, &decision, &cfg);
+
+        assert_eq!(session.provider, "anthropic");
+        assert_eq!(session.model, "claude-new");
+        assert_eq!(session.provider_override_audit.len(), 1);
+        assert!(
+            !session.provider_override_audit[0].context_disclosure_acknowledged,
+            "same-provider model changes must not be recorded as cross-provider disclosure"
+        );
+    }
+
+    #[test]
+    fn session_resume_provider_override_resolution_does_not_mutate_on_restore_or_error() {
+        let session = Session::new("anthropic", "claude-saved", 200_000, "");
+        let original_provider = session.provider.clone();
+        let original_model = session.model.clone();
+        let cli = Cli {
+            resume_provider: Some("missing-profile".to_string()),
+            ..Cli::default()
+        };
+
+        assert!(
+            resolve_resume_provider_decision(&cli, &Config::default(), &session).is_err()
+        );
+        assert_eq!(session.provider, original_provider);
+        assert_eq!(session.model, original_model);
+        assert!(session.provider_override_audit.is_empty());
+    }
+
+    #[test]
+    fn session_resume_provider_identity_legacy_metadata_deserializes_without_audit() {
+        let session = Session::new("anthropic", "claude-saved", 200_000, "");
+        let mut legacy_json = serde_json::to_value(&session).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_override_audit");
+
+        let restored: Session = serde_json::from_value(legacy_json).unwrap();
+
+        assert_eq!(restored.provider, "anthropic");
+        assert_eq!(restored.model, "claude-saved");
+        assert!(restored.provider_override_audit.is_empty());
     }
 }

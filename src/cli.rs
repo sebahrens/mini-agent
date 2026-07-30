@@ -43,6 +43,26 @@ pub struct Cli {
     #[arg(long = "session", help = "Load session by ID prefix")]
     pub session: Option<String>,
 
+    #[arg(
+        long = "resume-provider",
+        value_name = "PROVIDER",
+        help = "Explicitly resume saved context with another provider/profile (privacy warning is displayed and the change is audited)"
+    )]
+    pub resume_provider: Option<String>,
+
+    #[arg(
+        long = "resume-model",
+        value_name = "MODEL",
+        help = "Explicitly resume with another model; uses the saved provider unless --resume-provider is also set"
+    )]
+    pub resume_model: Option<String>,
+
+    #[arg(
+        long = "resume-provider-safety-check",
+        help = "Verify resume provider identity and explicit override semantics, then exit"
+    )]
+    pub resume_provider_safety_check: bool,
+
     #[arg(long = "name", help = "Name for the session")]
     pub name: Option<String>,
 

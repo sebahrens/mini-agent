@@ -247,7 +247,6 @@ async fn handle_model(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         .await;
     *ctx.agent = Some(new_agent);
     ctx.session.model = new_model.clone();
-    ctx.session.provider = ctx.cli.resolve_provider(ctx.cfg);
     ctx.session
         .update_context_window(ctx.cfg.resolve_context_window(
             &ctx.session.provider,

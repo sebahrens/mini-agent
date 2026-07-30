@@ -54,6 +54,12 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if cli.resume_provider_safety_check {
+        startup::verify_resume_provider_safety()?;
+        println!("session resume provider safety check: PASS");
+        return Ok(());
+    }
+
     let is_interactive = !cli.print;
     #[cfg(feature = "acp")]
     let is_interactive = is_interactive && !cli.acp_enabled;
