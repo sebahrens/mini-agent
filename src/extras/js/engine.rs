@@ -26,26 +26,19 @@ impl ReplyPath {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplyDelivery {
-    Delivered,
-    ReceiverDropped,
-}
-
 fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
     outcome: JsOutcome,
     reply_path: ReplyPath,
-) -> ReplyDelivery {
-    if reply.send(JsResponse { outcome }).is_ok() {
-        return ReplyDelivery::Delivered;
+) {
+    // Keep this diagnostic independent of JsResponse's formatting traits:
+    // SendError owns the undelivered protocol value.
+    if reply.send(JsResponse { outcome }).is_err() {
+        tracing::debug!(
+            reply_path = reply_path.as_str(),
+            "JS engine reply receiver dropped before response delivery"
+        );
     }
-
-    tracing::debug!(
-        reply_path = reply_path.as_str(),
-        "JS engine reply receiver dropped before response delivery"
-    );
-    ReplyDelivery::ReceiverDropped
 }
 
 #[derive(Clone, Copy)]
@@ -388,13 +381,10 @@ mod tests {
         assert_eq!(ReplyPath::Completed.as_str(), "completed");
 
         let (delivered_reply, delivered_receiver) = oneshot::channel();
-        assert_eq!(
-            send_reply_or_log_drop(
-                delivered_reply,
-                JsOutcome::Value("delivered".to_string()),
-                ReplyPath::Completed,
-            ),
-            ReplyDelivery::Delivered,
+        send_reply_or_log_drop(
+            delivered_reply,
+            JsOutcome::Value("delivered".to_string()),
+            ReplyPath::Completed,
         );
         assert_eq!(
             delivered_receiver
@@ -406,13 +396,10 @@ mod tests {
 
         let (dropped_reply, dropped_receiver) = oneshot::channel();
         drop(dropped_receiver);
-        assert_eq!(
-            send_reply_or_log_drop(
-                dropped_reply,
-                JsOutcome::Value("undelivered".to_string()),
-                ReplyPath::Completed,
-            ),
-            ReplyDelivery::ReceiverDropped,
+        send_reply_or_log_drop(
+            dropped_reply,
+            JsOutcome::Value("undelivered".to_string()),
+            ReplyPath::Completed,
         );
     }
 
