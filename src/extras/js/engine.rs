@@ -2,6 +2,7 @@ use rquickjs::promise::PromiseState;
 use rquickjs::{Coerced, Context, Ctx, Error, FromJs, Persistent, Runtime, Value};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 use crate::extras::js::host::register_host_globals;
 use crate::extras::js::tool::PermissionBridge;
@@ -9,6 +10,12 @@ use crate::extras::js::types::*;
 use crate::sandbox::Sandbox;
 
 const MAX_PENDING_JOBS: usize = 10_000;
+
+fn send_reply(reply: oneshot::Sender<JsResponse>, outcome: JsOutcome) {
+    if reply.send(JsResponse { outcome }).is_err() {
+        tracing::debug!("JS engine reply receiver dropped before response delivery");
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ExecutionPolicy {
@@ -200,22 +207,15 @@ pub(crate) fn js_thread_main(
 ) {
     while let Ok(req) = rx.recv() {
         if req.cancellation.is_cancelled() {
-            if req
-                .reply
-                .send(JsResponse {
-                    outcome: JsOutcome::Error("execution cancelled".to_string()),
-                })
-                .is_err()
-            {
-                tracing::debug!("JS engine reply channel closed");
-            }
+            send_reply(
+                req.reply,
+                JsOutcome::Error("execution cancelled".to_string()),
+            );
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        if req.reply.send(JsResponse { outcome }).is_err() {
-            tracing::debug!("JS engine reply channel closed");
-        }
+        send_reply(req.reply, outcome);
     }
 }
 
@@ -347,8 +347,6 @@ pub(crate) fn run_step_for_test(
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::oneshot;
-
     use super::*;
     use crate::extras::js::tool::PermissionBridgeOwner;
 
