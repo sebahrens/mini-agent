@@ -52,8 +52,10 @@ run_in_clean_install_environment "$install_root" /usr/bin/env /usr/bin/true
             for line in completed.stdout.splitlines()
             if "=" in line
         )
-        self.assertEqual("false", environment.get("CARGO_HTTP_MULTIPLEXING"))
         self.assertEqual("10", environment.get("CARGO_NET_RETRY"))
+        self.assertEqual("0", environment.get("CARGO_INCREMENTAL"))
+        self.assertEqual("256", environment.get("CARGO_PROFILE_DEV_CODEGEN_UNITS"))
+        self.assertNotIn("CARGO_HTTP_MULTIPLEXING", environment)
         self.assertNotIn("CARGO_NET_OFFLINE", environment)
 
     def test_hard_timeout_runs_shell_functions_when_timeout_binary_exists(self) -> None:

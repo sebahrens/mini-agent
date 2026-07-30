@@ -96,7 +96,6 @@ agent-client-protocol = { version = "1.0.1", optional = true }
 blocking = { version = "1", optional = true }
 lsp-types = { version = "0.97", optional = true }
 rquickjs = { version = "0.12", features = ["full"], optional = true }
-mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }

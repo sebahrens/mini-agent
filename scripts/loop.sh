@@ -1690,8 +1690,11 @@ run_in_clean_install_environment() {
     clean_env+=("CARGO_INSTALL_ROOT=$install_root" "CARGO_HOME=$install_root/cargo-home")
     clean_env+=("CARGO_TARGET_DIR=$install_root/cargo-target" "RUSTC=$rustc_path" "SHELL=/bin/bash")
     # Every evidence replay starts with an empty Cargo home, so it must be able to
-    # populate its private registry even when the parent loop runs offline.
-    clean_env+=("CARGO_HTTP_MULTIPLEXING=false" "CARGO_NET_RETRY=10")
+    # populate its private registry even when the parent loop runs offline. The
+    # target is also empty, so favor one-shot parallel codegen over incremental
+    # artifacts that cannot be reused by a later replay.
+    clean_env+=("CARGO_NET_RETRY=10" "CARGO_INCREMENTAL=0")
+    clean_env+=("CARGO_PROFILE_DEV_CODEGEN_UNITS=256")
     "${clean_env[@]}" "$cargo_path" "$@"
 }
 
