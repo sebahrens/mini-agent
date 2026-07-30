@@ -1,16 +1,13 @@
-{% set name = "zerostack-bin" %}
-{% set version = "1.7.0" %}
-
 package:
-  name: {{ name }}
-  version: {{ version }}
+  name: zerostack-bin
+  version: 1.7.0
 
 source:
-  - url: https://github.com/gi-dellav/zerostack/releases/download/v{{ version }}/mini-agent-x86_64-unknown-linux-musl.tar.gz  # [linux and x86_64]
+  - url: https://github.com/gi-dellav/zerostack/releases/download/v1.7.0/mini-agent-x86_64-unknown-linux-musl.tar.gz  # [linux and x86_64]
     sha256: bee067458568c2b021dced37d91377301ee356d792b855c119f48f03cd698364
-  - url: https://github.com/gi-dellav/zerostack/releases/download/v{{ version }}/mini-agent-aarch64-unknown-linux-musl.tar.gz  # [linux and aarch64]
+  - url: https://github.com/gi-dellav/zerostack/releases/download/v1.7.0/mini-agent-aarch64-unknown-linux-musl.tar.gz  # [linux and aarch64]
     sha256: 0b1e28ed7552c38ebbea1f1c918ec1c3e5d4bab299c010b416aef1e2f74a9213
-  - url: https://raw.githubusercontent.com/gi-dellav/zerostack/v{{ version }}/LICENSE
+  - url: https://raw.githubusercontent.com/gi-dellav/zerostack/v1.7.0/LICENSE
     sha256: 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 
 build:

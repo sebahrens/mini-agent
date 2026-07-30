@@ -1,12 +1,9 @@
-{% set name = "zerostack" %}
-{% set version = "1.7.0" %}
-
 package:
-  name: {{ name }}
-  version: {{ version }}
+  name: zerostack
+  version: 1.7.0
 
 source:
-  url: https://github.com/gi-dellav/zerostack/archive/refs/tags/v{{ version }}.tar.gz
+  url: https://github.com/gi-dellav/zerostack/archive/refs/tags/v1.7.0.tar.gz
   sha256: ec28bc735b683b0c556388c898cc528affd5109ffccc026f36d64702e63561ee
 
 build:
@@ -17,9 +14,9 @@ build:
 
 requirements:
   build:
-    - {{ stdlib('c') }}
-    - {{ compiler('c') }}
-    - {{ compiler('rust') }}
+    - "{{ stdlib('c') }}"
+    - "{{ compiler('c') }}"
+    - "{{ compiler('rust') }}"
     - cargo-bundle-licenses
     - cargo-auditable
 

@@ -295,18 +295,6 @@ pub struct Cli {
     pub message: Vec<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use clap::CommandFactory;
-
-    use super::Cli;
-
-    #[test]
-    fn command_name_matches_canonical_cargo_binary() {
-        assert_eq!(Cli::command().get_name(), "mini-agent");
-    }
-}
-
 impl Cli {
     pub fn resolve_quick_model<'a>(
         &self,
@@ -471,5 +459,17 @@ impl Cli {
                 .map(|a| a.advisor_kilobytes_limit)
                 .unwrap_or(256)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn command_name_matches_canonical_cargo_binary() {
+        assert_eq!(Cli::command().get_name(), "mini-agent");
     }
 }
