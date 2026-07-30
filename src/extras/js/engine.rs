@@ -22,10 +22,9 @@ fn send_reply_or_log_drop(
     outcome: JsOutcome,
     reply_path: ReplyPath,
 ) {
-    if let Err(undelivered_response) = reply.send(JsResponse { outcome }) {
+    if reply.send(JsResponse { outcome }).is_err() {
         tracing::debug!(
             ?reply_path,
-            outcome = ?undelivered_response.outcome,
             "JS engine reply receiver dropped before response delivery"
         );
     }
