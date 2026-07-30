@@ -239,6 +239,10 @@ pub(crate) fn js_thread_main(
     runtime: tokio::runtime::Handle,
 ) {
     while let Ok(req) = rx.recv() {
+        if req.reply.is_closed() {
+            log_reply_drop(ReplyPath::AbandonedBeforeExecution);
+            continue;
+        }
         if req.cancellation.is_cancelled() {
             send_reply_or_log_drop(
                 req.reply,
@@ -247,10 +251,6 @@ pub(crate) fn js_thread_main(
                 },
                 ReplyPath::EarlyCancel,
             );
-            continue;
-        }
-        if req.reply.is_closed() {
-            log_reply_drop(ReplyPath::AbandonedBeforeExecution);
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn js_reply_receiver_drop_is_non_fatal_for_cancelled_and_completed_requests() {
+    async fn js_reply_receiver_drop_skips_abandoned_requests_and_thread_recovers() {
         let permission_owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
         let permission_bridge = permission_owner.bridge();
         let (request_tx, request_rx) = mpsc::channel();
@@ -451,7 +451,7 @@ mod tests {
         drop(cancelled_receiver);
         request_tx
             .send(JsRequest {
-                code: "unreachable".to_string(),
+                code: "cancelled request must not run".to_string(),
                 cancellation,
                 reply: cancelled_reply,
             })
@@ -465,7 +465,7 @@ mod tests {
                 cancellation: PermCancellation::new(),
                 reply: completed_reply,
             })
-            .expect("normal request should reach JS thread");
+            .expect("abandoned request should reach JS thread");
 
         let (recovery_reply, recovery_receiver) = oneshot::channel();
         request_tx
