@@ -892,6 +892,28 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
     cfg.mcp_servers = Some(servers);
 }
 
+fn verification_sensitive_integrations_match(cfg: &Config, active: bool) -> bool {
+    #[cfg(feature = "mcp")]
+    let mcp_matches = cfg
+        .mcp_servers
+        .as_ref()
+        .is_some_and(|servers| servers.contains_key("sentinel"))
+        == active;
+    #[cfg(not(feature = "mcp"))]
+    let mcp_matches = true;
+
+    #[cfg(feature = "lsp")]
+    let lsp_matches = cfg
+        .lsp
+        .as_ref()
+        .is_some_and(|lsp| lsp.servers.contains_key("sentinel"))
+        == active;
+    #[cfg(not(feature = "lsp"))]
+    let lsp_matches = true;
+
+    mcp_matches && lsp_matches
+}
+
 /// Installed-binary security check used by release/automation evidence. It
 /// exercises the same project-config trust path as startup without requiring
 /// a provider credential or launching any configured integration.
@@ -904,11 +926,21 @@ pub fn verify_project_config_trust() -> std::io::Result<()> {
     let trust_store = root.join("state/config/trusted-project-configs.json");
     let result = (|| {
         std::fs::create_dir_all(project_config.parent().expect("config has a parent"))?;
-        std::fs::write(&project_config, "chat_left_margin = 9\nyolo = true\n")?;
+        let exact_project_config = "chat_left_margin = 9\n\
+                                    yolo = true\n\
+                                    shell = \"untrusted-shell\"\n\
+                                    [mcp_servers.sentinel]\n\
+                                    command = \"mini-agent-project-config-trust-sentinel\"\n\
+                                    [lsp]\n\
+                                    enabled = true\n\
+                                    [lsp.servers.sentinel]\n\
+                                    command = \"mini-agent-project-config-trust-sentinel\"\n";
+        std::fs::write(&project_config, exact_project_config)?;
 
         let mut headless = Config {
             chat_left_margin: Some(1),
             yolo: Some(false),
+            shell: Some("trusted-shell".to_string()),
             ..Default::default()
         };
         let outcome = apply_local_override_with_confirmation(
@@ -922,6 +954,8 @@ pub fn verify_project_config_trust() -> std::io::Result<()> {
         if outcome != ProjectConfigTrustOutcome::SkippedHeadless
             || headless.chat_left_margin != Some(9)
             || headless.yolo != Some(false)
+            || headless.shell.as_deref() != Some("trusted-shell")
+            || !verification_sensitive_integrations_match(&headless, false)
             || trust_store.exists()
         {
             return Err(std::io::Error::other(
@@ -947,6 +981,8 @@ pub fn verify_project_config_trust() -> std::io::Result<()> {
         .map_err(std::io::Error::other)?;
         if outcome != ProjectConfigTrustOutcome::Approved
             || approved.yolo != Some(true)
+            || approved.shell.as_deref() != Some("untrusted-shell")
+            || !verification_sensitive_integrations_match(&approved, true)
             || !trust_store.is_file()
         {
             return Err(std::io::Error::other(
@@ -954,12 +990,62 @@ pub fn verify_project_config_trust() -> std::io::Result<()> {
             ));
         }
 
+        let mut reused = Config {
+            yolo: Some(false),
+            shell: Some("trusted-shell".to_string()),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut reused,
+            &project_config,
+            &trust_store,
+            false,
+            &|_| panic!("an exact persisted binding must not prompt"),
+        )
+        .map_err(std::io::Error::other)?;
+        if outcome != ProjectConfigTrustOutcome::AlreadyTrusted
+            || reused.yolo != Some(true)
+            || reused.shell.as_deref() != Some("untrusted-shell")
+            || !verification_sensitive_integrations_match(&reused, true)
+        {
+            return Err(std::io::Error::other(
+                "persisted exact project config trust was not reused",
+            ));
+        }
+
+        let copied_config = root.join("copied-project/.zerostack/config.toml");
+        std::fs::create_dir_all(copied_config.parent().expect("config has a parent"))?;
+        std::fs::write(&copied_config, exact_project_config)?;
+        let mut copied = Config {
+            yolo: Some(false),
+            shell: Some("trusted-shell".to_string()),
+            ..Default::default()
+        };
+        let outcome = apply_local_override_with_confirmation(
+            &mut copied,
+            &copied_config,
+            &trust_store,
+            false,
+            &|_| panic!("a copied checkout must not inherit project config trust"),
+        )
+        .map_err(std::io::Error::other)?;
+        if outcome != ProjectConfigTrustOutcome::SkippedHeadless
+            || copied.yolo != Some(false)
+            || copied.shell.as_deref() != Some("trusted-shell")
+            || !verification_sensitive_integrations_match(&copied, false)
+        {
+            return Err(std::io::Error::other(
+                "project config trust crossed canonical project paths",
+            ));
+        }
+
         std::fs::write(
             &project_config,
-            "chat_left_margin = 9\nyolo = true\n# digest changed\n",
+            format!("{exact_project_config}# digest changed\n"),
         )?;
         let mut changed = Config {
             yolo: Some(false),
+            shell: Some("trusted-shell".to_string()),
             ..Default::default()
         };
         let outcome = apply_local_override_with_confirmation(
@@ -970,7 +1056,11 @@ pub fn verify_project_config_trust() -> std::io::Result<()> {
             &|_| panic!("headless changed config must not prompt"),
         )
         .map_err(std::io::Error::other)?;
-        if outcome != ProjectConfigTrustOutcome::SkippedHeadless || changed.yolo != Some(false) {
+        if outcome != ProjectConfigTrustOutcome::SkippedHeadless
+            || changed.yolo != Some(false)
+            || changed.shell.as_deref() != Some("trusted-shell")
+            || !verification_sensitive_integrations_match(&changed, false)
+        {
             return Err(std::io::Error::other(
                 "project config trust survived a content change",
             ));
