@@ -13,11 +13,11 @@ const MAX_PENDING_JOBS: usize = 10_000;
 
 fn send_reply_or_log_drop(
     reply: oneshot::Sender<JsResponse>,
-    outcome: JsOutcome,
+    response: JsResponse,
     reply_path: &'static str,
 ) {
-    // The send error owns JsResponse; keep this diagnostic independent of its formatting traits.
-    if reply.send(JsResponse { outcome }).is_err() {
+    // The send error returns the protocol value; discard it without adding a formatting bound.
+    if let Err(_undelivered_response) = reply.send(response) {
         tracing::debug!(
             reply_path = %reply_path,
             "JS engine reply receiver dropped before response delivery"
@@ -217,14 +217,16 @@ pub(crate) fn js_thread_main(
         if req.cancellation.is_cancelled() {
             send_reply_or_log_drop(
                 req.reply,
-                JsOutcome::Error("execution cancelled".to_string()),
+                JsResponse {
+                    outcome: JsOutcome::Error("execution cancelled".to_string()),
+                },
                 "early_cancel",
             );
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
-        send_reply_or_log_drop(req.reply, outcome, "completed");
+        send_reply_or_log_drop(req.reply, JsResponse { outcome }, "completed");
     }
 }
 
@@ -364,7 +366,9 @@ mod tests {
         let (delivered_reply, delivered_receiver) = oneshot::channel();
         send_reply_or_log_drop(
             delivered_reply,
-            JsOutcome::Value("delivered".to_string()),
+            JsResponse {
+                outcome: JsOutcome::Value("delivered".to_string()),
+            },
             "test_delivered",
         );
         assert_eq!(
@@ -379,7 +383,9 @@ mod tests {
         drop(dropped_receiver);
         send_reply_or_log_drop(
             dropped_reply,
-            JsOutcome::Value("undelivered".to_string()),
+            JsResponse {
+                outcome: JsOutcome::Value("undelivered".to_string()),
+            },
             "test_dropped",
         );
     }
