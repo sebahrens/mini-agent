@@ -16,10 +16,11 @@ fn send_reply_or_log_drop(
     response: JsResponse,
     reply_path: &'static str,
 ) {
-    // The send error returns the protocol value; discard it without adding a formatting bound.
-    if let Err(_undelivered_response) = reply.send(response) {
+    // JsResponse's Debug implementation redacts value/error bodies, and avoids a Display bound.
+    if let Err(undelivered_response) = reply.send(response) {
         tracing::debug!(
             reply_path = %reply_path,
+            response = ?undelivered_response,
             "JS engine reply receiver dropped before response delivery"
         );
     }
