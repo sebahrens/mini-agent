@@ -752,7 +752,10 @@ run_verification() {
     fi
 
     # mini-agent: Cargo.toml is at repo root (no rust/ subdirectory)
-    local failed=0 errors="" cargo_dir="."
+    # real_failure=1 means an actual build/test/syntax error — triggers a new P0.
+    # failed=1 but real_failure=0 means "no relevant code changed" — reopen PICKED
+    # bead silently; do NOT spawn a new child P0 (that causes the runaway chain).
+    local failed=0 real_failure=0 errors="" cargo_dir="."
     if [ ! -f "Cargo.toml" ]; then
         echo -e "${RED}FAIL: verification requires root Cargo.toml${NC}" >&2
         return 1
@@ -780,10 +783,11 @@ run_verification() {
     local changed_files="" diff_check_output="" relevant_files=0
     if ! git rev-parse "$range_base" "$range_head" >/dev/null 2>&1 \
             || ! changed_files=$(git diff --name-only "$range_base" "$range_head" 2>/dev/null); then
-        failed=1
+        failed=1; real_failure=1
         errors+="=== verification range ===$'\n'Unable to inspect $range_base..$range_head$'\n\n'"
     elif [ -z "$changed_files" ]; then
         failed=1
+        # No files at all were committed — not a build error, just nothing changed.
         errors+="=== verification range ===$'\n'No files changed in $range_base..$range_head$'\n\n'"
     fi
 
@@ -791,7 +795,7 @@ run_verification() {
     if diff_check_output=$(git diff --check "$range_base" "$range_head" 2>&1); then
         echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} git diff --check"
     else
-        failed=1
+        failed=1; real_failure=1
         echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} git diff --check"
         errors+="=== diff errors ===$'\n'${diff_check_output}$'\n\n'"
     fi
@@ -818,7 +822,7 @@ run_verification() {
             if syntax_output=$(bash -n "$changed_file" 2>&1); then
                 echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} bash -n ${changed_file}"
             else
-                failed=1
+                failed=1; real_failure=1
                 echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} bash -n ${changed_file}"
                 errors+="=== shell syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
             fi
@@ -830,90 +834,90 @@ run_verification() {
                 ;;
             *.json)
                 if ! command -v jq >/dev/null 2>&1; then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== JSON verification unavailable ===$'\n'jq is required for ${changed_file}$'\n\n'"
                 elif ! syntax_output=$(jq empty "$changed_file" 2>&1); then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== JSON syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
                 fi
                 ;;
             *.yaml|*.yml)
                 if command -v ruby >/dev/null 2>&1; then
                     syntax_output=$(ruby -e 'require "psych"; Psych.parse_file(ARGV.fetch(0))' "$changed_file" 2>&1) || {
-                        failed=1
+                        failed=1; real_failure=1
                         errors+="=== YAML syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
                     }
                 elif command -v python3 >/dev/null 2>&1 \
                         && python3 -c 'import yaml' >/dev/null 2>&1; then
                     syntax_output=$(python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1], encoding="utf-8"))' "$changed_file" 2>&1) || {
-                        failed=1
+                        failed=1; real_failure=1
                         errors+="=== YAML syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
                     }
                 else
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== YAML verification unavailable ===$'\n'No Ruby Psych or Python PyYAML for ${changed_file}$'\n\n'"
                 fi
                 ;;
             *.js|*.mjs|*.cjs)
                 if ! command -v node >/dev/null 2>&1; then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== JavaScript verification unavailable ===$'\n'node is required for ${changed_file}$'\n\n'"
                 elif ! syntax_output=$(node --check "$changed_file" 2>&1); then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== JavaScript syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
                 fi
                 ;;
             *.rb)
                 if ! command -v ruby >/dev/null 2>&1; then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== Ruby verification unavailable ===$'\n'ruby is required for ${changed_file}$'\n\n'"
                 elif ! syntax_output=$(ruby -c "$changed_file" 2>&1); then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== Ruby syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
                 fi
                 ;;
             *.py)
                 if ! command -v python3 >/dev/null 2>&1; then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== Python verification unavailable ===$'\n'python3 is required for ${changed_file}$'\n\n'"
                 else
                     mkdir -p target/.loop-pycache
                     if ! syntax_output=$(PYTHONPYCACHEPREFIX="$PWD/target/.loop-pycache" python3 -m py_compile "$changed_file" 2>&1); then
-                        failed=1
+                        failed=1; real_failure=1
                         errors+="=== Python syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
                     fi
                 fi
                 ;;
             *.ps1)
                 if ! command -v pwsh >/dev/null 2>&1; then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== PowerShell verification unavailable ===$'\n'pwsh is required for ${changed_file}$'\n\n'"
                 elif ! syntax_output=$(pwsh -NoProfile -Command '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$null, [ref]$errors); if ($errors) { $errors | Out-String | Write-Error; exit 1 }' "$changed_file" 2>&1); then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== PowerShell syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
                 fi
                 ;;
             *.nix)
                 if ! command -v nix-instantiate >/dev/null 2>&1; then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== Nix verification unavailable ===$'\n'nix-instantiate is required for ${changed_file}$'\n\n'"
                 elif ! syntax_output=$(nix-instantiate --parse "$changed_file" 2>&1); then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== Nix syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
                 fi
                 ;;
             justfile)
                 if ! command -v just >/dev/null 2>&1; then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== justfile verification unavailable ===$'\n'just is required for ${changed_file}$'\n\n'"
                 elif ! syntax_output=$(just --summary --justfile "$changed_file" 2>&1); then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== justfile syntax errors ===$'\n'${syntax_output}$'\n\n'"
                 fi
                 ;;
             *)
                 if [ "$relevant" = true ]; then
-                    failed=1
+                    failed=1; real_failure=1
                     errors+="=== verifier missing ===$'\n'No automated checker is configured for relevant file ${changed_file} (profile=${profile})$'\n\n'"
                 fi
                 ;;
@@ -922,6 +926,9 @@ run_verification() {
 
     if [ "$relevant_files" -eq 0 ]; then
         failed=1
+        # Do NOT set real_failure=1: "no relevant code changed" is not a build
+        # error. The PICKED bead will be reopened for retry but no new child P0
+        # is spawned — that was the source of the runaway "fix build errors" chain.
         errors+="=== relevance allowlist ===$'\n'No ${profile} production implementation file changed for declared surfaces: ${surfaces}$'\n\n'"
     fi
 
@@ -966,7 +973,7 @@ run_verification() {
     if fmt_output=$(cd "$cargo_dir" && "$CARGO" fmt --check 2>&1); then
         echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} cargo fmt --check"
     else
-        failed=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} cargo fmt --check"
+        failed=1; real_failure=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} cargo fmt --check"
         errors+="=== cargo fmt errors ===$'\n'${fmt_output}$'\n\n'"
     fi
 
@@ -988,7 +995,7 @@ run_verification() {
     if clippy_output=$(cd "$cargo_dir" && "$CARGO" "${clippy_cmd_args[@]}" 2>&1); then
         echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} ${clippy_cmd_label}"
     else
-        failed=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${clippy_cmd_label}"
+        failed=1; real_failure=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${clippy_cmd_label}"
         errors+="=== cargo clippy errors ===$'\n'${clippy_output}$'\n\n'"
     fi
 
@@ -999,7 +1006,7 @@ run_verification() {
     local test_tier="full"
     if [ "${LOOP_TEST_TIER:-full}" != full ]; then
         echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} LOOP_TEST_TIER may not skip integration tests"
-        failed=1
+        failed=1; real_failure=1
         errors+="=== test policy ===$'\n'Every Rust acceptance requires the full test tier$'\n\n'"
     else
         local test_log="$cargo_dir/target/.loop-test.log"
@@ -1045,7 +1052,7 @@ run_verification() {
                 echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} build only ($(wc -l < "$bins_file" | tr -d ' ') test binaries)"
                 _have_bins=true
             else
-                failed=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${test_cmd_label} --no-run"
+                failed=1; real_failure=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${test_cmd_label} --no-run"
                 test_output=$(cat "$norun_log" 2>/dev/null || echo "(norun log missing)")
                 errors+="=== test build errors (${test_cmd_label} --no-run) ===$'\n'${test_output}$'\n\n'"
             fi
@@ -1054,7 +1061,7 @@ run_verification() {
             if (cd "$cargo_dir" && "$CARGO" "${test_cmd_args[@]}" 2>&1 | tee "target/.loop-test.log" >&2; exit "${PIPESTATUS[0]}"); then
                 echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} ${test_cmd_label}"
             else
-                failed=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${test_cmd_label}"
+                failed=1; real_failure=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${test_cmd_label}"
                 test_output=$(cat "$test_log" 2>/dev/null || echo "(test log missing)")
                 errors+="=== test errors (${test_cmd_label}) ===$'\n'${test_output}$'\n\n'"
             fi
@@ -1137,7 +1144,7 @@ run_verification() {
                 if [ "$_bin_ok" = true ]; then
                     printf '%s\t%s\tPASS\t%s\n' "$_bin" "$_cur" "$now_ts" >> "$pass_tmp"
                 else
-                    failed=1
+                    failed=1; real_failure=1
                 fi
             done < "$bins_to_run"
             mv "$pass_tmp" "$pass_cache"
@@ -1159,10 +1166,17 @@ run_verification() {
         return 0
     fi
 
-    echo -e "${BOLD}│${NC}  ${RED}Verification FAILED — filing P0 bug bead${NC}"
-    echo -e "${BOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
-
-    report_verification_failure "$errors"
+    if [ "$real_failure" = "1" ]; then
+        echo -e "${BOLD}│${NC}  ${RED}Verification FAILED — filing P0 bug bead${NC}"
+        echo -e "${BOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
+        report_verification_failure "$errors"
+    else
+        # Only "no relevant code changed" — do NOT spawn a child P0.  The
+        # PICKED bead will be reopened so the agent can try again without a
+        # runaway "fix build errors" chain clogging the queue.
+        echo -e "${BOLD}│${NC}  ${YELLOW}No relevant code changed — reopening PICKED bead (no P0 filed)${NC}"
+        echo -e "${BOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
+    fi
     return 1
 }
 
@@ -1976,11 +1990,24 @@ decide_build_outcome() {
         if [ "$verify_status" = "0" ] && [ "$evidence" = pass ] \
                 && [ "$committed" = true ] && [ "$code_changed" = true ]; then
             echo accept
+        elif [ "$verify_status" = "0" ] && [ "$evidence" = pass ]; then
+            # Build passes and evidence is valid but no code changed or not
+            # committed — agent closed it prematurely; reopen quietly.
+            echo reopen
         else
+            # Build failed OR evidence is invalid: reopen so the agent retries.
+            # evidence=invalid when verify passes means the proof format was
+            # wrong but the binary works — still reopen (not reject) so the
+            # agent can supply better evidence next iteration, but do NOT spawn
+            # a new child P0 (that is handled by run_verification).
             echo reopen
         fi
     elif [ "$verify_status" = "0" ] && [ "$evidence" = pass ] && [ "$committed" = true ] && [ "$code_changed" = true ]; then
         echo auto-close
+    elif [ "$verify_status" = "0" ] && [ "$evidence" = pass ]; then
+        # Build passes, evidence valid, but nothing committed or no code changed.
+        # Keep the bead alive without an explicit reopen comment.
+        echo partial
     else
         echo partial
     fi

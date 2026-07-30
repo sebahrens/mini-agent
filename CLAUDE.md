@@ -73,6 +73,13 @@ Also add `birdcage` (Phase 2) and an embedding crate (Phase 3) as optional under
 
 This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
 
+### Storage mode
+
+- This repository uses **embedded Dolt**. The database lives in `.beads/embeddeddolt/` and requires no external SQL server.
+- Do not run `bd dolt start`, `bd dolt stop`, or configure shared/server mode for this repository.
+- Do not add `dolt.shared-server`, `dolt_server_host`, or `dolt_server_port` settings. `.beads/metadata.json` must keep `dolt_mode: embedded`.
+- Use ordinary `bd` commands directly. Embedded Dolt is single-writer and manages its own file lock.
+
 ### Quick Reference
 
 ```bash
