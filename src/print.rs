@@ -11,17 +11,18 @@ const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
 const INSTALLED_BUILD_LABEL: &str = "installed binary provenance";
 
 fn installed_build_entry() -> (&'static str, String) {
+    let assertion_mode = if cfg!(debug_assertions) {
+        "debug assertions enabled"
+    } else {
+        "debug assertions disabled"
+    };
+
     (
         INSTALLED_BUILD_LABEL,
         format!(
-            "Cargo package {} version {}, debug assertions {} at compile time, target {}-{}",
+            "Cargo-installed package {} version {}, {assertion_mode} at compile time, target {}-{}",
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
-            if cfg!(debug_assertions) {
-                "enabled"
-            } else {
-                "disabled"
-            },
             std::env::consts::ARCH,
             std::env::consts::OS,
         ),
@@ -337,7 +338,7 @@ mod tests {
             (
                 "installed binary provenance",
                 format!(
-                    "Cargo package {} version {}, debug assertions {} at compile time, target {}-{}",
+                    "Cargo-installed package {} version {}, debug assertions {} at compile time, target {}-{}",
                     env!("CARGO_PKG_NAME"),
                     env!("CARGO_PKG_VERSION"),
                     if cfg!(debug_assertions) {
