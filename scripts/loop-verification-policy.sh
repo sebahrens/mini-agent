@@ -12,14 +12,24 @@ path_is_generated_python_bytecode() {
     esac
 }
 
+path_is_github_workflow() {
+    case "$1" in
+        .github/workflows/*.yml|.github/workflows/*.yaml) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 path_is_relevant_for_profile() {
     local path="$1" profile="$2" surfaces="${3:-rust}"
     # Generated Python bytecode is never an implementation surface. It can
     # appear under scripts/ after a local test run, but has no source verifier
     # and must not make an iteration relevant (or trigger "verifier missing").
     path_is_generated_python_bytecode "$path" && return 1
+    # CI workflow fixes are complete implementation changes when their YAML
+    # syntax and the Cargo gates pass, including under the headless profile.
+    path_is_github_workflow "$path" && return 0
     case "$path" in
-        src/*|Cargo.toml|Cargo.lock|build.rs|scripts/loop.sh|scripts/loop-verification-policy.sh|.github/workflows/*.yml|.github/workflows/*.yaml) return 0 ;;
+        src/*|Cargo.toml|Cargo.lock|build.rs|scripts/loop.sh|scripts/loop-verification-policy.sh) return 0 ;;
     esac
     case ",$surfaces," in
         *,script,*) case "$path" in scripts/*) return 0 ;; esac ;;

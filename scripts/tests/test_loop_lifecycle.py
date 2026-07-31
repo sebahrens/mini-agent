@@ -242,6 +242,11 @@ set -eu
 {relevance_function}
 
 path_is_relevant_for_profile scripts/loop.sh headless rust
+path_is_relevant_for_profile .github/workflows/ci.yml headless rust
+path_is_relevant_for_profile .github/workflows/ci.yaml headless rust
+if path_is_relevant_for_profile .github/workflows/ci.json headless rust; then
+    exit 41
+fi
 if path_is_relevant_for_profile scripts/tests/test_loop_lifecycle.py headless rust; then
     exit 42
 fi
