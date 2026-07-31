@@ -267,7 +267,11 @@ fn test_identity_validation_on_read() -> Result<(), Box<dyn std::error::Error>> 
         let mut store = SkillStore::open_at(&paths)?;
         store.insert_verified(&skill)?;
 
-        // Directly access the database to tamper with the stored skill.
+        // The storage trigger normally blocks this mutation. Drop it only in
+        // this corruption fixture to verify the independent read-time defense.
+        store
+            .conn_mut()
+            .execute_batch("DROP TRIGGER skill_revisions_identity_immutable;")?;
         store.conn_mut().execute(
             "UPDATE skill_revisions SET source = 'tampered' WHERE id = ?",
             [&correct_id],
@@ -561,7 +565,11 @@ fn test_malformed_json_skipped_in_list() -> Result<(), Box<dyn std::error::Error
         store.insert_verified(&skill1)?;
         store.insert_verified(&skill2)?;
 
-        // Corrupt skill1's JSON.
+        // Bypass the normal identity trigger only to exercise legacy/corrupt
+        // row handling in list_retrievable.
+        store
+            .conn_mut()
+            .execute_batch("DROP TRIGGER skill_revisions_identity_immutable;")?;
         store.conn_mut().execute(
             "UPDATE skill_revisions SET tags_json = '{invalid}' WHERE id = ?",
             [&skill1.id],
@@ -783,7 +791,7 @@ fn test_schema_v1_to_v3_migration_preserves_rows_and_rebuilds_active_only_fts()
             store
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            3
+            4
         );
         assert_eq!(
             store

@@ -1,0 +1,103 @@
+{
+  "mode": "autofix",
+  "intent": "Implement the Phase 5 evidence-based skill learning core on an isolated branch while preserving the Phase 3 and Phase 4 integration boundaries.",
+  "scope": [
+    "ARCHITECTURE.md",
+    "README.md",
+    "docs/specs/phase-5-evidence-learning.md",
+    "src/agent/builder.rs",
+    "src/extras/js/"
+  ],
+  "reviewers": [
+    "correctness",
+    "testing",
+    "maintainability",
+    "project-standards",
+    "agent-native",
+    "api-contracts",
+    "data-integrity",
+    "performance",
+    "reliability",
+    "security"
+  ],
+  "findings": [
+    {
+      "title": "Capability constraints were escapable through globalThis and asynchronous callbacks",
+      "severity": "P0",
+      "file": "src/extras/js/engine.rs",
+      "autofix_class": "safe_auto",
+      "confidence": 1.0,
+      "status": "fixed"
+    },
+    {
+      "title": "Telemetry retries could accept a changed immutable payload",
+      "severity": "P1",
+      "file": "src/extras/js/skills/telemetry.rs",
+      "autofix_class": "safe_auto",
+      "confidence": 1.0,
+      "status": "fixed"
+    },
+    {
+      "title": "Retention watermark could drop late events with older timestamps",
+      "severity": "P1",
+      "file": "src/extras/js/skills/retention.rs",
+      "autofix_class": "safe_auto",
+      "confidence": 0.98,
+      "status": "fixed"
+    },
+    {
+      "title": "Generic lifecycle transitions could bypass privileged promotion and supersession policy",
+      "severity": "P1",
+      "file": "src/extras/js/skills/lifecycle.rs",
+      "autofix_class": "safe_auto",
+      "confidence": 1.0,
+      "status": "fixed"
+    },
+    {
+      "title": "Production learned-skill binding awaits the Phase 3 frozen turn bundle",
+      "severity": "P1",
+      "file": "src/extras/js/tool.rs",
+      "autofix_class": "manual",
+      "confidence": 1.0,
+      "status": "blocked",
+      "blocker": "mini-agent-dqf"
+    },
+    {
+      "title": "Automatic quarantine index publication awaits immutable index generations",
+      "severity": "P1",
+      "file": "src/extras/js/skills/coordinator.rs",
+      "autofix_class": "manual",
+      "confidence": 1.0,
+      "status": "blocked",
+      "blocker": "mini-agent-af7.1"
+    },
+    {
+      "title": "Phase 5 end-to-end failure matrix and 100k benchmark remain outstanding",
+      "severity": "P1",
+      "file": "docs/specs/phase-5-evidence-learning.md",
+      "autofix_class": "manual",
+      "confidence": 1.0,
+      "status": "blocked",
+      "blocker": "mini-agent-38s.11"
+    }
+  ],
+  "applied_fixes": 15,
+  "residual_actionable_work": [
+    "Wire the frozen per-turn learned-skill bundle after mini-agent-dqf lands.",
+    "Publish quarantine and privacy removals into the immutable in-memory index after mini-agent-af7.1 lands.",
+    "Run the Phase 5 audit, failure matrix, and 100k-event benchmark after Phases 3 and 4 merge."
+  ],
+  "advisory_outputs": [
+    "The parallel Phase 4 worktree was not read or modified.",
+    "Phase 4 store-schema changes may require a deliberate rebase resolution.",
+    "Phase 5 child issues remain in progress because their production acceptance criteria depend on open Phase 3 and Phase 4 issues."
+  ],
+  "validation": {
+    "cargo_test_features_js_skills": "1139 passed; 0 failed; 3 ignored",
+    "cargo_test_features_js": "953 passed; 0 failed",
+    "cargo_test_default": "953 passed; 0 failed",
+    "cargo_install_debug": "passed",
+    "headless_connectivity_smoke": "Hello!"
+  },
+  "verdict": "Core implementation validated; Phase 5 exit blocked on Phases 3 and 4"
+}

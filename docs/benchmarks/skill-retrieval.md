@@ -54,3 +54,26 @@ an immutable generation; independently built randomized HNSW graphs must each me
 recall gate. Lifecycle removal applies a bounded immutable visibility mask immediately, proves
 5,000 removed IDs absent, and defers physical compaction to a later rebuild. The durable record is
 [`results/skill-retrieval-2026-07-31.json`](results/skill-retrieval-2026-07-31.json).
+
+## Phase 5 lifecycle and evidence operations
+
+The Phase 5 audit retains 100,000 revision rows and measures lifecycle-adjacent operations
+separately from retrieval. Run it with:
+
+```bash
+ZS_SKILL_BENCH_FULL=1 cargo test --features js,skills phase5_operations_benchmark -- --ignored --nocapture
+```
+
+The accepted 2026-08-01 debug-profile run passed every deliberately conservative budget:
+
+| Operation | Result | Budget |
+|---|---:|---:|
+| Deterministic routing, 100,000 turns | 826.323 ms | ≤2,000 ms |
+| Durable ingestion, 256 events | 30.837 ms | ≤500 ms |
+| Promotion policy, 10,000 evaluations | 978.692 ms | ≤5,000 ms |
+| Raw-event compaction, 256 events | 5.196 ms | ≤1,000 ms |
+| Generation-state refresh check | 0.102 ms | ≤100 ms |
+| Privacy purge at 100,000 retained rows | 49.219 ms | ≤1,000 ms |
+
+The machine-readable record is
+[`results/phase5-operations-2026-08-01.json`](results/phase5-operations-2026-08-01.json).

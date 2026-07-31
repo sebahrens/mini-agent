@@ -27,13 +27,24 @@ use sha2::{Digest, Sha256};
 
 pub mod admission;
 mod admission_store;
+pub mod capability;
 pub mod coordinator;
 pub mod embed;
 pub mod fakes;
+pub mod feedback;
 pub mod held_out;
 pub mod index;
+pub mod lifecycle;
+pub mod policy;
+pub mod privacy;
 pub mod proposal;
+pub mod quarantine;
+pub mod repair;
+pub mod retention;
+pub mod router;
+pub mod scheduler;
 pub mod store;
+pub mod telemetry;
 pub mod turn;
 pub mod verify;
 pub mod visibility;
@@ -111,7 +122,7 @@ pub(crate) fn private_skill_source(skill: &SkillArtifact) -> String {
     format!(
         "(function(read_file,write_file,spawn,fetch,globalThis,self,window,global,Function,Promise,__zs_Object){{\n\
          'use strict';\n{}\n;return __zs_Object.freeze({{{published}}});\n\
-         }})({read_file},{write_file},{spawn},{fetch},{safe_global},{safe_global},{safe_global},{safe_global},undefined,undefined,Object)",
+         }})({read_file},{write_file},{spawn},{fetch},{safe_global},{safe_global},{safe_global},{safe_global},undefined,Promise,Object)",
         skill.source,
     )
 }
@@ -121,7 +132,10 @@ pub(crate) fn private_skill_source(skill: &SkillArtifact) -> String {
 const IDENTITY_DOMAIN: &[u8] = b"mini-agent/skill-identity";
 
 /// Capability tier. Maps onto the verifier's Tier 0/1/2 host-exposure matrix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum CapabilityTier {
     /// Tier 0 — no host globals whatsoever.
     Pure,
