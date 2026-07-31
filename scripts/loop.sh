@@ -730,12 +730,13 @@ append_verification_error() {
 }
 
 report_verification_failure() {
-    local errors="$1" source_bead="${PICKED_ID:-unknown}"
+    local errors="$1" source_bead="${PICKED_ID:-unknown}" description
     [ ${#errors} -gt 3000 ] && errors="[truncated]..${errors: -3000}"
+    description=$'Post-agent verification failed. Fix before any other work.\n\n'"$errors"
 
     if bd create --title="Fix build errors from iteration $CURRENT_ITERATION ($source_bead)" \
             --type=bug --priority=0 \
-            --description=$'Post-agent verification failed. Fix before any other work.\n\n'"$errors" \
+            --description "$description" \
             >/dev/null 2>&1; then
         echo -e "${RED}  Filed P0 bug bead — next iteration will pick it up${NC}"
     else
