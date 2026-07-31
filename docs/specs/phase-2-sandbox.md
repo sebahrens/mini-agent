@@ -2,9 +2,9 @@
 
 - **Document role**: normative phase specification
 - **Specification version**: 1.0.0
-- **Delivery status**: planned
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-07-31
 - **Entry dependency**: Phase 1 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 2 blocker
 
@@ -217,16 +217,16 @@ semantics, ACL interactions, CI, and release gate.
 
 ## Acceptance criteria
 
-- [ ] `sandbox`, `js`, and `js,sandbox` feature combinations compile and retain their documented
+- [x] `sandbox`, `js`, and `js,sandbox` feature combinations compile and retain their documented
       relationships.
-- [ ] `fetch()` validates URLs, rechecks redirects, enforces bounds/deadlines/cancellation, applies
+- [x] `fetch()` validates URLs, rechecks redirects, enforces bounds/deadlines/cancellation, applies
       the narrowing allow-list, and always obtains `js/fetch` permission.
-- [ ] File allow-lists match resolved targets and never bypass Phase 1 permissions or secure I/O.
+- [x] File allow-lists match resolved targets and never bypass Phase 1 permissions or secure I/O.
 - [x] Linux and macOS process escape/denial tests prove their documented backend guarantees.
-- [ ] Backend absence/failure and Windows non-isolation are visible and never reported as
+- [x] Backend absence/failure and Windows non-isolation are visible and never reported as
       sandboxed.
 - [x] JS process spawn still uses the one shared `Sandbox::wrap_command` path.
-- [ ] Default and `js`-only behavior deny JS file access until roots or explicit unrestricted
+- [x] Default and `js`-only behavior deny JS file access until roots or explicit unrestricted
       opt-ins are configured; non-file JS behavior remains unchanged.
 - [x] Linux `bwrap` filesystem, namespace, device, environment, and network policy is explicit,
       capability-reported, fail-closed, and covered by real-backend CI probes.

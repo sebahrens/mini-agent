@@ -4,7 +4,7 @@
 - **Specification version**: 1.0.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-07-31
 
 ## Authority and conflict resolution
 
@@ -30,8 +30,8 @@ planning context only; it cannot override the cited section.
 | Phase | Normative spec | Delivery status | Owns |
 |-------|----------------|-----------------|------|
 | Foundation | [platform-paths.md](platform-paths.md) | In progress | Typed Linux/macOS/Windows roots, artifact ownership, secure migration |
-| 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | In progress | Core QuickJS integration, `JsTool`, primitive host globals |
-| 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Planned | `fetch()`, file allow-lists, Linux/macOS process isolation |
+| 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | Delivered | Core QuickJS integration, `JsTool`, primitive host globals |
+| 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS process isolation |
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Planned | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Planned | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Planned | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |

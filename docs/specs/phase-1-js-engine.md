@@ -2,9 +2,9 @@
 
 - **Document role**: normative phase specification
 - **Specification version**: 1.0.0
-- **Delivery status**: implementation in progress
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-07-31
 - **Entry dependency**: none for the non-persistent engine
 - **Exit dependency**: every acceptance criterion below and every Phase 1 blocker
 
@@ -226,15 +226,15 @@ Tests cover, at minimum:
 
 ## Acceptance criteria
 
-- [ ] All threading, runtime, limit, eval, microtask, and exception invariants above are tested.
-- [ ] `JsTool` and all of its fields satisfy `Send + Sync`; QuickJS state stays on its thread.
-- [ ] Every file operation is permission-gated on the resolved target and fails without effects.
-- [ ] Every process spawn is permission-gated, argument-safe, bounded, and created by
+- [x] All threading, runtime, limit, eval, microtask, and exception invariants above are tested.
+- [x] `JsTool` and all of its fields satisfy `Send + Sync`; QuickJS state stays on its thread.
+- [x] Every file operation is permission-gated on the resolved target and fails without effects.
+- [x] Every process spawn is permission-gated, argument-safe, bounded, and created by
       `Sandbox::wrap_command`.
-- [ ] Documentation and runtime diagnostics distinguish VM isolation from effective child-process
+- [x] Documentation and runtime diagnostics distinguish VM isolation from effective child-process
       isolation.
-- [ ] No Phase 2 or later host global is registered in a `js`-only Phase 1 build.
-- [ ] The default build remains unchanged and the `js` feature test suite passes.
+- [x] No Phase 2 or later host global is registered in a `js`-only Phase 1 build.
+- [x] The default build remains unchanged and the `js` feature test suite passes.
 
 ## Out of scope for Phase 1
 
