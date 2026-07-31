@@ -161,6 +161,12 @@ if path_is_relevant_for_profile scripts/tests/test_loop_lifecycle.py headless ru
     exit 42
 fi
 path_is_relevant_for_profile scripts/tests/test_loop_lifecycle.py headless script
+if path_is_relevant_for_profile scripts/tests/__pycache__/test_loop_lifecycle.cpython-314.pyc headless script; then
+    exit 43
+fi
+if path_is_relevant_for_profile scripts/tests/test_loop_lifecycle.pyo packaged-artifact packaging; then
+    exit 44
+fi
 """
 
         completed = subprocess.run(
