@@ -105,6 +105,10 @@ pub struct Config {
     pub auto_update_themes: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_providers: Option<HashMap<String, types::CustomProviderConfig>>,
+    /// Embedding backend for the skill library. Absent means the built-in
+    /// offline deterministic backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<types::EmbeddingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "permission-regex")]

@@ -3,6 +3,89 @@ use std::collections::HashMap;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
+/// Which backend the skill library uses to produce embedding vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingBackendKind {
+    /// Offline deterministic projection. Builds and runs everywhere with no
+    /// model download and no network access. Vectors are stable and
+    /// well-formed but carry no semantic meaning, so retrieval quality is not
+    /// comparable to a real model. This is the default because it is the only
+    /// backend guaranteed to be available.
+    #[default]
+    Deterministic,
+    /// An OpenAI-compatible embeddings HTTP API. Requires `base_url`, `model`,
+    /// `api_key_env`, and `dimensions`.
+    External,
+    /// Local ONNX/BGE inference via `fastembed`. Requires the `skills-embed`
+    /// build feature, which does not compile on every host.
+    Local,
+}
+
+impl std::fmt::Display for EmbeddingBackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deterministic => write!(f, "deterministic"),
+            Self::External => write!(f, "external"),
+            Self::Local => write!(f, "local"),
+        }
+    }
+}
+
+/// Embedding configuration for the skill library (`[embedding]` in config).
+///
+/// Example:
+///
+/// ```toml
+/// [embedding]
+/// backend = "external"
+/// base_url = "https://api.openai.com/v1"
+/// model = "text-embedding-3-small"
+/// api_key_env = "OPENAI_API_KEY"
+/// dimensions = 1536
+/// timeout_secs = 30
+///
+/// [embedding.headers]
+/// X-Organization = "acme"
+/// ```
+///
+/// The API key itself is never stored in config — only the name of the
+/// environment variable holding it, matching [`CustomProviderConfig`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// Which backend to use. Defaults to `deterministic`.
+    pub backend: EmbeddingBackendKind,
+    /// API root for `backend = "external"`. The embeddings path is appended,
+    /// so give the root (e.g. `https://api.openai.com/v1`), not the full
+    /// endpoint. A trailing slash is tolerated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Model name sent to the external API, or the local model identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<CompactString>,
+    /// Name of the environment variable holding the API key. The key is read
+    /// at startup and never written back to config or logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<CompactString>,
+    /// Vector dimensions the external model returns. Required for `external`
+    /// because vectors of a different width must be rejected rather than
+    /// silently mixed into an existing index generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
+    /// Opaque revision tag recorded alongside stored vectors. Change it when
+    /// the upstream model changes so old vectors become ineligible instead of
+    /// being compared against incompatible new ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<CompactString>,
+    /// Request timeout in seconds. Defaults to 30.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Extra headers sent with every embedding request.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuickModelConfig {
     pub provider: CompactString,
