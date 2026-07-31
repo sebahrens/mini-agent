@@ -125,6 +125,27 @@ pub struct Config {
     pub sandbox: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "sandbox-backend")]
     pub sandbox_backend: Option<String>,
+    #[cfg(feature = "js")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "js-file-base-dir")]
+    pub js_file_base_dir: Option<String>,
+    #[cfg(feature = "js")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "js-read-roots")]
+    pub js_read_roots: Option<Vec<String>>,
+    #[cfg(feature = "js")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "js-write-roots")]
+    pub js_write_roots: Option<Vec<String>>,
+    #[cfg(feature = "js")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-read-unrestricted"
+    )]
+    pub js_read_unrestricted: Option<bool>,
+    #[cfg(feature = "js")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-write-unrestricted"
+    )]
+    pub js_write_unrestricted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_all_mcp_calls: Option<bool>,
     #[cfg(feature = "mcp")]
@@ -680,5 +701,27 @@ code = "deepseek-v4-pro"
     fn default_config_has_no_prompt_to_model() {
         let cfg = Config::default();
         assert_eq!(cfg.resolve_prompt_model("plan"), None);
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn toml_deserializes_js_file_allow_policy_settings() {
+        let toml_str = r#"
+js-file-base-dir = "workspace"
+js-read-roots = ["src", "docs"]
+js-write-roots = ["generated"]
+js-read-unrestricted = false
+js-write-unrestricted = true
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(cfg.js_file_base_dir.as_deref(), Some("workspace"));
+        assert_eq!(
+            cfg.js_read_roots,
+            Some(vec!["src".to_string(), "docs".to_string()])
+        );
+        assert_eq!(cfg.js_write_roots, Some(vec!["generated".to_string()]));
+        assert_eq!(cfg.js_read_unrestricted, Some(false));
+        assert_eq!(cfg.js_write_unrestricted, Some(true));
     }
 }

@@ -14,6 +14,7 @@ use tokio::task::{AbortHandle, JoinSet};
 
 use crate::agent::tools::ToolError;
 use crate::extras::js::engine::js_thread_main;
+use crate::extras::js::host::AllowConfig;
 use crate::extras::js::types::{
     JsOutcome, JsRequest, JsResponse, PermCancellation, PermOutcome, PermRequest,
     PermRequestBuildError, PermResponse, PermResponseRejection, PermissionBackendFailure,
@@ -486,7 +487,12 @@ pub struct JsTool {
 }
 
 impl JsTool {
-    pub fn new(sandbox: Sandbox, permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
+    pub fn new(
+        sandbox: Sandbox,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        allow_config: AllowConfig,
+    ) -> Self {
         let permission_bridge = PermissionBridgeOwner::new(permission, ask_tx, STEP_TIMEOUT);
         let bridge = permission_bridge.bridge();
         let (tx, rx) = mpsc::channel();
@@ -499,7 +505,7 @@ impl JsTool {
             .stack_size(THREAD_STACK)
             .spawn(move || {
                 let _stopped = ThreadStopped(thread_stopped_on_exit);
-                js_thread_main(rx, sandbox, bridge, js_runtime);
+                js_thread_main(rx, sandbox, bridge, js_runtime, allow_config);
             })
             .expect("failed to spawn JS thread");
 
@@ -895,6 +901,7 @@ mod js_permission_bridge {
             Sandbox::new(false, "bwrap"),
             Some(permission(Action::Ask)),
             Some(ask_tx),
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
         );
         let thread_stopped = tool.thread_stopped_flag();
         drop(tool);

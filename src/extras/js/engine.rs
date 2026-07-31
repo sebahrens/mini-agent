@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use crate::extras::js::host::register_host_globals;
+use crate::extras::js::host::{AllowConfig, register_host_globals};
 use crate::extras::js::tool::PermissionBridge;
 use crate::extras::js::types::*;
 use crate::sandbox::Sandbox;
@@ -236,6 +236,7 @@ pub(crate) fn js_thread_main(
     sandbox: Sandbox,
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
+    allow_config: AllowConfig,
 ) {
     while let Ok(req) = rx.recv() {
         if req.reply.is_closed() {
@@ -255,7 +256,14 @@ pub(crate) fn js_thread_main(
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
-        let outcome = run_step(&req.code, &sandbox, &bridge, &req.cancellation, &runtime);
+        let outcome = run_step(
+            &req.code,
+            &sandbox,
+            &bridge,
+            &req.cancellation,
+            &runtime,
+            &allow_config,
+        );
         deliver_reply_or_cancel(
             req.reply,
             JsResponse { outcome },
@@ -272,6 +280,7 @@ pub(crate) fn run_step(
     permission_bridge: &PermissionBridge,
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
+    allow_config: &AllowConfig,
 ) -> JsOutcome {
     run_step_with_policy(
         code,
@@ -279,6 +288,7 @@ pub(crate) fn run_step(
         permission_bridge,
         cancellation,
         runtime,
+        allow_config,
         ExecutionPolicy {
             timeout: STEP_TIMEOUT,
             max_pending_jobs: MAX_PENDING_JOBS,
@@ -292,6 +302,7 @@ fn run_step_with_policy(
     permission_bridge: &PermissionBridge,
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
+    allow_config: &AllowConfig,
     policy: ExecutionPolicy,
 ) -> JsOutcome {
     // Fresh Runtime EVERY step — OOM poisons allocator; never reuse
@@ -322,6 +333,7 @@ fn run_step_with_policy(
         sandbox.clone(),
         permission_bridge.clone(),
         runtime.clone(),
+        allow_config.clone(),
     ) {
         return match error {
             Error::Allocation => JsOutcome::OomKilled,
@@ -375,6 +387,7 @@ pub(crate) fn run_step_for_test(
     permission_bridge: &PermissionBridge,
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
+    allow_config: &AllowConfig,
     timeout: Duration,
     max_pending_jobs: usize,
 ) -> JsOutcome {
@@ -384,6 +397,7 @@ pub(crate) fn run_step_for_test(
         permission_bridge,
         cancellation,
         runtime,
+        allow_config,
         ExecutionPolicy {
             timeout,
             max_pending_jobs,

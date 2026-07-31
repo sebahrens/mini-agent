@@ -87,19 +87,35 @@ of the existing permission service.
 
 ## File allow-list
 
-Configuration supplies separate read and write patterns. Matching occurs against the same
-canonical/resolved UTF-8 target used by Phase 1 permission checks, using component-aware semantics.
-It never matches the caller’s unresolved spelling.
+Configuration supplies separate directory roots through `js-read-roots` and `js-write-roots`.
+Relative roots resolve against `js-file-base-dir`; when that setting is absent, the base is the
+startup workspace directory captured while the agent is built. A relative `js-file-base-dir`
+itself resolves against that same startup directory. The base and every root are normalized once
+to absolute canonical directories, so later process-CWD changes cannot alter the policy.
+
+An absent, empty, malformed, nonexistent, or internally ambiguous root list denies that access
+class. Unrestricted access is available only through the explicit `js-read-unrestricted = true`
+or `js-write-unrestricted = true` opt-in. Supplying roots and the corresponding unrestricted
+setting together is ambiguous and denies access. Read and write policy remain independent, and
+neither form bypasses the mandatory Phase 1 permission check.
+
+Containment uses `Path` components against the same canonical/resolved UTF-8 target used by Phase 1
+permission checks. It never uses raw string prefixes or glob matching, so a `/safe` root does not
+match `/safe-evil`. Reads follow a final symlink only when its canonical target remains within an
+allowed root; dangling links are invalid. Writes reject final symlinks. For a nonexistent write
+target, authorization canonicalizes the nearest existing directory and validates every remaining
+normal path component. A symlinked parent is therefore judged by its canonical destination.
 
 The decision order is:
 
 1. securely resolve the target without reading content or mutating;
-2. reject when the applicable allow-list is configured and does not match;
+2. obtain a typed allow-list authorization decision for the resolved target and reject denials;
 3. obtain the mandatory Phase 1 permission for the exact resolved target; and
 4. perform the Phase 1 stable read or atomic no-follow write.
 
-An absent allow-list means “no additional Phase 2 restriction,” not “no permission required.”
-Allow-list failure, permission denial, races, timeout, and I/O errors have no read/write effect.
+The allow-list helper authorizes only; it does not perform file I/O. Final reads and writes
+separately revalidate the target or parent identity immediately before operating. Allow-list
+failure, permission denial, races, timeout, and I/O errors have no read/write effect.
 
 ## birdcage integration
 
@@ -177,7 +193,8 @@ semantics, ACL interactions, CI, and release gate.
 - [ ] Backend absence/failure and Windows non-isolation are visible and never reported as
       sandboxed.
 - [ ] JS process spawn still uses the one shared `Sandbox::wrap_command` path.
-- [ ] Default and `js`-only behavior remain unchanged except for explicitly fixed Phase 1 defects.
+- [ ] Default and `js`-only behavior deny JS file access until roots or explicit unrestricted
+      opt-ins are configured; non-file JS behavior remains unchanged.
 - [x] Linux `bwrap` filesystem, namespace, device, environment, and network policy is explicit,
       capability-reported, fail-closed, and covered by real-backend CI probes.
 

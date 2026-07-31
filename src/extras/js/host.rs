@@ -12,6 +12,357 @@ use crate::extras::js::types::{
 };
 use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileAccess {
+    Read,
+    Write,
+}
+
+impl FileAccess {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllowPolicyReason {
+    NoConfiguredRoots(FileAccess),
+    InvalidConfiguration(FileAccess),
+    InvalidTarget(FileAccess),
+    AmbiguousSymlink(FileAccess),
+    OutsideConfiguredRoots(FileAccess),
+}
+
+impl std::fmt::Display for AllowPolicyReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (access, reason) = match self {
+            Self::NoConfiguredRoots(access) => (
+                access,
+                "no roots are configured; unrestricted access requires an explicit opt-in",
+            ),
+            Self::InvalidConfiguration(access) => {
+                (access, "the configured roots are invalid or ambiguous")
+            }
+            Self::InvalidTarget(access) => (access, "the target path is invalid or cannot be resolved"),
+            Self::AmbiguousSymlink(access) => {
+                (access, "the target is a final or dangling symlink")
+            }
+            Self::OutsideConfiguredRoots(access) => {
+                (access, "the resolved target is outside the configured roots")
+            }
+        };
+        write!(formatter, "JS file {} denied: {reason}", access.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthorizationDecision {
+    Allowed(PathBuf),
+    Denied(AllowPolicyReason),
+}
+
+#[derive(Debug, Clone)]
+enum PathPolicy {
+    Deny(AllowPolicyReason),
+    Roots(Vec<PathBuf>),
+    Unrestricted,
+}
+
+/// Canonical, component-aware narrowing policy for the JS file host globals.
+///
+/// Relative configured roots are resolved against `base`, which is captured
+/// once at startup. The resulting policy never consults the process CWD.
+#[derive(Debug, Clone)]
+pub(crate) struct AllowConfig {
+    base: PathBuf,
+    read: PathPolicy,
+    write: PathPolicy,
+}
+
+impl AllowConfig {
+    pub(crate) fn from_settings(
+        startup_base: &Path,
+        configured_base: Option<&str>,
+        read_roots: Option<&[String]>,
+        write_roots: Option<&[String]>,
+        read_unrestricted: bool,
+        write_unrestricted: bool,
+    ) -> Self {
+        let base = resolve_policy_base(startup_base, configured_base);
+        let Ok(base) = base else {
+            return Self {
+                base: startup_base.to_path_buf(),
+                read: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(
+                    FileAccess::Read,
+                )),
+                write: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(
+                    FileAccess::Write,
+                )),
+            };
+        };
+
+        Self {
+            read: build_path_policy(
+                &base,
+                read_roots,
+                read_unrestricted,
+                FileAccess::Read,
+            ),
+            write: build_path_policy(
+                &base,
+                write_roots,
+                write_unrestricted,
+                FileAccess::Write,
+            ),
+            base,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unrestricted(base: &Path) -> Self {
+        Self::from_settings(base, None, None, None, true, true)
+    }
+
+    pub(crate) fn authorize_read(&self, target: &Path) -> AuthorizationDecision {
+        let resolved = match resolve_policy_read_target(&self.base, target) {
+            Ok(path) => path,
+            Err(reason) => return AuthorizationDecision::Denied(reason),
+        };
+        authorize_resolved(&self.read, resolved, FileAccess::Read)
+    }
+
+    pub(crate) fn authorize_write(&self, target: &Path) -> AuthorizationDecision {
+        let resolved = match resolve_policy_write_target(&self.base, target) {
+            Ok(path) => path,
+            Err(reason) => return AuthorizationDecision::Denied(reason),
+        };
+        authorize_resolved(&self.write, resolved, FileAccess::Write)
+    }
+
+}
+
+fn path_has_ambiguous_spelling(path: &Path) -> bool {
+    let Some(path) = path.to_str() else {
+        return true;
+    };
+    if path.is_empty() || path.contains('\0') {
+        return true;
+    }
+    #[cfg(unix)]
+    if path.contains('\\') {
+        return true;
+    }
+    false
+}
+
+fn absolute_lexical_from(base: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    let source = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in source.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized.is_absolute() {
+        Ok(normalized)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path did not resolve to an absolute path",
+        ))
+    }
+}
+
+fn resolve_policy_base(
+    startup_base: &Path,
+    configured_base: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    if path_has_ambiguous_spelling(startup_base) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid startup base",
+        ));
+    }
+    let startup_base = std::fs::canonicalize(startup_base)?;
+    if !startup_base.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "startup base is not a directory",
+        ));
+    }
+    let configured = configured_base.map_or_else(|| Path::new("."), Path::new);
+    if path_has_ambiguous_spelling(configured) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid configured base",
+        ));
+    }
+    let base = absolute_lexical_from(&startup_base, configured)?;
+    let base = std::fs::canonicalize(base)?;
+    if !base.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configured base is not a directory",
+        ));
+    }
+    Ok(base)
+}
+
+fn build_path_policy(
+    base: &Path,
+    roots: Option<&[String]>,
+    unrestricted: bool,
+    access: FileAccess,
+) -> PathPolicy {
+    if unrestricted {
+        return if roots.is_some() {
+            PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(access))
+        } else {
+            PathPolicy::Unrestricted
+        };
+    }
+    let Some(roots) = roots else {
+        return PathPolicy::Deny(AllowPolicyReason::NoConfiguredRoots(access));
+    };
+    if roots.is_empty() {
+        return PathPolicy::Deny(AllowPolicyReason::NoConfiguredRoots(access));
+    }
+
+    let mut canonical_roots = Vec::with_capacity(roots.len());
+    for root in roots {
+        let root = Path::new(root);
+        if path_has_ambiguous_spelling(root) {
+            return PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(access));
+        }
+        let Ok(root) = absolute_lexical_from(base, root)
+            .and_then(std::fs::canonicalize)
+            .and_then(|root| {
+                if root.is_dir() {
+                    Ok(root)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "configured root is not a directory",
+                    ))
+                }
+            })
+        else {
+            return PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(access));
+        };
+        if !canonical_roots.contains(&root) {
+            canonical_roots.push(root);
+        }
+    }
+    PathPolicy::Roots(canonical_roots)
+}
+
+fn resolve_policy_read_target(
+    base: &Path,
+    target: &Path,
+) -> Result<PathBuf, AllowPolicyReason> {
+    if path_has_ambiguous_spelling(target) {
+        return Err(AllowPolicyReason::InvalidTarget(FileAccess::Read));
+    }
+    let absolute = absolute_lexical_from(base, target)
+        .map_err(|_| AllowPolicyReason::InvalidTarget(FileAccess::Read))?;
+    std::fs::canonicalize(absolute)
+        .map_err(|_| AllowPolicyReason::InvalidTarget(FileAccess::Read))
+}
+
+fn resolve_policy_write_target(
+    base: &Path,
+    target: &Path,
+) -> Result<PathBuf, AllowPolicyReason> {
+    use std::path::Component;
+
+    if path_has_ambiguous_spelling(target) {
+        return Err(AllowPolicyReason::InvalidTarget(FileAccess::Write));
+    }
+    let absolute = absolute_lexical_from(base, target)
+        .map_err(|_| AllowPolicyReason::InvalidTarget(FileAccess::Write))?;
+    match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(AllowPolicyReason::AmbiguousSymlink(FileAccess::Write));
+            }
+            std::fs::canonicalize(absolute)
+                .map_err(|_| AllowPolicyReason::InvalidTarget(FileAccess::Write))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut ancestor = absolute.as_path();
+            let mut missing = Vec::new();
+            let canonical_parent = loop {
+                match std::fs::canonicalize(ancestor) {
+                    Ok(canonical) => break canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let Some(name) = ancestor.file_name() else {
+                            return Err(AllowPolicyReason::InvalidTarget(FileAccess::Write));
+                        };
+                        missing.push(name.to_os_string());
+                        let Some(parent) = ancestor.parent() else {
+                            return Err(AllowPolicyReason::InvalidTarget(FileAccess::Write));
+                        };
+                        ancestor = parent;
+                    }
+                    Err(_) => return Err(AllowPolicyReason::InvalidTarget(FileAccess::Write)),
+                }
+            };
+            if !canonical_parent.is_dir() {
+                return Err(AllowPolicyReason::InvalidTarget(FileAccess::Write));
+            }
+            let mut resolved = canonical_parent;
+            for part in missing.into_iter().rev() {
+                let part = Path::new(&part);
+                if !part
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(AllowPolicyReason::InvalidTarget(FileAccess::Write));
+                }
+                resolved.push(part);
+            }
+            Ok(resolved)
+        }
+        Err(_) => Err(AllowPolicyReason::InvalidTarget(FileAccess::Write)),
+    }
+}
+
+fn authorize_resolved(
+    policy: &PathPolicy,
+    target: PathBuf,
+    access: FileAccess,
+) -> AuthorizationDecision {
+    if !target.is_absolute() || path_has_ambiguous_spelling(&target) {
+        return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(access));
+    }
+    match policy {
+        PathPolicy::Deny(reason) => AuthorizationDecision::Denied(*reason),
+        PathPolicy::Unrestricted => AuthorizationDecision::Allowed(target),
+        PathPolicy::Roots(roots) => {
+            if roots.iter().any(|root| target.starts_with(root)) {
+                AuthorizationDecision::Allowed(target)
+            } else {
+                AuthorizationDecision::Denied(AllowPolicyReason::OutsideConfiguredRoots(access))
+            }
+        }
+    }
+}
+
 impl<'js> IntoJs<'js> for SpawnResult {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
         let obj = Object::new(ctx.clone())?;
@@ -39,6 +390,10 @@ fn file_error(
     message: impl Into<String>,
 ) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message(kind, tool, message.into())
+}
+
+fn allow_policy_error(tool: &'static str, reason: AllowPolicyReason) -> rquickjs::Error {
+    rquickjs::Error::new_from_js_message("file access policy", tool, reason.to_string())
 }
 
 async fn timeout_host_call<T>(
@@ -313,6 +668,7 @@ async fn write_approved_file(target: ResolvedWriteTarget, content: String) -> rq
 pub(crate) fn make_read_file(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
+    allow_config: AllowConfig,
 ) -> impl Fn(String) -> rquickjs::Result<String> {
     move |path: String| {
         let target = block_on_host_call(
@@ -322,6 +678,9 @@ pub(crate) fn make_read_file(
             STEP_TIMEOUT,
             resolve_read_target(&path),
         )?;
+        if let AuthorizationDecision::Denied(reason) = allow_config.authorize_read(&target.path) {
+            return Err(allow_policy_error("js/read_file", reason));
+        }
         let permission_path = permission_path("js/read_file", &target.path)?;
         permission_bridge
             .check_path("js/read_file", &permission_path)
@@ -339,6 +698,7 @@ pub(crate) fn make_read_file(
 pub(crate) fn make_write_file(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
+    allow_config: AllowConfig,
 ) -> impl Fn(String, String) -> rquickjs::Result<()> {
     move |path: String, content: String| {
         if content.len() > WRITE_FILE_MAX_BYTES {
@@ -355,6 +715,9 @@ pub(crate) fn make_write_file(
             STEP_TIMEOUT,
             resolve_write_target(&path),
         )?;
+        if let AuthorizationDecision::Denied(reason) = allow_config.authorize_write(&target.path) {
+            return Err(allow_policy_error("js/write_file", reason));
+        }
         let permission_path = permission_path("js/write_file", &target.path)?;
         permission_bridge
             .check_path("js/write_file", &permission_path)
@@ -449,17 +812,26 @@ pub(crate) fn register_host_globals(
     sandbox: Sandbox,
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
+    allow_config: AllowConfig,
 ) -> rquickjs::Result<()> {
     ctx.with(|ctx| {
         let globals = ctx.globals();
 
         globals.set(
             "read_file",
-            Func::from(make_read_file(permission_bridge.clone(), runtime.clone())),
+            Func::from(make_read_file(
+                permission_bridge.clone(),
+                runtime.clone(),
+                allow_config.clone(),
+            )),
         )?;
         globals.set(
             "write_file",
-            Func::from(make_write_file(permission_bridge.clone(), runtime.clone())),
+            Func::from(make_write_file(
+                permission_bridge.clone(),
+                runtime.clone(),
+                allow_config,
+            )),
         )?;
         globals.set(
             "spawn",
@@ -530,6 +902,250 @@ mod tests {
         }
     }
 
+    fn expect_allowed(decision: AuthorizationDecision) -> PathBuf {
+        match decision {
+            AuthorizationDecision::Allowed(path) => path,
+            AuthorizationDecision::Denied(reason) => panic!("expected allow, got {reason}"),
+        }
+    }
+
+    fn expect_denied(
+        decision: AuthorizationDecision,
+        expected: AllowPolicyReason,
+    ) -> AllowPolicyReason {
+        match decision {
+            AuthorizationDecision::Allowed(path) => {
+                panic!("expected denial, allowed {}", path.display())
+            }
+            AuthorizationDecision::Denied(reason) => {
+                assert_eq!(reason, expected);
+                reason
+            }
+        }
+    }
+
+    #[test]
+    fn js_file_allow_policy_uses_canonical_component_containment() {
+        let temp = TempDir::new();
+        let safe = temp.path().join("safe");
+        let sibling = temp.path().join("safe-evil");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let descendant = safe.join("child.txt");
+        let sibling_file = sibling.join("secret.txt");
+        std::fs::write(&descendant, "allowed").unwrap();
+        std::fs::write(&sibling_file, "denied").unwrap();
+        let roots = vec![safe.to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
+
+        assert_eq!(expect_allowed(policy.authorize_read(&safe)), safe.canonicalize().unwrap());
+        assert_eq!(
+            expect_allowed(policy.authorize_read(&descendant)),
+            descendant.canonicalize().unwrap()
+        );
+        expect_denied(
+            policy.authorize_read(&sibling_file),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+        expect_denied(
+            policy.authorize_read(&safe.join("..").join("safe-evil").join("secret.txt")),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+    }
+
+    #[test]
+    fn js_file_allow_policy_resolves_relative_roots_against_explicit_base() {
+        let temp = TempDir::new();
+        let configured_base = temp.path().join("policy-base");
+        let safe = configured_base.join("safe");
+        std::fs::create_dir_all(&safe).unwrap();
+        let source = safe.join("source.txt");
+        std::fs::write(&source, "allowed").unwrap();
+        let roots = vec!["safe".to_string()];
+        let policy = AllowConfig::from_settings(
+            temp.path(),
+            Some("policy-base"),
+            Some(&roots),
+            Some(&roots),
+            false,
+            false,
+        );
+
+        assert_ne!(std::env::current_dir().unwrap(), configured_base);
+        assert_eq!(
+            expect_allowed(policy.authorize_read(&source)),
+            source.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn js_file_allow_policy_keeps_read_and_write_roots_separate() {
+        let temp = TempDir::new();
+        let read_root = temp.path().join("read");
+        let write_root = temp.path().join("write");
+        std::fs::create_dir_all(&read_root).unwrap();
+        std::fs::create_dir_all(&write_root).unwrap();
+        let read_roots = vec![read_root.to_string_lossy().into_owned()];
+        let write_roots = vec![write_root.to_string_lossy().into_owned()];
+        let policy = AllowConfig::from_settings(
+            temp.path(),
+            None,
+            Some(&read_roots),
+            Some(&write_roots),
+            false,
+            false,
+        );
+
+        expect_allowed(policy.authorize_read(&read_root));
+        expect_denied(
+            policy.authorize_write(&read_root.join("new.txt")),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Write),
+        );
+        expect_allowed(policy.authorize_write(&write_root.join("new.txt")));
+        expect_denied(
+            policy.authorize_read(&write_root),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+    }
+
+    #[test]
+    fn js_file_allow_policy_nonexistent_write_uses_nearest_canonical_parent() {
+        let temp = TempDir::new();
+        let safe = temp.path().join("safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let roots = vec![safe.to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(temp.path(), None, None, Some(&roots), false, false);
+
+        assert_eq!(
+            expect_allowed(policy.authorize_write(&safe.join("missing/child/file.txt"))),
+            safe.canonicalize().unwrap().join("missing/child/file.txt")
+        );
+        expect_denied(
+            policy.authorize_write(&safe.join("../outside/escaped.txt")),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Write),
+        );
+    }
+
+    #[test]
+    fn js_file_allow_policy_empty_malformed_and_ambiguous_settings_deny() {
+        let temp = TempDir::new();
+        let empty = Vec::new();
+        let empty_policy =
+            AllowConfig::from_settings(temp.path(), None, Some(&empty), Some(&empty), false, false);
+        expect_denied(
+            empty_policy.authorize_read(temp.path()),
+            AllowPolicyReason::NoConfiguredRoots(FileAccess::Read),
+        );
+
+        let malformed = vec!["missing-root".to_string()];
+        let malformed_policy = AllowConfig::from_settings(
+            temp.path(),
+            None,
+            Some(&malformed),
+            Some(&malformed),
+            false,
+            false,
+        );
+        expect_denied(
+            malformed_policy.authorize_read(temp.path()),
+            AllowPolicyReason::InvalidConfiguration(FileAccess::Read),
+        );
+
+        let valid = vec![temp.path().to_string_lossy().into_owned()];
+        let ambiguous = AllowConfig::from_settings(
+            temp.path(),
+            None,
+            Some(&valid),
+            Some(&valid),
+            true,
+            true,
+        );
+        expect_denied(
+            ambiguous.authorize_read(temp.path()),
+            AllowPolicyReason::InvalidConfiguration(FileAccess::Read),
+        );
+    }
+
+    #[test]
+    fn js_file_allow_policy_requires_explicit_unrestricted_opt_in() {
+        let temp = TempDir::new();
+        let denied = AllowConfig::from_settings(temp.path(), None, None, None, false, false);
+        expect_denied(
+            denied.authorize_read(temp.path()),
+            AllowPolicyReason::NoConfiguredRoots(FileAccess::Read),
+        );
+
+        let unrestricted = AllowConfig::unrestricted(temp.path());
+        expect_allowed(unrestricted.authorize_read(temp.path()));
+        expect_allowed(unrestricted.authorize_write(&temp.path().join("missing/file.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn js_file_allow_policy_defines_symlink_behavior() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let safe = temp.path().join("safe");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let inside_file = safe.join("inside.txt");
+        let outside_file = outside.join("outside.txt");
+        std::fs::write(&inside_file, "inside").unwrap();
+        std::fs::write(&outside_file, "outside").unwrap();
+        let inside_link = safe.join("inside-link");
+        let escape_link = safe.join("escape-link");
+        let dangling_link = safe.join("dangling-link");
+        let parent_link = safe.join("parent-link");
+        symlink(&inside_file, &inside_link).unwrap();
+        symlink(&outside_file, &escape_link).unwrap();
+        symlink(safe.join("missing"), &dangling_link).unwrap();
+        symlink(&outside, &parent_link).unwrap();
+        let roots = vec![safe.to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
+
+        assert_eq!(
+            expect_allowed(policy.authorize_read(&inside_link)),
+            inside_file.canonicalize().unwrap()
+        );
+        expect_denied(
+            policy.authorize_read(&escape_link),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+        expect_denied(
+            policy.authorize_read(&dangling_link),
+            AllowPolicyReason::InvalidTarget(FileAccess::Read),
+        );
+        expect_denied(
+            policy.authorize_write(&inside_link),
+            AllowPolicyReason::AmbiguousSymlink(FileAccess::Write),
+        );
+        expect_denied(
+            policy.authorize_write(&parent_link.join("new.txt")),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Write),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn js_file_allow_policy_rejects_alternate_separator_spelling() {
+        let temp = TempDir::new();
+        let roots = vec![temp.path().to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
+
+        expect_denied(
+            policy.authorize_write(Path::new(r"safe\..\outside.txt")),
+            AllowPolicyReason::InvalidTarget(FileAccess::Write),
+        );
+    }
+
     fn standard_permission(working_dir: PathBuf) -> PermCheck {
         Arc::new(Mutex::new(PermissionChecker::new(
             &PermissionConfigs::default(),
@@ -567,6 +1183,7 @@ mod tests {
             Sandbox::new(false, "bwrap"),
             permission_owner.bridge(),
             tokio::runtime::Handle::current(),
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
         );
 
         assert!(
@@ -580,16 +1197,53 @@ mod tests {
         ask_tx: Option<AskSender>,
         path: PathBuf,
     ) -> Result<String, String> {
+        call_read_file_with_policy(
+            permission,
+            ask_tx,
+            path,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        )
+        .await
+    }
+
+    async fn call_read_file_with_policy(
+        permission: PermCheck,
+        ask_tx: Option<AskSender>,
+        path: PathBuf,
+        allow_config: AllowConfig,
+    ) -> Result<String, String> {
         let runtime = tokio::runtime::Handle::current();
         let owner = PermissionBridgeOwner::new(Some(permission), ask_tx, STEP_TIMEOUT);
         let bridge = owner.bridge();
         tokio::task::spawn_blocking(move || {
             let _owner = owner;
-            make_read_file(bridge, runtime)(path.to_string_lossy().into_owned())
+            make_read_file(bridge, runtime, allow_config)(path.to_string_lossy().into_owned())
                 .map_err(|error| error.to_string())
         })
         .await
         .expect("read_file test task panicked")
+    }
+
+    #[tokio::test]
+    async fn js_file_allow_policy_denies_before_mandatory_permission() {
+        let temp = TempDir::new();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("source.txt");
+        std::fs::write(&source, "must not be read").unwrap();
+        let policy = AllowConfig::from_settings(&workspace, None, None, None, false, false);
+        let permission = host_permission(workspace, Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+
+        let error = call_read_file_with_policy(permission, Some(ask_tx), source, policy)
+            .await
+            .expect_err("empty read policy must deny");
+
+        assert!(error.contains("JS file read denied: no roots are configured"));
+        assert!(
+            ask_rx.try_recv().is_err(),
+            "policy denial reached the permission service"
+        );
     }
 
     async fn call_write_file(
@@ -601,9 +1255,10 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let owner = PermissionBridgeOwner::new(Some(permission), ask_tx, STEP_TIMEOUT);
         let bridge = owner.bridge();
+        let allow_config = AllowConfig::unrestricted(&std::env::current_dir().unwrap());
         tokio::task::spawn_blocking(move || {
             let _owner = owner;
-            make_write_file(bridge, runtime)(
+            make_write_file(bridge, runtime, allow_config)(
                 path.to_string_lossy().into_owned(),
                 content.to_string(),
             )
@@ -817,10 +1472,11 @@ mod tests {
             PermissionBridgeOwner::new(Some(standard_permission(working_dir)), None, STEP_TIMEOUT);
         let bridge = owner.bridge();
         let target_for_call = target.clone();
+        let allow_config = AllowConfig::unrestricted(&std::env::current_dir().unwrap());
 
         let error = tokio::task::spawn_blocking(move || {
             let _owner = owner;
-            make_write_file(bridge, runtime)(
+            make_write_file(bridge, runtime, allow_config)(
                 target_for_call.to_string_lossy().into_owned(),
                 "x".repeat(WRITE_FILE_MAX_BYTES + 1),
             )

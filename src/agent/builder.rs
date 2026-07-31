@@ -171,10 +171,26 @@ fn register_js_tool(
     sandbox: Sandbox,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    cfg: &Config,
 ) {
+    use crate::extras::js::host::AllowConfig;
     use crate::extras::js::tool::JsTool;
 
-    tools.push(Box::new(JsTool::new(sandbox, permission, ask_tx)));
+    let startup_base = std::env::current_dir().unwrap_or_default();
+    let allow_config = AllowConfig::from_settings(
+        &startup_base,
+        cfg.js_file_base_dir.as_deref(),
+        cfg.js_read_roots.as_deref(),
+        cfg.js_write_roots.as_deref(),
+        cfg.js_read_unrestricted.unwrap_or(false),
+        cfg.js_write_unrestricted.unwrap_or(false),
+    );
+    tools.push(Box::new(JsTool::new(
+        sandbox,
+        permission,
+        ask_tx,
+        allow_config,
+    )));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,7 +361,13 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         }
 
         #[cfg(feature = "js")]
-        register_js_tool(&mut all_tools, sandbox, permission.clone(), ask_tx.clone());
+        register_js_tool(
+            &mut all_tools,
+            sandbox,
+            permission.clone(),
+            ask_tx.clone(),
+            cfg,
+        );
 
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
 
@@ -364,7 +386,13 @@ mod js_tests {
     #[tokio::test]
     async fn registers_and_executes_js_tool() {
         let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
-        register_js_tool(&mut tools, Sandbox::new(false, "bwrap"), None, None);
+        register_js_tool(
+            &mut tools,
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            &crate::config::Config::default(),
+        );
 
         assert_eq!(
             tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),

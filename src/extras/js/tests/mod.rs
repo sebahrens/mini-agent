@@ -1,4 +1,5 @@
 use crate::extras::js::tool::JsTool;
+use crate::extras::js::host::AllowConfig;
 use crate::extras::js::types::{
     JsOutcome, JsRequest, JsResponse, PermCancellation, STEP_TIMEOUT, THREAD_STACK,
 };
@@ -20,7 +21,12 @@ fn make_test_tool_with_permissions(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) -> JsTool {
-    JsTool::new(sandbox, permission, ask_tx)
+    JsTool::new(
+        sandbox,
+        permission,
+        ask_tx,
+        AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+    )
 }
 
 fn restrictive_permission_allowing_js_entrypoint() -> PermCheck {
@@ -281,6 +287,7 @@ async fn js_outcome_mapping() {
     let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
     let bridge = owner.bridge();
     let runtime = tokio::runtime::Handle::current();
+    let allow_config = AllowConfig::unrestricted(&std::env::current_dir().unwrap());
 
     let run = |code: &str, timeout: Duration, max_pending_jobs: usize| {
         run_step_for_test(
@@ -289,6 +296,7 @@ async fn js_outcome_mapping() {
             &bridge,
             &PermCancellation::new(),
             &runtime,
+            &allow_config,
             timeout,
             max_pending_jobs,
         )
