@@ -82,7 +82,8 @@ jobs:
         run: cargo test --locked linux_sandbox_policy
 
       - name: Test shared sandbox module
-        run: 'cargo test --locked sandbox::'
+        run: >-
+          cargo test --locked sandbox::
 
       - name: Test JS spawn parity through the shared sandbox
         run: cargo test --locked --features js,sandbox
