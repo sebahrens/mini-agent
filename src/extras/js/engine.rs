@@ -7,14 +7,31 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-#[cfg(feature = "skills")]
-use crate::extras::js::host::SkillCapabilityGate;
 use crate::extras::js::host::{AllowConfig, register_host_globals};
+#[cfg(feature = "skills")]
+use crate::extras::js::host::{SkillCapabilityGate, register_proposal_global};
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::proposal::ProposalHost;
 use crate::extras::js::tool::PermissionBridge;
 use crate::extras::js::types::*;
 use crate::sandbox::Sandbox;
 
 const MAX_PENDING_JOBS: usize = 10_000;
+
+#[derive(Clone, Default)]
+pub(crate) struct NormalExecutionHosts {
+    #[cfg(feature = "skills")]
+    proposal: Option<ProposalHost>,
+}
+
+impl NormalExecutionHosts {
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_proposal(proposal: ProposalHost) -> Self {
+        Self {
+            proposal: Some(proposal),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ReplyPath {
@@ -242,6 +259,7 @@ pub(crate) fn js_thread_main(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
     allow_config: AllowConfig,
+    execution_hosts: NormalExecutionHosts,
 ) {
     while let Ok(req) = rx.recv() {
         if req.reply.is_closed() {
@@ -270,6 +288,7 @@ pub(crate) fn js_thread_main(
             &req.cancellation,
             &runtime,
             &allow_config,
+            &execution_hosts,
         );
         #[cfg(not(feature = "skills"))]
         let outcome = run_step(
@@ -279,6 +298,7 @@ pub(crate) fn js_thread_main(
             &req.cancellation,
             &runtime,
             &allow_config,
+            &execution_hosts,
         );
         deliver_reply_or_cancel(
             req.reply,
@@ -298,6 +318,7 @@ pub(crate) fn run_step(
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
     allow_config: &AllowConfig,
+    execution_hosts: &NormalExecutionHosts,
 ) -> JsOutcome {
     run_step_with_policy(
         code,
@@ -306,6 +327,7 @@ pub(crate) fn run_step(
         cancellation,
         runtime,
         allow_config,
+        execution_hosts,
         #[cfg(feature = "skills")]
         None,
         ExecutionPolicy {
@@ -316,6 +338,7 @@ pub(crate) fn run_step(
 }
 
 #[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
 fn run_step_with_skills(
     code: &str,
     skills: &crate::extras::js::skills::turn::TurnSkillBundle,
@@ -324,6 +347,7 @@ fn run_step_with_skills(
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
     allow_config: &AllowConfig,
+    execution_hosts: &NormalExecutionHosts,
 ) -> JsOutcome {
     run_step_with_policy(
         code,
@@ -332,6 +356,7 @@ fn run_step_with_skills(
         cancellation,
         runtime,
         allow_config,
+        execution_hosts,
         Some(skills),
         ExecutionPolicy {
             timeout: STEP_TIMEOUT,
@@ -634,9 +659,13 @@ fn run_step_with_policy(
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
     allow_config: &AllowConfig,
+    execution_hosts: &NormalExecutionHosts,
     #[cfg(feature = "skills")] skills: Option<&crate::extras::js::skills::turn::TurnSkillBundle>,
     policy: ExecutionPolicy,
 ) -> JsOutcome {
+    #[cfg(not(feature = "skills"))]
+    let _ = execution_hosts;
+
     // Fresh Runtime EVERY step — OOM poisons allocator; never reuse
     let rt = match Runtime::new() {
         Ok(r) => r,
@@ -674,6 +703,13 @@ fn run_step_with_policy(
         return match error {
             Error::Allocation => JsOutcome::OomKilled,
             error => JsOutcome::Error(format!("Failed to register host globals: {error}")),
+        };
+    }
+    #[cfg(feature = "skills")]
+    if let Err(error) = register_proposal_global(&ctx, execution_hosts.proposal.clone()) {
+        return match error {
+            Error::Allocation => JsOutcome::OomKilled,
+            error => JsOutcome::Error(format!("Failed to register proposal global: {error}")),
         };
     }
 
@@ -752,6 +788,7 @@ pub(crate) fn run_step_for_test(
         cancellation,
         runtime,
         allow_config,
+        &NormalExecutionHosts::default(),
         #[cfg(feature = "skills")]
         None,
         ExecutionPolicy {
@@ -854,6 +891,7 @@ mod tests {
                     permission_bridge,
                     runtime,
                     AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+                    NormalExecutionHosts::default(),
                 );
             })
             .expect("failed to spawn JS test thread");

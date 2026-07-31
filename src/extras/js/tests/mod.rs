@@ -1,7 +1,17 @@
 #[cfg(feature = "skills")]
 mod agent_skill_catalog;
 #[cfg(feature = "skills")]
+mod auto_admission_end_to_end;
+#[cfg(feature = "skills")]
+mod propose_skill_host;
+#[cfg(feature = "skills")]
+mod skill_admission_gate;
+#[cfg(feature = "skills")]
+mod skill_admission_schema;
+#[cfg(feature = "skills")]
 mod skill_embedder;
+#[cfg(feature = "skills")]
+mod skill_held_out_evaluator;
 #[cfg(feature = "skills")]
 mod skill_index;
 #[cfg(feature = "skills")]
@@ -516,6 +526,7 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
                 bridge,
                 runtime,
                 AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+                crate::extras::js::engine::NormalExecutionHosts::default(),
             );
         })
         .expect("failed to spawn JS reply-drop test thread");

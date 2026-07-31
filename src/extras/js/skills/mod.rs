@@ -25,13 +25,18 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
+pub mod admission;
+mod admission_store;
 pub mod coordinator;
 pub mod embed;
 pub mod fakes;
+pub mod held_out;
 pub mod index;
+pub mod proposal;
 pub mod store;
 pub mod turn;
 pub mod verify;
+pub mod visibility;
 
 /// Version of the canonical serialization scheme. Bumping this changes every identity.
 pub const IDENTITY_VERSION: u32 = 1;

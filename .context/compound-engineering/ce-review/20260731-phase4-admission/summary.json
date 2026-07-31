@@ -1,0 +1,160 @@
+{
+  "mode": "autofix",
+  "intent": "Implement every Phase 4 durable proposal and human-gated canary admission unit from a fresh main-based worktree without exposing proposal persistence, held-out fixtures, or lifecycle authority to QuickJS.",
+  "scope": "origin/main merge-base through the phase-4-admission working tree",
+  "plan": "docs/specs/phase-4-auto-admission.md",
+  "reviewers": [
+    "correctness",
+    "testing",
+    "maintainability",
+    "project-standards",
+    "agent-native",
+    "learnings",
+    "security",
+    "performance",
+    "api-contract",
+    "data-integrity",
+    "reliability",
+    "adversarial"
+  ],
+  "findings": [
+    {
+      "title": "Verifier admitted undetected export mutations",
+      "severity": "P1",
+      "file": "src/extras/js/skills/verify.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 1.0,
+      "pre_existing": true,
+      "status": "fixed",
+      "fix": "Reject undetected mutations, isolate each export mutation in a fresh context, install the interrupt deadline before evaluation, and bump the verifier version."
+    },
+    {
+      "title": "Admission evaluator had no production worker",
+      "severity": "P1",
+      "file": "src/agent/builder.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.98,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Start a dedicated admission worker with its own store connection and configured embedder alongside the bounded proposal worker."
+    },
+    {
+      "title": "Approval trusted stale held-out selection",
+      "severity": "P1",
+      "file": "src/extras/js/skills/admission.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.96,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Rerun identity, predecessor, duplicate, held-out, verifier/fake version, and embedding compatibility gates immediately before the private canary transaction."
+    },
+    {
+      "title": "Successful evaluation could strand verified proposals",
+      "severity": "P1",
+      "file": "src/extras/js/skills/store.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.95,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Persist the passed report, verified revision, and awaiting-approval proposal state in one transaction."
+    },
+    {
+      "title": "Proposal parsing copied arrays before enforcing bounds",
+      "severity": "P2",
+      "file": "src/extras/js/skills/proposal.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.93,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Inspect QuickJS array and string lengths before allocating Rust values and consume the per-session attempt budget before shape parsing."
+    },
+    {
+      "title": "Blocked proposals had no reevaluation transition",
+      "severity": "P2",
+      "file": "src/extras/js/skills/store.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.92,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Add an authenticated optimistic transition that requeues only held-out-suite-blocked proposals after trusted suite import."
+    },
+    {
+      "title": "Idempotent enqueue could rebind lineage",
+      "severity": "P2",
+      "file": "src/extras/js/skills/store.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.9,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Reject same-artifact submissions that name a different immutable predecessor."
+    },
+    {
+      "title": "Long evaluation could outlive its lease",
+      "severity": "P2",
+      "file": "src/extras/js/skills/admission.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.88,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Renew the claimed lease to a bounded evaluation window and cap aggregate matched suites and cases."
+    },
+    {
+      "title": "Proposal capability was hidden from tool discovery",
+      "severity": "P3",
+      "file": "src/extras/js/tool.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.9,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Advertise the structured propose_skill global only when its durable workers are installed."
+    },
+    {
+      "title": "Evaluation reports were not rehashed on read",
+      "severity": "P1",
+      "file": "src/extras/js/skills/store.rs",
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "confidence": 0.97,
+      "pre_existing": false,
+      "status": "fixed",
+      "fix": "Centralize the versioned report identity, bind timestamps, validate it before persistence, and rehash reports on every review read."
+    }
+  ],
+  "applied_fixes": 10,
+  "residual_actionable_work": [],
+  "advisory_outputs": [
+    "Phase 3 entry dependencies are delivered and their beads are closed.",
+    "No relevant docs/solutions learning was found.",
+    "Canary stays intentionally absent from active retrieval, prompt manifests, turn bundles, and runtime source binding until Phase 5."
+  ],
+  "validation": {
+    "targeted_phase4_tests": "passed",
+    "full_js_skills_suite": "1161 passed; 0 failed; 4 ignored",
+    "full_js_suite": "953 passed; 0 failed",
+    "default_suite": "953 passed; 0 failed",
+    "js_sandbox_suite": "970 passed; 0 failed",
+    "clippy": "passed with -D warnings",
+    "debug_install": "passed",
+    "real_binary_smoke": "passed: headless Hello and TUI Ready to code"
+  },
+  "verdict": "Ready to merge"
+}

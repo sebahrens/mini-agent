@@ -307,11 +307,35 @@ mod tests {
         assert_eq!(report.mutation_outcomes[0], MutationOutcome::Detected);
     }
 
-    // Note: This test is disabled due to RefCell borrow issues with rquickjs mutation testing.
-    // The mutation pass will be refined in future iterations.
-    //
-    // #[test]
-    // fn test_mutation_undetected_when_export_unused() { ... }
+    #[test]
+    fn test_mutation_undetected_when_export_unused() {
+        let s = skill(
+            "function unused() { return 42; }",
+            vec!["true"],
+            vec![("unused", "(): number")],
+            CapabilityTier::Pure,
+            vec![],
+        );
+        assert!(matches!(
+            verify_skill(&s),
+            Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
+        ));
+    }
+
+    #[test]
+    fn test_mutation_context_is_fresh_for_each_export() {
+        let s = skill(
+            "function used() { return 1; } function unused() { return 2; }",
+            vec!["used() === 1"],
+            vec![("used", "(): number"), ("unused", "(): number")],
+            CapabilityTier::Pure,
+            vec![],
+        );
+        assert!(matches!(
+            verify_skill(&s),
+            Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
+        ));
+    }
 
     #[test]
     fn test_tier_0_pure_has_no_capability() {

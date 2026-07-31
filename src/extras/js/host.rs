@@ -19,6 +19,10 @@ use std::sync::Arc;
 #[cfg(feature = "sandbox")]
 use std::time::Instant;
 
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::proposal::{JsProposal, ProposalError, ProposalHost};
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::store::EnqueueStatus;
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::{
     READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
@@ -1725,6 +1729,62 @@ pub(crate) fn make_spawn(
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
     make_spawn_with_timeout(sandbox, permission_bridge, runtime, STEP_TIMEOUT)
+}
+
+#[cfg(feature = "skills")]
+pub(crate) fn make_propose_skill(
+    proposal_host: ProposalHost,
+) -> impl for<'js> Fn(Object<'js>) -> rquickjs::Result<String> {
+    move |object: Object<'_>| {
+        proposal_host
+            .budget
+            .consume()
+            .map_err(proposal_host_error)?;
+        let proposal = JsProposal::from_object(&object).map_err(proposal_host_error)?;
+        let predecessor_id = proposal.predecessor_id.clone();
+        let artifact = proposal
+            .validate_and_canonicalize()
+            .map_err(proposal_host_error)?;
+        let result = proposal_host
+            .sender
+            .enqueue(artifact, predecessor_id)
+            .map_err(proposal_host_error)?;
+        let status = match result.status {
+            EnqueueStatus::Pending => "pending",
+            EnqueueStatus::Verified => "verified",
+            EnqueueStatus::Rejected => "rejected",
+            EnqueueStatus::AwaitingApproval => "awaiting_approval",
+            EnqueueStatus::Approved => "approved",
+        };
+        serde_json::to_string(&serde_json::json!({
+            "id": result.skill_id,
+            "proposal_id": result.proposal_id,
+            "status": status,
+            "report_id": result.report_id,
+        }))
+        .map_err(|_| proposal_host_error(ProposalError::StoreUnavailable))
+    }
+}
+
+#[cfg(feature = "skills")]
+fn proposal_host_error(error: ProposalError) -> rquickjs::Error {
+    rquickjs::Error::new_from_js_message("proposal", "js/propose_skill", error.to_string())
+}
+
+#[cfg(feature = "skills")]
+pub(crate) fn register_proposal_global(
+    ctx: &Context,
+    proposal_host: Option<ProposalHost>,
+) -> rquickjs::Result<()> {
+    if let Some(proposal_host) = proposal_host {
+        ctx.with(|ctx| {
+            ctx.globals().set(
+                "propose_skill",
+                Func::from(make_propose_skill(proposal_host)),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 const SPAWN_STDOUT_MAX_BYTES: usize = 1024 * 1024;

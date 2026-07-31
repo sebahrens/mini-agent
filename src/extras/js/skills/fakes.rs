@@ -171,6 +171,17 @@ impl FakeHostGlobals {
         self.state.lock().unwrap().transcript.clone()
     }
 
+    /// Seed verifier-owned virtual data without recording an operation.
+    ///
+    /// Held-out fixtures use this to provide hidden deterministic responses. The
+    /// proposal runtime cannot access this handle or inspect the seeded bytes.
+    pub(crate) fn seed_file(&self, path: &str, content: &str) -> Result<(), String> {
+        if !self.manifest.allows(HostCapability::ReadFile) {
+            return Err("read_file not declared in capability manifest".to_string());
+        }
+        self.state.lock().unwrap().write_file(path, content)
+    }
+
     /// Read a virtual file. Fails if not declared in capability manifest.
     pub fn read_file(&self, path: &str) -> Result<String, String> {
         if !self.manifest.allows(HostCapability::ReadFile) {

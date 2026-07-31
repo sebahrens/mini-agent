@@ -755,7 +755,7 @@ fn test_transaction_interruption_recovery() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn test_schema_v1_to_v2_migration_preserves_rows_and_rebuilds_active_only_fts()
+fn test_schema_v1_to_v3_migration_preserves_rows_and_rebuilds_active_only_fts()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = temp_app_paths();
     let paths = resolve_test_paths(&temp_dir)?;
@@ -783,7 +783,7 @@ fn test_schema_v1_to_v2_migration_preserves_rows_and_rebuilds_active_only_fts()
             store
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            2
+            3
         );
         assert_eq!(
             store

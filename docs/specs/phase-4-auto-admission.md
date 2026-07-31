@@ -1,10 +1,10 @@
 # Phase 4 — Agent Proposals and Human-Gated Admission
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.0.0
-- **Delivery status**: planned
+- **Specification version**: 1.1.0
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-07-31
 - **Entry dependencies**: Foundation, Phase 1, and Phase 3 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 4 blocker
 
@@ -61,13 +61,23 @@ mutable copy of canonical source that could drift from the final artifact.
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `src/extras/js/skills/admission.rs` | TO BE CREATED | Durable queue, evaluator, approval transaction |
-| `src/extras/js/skills/held_out.rs` | TO BE CREATED | Trusted data-driven case store/loader |
-| `src/extras/js/skills/verify.rs` | Phase 3 creates | Pure embedded/inherited/held-out execution |
-| `src/extras/js/skills/store.rs` | Phase 3 creates | Proposal/report schema and lifecycle transactions |
-| `src/extras/js/host.rs` | Phase 1 creates | Register bounded `propose_skill` |
-| `src/extras/js/types.rs` | Phase 1 creates | Proposal request/response channel types |
-| `src/extras/js/engine.rs` | Phase 1 creates | Register the host only in normal `skills` execution mode; verifier modes omit it |
+| `src/extras/js/skills/proposal.rs` | IMPLEMENTED | Bounded validation, session budget, and durable queue handoff |
+| `src/extras/js/skills/admission.rs` | IMPLEMENTED | Lease evaluator, review packet, retry classification, and approval orchestration |
+| `src/extras/js/skills/admission_store.rs` | IMPLEMENTED | Private optimistic canary/denial transactions |
+| `src/extras/js/skills/held_out.rs` | IMPLEMENTED | Trusted data-driven case store/loader and report binding |
+| `src/extras/js/skills/visibility.rs` | IMPLEMENTED | Active-only index, prompt manifest, and frozen turn-bundle boundary |
+| `src/extras/js/skills/verify.rs` | EXTENDED | Pure embedded/inherited/held-out execution |
+| `src/extras/js/skills/store.rs` | EXTENDED | Proposal/report/suite/approval schema and lifecycle primitives |
+| `src/extras/js/host.rs` | EXTENDED | Bounded `propose_skill` host implementation |
+| `src/extras/js/engine.rs` | EXTENDED | Register the host only in normal `skills` execution mode; verifier modes omit it |
+
+The implementation keeps proposal persistence on a dedicated bounded worker, not the QuickJS
+thread. A separate bounded-lifecycle admission worker opens its own store connection and advances
+durable proposals off the JS and async executor threads. `AdmissionEvaluator` is the sole
+evaluator/reviewer service. Its private
+`admission_store` dependency owns the only Phase 4 canary transaction; neither `SkillStore`'s
+public surface nor a JS global exposes an active transition. Active-only visibility snapshots
+exclude pending, verified, rejected, and canary revisions by construction.
 
 ---
 
@@ -257,6 +267,8 @@ Expected values, fixture responses, and transcripts are never included in agent 
 If no suitable suite matches, the proposal remains verified with
 `held_out_suite_required`. It cannot enter canary until a human imports or approves a suite and
 requests reevaluation. Agent-authored embedded tests alone never satisfy this gate.
+The authenticated reevaluation transition atomically returns only that blocked proposal and its
+revision to `pending`; it cannot reset deterministic rejection or alter identity-bearing bytes.
 
 ## Promotion gate
 
@@ -310,28 +322,28 @@ may display source and sanitized metadata only through an explicitly authorized 
 
 All must pass under `cargo test --features js,skills`:
 
-- [ ] Host validation rejects empty/oversized/malformed payloads and Tier 3 capabilities without
+- [x] Host validation rejects empty/oversized/malformed payloads and Tier 3 capabilities without
       panicking or evaluating proposal code inline.
-- [ ] Proposal identity covers source, ordered tests/exports, description/tags, capability, and
+- [x] Proposal identity covers source, ordered tests/exports, description/tags, capability, and
       identity version; duplicate proposals are idempotent.
-- [ ] Durable queue claims recover after crash/lease expiry and retry infrastructure failures with
+- [x] Durable queue claims recover after crash/lease expiry and retry infrastructure failures with
       bounded backoff and attempt counts.
-- [ ] Evaluator reloads and rehashes the artifact before invoking the Phase 3 no-effect verifier.
-- [ ] Agent-authored tests have no real host effects, only exact boolean `true` passes, Tier 1/2
+- [x] Evaluator reloads and rehashes the artifact before invoking the Phase 3 no-effect verifier.
+- [x] Agent-authored tests have no real host effects, only exact boolean `true` passes, Tier 1/2
       access only declared deterministic fakes, and mutation checks reject vacuous suites.
-- [ ] Replacement proposals inherit every predecessor regression and cannot delete a failing case.
-- [ ] Held-out suites are data-driven, content-addressed, human-approved, hidden from proposal APIs,
+- [x] Replacement proposals inherit every predecessor regression and cannot delete a failing case.
+- [x] Held-out suites are data-driven, content-addressed, human-approved, hidden from proposal APIs,
       and generic integration fixtures do not require a per-skill Rust registry.
-- [ ] No matching held-out suite blocks approval; embedded-test success cannot activate a skill.
-- [ ] Evaluator verifies exports/capability, semantic duplicates, and versioned embedding before
+- [x] No matching held-out suite blocks approval; embedded-test success cannot activate a skill.
+- [x] Evaluator verifies exports/capability, semantic duplicates, and versioned embedding before
       human review.
-- [ ] Human approval atomically transitions only an unchanged verified revision to canary, records
+- [x] Human approval atomically transitions only an unchanged verified revision to canary, records
       audit data, and bumps index generation; stale rows and simulated failures fully roll back.
-- [ ] Without Phase 5 routing, canary revisions remain absent from model manifests and JS bundles.
-- [ ] Phase 4 has no path that automatically marks an agent proposal active.
-- [ ] Proposal submission remains non-blocking from the JS thread and respects queue/session bounds.
-- [ ] Logs and reports omit source, tests, held-out values, raw prompts, arguments, and secrets.
-- [ ] `cargo test --features js` without `skills` passes unchanged.
+- [x] Without Phase 5 routing, canary revisions remain absent from model manifests and JS bundles.
+- [x] Phase 4 has no path that automatically marks an agent proposal active.
+- [x] Proposal submission remains non-blocking from the JS thread and respects queue/session bounds.
+- [x] Logs and reports omit source, tests, held-out values, raw prompts, arguments, and secrets.
+- [x] `cargo test --features js` without `skills` passes unchanged.
 
 ---
 
