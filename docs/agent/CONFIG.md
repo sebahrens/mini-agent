@@ -88,13 +88,26 @@ permission.
 The skill library ranks skills against your prompt using embedding vectors. The
 `[embedding]` section selects where those vectors come from.
 
+The `external` backend defaults to the **same OpenRouter endpoint and credential
+the LLM already uses**, so enabling real embeddings needs only:
+
 ```toml
 [embedding]
-backend = "external"                      # deterministic | external | local
+backend = "external"
+```
+
+That resolves to `https://openrouter.ai/api/v1/embeddings` with
+`openai/text-embedding-3-small` (1536 dimensions), authenticated from
+`OPENROUTER_API_KEY` — the same variable the OpenRouter LLM provider reads. Any
+field can be overridden to point at a different OpenAI-compatible provider:
+
+```toml
+[embedding]
+backend = "external"
 base_url = "https://api.openai.com/v1"    # API root, not the full endpoint
-model = "text-embedding-3-small"
+model = "text-embedding-3-large"
 api_key_env = "OPENAI_API_KEY"            # variable name, never the key itself
-dimensions = 1536
+dimensions = 3072                         # required for any non-default model
 timeout_secs = 30                         # optional, default 30
 # model_revision = "2026-01-snapshot"     # optional; defaults to `model`
 
@@ -102,22 +115,37 @@ timeout_secs = 30                         # optional, default 30
 X-Organization = "acme"
 ```
 
+`dimensions` is inferred only for the default model. Any other model must state
+its width, because a wrong value would silently mix incompatible vectors into an
+index generation.
+
 | Backend | Requires | Notes |
 |---------|----------|-------|
 | `deterministic` (default) | nothing | Offline hash projection. Builds and runs everywhere with no download and no network. Vectors are stable and well-formed but carry **no semantic meaning**, so retrieval quality is not comparable to a real model. |
 | `external` | `base_url`, `model`, `api_key_env`, `dimensions` | Any OpenAI-compatible `/embeddings` endpoint. The practical choice for real embeddings without a local model. |
-| `local` | the `skills-embed` build feature | Local ONNX inference of `BAAI/bge-small-en-v1.5` via `fastembed`. This feature does not compile on every host — notably `x86_64-apple-darwin`, for which `ort-sys` ships no prebuilt binaries. |
+| `local` | the `skills-embed` build feature | Local ONNX inference of `BAAI/bge-small-en-v1.5` via `fastembed`, 384 dimensions. Fully offline after the first model download (~30 MiB). |
 
 The API key is read from the environment variable named by `api_key_env`. It is
 never written to config, never included in an error message, and redacted from
 debug output; endpoint URLs are stripped from error text so a key passed as a
 query parameter cannot reach a log.
 
-`dimensions` is mandatory for `external` because stored vectors are keyed by
-`(model_id, model_revision)` and a differently sized vector must be rejected
-rather than silently mixed into an existing index generation. Change
-`model_revision` when the upstream model changes so existing vectors become
-ineligible instead of being compared against incompatible new ones.
+Stored vectors are keyed by `(model_id, model_revision)`. Change `model_revision`
+when the upstream model changes so existing vectors become ineligible instead of
+being compared against incompatible new ones.
+
+### Building the `local` backend
+
+`skills-embed` pulls `ort-sys` (ONNX Runtime). On hosts it ships prebuilt
+binaries for (Linux x86_64, arm64 macOS) plain `--features skills-embed` works.
+On hosts it does not — notably `x86_64-apple-darwin` — use the
+`skills-embed-dynamic` feature, which links ONNX Runtime at run time instead:
+
+```bash
+brew install onnxruntime
+export ORT_DYLIB_PATH=$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib
+cargo test --features js,skills,skills-embed-dynamic
+```
 
 Selecting `local` without the `skills-embed` feature is a startup error rather
 than a silent downgrade to `deterministic`.

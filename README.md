@@ -101,18 +101,20 @@ separate boundary; subprocess network isolation does not bypass or replace fetch
 | `sandbox` | — | Linux/macOS process isolation for `spawn`, and the `fetch` global |
 | `skills` | `js` | Learned-skill store, retrieval, and no-effect verifier (`rusqlite`, bundled SQLite) |
 | `skills-embed` | `skills` | Local BGE embedding inference (`fastembed` → ONNX Runtime) |
+| `skills-embed-dynamic` | `skills-embed` | Links ONNX Runtime at run time via `ORT_DYLIB_PATH`, for hosts without prebuilt `ort-sys` binaries |
 | `mcp` | — | MCP client transports and tool discovery |
 
 Selecting `skills` automatically enables `js`; a skills-without-JS build is not
 selectable. `skills` alone uses an offline deterministic embedding backend, so it
 builds everywhere.
 
-**Platform caveat:** `skills-embed` pulls `ort-sys` (ONNX Runtime), which has no
-prebuilt binaries for some hosts — notably `x86_64-apple-darwin`, where it fails
-to build. That is why it is a separate opt-in feature and why required CI does not
-enable it. For real semantic embeddings without a local model, point the
-`[embedding]` config section at an external OpenAI-compatible API instead; see
-[`docs/agent/CONFIG.md`](docs/agent/CONFIG.md).
+**Platform caveat:** `skills-embed` pulls `ort-sys` (ONNX Runtime), which ships no
+prebuilt binaries for some hosts — notably `x86_64-apple-darwin`. On those hosts
+build with `skills-embed-dynamic` and point `ORT_DYLIB_PATH` at a local ONNX
+Runtime (`brew install onnxruntime`). Either way it stays opt-in and out of
+required CI because of the native download. For real embeddings with no local
+model at all, `[embedding] backend = "external"` reuses the OpenRouter endpoint
+and key the LLM already uses; see [`docs/agent/CONFIG.md`](docs/agent/CONFIG.md).
 
 Supported combinations exercised in CI: default, `--no-default-features`, `js`,
 `skills`, `js,sandbox`, `mcp`, `js,skills`, and `mcp,js,skills`.

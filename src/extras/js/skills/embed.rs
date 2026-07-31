@@ -205,6 +205,20 @@ impl EmbeddingBackend for DeterministicBackend {
     }
 }
 
+/// Default external endpoint: the same OpenRouter API root the LLM provider uses,
+/// so the skill library needs no separate provider setup.
+pub const DEFAULT_EXTERNAL_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Default credential: the same environment variable the OpenRouter LLM provider
+/// reads (see `ProviderKind::OpenRouter` in `src/auth.rs`).
+pub const DEFAULT_EXTERNAL_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Default embedding model, routed through OpenRouter.
+pub const DEFAULT_EXTERNAL_MODEL: &str = "openai/text-embedding-3-small";
+
+/// Output width of [`DEFAULT_EXTERNAL_MODEL`]. Verified against the live endpoint.
+pub const DEFAULT_EXTERNAL_DIMENSIONS: usize = 1536;
+
 /// Embedding backend backed by an OpenAI-compatible embeddings HTTP API.
 ///
 /// Selected with `[embedding] backend = "external"`. This is the practical way to
@@ -216,13 +230,36 @@ impl EmbeddingBackend for DeterministicBackend {
 /// All calls are blocking and must run on a blocking worker, never on the async
 /// executor or the QuickJS thread.
 pub struct ExternalBackend {
-    client: reqwest::blocking::Client,
+    timeout: std::time::Duration,
     endpoint: String,
     api_key: String,
     model_id: String,
     model_revision: String,
     dimensions: usize,
     headers: Vec<(String, String)>,
+}
+
+/// Process-wide blocking HTTP client for external embedding requests.
+///
+/// `reqwest::blocking::Client` owns an internal tokio runtime, and dropping a
+/// runtime from an async context panics with "Cannot drop a runtime in a context
+/// where blocking is not allowed". Because the agent runner is async, a client
+/// stored in `ExternalBackend` would panic whenever the embedder was dropped on
+/// an async task. A `static` is never dropped, so keeping one shared client here
+/// removes that failure mode entirely. Per-request timeouts are applied at the
+/// `RequestBuilder`, so the shared client needs no default timeout.
+fn external_http_client() -> Result<&'static reqwest::blocking::Client, EmbeddingError> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+        std::sync::OnceLock::new();
+
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| EmbeddingError::InitializationFailed(error.clone()))
 }
 
 /// Hand-written so the API key can never reach a log or panic message. Do not
@@ -246,11 +283,10 @@ impl ExternalBackend {
     /// misconfiguration surfaces at startup rather than as empty retrieval
     /// results during a turn.
     pub fn from_config(config: &crate::config::EmbeddingConfig) -> Result<Self, EmbeddingError> {
-        let api_key_env = config.api_key_env.as_deref().ok_or_else(|| {
-            EmbeddingError::InvalidConfiguration(
-                "[embedding] backend = \"external\" requires `api_key_env`".to_string(),
-            )
-        })?;
+        let api_key_env = config
+            .api_key_env
+            .as_deref()
+            .unwrap_or(DEFAULT_EXTERNAL_API_KEY_ENV);
 
         let api_key = std::env::var(api_key_env).map_err(|_| {
             EmbeddingError::InvalidConfiguration(format!(
@@ -275,22 +311,27 @@ impl ExternalBackend {
         config: &crate::config::EmbeddingConfig,
         api_key: String,
     ) -> Result<Self, EmbeddingError> {
-        let missing = |field: &str| {
-            EmbeddingError::InvalidConfiguration(format!(
-                "[embedding] backend = \"external\" requires `{field}`"
-            ))
-        };
-
+        // Default to the same OpenRouter endpoint and credential the LLM already
+        // uses, so `backend = "external"` works with no duplicated provider config.
         let base_url = config
             .base_url
             .as_deref()
-            .ok_or_else(|| missing("base_url"))?;
-        let model_id = config.model.as_deref().ok_or_else(|| missing("model"))?;
-        config
-            .api_key_env
-            .as_deref()
-            .ok_or_else(|| missing("api_key_env"))?;
-        let dimensions = config.dimensions.ok_or_else(|| missing("dimensions"))?;
+            .unwrap_or(DEFAULT_EXTERNAL_BASE_URL);
+        let model_id = config.model.as_deref().unwrap_or(DEFAULT_EXTERNAL_MODEL);
+
+        // Dimensions may only be inferred for the model whose width we actually
+        // know. A custom model must state its width, because a wrong value would
+        // silently mix incompatible vectors into an index generation.
+        let dimensions = match config.dimensions {
+            Some(dimensions) => dimensions,
+            None if model_id == DEFAULT_EXTERNAL_MODEL => DEFAULT_EXTERNAL_DIMENSIONS,
+            None => {
+                return Err(EmbeddingError::InvalidConfiguration(format!(
+                    "[embedding] `dimensions` is required for model `{model_id}`; it can only \
+                     be inferred for the default `{DEFAULT_EXTERNAL_MODEL}`"
+                )));
+            }
+        };
 
         if dimensions == 0 {
             return Err(EmbeddingError::InvalidConfiguration(
@@ -299,10 +340,6 @@ impl ExternalBackend {
         }
 
         let timeout = std::time::Duration::from_secs(config.timeout_secs.unwrap_or(30));
-        let client = reqwest::blocking::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|error| EmbeddingError::InitializationFailed(error.to_string()))?;
 
         // `base_url` is the API root; append the standard embeddings path.
         let endpoint = format!("{}/embeddings", base_url.trim_end_matches('/'));
@@ -324,7 +361,7 @@ impl ExternalBackend {
         headers.sort();
 
         Ok(Self {
-            client,
+            timeout,
             endpoint,
             api_key,
             model_id: model_id.to_string(),
@@ -342,9 +379,9 @@ impl ExternalBackend {
 
         let body = serde_json::json!({ "model": self.model_id, "input": inputs });
 
-        let mut request = self
-            .client
+        let mut request = external_http_client()?
             .post(&self.endpoint)
+            .timeout(self.timeout)
             .bearer_auth(&self.api_key)
             .json(&body);
         for (name, value) in &self.headers {
@@ -520,6 +557,8 @@ fn redact_url(message: &str) -> String {
 pub mod fastembed_backend {
     use super::*;
     use fastembed::{EmbeddingModel, InitOptions};
+    // `InitOptions` is #[non_exhaustive] in fastembed 5, so it must be built through
+    // its builder rather than a struct expression.
     use std::sync::{Arc, Mutex};
 
     /// Real ONNX/BGE embedding backend using fastembed.
@@ -539,10 +578,7 @@ pub mod fastembed_backend {
         /// This downloads the model on first run and caches it locally.
         pub fn new() -> Result<Self, EmbeddingError> {
             let model_id = "BAAI/bge-small-en-v1.5";
-            let options = InitOptions {
-                model_name: fastembed::EmbeddingModel::BGESmallENV15,
-                ..Default::default()
-            };
+            let options = InitOptions::new(EmbeddingModel::BGESmallENV15);
 
             let model = fastembed::TextEmbedding::try_new(options)
                 .map_err(|e| EmbeddingError::InitializationFailed(e.to_string()))?;
@@ -565,10 +601,10 @@ pub mod fastembed_backend {
                 }
             }
 
-            let model = self.model.lock().map_err(|_| EmbeddingError::WorkerPanic)?;
+            let mut model = self.model.lock().map_err(|_| EmbeddingError::WorkerPanic)?;
 
             let embeddings = model
-                .embed(documents.to_vec(), None)
+                .embed(documents, None)
                 .map_err(|e| EmbeddingError::InitializationFailed(e.to_string()))?;
 
             // Validate output
@@ -592,7 +628,7 @@ pub mod fastembed_backend {
                 return Err(EmbeddingError::EmptyQuery);
             }
 
-            let model = self.model.lock().map_err(|_| EmbeddingError::WorkerPanic)?;
+            let mut model = self.model.lock().map_err(|_| EmbeddingError::WorkerPanic)?;
 
             let mut embeddings = model
                 .embed(vec![query.to_string()], None)
@@ -1306,30 +1342,31 @@ mod external_backend_tests {
     }
 
     #[test]
-    fn external_backend_requires_each_mandatory_field() {
-        for (field, mutate) in [
-            (
-                "base_url",
-                (|c: &mut EmbeddingConfig| c.base_url = None) as fn(&mut EmbeddingConfig),
-            ),
-            ("model", |c: &mut EmbeddingConfig| c.model = None),
-            ("api_key_env", |c: &mut EmbeddingConfig| {
-                c.api_key_env = None
-            }),
-            ("dimensions", |c: &mut EmbeddingConfig| c.dimensions = None),
-        ] {
-            let mut config = valid_config();
-            mutate(&mut config);
-            let error = ExternalBackend::from_config_with_key(&config, "k".to_string())
-                .expect_err("a missing mandatory field must be rejected");
-            match error {
-                EmbeddingError::InvalidConfiguration(message) => assert!(
-                    message.contains(field),
-                    "error for missing {field} should name it, got: {message}"
-                ),
-                other => panic!("missing {field} produced the wrong error: {other:?}"),
-            }
-        }
+    fn external_backend_defaults_every_field_to_the_openrouter_llm_settings() {
+        // A bare `backend = "external"` must work without repeating provider
+        // config: it inherits the same endpoint and credential the LLM uses.
+        let config = EmbeddingConfig {
+            backend: EmbeddingBackendKind::External,
+            ..EmbeddingConfig::default()
+        };
+        let backend = ExternalBackend::from_config_with_key(&config, "k".to_string())
+            .expect("a bare external config must resolve against defaults");
+        assert_eq!(backend.endpoint, "https://openrouter.ai/api/v1/embeddings");
+        assert_eq!(backend.model_id(), "openai/text-embedding-3-small");
+        assert_eq!(backend.dimensions(), 1536);
+    }
+
+    #[test]
+    fn explicit_fields_override_the_defaults() {
+        let mut config = valid_config();
+        config.base_url = Some("https://api.openai.com/v1".to_string());
+        config.model = Some("text-embedding-3-large".into());
+        config.dimensions = Some(3072);
+        let backend = ExternalBackend::from_config_with_key(&config, "k".to_string())
+            .expect("explicit config must be honoured");
+        assert_eq!(backend.endpoint, "https://api.openai.com/v1/embeddings");
+        assert_eq!(backend.model_id(), "text-embedding-3-large");
+        assert_eq!(backend.dimensions(), 3072);
     }
 
     #[test]
@@ -1463,5 +1500,204 @@ X-Organization = "acme"
         assert!(!redacted.contains("sk-secret"), "got: {redacted}");
         assert!(!redacted.contains("api.example.com"), "got: {redacted}");
         assert!(redacted.contains("<url>"), "got: {redacted}");
+    }
+}
+
+/// Live end-to-end tests against the configured external provider.
+///
+/// These are `#[ignore]` by default so the normal suite stays hermetic and
+/// offline. Run them explicitly with a key present:
+///
+/// ```text
+/// cargo test --features js,skills external_live -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod external_live_tests {
+    use super::*;
+    use crate::config::{EmbeddingBackendKind, EmbeddingConfig};
+
+    /// Config with every field defaulted — the whole point is that pointing at
+    /// OpenRouter requires nothing beyond selecting the backend.
+    fn defaulted_external_config() -> EmbeddingConfig {
+        EmbeddingConfig {
+            backend: EmbeddingBackendKind::External,
+            ..EmbeddingConfig::default()
+        }
+    }
+
+    #[test]
+    fn defaults_resolve_to_openrouter_without_any_extra_config() {
+        let backend = ExternalBackend::from_config_with_key(
+            &defaulted_external_config(),
+            "placeholder".to_string(),
+        )
+        .expect("a bare external config must resolve against the OpenRouter defaults");
+
+        assert_eq!(backend.endpoint, "https://openrouter.ai/api/v1/embeddings");
+        assert_eq!(backend.model_id(), "openai/text-embedding-3-small");
+        assert_eq!(backend.dimensions(), 1536);
+        assert_eq!(DEFAULT_EXTERNAL_API_KEY_ENV, "OPENROUTER_API_KEY");
+    }
+
+    #[test]
+    fn a_custom_model_must_declare_its_dimensions() {
+        let mut config = defaulted_external_config();
+        config.model = Some("some/other-embedding-model".into());
+        let error = ExternalBackend::from_config_with_key(&config, "placeholder".to_string())
+            .expect_err("dimensions must not be guessed for an unknown model");
+        assert!(
+            matches!(error, EmbeddingError::InvalidConfiguration(ref m) if m.contains("dimensions")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "performs a live network call; requires OPENROUTER_API_KEY"]
+    fn live_openrouter_query_embedding_is_well_formed() {
+        let backend = ExternalBackend::from_config(&defaulted_external_config())
+            .expect("OPENROUTER_API_KEY must be set for the live test");
+
+        let vector = backend
+            .embed_query("parse JSON safely and return null on error")
+            .expect("live embedding request must succeed");
+
+        assert_eq!(vector.len(), 1536, "unexpected embedding width");
+        assert!(
+            vector.iter().all(|value| value.is_finite()),
+            "non-finite value present"
+        );
+        let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "vector must be unit-normalized, norm was {norm}"
+        );
+    }
+
+    #[test]
+    #[ignore = "performs a live network call; requires OPENROUTER_API_KEY"]
+    fn live_openrouter_batch_preserves_input_order_and_semantics() {
+        let backend = ExternalBackend::from_config(&defaulted_external_config())
+            .expect("OPENROUTER_API_KEY must be set for the live test");
+
+        let documents = vec![
+            "a function that parses JSON text".to_string(),
+            "a recipe for sourdough bread".to_string(),
+            "a helper that decodes JSON strings".to_string(),
+        ];
+        let vectors = backend
+            .embed_documents(&documents)
+            .expect("live batch request must succeed");
+
+        assert_eq!(vectors.len(), 3);
+        for vector in &vectors {
+            assert_eq!(vector.len(), 1536);
+        }
+
+        let cosine = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+
+        // Documents 0 and 2 are both about JSON parsing; 1 is unrelated. If the
+        // response were misordered or the vectors meaningless, this would not hold.
+        let json_pair = cosine(&vectors[0], &vectors[2]);
+        let unrelated = cosine(&vectors[0], &vectors[1]);
+        assert!(
+            json_pair > unrelated,
+            "semantically related documents should score higher: {json_pair} vs {unrelated}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "performs a live network call; requires OPENROUTER_API_KEY"]
+    async fn live_openrouter_query_cache_avoids_a_second_request() {
+        let embedder =
+            Embedder::from_config(Some(&defaulted_external_config())).expect("embedder must build");
+
+        let first = embedder
+            .embed_query_cached("find duplicate files")
+            .await
+            .expect("first");
+        let stats = embedder.cache_stats().await;
+        assert_eq!(stats.hits, 0);
+
+        let second = embedder
+            .embed_query_cached("find duplicate files")
+            .await
+            .expect("second");
+        let stats = embedder.cache_stats().await;
+        assert_eq!(
+            stats.hits, 1,
+            "the second identical query must be served from cache"
+        );
+        assert_eq!(first, second);
+        assert_eq!(embedder.model_metadata().dimensions, 1536);
+    }
+}
+
+/// Live tests for the local ONNX/BGE backend.
+///
+/// Requires the `skills-embed` feature. On hosts where `ort-sys` has no prebuilt
+/// binaries (notably x86_64-apple-darwin), build with `ort`'s `load-dynamic`
+/// feature and point `ORT_DYLIB_PATH` at a local ONNX Runtime, e.g.
+/// `brew install onnxruntime`. The first run downloads the model (~30 MiB).
+///
+/// ```text
+/// ORT_DYLIB_PATH=$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib \
+///   cargo test --features js,skills,skills-embed skills_embed_live -- --ignored --nocapture
+/// ```
+#[cfg(all(test, feature = "skills-embed"))]
+mod skills_embed_live_tests {
+    use super::*;
+
+    /// One shared backend for the whole module. Constructing a second model
+    /// concurrently races on the shared model cache, and the production
+    /// `Embedder` shares a single backend anyway.
+    fn shared_backend() -> &'static fastembed_backend::FastembedBackend {
+        static BACKEND: std::sync::OnceLock<fastembed_backend::FastembedBackend> =
+            std::sync::OnceLock::new();
+        BACKEND.get_or_init(|| {
+            fastembed_backend::FastembedBackend::new().expect("fastembed model must initialize")
+        })
+    }
+
+    #[test]
+    #[ignore = "downloads the BGE model and requires ONNX Runtime; see module docs"]
+    fn skills_embed_live_produces_normalized_bge_vectors() {
+        let backend =
+            fastembed_backend::FastembedBackend::new().expect("fastembed model must initialize");
+
+        assert_eq!(backend.model_id(), "BAAI/bge-small-en-v1.5");
+        assert_eq!(backend.dimensions(), 384);
+
+        let vector = backend
+            .embed_query("parse JSON safely and return null on error")
+            .expect("query embedding must succeed");
+        assert_eq!(vector.len(), 384);
+        assert!(vector.iter().all(|v| v.is_finite()));
+        let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+    }
+
+    #[test]
+    #[ignore = "downloads the BGE model and requires ONNX Runtime; see module docs"]
+    fn skills_embed_live_batch_is_semantically_ordered() {
+        let backend =
+            fastembed_backend::FastembedBackend::new().expect("fastembed model must initialize");
+
+        let documents = vec![
+            "a function that parses JSON text".to_string(),
+            "a recipe for sourdough bread".to_string(),
+            "a helper that decodes JSON strings".to_string(),
+        ];
+        let vectors = backend
+            .embed_documents(&documents)
+            .expect("batch embedding must succeed");
+        assert_eq!(vectors.len(), 3);
+
+        let cosine = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+        let related = cosine(&vectors[0], &vectors[2]);
+        let unrelated = cosine(&vectors[0], &vectors[1]);
+        assert!(
+            related > unrelated,
+            "related documents must score higher: {related} vs {unrelated}"
+        );
     }
 }

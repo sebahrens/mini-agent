@@ -49,7 +49,11 @@ skills = ["js", "dep:rusqlite"]
 # Real ONNX/BGE embedding backend. Opt-in because `ort-sys` ships no prebuilt
 # binaries for some hosts (notably x86_64-apple-darwin); `skills` alone must build
 # everywhere and uses the deterministic backend.
-skills-embed = ["skills", "dep:fastembed"]
+skills-embed = ["skills", "dep:fastembed", "dep:ort"]
+# Link ONNX Runtime at runtime instead of requiring a build-time prebuilt binary.
+# Needed on hosts ort-sys has no prebuilt for (notably x86_64-apple-darwin);
+# requires ORT_DYLIB_PATH to point at a local libonnxruntime at run time.
+skills-embed-dynamic = ["skills-embed", "ort/load-dynamic"]
 
 [dependencies]
 rig = { package = "rig-core", version = "0.40", default-features = false, features = [
@@ -109,6 +113,7 @@ rquickjs = { version = "0.12", features = ["full"], optional = true }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 fastembed = { version = "5", optional = true }
+ort = { version = "=2.0.0-rc.13", optional = true }
 
 [dev-dependencies]
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }
