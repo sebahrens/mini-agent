@@ -3655,6 +3655,78 @@ mod tests {
         assert_eq!(result.code, 7);
     }
 
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn spawn_requested_unavailable_sandbox_starts_no_child() {
+        let marker = std::env::current_dir().unwrap().join(format!(
+            ".mini-agent-js-spawn-unavailable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let runtime = tokio::runtime::Handle::current();
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let bridge = owner.bridge();
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let error = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            make_spawn(
+                Sandbox::new(true, "__mini_agent_unavailable_sandbox__"),
+                bridge,
+                runtime,
+            )("touch".to_string(), vec![marker_arg])
+            .expect_err("unavailable required sandbox must deny JS spawn")
+            .to_string()
+        })
+        .await
+        .expect("spawn sandbox integration test task panicked");
+
+        assert!(
+            error.contains("unavailable"),
+            "sandbox denial should explain backend unavailability: {error}"
+        );
+        let started = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !started,
+            "JS spawn must not start a child when required isolation is unavailable"
+        );
+    }
+
+    #[cfg(all(feature = "sandbox", target_os = "macos"))]
+    #[tokio::test]
+    async fn spawn_uses_real_macos_seatbelt_write_boundary() {
+        let outside_marker = std::env::current_dir()
+            .unwrap()
+            .parent()
+            .expect("test repository must not be filesystem root")
+            .join(format!(
+                ".mini-agent-js-spawn-seatbelt-denied-{}",
+                uuid::Uuid::new_v4()
+            ));
+        let script = format!(
+            "if touch '{}' 2>/dev/null; then exit 10; fi; printf JS_SPAWN_SEATBELT_PASS",
+            outside_marker.to_string_lossy().replace('\'', "'\"'\"'")
+        );
+        let runtime = tokio::runtime::Handle::current();
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let bridge = owner.bridge();
+        let result = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            make_spawn(Sandbox::new(true, "seatbelt"), bridge, runtime)(
+                "bash".to_string(),
+                vec!["-c".to_string(), script],
+            )
+            .expect("Seatbelt-wrapped JS spawn should complete")
+        })
+        .await
+        .expect("spawn Seatbelt integration test task panicked");
+
+        let escaped = outside_marker.exists();
+        let _ = std::fs::remove_file(&outside_marker);
+        assert_eq!(result.code, 0, "unexpected stderr: {}", result.stderr);
+        assert_eq!(result.stdout, "JS_SPAWN_SEATBELT_PASS");
+        assert!(!escaped, "JS spawn escaped the Seatbelt write boundary");
+    }
+
     #[tokio::test]
     async fn js_file_host_permissions_repeated_reads_trigger_doom_loop_detection() {
         let temp = TempDir::new();
