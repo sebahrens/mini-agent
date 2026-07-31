@@ -17,10 +17,18 @@ echo "Syncing version ${VERSION} across packaging files..."
 # PKGBUILD
 sed -i "s/^pkgver=.*/pkgver=${VERSION}/" "${ROOT_DIR}/packaging/aur/PKGBUILD"
 
-# conda meta.yaml files
+# conda meta.yaml files (plain YAML format: "version: X.Y.Z")
 for meta in "${ROOT_DIR}/packaging/conda/"*/meta.yaml; do
-    sed -i "s/{% set version = \".*\" %}/{% set version = \"${VERSION}\" %}/" "$meta"
+    sed -i "s/^  version: .*/  version: ${VERSION}/" "$meta"
 done
+
+# conda source URLs
+sed -i "s|/tags/v[0-9][^/]*/|/tags/v${VERSION}/|" \
+    "${ROOT_DIR}/packaging/conda/zerostack/meta.yaml"
+sed -i "s|/download/v[0-9][^/]*/|/download/v${VERSION}/|g" \
+    "${ROOT_DIR}/packaging/conda/zerostack-bin/meta.yaml"
+sed -i "s|/zerostack/v[0-9][^/]*/LICENSE|/zerostack/v${VERSION}/LICENSE|g" \
+    "${ROOT_DIR}/packaging/conda/zerostack-bin/meta.yaml"
 
 # Homebrew formula
 HB_FORMULA="${ROOT_DIR}/packaging/homebrew/zerostack.rb"

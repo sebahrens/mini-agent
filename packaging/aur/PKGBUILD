@@ -2,7 +2,7 @@
 # Upstream: https://github.com/gi-dellav/zerostack
 
 pkgname=zerostack-bin
-pkgver=1.7.0
+pkgver=1.7.2
 pkgrel=1
 pkgdesc="Minimalistic coding agent written in Rust, optimized for memory footprint and performance"
 arch=('x86_64' 'aarch64')

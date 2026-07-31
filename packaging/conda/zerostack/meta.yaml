@@ -1,9 +1,9 @@
 package:
   name: zerostack
-  version: 1.7.0
+  version: 1.7.2
 
 source:
-  url: https://github.com/gi-dellav/zerostack/archive/refs/tags/v1.7.0.tar.gz
+  url: https://github.com/gi-dellav/zerostack/archive/refs/tags/v1.7.2.tar.gz
   sha256: ec28bc735b683b0c556388c898cc528affd5109ffccc026f36d64702e63561ee
 
 build:

@@ -71,8 +71,10 @@ def validate_workflow(text: str, binary: str) -> list[str]:
     errors: list[str] = []
     required_counts = {
         f"CANONICAL_BINARY: {binary}": 1,
-        'archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"': 2,
-        'archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"': 2,
+        # 3 jobs produce archives: build (Linux/macOS), build-static (musl), build-windows
+        'archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"': 3,
+        'archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"': 3,
+        # Unix jobs: 4 smoke invocations (2 jobs × 2 archives each)
         'tar czf "$archive" -C "target/${{ matrix.target }}/release" '
         '"$CANONICAL_BINARY"': 4,
         'test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"': 4,
@@ -180,6 +182,47 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
     return errors
 
 
+def cargo_version(metadata: dict[str, Any], root: Path) -> str | None:
+    manifest = (root / "Cargo.toml").resolve()
+    package = next(
+        (
+            p
+            for p in metadata.get("packages", [])
+            if Path(p["manifest_path"]).resolve() == manifest
+        ),
+        None,
+    )
+    return package.get("version") if package else None
+
+
+def validate_versions(root: Path, version: str) -> list[str]:
+    """Check that AUR, Conda, and Homebrew metadata agree with Cargo version."""
+    import re
+
+    errors: list[str] = []
+
+    checks: list[tuple[str, str]] = [
+        ("packaging/aur/PKGBUILD", rf"^pkgver={re.escape(version)}$"),
+        ("packaging/conda/zerostack/meta.yaml", rf"^\s+version: {re.escape(version)}$"),
+        ("packaging/conda/zerostack-bin/meta.yaml", rf"^\s+version: {re.escape(version)}$"),
+        ("packaging/homebrew/zerostack.rb", rf'^\s+version "{re.escape(version)}"$'),
+    ]
+
+    for relative_path, pattern in checks:
+        path = root / relative_path
+        if not path.is_file():
+            errors.append(f"packaging file missing: {relative_path}")
+            continue
+        text = path.read_text(encoding="utf-8")
+        if not re.search(pattern, text, re.MULTILINE):
+            errors.append(
+                f"{relative_path} does not contain expected version {version!r}"
+                f" (pattern {pattern!r})"
+            )
+
+    return errors
+
+
 def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
     binary, errors = canonical_binary(metadata, root)
     if binary is None:
@@ -193,6 +236,11 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
             validate_workflow(workflow_path.read_text(encoding="utf-8"), binary)
         )
     errors.extend(validate_file_fragments(root, binary))
+
+    version = cargo_version(metadata, root)
+    if version:
+        errors.extend(validate_versions(root, version))
+
     return errors
 
 
@@ -210,7 +258,8 @@ def main() -> int:
         return 1
 
     binary, _ = canonical_binary(metadata, ROOT)
-    print(f"package metadata consistent: canonical binary {binary!r}")
+    version = cargo_version(metadata, ROOT)
+    print(f"package metadata consistent: canonical binary {binary!r}, version {version!r}")
     return 0
 
 

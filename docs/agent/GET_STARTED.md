@@ -167,9 +167,14 @@ If you want to use zerostack from scripts, from other programs, or if you just w
 | `--parallel` | Run the agent inside a self-managed git worktree (Experimental) |
 | `--load-prompt <prompt>` | Use a specific prompt |
 
-## 6. Opt-in features
+## 6. Feature contract
 
-Everything above ships in the default build. A few extras are compiled in
+The default build and every pre-built release archive include the embedded
+JavaScript engine (`js` feature). The `mini-agent-lite-*` release archives
+are built with `--no-default-features` and omit JS and other default features
+— use those only when you need a minimal binary without the JS runtime.
+
+Everything else above ships in the default build. A few extras are compiled in
 only when you ask for them: lifecycle hooks (`--features hooks`), a
 second-model advisor (`--features advisor`), image/PDF message attachments
 (`--features multimodal,pdf`), and ACP editor integration

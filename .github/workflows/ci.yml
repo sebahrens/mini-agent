@@ -371,8 +371,18 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      - name: Check package manifest
-        run: cargo package --locked --allow-dirty --no-verify
+      - name: Package crate
+        run: cargo package --locked
+
+      - name: Verify packaged crate builds and installs in isolation
+        run: |
+          crate=$(ls target/package/mini-agent-*.crate | tail -1)
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          tar xzf "$crate" -C "$tmpdir"
+          pkgdir=$(ls -d "$tmpdir"/mini-agent-*)
+          cargo install --locked --path "$pkgdir" --debug --root "$tmpdir/install"
+          "$tmpdir/install/bin/mini-agent" --version | grep -Fq "mini-agent "
 
   dependency-policy:
     runs-on: ubuntu-latest

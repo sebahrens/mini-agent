@@ -1,9 +1,10 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch: {}
+  # push:
+  #   tags:
+  #     - "v*"
 
 permissions:
   contents: write
@@ -29,34 +30,9 @@ jobs:
       - name: Validate Cargo and package metadata
         run: python3 scripts/check-package-metadata.py
 
-  create-release:
-    needs: package-metadata
-    runs-on: ubuntu-latest
-    steps:
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          prerelease=""
-          # Any semver pre-release tag (contains a hyphen, e.g. v1.5.1-rc2)
-          # is published as a GitHub prerelease, never as "latest".
-          if [[ "$tag" == *-* ]]; then
-            prerelease="--prerelease"
-          fi
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $tag already exists, leaving it untouched"
-          else
-            gh release create "$tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$tag" \
-              --generate-notes \
-              $prerelease
-          fi
-
   build:
     name: ${{ matrix.target }}
-    needs: create-release
+    needs: package-metadata
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -93,14 +69,6 @@ jobs:
           "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
           rm -rf "$smoke_dir"
 
-      - name: Upload release asset
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz" \
-            --repo "$GITHUB_REPOSITORY" --clobber
-
       - name: Build lite
         run: cargo build --release --no-default-features --target ${{ matrix.target }}
 
@@ -114,17 +82,19 @@ jobs:
           "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
           rm -rf "$smoke_dir"
 
-      - name: Upload lite release asset
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz" \
-            --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: archives-${{ matrix.target }}
+          path: |
+            ${{ env.CANONICAL_BINARY }}-${{ matrix.target }}.tar.gz
+            ${{ env.CANONICAL_BINARY }}-lite-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
   build-static:
     name: ${{ matrix.target }}-static
-    needs: create-release
+    needs: package-metadata
     strategy:
       fail-fast: false
       matrix:
@@ -160,14 +130,6 @@ jobs:
           "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
           rm -rf "$smoke_dir"
 
-      - name: Upload release asset
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz" \
-            --repo "$GITHUB_REPOSITORY" --clobber
-
       - name: Build static lite binary (${{ matrix.target }})
         run: cross build --release --no-default-features --target ${{ matrix.target }}
 
@@ -181,26 +143,184 @@ jobs:
           "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
           rm -rf "$smoke_dir"
 
-      - name: Upload lite release asset
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: archives-${{ matrix.target }}
+          path: |
+            ${{ env.CANONICAL_BINARY }}-${{ matrix.target }}.tar.gz
+            ${{ env.CANONICAL_BINARY }}-lite-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  build-windows:
+    name: ${{ matrix.target }}
+    needs: package-metadata
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: "1.96.0"
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --all-features --target ${{ matrix.target }}
+
+      - name: Package and smoke binary
         run: |
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz" \
-            --repo "$GITHUB_REPOSITORY" --clobber
+          archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"
+          tar czf "$archive" -C "target/${{ matrix.target }}/release" "${CANONICAL_BINARY}.exe"
+          test "$(tar tzf "$archive")" = "${CANONICAL_BINARY}.exe"
+          smoke_dir="$(mktemp -d)"
+          tar xzf "$archive" -C "$smoke_dir"
+          "$smoke_dir/${CANONICAL_BINARY}.exe" --version | grep -Fq -- "$CANONICAL_BINARY "
+          rm -rf "$smoke_dir"
+
+      - name: Build lite
+        run: cargo build --release --no-default-features --target ${{ matrix.target }}
+
+      - name: Package and smoke lite binary
+        run: |
+          archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"
+          tar czf "$archive" -C "target/${{ matrix.target }}/release" "${CANONICAL_BINARY}.exe"
+          test "$(tar tzf "$archive")" = "${CANONICAL_BINARY}.exe"
+          smoke_dir="$(mktemp -d)"
+          tar xzf "$archive" -C "$smoke_dir"
+          "$smoke_dir/${CANONICAL_BINARY}.exe" --version | grep -Fq -- "$CANONICAL_BINARY "
+          rm -rf "$smoke_dir"
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: archives-${{ matrix.target }}
+          path: |
+            ${{ env.CANONICAL_BINARY }}-${{ matrix.target }}.tar.gz
+            ${{ env.CANONICAL_BINARY }}-lite-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
   checksums:
     name: SHA256SUMS
-    needs: [build, build-static]
+    needs: [build, build-static, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - name: Generate and upload SHA256SUMS
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archives-*
+          merge-multiple: true
+
+      - name: Verify expected archive set
+        run: |
+          expected=(
+            mini-agent-x86_64-unknown-linux-gnu.tar.gz
+            mini-agent-aarch64-unknown-linux-gnu.tar.gz
+            mini-agent-x86_64-apple-darwin.tar.gz
+            mini-agent-aarch64-apple-darwin.tar.gz
+            mini-agent-x86_64-unknown-linux-musl.tar.gz
+            mini-agent-aarch64-unknown-linux-musl.tar.gz
+            mini-agent-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz
+            mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz
+            mini-agent-lite-x86_64-apple-darwin.tar.gz
+            mini-agent-lite-aarch64-apple-darwin.tar.gz
+            mini-agent-lite-x86_64-unknown-linux-musl.tar.gz
+            mini-agent-lite-aarch64-unknown-linux-musl.tar.gz
+            mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
+          )
+          found=$(ls *.tar.gz | sort)
+          expected_sorted=$(printf '%s\n' "${expected[@]}" | sort)
+          if [ "$found" != "$expected_sorted" ]; then
+            echo "ERROR: Archive set mismatch"
+            echo "Expected:"
+            echo "$expected_sorted"
+            echo "Found:"
+            echo "$found"
+            exit 1
+          fi
+
+      - name: Generate SHA256SUMS
+        run: sha256sum *.tar.gz | sort > SHA256SUMS
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    name: Publish GitHub release
+    needs: [build, build-static, build-windows, checksums]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archives-*
+          merge-multiple: true
+
+      - name: Download checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: checksums
+
+      - name: Verify complete release set
+        run: |
+          expected=(
+            mini-agent-x86_64-unknown-linux-gnu.tar.gz
+            mini-agent-aarch64-unknown-linux-gnu.tar.gz
+            mini-agent-x86_64-apple-darwin.tar.gz
+            mini-agent-aarch64-apple-darwin.tar.gz
+            mini-agent-x86_64-unknown-linux-musl.tar.gz
+            mini-agent-aarch64-unknown-linux-musl.tar.gz
+            mini-agent-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz
+            mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz
+            mini-agent-lite-x86_64-apple-darwin.tar.gz
+            mini-agent-lite-aarch64-apple-darwin.tar.gz
+            mini-agent-lite-x86_64-unknown-linux-musl.tar.gz
+            mini-agent-lite-aarch64-unknown-linux-musl.tar.gz
+            mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
+            SHA256SUMS
+          )
+          for f in "${expected[@]}"; do
+            [ -f "$f" ] || { echo "ERROR: Missing expected file: $f"; exit 1; }
+          done
+          actual_count=$(ls *.tar.gz SHA256SUMS 2>/dev/null | wc -l)
+          if [ "$actual_count" -ne "${#expected[@]}" ]; then
+            echo "ERROR: Unexpected files present (got $actual_count, expected ${#expected[@]})"
+            ls *.tar.gz SHA256SUMS
+            exit 1
+          fi
+
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          mkdir -p dist
-          cd dist
-          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz'
-          sha256sum *.tar.gz > SHA256SUMS
-          gh release upload "$tag" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          prerelease=""
+          if [[ "$tag" == *-* ]]; then
+            prerelease="--prerelease"
+          fi
+          # Remove any partial release from a prior failed attempt so reruns are clean
+          gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create "$tag" \
+            *.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --generate-notes \
+            $prerelease

@@ -74,22 +74,72 @@ case "$ARCH" in
 esac
 
 ASSET_NAME="${BINARY_NAME}-${ARCH}-${OS}"
+ARCHIVE_FILE="${ASSET_NAME}.tar.gz"
 
 # ---- download ----
-URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}.tar.gz"
+BASE_URL="https://github.com/${REPO}/releases/latest/download"
 
 echo "Downloading ${BINARY_NAME} latest (${ASSET_NAME})..."
-echo "  -> ${URL}"
+echo "  -> ${BASE_URL}/${ARCHIVE_FILE}"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-curl -fsSL --max-time 300 -o "${TMPDIR}/${ASSET_NAME}.tar.gz" "$URL"
+curl -fsSL --max-time 300 -o "${TMPDIR}/${ARCHIVE_FILE}" "${BASE_URL}/${ARCHIVE_FILE}"
+curl -fsSL --max-time 60   -o "${TMPDIR}/SHA256SUMS"     "${BASE_URL}/SHA256SUMS"
+
+# ---- verify checksum before extraction ----
+#
+# Parse the single line for this exact archive from the manifest.
+# Fail closed for: missing manifest, no entry, duplicate entries,
+# wrong filename, or hash mismatch.
+MANIFEST="${TMPDIR}/SHA256SUMS"
+
+if [[ ! -s "$MANIFEST" ]]; then
+    echo "Error: checksum manifest is missing or empty." >&2
+    exit 1
+fi
+
+# Count entries for this archive (must be exactly 1)
+MATCH_COUNT=$(grep -c "  ${ARCHIVE_FILE}$" "$MANIFEST" || true)
+if [[ "$MATCH_COUNT" -eq 0 ]]; then
+    echo "Error: SHA256SUMS has no entry for ${ARCHIVE_FILE}." >&2
+    exit 1
+fi
+if [[ "$MATCH_COUNT" -gt 1 ]]; then
+    echo "Error: SHA256SUMS has duplicate entries for ${ARCHIVE_FILE}." >&2
+    exit 1
+fi
+
+EXPECTED_HASH=$(grep "  ${ARCHIVE_FILE}$" "$MANIFEST" | awk '{print $1}')
+
+# Validate hash is a 64-character hex string
+if [[ ! "$EXPECTED_HASH" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Error: SHA256SUMS contains a malformed hash for ${ARCHIVE_FILE}." >&2
+    exit 1
+fi
+
+# Compute actual hash using an available SHA-256 implementation
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL_HASH=$(sha256sum "${TMPDIR}/${ARCHIVE_FILE}" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL_HASH=$(shasum -a 256 "${TMPDIR}/${ARCHIVE_FILE}" | awk '{print $1}')
+else
+    echo "Error: no sha256sum or shasum found; cannot verify archive." >&2
+    exit 1
+fi
+
+if [[ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
+    echo "Error: checksum mismatch for ${ARCHIVE_FILE}." >&2
+    echo "  Expected: ${EXPECTED_HASH}" >&2
+    echo "  Actual:   ${ACTUAL_HASH}" >&2
+    exit 1
+fi
 
 # ---- install ----
 mkdir -p "$INSTALL_DIR"
 
-tar xzf "${TMPDIR}/${ASSET_NAME}.tar.gz" -C "$TMPDIR"
+tar xzf "${TMPDIR}/${ARCHIVE_FILE}" -C "$TMPDIR"
 
 if [[ ! -f "${TMPDIR}/${BINARY_NAME}" ]]; then
     echo "Error: archive does not contain the canonical ${BINARY_NAME} executable." >&2

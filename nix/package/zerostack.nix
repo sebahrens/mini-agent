@@ -29,15 +29,24 @@ rustPlatform.buildRustPackage {
     openssl
   ];
 
+  # Matches Cargo.toml default features plus optional extras.
+  # js must be listed explicitly so feature drift in Cargo.toml doesn’t
+  # silently drop the JS engine from the Nix package.
   buildFeatures = [
+    "js"
     "acp"
     "memory"
     "multithread"
   ];
 
-  # TODO: there needs to be a list of tests that can vs. can’t run in the Nix
-  # sandbox
+  # Network and subprocess tests cannot run inside the Nix sandbox.
+  # The postInstall smoke below verifies the packaged binary instead.
   doCheck = false;
+
+  postInstall = ‘’
+    # Smoke the exact installed binary: version string and exit code.
+    $out/bin/mini-agent --version | grep -Fq "mini-agent "
+  ‘’;
 
   meta = {
     description = manifest.description;
