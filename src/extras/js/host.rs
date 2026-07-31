@@ -1228,10 +1228,26 @@ mod tests {
         path: PathBuf,
         content: &'static str,
     ) -> Result<(), String> {
+        call_write_file_with_policy(
+            permission,
+            ask_tx,
+            path,
+            content,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        )
+        .await
+    }
+
+    async fn call_write_file_with_policy(
+        permission: PermCheck,
+        ask_tx: Option<AskSender>,
+        path: PathBuf,
+        content: &'static str,
+        allow_config: AllowConfig,
+    ) -> Result<(), String> {
         let runtime = tokio::runtime::Handle::current();
         let owner = PermissionBridgeOwner::new(Some(permission), ask_tx, STEP_TIMEOUT);
         let bridge = owner.bridge();
-        let allow_config = AllowConfig::unrestricted(&std::env::current_dir().unwrap());
         tokio::task::spawn_blocking(move || {
             let _owner = owner;
             make_write_file(bridge, runtime, allow_config)(
@@ -1242,6 +1258,150 @@ mod tests {
         })
         .await
         .expect("write_file test task panicked")
+    }
+
+    #[tokio::test]
+    async fn js_file_allow_enforcement_narrows_allowed_permissions_for_reads_and_writes() {
+        let temp = TempDir::new();
+        let allowed_root = temp.path().join("safe");
+        let sibling_root = temp.path().join("safe-evil");
+        std::fs::create_dir_all(&allowed_root).unwrap();
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        let allowed_source = allowed_root.join("source.txt");
+        let denied_source = sibling_root.join("source.txt");
+        std::fs::write(&allowed_source, "allowed").unwrap();
+        std::fs::write(&denied_source, "must stay private").unwrap();
+        let roots = vec![allowed_root.to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
+        let permission = host_permission(temp.path().to_path_buf(), Action::Allow, Action::Allow);
+
+        assert_eq!(
+            call_read_file_with_policy(permission.clone(), None, allowed_source, policy.clone(),)
+                .await
+                .expect("in-root read should succeed"),
+            "allowed"
+        );
+        let read_error =
+            call_read_file_with_policy(permission.clone(), None, denied_source, policy.clone())
+                .await
+                .expect_err("an allowed permission must not override the read roots");
+        assert!(
+            read_error.contains("outside the configured roots"),
+            "unexpected read policy error: {read_error}"
+        );
+
+        let allowed_target = allowed_root.join("created.txt");
+        call_write_file_with_policy(
+            permission.clone(),
+            None,
+            allowed_target.clone(),
+            "created safely",
+            policy.clone(),
+        )
+        .await
+        .expect("in-root write should succeed");
+        assert_eq!(
+            std::fs::read_to_string(allowed_target).unwrap(),
+            "created safely"
+        );
+
+        let denied_target = sibling_root.join("must-not-exist.txt");
+        let write_error = call_write_file_with_policy(
+            permission,
+            None,
+            denied_target.clone(),
+            "must not escape",
+            policy,
+        )
+        .await
+        .expect_err("an allowed permission must not override the write roots");
+        assert!(
+            write_error.contains("outside the configured roots"),
+            "unexpected write policy error: {write_error}"
+        );
+        assert!(
+            !denied_target.exists(),
+            "policy-denied write created an out-of-root file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn js_file_allow_enforcement_revalidates_after_permission_wait() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let allowed_root = temp.path().join("safe");
+        let write_parent = allowed_root.join("write-parent");
+        let outside_root = temp.path().join("outside");
+        std::fs::create_dir_all(&write_parent).unwrap();
+        std::fs::create_dir_all(&outside_root).unwrap();
+        let source = allowed_root.join("source.txt");
+        let original_source = allowed_root.join("original-source.txt");
+        let outside_source = outside_root.join("outside.txt");
+        std::fs::write(&source, "approved identity").unwrap();
+        std::fs::write(&outside_source, "must not be read").unwrap();
+        let roots = vec![allowed_root.to_string_lossy().into_owned()];
+        let policy =
+            AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
+        let permission = host_permission(temp.path().to_path_buf(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+
+        let read = tokio::spawn(call_read_file_with_policy(
+            permission.clone(),
+            Some(ask_tx.clone()),
+            source.clone(),
+            policy.clone(),
+        ));
+        let request = ask_rx.recv().await.expect("read should request permission");
+        std::fs::rename(&source, &original_source).unwrap();
+        symlink(&outside_source, &source).unwrap();
+        request
+            .reply
+            .send(UserDecision::AllowOnce)
+            .expect("read permission request receiver dropped");
+        let read_error = read
+            .await
+            .expect("read task panicked")
+            .expect_err("swapped read target must fail");
+        assert!(
+            read_error.contains("Path changed after permission check"),
+            "unexpected read swap error: {read_error}"
+        );
+
+        let target = write_parent.join("created.txt");
+        let original_parent = allowed_root.join("original-write-parent");
+        let outside_target = outside_root.join("created.txt");
+        let write = tokio::spawn(call_write_file_with_policy(
+            permission,
+            Some(ask_tx),
+            target,
+            "must not escape",
+            policy,
+        ));
+        let request = ask_rx
+            .recv()
+            .await
+            .expect("write should request permission");
+        std::fs::rename(&write_parent, &original_parent).unwrap();
+        symlink(&outside_root, &write_parent).unwrap();
+        request
+            .reply
+            .send(UserDecision::AllowOnce)
+            .expect("write permission request receiver dropped");
+        let write_error = write
+            .await
+            .expect("write task panicked")
+            .expect_err("swapped write parent must fail");
+        assert!(
+            !write_error.is_empty(),
+            "swapped write parent returned an empty error"
+        );
+        assert!(
+            !outside_target.exists(),
+            "swapped parent redirected the policy-approved write"
+        );
     }
 
     async fn call_spawn(
