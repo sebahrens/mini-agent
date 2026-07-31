@@ -259,6 +259,84 @@ git diff --cached --name-only
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual("src/lib.rs\n", completed.stdout)
 
+    def test_automatic_staging_keeps_tracked_python_bytecode_deletions(
+        self,
+    ) -> None:
+        source = LOOP_SCRIPT.read_text()
+        bytecode_function = extract_function(
+            source,
+            "path_is_generated_python_bytecode",
+            "path_is_relevant_for_profile",
+        )
+        staging_function = extract_function(
+            source,
+            "stage_non_beads_changes",
+            "reopen_build_bead",
+        )
+        harness = f"""
+set -eu
+
+{bytecode_function}
+
+{staging_function}
+
+stage_non_beads_changes
+git diff --cached --name-status
+"""
+
+        with tempfile.TemporaryDirectory() as temp_directory:
+            repository = Path(temp_directory)
+            bytecode = (
+                repository
+                / "scripts"
+                / "tests"
+                / "__pycache__"
+                / "test_loop_lifecycle.cpython-314.pyc"
+            )
+            bytecode.parent.mkdir(parents=True)
+            bytecode.write_bytes(b"\x00tracked")
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Loop Test",
+                    "-c",
+                    "user.email=loop@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "base",
+                ],
+                cwd=repository,
+                check=True,
+            )
+
+            bytecode.unlink()
+            completed = subprocess.run(
+                ["bash", "-c", harness],
+                cwd=repository,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(
+            "D\tscripts/tests/__pycache__/"
+            "test_loop_lifecycle.cpython-314.pyc\n",
+            completed.stdout,
+        )
+
     def test_run_verification_accepts_headless_workflow_only_commit(self) -> None:
         source = LOOP_SCRIPT.read_text()
         relevance_function = extract_function(
