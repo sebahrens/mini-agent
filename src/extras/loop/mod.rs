@@ -7,6 +7,30 @@ pub mod transcript;
 pub const DEFAULT_PLAN_FILENAME: &str = "LOOP_PLAN.md";
 pub const SUMMARY_TRUNCATION_CHARS: usize = 1024;
 
+#[cfg(unix)]
+pub(crate) fn verify_workflow_only_headless_relevance() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let policy = include_str!("../../../scripts/loop-verification-policy.sh");
+    let harness = format!(
+        "{policy}\n\
+         path_is_relevant_for_profile .github/workflows/ci.yml headless rust\n\
+         path_is_relevant_for_profile .github/workflows/ci.yaml headless rust\n\
+         ! path_is_relevant_for_profile docs/architecture.md headless rust\n"
+    );
+    let status = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(harness)
+        .status()
+        .context("failed to execute the embedded loop verification policy")?;
+
+    anyhow::ensure!(
+        status.success(),
+        "embedded loop verification policy rejected workflow-only headless changes"
+    );
+    Ok(())
+}
+
 pub struct LoopState {
     pub active: bool,
     pub prompt: String,

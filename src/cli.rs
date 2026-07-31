@@ -95,6 +95,13 @@ pub struct Cli {
     )]
     pub acp_permission_policy_check: bool,
 
+    #[cfg(all(feature = "loop", unix))]
+    #[arg(
+        long = "loop-verification-policy-check",
+        help = "Verify workflow-only changes are relevant to headless loop verification, then exit"
+    )]
+    pub loop_verification_policy_check: bool,
+
     #[arg(long = "name", help = "Name for the session")]
     pub name: Option<String>,
 

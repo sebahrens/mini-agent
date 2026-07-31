@@ -44,6 +44,14 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
+
+    #[cfg(all(feature = "loop", unix))]
+    if cli.loop_verification_policy_check {
+        extras::r#loop::verify_workflow_only_headless_relevance()?;
+        println!("workflow-only headless loop verification check: PASS");
+        return Ok(());
+    }
+
     let workspace_root =
         std::env::current_dir().context("failed to resolve the startup workspace root")?;
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
