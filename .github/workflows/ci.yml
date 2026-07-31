@@ -66,6 +66,27 @@ jobs:
       - name: Test (${{ matrix.features }})
         run: cargo test --locked ${{ matrix.features }}
 
+  linux-sandbox-policy:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Test Linux sandbox capability policy
+        run: cargo test --locked linux_sandbox_policy
+
+      - name: Test shared sandbox module
+        run: cargo test --locked sandbox::
+
+      - name: Test JS spawn parity through the shared sandbox
+        run: cargo test --locked --features js,sandbox
+
   platform-paths:
     if: github.event_name != 'schedule'
     strategy:

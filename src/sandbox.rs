@@ -2,6 +2,7 @@ use std::collections::HashSet;
 #[cfg(test)]
 use std::process::Output;
 use std::process::{ExitStatus, Stdio};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -58,13 +59,34 @@ pub(crate) struct CommandOutput {
     pub status: CommandStatus,
 }
 
-static BWRAP_AVAILABLE: OnceLock<bool> = OnceLock::new();
+#[cfg(target_os = "linux")]
+static BWRAP_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 fn bwrap_exists() -> bool {
-    *BWRAP_AVAILABLE.get_or_init(|| which_cmd("bwrap"))
+    bwrap_path().is_some()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bwrap_exists() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn bwrap_path() -> Option<&'static Path> {
+    BWRAP_PATH
+        .get_or_init(|| find_trusted_system_executable("bwrap"))
+        .as_deref()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bwrap_path() -> Option<&'static Path> {
+    None
 }
 
 static ZEROBOX_AVAILABLE: OnceLock<bool> = OnceLock::new();
+const BWRAP_REQUESTED_NETWORK_POLICY: &str =
+    "deny (unshare-net; backend absence/setup failure denies launch)";
 
 fn zerobox_exists() -> bool {
     *ZEROBOX_AVAILABLE.get_or_init(|| which_cmd("zerobox"))
@@ -82,16 +104,77 @@ pub enum SandboxPolicy {
     RequiredButUnavailable,
 }
 
+/// User-visible description of the subprocess boundary selected by [`Sandbox`].
+///
+/// These fields describe enforced backend behavior, not aspirational feature
+/// support. In particular, a requested backend that is unavailable denies
+/// subprocess launch instead of reporting the backend's configured flags as
+/// active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxCapabilityMatrix {
+    pub backend: String,
+    pub status: &'static str,
+    pub filesystem_reads: &'static str,
+    pub filesystem_writes: &'static str,
+    pub process_namespace: &'static str,
+    pub devices: &'static str,
+    pub environment: &'static str,
+    pub network: &'static str,
+    pub requested_network_policy: &'static str,
+}
+
 fn which_cmd(name: &str) -> bool {
     // Search PATH directly rather than shelling out to `which`, which may not
     // exist on minimal images (Alpine, distroless).
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(name);
-        candidate.is_file()
-    })
+    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(name)))
+}
+
+#[cfg(target_os = "linux")]
+fn find_trusted_system_executable(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .filter_map(|candidate| candidate.canonicalize().ok())
+        .find(|candidate| is_trusted_system_path(candidate))
+}
+
+#[cfg(target_os = "linux")]
+fn is_trusted_system_path(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for (index, ancestor) in path.ancestors().enumerate() {
+        let Ok(metadata) = ancestor.metadata() else {
+            return false;
+        };
+        if metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+            return false;
+        }
+        if index == 0 && (!metadata.is_file() || metadata.permissions().mode() & 0o111 == 0) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 pub(crate) struct ProcessGroupGuard {
@@ -149,15 +232,74 @@ impl Sandbox {
         if !self.enabled {
             return SandboxPolicy::Disabled;
         }
-        let available = if self.backend == "zerobox" {
-            zerobox_exists()
-        } else {
-            bwrap_exists()
+        let available = match self.backend.as_str() {
+            "bwrap" => bwrap_exists(),
+            "zerobox" => zerobox_exists(),
+            _ => false,
         };
         if available {
             SandboxPolicy::RequiredAndAvailable
         } else {
             SandboxPolicy::RequiredButUnavailable
+        }
+    }
+
+    pub fn capability_matrix(&self) -> SandboxCapabilityMatrix {
+        match self.policy() {
+            SandboxPolicy::Disabled => SandboxCapabilityMatrix {
+                backend: self.backend.clone(),
+                status: "disabled",
+                filesystem_reads: "host visibility inherited",
+                filesystem_writes: "host permissions inherited",
+                process_namespace: "host namespaces inherited",
+                devices: "host devices inherited",
+                environment: "parent environment inherited",
+                network: "host network inherited",
+                requested_network_policy: "not requested",
+            },
+            SandboxPolicy::RequiredButUnavailable => SandboxCapabilityMatrix {
+                backend: self.backend.clone(),
+                status: "requested-but-unavailable; subprocess launch denied",
+                filesystem_reads: "none; subprocess launch denied",
+                filesystem_writes: "none; subprocess launch denied",
+                process_namespace: "none; subprocess launch denied",
+                devices: "none; subprocess launch denied",
+                environment: "none; subprocess launch denied",
+                network: "none; subprocess launch denied",
+                requested_network_policy: if self.backend == "bwrap" {
+                    BWRAP_REQUESTED_NETWORK_POLICY
+                } else {
+                    "backend-defined; mini-agent makes no network-isolation claim"
+                },
+            },
+            SandboxPolicy::RequiredAndAvailable if self.backend == "bwrap" => {
+                SandboxCapabilityMatrix {
+                    backend: self.backend.clone(),
+                    status: "required-and-available",
+                    filesystem_reads:
+                        "workspace, application cache, explicit read-only runtime assets, and proc kernel metadata",
+                    filesystem_writes:
+                        "workspace, application cache, and private ephemeral /tmp only",
+                    process_namespace: "user, PID, IPC, UTS, and cgroup namespaces isolated",
+                    devices: "minimal synthetic /dev",
+                    environment: "cleared, then populated from a non-credential allow-list",
+                    network:
+                        "IP network denied by an isolated namespace; filesystem Unix sockets in writable binds remain reachable",
+                    requested_network_policy: BWRAP_REQUESTED_NETWORK_POLICY,
+                }
+            }
+            SandboxPolicy::RequiredAndAvailable => SandboxCapabilityMatrix {
+                backend: self.backend.clone(),
+                status: "required-and-available",
+                filesystem_reads: "backend-defined",
+                filesystem_writes: "workspace allowed; other behavior backend-defined",
+                process_namespace: "backend-defined",
+                devices: "backend-defined",
+                environment: "backend-defined",
+                network: "backend-defined; mini-agent makes no network-isolation claim",
+                requested_network_policy:
+                    "backend-defined; mini-agent makes no network-isolation claim",
+            },
         }
     }
 
@@ -185,7 +327,9 @@ impl Sandbox {
             SandboxPolicy::RequiredAndAvailable => {}
         }
 
-        let cwd = std::env::current_dir().unwrap_or_default();
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
+        let cwd = canonical_non_root(&cwd, "working directory")?;
 
         if self.backend == "zerobox" {
             let mut cmd = Command::new("zerobox");
@@ -199,45 +343,50 @@ impl Sandbox {
             return Ok(cmd);
         }
 
-        let mut cmd = Command::new("bwrap");
+        let paths = crate::paths::process_paths()
+            .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
+        std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
+            format!(
+                "sandbox: failed to create application cache {}: {error}",
+                paths.cache_dir.display()
+            )
+        })?;
+        let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+
+        let bwrap = bwrap_path().ok_or_else(|| {
+            "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
+                .to_string()
+        })?;
+        Ok(self.build_bwrap_command(bwrap, command, &cwd, &cache_dir))
+    }
+
+    fn build_bwrap_command(
+        &self,
+        bwrap: &Path,
+        command: &str,
+        cwd: &Path,
+        cache_dir: &Path,
+    ) -> Command {
+        let mut cmd = Command::new(bwrap);
         cmd.arg("--clearenv");
         for (k, v) in essential_env() {
             cmd.arg("--setenv").arg(k).arg(v);
         }
-        match std::fs::canonicalize("/etc/resolv.conf") {
-            Ok(target) => {
-                cmd.arg("--ro-bind-try");
-                cmd.arg(target);
-                cmd.arg("/etc/resolv.conf");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "sandbox: no resolver file could be mounted: could not resolve /etc/resolv.conf: {}",
-                    e
-                );
-            }
+        cmd.args(["--setenv", "TMPDIR", "/tmp"]);
+
+        // Start from bubblewrap's empty root and add only executable/runtime
+        // assets. Never read-bind the host root: doing so would expose home
+        // directories, credentials, and other unrelated host state.
+        for path in [
+            "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix",
+        ] {
+            cmd.args(["--ro-bind-try", path, path]);
         }
-        // must bind /etc/resolv.conf before /.
-        cmd.args(["--ro-bind", "/", "/", "--bind"]);
-        cmd.arg(cwd.as_os_str());
-        cmd.arg(cwd.as_os_str());
-        // Bind the resolved application cache as writable after "/" bind.
-        if let Ok(paths) = crate::paths::process_paths() {
-            let cache_dir = paths.cache_dir;
-            if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-                tracing::warn!(
-                    "sandbox: failed to create cache dir {}: {e}",
-                    cache_dir.display()
-                );
-            }
-            cmd.arg("--bind");
-            cmd.arg(cache_dir.as_os_str());
-            cmd.arg(cache_dir.as_os_str());
+        cmd.args(["--dir", "/etc"]);
+        for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+            cmd.args(["--ro-bind-try", path, path]);
         }
         cmd.args([
-            "--ro-bind",
-            "/sys",
-            "/sys",
             "--proc",
             "/proc",
             "--dev",
@@ -245,18 +394,29 @@ impl Sandbox {
             "--tmpfs",
             "/tmp",
         ]);
+        cmd.arg("--bind").arg(cwd).arg(cwd);
+        cmd.arg("--bind").arg(cache_dir).arg(cache_dir);
         cmd.args([
+            "--unshare-user",
             "--unshare-ipc",
             "--unshare-pid",
+            "--unshare-net",
             "--unshare-uts",
             "--unshare-cgroup",
+            "--remount-ro",
+            "/",
+            "--chdir",
+        ]);
+        cmd.arg(cwd);
+        cmd.args([
             "--die-with-parent",
+            "--",
             &self.shell,
             "-c",
             command,
         ]);
         configure_child_lifetime(&mut cmd);
-        Ok(cmd)
+        cmd
     }
 
     #[cfg(test)]
@@ -639,38 +799,7 @@ pub(crate) fn kill_process_group(pid: u32) {
 
 fn essential_env() -> Vec<(&'static str, String)> {
     let preserve = [
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "TERM",
-        "LANG",
-        "LC_ALL",
-        "SSH_AUTH_SOCK",
-        "SSH_AGENT_PID",
-        "SSH_ASKPASS",
-        "GIT_ASKPASS",
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "EDITOR",
-        "VISUAL",
-        "LD_LIBRARY_PATH",
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "GOPATH",
-        "GOROOT",
-        "VIRTUAL_ENV",
-        "JAVA_HOME",
-        "NODE_PATH",
-        "TMPDIR",
-        "XDG_RUNTIME_DIR",
-        "XDG_CACHE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "COLORTERM",
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "COLORTERM",
         "NO_COLOR",
     ];
     let mut vars = Vec::with_capacity(preserve.len());
@@ -680,6 +809,17 @@ fn essential_env() -> Vec<(&'static str, String)> {
         }
     }
     vars
+}
+
+fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("sandbox: failed to resolve {label} {}: {error}", path.display()))?;
+    if canonical.parent().is_none() {
+        return Err(format!(
+            "sandbox: refusing to expose filesystem root as {label}"
+        ));
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -745,5 +885,177 @@ mod sandbox_tests {
             cmd.is_ok(),
             "disabled sandbox must always produce a command"
         );
+    }
+
+    #[test]
+    fn linux_sandbox_policy_command_matches_capability_matrix() {
+        let sandbox = Sandbox::new(true, "bwrap");
+        let cmd = sandbox.build_bwrap_command(
+            Path::new("/usr/bin/bwrap"),
+            "printf sandboxed",
+            Path::new("/workspace"),
+            Path::new("/cache/mini-agent"),
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        for flag in [
+            "--clearenv",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--unshare-net",
+            "--dev",
+            "--proc",
+            "--remount-ro",
+        ] {
+            assert!(args.iter().any(|arg| arg == flag), "missing {flag}");
+        }
+        assert!(
+            !args
+                .windows(3)
+                .any(|args| args[0] == "--ro-bind" && args[1] == "/" && args[2] == "/"),
+            "the host root must never be visible inside the sandbox"
+        );
+        assert!(args.windows(3).any(|args| {
+            args[0] == "--bind" && args[1] == "/workspace" && args[2] == "/workspace"
+        }));
+        assert!(args.windows(3).any(|args| {
+            args[0] == "--bind"
+                && args[1] == "/cache/mini-agent"
+                && args[2] == "/cache/mini-agent"
+        }));
+        for credential_variable in [
+            "OPENROUTER_API_KEY",
+            "SSH_AUTH_SOCK",
+            "SSH_ASKPASS",
+            "GIT_ASKPASS",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            assert!(
+                !args.iter().any(|arg| arg == credential_variable),
+                "{credential_variable} must not be forwarded"
+            );
+        }
+
+        let matrix = sandbox.capability_matrix();
+        assert_eq!(
+            matrix.requested_network_policy,
+            BWRAP_REQUESTED_NETWORK_POLICY
+        );
+    }
+
+    #[test]
+    fn linux_sandbox_policy_unknown_backend_is_unavailable() {
+        assert_eq!(
+            unavailable().policy(),
+            SandboxPolicy::RequiredButUnavailable
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_sandbox_policy_enforces_real_backend() {
+        if !bwrap_exists() {
+            eprintln!("skipping real Linux sandbox probe because bwrap is not installed");
+            return;
+        }
+
+        let unique = uuid::Uuid::new_v4();
+        let host_secret =
+            std::env::temp_dir().join(format!("mini-agent-host-secret-{unique}"));
+        std::fs::write(&host_secret, b"must stay hidden").unwrap();
+        let workspace_probe = std::env::current_dir()
+            .unwrap()
+            .join(format!(".mini-agent-sandbox-write-{unique}"));
+        let workspace_probe_name = workspace_probe.file_name().unwrap().to_string_lossy();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let loopback_port = listener.local_addr().unwrap().port();
+
+        let script = format!(
+            r#"
+if cat /tmp/{host_secret_name} >/dev/null 2>&1; then exit 10; fi
+if printf denied >/etc/mini-agent-sandbox-policy-probe 2>/dev/null; then exit 11; fi
+test -r Cargo.toml || exit 12
+printf workspace > {workspace_probe_name}
+test "$(cat {workspace_probe_name})" = workspace || exit 13
+rm -f {workspace_probe_name}
+test -c /dev/null || exit 14
+test ! -e /dev/sda || exit 15
+test -z "${{MINI_AGENT_SANDBOX_SECRET+x}}" || exit 16
+if (exec 3<>/dev/tcp/127.0.0.1/{loopback_port}) 2>/dev/null; then exit 17; fi
+if (exec 3<>/dev/tcp/1.1.1.1/53) 2>/dev/null; then exit 18; fi
+printf LINUX_SANDBOX_POLICY_PASS
+"#,
+            host_secret_name = host_secret.file_name().unwrap().to_string_lossy(),
+            workspace_probe_name = workspace_probe_name,
+        );
+
+        let sandbox = Sandbox::new(true, "bwrap");
+        let mut command = sandbox.wrap_command(&script).unwrap();
+        command.env("MINI_AGENT_SANDBOX_SECRET", "must-not-cross-clearenv");
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+
+        drop(listener);
+        let _ = std::fs::remove_file(&host_secret);
+        let _ = std::fs::remove_file(&workspace_probe);
+        assert_eq!(
+            output.status,
+            CommandStatus::Completed,
+            "sandbox probe did not complete: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.exit_status.is_some_and(|status| status.success()),
+            "sandbox probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"LINUX_SANDBOX_POLICY_PASS");
+        assert_eq!(
+            sandbox.capability_matrix().network,
+            "IP network denied by an isolated namespace; filesystem Unix sockets in writable binds remain reachable"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_sandbox_policy_backend_setup_failure_is_fail_closed() {
+        if !bwrap_exists() {
+            eprintln!("skipping real Linux sandbox probe because bwrap is not installed");
+            return;
+        }
+
+        let marker = std::env::current_dir().unwrap().join(format!(
+            ".mini-agent-sandbox-setup-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let marker_name = marker.file_name().unwrap().to_string_lossy();
+        let sandbox = Sandbox::new(true, "bwrap")
+            .with_shell("/__mini_agent_missing_sandbox_shell__");
+        let output = sandbox
+            .output_command_with_limits(
+                &format!("touch {marker_name}"),
+                DEFAULT_COMMAND_LIMITS,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !output.exit_status.is_some_and(|status| status.success()),
+            "backend setup failure must not report success"
+        );
+        assert!(
+            !marker.exists(),
+            "the requested command must not run after backend setup failure"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 }

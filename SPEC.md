@@ -65,6 +65,10 @@ Normative specification:
 - Apply file allow-lists only to resolved targets and only as a restriction before the mandatory
   Phase 1 permission.
 - Extend the shared process wrapper and verify effective isolation on Linux and macOS.
+- On Linux, the opt-in `bwrap` policy exposes only the workspace, application cache, private
+  temporary storage, and explicit read-only runtime assets; it clears credential-bearing
+  environment state, creates process/device/network boundaries, and denies launch on setup error.
+  Disabling sandboxing intentionally inherits host capabilities and is reported distinctly.
 - Do not claim Windows process isolation; it is outside Phase 2.
 
 ## Phase 3 — skill library

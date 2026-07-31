@@ -25,7 +25,15 @@ child-process isolation on any platform.
 
 ## Cargo.toml additions
 
-The features are independent:
+The features are independent. The checked-in Linux `bwrap` backend uses the system executable and
+therefore currently needs no Rust dependency:
+
+```toml
+[features]
+sandbox = []
+```
+
+A later macOS/birdcage implementation may extend that feature without changing the relationship:
 
 ```toml
 [features]
@@ -113,6 +121,44 @@ The implementation must not add a parallel raw `std::process::Command` path for 
 adapter remains behind the shared wrapper and preserves Phase 1 permission, argument, timeout,
 cancellation, and output bounds.
 
+### Linux `bwrap` capability matrix
+
+The default Linux subprocess policy is opt-in (`--sandbox` or `sandbox = true`). When disabled,
+the wrapper intentionally inherits host capabilities and reports that state. When enabled with
+the default `bwrap` backend, the following matrix is normative:
+
+| Capability | Enforced policy |
+|------------|-----------------|
+| Filesystem reads | The canonical current workspace, mini-agent's canonical application cache, explicit read-only runtime roots (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/nix` when present), `/etc/localtime`, `/etc/ld.so.cache`, and kernel/system metadata exposed by the new `/proc` |
+| Filesystem writes | The workspace and application cache bind mounts plus a private ephemeral `/tmp`; the remaining sandbox root and runtime mounts are read-only |
+| Process namespace | Separate user, PID, IPC, UTS, and cgroup namespaces |
+| Devices | A synthetic minimal `/dev`; host device trees are not mounted |
+| Environment | `--clearenv`, followed only by `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `COLORTERM`, and `NO_COLOR`; `TMPDIR` is fixed to `/tmp` |
+| Network | A separate IP network namespace; host interfaces, host loopback listeners, and external IP networks are unreachable. Filesystem Unix-domain sockets inside the workspace or application-cache bind remain reachable |
+
+The working directory is the workspace boundary. The wrapper refuses filesystem root as a
+workspace or application-cache root, but a user who starts mini-agent in another broad directory
+has intentionally selected that directory as visible and writable. Runtime mounts remain readable
+and therefore are not confidentiality boundaries for their contents.
+
+The wrapper does not claim seccomp syscall filtering, CPU/memory quotas, Unix-domain socket
+filtering inside writable binds, confidentiality for kernel/system metadata exposed through
+`/proc`, protection from the host kernel, or Windows isolation. The `zerobox` backend currently
+requests workspace writes but its read/process/device/environment/network behavior is
+backend-defined; mini-agent must not report it as satisfying the Linux `bwrap` matrix.
+
+The selected `bwrap` executable and every parent directory must be root-owned and not
+group/world-writable; a workspace- or user-controlled PATH entry is never trusted as the security
+backend. Backend absence and every current-directory, cache-directory, namespace, mount, device,
+or child setup error fail closed. No command is retried outside the backend. Capability reporting
+must distinguish disabled, requested-and-available, and requested-but-unavailable states and must
+list the actual bwrap flags/mount policy above.
+
+Subprocess networking and the in-process `fetch()` global are separate capabilities. The bwrap
+subprocess policy always denies networking. A permission-approved `fetch()` runs in the parent
+host implementation and remains subject to its URL validation, allow-list, redirect, deadline,
+and response bounds; it does not grant network access to spawned processes.
+
 ## Windows behavior
 
 The in-process QuickJS engine may compile and run on Windows, but Phase 2 does not make the full
@@ -132,6 +178,8 @@ semantics, ACL interactions, CI, and release gate.
       sandboxed.
 - [ ] JS process spawn still uses the one shared `Sandbox::wrap_command` path.
 - [ ] Default and `js`-only behavior remain unchanged except for explicitly fixed Phase 1 defects.
+- [x] Linux `bwrap` filesystem, namespace, device, environment, and network policy is explicit,
+      capability-reported, fail-closed, and covered by real-backend CI probes.
 
 ## Out of scope for Phase 2
 

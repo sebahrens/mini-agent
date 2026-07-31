@@ -187,7 +187,7 @@ pub struct Cli {
 
     #[arg(
         long = "sandbox",
-        help = "Run bash commands inside bubblewrap (bwrap) sandbox"
+        help = "Enforce subprocess filesystem/process isolation and deny network; fail closed if the backend is unavailable"
     )]
     pub sandbox: bool,
 

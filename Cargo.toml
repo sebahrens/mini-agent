@@ -44,6 +44,7 @@ advisor = []
 hooks = []
 lsp = ["dep:lsp-types"]
 js = ["dep:rquickjs"]
+sandbox = []
 skills = ["js"]
 
 [dependencies]

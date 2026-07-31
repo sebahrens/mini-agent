@@ -3,6 +3,7 @@ use std::io::{self, Write as IoWrite};
 
 use crate::cli;
 use crate::config;
+use crate::sandbox::Sandbox;
 use crate::session;
 
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
@@ -134,7 +135,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     };
     let no_context_files = cli.resolve_no_context_files(cfg);
     let sandbox = cli.resolve_sandbox(cfg);
+    let sandbox_backend = cli.resolve_sandbox_backend(cfg);
     let shell = cli.resolve_shell(cfg);
+    let sandbox_capabilities =
+        Sandbox::new(sandbox, &sandbox_backend).with_shell(&shell).capability_matrix();
     let edit_system = cli.resolve_edit_system(cfg);
     let compact = cfg.resolve_compact_enabled();
 
@@ -252,6 +256,37 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
             ("tools", tools_allowlist),
             ("no-context-files", no_context_files.to_string()),
             ("compact", compact.to_string()),
+        ],
+    );
+
+    append_section(
+        &mut output,
+        "Sandbox capabilities",
+        &[
+            ("backend", sandbox_capabilities.backend),
+            ("status", sandbox_capabilities.status.to_string()),
+            (
+                "filesystem reads",
+                sandbox_capabilities.filesystem_reads.to_string(),
+            ),
+            (
+                "filesystem writes",
+                sandbox_capabilities.filesystem_writes.to_string(),
+            ),
+            (
+                "process namespace",
+                sandbox_capabilities.process_namespace.to_string(),
+            ),
+            ("devices", sandbox_capabilities.devices.to_string()),
+            (
+                "environment",
+                sandbox_capabilities.environment.to_string(),
+            ),
+            ("network", sandbox_capabilities.network.to_string()),
+            (
+                "requested network policy",
+                sandbox_capabilities.requested_network_policy.to_string(),
+            ),
         ],
     );
 

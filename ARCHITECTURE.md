@@ -88,6 +88,36 @@ engine does not turn an unisolated child process into a sandbox.
 The normative hardening contract is
 [`phase-2-sandbox.md`](docs/specs/phase-2-sandbox.md).
 
+### Linux subprocess capability boundary
+
+Linux `bwrap` subprocess isolation is opt-in and fail-closed. When requested, the wrapper builds an
+empty mount namespace rather than read-mounting `/`. It exposes the current workspace and the
+mini-agent application cache read/write, a private ephemeral `/tmp`, and only explicit read-only
+runtime roots and selected non-secret `/etc` files. The sandbox root is remounted read-only after
+those nested mounts are installed.
+
+The same wrapper creates user, PID, IPC, UTS, cgroup, and network namespaces, supplies a synthetic
+`/dev`, and clears the environment before restoring a narrow non-credential allow-list. The
+network namespace has no host or external IP connectivity; in particular, host loopback listeners
+are not reachable. Filesystem Unix-domain sockets inside the workspace or application-cache bind
+mount remain reachable and are not covered by the IP-network guarantee. A missing or untrusted
+backend executable, invalid workspace/cache root, namespace failure, mount failure, or child setup
+failure denies execution rather than falling back to the host.
+
+| State | Read/write/process/device/environment/network result |
+|-------|------------------------------------------------------|
+| Sandbox disabled | Host capabilities are inherited intentionally and reported as such |
+| Linux `bwrap` available | The checked-in capability matrix above is applied |
+| Linux `bwrap` unavailable or setup fails | Subprocess launch is denied |
+| `zerobox` selected | Only its workspace-write request is known; no mini-agent network-isolation claim is made |
+
+This boundary does not include seccomp filtering, CPU/memory quotas, Unix-domain socket filtering,
+kernel/system metadata exposed by `/proc`, kernel confidentiality, or Windows process isolation.
+The process working directory defines the workspace exposure, so starting mini-agent in a broad
+directory intentionally broadens visible and writable state. The `bwrap` executable and every
+parent directory must be root-owned and not group/world-writable.
+In-process permission-gated fetch remains separate from subprocess network isolation.
+
 ## Feature relationships
 
 - `js` enables the Phase 1 engine.

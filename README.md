@@ -54,6 +54,34 @@ artifact retained for history and must not guide implementation.
 - Phase 4 requires human approval into non-retrievable canary state. Phase 5 owns the limited,
   evidence-based automatic lifecycle.
 
+## Linux subprocess sandbox
+
+Sandboxing is opt-in (`--sandbox` or `sandbox = true`) and fail-closed. Without it, subprocesses
+inherit the host filesystem, environment, devices, process namespaces, and network. With the
+default `bwrap` backend on Linux, mini-agent applies this capability matrix:
+
+| Capability | Enforced Linux `bwrap` policy |
+|------------|---------------------------------|
+| Filesystem reads | Current workspace, mini-agent's application cache, explicit system runtime roots (`/usr`, `/bin`, `/sbin`, `/lib*`, `/nix`), `/etc/localtime`, `/etc/ld.so.cache`, and kernel/system metadata exposed by the new `/proc` |
+| Filesystem writes | Current workspace, mini-agent's application cache, and a private ephemeral `/tmp`; the remaining sandbox root and runtime mounts are read-only |
+| Processes | Separate user, PID, IPC, UTS, and cgroup namespaces |
+| Devices | A minimal synthetic `/dev`; host devices are not mounted |
+| Environment | Cleared and rebuilt from `PATH`, identity, shell, terminal, locale, and color variables; credential, agent-socket, display, and API-key variables are not forwarded |
+| Network | Separate IP network namespace with no host or external IP connectivity, including no access to host loopback listeners; filesystem Unix-domain sockets placed in the workspace or application cache remain reachable |
+
+Only the workspace path selected by the process working directory is exposed; running mini-agent
+from a broad or sensitive directory broadens that boundary. The sandbox does not provide seccomp,
+CPU/memory quotas, filtering of Unix-domain sockets inside writable bind mounts, or confidentiality
+from host kernel metadata. Only a root-owned, non-group/world-writable `bwrap` executable beneath
+equally protected parent directories is trusted. If it is missing or any namespace or mount setup
+fails, the subprocess does not run. The optional `zerobox` backend has
+backend-defined read/process/device/environment/network behavior and is not reported as providing
+the Linux `bwrap` guarantee.
+
+Use `mini-agent --sandbox --sandbox-backend bwrap --print-config` to see the configured backend,
+availability, and effective capability report. Permission-gated in-process HTTP fetches are a
+separate boundary; subprocess network isolation does not bypass or replace fetch permissions.
+
 ## Phase status
 
 | Phase | Scope | Status |
