@@ -25,22 +25,12 @@ child-process isolation on any platform.
 
 ## Cargo.toml additions
 
-The features are independent. The checked-in Linux `bwrap` backend uses the system executable and
-therefore currently needs no Rust dependency:
+The features are independent. The checked-in Linux `bwrap` and macOS `seatbelt` backends use
+trusted system executables and therefore need no Rust dependency:
 
 ```toml
 [features]
 sandbox = []
-```
-
-A later macOS/birdcage implementation may extend that feature without changing the relationship:
-
-```toml
-[features]
-sandbox = ["dep:birdcage"]
-
-[dependencies]
-birdcage = { version = "0.7", optional = true }
 ```
 
 - `sandbox` without `js` extends the shared process sandbox and must compile.
@@ -153,7 +143,7 @@ effective backend.
 | Platform | Phase 2 process guarantee |
 |----------|---------------------------|
 | Linux | Effective configured isolation using the supported Linux backend, verified by escape/denial tests |
-| macOS | Effective Seatbelt isolation while the supported backend is available, verified by escape/denial tests |
+| macOS | Seatbelt denies network and writes outside the workspace/cache/temp boundary; host-readable files, devices, and process namespaces are explicitly not claimed as isolated |
 | Windows | No Phase 2 process-isolation guarantee; execution is disabled or explicitly reported as non-isolated according to product policy |
 
 Backend absence or setup failure never masquerades as isolation. Whether fallback execution is
@@ -202,6 +192,22 @@ subprocess policy always denies networking. A permission-approved `fetch()` runs
 host implementation and remains subject to its URL validation, allow-list, redirect, deadline,
 and response bounds; it does not grant network access to spawned processes.
 
+### macOS `seatbelt` capability matrix
+
+macOS defaults to the fixed `/usr/bin/sandbox-exec` backend. The executable and every parent
+directory must be root-owned and not group/world-writable. The generated profile denies by
+default, allows child processes, allows host-readable files, permits writes only below the
+canonical workspace, canonical application cache, `/private/tmp`, and `/dev/null`, and denies all
+Seatbelt network operations. The child starts through `/usr/bin/env -i`; only the same
+non-credential environment allow-list as Linux is restored and `TMPDIR` is fixed to
+`/private/tmp`.
+
+Seatbelt does not provide a filesystem or process namespace. Accordingly, Phase 2 does not claim
+read confidentiality, device isolation, a private temporary directory, or process-namespace
+isolation on macOS. It does enforce the stated write and network boundaries, and all descendants
+inherit the profile. Backend absence, profile application failure, or child setup failure starts
+no requested child and is never retried unsandboxed.
+
 ## Windows behavior
 
 The in-process QuickJS engine may compile and run on Windows, but Phase 2 does not make the full
@@ -216,10 +222,10 @@ semantics, ACL interactions, CI, and release gate.
 - [ ] `fetch()` validates URLs, rechecks redirects, enforces bounds/deadlines/cancellation, applies
       the narrowing allow-list, and always obtains `js/fetch` permission.
 - [ ] File allow-lists match resolved targets and never bypass Phase 1 permissions or secure I/O.
-- [ ] Linux and macOS process escape/denial tests prove an effective backend before Phase 2 closes.
+- [x] Linux and macOS process escape/denial tests prove their documented backend guarantees.
 - [ ] Backend absence/failure and Windows non-isolation are visible and never reported as
       sandboxed.
-- [ ] JS process spawn still uses the one shared `Sandbox::wrap_command` path.
+- [x] JS process spawn still uses the one shared `Sandbox::wrap_command` path.
 - [ ] Default and `js`-only behavior deny JS file access until roots or explicit unrestricted
       opt-ins are configured; non-file JS behavior remains unchanged.
 - [x] Linux `bwrap` filesystem, namespace, device, environment, and network policy is explicit,

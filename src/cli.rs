@@ -4,6 +4,14 @@ use compact_str::CompactString;
 use crate::config;
 use crate::config::types::EditSystem;
 
+fn default_sandbox_backend() -> String {
+    if cfg!(target_os = "macos") {
+        "seatbelt".to_string()
+    } else {
+        "bwrap".to_string()
+    }
+}
+
 #[derive(Parser, Debug, Default, Clone)]
 #[command(name = "mini-agent", version, about = "Minimal coding agent")]
 pub struct Cli {
@@ -200,7 +208,7 @@ pub struct Cli {
 
     #[arg(
         long = "sandbox-backend",
-        help = "Sandbox backend: bwrap (default) or zerobox"
+        help = "Sandbox backend: bwrap (Linux default), seatbelt (macOS default), or zerobox"
     )]
     pub sandbox_backend: Option<String>,
 
@@ -440,7 +448,7 @@ impl Cli {
         self.sandbox_backend
             .clone()
             .or_else(|| cfg.sandbox_backend.clone())
-            .unwrap_or_else(|| "bwrap".to_string())
+            .unwrap_or_else(default_sandbox_backend)
     }
 
     pub fn resolve_shell(&self, cfg: &config::Config) -> String {
@@ -531,10 +539,24 @@ impl Cli {
 mod tests {
     use clap::CommandFactory;
 
-    use super::Cli;
+    use super::{Cli, default_sandbox_backend};
+    use crate::config;
 
     #[test]
     fn command_name_matches_canonical_cargo_binary() {
         assert_eq!(Cli::command().get_name(), "mini-agent");
+    }
+
+    #[test]
+    fn sandbox_backend_default_is_platform_appropriate_and_overridable() {
+        let mut cli = Cli::default();
+        let mut cfg = config::Config::default();
+        assert_eq!(cli.resolve_sandbox_backend(&cfg), default_sandbox_backend());
+
+        cfg.sandbox_backend = Some("configured".to_string());
+        assert_eq!(cli.resolve_sandbox_backend(&cfg), "configured");
+
+        cli.sandbox_backend = Some("command-line".to_string());
+        assert_eq!(cli.resolve_sandbox_backend(&cfg), "command-line");
     }
 }

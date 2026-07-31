@@ -61,6 +61,8 @@ pub(crate) struct CommandOutput {
 
 #[cfg(target_os = "linux")]
 static BWRAP_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static SEATBELT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 fn bwrap_exists() -> bool {
@@ -84,9 +86,36 @@ fn bwrap_path() -> Option<&'static Path> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn seatbelt_exists() -> bool {
+    seatbelt_path().is_some()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn seatbelt_exists() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_path() -> Option<&'static Path> {
+    SEATBELT_PATH
+        .get_or_init(|| {
+            let path = PathBuf::from("/usr/bin/sandbox-exec");
+            is_trusted_system_path(&path).then_some(path)
+        })
+        .as_deref()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn seatbelt_path() -> Option<&'static Path> {
+    None
+}
+
 static ZEROBOX_AVAILABLE: OnceLock<bool> = OnceLock::new();
 const BWRAP_REQUESTED_NETWORK_POLICY: &str =
     "deny (unshare-net; backend absence/setup failure denies launch)";
+const SEATBELT_REQUESTED_NETWORK_POLICY: &str =
+    "deny (Seatbelt network*; backend absence/setup failure denies launch)";
 
 fn zerobox_exists() -> bool {
     *ZEROBOX_AVAILABLE.get_or_init(|| which_cmd("zerobox"))
@@ -141,7 +170,7 @@ fn find_trusted_system_executable(name: &str) -> Option<PathBuf> {
         .find(|candidate| is_trusted_system_path(candidate))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_trusted_system_path(path: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -234,6 +263,7 @@ impl Sandbox {
         }
         let available = match self.backend.as_str() {
             "bwrap" => bwrap_exists(),
+            "seatbelt" => seatbelt_exists(),
             "zerobox" => zerobox_exists(),
             _ => false,
         };
@@ -266,10 +296,10 @@ impl Sandbox {
                 devices: "none; subprocess launch denied",
                 environment: "none; subprocess launch denied",
                 network: "none; subprocess launch denied",
-                requested_network_policy: if self.backend == "bwrap" {
-                    BWRAP_REQUESTED_NETWORK_POLICY
-                } else {
-                    "backend-defined; mini-agent makes no network-isolation claim"
+                requested_network_policy: match self.backend.as_str() {
+                    "bwrap" => BWRAP_REQUESTED_NETWORK_POLICY,
+                    "seatbelt" => SEATBELT_REQUESTED_NETWORK_POLICY,
+                    _ => "backend-defined; mini-agent makes no network-isolation claim",
                 },
             },
             SandboxPolicy::RequiredAndAvailable if self.backend == "bwrap" => {
@@ -283,6 +313,19 @@ impl Sandbox {
                     environment: "cleared, then populated from a non-credential allow-list",
                     network: "IP network denied by an isolated namespace; filesystem Unix sockets in writable binds remain reachable",
                     requested_network_policy: BWRAP_REQUESTED_NETWORK_POLICY,
+                }
+            }
+            SandboxPolicy::RequiredAndAvailable if self.backend == "seatbelt" => {
+                SandboxCapabilityMatrix {
+                    backend: self.backend.clone(),
+                    status: "required-and-available",
+                    filesystem_reads: "host-readable files remain readable (Seatbelt read confinement is not claimed)",
+                    filesystem_writes: "workspace, application cache, shared temporary directory, and /dev/null only",
+                    process_namespace: "no namespace isolation; child processes inherit the Seatbelt profile",
+                    devices: "host-readable devices remain readable; writes are limited to /dev/null",
+                    environment: "cleared, then populated from a non-credential allow-list",
+                    network: "all Seatbelt network operations denied",
+                    requested_network_policy: SEATBELT_REQUESTED_NETWORK_POLICY,
                 }
             }
             SandboxPolicy::RequiredAndAvailable => SandboxCapabilityMatrix {
@@ -349,11 +392,55 @@ impl Sandbox {
         })?;
         let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
 
+        if self.backend == "seatbelt" {
+            let seatbelt = seatbelt_path().ok_or_else(|| {
+                "sandbox backend 'seatbelt' is not a trusted system executable — refusing to run unsandboxed"
+                    .to_string()
+            })?;
+            return self.build_seatbelt_command(seatbelt, command, &cwd, &cache_dir);
+        }
+
         let bwrap = bwrap_path().ok_or_else(|| {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
         Ok(self.build_bwrap_command(bwrap, command, &cwd, &cache_dir))
+    }
+
+    fn build_seatbelt_command(
+        &self,
+        seatbelt: &Path,
+        command: &str,
+        cwd: &Path,
+        cache_dir: &Path,
+    ) -> Result<Command, String> {
+        let workspace = seatbelt_string_literal(cwd, "working directory")?;
+        let cache = seatbelt_string_literal(cache_dir, "application cache")?;
+        let profile = format!(
+            r#"(version 1)
+(deny default)
+(allow process*)
+(allow file-read*)
+(allow file-write*
+    (subpath "{workspace}")
+    (subpath "{cache}")
+    (subpath "/private/tmp")
+    (literal "/dev/null"))
+(deny network*)"#
+        );
+
+        let mut cmd = Command::new(seatbelt);
+        cmd.arg("-p").arg(profile);
+        // `env -i` is inside the sandbox wrapper, so callers cannot restore
+        // credentials by adding environment variables to the returned command.
+        cmd.arg("/usr/bin/env").arg("-i");
+        for (key, value) in essential_env() {
+            cmd.arg(format!("{key}={value}"));
+        }
+        cmd.arg("TMPDIR=/private/tmp");
+        cmd.arg(&self.shell).arg("-c").arg(command);
+        configure_child_lifetime(&mut cmd);
+        Ok(cmd)
     }
 
     fn build_bwrap_command(
@@ -815,6 +902,21 @@ fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+fn seatbelt_string_literal(path: &Path, label: &str) -> Result<String, String> {
+    let value = path.to_str().ok_or_else(|| {
+        format!(
+            "sandbox: {label} {} is not valid UTF-8 for the Seatbelt profile",
+            path.display()
+        )
+    })?;
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "sandbox: {label} contains control characters that cannot be represented safely in a Seatbelt profile"
+        ));
+    }
+    Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
@@ -942,6 +1044,76 @@ mod sandbox_tests {
     }
 
     #[test]
+    fn macos_seatbelt_policy_command_matches_capability_matrix() {
+        let sandbox = Sandbox::new(true, "seatbelt");
+        let command = sandbox
+            .build_seatbelt_command(
+                Path::new("/usr/bin/sandbox-exec"),
+                "printf sandboxed",
+                Path::new("/workspace"),
+                Path::new("/cache/mini-agent"),
+            )
+            .unwrap();
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let profile = args
+            .windows(2)
+            .find_map(|args| (args[0] == "-p").then_some(args[1].as_str()))
+            .expect("Seatbelt profile argument");
+
+        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains(r#"(subpath "/workspace")"#));
+        assert!(profile.contains(r#"(subpath "/cache/mini-agent")"#));
+        assert!(!profile.contains("(allow network"));
+        assert!(
+            args.windows(2)
+                .any(|args| args[0] == "/usr/bin/env" && args[1] == "-i"),
+            "Seatbelt child environment must be cleared inside the wrapper"
+        );
+        for credential_variable in [
+            "OPENROUTER_API_KEY",
+            "SSH_AUTH_SOCK",
+            "SSH_ASKPASS",
+            "GIT_ASKPASS",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.starts_with(&format!("{credential_variable}="))),
+                "{credential_variable} must not be forwarded"
+            );
+        }
+
+        let matrix = SandboxCapabilityMatrix {
+            backend: "seatbelt".to_string(),
+            status: "required-and-available",
+            filesystem_reads: "host-readable files remain readable (Seatbelt read confinement is not claimed)",
+            filesystem_writes: "workspace, application cache, shared temporary directory, and /dev/null only",
+            process_namespace: "no namespace isolation; child processes inherit the Seatbelt profile",
+            devices: "host-readable devices remain readable; writes are limited to /dev/null",
+            environment: "cleared, then populated from a non-credential allow-list",
+            network: "all Seatbelt network operations denied",
+            requested_network_policy: SEATBELT_REQUESTED_NETWORK_POLICY,
+        };
+        assert_eq!(matrix.network, "all Seatbelt network operations denied");
+    }
+
+    #[test]
+    fn seatbelt_profile_escapes_paths_and_rejects_controls() {
+        assert_eq!(
+            seatbelt_string_literal(Path::new(r#"/tmp/a\"b"#), "probe").unwrap(),
+            r#"/tmp/a\\\"b"#
+        );
+        let error = seatbelt_string_literal(Path::new("/tmp/a\nb"), "probe").unwrap_err();
+        assert!(error.contains("control characters"));
+    }
+
+    #[test]
     fn linux_sandbox_policy_unknown_backend_is_unavailable() {
         assert_eq!(
             unavailable().policy(),
@@ -1030,6 +1202,107 @@ printf LINUX_SANDBOX_POLICY_PASS
         let marker_name = marker.file_name().unwrap().to_string_lossy();
         let sandbox =
             Sandbox::new(true, "bwrap").with_shell("/__mini_agent_missing_sandbox_shell__");
+        let output = sandbox
+            .output_command_with_limits(&format!("touch {marker_name}"), DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+
+        assert!(
+            !output.exit_status.is_some_and(|status| status.success()),
+            "backend setup failure must not report success"
+        );
+        assert!(
+            !marker.exists(),
+            "the requested command must not run after backend setup failure"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_seatbelt_policy_enforces_real_backend() {
+        if !seatbelt_exists() {
+            panic!("the supported macOS Seatbelt backend is unavailable");
+        }
+
+        let unique = uuid::Uuid::new_v4();
+        let workspace_probe = std::env::current_dir()
+            .unwrap()
+            .join(format!(".mini-agent-seatbelt-write-{unique}"));
+        let workspace_probe_name = workspace_probe.file_name().unwrap().to_string_lossy();
+        let escape_link = std::env::current_dir()
+            .unwrap()
+            .join(format!(".mini-agent-seatbelt-escape-{unique}"));
+        let escape_link_name = escape_link.file_name().unwrap().to_string_lossy();
+        let outside_probe = std::env::current_dir()
+            .unwrap()
+            .parent()
+            .expect("test repository must not be filesystem root")
+            .join(format!(".mini-agent-seatbelt-denied-{unique}"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let loopback_port = listener.local_addr().unwrap().port();
+
+        let script = format!(
+            r#"
+if touch {outside_probe} 2>/dev/null; then exit 10; fi
+ln -s {outside_probe} {escape_link_name} || exit 11
+if printf escaped > {escape_link_name} 2>/dev/null; then exit 12; fi
+rm -f {escape_link_name}
+printf workspace > {workspace_probe_name}
+test "$(cat {workspace_probe_name})" = workspace || exit 13
+rm -f {workspace_probe_name}
+test -z "${{MINI_AGENT_SANDBOX_SECRET+x}}" || exit 14
+if (exec 3<>/dev/tcp/127.0.0.1/{loopback_port}) 2>/dev/null; then exit 15; fi
+printf MACOS_SEATBELT_POLICY_PASS
+"#,
+            outside_probe = outside_probe.to_string_lossy(),
+            escape_link_name = escape_link_name,
+            workspace_probe_name = workspace_probe_name,
+        );
+
+        let sandbox = Sandbox::new(true, "seatbelt");
+        let mut command = sandbox.wrap_command(&script).unwrap();
+        command.env("MINI_AGENT_SANDBOX_SECRET", "must-not-cross-env-i");
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+
+        drop(listener);
+        let _ = std::fs::remove_file(&outside_probe);
+        let _ = std::fs::remove_file(&workspace_probe);
+        let _ = std::fs::remove_file(&escape_link);
+        assert_eq!(
+            output.status,
+            CommandStatus::Completed,
+            "Seatbelt probe did not complete: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.exit_status.is_some_and(|status| status.success()),
+            "Seatbelt probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"MACOS_SEATBELT_POLICY_PASS");
+        let matrix = sandbox.capability_matrix();
+        assert_eq!(matrix.network, "all Seatbelt network operations denied");
+        assert!(matrix.filesystem_reads.contains("not claimed"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_seatbelt_setup_failure_is_fail_closed() {
+        if !seatbelt_exists() {
+            panic!("the supported macOS Seatbelt backend is unavailable");
+        }
+
+        let marker = std::env::current_dir().unwrap().join(format!(
+            ".mini-agent-seatbelt-setup-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let marker_name = marker.file_name().unwrap().to_string_lossy();
+        let sandbox =
+            Sandbox::new(true, "seatbelt").with_shell("/__mini_agent_missing_sandbox_shell__");
         let output = sandbox
             .output_command_with_limits(&format!("touch {marker_name}"), DEFAULT_COMMAND_LIMITS)
             .await
