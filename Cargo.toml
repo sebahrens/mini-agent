@@ -45,7 +45,11 @@ hooks = []
 lsp = ["dep:lsp-types"]
 js = ["dep:rquickjs"]
 sandbox = []
-skills = ["js"]
+skills = ["js", "dep:rusqlite"]
+# Real ONNX/BGE embedding backend. Opt-in because `ort-sys` ships no prebuilt
+# binaries for some hosts (notably x86_64-apple-darwin); `skills` alone must build
+# everywhere and uses the deterministic backend.
+skills-embed = ["skills", "dep:fastembed"]
 
 [dependencies]
 rig = { package = "rig-core", version = "0.40", default-features = false, features = [
@@ -80,6 +84,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
     "native-tls",
     "charset",
     "http2",
@@ -102,6 +107,8 @@ blocking = { version = "1", optional = true }
 lsp-types = { version = "0.97", optional = true }
 rquickjs = { version = "0.12", features = ["full"], optional = true }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+fastembed = { version = "5", optional = true }
 
 [dev-dependencies]
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }

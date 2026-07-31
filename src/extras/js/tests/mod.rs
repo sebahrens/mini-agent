@@ -1,3 +1,10 @@
+#[cfg(feature = "skills")]
+mod skill_embedder;
+#[cfg(feature = "skills")]
+mod skill_store_schema;
+#[cfg(feature = "skills")]
+mod skill_verification_semantics;
+
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::tool::JsTool;
 use crate::extras::js::types::{
