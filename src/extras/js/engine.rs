@@ -381,6 +381,7 @@ fn run_step_with_policy(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_step_for_test(
     code: &str,
     sandbox: &Sandbox,
