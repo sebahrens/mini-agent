@@ -25,6 +25,8 @@ pub struct PermissionConfig {
     #[serde(rename = "*")]
     pub default: Option<Action>,
     pub bash: Option<ToolPerm>,
+    #[serde(rename = "js/fetch", alias = "fetch")]
+    pub js_fetch: Option<ToolPerm>,
     pub read: Option<ToolPerm>,
     pub write: Option<ToolPerm>,
     pub edit: Option<ToolPerm>,

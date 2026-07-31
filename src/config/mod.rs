@@ -150,6 +150,15 @@ pub struct Config {
         rename = "js-write-unrestricted"
     )]
     pub js_write_unrestricted: Option<bool>,
+    #[cfg(feature = "js")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "js-fetch-origins")]
+    pub js_fetch_origins: Option<Vec<String>>,
+    #[cfg(feature = "js")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "js-fetch-allow-http"
+    )]
+    pub js_fetch_allow_http: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_all_mcp_calls: Option<bool>,
     #[cfg(feature = "mcp")]
@@ -716,6 +725,8 @@ js-read-roots = ["src", "docs"]
 js-write-roots = ["generated"]
 js-read-unrestricted = false
 js-write-unrestricted = true
+js-fetch-origins = ["https://example.com", "http://public.example:8080"]
+js-fetch-allow-http = true
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
 
@@ -727,5 +738,13 @@ js-write-unrestricted = true
         assert_eq!(cfg.js_write_roots, Some(vec!["generated".to_string()]));
         assert_eq!(cfg.js_read_unrestricted, Some(false));
         assert_eq!(cfg.js_write_unrestricted, Some(true));
+        assert_eq!(
+            cfg.js_fetch_origins,
+            Some(vec![
+                "https://example.com".to_string(),
+                "http://public.example:8080".to_string()
+            ])
+        );
+        assert_eq!(cfg.js_fetch_allow_http, Some(true));
     }
 }

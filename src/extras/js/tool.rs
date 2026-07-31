@@ -217,7 +217,7 @@ impl PermissionBridge {
         }
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.shutdown.is_cancelled()
             || self
                 .invocation_cancellation
@@ -569,10 +569,16 @@ impl Tool for JsTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Execute JavaScript code. Available globals: read_file(path), write_file(path, content), \
-         spawn(cmd, args), console.log(...). Returns the last expression value as a string. \
-         Errors include the stack trace for self-correction."
-            .to_string()
+        let globals = if cfg!(feature = "sandbox") {
+            "read_file(path), write_file(path, content), fetch(url, options), \
+             spawn(cmd, args), console.log(...)"
+        } else {
+            "read_file(path), write_file(path, content), spawn(cmd, args), console.log(...)"
+        };
+        format!(
+            "Execute JavaScript code. Available globals: {globals}. Returns the last expression \
+             value as a string. Errors include the stack trace for self-correction."
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {

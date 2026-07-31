@@ -184,6 +184,10 @@ fn register_js_tool(
         cfg.js_write_roots.as_deref(),
         cfg.js_read_unrestricted.unwrap_or(false),
         cfg.js_write_unrestricted.unwrap_or(false),
+    )
+    .with_fetch_settings(
+        cfg.js_fetch_origins.as_deref(),
+        cfg.js_fetch_allow_http.unwrap_or(false),
     );
     tools.push(Box::new(JsTool::new(
         sandbox,

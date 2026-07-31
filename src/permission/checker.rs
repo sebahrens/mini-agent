@@ -60,6 +60,7 @@ impl PermissionChecker {
         let mut rules: HashMap<String, Vec<(Pattern, Action)>> = HashMap::new();
         for (tool_name, tool_perm) in [
             ("bash", &config.bash),
+            ("js/fetch", &config.js_fetch),
             ("read", &config.read),
             ("write", &config.write),
             ("edit", &config.edit),
@@ -264,10 +265,11 @@ impl PermissionChecker {
                     Action::Ask
                 }
             }),
-            SecurityMode::Standard => base.unwrap_or_else(|| {
-                if tool == "bash" {
-                    // Bash scripts are opaque permission keys. An unmatched
-                    // script must never inherit a permissive default.
+            SecurityMode::Standard => base.unwrap_or({
+                if matches!(tool, "bash" | "js/fetch") {
+                    // Bash scripts and network destinations are opaque,
+                    // security-sensitive permission keys. An unmatched call
+                    // must never inherit a permissive default.
                     Action::Ask
                 } else {
                     self.default_action
@@ -859,5 +861,76 @@ mod tests {
             default_checker.is_external_path(&sibling.join("outside.txt").to_string_lossy()),
             "sibling-prefix path must remain outside the workspace"
         );
+    }
+
+    #[test]
+    fn js_fetch_permissions_fail_closed_by_mode_and_honor_explicit_rules() {
+        let new_checker = |mode, config| {
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                mode,
+                None,
+                Some(vec![
+                    "standard".to_string(),
+                    "restrictive".to_string(),
+                    "readonly".to_string(),
+                    "planwrite".to_string(),
+                    "guarded".to_string(),
+                    "yolo".to_string(),
+                ]),
+            )
+        };
+        for mode in [
+            SecurityMode::Standard,
+            SecurityMode::Restrictive,
+            SecurityMode::Guarded,
+        ] {
+            assert_eq!(
+                new_checker(mode, PermissionConfig::default()).check(
+                    "js/fetch",
+                    "https://example.com/ destinations=[93.184.216.34:443]"
+                ),
+                CheckResult::Ask
+            );
+        }
+        for mode in [SecurityMode::ReadOnly, SecurityMode::PlanWrite] {
+            assert!(matches!(
+                new_checker(mode, PermissionConfig::default()).check(
+                    "js/fetch",
+                    "https://example.com/ destinations=[93.184.216.34:443]"
+                ),
+                CheckResult::Denied(_)
+            ));
+        }
+        assert_eq!(
+            new_checker(SecurityMode::Yolo, PermissionConfig::default()).check(
+                "js/fetch",
+                "https://example.com/ destinations=[93.184.216.34:443]"
+            ),
+            CheckResult::Allowed
+        );
+
+        let allow = PermissionConfig {
+            js_fetch: Some(ToolPerm::Simple(Action::Allow)),
+            ..PermissionConfig::default()
+        };
+        assert_eq!(
+            new_checker(SecurityMode::Standard, allow).check(
+                "js/fetch",
+                "https://example.com/ destinations=[93.184.216.34:443]"
+            ),
+            CheckResult::Allowed
+        );
+        let deny = PermissionConfig {
+            js_fetch: Some(ToolPerm::Simple(Action::Deny)),
+            ..PermissionConfig::default()
+        };
+        assert!(matches!(
+            new_checker(SecurityMode::Yolo, deny).check(
+                "js/fetch",
+                "https://example.com/ destinations=[93.184.216.34:443]"
+            ),
+            CheckResult::Denied(_)
+        ));
     }
 }

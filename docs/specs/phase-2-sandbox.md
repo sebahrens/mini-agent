@@ -71,16 +71,34 @@ have finite deadlines and cancellation.
 
 `fetch(url, opts?)` is registered only for the Phase 2 feature combination. It:
 
-1. parses and normalizes an absolute HTTP(S) URL;
-2. checks a configured URL allow-list as a narrowing policy;
-3. always obtains `js/fetch` permission for the normalized URL;
-4. applies a finite request deadline and cancellation; and
-5. returns `{status, text}` or a typed JS error.
+1. parses and normalizes one absolute URL with the same parser used by the transport;
+2. rejects credentials, fragments, ambiguous hosts, and schemes other than HTTPS (or HTTP when
+   `js-fetch-allow-http = true`);
+3. checks `js-fetch-origins` as an exact-origin narrowing policy when configured;
+4. resolves the host under a three-second deadline and rejects the whole answer set if any IPv4,
+   IPv6, or mapped address is loopback, private, link-local, multicast, unspecified, reserved,
+   documentation-only, transition-only, or metadata-capable;
+5. obtains `js/fetch` permission for the normalized URL and sorted exact socket-address set;
+6. binds the connection to that authorized resolution result; and
+7. returns `{status, text}` or a typed JS error.
 
-When an allow-list exists, an unmatched URL is rejected before I/O. Without an additional
-allow-list restriction, an unknown URL follows the normal permission policy: interactive `Ask`
-when available and fail-closed in non-interactive mode. Redirects are disabled or each target
-repeats normalization, allow-list, and permission checks before redirected I/O.
+`js-fetch-origins` entries contain only a scheme, host, and optional non-default port, for example
+`["https://docs.rs", "https://api.example.com:8443"]`. An empty or malformed configured list denies
+all fetches. When the setting is absent, the origin narrowing layer is unrestricted but the
+mandatory permission check remains. An unmatched `js/fetch` permission is `Ask` in interactive
+standard/guarded modes and fails closed without an approval channel. Read-only and plan-write
+modes deny it by default. Explicit `permission`, `permission-allow`, `permission-ask`, and
+`permission-deny` rules can target `js/fetch`.
+
+Options support `method` (`GET` or `POST`), a string-to-string `headers` object, and a UTF-8
+`body` for POST. Host, framing, proxy, credential, forwarding, and content-encoding headers are
+controlled by the host and cannot be supplied from JavaScript.
+
+Automatic redirects are disabled. Up to five redirects are followed manually, and every target
+repeats scheme, credential, origin, DNS/address, permission, and connection-binding checks before
+redirected I/O. This also prevents DNS answer changes between authorization and connect from
+rebinding an approved hostname to a denied address. Non-GET requests are never replayed after a
+redirect. A redirect cannot carry caller-supplied headers to a different origin.
 
 The blocking transport disables automatic redirects, ambient proxy discovery, connection pooling,
 and transparent response decompression. Its default connect and per-read timeouts are three

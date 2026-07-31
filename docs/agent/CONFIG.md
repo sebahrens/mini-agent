@@ -319,6 +319,8 @@ Accepted top-level keys:
 | `yolo`                    | boolean | Select yolo mode (allow all, ask for destructive bash commands).                                                                                                            |
 | `permission-modes`        | array   | List of mode names that apply config-based rules. Default: `["guarded", "standard", "yolo"]`. Modes excluded from this list skip config rule matching entirely.             |
 | `sandbox`                 | boolean | Run bash commands in the bubblewrap sandbox. Default: `false`.                                                                                                              |
+| `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
+| `js-fetch-allow-http`     | boolean | Permit public-address HTTP origins for JS `fetch()` in addition to HTTPS. Default: `false`. Private, loopback, link-local, metadata, multicast, and reserved destinations remain denied. |
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `guarded`, `yolo`.                                          |
 | `show_tool_details`       | boolean or integer | Show tool-result previews in the TUI. `false` hides output, `true` shows all lines, an integer limits to that many lines (e.g. `3`). Default: `3`. |
 | `show_reasoning`          | boolean | Show streamed reasoning text in the TUI. Can still be toggled at runtime with `Ctrl+R` or `/reasoning`. Default: `false`. |
@@ -805,8 +807,8 @@ Example:
 
 Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping patterns to actions. Supported
-permission tool keys are `bash`, `read`, `write`, `edit`, `grep`, `find_files`,
-`list_dir`, and `todo_write`. MCP-backed tools are checked under
+permission tool keys are `bash`, `js/fetch`, `read`, `write`, `edit`, `grep`,
+`find_files`, `list_dir`, and `todo_write`. MCP-backed tools are checked under
 `mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the default action,
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is

@@ -84,6 +84,63 @@ async fn test_return_value() {
 }
 
 #[tokio::test]
+async fn test_fetch_global_matches_sandbox_feature() {
+    use rig::tool::Tool;
+    let tool = make_test_tool();
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "typeof fetch".to_string(),
+        })
+        .await
+        .expect("call failed");
+    assert_eq!(
+        result,
+        if cfg!(feature = "sandbox") {
+            "function"
+        } else {
+            "undefined"
+        }
+    );
+}
+
+#[cfg(feature = "sandbox")]
+#[tokio::test]
+async fn test_fetch_options_fail_closed_before_network_io() {
+    use rig::tool::Tool;
+    let tool = make_test_tool();
+
+    for (code, expected) in [
+        (
+            "try { fetch('https://example.com', {method: 'DELETE'}); } catch (e) { String(e) }",
+            "method must be GET or POST",
+        ),
+        (
+            "try { fetch('https://example.com', {headers: {Host: 'evil'}}); } catch (e) { String(e) }",
+            "header 'host' is controlled by the host",
+        ),
+        (
+            "try { fetch('https://example.com', {unknown: true}); } catch (e) { String(e) }",
+            "unsupported field 'unknown'",
+        ),
+        (
+            "try { fetch('https://example.com', {method: 'POST', body: 'x'.repeat(262145)}); } catch (e) { String(e) }",
+            "request body exceeds the configured limit",
+        ),
+    ] {
+        let result = tool
+            .call(crate::extras::js::tool::JsArgs {
+                code: code.to_string(),
+            })
+            .await
+            .expect("call failed");
+        assert!(
+            result.contains(expected),
+            "expected {expected:?} in fetch error, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_read_write_roundtrip() {
     use rig::tool::Tool;
     let tool = make_test_tool();

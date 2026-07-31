@@ -2,6 +2,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "sandbox")]
+use rquickjs::prelude::Opt;
 use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -11,7 +13,9 @@ use reqwest::Url;
 #[cfg(feature = "sandbox")]
 use std::io::Read;
 #[cfg(feature = "sandbox")]
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(feature = "sandbox")]
+use std::sync::Arc;
 #[cfg(feature = "sandbox")]
 use std::time::Instant;
 
@@ -90,6 +94,8 @@ pub(crate) struct AllowConfig {
     base: PathBuf,
     read: PathPolicy,
     write: PathPolicy,
+    #[cfg(feature = "sandbox")]
+    fetch: FetchPolicy,
 }
 
 impl AllowConfig {
@@ -107,6 +113,8 @@ impl AllowConfig {
                 base: startup_base.to_path_buf(),
                 read: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Read)),
                 write: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Write)),
+                #[cfg(feature = "sandbox")]
+                fetch: FetchPolicy::default(),
             };
         };
 
@@ -114,6 +122,22 @@ impl AllowConfig {
             read: build_path_policy(&base, read_roots, read_unrestricted, FileAccess::Read),
             write: build_path_policy(&base, write_roots, write_unrestricted, FileAccess::Write),
             base,
+            #[cfg(feature = "sandbox")]
+            fetch: FetchPolicy::default(),
+        }
+    }
+
+    pub(crate) fn with_fetch_settings(self, origins: Option<&[String]>, allow_http: bool) -> Self {
+        #[cfg(feature = "sandbox")]
+        {
+            let mut configured = self;
+            configured.fetch = FetchPolicy::from_settings(origins, allow_http);
+            configured
+        }
+        #[cfg(not(feature = "sandbox"))]
+        {
+            let _ = (origins, allow_http);
+            self
         }
     }
 
@@ -365,6 +389,342 @@ impl<'js> IntoJs<'js> for SpawnResult {
 }
 
 #[cfg(feature = "sandbox")]
+const FETCH_DNS_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(feature = "sandbox")]
+const FETCH_MAX_REDIRECTS: usize = 5;
+#[cfg(feature = "sandbox")]
+const FETCH_MAX_DESTINATION_ADDRESSES: usize = 32;
+
+#[cfg(feature = "sandbox")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FetchOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+#[cfg(feature = "sandbox")]
+#[derive(Debug, Clone)]
+enum FetchOriginPolicy {
+    Unrestricted,
+    Exact(Vec<FetchOrigin>),
+    Deny,
+}
+
+#[cfg(feature = "sandbox")]
+#[derive(Debug, Clone)]
+struct FetchPolicy {
+    origins: FetchOriginPolicy,
+    allow_http: bool,
+}
+
+#[cfg(feature = "sandbox")]
+impl Default for FetchPolicy {
+    fn default() -> Self {
+        Self {
+            origins: FetchOriginPolicy::Unrestricted,
+            allow_http: false,
+        }
+    }
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchPolicy {
+    fn from_settings(origins: Option<&[String]>, allow_http: bool) -> Self {
+        let Some(origins) = origins else {
+            return Self {
+                allow_http,
+                ..Self::default()
+            };
+        };
+        if origins.is_empty() {
+            return Self {
+                origins: FetchOriginPolicy::Deny,
+                allow_http,
+            };
+        }
+        let parsed = origins
+            .iter()
+            .map(|origin| parse_configured_origin(origin, allow_http))
+            .collect::<Result<Vec<_>, _>>();
+        Self {
+            origins: parsed
+                .map(FetchOriginPolicy::Exact)
+                .unwrap_or(FetchOriginPolicy::Deny),
+            allow_http,
+        }
+    }
+
+    fn authorize(&self, raw_url: &str) -> Result<Url, FetchError> {
+        let url = normalize_fetch_url(raw_url, self.allow_http)?;
+        let origin = fetch_origin(&url)?;
+        match &self.origins {
+            FetchOriginPolicy::Unrestricted => Ok(url),
+            FetchOriginPolicy::Exact(origins) if origins.contains(&origin) => Ok(url),
+            FetchOriginPolicy::Exact(_) | FetchOriginPolicy::Deny => Err(FetchError::OriginDenied),
+        }
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn parse_configured_origin(raw: &str, allow_http: bool) -> Result<FetchOrigin, FetchError> {
+    let url = normalize_fetch_url(raw, allow_http)?;
+    if url.path() != "/" || url.query().is_some() {
+        return Err(FetchError::InvalidOrigin);
+    }
+    fetch_origin(&url)
+}
+
+#[cfg(feature = "sandbox")]
+fn normalize_fetch_url(raw: &str, allow_http: bool) -> Result<Url, FetchError> {
+    let mut url = Url::parse(raw).map_err(|_| FetchError::InvalidUrl)?;
+    match url.scheme() {
+        "https" => {}
+        "http" if allow_http => {}
+        _ => return Err(FetchError::SchemeDenied),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(FetchError::EmbeddedCredentials);
+    }
+    if url.fragment().is_some() {
+        return Err(FetchError::FragmentDenied);
+    }
+    let host = url.host_str().ok_or(FetchError::MissingHost)?;
+    if host.is_empty() || host.ends_with('.') {
+        return Err(FetchError::InvalidHost);
+    }
+    let port = url.port_or_known_default().ok_or(FetchError::MissingPort)?;
+    if url.port() == Some(port) && matches!((url.scheme(), port), ("https", 443) | ("http", 80)) {
+        url.set_port(None).map_err(|_| FetchError::InvalidUrl)?;
+    }
+    Ok(url)
+}
+
+#[cfg(feature = "sandbox")]
+fn fetch_origin(url: &Url) -> Result<FetchOrigin, FetchError> {
+    Ok(FetchOrigin {
+        scheme: url.scheme().to_string(),
+        host: url
+            .host_str()
+            .ok_or(FetchError::MissingHost)?
+            .to_ascii_lowercase(),
+        port: url.port_or_known_default().ok_or(FetchError::MissingPort)?,
+    })
+}
+
+#[cfg(feature = "sandbox")]
+trait FetchResolver: Send + Sync {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError>;
+}
+
+#[cfg(feature = "sandbox")]
+struct RuntimeFetchResolver {
+    runtime: tokio::runtime::Handle,
+    permission_bridge: PermissionBridge,
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchResolver for RuntimeFetchResolver {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError> {
+        if self.permission_bridge.is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+        if let Ok(address) = host.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(address, port)]);
+        }
+        let bridge = self.permission_bridge.clone();
+        self.runtime.block_on(async move {
+            tokio::select! {
+                result = tokio::time::timeout(
+                    FETCH_DNS_TIMEOUT,
+                    tokio::net::lookup_host((host, port)),
+                ) => {
+                    match result {
+                        Ok(Ok(addresses)) => {
+                            let addresses = addresses
+                                .take(FETCH_MAX_DESTINATION_ADDRESSES + 1)
+                                .collect::<Vec<_>>();
+                            if addresses.is_empty() {
+                                Err(FetchError::DnsResolutionFailed)
+                            } else {
+                                Ok(addresses)
+                            }
+                        }
+                        Ok(Err(_)) => Err(FetchError::DnsResolutionFailed),
+                        Err(_) => Err(FetchError::TimedOut),
+                    }
+                }
+                _ = bridge.cancelled() => Err(FetchError::Cancelled),
+            }
+        })
+    }
+}
+
+#[cfg(feature = "sandbox")]
+trait FetchSender: Send + Sync {
+    fn send(
+        &self,
+        url: Url,
+        request: &FetchRequest,
+        addresses: &[SocketAddr],
+        permission_bridge: &PermissionBridge,
+    ) -> Result<FetchTransportOutcome, FetchError>;
+}
+
+#[cfg(feature = "sandbox")]
+struct BoundFetchSender;
+
+#[cfg(feature = "sandbox")]
+impl FetchSender for BoundFetchSender {
+    fn send(
+        &self,
+        url: Url,
+        request: &FetchRequest,
+        addresses: &[SocketAddr],
+        permission_bridge: &PermissionBridge,
+    ) -> Result<FetchTransportOutcome, FetchError> {
+        let host = url.host_str().ok_or(FetchError::MissingHost)?;
+        let transport = FetchTransport::new(Some((host, addresses)))?;
+        transport.execute(url, request, || permission_bridge.is_cancelled())
+    }
+}
+
+#[cfg(feature = "sandbox")]
+struct FetchExecutor {
+    policy: FetchPolicy,
+    resolver: Arc<dyn FetchResolver>,
+    sender: Arc<dyn FetchSender>,
+    permission_bridge: PermissionBridge,
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchExecutor {
+    fn execute(&self, raw_url: &str, request: &FetchRequest) -> Result<FetchResult, FetchError> {
+        let mut current = raw_url.to_string();
+        for redirect_count in 0..=FETCH_MAX_REDIRECTS {
+            let url = self.policy.authorize(&current)?;
+            let host = url.host_str().ok_or(FetchError::MissingHost)?;
+            let port = url.port_or_known_default().ok_or(FetchError::MissingPort)?;
+            let mut addresses = self.resolver.resolve(host, port)?;
+            addresses.sort_unstable();
+            addresses.dedup();
+            validate_public_destinations(&addresses)?;
+
+            let permission_key = fetch_permission_key(&url, &addresses);
+            self.permission_bridge
+                .check("js/fetch", &permission_key)
+                .map_err(|error| FetchError::Permission(error.to_string()))?;
+
+            let origin = fetch_origin(&url)?;
+            match self
+                .sender
+                .send(url, request, &addresses, &self.permission_bridge)?
+            {
+                FetchTransportOutcome::Complete(result) => return Ok(result),
+                FetchTransportOutcome::Redirect(redirect) => {
+                    if redirect_count == FETCH_MAX_REDIRECTS {
+                        return Err(FetchError::TooManyRedirects);
+                    }
+                    let redirect = self.policy.authorize(redirect.as_str())?;
+                    if request.method != reqwest::Method::GET {
+                        return Err(FetchError::RedirectReplayDenied);
+                    }
+                    if !request.headers.is_empty() && origin != fetch_origin(&redirect)? {
+                        return Err(FetchError::CrossOriginRedirectDenied);
+                    }
+                    current = redirect.into();
+                }
+            }
+        }
+        Err(FetchError::TooManyRedirects)
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn fetch_permission_key(url: &Url, addresses: &[SocketAddr]) -> String {
+    let destinations = addresses
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{} destinations=[{destinations}]", url.as_str())
+}
+
+#[cfg(feature = "sandbox")]
+fn validate_public_destinations(addresses: &[SocketAddr]) -> Result<(), FetchError> {
+    if addresses.len() > FETCH_MAX_DESTINATION_ADDRESSES {
+        Err(FetchError::TooManyDestinations)
+    } else if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        Err(FetchError::DestinationDenied)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let value = u32::from(address);
+    ![
+        (0x0000_0000, 8),  // current network / unspecified
+        (0x0a00_0000, 8),  // RFC1918
+        (0x6440_0000, 10), // shared address space
+        (0x7f00_0000, 8),  // loopback
+        (0xa9fe_0000, 16), // link-local and metadata
+        (0xac10_0000, 12), // RFC1918
+        (0xc000_0000, 24), // IETF protocol assignments
+        (0xc000_0200, 24), // TEST-NET-1
+        (0xc058_6300, 24), // deprecated 6to4 relay anycast
+        (0xc0a8_0000, 16), // RFC1918
+        (0xc612_0000, 15), // benchmarking
+        (0xc633_6400, 24), // TEST-NET-2
+        (0xcb00_7100, 24), // TEST-NET-3
+        (0xe000_0000, 4),  // multicast
+        (0xf000_0000, 4),  // reserved and limited broadcast
+    ]
+    .into_iter()
+    .any(|(network, prefix)| ipv4_in_prefix(value, network, prefix))
+}
+
+#[cfg(feature = "sandbox")]
+fn ipv4_in_prefix(address: u32, network: u32, prefix: u8) -> bool {
+    let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
+    address & mask == network & mask
+}
+
+#[cfg(feature = "sandbox")]
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    let value = u128::from(address);
+    if !ipv6_in_prefix(value, 0x2000_u128 << 112, 3) {
+        return false;
+    }
+    ![
+        (0x2001_u128 << 112, 23),     // IETF special-use
+        (0x2001_0db8_u128 << 96, 32), // documentation
+        (0x2002_u128 << 112, 16),     // 6to4 transition addresses
+        (0x3fff_u128 << 112, 20),     // documentation
+    ]
+    .into_iter()
+    .any(|(network, prefix)| ipv6_in_prefix(value, network, prefix))
+}
+
+#[cfg(feature = "sandbox")]
+fn ipv6_in_prefix(address: u128, network: u128, prefix: u8) -> bool {
+    let mask = u128::MAX.checked_shl(u32::from(128 - prefix)).unwrap_or(0);
+    address & mask == network & mask
+}
+
+#[cfg(feature = "sandbox")]
 const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "sandbox")]
 const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(3);
@@ -417,11 +777,134 @@ impl FetchRequest {
             body: None,
         }
     }
+
+    fn from_options(options: Option<&Object<'_>>) -> Result<Self, FetchError> {
+        let Some(options) = options else {
+            return Ok(Self::get());
+        };
+        for key in options.keys::<String>() {
+            let key = key.map_err(|error| FetchError::InvalidOptions(error.to_string()))?;
+            if !matches!(key.as_str(), "method" | "headers" | "body") {
+                return Err(FetchError::InvalidOptions(format!(
+                    "unsupported field '{key}'"
+                )));
+            }
+        }
+
+        let method = options
+            .get::<_, Option<String>>("method")
+            .map_err(|error| FetchError::InvalidOptions(error.to_string()))?
+            .unwrap_or_else(|| "GET".to_string())
+            .to_ascii_uppercase();
+        let method = match method.as_str() {
+            "GET" => reqwest::Method::GET,
+            "POST" => reqwest::Method::POST,
+            _ => {
+                return Err(FetchError::InvalidOptions(
+                    "method must be GET or POST".to_string(),
+                ));
+            }
+        };
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(object) = options
+            .get::<_, Option<Object<'_>>>("headers")
+            .map_err(|error| FetchError::InvalidOptions(error.to_string()))?
+        {
+            for property in object.props::<String, String>() {
+                let (name, value) =
+                    property.map_err(|error| FetchError::InvalidOptions(error.to_string()))?;
+                let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| FetchError::InvalidOptions("invalid header name".to_string()))?;
+                if is_forbidden_fetch_header(&name) {
+                    return Err(FetchError::InvalidOptions(format!(
+                        "header '{}' is controlled by the host",
+                        name.as_str()
+                    )));
+                }
+                let value = reqwest::header::HeaderValue::from_str(&value)
+                    .map_err(|_| FetchError::InvalidOptions("invalid header value".to_string()))?;
+                headers.append(name, value);
+            }
+        }
+
+        let body = options
+            .get::<_, Option<String>>("body")
+            .map_err(|error| FetchError::InvalidOptions(error.to_string()))?
+            .map(String::into_bytes);
+        if method == reqwest::Method::GET && body.is_some() {
+            return Err(FetchError::InvalidOptions(
+                "GET requests cannot have a body".to_string(),
+            ));
+        }
+        validate_header_limits(
+            &headers,
+            FETCH_REQUEST_HEADER_MAX_COUNT,
+            FETCH_REQUEST_HEADER_MAX_BYTES,
+            FetchError::RequestHeadersTooLarge,
+        )?;
+        if body
+            .as_ref()
+            .is_some_and(|body| body.len() > FETCH_REQUEST_BODY_MAX_BYTES)
+        {
+            return Err(FetchError::RequestBodyTooLarge);
+        }
+
+        Ok(Self {
+            method,
+            headers,
+            body,
+        })
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn is_forbidden_fetch_header(name: &reqwest::header::HeaderName) -> bool {
+    let name = name.as_str();
+    matches!(
+        name,
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "authorization"
+            | "cookie"
+            | "forwarded"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+            | "x-real-ip"
+            | "via"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "accept-encoding"
+    ) || name.starts_with("proxy-")
+        || name.starts_with("sec-")
 }
 
 #[cfg(feature = "sandbox")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FetchError {
+    InvalidUrl,
+    SchemeDenied,
+    EmbeddedCredentials,
+    FragmentDenied,
+    MissingHost,
+    InvalidHost,
+    MissingPort,
+    InvalidOrigin,
+    OriginDenied,
+    DnsResolutionFailed,
+    DestinationDenied,
+    TooManyDestinations,
+    Permission(String),
+    TooManyRedirects,
+    RedirectReplayDenied,
+    CrossOriginRedirectDenied,
+    InvalidOptions(String),
     ClientBuild(String),
     Cancelled,
     TimedOut,
@@ -439,6 +922,37 @@ pub(crate) enum FetchError {
 impl std::fmt::Display for FetchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidUrl => formatter.write_str("fetch URL is invalid or ambiguous"),
+            Self::SchemeDenied => formatter.write_str("fetch URL scheme is not allowed"),
+            Self::EmbeddedCredentials => {
+                formatter.write_str("fetch URL must not contain embedded credentials")
+            }
+            Self::FragmentDenied => formatter.write_str("fetch URL fragments are not supported"),
+            Self::MissingHost => formatter.write_str("fetch URL has no host"),
+            Self::InvalidHost => formatter.write_str("fetch URL host is invalid or ambiguous"),
+            Self::MissingPort => formatter.write_str("fetch URL has no effective port"),
+            Self::InvalidOrigin => {
+                formatter.write_str("fetch origin configuration must contain only an origin")
+            }
+            Self::OriginDenied => {
+                formatter.write_str("fetch URL origin is not allowed by configuration")
+            }
+            Self::DnsResolutionFailed => formatter.write_str("fetch DNS resolution failed"),
+            Self::DestinationDenied => {
+                formatter.write_str("fetch destination is not a public network address")
+            }
+            Self::TooManyDestinations => {
+                formatter.write_str("fetch DNS answer exceeds the destination address limit")
+            }
+            Self::Permission(error) => write!(formatter, "fetch permission denied: {error}"),
+            Self::TooManyRedirects => formatter.write_str("fetch redirect limit exceeded"),
+            Self::RedirectReplayDenied => {
+                formatter.write_str("fetch refuses to replay a non-GET request after a redirect")
+            }
+            Self::CrossOriginRedirectDenied => formatter.write_str(
+                "fetch refuses to forward caller headers across an origin-changing redirect",
+            ),
+            Self::InvalidOptions(message) => write!(formatter, "invalid fetch options: {message}"),
             Self::ClientBuild(message) => write!(formatter, "fetch client setup failed: {message}"),
             Self::Cancelled => formatter.write_str("fetch cancelled"),
             Self::TimedOut => formatter.write_str("fetch timed out"),
@@ -592,7 +1106,7 @@ impl FetchTransport {
         )?;
         reject_encoded_response(response.headers())?;
 
-        if response.status().is_redirection() {
+        if is_followable_redirect(response.status()) {
             let location = response
                 .headers()
                 .get(reqwest::header::LOCATION)
@@ -639,6 +1153,18 @@ impl FetchTransport {
             text,
         }))
     }
+}
+
+#[cfg(feature = "sandbox")]
+fn is_followable_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::MOVED_PERMANENTLY
+            | reqwest::StatusCode::FOUND
+            | reqwest::StatusCode::SEE_OTHER
+            | reqwest::StatusCode::TEMPORARY_REDIRECT
+            | reqwest::StatusCode::PERMANENT_REDIRECT
+    )
 }
 
 #[cfg(feature = "sandbox")]
@@ -1065,6 +1591,33 @@ pub(crate) fn make_write_file(
     }
 }
 
+#[cfg(feature = "sandbox")]
+fn make_fetch(
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+    policy: FetchPolicy,
+) -> impl for<'js> Fn(String, Opt<Object<'js>>) -> rquickjs::Result<FetchResult> {
+    let resolver = Arc::new(RuntimeFetchResolver {
+        runtime,
+        permission_bridge: permission_bridge.clone(),
+    });
+    let executor = Arc::new(FetchExecutor {
+        policy,
+        resolver,
+        sender: Arc::new(BoundFetchSender),
+        permission_bridge,
+    });
+    move |url: String, options: Opt<Object<'_>>| {
+        let request = FetchRequest::from_options(options.0.as_ref()).map_err(fetch_host_error)?;
+        executor.execute(&url, &request).map_err(fetch_host_error)
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn fetch_host_error(error: FetchError) -> rquickjs::Error {
+    rquickjs::Error::new_from_js_message("network policy", "js/fetch", error.to_string())
+}
+
 pub(crate) fn make_spawn(
     sandbox: Sandbox,
     permission_bridge: PermissionBridge,
@@ -1163,7 +1716,16 @@ pub(crate) fn register_host_globals(
             Func::from(make_write_file(
                 permission_bridge.clone(),
                 runtime.clone(),
-                allow_config,
+                allow_config.clone(),
+            )),
+        )?;
+        #[cfg(feature = "sandbox")]
+        globals.set(
+            "fetch",
+            Func::from(make_fetch(
+                permission_bridge.clone(),
+                runtime.clone(),
+                allow_config.fetch,
             )),
         )?;
         globals.set(
@@ -1316,6 +1878,35 @@ mod tests {
 
     #[cfg(feature = "sandbox")]
     #[test]
+    fn js_fetch_transport_binds_the_authorized_resolution_without_dns() {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nbound",
+                )
+                .unwrap();
+        });
+        let url = Url::parse(&format!("http://public.invalid:{}/", address.port())).unwrap();
+        let transport = FetchTransport::new(Some(("public.invalid", &[address]))).unwrap();
+
+        assert_eq!(
+            transport.execute(url, &FetchRequest::get(), || false),
+            Ok(FetchTransportOutcome::Complete(FetchResult {
+                status: 200,
+                text: "bound".to_string(),
+            }))
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
     fn js_fetch_transport_hands_redirect_to_authorization_layer() {
         use std::io::Write as _;
 
@@ -1336,6 +1927,25 @@ mod tests {
 
         assert_eq!(result, FetchTransportOutcome::Redirect(expected));
         server.join().unwrap();
+
+        let (not_modified_url, not_modified_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            transport
+                .execute(not_modified_url, &FetchRequest::get(), || false)
+                .unwrap(),
+            FetchTransportOutcome::Complete(FetchResult {
+                status: 304,
+                text: String::new(),
+            })
+        );
+        not_modified_server.join().unwrap();
     }
 
     #[cfg(feature = "sandbox")]
@@ -1558,6 +2168,538 @@ mod tests {
             Err(FetchError::Cancelled)
         );
         cancel_server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[derive(Default)]
+    struct FakeFetchResolver {
+        responses: Mutex<std::collections::VecDeque<Result<Vec<SocketAddr>, FetchError>>>,
+    }
+
+    #[cfg(feature = "sandbox")]
+    impl FakeFetchResolver {
+        fn new(responses: Vec<Result<Vec<SocketAddr>, FetchError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    impl FetchResolver for FakeFetchResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, FetchError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake resolver response exhausted")
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[derive(Default)]
+    struct FakeFetchSender {
+        responses: Mutex<std::collections::VecDeque<Result<FetchTransportOutcome, FetchError>>>,
+        calls: Mutex<Vec<(Url, Vec<SocketAddr>)>>,
+    }
+
+    #[cfg(feature = "sandbox")]
+    impl FakeFetchSender {
+        fn new(responses: Vec<Result<FetchTransportOutcome, FetchError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    impl FetchSender for FakeFetchSender {
+        fn send(
+            &self,
+            url: Url,
+            _request: &FetchRequest,
+            addresses: &[SocketAddr],
+            _permission_bridge: &PermissionBridge,
+        ) -> Result<FetchTransportOutcome, FetchError> {
+            self.calls.lock().unwrap().push((url, addresses.to_vec()));
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake sender response exhausted")
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    fn fetch_permission(action: Action) -> PermCheck {
+        let config = PermissionConfig {
+            js_fetch: Some(ToolPerm::Simple(action)),
+            doom_loop: Some(Action::Allow),
+            ..PermissionConfig::default()
+        };
+        Arc::new(Mutex::new(PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(std::env::current_dir().unwrap()),
+            Some(vec!["standard".to_string()]),
+        )))
+    }
+
+    #[cfg(feature = "sandbox")]
+    fn public_address() -> SocketAddr {
+        "93.184.216.34:443".parse().unwrap()
+    }
+
+    #[cfg(feature = "sandbox")]
+    fn completed_fetch() -> FetchTransportOutcome {
+        FetchTransportOutcome::Complete(FetchResult {
+            status: 200,
+            text: "ok".to_string(),
+        })
+    }
+
+    #[cfg(feature = "sandbox")]
+    async fn run_fake_fetch(
+        policy: FetchPolicy,
+        resolution: Vec<Result<Vec<SocketAddr>, FetchError>>,
+        responses: Vec<Result<FetchTransportOutcome, FetchError>>,
+        permission: PermCheck,
+        ask_tx: Option<AskSender>,
+        permission_timeout: Duration,
+        raw_url: &str,
+    ) -> (Result<FetchResult, FetchError>, Arc<FakeFetchSender>) {
+        run_fake_fetch_request(
+            policy,
+            resolution,
+            responses,
+            permission,
+            ask_tx,
+            permission_timeout,
+            raw_url,
+            FetchRequest::get(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[allow(clippy::too_many_arguments)]
+    async fn run_fake_fetch_request(
+        policy: FetchPolicy,
+        resolution: Vec<Result<Vec<SocketAddr>, FetchError>>,
+        responses: Vec<Result<FetchTransportOutcome, FetchError>>,
+        permission: PermCheck,
+        ask_tx: Option<AskSender>,
+        permission_timeout: Duration,
+        raw_url: &str,
+        request: FetchRequest,
+    ) -> (Result<FetchResult, FetchError>, Arc<FakeFetchSender>) {
+        let owner = PermissionBridgeOwner::new(Some(permission), ask_tx, permission_timeout);
+        let sender = Arc::new(FakeFetchSender::new(responses));
+        let executor = FetchExecutor {
+            policy,
+            resolver: Arc::new(FakeFetchResolver::new(resolution)),
+            sender: sender.clone(),
+            permission_bridge: owner.bridge(),
+        };
+        let raw_url = raw_url.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            executor.execute(&raw_url, &request)
+        })
+        .await
+        .expect("fake fetch task panicked");
+        (result, sender)
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_ssrf_policy_rejects_special_ip_classes_and_mapped_forms() {
+        for address in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.100.100.200",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.0.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::a00:1",
+            "3fff::1",
+            "5f00::1",
+        ] {
+            assert!(
+                !is_public_ip(address.parse().unwrap()),
+                "{address} must be denied"
+            );
+        }
+        for address in ["8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"] {
+            assert!(
+                is_public_ip(address.parse().unwrap()),
+                "{address} should be public"
+            );
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_ssrf_policy_normalizes_origins_and_rejects_ambiguous_urls() {
+        let origins = vec!["https://example.com".to_string()];
+        let policy = FetchPolicy::from_settings(Some(&origins), false);
+        assert_eq!(
+            policy.authorize("https://EXAMPLE.com:443/a?b=1").unwrap(),
+            Url::parse("https://example.com/a?b=1").unwrap()
+        );
+        assert_eq!(
+            policy.authorize("https://example.com.evil/a"),
+            Err(FetchError::OriginDenied)
+        );
+        assert_eq!(
+            policy.authorize("http://example.com/a"),
+            Err(FetchError::SchemeDenied)
+        );
+        assert_eq!(
+            policy.authorize("ftp://example.com/a"),
+            Err(FetchError::SchemeDenied)
+        );
+        assert_eq!(
+            policy.authorize("https://user:secret@example.com/a"),
+            Err(FetchError::EmbeddedCredentials)
+        );
+        assert_eq!(
+            policy.authorize("https://example.com/a#fragment"),
+            Err(FetchError::FragmentDenied)
+        );
+        assert_eq!(
+            policy.authorize("https://example.com./a"),
+            Err(FetchError::InvalidHost)
+        );
+
+        let http_origins = vec!["http://example.com:8080".to_string()];
+        let http_policy = FetchPolicy::from_settings(Some(&http_origins), true);
+        assert!(http_policy.authorize("http://example.com:8080/a").is_ok());
+        assert_eq!(
+            http_policy.authorize("http://example.com/a"),
+            Err(FetchError::OriginDenied)
+        );
+        assert_eq!(
+            normalize_fetch_url("http://2130706433/", true)
+                .unwrap()
+                .host_str(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_ssrf_policy_denies_private_mixed_permission_and_rebinding_before_io() {
+        let policy = FetchPolicy::from_settings(None, false);
+        let private = "127.0.0.1:443".parse().unwrap();
+        let (result, sender) = run_fake_fetch(
+            policy.clone(),
+            vec![Ok(vec![private])],
+            vec![Ok(completed_fetch())],
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::DestinationDenied));
+        assert_eq!(sender.call_count(), 0);
+
+        let excessive_addresses = (1..=FETCH_MAX_DESTINATION_ADDRESSES + 1)
+            .map(|last| {
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, u8::try_from(last).unwrap())),
+                    443,
+                )
+            })
+            .collect();
+        let (result, sender) = run_fake_fetch(
+            policy.clone(),
+            vec![Ok(excessive_addresses)],
+            vec![Ok(completed_fetch())],
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::TooManyDestinations));
+        assert_eq!(sender.call_count(), 0);
+
+        let (result, sender) = run_fake_fetch(
+            policy.clone(),
+            vec![Ok(vec![public_address(), private])],
+            vec![Ok(completed_fetch())],
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::DestinationDenied));
+        assert_eq!(sender.call_count(), 0);
+
+        let (result, sender) = run_fake_fetch(
+            policy.clone(),
+            vec![Ok(vec![public_address()])],
+            vec![Ok(completed_fetch())],
+            fetch_permission(Action::Deny),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert!(matches!(result, Err(FetchError::Permission(_))));
+        assert_eq!(sender.call_count(), 0);
+
+        let redirect = Url::parse("https://example.com/again").unwrap();
+        let (result, sender) = run_fake_fetch(
+            policy,
+            vec![Ok(vec![public_address()]), Ok(vec![private])],
+            vec![Ok(FetchTransportOutcome::Redirect(redirect))],
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::DestinationDenied));
+        assert_eq!(sender.call_count(), 1);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_ssrf_policy_reauthorizes_redirects_and_caps_loops() {
+        let redirect = Url::parse("https://example.com/next").unwrap();
+        let (result, sender) = run_fake_fetch(
+            FetchPolicy::from_settings(None, false),
+            vec![Ok(vec![public_address()]), Ok(vec![public_address()])],
+            vec![
+                Ok(FetchTransportOutcome::Redirect(redirect)),
+                Ok(completed_fetch()),
+            ],
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/start",
+        )
+        .await;
+        assert_eq!(
+            result,
+            Ok(FetchResult {
+                status: 200,
+                text: "ok".to_string()
+            })
+        );
+        assert_eq!(sender.call_count(), 2);
+
+        let resolutions = (0..=FETCH_MAX_REDIRECTS)
+            .map(|_| Ok(vec![public_address()]))
+            .collect();
+        let responses = (0..=FETCH_MAX_REDIRECTS)
+            .map(|_| {
+                Ok(FetchTransportOutcome::Redirect(
+                    Url::parse("https://example.com/loop").unwrap(),
+                ))
+            })
+            .collect();
+        let (result, sender) = run_fake_fetch(
+            FetchPolicy::from_settings(None, false),
+            resolutions,
+            responses,
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/loop",
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::TooManyRedirects));
+        assert_eq!(sender.call_count(), FETCH_MAX_REDIRECTS + 1);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_ssrf_policy_does_not_replay_posts_or_leak_headers_across_origins() {
+        let mut post = FetchRequest::get();
+        post.method = reqwest::Method::POST;
+        post.body = Some(b"mutation".to_vec());
+        let (result, sender) = run_fake_fetch_request(
+            FetchPolicy::from_settings(None, false),
+            vec![Ok(vec![public_address()])],
+            vec![Ok(FetchTransportOutcome::Redirect(
+                Url::parse("https://example.com/after-post").unwrap(),
+            ))],
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/start",
+            post,
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::RedirectReplayDenied));
+        assert_eq!(sender.call_count(), 1);
+
+        let mut request = FetchRequest::get();
+        request.headers.insert(
+            reqwest::header::HeaderName::from_static("x-api-key"),
+            reqwest::header::HeaderValue::from_static("secret"),
+        );
+        let (result, sender) = run_fake_fetch_request(
+            FetchPolicy::from_settings(None, false),
+            vec![Ok(vec![public_address()])],
+            vec![Ok(FetchTransportOutcome::Redirect(
+                Url::parse("https://other.example/steal").unwrap(),
+            ))],
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/start",
+            request,
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::CrossOriginRedirectDenied));
+        assert_eq!(
+            sender.call_count(),
+            1,
+            "redirect target must not reach DNS, permission, or transport"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_ssrf_policy_handles_allow_ask_timeout_and_channel_closure() {
+        let policy = FetchPolicy::from_settings(None, false);
+        let (result, sender) = run_fake_fetch(
+            policy.clone(),
+            vec![Ok(vec![public_address()])],
+            vec![Ok(completed_fetch())],
+            fetch_permission(Action::Allow),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(sender.call_count(), 1);
+
+        let (result, sender) = run_fake_fetch(
+            policy.clone(),
+            vec![Ok(vec![public_address()])],
+            vec![Ok(completed_fetch())],
+            fetch_permission(Action::Ask),
+            None,
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert!(matches!(result, Err(FetchError::Permission(_))));
+        assert_eq!(sender.call_count(), 0);
+
+        let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(1);
+        let (result, sender) = run_fake_fetch(
+            policy.clone(),
+            vec![Ok(vec![public_address()])],
+            vec![Ok(completed_fetch())],
+            fetch_permission(Action::Ask),
+            Some(ask_tx),
+            Duration::from_millis(30),
+            "https://example.com/",
+        )
+        .await;
+        drop(ask_rx);
+        assert!(matches!(
+            result,
+            Err(FetchError::Permission(ref message)) if message.contains("timed out")
+        ));
+        assert_eq!(sender.call_count(), 0);
+
+        let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(1);
+        drop(ask_rx);
+        let (result, sender) = run_fake_fetch(
+            policy,
+            vec![Ok(vec![public_address()])],
+            vec![Ok(completed_fetch())],
+            fetch_permission(Action::Ask),
+            Some(ask_tx),
+            STEP_TIMEOUT,
+            "https://example.com/",
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FetchError::Permission(ref message))
+                if message.to_ascii_lowercase().contains("channel")
+        ));
+        assert_eq!(sender.call_count(), 0);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_ssrf_policy_permission_key_contains_normalized_url_and_destinations() {
+        let owner = PermissionBridgeOwner::new(
+            Some(fetch_permission(Action::Ask)),
+            {
+                let (ask_tx, mut ask_rx) =
+                    tokio::sync::mpsc::channel::<crate::permission::ask::AskRequest>(1);
+                let approval = tokio::spawn(async move {
+                    let request = ask_rx.recv().await.expect("fetch should ask permission");
+                    assert_eq!(request.tool.as_str(), "js/fetch");
+                    assert_eq!(
+                        request.input.as_str(),
+                        "https://example.com/path destinations=[93.184.216.34:443]"
+                    );
+                    request
+                        .reply
+                        .send(UserDecision::AllowOnce)
+                        .expect("fetch approval receiver dropped");
+                });
+                std::mem::drop(approval);
+                Some(ask_tx)
+            },
+            STEP_TIMEOUT,
+        );
+        let sender = Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())]));
+        let executor = FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: sender.clone(),
+            permission_bridge: owner.bridge(),
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            executor.execute("https://EXAMPLE.com:443/path", &FetchRequest::get())
+        })
+        .await
+        .expect("fake fetch task panicked");
+
+        assert_eq!(
+            result,
+            Ok(FetchResult {
+                status: 200,
+                text: "ok".to_string()
+            })
+        );
+        assert_eq!(sender.call_count(), 1);
     }
 
     fn expect_allowed(decision: AuthorizationDecision) -> PathBuf {
