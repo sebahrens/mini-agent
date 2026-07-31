@@ -83,6 +83,45 @@ by whole-tree digest below `<data-dir>/agent-skills/<name>/<digest>/`.
 `allowed-tools` is retained as non-authoritative metadata and grants no tool
 permission.
 
+## Skill embeddings
+
+The skill library ranks skills against your prompt using embedding vectors. The
+`[embedding]` section selects where those vectors come from.
+
+```toml
+[embedding]
+backend = "external"                      # deterministic | external | local
+base_url = "https://api.openai.com/v1"    # API root, not the full endpoint
+model = "text-embedding-3-small"
+api_key_env = "OPENAI_API_KEY"            # variable name, never the key itself
+dimensions = 1536
+timeout_secs = 30                         # optional, default 30
+# model_revision = "2026-01-snapshot"     # optional; defaults to `model`
+
+[embedding.headers]                       # optional extra request headers
+X-Organization = "acme"
+```
+
+| Backend | Requires | Notes |
+|---------|----------|-------|
+| `deterministic` (default) | nothing | Offline hash projection. Builds and runs everywhere with no download and no network. Vectors are stable and well-formed but carry **no semantic meaning**, so retrieval quality is not comparable to a real model. |
+| `external` | `base_url`, `model`, `api_key_env`, `dimensions` | Any OpenAI-compatible `/embeddings` endpoint. The practical choice for real embeddings without a local model. |
+| `local` | the `skills-embed` build feature | Local ONNX inference of `BAAI/bge-small-en-v1.5` via `fastembed`. This feature does not compile on every host — notably `x86_64-apple-darwin`, for which `ort-sys` ships no prebuilt binaries. |
+
+The API key is read from the environment variable named by `api_key_env`. It is
+never written to config, never included in an error message, and redacted from
+debug output; endpoint URLs are stripped from error text so a key passed as a
+query parameter cannot reach a log.
+
+`dimensions` is mandatory for `external` because stored vectors are keyed by
+`(model_id, model_revision)` and a differently sized vector must be rejected
+rather than silently mixed into an existing index generation. Change
+`model_revision` when the upstream model changes so existing vectors become
+ineligible instead of being compared against incompatible new ones.
+
+Selecting `local` without the `skills-embed` feature is a startup error rather
+than a silent downgrade to `deterministic`.
+
 ## Config-file privacy
 
 The global config can contain plaintext API keys, authorization headers, and
