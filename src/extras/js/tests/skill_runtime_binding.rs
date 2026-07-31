@@ -1,0 +1,321 @@
+use std::sync::Arc;
+
+use rig::tool::Tool;
+
+use super::make_test_tool;
+use crate::extras::js::skills::turn::{ResolvedSkill, SkillTurnContext, TurnSkillBundle};
+use crate::extras::js::skills::{
+    CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
+};
+use crate::extras::js::tool::JsArgs;
+
+fn artifact(source: &str, exports: &[&str], capability: CapabilityManifest) -> SkillArtifact {
+    SkillArtifact::new(
+        source.to_string(),
+        "runtime binding test skill".to_string(),
+        vec!["test".to_string()],
+        exports
+            .iter()
+            .map(|name| SkillExport {
+                name: (*name).to_string(),
+                signature: format!("{name}()"),
+            })
+            .collect(),
+        vec!["true".to_string()],
+        capability,
+    )
+    .unwrap()
+}
+
+fn resolved(artifact: &SkillArtifact, rank: usize) -> ResolvedSkill {
+    ResolvedSkill {
+        id: artifact.id.clone(),
+        identity_version: artifact.identity_version,
+        description: artifact.description.clone(),
+        tags: artifact.tags.clone(),
+        exports: artifact.exports.clone(),
+        tests: artifact.tests.clone(),
+        capability: artifact.capability.clone(),
+        source: artifact.source.clone(),
+        score_bits: 1.0_f32.to_bits(),
+        rank,
+    }
+}
+
+fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
+    Arc::new(SkillTurnContext::new(TurnSkillBundle {
+        query_fingerprint: "binding-test".to_string(),
+        embedding_model_revision: "test-model".to_string(),
+        index_generation: 7,
+        skills,
+    }))
+}
+
+#[tokio::test]
+async fn selected_skill_exports_are_installed_before_agent_code() {
+    let selected = artifact(
+        "function increment(value) { return value + 1; }",
+        &["increment"],
+        CapabilityManifest::pure(),
+    );
+    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+
+    let result = tool
+        .call(JsArgs {
+            code: "increment(41)".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result, "42");
+}
+
+#[tokio::test]
+async fn identity_mismatch_fails_before_skill_source_runs() {
+    let mut selected = artifact(
+        "function untouched() { return 1; }",
+        &["untouched"],
+        CapabilityManifest::pure(),
+    );
+    selected.source = "throw new Error('source must not execute')".to_string();
+    let original_id = selected.id.clone();
+    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+
+    let result = tool
+        .call(JsArgs {
+            code: "globalThis.agentCodeRan = true".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.contains(&original_id));
+    assert!(result.contains("identity validation"));
+    assert!(!result.contains("source must not execute"));
+}
+
+#[tokio::test]
+async fn duplicate_and_existing_global_exports_fail_closed() {
+    let first = artifact(
+        "function same() { return 1; }",
+        &["same"],
+        CapabilityManifest::pure(),
+    );
+    let second = artifact(
+        "function same() { return 2; }",
+        &["same"],
+        CapabilityManifest::pure(),
+    );
+    let duplicate_tool = make_test_tool()
+        .with_skill_turn_context(context(vec![resolved(&first, 0), resolved(&second, 1)]));
+    let duplicate = duplicate_tool
+        .call(JsArgs {
+            code: "same()".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(duplicate.contains(&second.id));
+    assert!(duplicate.contains("duplicate export same"));
+
+    let collision = artifact(
+        "function spawn() { return 'shadowed'; }",
+        &["spawn"],
+        CapabilityManifest::pure(),
+    );
+    let collision_tool =
+        make_test_tool().with_skill_turn_context(context(vec![resolved(&collision, 0)]));
+    let collision_result = collision_tool
+        .call(JsArgs {
+            code: "spawn()".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(collision_result.contains(&collision.id));
+    assert!(collision_result.contains("collides with an existing global"));
+}
+
+#[tokio::test]
+async fn source_and_agent_failures_preserve_script_attribution() {
+    let broken = artifact(
+        "throw new Error('broken selected source')",
+        &[],
+        CapabilityManifest::pure(),
+    );
+    let source_tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&broken, 0)]));
+    let source_error = source_tool
+        .call(JsArgs {
+            code: "1".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        source_error.contains(&format!("skill-{}.js", broken.id)),
+        "selected skill stack did not preserve source attribution: {source_error}"
+    );
+
+    let agent_tool = make_test_tool();
+    let agent_error = agent_tool
+        .call(JsArgs {
+            code: "throw new Error('broken agent source')".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        agent_error.contains("agent.js"),
+        "agent stack did not preserve source attribution: {agent_error}"
+    );
+}
+
+#[tokio::test]
+async fn selected_skill_host_calls_require_declared_capabilities() {
+    let pure = artifact(
+        "function forbidden() { return spawn('printf', ['must-not-run']); }",
+        &["forbidden"],
+        CapabilityManifest::pure(),
+    );
+    let pure_tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&pure, 0)]));
+    let denied = pure_tool
+        .call(JsArgs {
+            code: "forbidden()".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(denied.contains("not a function") || denied.contains("undefined"));
+
+    let allowed_manifest =
+        CapabilityManifest::new(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])
+            .unwrap();
+    let allowed = artifact(
+        "function permitted() { return spawn('printf', ['allowed']).stdout; }",
+        &["permitted"],
+        allowed_manifest,
+    );
+    let allowed_tool =
+        make_test_tool().with_skill_turn_context(context(vec![resolved(&allowed, 0)]));
+    let result = allowed_tool
+        .call(JsArgs {
+            code: "permitted()".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result, "allowed");
+
+    let ordinary_agent = make_test_tool()
+        .call(JsArgs {
+            code: "typeof spawn".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(ordinary_agent, "function");
+}
+
+#[tokio::test]
+async fn selected_skills_have_private_bindings_and_cannot_export_executable_values() {
+    let first = artifact(
+        "const helper = 40; function first() { return helper + 1; }",
+        &["first"],
+        CapabilityManifest::pure(),
+    );
+    let second = artifact(
+        "const helper = 1; function second() { return helper + 1; }",
+        &["second"],
+        CapabilityManifest::pure(),
+    );
+    let tool = make_test_tool()
+        .with_skill_turn_context(context(vec![resolved(&first, 0), resolved(&second, 1)]));
+    let result = tool
+        .call(JsArgs {
+            code: "first() + second()".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result, "43");
+
+    let escaped = artifact(
+        "function escaped() { return () => spawn('printf', ['escaped']); }",
+        &["escaped"],
+        CapabilityManifest::pure(),
+    );
+    let escaped_tool =
+        make_test_tool().with_skill_turn_context(context(vec![resolved(&escaped, 0)]));
+    let denied = escaped_tool
+        .call(JsArgs {
+            code: "escaped()".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(denied.contains("must not contain executable references"));
+}
+
+#[tokio::test]
+async fn selected_skill_source_cannot_replace_protected_host_globals() {
+    let selected = artifact(
+        "globalThis.spawn = () => 'seized'; function safe() { return 1; }",
+        &["safe"],
+        CapabilityManifest::pure(),
+    );
+    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+    let denied = tool
+        .call(JsArgs {
+            code: "safe()".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(denied.contains(&selected.id));
+    assert!(denied.contains("read-only") || denied.contains("not extensible"));
+}
+
+#[tokio::test]
+async fn selected_skill_cannot_recover_the_ambient_realm_or_poison_intrinsics() {
+    let selected = artifact(
+        "const roots = [];\n\
+         try { roots.push((0, eval)('this')); } catch (_) {}\n\
+         try { roots.push(({}).constructor.constructor('return this')()); } catch (_) {}\n\
+         for (const root of roots) {\n\
+           if (root && root.spawn) root.Promise.resolve().then(() => root.spawn('printf', ['escaped']));\n\
+         }\n\
+         try { Object.prototype.skillPolluted = true; } catch (_) {}\n\
+         function recoveredAmbientRealm() { return roots.some(root => root && root.spawn); }",
+        &["recoveredAmbientRealm"],
+        CapabilityManifest::pure(),
+    );
+    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+
+    let result = tool
+        .call(JsArgs {
+            code: "JSON.stringify({ recovered: recoveredAmbientRealm(), polluted: ({}).skillPolluted, dynamicCode: typeof Function })".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+        serde_json::json!({"recovered": false, "dynamicCode": "undefined"})
+    );
+}
+
+#[test]
+fn turn_context_replacement_does_not_mutate_existing_snapshots() {
+    let old = artifact(
+        "function oldSkill() { return 1; }",
+        &["oldSkill"],
+        CapabilityManifest::pure(),
+    );
+    let new = artifact(
+        "function newSkill() { return 2; }",
+        &["newSkill"],
+        CapabilityManifest::pure(),
+    );
+    let turn_context = context(vec![resolved(&old, 0)]);
+    let frozen = turn_context.snapshot();
+
+    turn_context.replace(TurnSkillBundle {
+        query_fingerprint: "next-turn".to_string(),
+        embedding_model_revision: "test-model".to_string(),
+        index_generation: 8,
+        skills: vec![resolved(&new, 0)],
+    });
+
+    assert_eq!(frozen.index_generation, 7);
+    assert_eq!(frozen.skills[0].id, old.id);
+    assert_eq!(turn_context.snapshot().skills[0].id, new.id);
+}

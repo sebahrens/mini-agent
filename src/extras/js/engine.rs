@@ -1,9 +1,14 @@
+use rquickjs::context::EvalOptions;
 use rquickjs::promise::PromiseState;
 use rquickjs::{Coerced, Context, Ctx, Error, FromJs, Persistent, Runtime, Value};
+#[cfg(feature = "skills")]
+use rquickjs::{Function, Object};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
+#[cfg(feature = "skills")]
+use crate::extras::js::host::SkillCapabilityGate;
 use crate::extras::js::host::{AllowConfig, register_host_globals};
 use crate::extras::js::tool::PermissionBridge;
 use crate::extras::js::types::*;
@@ -256,6 +261,17 @@ pub(crate) fn js_thread_main(
             continue;
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
+        #[cfg(feature = "skills")]
+        let outcome = run_step_with_skills(
+            &req.code,
+            &req.skill_bundle,
+            &sandbox,
+            &bridge,
+            &req.cancellation,
+            &runtime,
+            &allow_config,
+        );
+        #[cfg(not(feature = "skills"))]
         let outcome = run_step(
             &req.code,
             &sandbox,
@@ -274,6 +290,7 @@ pub(crate) fn js_thread_main(
 }
 
 // pub(crate) required: Phase 3's verify_skill() calls this cross-module
+#[cfg_attr(feature = "skills", allow(dead_code))]
 pub(crate) fn run_step(
     code: &str,
     sandbox: &Sandbox,
@@ -289,6 +306,8 @@ pub(crate) fn run_step(
         cancellation,
         runtime,
         allow_config,
+        #[cfg(feature = "skills")]
+        None,
         ExecutionPolicy {
             timeout: STEP_TIMEOUT,
             max_pending_jobs: MAX_PENDING_JOBS,
@@ -296,6 +315,318 @@ pub(crate) fn run_step(
     )
 }
 
+#[cfg(feature = "skills")]
+fn run_step_with_skills(
+    code: &str,
+    skills: &crate::extras::js::skills::turn::TurnSkillBundle,
+    sandbox: &Sandbox,
+    permission_bridge: &PermissionBridge,
+    cancellation: &PermCancellation,
+    runtime: &tokio::runtime::Handle,
+    allow_config: &AllowConfig,
+) -> JsOutcome {
+    run_step_with_policy(
+        code,
+        sandbox,
+        permission_bridge,
+        cancellation,
+        runtime,
+        allow_config,
+        Some(skills),
+        ExecutionPolicy {
+            timeout: STEP_TIMEOUT,
+            max_pending_jobs: MAX_PENDING_JOBS,
+        },
+    )
+}
+
+#[cfg(feature = "skills")]
+fn install_selected_skills(
+    runtime: &Runtime,
+    context: &Context,
+    bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
+    gate: &SkillCapabilityGate,
+    deadline: Instant,
+    cancellation: &PermCancellation,
+    permission_bridge: &PermissionBridge,
+) -> Result<(), JsOutcome> {
+    use std::collections::HashSet;
+
+    let mut declared = HashSet::new();
+    let wrapper_factory = context.with(|ctx| {
+        ctx.eval::<Value, _>(
+            crate::extras::js::skills::SKILL_REALM_HARDENING_JS,
+        )
+        .map_err(|error| {
+            skill_error_outcome(
+                &ctx,
+                "skill-realm-hardening",
+                error,
+                deadline,
+                cancellation,
+                permission_bridge,
+            )
+        })?;
+        ctx.eval::<Value, _>(
+            "(function(){\
+             for (const name of ['read_file','write_file','fetch','spawn','console']) {\
+               if (Object.prototype.hasOwnProperty.call(globalThis, name)) {\
+                 Object.defineProperty(globalThis, name, {writable:false,configurable:false});\
+               }\
+             }\
+             if (typeof console === 'object') Object.freeze(console);\
+             })()",
+        )
+        .map_err(|error| {
+            skill_error_outcome(
+                &ctx,
+                "capability-wrapper",
+                error,
+                deadline,
+                cancellation,
+                permission_bridge,
+            )
+        })?;
+        let enter_gate = gate.clone();
+        let enter = Function::new(ctx.clone(), move |skill_id: String| {
+            enter_gate.push_registered(&skill_id)
+        })
+        .map_err(|error| {
+            skill_error_outcome(
+                &ctx,
+                "capability-wrapper",
+                error,
+                deadline,
+                cancellation,
+                permission_bridge,
+            )
+        })?;
+        let exit_gate = gate.clone();
+        let exit =
+            Function::new(ctx.clone(), move || exit_gate.pop_registered()).map_err(|error| {
+                skill_error_outcome(
+                    &ctx,
+                    "capability-wrapper",
+                    error,
+                    deadline,
+                    cancellation,
+                    permission_bridge,
+                )
+            })?;
+        let build_wrapper: Function = ctx
+            .eval(
+                "(enter, exit) => {\n\
+                 const clone = (value) => {\n\
+                   if (value === null || ['string','number','boolean','undefined'].includes(typeof value)) return value;\n\
+                   if (typeof value === 'object') {\n\
+                     if (typeof value.then === 'function') throw new TypeError('skill promises are not supported');\n\
+                     const encoded = JSON.stringify(value);\n\
+                     if (encoded === undefined) throw new TypeError('skill values must be JSON-safe');\n\
+                     return JSON.parse(encoded);\n\
+                   }\n\
+                   throw new TypeError('skill values must not contain executable references');\n\
+                 };\n\
+                 return (fn, id) => function(...args) {\n\
+                 enter(id);\n\
+                 try { return clone(fn.apply(undefined, args.map(clone))); } finally { exit(); }\n\
+                 };\n\
+                 }",
+            )
+            .map_err(|error| {
+                skill_error_outcome(
+                    &ctx,
+                    "capability-wrapper",
+                    error,
+                    deadline,
+                    cancellation,
+                    permission_bridge,
+                )
+            })?;
+        let wrapper_factory: Function = build_wrapper.call((enter, exit)).map_err(|error| {
+            skill_error_outcome(
+                &ctx,
+                "capability-wrapper",
+                error,
+                deadline,
+                cancellation,
+                permission_bridge,
+            )
+        })?;
+        Ok::<_, JsOutcome>(Persistent::save(&ctx, wrapper_factory))
+    })?;
+    if let Some(outcome) = drain_pending_jobs(
+        runtime,
+        deadline,
+        MAX_PENDING_JOBS,
+        cancellation,
+        permission_bridge,
+    ) {
+        return Err(outcome);
+    }
+
+    for resolved in &bundle.skills {
+        let artifact = crate::extras::js::skills::SkillArtifact {
+            id: resolved.id.clone(),
+            identity_version: resolved.identity_version,
+            source: resolved.source.clone(),
+            description: resolved.description.clone(),
+            tags: resolved.tags.clone(),
+            exports: resolved.exports.clone(),
+            tests: resolved.tests.clone(),
+            capability: resolved.capability.clone(),
+        };
+        if let Err(error) = artifact.verify_identity() {
+            return Err(JsOutcome::Error(format!(
+                "selected skill {} failed identity validation: {error}",
+                resolved.id
+            )));
+        }
+        gate.register(resolved.id.clone(), resolved.capability.clone());
+        context.with(|ctx| {
+            let globals = ctx.globals();
+            for export in &resolved.exports {
+                if !declared.insert(export.name.clone()) {
+                    return Err(JsOutcome::Error(format!(
+                        "selected skill {} declares duplicate export {}",
+                        resolved.id, export.name
+                    )));
+                }
+                match globals.contains_key(export.name.as_str()) {
+                    Ok(true) => {
+                        return Err(JsOutcome::Error(format!(
+                            "selected skill {} export {} collides with an existing global",
+                            resolved.id, export.name
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(skill_error_outcome(
+                            &ctx,
+                            &resolved.id,
+                            error,
+                            deadline,
+                            cancellation,
+                            permission_bridge,
+                        ));
+                    }
+                }
+            }
+            Ok::<_, JsOutcome>(())
+        })?;
+
+        let private_source = crate::extras::js::skills::private_skill_source(&artifact);
+        let namespace = {
+            let _active = gate.enter(resolved.capability.clone());
+            let namespace = context.with(|ctx| {
+                let mut options = EvalOptions::default();
+                options.filename = Some(format!("skill-{}.js", resolved.id));
+                ctx.eval_with_options::<Object, _>(private_source.as_bytes(), options)
+                    .map(|namespace| Persistent::save(&ctx, namespace))
+                    .map_err(|error| {
+                        skill_error_outcome(
+                            &ctx,
+                            &resolved.id,
+                            error,
+                            deadline,
+                            cancellation,
+                            permission_bridge,
+                        )
+                    })
+            })?;
+            if let Some(outcome) = drain_pending_jobs(
+                runtime,
+                deadline,
+                MAX_PENDING_JOBS,
+                cancellation,
+                permission_bridge,
+            ) {
+                return Err(outcome);
+            }
+            namespace
+        };
+
+        context.with(|ctx| {
+            let globals = ctx.globals();
+            let namespace = namespace.restore(&ctx).map_err(|error| {
+                skill_error_outcome(
+                    &ctx,
+                    &resolved.id,
+                    error,
+                    deadline,
+                    cancellation,
+                    permission_bridge,
+                )
+            })?;
+            let wrapper_factory = wrapper_factory.clone().restore(&ctx).map_err(|error| {
+                skill_error_outcome(
+                    &ctx,
+                    &resolved.id,
+                    error,
+                    deadline,
+                    cancellation,
+                    permission_bridge,
+                )
+            })?;
+            for export in &resolved.exports {
+                let original: Function = namespace.get(export.name.as_str()).map_err(|error| {
+                    skill_error_outcome(
+                        &ctx,
+                        &resolved.id,
+                        error,
+                        deadline,
+                        cancellation,
+                        permission_bridge,
+                    )
+                })?;
+                let wrapper: Function = wrapper_factory
+                    .call((original, resolved.id.clone()))
+                    .map_err(|error| {
+                        skill_error_outcome(
+                            &ctx,
+                            &resolved.id,
+                            error,
+                            deadline,
+                            cancellation,
+                            permission_bridge,
+                        )
+                    })?;
+                globals
+                    .set(export.name.as_str(), wrapper)
+                    .map_err(|error| {
+                        skill_error_outcome(
+                            &ctx,
+                            &resolved.id,
+                            error,
+                            deadline,
+                            cancellation,
+                            permission_bridge,
+                        )
+                    })?;
+            }
+            Ok::<_, JsOutcome>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "skills")]
+fn skill_error_outcome(
+    ctx: &Ctx<'_>,
+    skill_id: &str,
+    error: Error,
+    deadline: Instant,
+    cancellation: &PermCancellation,
+    permission_bridge: &PermissionBridge,
+) -> JsOutcome {
+    match error_outcome(ctx, error, deadline, cancellation, permission_bridge) {
+        JsOutcome::Error(error) => {
+            JsOutcome::Error(format!("selected skill {skill_id} failed: {error}"))
+        }
+        outcome => outcome,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_step_with_policy(
     code: &str,
     sandbox: &Sandbox,
@@ -303,6 +634,7 @@ fn run_step_with_policy(
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
     allow_config: &AllowConfig,
+    #[cfg(feature = "skills")] skills: Option<&crate::extras::js::skills::turn::TurnSkillBundle>,
     policy: ExecutionPolicy,
 ) -> JsOutcome {
     // Fresh Runtime EVERY step — OOM poisons allocator; never reuse
@@ -328,12 +660,16 @@ fn run_step_with_policy(
         Err(e) => return JsOutcome::Error(format!("Context::full failed: {e}")),
     };
 
+    #[cfg(feature = "skills")]
+    let skill_gate = SkillCapabilityGate::default();
     if let Err(error) = register_host_globals(
         &ctx,
         sandbox.clone(),
         permission_bridge.clone(),
         runtime.clone(),
         allow_config.clone(),
+        #[cfg(feature = "skills")]
+        skill_gate.clone(),
     ) {
         return match error {
             Error::Allocation => JsOutcome::OomKilled,
@@ -341,8 +677,25 @@ fn run_step_with_policy(
         };
     }
 
+    #[cfg(feature = "skills")]
+    if let Some(skills) = skills
+        && let Err(outcome) = install_selected_skills(
+            &rt,
+            &ctx,
+            skills,
+            &skill_gate,
+            deadline,
+            cancellation,
+            permission_bridge,
+        )
+    {
+        return outcome;
+    }
+
     let evaluated: Result<Persistent<Value<'static>>, JsOutcome> = ctx.with(|ctx| {
-        ctx.eval::<Value, _>(code)
+        let mut options = EvalOptions::default();
+        options.filename = Some("agent.js".to_string());
+        ctx.eval_with_options::<Value, _>(code.as_bytes(), options)
             .map(|value| Persistent::save(&ctx, value))
             .map_err(|error| error_outcome(&ctx, error, deadline, cancellation, permission_bridge))
     });
@@ -399,6 +752,8 @@ pub(crate) fn run_step_for_test(
         cancellation,
         runtime,
         allow_config,
+        #[cfg(feature = "skills")]
+        None,
         ExecutionPolicy {
             timeout,
             max_pending_jobs,
@@ -510,6 +865,10 @@ mod tests {
         request_tx
             .send(JsRequest {
                 code: "abandoned request must not run".to_string(),
+                #[cfg(feature = "skills")]
+                skill_bundle: std::sync::Arc::new(
+                    crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
+                ),
                 cancellation: abandoned_cancellation,
                 reply: abandoned_reply,
             })
@@ -519,6 +878,10 @@ mod tests {
         request_tx
             .send(JsRequest {
                 code: "40 + 2".to_string(),
+                #[cfg(feature = "skills")]
+                skill_bundle: std::sync::Arc::new(
+                    crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
+                ),
                 cancellation: PermCancellation::new(),
                 reply: recovery_reply,
             })

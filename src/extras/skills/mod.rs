@@ -4,7 +4,16 @@
 //! descriptive metadata and bundled JavaScript is never admitted to the
 //! learned-JS store by this module.
 
+// Phase 3 exposes catalog lifecycle fields that Phase 4 admission consumes.
+#![allow(dead_code)]
+
+#[cfg(feature = "skills")]
+pub mod catalog;
 mod import;
+#[cfg(feature = "skills")]
+pub mod index;
+#[cfg(feature = "skills")]
+pub mod loader;
 mod manifest;
 
 #[allow(unused_imports)]

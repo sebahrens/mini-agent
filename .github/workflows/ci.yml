@@ -84,6 +84,10 @@ jobs:
       - name: Test (${{ matrix.features }})
         run: cargo test --locked ${{ matrix.features }}
 
+      - name: Validate deterministic skill retrieval benchmark metrics
+        if: matrix.os == 'ubuntu-latest' && matrix.features == '--features js,skills'
+        run: cargo test --locked --features js,skills skill_retrieval_benchmark_smoke -- --nocapture
+
   # The local ONNX/BGE embedding backend. Kept out of the required matrix because
   # ort-sys ships no prebuilt binaries for every host (notably x86_64-apple-darwin)
   # and downloading the runtime makes the job slow and network-dependent. Failure

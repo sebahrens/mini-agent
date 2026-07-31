@@ -1,11 +1,11 @@
 //! Comprehensive fixtures for SkillStore schema, migrations, constraints, and lifecycle.
 
-use crate::extras::js::skills::store::{SkillStore, StoreError};
+use crate::extras::js::skills::store::SkillStore;
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
 };
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 
 // ============================================================================
@@ -69,7 +69,7 @@ fn minimal_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
             name: "greet".to_string(),
             signature: "() => string".to_string(),
         }],
-        vec!["test('greet', () => greet() === 'hello')".to_string()],
+        vec!["greet() === 'hello'".to_string()],
         CapabilityManifest::pure(),
     )?)
 }
@@ -77,14 +77,14 @@ fn minimal_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
 /// Create a skill with ReadOnly capability.
 fn readonly_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
     Ok(SkillArtifact::new(
-        "function readConfig() { return read_file('/etc/config'); }".to_string(),
+        "function readConfig() { try { read_file('/etc/config'); return false; } catch (error) { return String(error).includes('File not found'); } }".to_string(),
         "Read system configuration.".to_string(),
         vec!["config".to_string(), "read".to_string()],
         vec![SkillExport {
             name: "readConfig".to_string(),
             signature: "() => string".to_string(),
         }],
-        vec!["test('readConfig', () => typeof readConfig() === 'string')".to_string()],
+        vec!["readConfig() === true".to_string()],
         CapabilityManifest::new(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])?,
     )?)
 }
@@ -99,9 +99,92 @@ fn sideeffecting_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
             name: "deploy".to_string(),
             signature: "() => object".to_string(),
         }],
-        vec!["test('deploy', () => deploy().code !== undefined)".to_string()],
+        vec!["typeof deploy() === 'string'".to_string()],
         CapabilityManifest::new(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])?,
     )?)
+}
+
+fn create_schema_v1(paths: &AppPaths) -> Result<Connection, Box<dyn std::error::Error>> {
+    let db_path = paths.local_data_dir.join("skills").join("skills.db");
+    std::fs::create_dir_all(db_path.parent().unwrap())?;
+    let db = Connection::open(db_path)?;
+    db.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE skill_revisions (
+            id TEXT PRIMARY KEY, identity_version INTEGER NOT NULL,
+            source TEXT NOT NULL, description TEXT NOT NULL, tags_json TEXT NOT NULL,
+            exports_json TEXT NOT NULL, tests_json TEXT NOT NULL,
+            capability_json TEXT NOT NULL, status TEXT NOT NULL,
+            supersedes_id TEXT, superseded_by_id TEXT,
+            row_version INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            CHECK (status IN ('pending','verified','canary','active','quarantined',
+                              'superseded','retired','rejected'))
+        );
+        CREATE TABLE skill_embeddings (
+            skill_id TEXT NOT NULL, model_id TEXT NOT NULL, model_revision TEXT NOT NULL,
+            dimensions INTEGER NOT NULL, normalized INTEGER NOT NULL,
+            embedding BLOB NOT NULL, created_at INTEGER NOT NULL,
+            PRIMARY KEY (skill_id, model_id, model_revision),
+            FOREIGN KEY (skill_id) REFERENCES skill_revisions(id) ON DELETE CASCADE
+        );
+        CREATE VIRTUAL TABLE skill_search USING fts5(identifier, description, tags, exports);
+        CREATE TRIGGER skill_search_ai AFTER INSERT ON skill_revisions BEGIN
+            INSERT INTO skill_search (rowid, identifier, description, tags, exports)
+            VALUES (NEW.rowid, substr(NEW.id, 1, 16), NEW.description, NEW.tags_json, NEW.exports_json);
+        END;
+        CREATE TRIGGER skill_search_ad AFTER DELETE ON skill_revisions BEGIN
+            DELETE FROM skill_search WHERE rowid = OLD.rowid;
+        END;
+        CREATE TRIGGER skill_search_au AFTER UPDATE ON skill_revisions BEGIN
+            DELETE FROM skill_search WHERE rowid = OLD.rowid;
+            INSERT INTO skill_search (rowid, identifier, description, tags, exports)
+            VALUES (NEW.rowid, substr(NEW.id, 1, 16), NEW.description, NEW.tags_json, NEW.exports_json);
+        END;
+        PRAGMA user_version = 1;
+        ",
+    )?;
+    Ok(db)
+}
+
+fn insert_schema_v1_artifact(
+    db: &Connection,
+    skill: &SkillArtifact,
+    status: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let exports = skill
+        .exports
+        .iter()
+        .map(|export| {
+            serde_json::json!({
+                "name": export.name,
+                "signature": export.signature,
+            })
+        })
+        .collect::<Vec<_>>();
+    let capability = serde_json::json!({
+        "tier": skill.capability.tier.as_token(),
+        "allowed_hosts": skill.capability.allowed_hosts.iter().map(|host| host.as_token()).collect::<Vec<_>>(),
+    });
+    db.execute(
+        "INSERT INTO skill_revisions (
+            id, identity_version, source, description, tags_json, exports_json,
+            tests_json, capability_json, status, row_version, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1)",
+        params![
+            skill.id,
+            skill.identity_version,
+            skill.source,
+            skill.description,
+            serde_json::to_string(&skill.tags)?,
+            serde_json::to_string(&exports)?,
+            serde_json::to_string(&skill.tests)?,
+            serde_json::to_string(&capability)?,
+            status,
+        ],
+    )?;
+    Ok(())
 }
 
 // ============================================================================
@@ -358,7 +441,7 @@ fn test_embedding_storage_and_retrieval() -> Result<(), Box<dyn std::error::Erro
         store.insert_verified(&skill)?;
 
         // Store an embedding.
-        let embedding_vec = vec![0.1f32, 0.2, 0.3, 0.4];
+        let embedding_vec = vec![1.0f32, 0.0, 0.0, 0.0];
         let embedding_bytes = embedding_vec
             .iter()
             .flat_map(|f| f.to_le_bytes())
@@ -405,7 +488,10 @@ fn test_embedding_foreign_key_cascade() -> Result<(), Box<dyn std::error::Error>
         store.insert_verified(&skill)?;
 
         // Store an embedding.
-        let embedding_bytes = vec![1, 2, 3, 4];
+        let embedding_bytes = [1.0f32, 0.0, 0.0, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
         store.store_embedding(&skill_id, "model1", "1", 4, true, &embedding_bytes)?;
 
         // Delete the skill.
@@ -443,7 +529,7 @@ fn test_fts5_available() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_duplicate_insert_rejected() -> Result<(), Box<dyn std::error::Error>> {
+fn test_exact_duplicate_insert_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = temp_app_paths();
     let paths = resolve_test_paths(&temp_dir)?;
 
@@ -453,15 +539,8 @@ fn test_duplicate_insert_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let mut store = SkillStore::open_at(&paths)?;
         store.insert_verified(&skill)?;
 
-        // Attempt to insert the same skill again.
-        let result = store.insert_verified(&skill);
-        assert!(result.is_err(), "Duplicate insert should be rejected");
-
-        if let Err(StoreError::AlreadyExists(id)) = result {
-            assert_eq!(id, skill.id);
-        } else {
-            panic!("Expected StoreError::AlreadyExists");
-        }
+        store.insert_verified(&skill)?;
+        assert_eq!(store.list_retrievable()?.len(), 1);
     }
 
     // Clean up.
@@ -531,11 +610,14 @@ fn test_various_tag_normalization() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create skills with different tag variations.
     let skill1 = SkillArtifact::new(
-        "test".to_string(),
+        "function test() { return true; }".to_string(),
         "Test skill".to_string(),
         vec!["TAG".to_string(), "tag".to_string(), "  tag  ".to_string()],
-        vec![],
-        vec!["test()".to_string()],
+        vec![SkillExport {
+            name: "test".to_string(),
+            signature: "() => boolean".to_string(),
+        }],
+        vec!["test() === true".to_string()],
         CapabilityManifest::pure(),
     )?;
 
@@ -572,14 +654,14 @@ fn test_capability_manifest_serialization() -> Result<(), Box<dyn std::error::Er
     )?;
 
     let skill = SkillArtifact::new(
-        "function test() {}".to_string(),
+        "function test() { return true; }".to_string(),
         "Test skill with capabilities.".to_string(),
         vec!["test".to_string()],
         vec![SkillExport {
             name: "test".to_string(),
             signature: "() => void".to_string(),
         }],
-        vec!["test('test', () => true)".to_string()],
+        vec!["test() === true".to_string()],
         CapabilityManifest::new(
             CapabilityTier::SideEffecting,
             vec![
@@ -651,17 +733,143 @@ fn test_transaction_interruption_recovery() -> Result<(), Box<dyn std::error::Er
         let mut store = SkillStore::open_at(&paths)?;
         store.insert_verified(&skill1)?;
 
-        // Attempt to insert skill2 twice; second should fail.
+        // Exact duplicate insertion is an idempotent retry.
         store.insert_verified(&skill2)?;
-        let result = store.insert_verified(&skill2);
-        assert!(result.is_err());
+        store.insert_verified(&skill2)?;
 
         // Verify the store still works and both skills exist.
         assert!(store.get(&skill1.id)?.is_some());
         assert!(store.get(&skill2.id)?.is_some());
+        assert_eq!(
+            store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM skill_revisions", [], |row| row
+                    .get::<_, i64>(0))?,
+            2
+        );
     }
 
     // Clean up.
+    std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+#[test]
+fn test_schema_v1_to_v2_migration_preserves_rows_and_rebuilds_active_only_fts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = temp_app_paths();
+    let paths = resolve_test_paths(&temp_dir)?;
+    let active = minimal_skill()?;
+    let retired = readonly_skill()?;
+    {
+        let db = create_schema_v1(&paths)?;
+        insert_schema_v1_artifact(&db, &active, "active")?;
+        insert_schema_v1_artifact(&db, &retired, "retired")?;
+        let embedding = [1.0f32, 0.0, 0.0, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        db.execute(
+            "INSERT INTO skill_embeddings (
+                skill_id, model_id, model_revision, dimensions, normalized, embedding, created_at
+             ) VALUES (?, 'fixture-model', 'v1', 4, 1, ?, 1)",
+            params![active.id, embedding],
+        )?;
+    }
+
+    for _ in 0..2 {
+        let store = SkillStore::open_at(&paths)?;
+        assert_eq!(
+            store
+                .conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            2
+        );
+        assert_eq!(
+            store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM skill_revisions", [], |row| row
+                    .get::<_, i64>(0))?,
+            2
+        );
+        assert_eq!(
+            store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM skill_embeddings", [], |row| row
+                    .get::<_, i64>(0))?,
+            1
+        );
+        let identifiers = store
+            .conn()
+            .prepare("SELECT identifier FROM skill_search ORDER BY identifier")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(identifiers, vec![active.id.clone()]);
+        let state = store.generation_state()?;
+        assert_eq!(state.desired_generation, 0);
+        assert_eq!(state.applied_generation, 0);
+        assert_eq!(state.model_id, "");
+        assert_eq!(state.model_revision, "");
+        assert_eq!(state.dimensions, 0);
+        assert!(state.normalized);
+    }
+
+    std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+#[test]
+fn test_purge_deletes_invalid_legacy_id_without_raw_tombstone()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = temp_app_paths();
+    let paths = resolve_test_paths(&temp_dir)?;
+    let invalid_id = "legacy/raw/identifier";
+    {
+        let db = create_schema_v1(&paths)?;
+        db.execute(
+            "INSERT INTO skill_revisions (
+                id, identity_version, source, description, tags_json, exports_json,
+                tests_json, capability_json, status, row_version, created_at, updated_at
+             ) VALUES (?, 1, 'legacy bytes', 'legacy', '[]', '[]', '[]',
+                       '{\"tier\":\"pure\",\"allowed_hosts\":[]}', 'active', 1, 1, 1)",
+            [invalid_id],
+        )?;
+        db.execute(
+            "INSERT INTO skill_embeddings (
+                skill_id, model_id, model_revision, dimensions, normalized, embedding, created_at
+             ) VALUES (?, 'legacy-model', 'v1', 1, 1, ?, 1)",
+            params![invalid_id, 1.0f32.to_le_bytes().to_vec()],
+        )?;
+    }
+
+    let mut store = SkillStore::open_at(&paths)?;
+    store.purge(invalid_id)?;
+    assert_eq!(
+        store.conn().query_row(
+            "SELECT COUNT(*) FROM skill_revisions WHERE id = ?",
+            [invalid_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        store.conn().query_row(
+            "SELECT COUNT(*) FROM skill_embeddings WHERE skill_id = ?",
+            [invalid_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        store.conn().query_row(
+            "SELECT COUNT(*) FROM skill_tombstones WHERE id = ?",
+            [invalid_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+
+    drop(store);
     std::fs::remove_dir_all(&temp_dir)?;
     Ok(())
 }

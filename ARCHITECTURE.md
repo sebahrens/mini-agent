@@ -198,7 +198,7 @@ src/extras/js/
 ├── tool.rs
 ├── types.rs
 ├── tests/
-└── skills/        # Phase 3 target
+└── skills/        # Phase 3 learned-skill implementation
 ```
 
 Tool registration lives in `src/agent/builder.rs`; the shared process wrapper lives in

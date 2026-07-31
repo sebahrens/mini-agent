@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "seed": 1592590339,
+  "profile": "debug",
+  "corpus": { "revisions": 100000, "dimensions": 384 },
+  "machine": {
+    "os": "macos",
+    "arch": "x86_64",
+    "cpu": "Intel(R) Core(TM) i7-1068NG7 CPU @ 2.30GHz",
+    "logical_cpus": 8,
+    "memory_bytes": 34359738368
+  },
+  "model": {
+    "id": "deterministic-hash",
+    "revision": "deterministic-v1",
+    "normalized": true
+  },
+  "index": {
+    "kind": "hnsw-with-exact-oracle-and-frozen-fts5",
+    "connections": 24,
+    "construction_ef": 100,
+    "production_candidate_limit": 32,
+    "recall_audit_candidate_limit": 40,
+    "search_ef_floor": 36
+  },
+  "latency_us": {
+    "query_embedding_cold": 383.467,
+    "query_embedding_warm": 44.125,
+    "snapshot_build": 92749693.006,
+    "snapshot_rebuild": 110369290.654,
+    "lifecycle_removal_refresh": 5567.316,
+    "index_search": { "samples": 500, "p50": 2638.081, "p95": 3989.641, "p99": 4501.292 },
+    "dense": { "samples": 500, "p50": 1987.289, "p95": 2860.951, "p99": 3379.997 },
+    "fts_candidates": { "samples": 500, "p50": 621.192, "p95": 1130.474, "p99": 1488.964 },
+    "fusion_dedupe_budget": { "samples": 500, "p50": 29.403, "p95": 70.143, "p99": 117.518 },
+    "exact_oracle": { "samples": 200, "p50": 55609.618, "p95": 62337.744, "p99": 70575.260 },
+    "concurrent_reader": { "samples": 4, "p50": 2625.525, "p95": 3627.144, "p99": 3627.144 }
+  },
+  "memory": { "rss_before_kib": 6880, "peak_observed_rss_kib": 1665412 },
+  "relevance": {
+    "ann_recall_at_10_against_exact": 0.9675,
+    "ann_self_query_top1_rate": 0.98,
+    "independent_rebuild_recall_at_10": 0.985,
+    "deterministic_within_generation": true,
+    "lifecycle_filtered": true,
+    "zero_result": true
+  },
+  "gate": { "p99_target_us": 5000, "observed_p99_us": 4501.292, "recall_at_10_target": 0.95, "passed": true }
+}

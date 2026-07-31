@@ -564,12 +564,48 @@ pub enum AnyModel {
 }
 
 #[derive(Clone)]
-pub enum AnyAgent {
+pub enum AnyAgentInner {
     OpenRouter(Agent<openrouter::completion::CompletionModel>),
     OpenAI(OpenAiAgent),
     Anthropic(Agent<anthropic::completion::CompletionModel>),
     Gemini(Agent<gemini::completion::CompletionModel>),
     Ollama(Agent<ollama::CompletionModel>),
+}
+
+#[derive(Clone)]
+pub struct AnyAgent {
+    inner: AnyAgentInner,
+    #[cfg(feature = "skills")]
+    skills: Option<std::sync::Arc<crate::extras::js::skills::turn::SkillRuntime>>,
+    #[cfg(feature = "skills")]
+    turn_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl AnyAgent {
+    pub(crate) fn without_skills(inner: AnyAgentInner) -> Self {
+        Self {
+            inner,
+            #[cfg(feature = "skills")]
+            skills: None,
+            #[cfg(feature = "skills")]
+            turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    fn with_runtime(
+        inner: AnyAgentInner,
+        #[cfg(feature = "skills")] skills: Option<
+            std::sync::Arc<crate::extras::js::skills::turn::SkillRuntime>,
+        >,
+    ) -> Self {
+        Self {
+            inner,
+            #[cfg(feature = "skills")]
+            skills,
+            #[cfg(feature = "skills")]
+            turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
 }
 
 /// Synthesizes an `AgentRunner` for a prompt blocked by a `UserPromptSubmit`
@@ -602,11 +638,25 @@ impl AnyAgent {
         // for plain `-p` one-shot runs.
         #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
     ) -> anyhow::Result<(String, rig::completion::Usage)> {
-        match self {
-            AnyAgent::OpenRouter(a) => {
+        #[cfg(feature = "skills")]
+        let _turn_guard = if self.skills.is_some() {
+            Some(self.turn_gate.lock().await)
+        } else {
+            None
+        };
+        #[cfg(feature = "skills")]
+        let prompt = if let Some(skills) = &self.skills {
+            skills.prepare_prompt(prompt).await
+        } else {
+            prompt.to_string()
+        };
+        #[cfg(not(feature = "skills"))]
+        let prompt = prompt.to_string();
+        match &self.inner {
+            AnyAgentInner::OpenRouter(a) => {
                 runner::run_print(
                     a,
-                    prompt,
+                    &prompt,
                     pure_stdout,
                     retry_config,
                     history,
@@ -615,11 +665,11 @@ impl AnyAgent {
                 )
                 .await
             }
-            AnyAgent::OpenAI(a) => match a {
+            AnyAgentInner::OpenAI(a) => match a {
                 OpenAiAgent::Responses(a) => {
                     runner::run_print(
                         a,
-                        prompt,
+                        &prompt,
                         pure_stdout,
                         retry_config,
                         history,
@@ -631,7 +681,7 @@ impl AnyAgent {
                 OpenAiAgent::Completions(a) => {
                     runner::run_print(
                         a,
-                        prompt,
+                        &prompt,
                         pure_stdout,
                         retry_config,
                         history,
@@ -641,10 +691,10 @@ impl AnyAgent {
                     .await
                 }
             },
-            AnyAgent::Anthropic(a) => {
+            AnyAgentInner::Anthropic(a) => {
                 runner::run_print(
                     a,
-                    prompt,
+                    &prompt,
                     pure_stdout,
                     retry_config,
                     history,
@@ -653,10 +703,10 @@ impl AnyAgent {
                 )
                 .await
             }
-            AnyAgent::Gemini(a) => {
+            AnyAgentInner::Gemini(a) => {
                 runner::run_print(
                     a,
-                    prompt,
+                    &prompt,
                     pure_stdout,
                     retry_config,
                     history,
@@ -665,10 +715,10 @@ impl AnyAgent {
                 )
                 .await
             }
-            AnyAgent::Ollama(a) => {
+            AnyAgentInner::Ollama(a) => {
                 runner::run_print(
                     a,
-                    prompt,
+                    &prompt,
                     pure_stdout,
                     retry_config,
                     history,
@@ -688,26 +738,40 @@ impl AnyAgent {
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         retry_config: &RetryConfig,
     ) -> runner::SubagentRunOutput {
-        match self {
-            AnyAgent::OpenRouter(a) => {
-                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+        #[cfg(feature = "skills")]
+        let _turn_guard = if self.skills.is_some() {
+            Some(self.turn_gate.lock().await)
+        } else {
+            None
+        };
+        #[cfg(feature = "skills")]
+        let prompt = if let Some(skills) = &self.skills {
+            skills.prepare_prompt(prompt).await
+        } else {
+            prompt.to_string()
+        };
+        #[cfg(not(feature = "skills"))]
+        let prompt = prompt.to_string();
+        match &self.inner {
+            AnyAgentInner::OpenRouter(a) => {
+                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
             }
-            AnyAgent::OpenAI(a) => match a {
+            AnyAgentInner::OpenAI(a) => match a {
                 OpenAiAgent::Responses(a) => {
-                    runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+                    runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
                 }
                 OpenAiAgent::Completions(a) => {
-                    runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+                    runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
                 }
             },
-            AnyAgent::Anthropic(a) => {
-                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            AnyAgentInner::Anthropic(a) => {
+                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
             }
-            AnyAgent::Gemini(a) => {
-                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            AnyAgentInner::Gemini(a) => {
+                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
             }
-            AnyAgent::Ollama(a) => {
-                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            AnyAgentInner::Ollama(a) => {
+                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
             }
         }
     }
@@ -732,21 +796,37 @@ impl AnyAgent {
             }
             crate::extras::hooks::PromptGate::Proceed(prompt) => prompt,
         };
-        match self {
-            AnyAgent::OpenRouter(a) => runner::spawn_agent(
+        #[cfg(feature = "skills")]
+        let turn_guard = if self.skills.is_some() {
+            Some(std::sync::Arc::clone(&self.turn_gate).lock_owned().await)
+        } else {
+            None
+        };
+        #[cfg(feature = "skills")]
+        let prompt = if let Some(skills) = &self.skills {
+            skills.prepare_prompt(&prompt).await
+        } else {
+            prompt
+        };
+        match self.inner {
+            AnyAgentInner::OpenRouter(a) => runner::spawn_agent(
                 a,
                 prompt,
                 history,
                 retry_config,
+                #[cfg(feature = "skills")]
+                turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
             ),
-            AnyAgent::OpenAI(a) => match a {
+            AnyAgentInner::OpenAI(a) => match a {
                 OpenAiAgent::Responses(a) => runner::spawn_agent(
                     a,
                     prompt,
                     history,
                     retry_config,
+                    #[cfg(feature = "skills")]
+                    turn_guard,
                     #[cfg(feature = "hooks")]
                     loop_info,
                 ),
@@ -755,31 +835,39 @@ impl AnyAgent {
                     prompt,
                     history,
                     retry_config,
+                    #[cfg(feature = "skills")]
+                    turn_guard,
                     #[cfg(feature = "hooks")]
                     loop_info,
                 ),
             },
-            AnyAgent::Anthropic(a) => runner::spawn_agent(
+            AnyAgentInner::Anthropic(a) => runner::spawn_agent(
                 a,
                 prompt,
                 history,
                 retry_config,
+                #[cfg(feature = "skills")]
+                turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
             ),
-            AnyAgent::Gemini(a) => runner::spawn_agent(
+            AnyAgentInner::Gemini(a) => runner::spawn_agent(
                 a,
                 prompt,
                 history,
                 retry_config,
+                #[cfg(feature = "skills")]
+                turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
             ),
-            AnyAgent::Ollama(a) => runner::spawn_agent(
+            AnyAgentInner::Ollama(a) => runner::spawn_agent(
                 a,
                 prompt,
                 history,
                 retry_config,
+                #[cfg(feature = "skills")]
+                turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
             ),
@@ -794,11 +882,11 @@ impl AnyAgent {
         id: u32,
         retry_config: RetryConfig,
     ) -> crate::agent::runner::BtwRunner {
-        match self {
-            AnyAgent::OpenRouter(a) => {
+        match self.inner {
+            AnyAgentInner::OpenRouter(a) => {
                 runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
             }
-            AnyAgent::OpenAI(a) => match a {
+            AnyAgentInner::OpenAI(a) => match a {
                 OpenAiAgent::Responses(a) => {
                     runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                 }
@@ -806,13 +894,13 @@ impl AnyAgent {
                     runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
                 }
             },
-            AnyAgent::Anthropic(a) => {
+            AnyAgentInner::Anthropic(a) => {
                 runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
             }
-            AnyAgent::Gemini(a) => {
+            AnyAgentInner::Gemini(a) => {
                 runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
             }
-            AnyAgent::Ollama(a) => {
+            AnyAgentInner::Ollama(a) => {
                 runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
             }
         }
@@ -1048,6 +1136,9 @@ async fn build_openai_agent(
     reasoning_enabled: bool,
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
+    #[cfg(feature = "skills")] skill_turn_context: Option<
+        std::sync::Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+    >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> OpenAiAgent {
     match model {
@@ -1063,6 +1154,8 @@ async fn build_openai_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "skills")]
+                skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1080,6 +1173,8 @@ async fn build_openai_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "skills")]
+                skill_turn_context,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1102,8 +1197,37 @@ pub async fn build_agent(
     extra_body: Option<serde_json::Value>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
-    match model {
-        AnyModel::OpenRouter(m, routing) => AnyAgent::OpenRouter(
+    #[cfg(feature = "skills")]
+    let skills = {
+        let paths = crate::paths::process_paths();
+        let embedding = cfg.embedding.clone();
+        match paths {
+            Ok(paths) => match tokio::task::spawn_blocking(move || {
+                crate::extras::js::skills::turn::SkillRuntime::open(&paths, embedding.as_ref())
+            })
+            .await
+            {
+                Ok(Ok(runtime)) => Some(std::sync::Arc::new(runtime)),
+                Ok(Err(error)) => {
+                    tracing::warn!("skill discovery disabled: {error}");
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!("skill discovery startup worker failed: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!("skill discovery paths unavailable: {error}");
+                None
+            }
+        }
+    };
+    #[cfg(feature = "skills")]
+    let skill_turn_context = skills.as_ref().map(|runtime| runtime.turn_context());
+
+    let inner = match model {
+        AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
             builder::build_agent_inner(
                 m,
                 cli,
@@ -1115,12 +1239,14 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 merge_extra_body(routing, extra_body),
+                #[cfg(feature = "skills")]
+                skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
             .await,
         ),
-        AnyModel::OpenAI(m) => AnyAgent::OpenAI(
+        AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(
             build_openai_agent(
                 m,
                 cli,
@@ -1132,12 +1258,14 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "skills")]
+                skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
             .await,
         ),
-        AnyModel::Anthropic(m) => AnyAgent::Anthropic(
+        AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(
             builder::build_agent_inner(
                 m,
                 cli,
@@ -1149,12 +1277,14 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "skills")]
+                skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
             .await,
         ),
-        AnyModel::Gemini(m) => AnyAgent::Gemini(
+        AnyModel::Gemini(m) => AnyAgentInner::Gemini(
             builder::build_agent_inner(
                 m,
                 cli,
@@ -1166,12 +1296,14 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "skills")]
+                skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
             .await,
         ),
-        AnyModel::Ollama(m) => AnyAgent::Ollama(
+        AnyModel::Ollama(m) => AnyAgentInner::Ollama(
             builder::build_agent_inner(
                 m,
                 cli,
@@ -1183,12 +1315,19 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "skills")]
+                skill_turn_context,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
             .await,
         ),
-    }
+    };
+    AnyAgent::with_runtime(
+        inner,
+        #[cfg(feature = "skills")]
+        skills,
+    )
 }
 
 /// Builds the isolated, tool-less `/btw` agent for the active provider.
@@ -1204,19 +1343,21 @@ pub fn build_btw_agent(
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
 ) -> AnyAgent {
-    match model {
-        AnyModel::OpenRouter(m, routing) => AnyAgent::OpenRouter(builder::build_btw_agent_inner(
-            m,
-            cli,
-            cfg,
-            context,
-            permission,
-            ask_tx,
-            reasoning_enabled,
-            temperature,
-            merge_extra_body(routing, extra_body),
-        )),
-        AnyModel::OpenAI(m) => AnyAgent::OpenAI(match m {
+    let inner = match model {
+        AnyModel::OpenRouter(m, routing) => {
+            AnyAgentInner::OpenRouter(builder::build_btw_agent_inner(
+                m,
+                cli,
+                cfg,
+                context,
+                permission,
+                ask_tx,
+                reasoning_enabled,
+                temperature,
+                merge_extra_body(routing, extra_body),
+            ))
+        }
+        AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
             OpenAiModel::Responses(m) => OpenAiAgent::Responses(builder::build_btw_agent_inner(
                 m,
                 cli,
@@ -1242,7 +1383,7 @@ pub fn build_btw_agent(
                 ))
             }
         }),
-        AnyModel::Anthropic(m) => AnyAgent::Anthropic(builder::build_btw_agent_inner(
+        AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(builder::build_btw_agent_inner(
             m,
             cli,
             cfg,
@@ -1253,7 +1394,7 @@ pub fn build_btw_agent(
             temperature,
             extra_body,
         )),
-        AnyModel::Gemini(m) => AnyAgent::Gemini(builder::build_btw_agent_inner(
+        AnyModel::Gemini(m) => AnyAgentInner::Gemini(builder::build_btw_agent_inner(
             m,
             cli,
             cfg,
@@ -1264,7 +1405,7 @@ pub fn build_btw_agent(
             temperature,
             extra_body,
         )),
-        AnyModel::Ollama(m) => AnyAgent::Ollama(builder::build_btw_agent_inner(
+        AnyModel::Ollama(m) => AnyAgentInner::Ollama(builder::build_btw_agent_inner(
             m,
             cli,
             cfg,
@@ -1275,5 +1416,6 @@ pub fn build_btw_agent(
             temperature,
             extra_body,
         )),
-    }
+    };
+    AnyAgent::without_skills(inner)
 }

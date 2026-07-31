@@ -281,11 +281,8 @@ mod tests {
     #[test]
     fn test_state_preserved_across_tests() {
         let s = skill(
-            "let counter = 0; function increment() { counter++; return true; }",
-            vec![
-                "(counter === 0 && increment() && counter === 1)",
-                "counter === 1",
-            ],
+            "let counter = 0; function increment() { counter++; return counter; }",
+            vec!["increment() === 1", "increment() === 2"],
             vec![("increment", "(): boolean")],
             CapabilityTier::Pure,
             vec![],
@@ -459,6 +456,36 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_export_vacuity_is_rejected() {
+        let s = skill(
+            "function covered() { return true; } function unused() { return true; }",
+            vec!["covered()"],
+            vec![("covered", "(): boolean"), ("unused", "(): boolean")],
+            CapabilityTier::Pure,
+            vec![],
+        );
+        assert!(matches!(
+            verify_skill(&s),
+            Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
+        ));
+    }
+
+    #[test]
+    fn test_infinite_source_is_interrupted() {
+        let s = skill(
+            "while (true) {} function unreachable() { return true; }",
+            vec!["unreachable()"],
+            vec![("unreachable", "(): boolean")],
+            CapabilityTier::Pure,
+            vec![],
+        );
+        assert!(matches!(
+            verify_skill(&s),
+            Err(VerificationError::SourceEvaluationFailed(_))
+        ));
+    }
+
+    #[test]
     fn test_fresh_runtime_per_verification() {
         let s = skill(
             "function test() { return true; }",
@@ -557,8 +584,8 @@ mod required_behaviour_probes {
     fn probe_tier1_receives_declared_read_file_fake() {
         // A Tier 1 skill declaring ReadFile must be able to call the fake.
         let skill = artifact(
-            "function readIt(p) { return read_file(p); }",
-            vec!["typeof read_file === 'function'"],
+            "function readIt() { return typeof read_file; }",
+            vec!["readIt() === 'function'"],
             vec![("readIt", "readIt(path: string): string")],
             CapabilityTier::ReadOnly,
             vec![HostCapability::ReadFile],
@@ -575,8 +602,8 @@ mod required_behaviour_probes {
         // This is only meaningful if some tier DOES get globals; otherwise the
         // Tier 0 assertion is vacuous.
         let tier0 = artifact(
-            "function f() { return true; }",
-            vec!["typeof read_file === 'undefined'"],
+            "function f() { return typeof read_file; }",
+            vec!["f() === 'undefined'"],
             vec![("f", "f(): boolean")],
             CapabilityTier::Pure,
             vec![],
@@ -584,8 +611,8 @@ mod required_behaviour_probes {
         assert!(verify_skill(&tier0).is_ok(), "Tier 0 must see no read_file");
 
         let tier1 = artifact(
-            "function f() { return true; }",
-            vec!["typeof read_file === 'function'"],
+            "function f() { return typeof read_file; }",
+            vec!["f() === 'function'"],
             vec![("f", "f(): boolean")],
             CapabilityTier::ReadOnly,
             vec![HostCapability::ReadFile],
@@ -600,8 +627,8 @@ mod required_behaviour_probes {
     fn probe_undeclared_host_is_unavailable_to_tier2() {
         // Declares Spawn only; fetch must not appear.
         let skill = artifact(
-            "function f() { return true; }",
-            vec!["typeof spawn === 'function' && typeof fetch === 'undefined'"],
+            "function f() { return typeof spawn === 'function' && typeof fetch === 'undefined'; }",
+            vec!["f()"],
             vec![("f", "f(): boolean")],
             CapabilityTier::SideEffecting,
             vec![HostCapability::Spawn],

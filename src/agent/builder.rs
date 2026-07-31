@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+#[cfg(feature = "skills")]
+use std::sync::Arc;
 
 use rig::agent::{Agent, AgentBuilder};
 use rig::completion::CompletionModel;
@@ -172,6 +174,9 @@ fn register_js_tool(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     cfg: &Config,
+    #[cfg(feature = "skills")] skill_turn_context: Option<
+        Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+    >,
 ) {
     use crate::extras::js::host::AllowConfig;
     use crate::extras::js::tool::JsTool;
@@ -189,12 +194,14 @@ fn register_js_tool(
         cfg.js_fetch_origins.as_deref(),
         cfg.js_fetch_allow_http.unwrap_or(false),
     );
-    tools.push(Box::new(JsTool::new(
-        sandbox,
-        permission,
-        ask_tx,
-        allow_config,
-    )));
+    let tool = JsTool::new(sandbox, permission, ask_tx, allow_config);
+    #[cfg(feature = "skills")]
+    let tool = if let Some(context) = skill_turn_context {
+        tool.with_skill_turn_context(context)
+    } else {
+        tool
+    };
+    tools.push(Box::new(tool));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -212,6 +219,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // pin Claude to the Anthropic direct route so `cache_control` is honored).
     // `None` for providers that need no extra routing.
     additional_params: Option<serde_json::Value>,
+    #[cfg(feature = "skills")] skill_turn_context: Option<
+        Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+    >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> Agent<M> {
     #[cfg(feature = "lsp")]
@@ -371,6 +381,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             permission.clone(),
             ask_tx.clone(),
             cfg,
+            #[cfg(feature = "skills")]
+            skill_turn_context,
         );
 
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
@@ -396,6 +408,8 @@ mod js_tests {
             None,
             None,
             &crate::config::Config::default(),
+            #[cfg(feature = "skills")]
+            None,
         );
 
         assert_eq!(

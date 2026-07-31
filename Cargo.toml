@@ -45,7 +45,7 @@ hooks = []
 lsp = ["dep:lsp-types"]
 js = ["dep:rquickjs"]
 sandbox = []
-skills = ["js", "dep:rusqlite"]
+skills = ["js", "dep:rusqlite", "dep:matrixmultiply", "dep:hnsw_rs"]
 # Real ONNX/BGE embedding backend. Opt-in because `ort-sys` ships no prebuilt
 # binaries for some hosts (notably x86_64-apple-darwin); `skills` alone must build
 # everywhere and uses the deterministic backend.
@@ -112,6 +112,8 @@ lsp-types = { version = "0.97", optional = true }
 rquickjs = { version = "0.12", features = ["full"], optional = true }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+matrixmultiply = { version = "0.3.11", optional = true, features = ["threading"] }
+hnsw_rs = { version = "0.3.4", optional = true }
 fastembed = { version = "5", optional = true }
 ort = { version = "=2.0.0-rc.13", optional = true }
 
@@ -123,6 +125,18 @@ opt-level = 0
 debug = false
 codegen-units = 16
 incremental = true
+
+# Exact 100k skill retrieval delegates its contiguous matrix-vector product to
+# this small kernel crate. Keep the kernel representative in debug builds while
+# the rest of mini-agent remains unoptimized and easy to inspect.
+[profile.dev.package.matrixmultiply]
+opt-level = 3
+
+[profile.dev.package.hnsw_rs]
+opt-level = 3
+
+[profile.dev.package.anndists]
+opt-level = 3
 
 [profile.release]
 opt-level = "z"

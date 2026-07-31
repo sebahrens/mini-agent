@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use rquickjs::prelude::{Func, Opt};
-use rquickjs::{Context, Ctx, Error, Runtime, Value};
+use rquickjs::{Context, Ctx, Error, Object, Runtime, Value};
 
 use crate::extras::js::skills::fakes::{FAKES_VERSION, FakeHostGlobals, FakeTranscript};
 use crate::extras::js::skills::{
@@ -34,8 +34,6 @@ pub enum TestResult {
     Passed,
     /// Test returned `false`.
     ReturnedFalse,
-    /// Test returned a truthy non-boolean value.
-    ReturnedTruthy(String), // type name or value representation
     /// Test threw an error.
     Threw(String),
     /// Test timed out.
@@ -44,8 +42,6 @@ pub enum TestResult {
     OutOfMemory,
     /// Too many pending jobs.
     JobLimitExceeded,
-    /// Test returned a Promise that rejected.
-    PromiseRejected(String),
 }
 
 /// Outcome of the mutation pass for one export.
@@ -55,8 +51,6 @@ pub enum MutationOutcome {
     Detected,
     /// All tests still passed with the export stubbed (vacuous export).
     Undetected,
-    /// An error occurred during mutation testing.
-    Error(String),
 }
 
 /// Complete verification report for one skill.
@@ -224,6 +218,7 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
     rt.set_max_stack_size(STACK_LIMIT);
 
     let deadline = Instant::now() + VERIFY_TIMEOUT;
+    rt.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let fakes = FakeHostGlobals::new(skill.capability.clone());
 
     // Evaluate source and tests in one fresh context.
@@ -233,24 +228,10 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
     let test_results = ctx.with(|ctx| {
         // Register fake host globals based on capability manifest
         register_fakes(&ctx, &fakes, skill.capability.tier)?;
+        ctx.eval::<Value, _>(super::SKILL_REALM_HARDENING_JS)
+            .map_err(|error| VerificationError::SourceEvaluationFailed(error.to_string()))?;
 
-        // Evaluate source code as one script (first script location).
-        if let Err(e) = ctx.eval::<Value, _>(skill.source.as_str()) {
-            return Err(VerificationError::SourceEvaluationFailed(match e {
-                Error::Allocation => "OutOfMemory".to_string(),
-                Error::Exception => {
-                    let caught = ctx.catch();
-                    if let Some(ex) = caught.as_exception() {
-                        let msg = ex.message().unwrap_or_default();
-                        let stack = ex.stack().unwrap_or_default();
-                        format!("{msg}\n{stack}")
-                    } else {
-                        format!("Exception: {:?}", caught)
-                    }
-                }
-                _ => e.to_string(),
-            }));
-        }
+        evaluate_private_source(&ctx, skill)?;
 
         // Validate that declared exports exist and are functions.
         for export in &skill.exports {
@@ -296,12 +277,7 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
     });
 
     // Drain jobs OUTSIDE the context closure to avoid borrow conflicts
-    if let Some(result) = drain_jobs(&rt, deadline)
-        && matches!(
-            result,
-            TestResult::Timeout | TestResult::JobLimitExceeded | TestResult::OutOfMemory
-        )
-    {
+    if let Some(result) = drain_jobs(&rt, deadline) {
         return Err(VerificationError::SourceEvaluationFailed(format!(
             "{:?}",
             result
@@ -326,78 +302,55 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
         unreachable!("all_passed is false but no failing test found");
     }
 
-    // Mutation pass: for each export, stub it and verify at least one test fails.
-    // Use a fresh context for mutation testing to avoid RefCell borrow issues.
-    let mutation_outcomes = {
+    // Every export mutation receives a fresh Context and fresh fake state. This
+    // prevents an earlier mutation or fake side effect from making later exports
+    // appear covered.
+    let mut mutation_outcomes = Vec::with_capacity(skill.exports.len());
+    for export in &skill.exports {
+        let mutation_fakes = FakeHostGlobals::new(skill.capability.clone());
         let ctx_mut = Context::full(&rt)
             .map_err(|e| VerificationError::ContextCreationFailed(e.to_string()))?;
-
-        let outcomes = ctx_mut.with(|ctx| {
-            // Register fakes in the mutation context as well
-            register_fakes(&ctx, &fakes, skill.capability.tier)?;
-
-            // Re-evaluate source with mutation support.
-            if let Err(e) = ctx.eval::<Value, _>(skill.source.as_str()) {
-                return Err(VerificationError::SourceEvaluationFailed(e.to_string()));
-            }
-
-            let mut outcomes = Vec::new();
-
-            for export in &skill.exports {
-                // Create a throwing stub for this export.
-                let stub_code = format!(
-                    r#"(function() {{ {name} = function() {{ throw new Error("export {name} is stubbed"); }}; return true; }})()"#,
-                    name = export.name
-                );
-
-                // Replace the export.
-                if let Err(e) = ctx.eval::<Value, _>(stub_code.as_str()) {
-                    return Err(VerificationError::MutationPassFailed {
-                        export: export.name.clone(),
-                        reason: e.to_string(),
-                    });
+        let detected = ctx_mut.with(|ctx| {
+            register_fakes(&ctx, &mutation_fakes, skill.capability.tier)?;
+            ctx.eval::<Value, _>(super::SKILL_REALM_HARDENING_JS)
+                .map_err(|error| VerificationError::SourceEvaluationFailed(error.to_string()))?;
+            evaluate_private_source(&ctx, skill)?;
+            let stub_code = format!(
+                r#"(function() {{ {name} = function() {{ throw new Error("export {name} is stubbed"); }}; return true; }})()"#,
+                name = export.name
+            );
+            ctx.eval::<Value, _>(stub_code.as_str()).map_err(|error| {
+                VerificationError::MutationPassFailed {
+                    export: export.name.clone(),
+                    reason: error.to_string(),
                 }
+            })?;
 
-                // Run all tests again; at least one must fail.
-                let mut any_failed = false;
-                for test_script in &skill.tests {
-                    match eval_exact_boolean(&ctx, test_script, deadline) {
-                        Ok(true) => {
-                            // Test still passes with export stubbed - vacuous
-                        }
-                        Ok(false) => {
-                            any_failed = true;
-                        }
-                        Err(_) => {
-                            any_failed = true;
-                        }
-                    };
+            Ok::<bool, VerificationError>(skill.tests.iter().any(|test_script| {
+                !matches!(eval_exact_boolean(&ctx, test_script, deadline), Ok(true))
+            }))
+        })?;
+        drop(ctx_mut);
 
-                    if any_failed {
-                        break;
-                    }
-                }
-
-                let outcome = if any_failed {
-                    MutationOutcome::Detected
-                } else {
-                    MutationOutcome::Undetected
-                };
-                outcomes.push(outcome);
-            }
-
-            Ok(outcomes)
-        });
-
-        // Drain jobs OUTSIDE the context closure
-        if drain_jobs(&rt, deadline).is_some() {
-            // Job queue issues during mutation pass - continue anyway
+        if let Some(result) = drain_jobs(&rt, deadline) {
+            return Err(VerificationError::MutationPassFailed {
+                export: export.name.clone(),
+                reason: format!("pending job failed: {result:?}"),
+            });
         }
-
-        outcomes
-    };
-
-    let mutation_outcomes = mutation_outcomes?;
+        let outcome = if detected {
+            MutationOutcome::Detected
+        } else {
+            MutationOutcome::Undetected
+        };
+        if outcome == MutationOutcome::Undetected {
+            return Err(VerificationError::MutationPassFailed {
+                export: export.name.clone(),
+                reason: "no test detected the stubbed export".to_string(),
+            });
+        }
+        mutation_outcomes.push(outcome);
+    }
 
     Ok(VerificationReport {
         skill_id: skill.id.clone(),
@@ -415,6 +368,42 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
 }
 
 /// Register fake host globals based on capability manifest.
+fn evaluate_private_source<'js>(
+    ctx: &Ctx<'js>,
+    skill: &SkillArtifact,
+) -> Result<(), VerificationError> {
+    let namespace: Object = ctx
+        .eval(super::private_skill_source(skill))
+        .map_err(|error| {
+            VerificationError::SourceEvaluationFailed(match error {
+                Error::Allocation => "OutOfMemory".to_string(),
+                Error::Exception => {
+                    let caught = ctx.catch();
+                    if let Some(exception) = caught.as_exception() {
+                        format!(
+                            "{}\n{}",
+                            exception.message().unwrap_or_default(),
+                            exception.stack().unwrap_or_default()
+                        )
+                    } else {
+                        format!("Exception: {caught:?}")
+                    }
+                }
+                _ => error.to_string(),
+            })
+        })?;
+    let globals = ctx.globals();
+    for export in &skill.exports {
+        let value: Value = namespace
+            .get(export.name.as_str())
+            .map_err(|error| VerificationError::SourceEvaluationFailed(error.to_string()))?;
+        globals
+            .set(export.name.as_str(), value)
+            .map_err(|error| VerificationError::SourceEvaluationFailed(error.to_string()))?;
+    }
+    Ok(())
+}
+
 /// For verification, fakes are simple JavaScript stubs that exist to satisfy type checks.
 /// They record their calls to the transcript via the FakeHostGlobals Arc<Mutex>.
 fn register_fakes(

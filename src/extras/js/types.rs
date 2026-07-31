@@ -15,6 +15,8 @@ static NEXT_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct JsRequest {
     pub code: String,
+    #[cfg(feature = "skills")]
+    pub skill_bundle: Arc<crate::extras::js::skills::turn::TurnSkillBundle>,
     pub cancellation: PermCancellation,
     pub reply: tokio::sync::oneshot::Sender<JsResponse>,
 }
@@ -24,6 +26,16 @@ impl fmt::Debug for JsRequest {
         f.debug_struct("JsRequest")
             .field("code", &Redacted)
             .field("code_len", &self.code.len())
+            .field("skill_count", &{
+                #[cfg(feature = "skills")]
+                {
+                    self.skill_bundle.skills.len()
+                }
+                #[cfg(not(feature = "skills"))]
+                {
+                    0usize
+                }
+            })
             .field("cancellation", &self.cancellation)
             .field("reply", &"<oneshot sender>")
             .finish()

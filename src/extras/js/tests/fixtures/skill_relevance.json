@@ -1,0 +1,8 @@
+{
+  "cases": [
+    { "name": "semantic", "query": "unmatched wording", "vector": [1.0, 0.0], "expected": "json", "dense_floor": 0.2, "lexical_floor": 2.0 },
+    { "name": "identifier", "query": "parseCsv", "vector": [1.0, 0.0], "expected": "csv", "dense_floor": 2.0, "lexical_floor": 0.0 },
+    { "name": "mixed", "query": "parseJson", "vector": [1.0, 0.0], "expected": "json", "dense_floor": 0.2, "lexical_floor": 0.0 },
+    { "name": "irrelevant", "query": "definitely absent", "vector": [0.70710677, 0.70710677], "expected": null, "dense_floor": 0.9, "lexical_floor": 2.0 }
+  ]
+}

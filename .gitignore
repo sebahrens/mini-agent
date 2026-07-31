@@ -13,6 +13,7 @@ __pycache__/
 # Codex workspace-local home (seeded by loop.sh when using codex executor)
 .codex/
 .worktrees
+.context/
 
 # Model cache downloaded by fastembed at runtime
 .fastembed_cache/

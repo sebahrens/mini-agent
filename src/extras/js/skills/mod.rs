@@ -5,6 +5,11 @@
 //! identity. Persistence lives in [`store`], embedding in [`embed`], and no-effect
 //! verification in [`verify`].
 //!
+//! Several admission and mutation entry points are intentionally unused by the
+//! Phase 3 runtime. Phase 4 is their first production caller.
+
+#![allow(dead_code)]
+//!
 //! Identity rules (see `docs/specs/phase-3-skill-library.md`):
 //!
 //! - `id` is the full 64-character lowercase hex SHA-256 of a versioned canonical
@@ -16,26 +21,95 @@
 //! - Operational data (timestamps, status, lineage, row version, embeddings) is outside
 //!   identity. There is no update operation for identity-bearing fields.
 
-// Phase 3 is built bottom-up: this module is the persistence, embedding, and
-// verification foundation, while the beads that consume it from the runner
-// (lifecycle CRUD, index snapshots, prompt-time retrieval, turn binding) land
-// later in the phase. Until that wiring exists the whole API is reachable only
-// from tests, so dead-code analysis on a non-test binary flags every item.
-// Remove this attribute once the runner consumes the skill library — see
-// mini-agent-q0i, -y9e, -h3q, and -dqf.
-#![allow(dead_code)]
-
 use std::fmt;
 
 use sha2::{Digest, Sha256};
 
+pub mod coordinator;
 pub mod embed;
 pub mod fakes;
+pub mod index;
 pub mod store;
+pub mod turn;
 pub mod verify;
 
 /// Version of the canonical serialization scheme. Bumping this changes every identity.
 pub const IDENTITY_VERSION: u32 = 1;
+
+/// Harden the shared QuickJS realm before any untrusted skill source is evaluated.
+/// Dynamic-code constructors and prototype mutation would otherwise recover the
+/// ambient agent global from a lexical skill namespace.
+pub const SKILL_REALM_HARDENING_JS: &str = r#"
+(function () {
+  const objects = [];
+  const add = (value) => {
+    if (value && !objects.includes(value)) objects.push(value);
+  };
+  for (const value of [
+    Object.prototype, Function.prototype, Array.prototype, String.prototype,
+    Number.prototype, Boolean.prototype, RegExp.prototype, Date.prototype,
+    Error.prototype, TypeError.prototype, RangeError.prototype, ReferenceError.prototype,
+    SyntaxError.prototype, EvalError.prototype, URIError.prototype,
+    Map.prototype, Set.prototype, WeakMap.prototype, WeakSet.prototype,
+    ArrayBuffer.prototype, DataView.prototype, Promise.prototype,
+    Object.getPrototypeOf(Uint8Array.prototype),
+    Object.getPrototypeOf(async function () {}),
+    Object.getPrototypeOf(function* () {}),
+    Object.getPrototypeOf(async function* () {}),
+    JSON, Math, Reflect
+  ]) add(value);
+  for (const value of objects) {
+    if (Object.prototype.hasOwnProperty.call(value, 'constructor')) {
+      Object.defineProperty(value, 'constructor', {
+        value: undefined, writable: false, configurable: false
+      });
+    }
+  }
+  for (const value of objects) Object.freeze(value);
+  Object.defineProperty(globalThis, 'eval', {
+    value: undefined, writable: false, configurable: false
+  });
+  Object.defineProperty(globalThis, 'Function', {
+    value: undefined, writable: false, configurable: false
+  });
+})()
+"#;
+
+pub(crate) fn private_skill_source(skill: &SkillArtifact) -> String {
+    let published = skill
+        .exports
+        .iter()
+        .map(|export| {
+            let key =
+                serde_json::to_string(&export.name).unwrap_or_else(|_| "\"invalid\"".to_string());
+            format!(
+                "{key}: (typeof {name} === 'function' ? {name} : undefined)",
+                name = export.name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let host = |capability: HostCapability, name: &str| {
+        if skill.capability.allows(capability) {
+            format!("globalThis.{name}")
+        } else {
+            "undefined".to_string()
+        }
+    };
+    let read_file = host(HostCapability::ReadFile, "read_file");
+    let write_file = host(HostCapability::WriteFile, "write_file");
+    let spawn = host(HostCapability::Spawn, "spawn");
+    let fetch = host(HostCapability::Fetch, "fetch");
+    let safe_global = format!(
+        "Object.freeze({{read_file:{read_file},write_file:{write_file},spawn:{spawn},fetch:{fetch}}})"
+    );
+    format!(
+        "(function(read_file,write_file,spawn,fetch,globalThis,self,window,global,Function,Promise,__zs_Object){{\n\
+         'use strict';\n{}\n;return __zs_Object.freeze({{{published}}});\n\
+         }})({read_file},{write_file},{spawn},{fetch},{safe_global},{safe_global},{safe_global},{safe_global},undefined,undefined,Object)",
+        skill.source,
+    )
+}
 
 /// Domain separator binding identities to this scheme, so a hash computed here can never
 /// collide with a hash of the same bytes computed for another purpose.
@@ -392,9 +466,6 @@ pub enum IdentityError {
 
     #[error("capability {0} declared more than once")]
     DuplicateCapability(HostCapability),
-
-    #[error("unknown capability token: {0}")]
-    UnknownCapability(String),
 
     #[error("export {0} declared more than once")]
     DuplicateExport(String),

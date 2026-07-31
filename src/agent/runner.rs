@@ -389,6 +389,7 @@ pub fn spawn_agent<M>(
     prompt: String,
     history: Vec<Message>,
     retry_config: RetryConfig,
+    #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     // `--loop` iteration/active state, for the `Stop` hook envelope's
     // `loop_iteration`/`loop_active` fields (per-iteration reset of
     // `stop_hook_active`/the block cap falls out for free: each iteration is
@@ -405,6 +406,8 @@ where
     let subagent_event_tx = event_tx.clone();
 
     let agent_future = async move {
+        #[cfg(feature = "skills")]
+        let _turn_guard = turn_guard;
         tracing::debug!(
             "spawn_agent: prompt_len={}, history_len={}, max_attempts={}",
             prompt.len(),
@@ -1186,6 +1189,8 @@ mod tests {
             "start one".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
             #[cfg(feature = "hooks")]
             None,
         );
@@ -1194,6 +1199,8 @@ mod tests {
             "start two".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
             #[cfg(feature = "hooks")]
             None,
         );
@@ -1243,6 +1250,8 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
             #[cfg(feature = "hooks")]
             None,
         );
@@ -1300,6 +1309,8 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
             #[cfg(feature = "hooks")]
             None,
         );
@@ -1365,6 +1376,8 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
             #[cfg(feature = "hooks")]
             None,
         );

@@ -83,8 +83,8 @@ Normative specification:
   identity version.
 - Verify in a fresh no-effect context. Tests are nonempty and every expression must return exact
   JavaScript boolean `true`; mutation checks cover every export.
-- Precompute embeddings, combine exact dense and lexical retrieval, and freeze one bundle before
-  model generation for the whole user turn.
+- Precompute embeddings, combine exact/ANN dense and lexical retrieval, and freeze one bundle
+  before model generation for the whole user turn. Exact ranking remains the ANN recall oracle.
 - Admit manually verified artifacts as active in Phase 3; reserve proposal/canary states for later
   phases.
 

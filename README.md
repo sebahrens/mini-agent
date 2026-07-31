@@ -87,9 +87,9 @@ separate boundary; subprocess network isolation does not bypass or replace fetch
 | Phase | Scope | Status |
 |-------|-------|--------|
 | Foundation | Typed paths, ownership, migration, platform security | In progress |
-| 1 | Core JS engine, host globals, permissions, process wrapper | In progress |
-| 2 | `fetch`, narrowing allow-lists, Linux/macOS process isolation | Planned |
-| 3 | Immutable learned skills and prompt-time retrieval | Planned |
+| 1 | Core JS engine, host globals, permissions, process wrapper | Delivered |
+| 2 | `fetch`, narrowing allow-lists, Linux/macOS process isolation | Delivered |
+| 3 | Agent Skills, immutable learned skills, and prompt-time retrieval | Delivered |
 | 4 | Agent proposals, held-out evaluation, human-gated canary | Planned |
 | 5 | Evidence, promotion, quarantine, repair, rollback | Planned |
 
@@ -99,7 +99,7 @@ separate boundary; subprocess network isolation does not bypass or replace fetch
 |---------|---------|------|
 | `js` | — | QuickJS engine and host globals (`rquickjs`) |
 | `sandbox` | — | Linux/macOS process isolation for `spawn`, and the `fetch` global |
-| `skills` | `js` | Learned-skill store, retrieval, and no-effect verifier (`rusqlite`, bundled SQLite) |
+| `skills` | `js` | Agent Skills catalog plus learned-skill store, hybrid retrieval, and no-effect verifier |
 | `skills-embed` | `skills` | Local BGE embedding inference (`fastembed` → ONNX Runtime) |
 | `skills-embed-dynamic` | `skills-embed` | Links ONNX Runtime at run time via `ORT_DYLIB_PATH`, for hosts without prebuilt `ort-sys` binaries |
 | `mcp` | — | MCP client transports and tool discovery |

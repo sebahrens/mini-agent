@@ -32,7 +32,7 @@ planning context only; it cannot override the cited section.
 | Foundation | [platform-paths.md](platform-paths.md) | In progress | Typed Linux/macOS/Windows roots, artifact ownership, secure migration |
 | 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | Delivered | Core QuickJS integration, `JsTool`, primitive host globals |
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS process isolation |
-| 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Planned | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
+| 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Planned | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Planned | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
 
@@ -102,10 +102,10 @@ The monorepo was flattened: production source and the workspace `Cargo.toml` are
 root. Paths under `zerostack/` in a superseded artifact are historical, not aliases that new
 tracker issues may cite.
 
-Phase 1 code exists under `src/extras/js/`; that fact does not by itself close the Phase 1 exit
-gate. The Agent Skills importer/catalog, learned-JS store, retrieval indexes, admission pipeline,
-and evidence-learning lifecycle remain later-phase work. Source line numbers are intentionally
-omitted here because they drift; tracker tasks must resolve current symbols before editing.
+Phase 1 and Phase 3 code exists under `src/extras/js/`, with the portable Agent Skills catalog in
+`src/extras/skills/`. Phase 4 admission and Phase 5 evidence learning remain later-phase work.
+Source line numbers are intentionally omitted here because they drift; tracker tasks must resolve
+current symbols before editing.
 
 ## Build commands (mandatory)
 

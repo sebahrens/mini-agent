@@ -456,4 +456,5 @@ Before committing, run `cargo fmt`. Do not use `cargo build`, `cargo check`, or 
 - Fully autonomous promotion for write/process/network capabilities.
 - Model-only quality judgments as durable evidence.
 - Online mutation of active source.
-- ANN indexing before the Phase 3 exact-index benchmark exceeds its p99 budget.
+- Additional ANN backends or distributed/shared indexes beyond Phase 3's immutable local HNSW
+  generation.

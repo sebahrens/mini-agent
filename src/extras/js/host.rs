@@ -25,6 +25,107 @@ use crate::extras::js::types::{
 };
 use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox};
 
+#[cfg(feature = "skills")]
+#[derive(Clone, Default)]
+pub(crate) struct SkillCapabilityGate {
+    stack: std::sync::Arc<std::sync::Mutex<Vec<crate::extras::js::skills::CapabilityManifest>>>,
+    registered: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::extras::js::skills::CapabilityManifest>,
+        >,
+    >,
+}
+
+#[cfg(feature = "skills")]
+impl SkillCapabilityGate {
+    pub(crate) fn register(
+        &self,
+        id: String,
+        manifest: crate::extras::js::skills::CapabilityManifest,
+    ) {
+        self.registered
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, manifest);
+    }
+
+    pub(crate) fn push_registered(&self, id: &str) -> rquickjs::Result<()> {
+        let manifest = self
+            .registered
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                rquickjs::Error::new_from_js_message(
+                    "skill capability",
+                    "selected skill",
+                    "unknown selected skill identity",
+                )
+            })?;
+        self.stack
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(manifest);
+        Ok(())
+    }
+
+    pub(crate) fn pop_registered(&self) {
+        let _ = self
+            .stack
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop();
+    }
+
+    pub(crate) fn enter(
+        &self,
+        manifest: crate::extras::js::skills::CapabilityManifest,
+    ) -> SkillCapabilityGuard {
+        self.stack
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(manifest);
+        SkillCapabilityGuard { gate: self.clone() }
+    }
+
+    fn authorize(
+        &self,
+        capability: crate::extras::js::skills::HostCapability,
+    ) -> rquickjs::Result<()> {
+        let stack = self.stack.lock().unwrap_or_else(|error| error.into_inner());
+        if stack
+            .last()
+            .is_none_or(|manifest| manifest.allows(capability))
+        {
+            Ok(())
+        } else {
+            Err(rquickjs::Error::new_from_js_message(
+                "skill capability",
+                capability.as_token(),
+                "selected skill did not declare this host capability",
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "skills")]
+pub(crate) struct SkillCapabilityGuard {
+    gate: SkillCapabilityGate,
+}
+
+#[cfg(feature = "skills")]
+impl Drop for SkillCapabilityGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .gate
+            .stack
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileAccess {
     Read,
@@ -1699,39 +1800,66 @@ pub(crate) fn register_host_globals(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
     allow_config: AllowConfig,
+    #[cfg(feature = "skills")] skill_gate: SkillCapabilityGate,
 ) -> rquickjs::Result<()> {
     ctx.with(|ctx| {
         let globals = ctx.globals();
 
-        globals.set(
-            "read_file",
-            Func::from(make_read_file(
-                permission_bridge.clone(),
-                runtime.clone(),
-                allow_config.clone(),
-            )),
-        )?;
-        globals.set(
-            "write_file",
-            Func::from(make_write_file(
-                permission_bridge.clone(),
-                runtime.clone(),
-                allow_config.clone(),
-            )),
-        )?;
+        let read_file = make_read_file(
+            permission_bridge.clone(),
+            runtime.clone(),
+            allow_config.clone(),
+        );
+        #[cfg(feature = "skills")]
+        let read_file = {
+            let gate = skill_gate.clone();
+            move |path: String| {
+                gate.authorize(crate::extras::js::skills::HostCapability::ReadFile)?;
+                read_file(path)
+            }
+        };
+        globals.set("read_file", Func::from(read_file))?;
+        let write_file = make_write_file(
+            permission_bridge.clone(),
+            runtime.clone(),
+            allow_config.clone(),
+        );
+        #[cfg(feature = "skills")]
+        let write_file = {
+            let gate = skill_gate.clone();
+            move |path: String, content: String| {
+                gate.authorize(crate::extras::js::skills::HostCapability::WriteFile)?;
+                write_file(path, content)
+            }
+        };
+        globals.set("write_file", Func::from(write_file))?;
         #[cfg(feature = "sandbox")]
-        globals.set(
-            "fetch",
-            Func::from(make_fetch(
+        {
+            let fetch = make_fetch(
                 permission_bridge.clone(),
                 runtime.clone(),
                 allow_config.fetch,
-            )),
-        )?;
-        globals.set(
-            "spawn",
-            Func::from(make_spawn(sandbox, permission_bridge, runtime)),
-        )?;
+            );
+            #[cfg(feature = "skills")]
+            let fetch = {
+                let gate = skill_gate.clone();
+                move |url: String, options: Opt<Object<'_>>| {
+                    gate.authorize(crate::extras::js::skills::HostCapability::Fetch)?;
+                    fetch(url, options)
+                }
+            };
+            globals.set("fetch", Func::from(fetch))?;
+        }
+        let spawn = make_spawn(sandbox, permission_bridge, runtime);
+        #[cfg(feature = "skills")]
+        let spawn = {
+            let gate = skill_gate.clone();
+            move |command: String, arguments: Vec<String>| {
+                gate.authorize(crate::extras::js::skills::HostCapability::Spawn)?;
+                spawn(command, arguments)
+            }
+        };
+        globals.set("spawn", Func::from(spawn))?;
 
         let console = Object::new(ctx.clone())?;
         let console_bytes_remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -2981,6 +3109,8 @@ mod tests {
             permission_owner.bridge(),
             tokio::runtime::Handle::current(),
             AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            #[cfg(feature = "skills")]
+            SkillCapabilityGate::default(),
         );
 
         assert!(

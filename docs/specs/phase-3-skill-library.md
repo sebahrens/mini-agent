@@ -1,10 +1,10 @@
 # Phase 3 — Skill Library
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.0.0
-- **Delivery status**: planned
+- **Specification version**: 1.1.0
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-07-31
 - **Entry dependencies**: Foundation and Phase 1 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 3 blocker
 
@@ -46,12 +46,14 @@ respects Linux XDG variables while placing SQLite under configuration storage.
 ```toml
 # Cargo.toml additions
 [features]
-skills = ["js", "dep:rusqlite"]
+skills = ["js", "dep:rusqlite", "dep:matrixmultiply", "dep:hnsw_rs"]
 skills-embed = ["skills", "dep:fastembed"]
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 fastembed = { version = "5", optional = true }
+matrixmultiply = { version = "0.3", optional = true, features = ["threading"] }
+hnsw_rs = { version = "0.3", optional = true }
 ```
 
 `skills` implies `js`; a selectable skills-without-JS state is invalid. Gate skill code behind
@@ -77,18 +79,18 @@ resolve against the current toolchain; the versions above are what is actually b
 
 ## File placement
 
-Learned JS files go in `src/extras/js/skills/` (to be created). Portable instruction-skill import
+Learned JS files live in `src/extras/js/skills/`. Portable instruction-skill import
 is a sibling feature so its resources are never mistaken for verified JS globals:
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `src/extras/js/skills/mod.rs` | TO BE CREATED | Immutable artifact, canonical identity, capability types |
-| `src/extras/js/skills/store.rs` | TO BE CREATED | SQLite schema, identity-validating persistence, lifecycle filters |
-| `src/extras/js/skills/embed.rs` | TO BE CREATED | Cached fastembed model and versioned embedding generation |
-| `src/extras/js/skills/index.rs` | TO BE CREATED | Immutable dense snapshot, FTS ranking, fusion, budgets |
-| `src/extras/js/skills/verify.rs` | TO BE CREATED | Fresh no-effect verifier used by Phases 3–5 |
-| `src/extras/skills/import.rs` | TO BE CREATED | Agent Skills directory/ZIP validation and content-addressed installation |
-| `src/extras/skills/index.rs` | TO BE CREATED | Progressive metadata discovery for instruction skills |
+| `src/extras/js/skills/mod.rs` | IMPLEMENTED | Immutable artifact, canonical identity, capability types |
+| `src/extras/js/skills/store.rs` | IMPLEMENTED | SQLite schema, identity-validating persistence, lifecycle filters |
+| `src/extras/js/skills/embed.rs` | IMPLEMENTED | Cached embedding backends and versioned embedding generation |
+| `src/extras/js/skills/index.rs` | IMPLEMENTED | Immutable dense snapshot, FTS ranking, fusion, budgets |
+| `src/extras/js/skills/verify.rs` | IMPLEMENTED | Fresh no-effect verifier used by Phases 3–5 |
+| `src/extras/skills/import.rs` | IMPLEMENTED | Agent Skills directory/ZIP validation and content-addressed installation |
+| `src/extras/skills/index.rs` | IMPLEMENTED | Progressive metadata discovery for instruction skills |
 | `src/extras/js/mod.rs` | Phase 1 creates | Add `#[cfg(feature = "skills")] pub mod skills;` |
 | `src/extras/js/types.rs` | Phase 1 creates | Add `ResolvedSkill`/`TurnSkillBundle` to `JsRequest` |
 | `src/extras/js/engine.rs` | Phase 1 creates | Evaluate selected skills and agent code as separate scripts |
@@ -312,24 +314,26 @@ extends a logical lineage entry with eligible canary alternatives after retrieva
 candidate/predecessor near-duplicates to the search corpus.
 
 - IDs/metadata and pre-normalized equal-dimension f32 vectors are contiguous and deterministic.
-- Exact cosine ranking is a dot product; a bounded heap selects candidates without sorting every
-  row.
+- Corpora below 10,000 rows use exact contiguous dot-product ranking. Larger corpora use an
+  immutable HNSW generation; the exact path remains the recall and regression oracle.
 - SQLite BLOBs are read only when building a new generation, never per query.
 - FTS5/BM25 produces lexical candidates from exact identifiers, exports, descriptions, and tags.
 - Dense and lexical ranks are combined with reciprocal-rank fusion.
 - A dense similarity floor may reduce the result to zero; top-k is a maximum, not a quota.
 - Semantic near-duplicates are collapsed before applying source/manifest budgets.
-- Final ordering is deterministic by fused score then full skill ID.
+- Within one immutable generation, final ordering is deterministic by fused score then full skill
+  ID. Independently rebuilt HNSW graphs must each satisfy the exact-oracle recall gate.
 
 Initial policy defaults are `max_skills = 3`, a configurable dense score floor, a compact manifest
 budget, and a separate JS source-byte budget. Threshold calibration must use checked-in retrieval
 fixtures; a magic score may not be accepted only because one model happened to emit it.
 
-At the 100,000-skill target, benchmark query embedding separately from index search. The exact
-in-memory implementation must meet a 5 ms p99 search target on a documented reference machine,
-excluding embedding inference. ANN/HNSW is not a Phase 3 dependency. It may replace the trait
-implementation only when a checked-in 100,000-skill benchmark demonstrates a missed p99 budget
-and includes recall, memory, build, update, quarantine, and deletion measurements.
+At the 100,000-skill target, benchmark query embedding separately from index search. The production
+hybrid index must meet a 5 ms p99 search target and at least 95% ANN recall@10 against the exact
+oracle on a documented reference machine, excluding embedding inference. The checked-in benchmark
+also reports memory, build, rebuild, concurrent-read, retirement/purge visibility, and relevance
+measurements. Large generations build off the request path and publish atomically; lifecycle
+removal uses an immutable visibility mask so revocation does not wait for a graph rebuild.
 
 ---
 
@@ -448,39 +452,39 @@ report tied to the full artifact ID.
 
 All must pass under `cargo test --features js,skills`:
 
-- [ ] Identity changes when source, test/order, export/signature, description/tag, capability, or
+- [x] Identity changes when source, test/order, export/signature, description/tag, capability, or
       identity version changes; operational metadata does not affect identity.
-- [ ] Agent Skills directories and ZIPs load according to the open `SKILL.md` format, preserve
+- [x] Agent Skills directories and ZIPs load according to the open `SKILL.md` format, preserve
       progressive disclosure, and reject traversal, links, archive bombs, reserved filenames, and
       cross-platform normalized collisions without executing resources.
-- [ ] `allowed-tools` and Agent Skill scripts never bypass permission/capability checks or enter the
+- [x] `allowed-tools` and Agent Skill scripts never bypass permission/capability checks or enter the
       learned JS store without independent proposal and verification.
-- [ ] The skill database, model cache, import tree, and index snapshots resolve to the storage
+- [x] The skill database, model cache, import tree, and index snapshots resolve to the storage
       classes in `platform-paths.md` on Linux, macOS, and Windows.
-- [ ] Caller ID mismatch, row tampering, legacy short IDs, dimensions/model mismatch, and a
+- [x] Caller ID mismatch, row tampering, legacy short IDs, dimensions/model mismatch, and a
       simulated collision are rejected without returning source to retrieval.
-- [ ] No-effect verification requires nonempty exact-boolean tests, gives Tier 0 no host globals,
+- [x] No-effect verification requires nonempty exact-boolean tests, gives Tier 0 no host globals,
       gives Tier 1/2 only declared deterministic in-memory fakes, and mutation checks prove every
       declared export affects at least one test.
-- [ ] Embeddings are generated at admission/migration and tagged with model revision/dimensions.
-- [ ] The fastembed model and bounded query cache are reused; request-time retrieval never lazily
+- [x] Embeddings are generated at admission/migration and tagged with model revision/dimensions.
+- [x] The fastembed model and bounded query cache are reused; request-time retrieval never lazily
       embeds a stored skill.
-- [ ] The current user prompt is the primary query and retrieval completes before the first model
+- [x] The current user prompt is the primary query and retrieval completes before the first model
       output; generated JS is not present in the query.
-- [ ] Exact dense + FTS ranking, RRF fusion, threshold, dedupe, deterministic order, and manifest/
+- [x] Exact/ANN dense + FTS ranking, RRF fusion, threshold, dedupe, deterministic order, and manifest/
       source budgets have fixture tests.
-- [ ] The model-visible manifest contains only the frozen selected bundle's metadata and is present
+- [x] The model-visible manifest contains only the frozen selected bundle's metadata and is present
       before the model emits a JS tool call.
-- [ ] Every JS call in one turn receives the same immutable bundle and retries do not re-embed.
-- [ ] Skill source and agent source run as separate scripts; an agent error on line N reports line N
+- [x] Every JS call in one turn receives the same immutable bundle and retries do not re-embed.
+- [x] Skill source and agent source run as separate scripts; an agent error on line N reports line N
       with zero, one, or three selected skills.
-- [ ] Pending/canary/quarantined/superseded/retired/rejected rows never appear as independent Phase
+- [x] Pending/canary/quarantined/superseded/retired/rejected rows never appear as independent Phase
       3 search results; only Phase 5 may route an eligible canary after selecting its active lineage.
-- [ ] A 100,000-skill benchmark reports query-embedding and index-search latency separately and
-      exact search meets the documented p99 target or blocks Phase 3 closure.
-- [ ] One query embedding is reused for typed Agent Skill and learned-JS indexes, with separate
+- [x] A 100,000-skill benchmark reports query-embedding and index-search latency separately and
+      production ANN search meets the documented p99 and recall gates.
+- [x] One query embedding is reused for typed Agent Skill and learned-JS indexes, with separate
       injection budgets; `mcp,js,skills` retains normal MCP discovery and permission checks.
-- [ ] `cargo test --features js` without `skills` passes unchanged.
+- [x] `cargo test --features js` without `skills` passes unchanged.
 
 ---
 
@@ -490,4 +494,4 @@ All must pass under `cargo test --features js,skills`:
 - Cross-agent skill sharing (single-user local store only)
 - Agent proposals and human-gated canary admission (Phase 4)
 - Evidence-driven promotion, quarantine, repair, and rollback (Phase 5)
-- ANN/HNSW unless the 100,000-skill exact-index benchmark misses its p99 budget
+- Additional ANN backends or distributed/shared indexes

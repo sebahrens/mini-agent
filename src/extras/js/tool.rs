@@ -484,6 +484,8 @@ pub struct JsTool {
     js_thread: Option<std::thread::JoinHandle<()>>,
     runtime: tokio::runtime::Handle,
     _thread_stopped: Arc<AtomicBool>,
+    #[cfg(feature = "skills")]
+    skill_turn_context: Arc<crate::extras::js::skills::turn::SkillTurnContext>,
 }
 
 impl JsTool {
@@ -515,7 +517,20 @@ impl JsTool {
             js_thread: Some(js_thread),
             runtime,
             _thread_stopped: thread_stopped,
+            #[cfg(feature = "skills")]
+            skill_turn_context: Arc::new(crate::extras::js::skills::turn::SkillTurnContext::new(
+                crate::extras::js::skills::turn::TurnSkillBundle::empty("unconfigured"),
+            )),
         }
+    }
+
+    #[cfg(feature = "skills")]
+    pub fn with_skill_turn_context(
+        mut self,
+        context: Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+    ) -> Self {
+        self.skill_turn_context = context;
+        self
     }
 
     #[cfg(test)]
@@ -606,6 +621,8 @@ impl Tool for JsTool {
             .ok_or_else(|| ToolError::Msg("JS engine thread disconnected".into()))?
             .send(JsRequest {
                 code: args.code,
+                #[cfg(feature = "skills")]
+                skill_bundle: self.skill_turn_context.snapshot(),
                 cancellation,
                 reply: reply_tx,
             })

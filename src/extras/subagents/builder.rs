@@ -2,7 +2,7 @@ use crate::agent::tools;
 use crate::extras::subagents::prompt;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
-use crate::provider::{AnyAgent, AnyModel, OpenAiAgent, OpenAiModel};
+use crate::provider::{AnyAgent, AnyAgentInner, AnyModel, OpenAiAgent, OpenAiModel};
 use rig::agent::{Agent, AgentBuilder};
 use rig::completion::CompletionModel;
 
@@ -152,8 +152,8 @@ pub(crate) async fn build_explore_agent(
     let max_list_dir_entries = cfg.resolve_subagent_max_list_dir_entries();
     #[cfg(feature = "archmd")]
     let arch_ref = architecture.as_deref();
-    match model {
-        AnyModel::OpenRouter(m, extra) => AnyAgent::OpenRouter(build_explore_agent_inner(
+    let inner = match model {
+        AnyModel::OpenRouter(m, extra) => AnyAgentInner::OpenRouter(build_explore_agent_inner(
             m,
             max_turns,
             max_text_file_size,
@@ -166,7 +166,7 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
         )),
-        AnyModel::OpenAI(m) => AnyAgent::OpenAI(match m {
+        AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
             OpenAiModel::Responses(m) => OpenAiAgent::Responses(build_explore_agent_inner(
                 m,
                 max_turns,
@@ -194,7 +194,7 @@ pub(crate) async fn build_explore_agent(
                 arch_ref,
             )),
         }),
-        AnyModel::Anthropic(m) => AnyAgent::Anthropic(build_explore_agent_inner(
+        AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(build_explore_agent_inner(
             m,
             max_turns,
             max_text_file_size,
@@ -207,7 +207,7 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
         )),
-        AnyModel::Gemini(m) => AnyAgent::Gemini(build_explore_agent_inner(
+        AnyModel::Gemini(m) => AnyAgentInner::Gemini(build_explore_agent_inner(
             m,
             max_turns,
             max_text_file_size,
@@ -220,7 +220,7 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
         )),
-        AnyModel::Ollama(m) => AnyAgent::Ollama(build_explore_agent_inner(
+        AnyModel::Ollama(m) => AnyAgentInner::Ollama(build_explore_agent_inner(
             m,
             max_turns,
             max_text_file_size,
@@ -233,7 +233,8 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
         )),
-    }
+    };
+    AnyAgent::without_skills(inner)
 }
 
 #[cfg(test)]

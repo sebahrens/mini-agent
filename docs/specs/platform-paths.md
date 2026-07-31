@@ -200,14 +200,16 @@ Agent Skill metadata and learned JS skill metadata use progressive disclosure an
 query embedding per user turn. The query embedding may be shared by typed indexes, but each
 catalog has a separate result and prompt budget:
 
-- Agent Skills inject selected `SKILL.md` instructions and expose resources on demand.
+- Agent Skills inject selected `SKILL.md` instructions and validated resources within independent
+  disclosure budgets.
 - Learned JS skills expose a compact manifest to the model and bind exact verified JS source only
   inside the frozen `TurnSkillBundle`.
 
 The current user prompt plus bounded deterministic context is the query. Stored skill vectors are
 precomputed. SQLite is never scanned in the request path, generated JS is never a retrieval query,
-and retries reuse the same bundle. Phase 3's exact pre-normalized dense scan, FTS5/BM25 fusion,
-score floor, dedupe, and 5 ms p99 index-search target remain mandatory at 100,000 revisions.
+and retries reuse the same bundle. Phase 3's pre-normalized exact/ANN dense retrieval, FTS5/BM25
+fusion, score floor, dedupe, 5 ms p99 index-search target, and 95% recall@10 gate against the exact
+oracle remain mandatory at 100,000 revisions.
 
 MCP remains an independent, default-enabled Cargo feature. Standard Agent Skill instructions may
 direct the model to configured MCP tools, but cannot create trusted MCP identities or bypass

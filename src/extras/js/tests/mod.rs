@@ -1,5 +1,17 @@
 #[cfg(feature = "skills")]
+mod agent_skill_catalog;
+#[cfg(feature = "skills")]
 mod skill_embedder;
+#[cfg(feature = "skills")]
+mod skill_index;
+#[cfg(feature = "skills")]
+mod skill_retrieval_benchmark;
+#[cfg(feature = "skills")]
+mod skill_runtime_binding;
+#[cfg(feature = "skills")]
+mod skill_runtime_prompt;
+#[cfg(feature = "skills")]
+mod skill_store_identity;
 #[cfg(feature = "skills")]
 mod skill_store_schema;
 #[cfg(feature = "skills")]
@@ -513,6 +525,10 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
     request_tx
         .send(JsRequest {
             code: "1 + 1".to_string(),
+            #[cfg(feature = "skills")]
+            skill_bundle: std::sync::Arc::new(
+                crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
+            ),
             cancellation: PermCancellation::new(),
             reply: completed_reply,
         })
@@ -525,6 +541,10 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
     request_tx
         .send(JsRequest {
             code: "throw new Error('must not execute')".to_string(),
+            #[cfg(feature = "skills")]
+            skill_bundle: std::sync::Arc::new(
+                crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
+            ),
             cancellation,
             reply: cancelled_reply,
         })
@@ -534,6 +554,10 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
     request_tx
         .send(JsRequest {
             code: "42".to_string(),
+            #[cfg(feature = "skills")]
+            skill_bundle: std::sync::Arc::new(
+                crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
+            ),
             cancellation: PermCancellation::new(),
             reply: recovery_reply,
         })
