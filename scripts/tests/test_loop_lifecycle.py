@@ -20,6 +20,43 @@ def extract_function(source: str, name: str, next_name: str) -> str:
 
 
 class LoopLifecycleTests(unittest.TestCase):
+    def test_verification_errors_are_appended_with_real_newlines(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+        append_function = extract_function(
+            source,
+            "append_verification_error",
+            "report_verification_failure",
+        )
+        harness = f"""
+set -eu
+
+errors=
+
+{append_function}
+
+append_verification_error "verifier missing" "No checker for generated.pyc"
+append_verification_error "cargo fmt errors" $'first line\\nsecond line'
+printf '%s' "$errors"
+"""
+
+        completed = subprocess.run(
+            ["bash", "-c", harness],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(
+            "=== verifier missing ===\n"
+            "No checker for generated.pyc\n\n"
+            "=== cargo fmt errors ===\n"
+            "first line\n"
+            "second line\n\n",
+            completed.stdout,
+        )
+
     def test_verification_failure_description_uses_real_newlines(self) -> None:
         source = LOOP_SCRIPT.read_text()
         report_function = extract_function(
@@ -391,6 +428,11 @@ git diff --cached --name-status
 
     def test_run_verification_accepts_headless_workflow_only_commit(self) -> None:
         source = LOOP_SCRIPT.read_text()
+        append_function = extract_function(
+            source,
+            "append_verification_error",
+            "report_verification_failure",
+        )
         relevance_function = extract_function(
             source,
             "path_is_generated_python_bytecode",
@@ -426,6 +468,8 @@ sign_test_binaries() {{
 report_verification_failure() {{
     return 1
 }}
+
+{append_function}
 
 {relevance_function}
 

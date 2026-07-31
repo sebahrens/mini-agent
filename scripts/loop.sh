@@ -724,6 +724,11 @@ sign_test_binaries() {
     echo -e "${BOLD}│${NC}  ${DIM}codesign: signed=${signed} reused=${reused} failed=${failed}${NC}"
 }
 
+append_verification_error() {
+    local heading="$1" body="$2"
+    printf -v errors '%s=== %s ===\n%s\n\n' "$errors" "$heading" "$body"
+}
+
 report_verification_failure() {
     local errors="$1" source_bead="${PICKED_ID:-unknown}"
     [ ${#errors} -gt 3000 ] && errors="[truncated]..${errors: -3000}"
@@ -784,11 +789,11 @@ run_verification() {
     if ! git rev-parse "$range_base" "$range_head" >/dev/null 2>&1 \
             || ! changed_files=$(git diff --name-only "$range_base" "$range_head" 2>/dev/null); then
         failed=1; real_failure=1
-        errors+="=== verification range ===$'\n'Unable to inspect $range_base..$range_head$'\n\n'"
+        append_verification_error "verification range" "Unable to inspect $range_base..$range_head"
     elif [ -z "$changed_files" ]; then
         failed=1
         # No files at all were committed — not a build error, just nothing changed.
-        errors+="=== verification range ===$'\n'No files changed in $range_base..$range_head$'\n\n'"
+        append_verification_error "verification range" "No files changed in $range_base..$range_head"
     fi
 
     echo -e "${BOLD}│${NC}  ${CYAN}git diff --check...${NC}"
@@ -797,7 +802,7 @@ run_verification() {
     else
         failed=1; real_failure=1
         echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} git diff --check"
-        errors+="=== diff errors ===$'\n'${diff_check_output}$'\n\n'"
+        append_verification_error "diff errors" "$diff_check_output"
     fi
 
     local changed_file syntax_output first_line relevant shell_file
@@ -825,7 +830,7 @@ run_verification() {
             else
                 failed=1; real_failure=1
                 echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} bash -n ${changed_file}"
-                errors+="=== shell syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                append_verification_error "shell syntax errors (${changed_file})" "$syntax_output"
             fi
             continue
         fi
@@ -843,90 +848,90 @@ run_verification() {
             *.json)
                 if ! command -v jq >/dev/null 2>&1; then
                     failed=1; real_failure=1
-                    errors+="=== JSON verification unavailable ===$'\n'jq is required for ${changed_file}$'\n\n'"
+                    append_verification_error "JSON verification unavailable" "jq is required for ${changed_file}"
                 elif ! syntax_output=$(jq empty "$changed_file" 2>&1); then
                     failed=1; real_failure=1
-                    errors+="=== JSON syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                    append_verification_error "JSON syntax errors (${changed_file})" "$syntax_output"
                 fi
                 ;;
             *.yaml|*.yml)
                 if command -v ruby >/dev/null 2>&1; then
                     syntax_output=$(ruby -e 'require "psych"; Psych.parse_file(ARGV.fetch(0))' "$changed_file" 2>&1) || {
                         failed=1; real_failure=1
-                        errors+="=== YAML syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                        append_verification_error "YAML syntax errors (${changed_file})" "$syntax_output"
                     }
                 elif command -v python3 >/dev/null 2>&1 \
                         && python3 -c 'import yaml' >/dev/null 2>&1; then
                     syntax_output=$(python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1], encoding="utf-8"))' "$changed_file" 2>&1) || {
                         failed=1; real_failure=1
-                        errors+="=== YAML syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                        append_verification_error "YAML syntax errors (${changed_file})" "$syntax_output"
                     }
                 else
                     failed=1; real_failure=1
-                    errors+="=== YAML verification unavailable ===$'\n'No Ruby Psych or Python PyYAML for ${changed_file}$'\n\n'"
+                    append_verification_error "YAML verification unavailable" "No Ruby Psych or Python PyYAML for ${changed_file}"
                 fi
                 ;;
             *.js|*.mjs|*.cjs)
                 if ! command -v node >/dev/null 2>&1; then
                     failed=1; real_failure=1
-                    errors+="=== JavaScript verification unavailable ===$'\n'node is required for ${changed_file}$'\n\n'"
+                    append_verification_error "JavaScript verification unavailable" "node is required for ${changed_file}"
                 elif ! syntax_output=$(node --check "$changed_file" 2>&1); then
                     failed=1; real_failure=1
-                    errors+="=== JavaScript syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                    append_verification_error "JavaScript syntax errors (${changed_file})" "$syntax_output"
                 fi
                 ;;
             *.rb)
                 if ! command -v ruby >/dev/null 2>&1; then
                     failed=1; real_failure=1
-                    errors+="=== Ruby verification unavailable ===$'\n'ruby is required for ${changed_file}$'\n\n'"
+                    append_verification_error "Ruby verification unavailable" "ruby is required for ${changed_file}"
                 elif ! syntax_output=$(ruby -c "$changed_file" 2>&1); then
                     failed=1; real_failure=1
-                    errors+="=== Ruby syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                    append_verification_error "Ruby syntax errors (${changed_file})" "$syntax_output"
                 fi
                 ;;
             *.py)
                 if ! command -v python3 >/dev/null 2>&1; then
                     failed=1; real_failure=1
-                    errors+="=== Python verification unavailable ===$'\n'python3 is required for ${changed_file}$'\n\n'"
+                    append_verification_error "Python verification unavailable" "python3 is required for ${changed_file}"
                 else
                     mkdir -p target/.loop-pycache
                     if ! syntax_output=$(PYTHONPYCACHEPREFIX="$PWD/target/.loop-pycache" python3 -m py_compile "$changed_file" 2>&1); then
                         failed=1; real_failure=1
-                        errors+="=== Python syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                        append_verification_error "Python syntax errors (${changed_file})" "$syntax_output"
                     fi
                 fi
                 ;;
             *.ps1)
                 if ! command -v pwsh >/dev/null 2>&1; then
                     failed=1; real_failure=1
-                    errors+="=== PowerShell verification unavailable ===$'\n'pwsh is required for ${changed_file}$'\n\n'"
+                    append_verification_error "PowerShell verification unavailable" "pwsh is required for ${changed_file}"
                 elif ! syntax_output=$(pwsh -NoProfile -Command '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$null, [ref]$errors); if ($errors) { $errors | Out-String | Write-Error; exit 1 }' "$changed_file" 2>&1); then
                     failed=1; real_failure=1
-                    errors+="=== PowerShell syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                    append_verification_error "PowerShell syntax errors (${changed_file})" "$syntax_output"
                 fi
                 ;;
             *.nix)
                 if ! command -v nix-instantiate >/dev/null 2>&1; then
                     failed=1; real_failure=1
-                    errors+="=== Nix verification unavailable ===$'\n'nix-instantiate is required for ${changed_file}$'\n\n'"
+                    append_verification_error "Nix verification unavailable" "nix-instantiate is required for ${changed_file}"
                 elif ! syntax_output=$(nix-instantiate --parse "$changed_file" 2>&1); then
                     failed=1; real_failure=1
-                    errors+="=== Nix syntax errors (${changed_file}) ===$'\n'${syntax_output}$'\n\n'"
+                    append_verification_error "Nix syntax errors (${changed_file})" "$syntax_output"
                 fi
                 ;;
             justfile)
                 if ! command -v just >/dev/null 2>&1; then
                     failed=1; real_failure=1
-                    errors+="=== justfile verification unavailable ===$'\n'just is required for ${changed_file}$'\n\n'"
+                    append_verification_error "justfile verification unavailable" "just is required for ${changed_file}"
                 elif ! syntax_output=$(just --summary --justfile "$changed_file" 2>&1); then
                     failed=1; real_failure=1
-                    errors+="=== justfile syntax errors ===$'\n'${syntax_output}$'\n\n'"
+                    append_verification_error "justfile syntax errors" "$syntax_output"
                 fi
                 ;;
             *)
                 if [ "$relevant" = true ]; then
                     failed=1; real_failure=1
-                    errors+="=== verifier missing ===$'\n'No automated checker is configured for relevant file ${changed_file} (profile=${profile})$'\n\n'"
+                    append_verification_error "verifier missing" "No automated checker is configured for relevant file ${changed_file} (profile=${profile})"
                 fi
                 ;;
         esac
@@ -937,7 +942,7 @@ run_verification() {
         # Do NOT set real_failure=1: "no relevant code changed" is not a build
         # error. The PICKED bead will be reopened for retry but no new child P0
         # is spawned — that was the source of the runaway "fix build errors" chain.
-        errors+="=== relevance allowlist ===$'\n'No ${profile} production implementation file changed for declared surfaces: ${surfaces}$'\n\n'"
+        append_verification_error "relevance allowlist" "No ${profile} production implementation file changed for declared surfaces: ${surfaces}"
     fi
 
     # mini-agent workspace: root package (mini-agent) and spike/.
@@ -982,7 +987,7 @@ run_verification() {
         echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} cargo fmt --check"
     else
         failed=1; real_failure=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} cargo fmt --check"
-        errors+="=== cargo fmt errors ===$'\n'${fmt_output}$'\n\n'"
+        append_verification_error "cargo fmt errors" "$fmt_output"
     fi
 
     # Scope clippy to touched crates when possible; fall back to workspace.
@@ -1004,7 +1009,7 @@ run_verification() {
         echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} ${clippy_cmd_label}"
     else
         failed=1; real_failure=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${clippy_cmd_label}"
-        errors+="=== cargo clippy errors ===$'\n'${clippy_output}$'\n\n'"
+        append_verification_error "cargo clippy errors" "$clippy_output"
     fi
 
     # Every accepted Rust iteration executes all unit and integration tests for
@@ -1015,7 +1020,7 @@ run_verification() {
     if [ "${LOOP_TEST_TIER:-full}" != full ]; then
         echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} LOOP_TEST_TIER may not skip integration tests"
         failed=1; real_failure=1
-        errors+="=== test policy ===$'\n'Every Rust acceptance requires the full test tier$'\n\n'"
+        append_verification_error "test policy" "Every Rust acceptance requires the full test tier"
     else
         local test_log="$cargo_dir/target/.loop-test.log"
         mkdir -p "$(dirname "$test_log")"
@@ -1062,7 +1067,7 @@ run_verification() {
             else
                 failed=1; real_failure=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${test_cmd_label} --no-run"
                 test_output=$(cat "$norun_log" 2>/dev/null || echo "(norun log missing)")
-                errors+="=== test build errors (${test_cmd_label} --no-run) ===$'\n'${test_output}$'\n\n'"
+                append_verification_error "test build errors (${test_cmd_label} --no-run)" "$test_output"
             fi
         else
             echo -e "${BOLD}│${NC}  ${YELLOW}SKIP${NC} jq missing — cache disabled, falling back to cargo test"
@@ -1071,7 +1076,7 @@ run_verification() {
             else
                 failed=1; real_failure=1; echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} ${test_cmd_label}"
                 test_output=$(cat "$test_log" 2>/dev/null || echo "(test log missing)")
-                errors+="=== test errors (${test_cmd_label}) ===$'\n'${test_output}$'\n\n'"
+                append_verification_error "test errors (${test_cmd_label})" "$test_output"
             fi
         fi
 
@@ -1161,7 +1166,7 @@ run_verification() {
             else
                 echo -e "${BOLD}│${NC}  ${RED}FAIL${NC} test exec (${cached} cache hits before failure)"
                 test_output=$(cat "$test_log" 2>/dev/null || echo "(test log missing)")
-                errors+="=== test errors (${test_cmd_label}) ===$'\n'${test_output}$'\n\n'"
+                append_verification_error "test errors (${test_cmd_label})" "$test_output"
             fi
         elif [ "$failed" = "0" ] && [ "$_have_bins" = true ]; then
             echo -e "${BOLD}│${NC}  ${GREEN}PASS${NC} all ${cached} binaries cached — nothing to exec"
