@@ -12,3 +12,4 @@ __pycache__/
 
 # Codex workspace-local home (seeded by loop.sh when using codex executor)
 .codex/
+.worktrees
