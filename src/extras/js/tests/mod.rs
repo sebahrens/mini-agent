@@ -1,5 +1,5 @@
-use crate::extras::js::tool::JsTool;
 use crate::extras::js::host::AllowConfig;
+use crate::extras::js::tool::JsTool;
 use crate::extras::js::types::{
     JsOutcome, JsRequest, JsResponse, PermCancellation, STEP_TIMEOUT, THREAD_STACK,
 };
@@ -434,7 +434,13 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
         .name("js-reply-drop-test".into())
         .stack_size(THREAD_STACK)
         .spawn(move || {
-            js_thread_main(request_rx, Sandbox::new(false, "bwrap"), bridge, runtime);
+            js_thread_main(
+                request_rx,
+                Sandbox::new(false, "bwrap"),
+                bridge,
+                runtime,
+                AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            );
         })
         .expect("failed to spawn JS reply-drop test thread");
 

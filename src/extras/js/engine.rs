@@ -497,6 +497,7 @@ mod tests {
                     Sandbox::new(false, "bwrap"),
                     permission_bridge,
                     runtime,
+                    AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
                 );
             })
             .expect("failed to spawn JS test thread");

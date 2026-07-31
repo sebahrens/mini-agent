@@ -46,13 +46,14 @@ impl std::fmt::Display for AllowPolicyReason {
             Self::InvalidConfiguration(access) => {
                 (access, "the configured roots are invalid or ambiguous")
             }
-            Self::InvalidTarget(access) => (access, "the target path is invalid or cannot be resolved"),
-            Self::AmbiguousSymlink(access) => {
-                (access, "the target is a final or dangling symlink")
+            Self::InvalidTarget(access) => {
+                (access, "the target path is invalid or cannot be resolved")
             }
-            Self::OutsideConfiguredRoots(access) => {
-                (access, "the resolved target is outside the configured roots")
-            }
+            Self::AmbiguousSymlink(access) => (access, "the target is a final or dangling symlink"),
+            Self::OutsideConfiguredRoots(access) => (
+                access,
+                "the resolved target is outside the configured roots",
+            ),
         };
         write!(formatter, "JS file {} denied: {reason}", access.as_str())
     }
@@ -95,28 +96,14 @@ impl AllowConfig {
         let Ok(base) = base else {
             return Self {
                 base: startup_base.to_path_buf(),
-                read: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(
-                    FileAccess::Read,
-                )),
-                write: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(
-                    FileAccess::Write,
-                )),
+                read: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Read)),
+                write: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Write)),
             };
         };
 
         Self {
-            read: build_path_policy(
-                &base,
-                read_roots,
-                read_unrestricted,
-                FileAccess::Read,
-            ),
-            write: build_path_policy(
-                &base,
-                write_roots,
-                write_unrestricted,
-                FileAccess::Write,
-            ),
+            read: build_path_policy(&base, read_roots, read_unrestricted, FileAccess::Read),
+            write: build_path_policy(&base, write_roots, write_unrestricted, FileAccess::Write),
             base,
         }
     }
@@ -141,7 +128,6 @@ impl AllowConfig {
         };
         authorize_resolved(&self.write, resolved, FileAccess::Write)
     }
-
 }
 
 fn path_has_ambiguous_spelling(path: &Path) -> bool {
@@ -271,23 +257,16 @@ fn build_path_policy(
     PathPolicy::Roots(canonical_roots)
 }
 
-fn resolve_policy_read_target(
-    base: &Path,
-    target: &Path,
-) -> Result<PathBuf, AllowPolicyReason> {
+fn resolve_policy_read_target(base: &Path, target: &Path) -> Result<PathBuf, AllowPolicyReason> {
     if path_has_ambiguous_spelling(target) {
         return Err(AllowPolicyReason::InvalidTarget(FileAccess::Read));
     }
     let absolute = absolute_lexical_from(base, target)
         .map_err(|_| AllowPolicyReason::InvalidTarget(FileAccess::Read))?;
-    std::fs::canonicalize(absolute)
-        .map_err(|_| AllowPolicyReason::InvalidTarget(FileAccess::Read))
+    std::fs::canonicalize(absolute).map_err(|_| AllowPolicyReason::InvalidTarget(FileAccess::Read))
 }
 
-fn resolve_policy_write_target(
-    base: &Path,
-    target: &Path,
-) -> Result<PathBuf, AllowPolicyReason> {
+fn resolve_policy_write_target(base: &Path, target: &Path) -> Result<PathBuf, AllowPolicyReason> {
     use std::path::Component;
 
     if path_has_ambiguous_spelling(target) {
@@ -939,7 +918,10 @@ mod tests {
         let policy =
             AllowConfig::from_settings(temp.path(), None, Some(&roots), Some(&roots), false, false);
 
-        assert_eq!(expect_allowed(policy.authorize_read(&safe)), safe.canonicalize().unwrap());
+        assert_eq!(
+            expect_allowed(policy.authorize_read(&safe)),
+            safe.canonicalize().unwrap()
+        );
         assert_eq!(
             expect_allowed(policy.authorize_read(&descendant)),
             descendant.canonicalize().unwrap()
@@ -1056,14 +1038,8 @@ mod tests {
         );
 
         let valid = vec![temp.path().to_string_lossy().into_owned()];
-        let ambiguous = AllowConfig::from_settings(
-            temp.path(),
-            None,
-            Some(&valid),
-            Some(&valid),
-            true,
-            true,
-        );
+        let ambiguous =
+            AllowConfig::from_settings(temp.path(), None, Some(&valid), Some(&valid), true, true);
         expect_denied(
             ambiguous.authorize_read(temp.path()),
             AllowPolicyReason::InvalidConfiguration(FileAccess::Read),
