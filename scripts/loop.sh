@@ -730,7 +730,7 @@ report_verification_failure() {
 
     if bd create --title="Fix build errors from iteration $CURRENT_ITERATION ($source_bead)" \
             --type=bug --priority=0 \
-            --description="Post-agent verification failed. Fix before any other work.$'\n\n'$errors" \
+            --description=$'Post-agent verification failed. Fix before any other work.\n\n'"$errors" \
             >/dev/null 2>&1; then
         echo -e "${RED}  Filed P0 bug bead — next iteration will pick it up${NC}"
     else

@@ -20,6 +20,58 @@ def extract_function(source: str, name: str, next_name: str) -> str:
 
 
 class LoopLifecycleTests(unittest.TestCase):
+    def test_verification_failure_description_uses_real_newlines(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+        report_function = extract_function(
+            source,
+            "report_verification_failure",
+            "run_verification",
+        )
+        harness = f"""
+set -eu
+
+CURRENT_ITERATION=77
+PICKED_ID=mini-agent-test
+RED=
+NC=
+
+bd() {{
+    [ "$1" = create ] || return 1
+    shift
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --description ]; then
+            shift
+            printf '%s' "$1" > "$CAPTURE_FILE"
+            return 0
+        fi
+        shift
+    done
+    return 1
+}}
+
+{report_function}
+
+report_verification_failure $'=== verifier missing ===\\npath.pyc\\n'
+"""
+
+        with tempfile.TemporaryDirectory() as temp_directory:
+            capture_file = Path(temp_directory) / "description.txt"
+            completed = subprocess.run(
+                ["bash", "-c", harness],
+                cwd=REPOSITORY_ROOT,
+                env={"CAPTURE_FILE": str(capture_file), "PATH": "/usr/bin:/bin"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                "Post-agent verification failed. Fix before any other work.\n\n"
+                "=== verifier missing ===\npath.pyc\n",
+                capture_file.read_text(),
+            )
+
     def test_clean_install_uses_online_resilient_cargo_network_settings(self) -> None:
         source = LOOP_SCRIPT.read_text()
         install_function = extract_function(
