@@ -82,6 +82,7 @@ jobs:
         run: cargo test --locked linux_sandbox_policy
 
       - name: Test shared sandbox module
+        # Keep this as a block scalar: Psych rejects a plain scalar ending in `::`.
         run: |
           cargo test --locked 'sandbox::'
 
