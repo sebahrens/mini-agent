@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -171,6 +172,125 @@ path_is_relevant_for_profile scripts/tests/test_loop_lifecycle.py headless scrip
         )
 
         self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_run_verification_accepts_headless_workflow_only_commit(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+        relevance_function = extract_function(
+            source,
+            "path_is_relevant_for_profile",
+            "current_iteration_has_relevant_changes",
+        )
+        verification_function = extract_function(
+            source,
+            "run_verification",
+            "show_agent_progress",
+        )
+        harness = f"""
+set -eu
+
+MODE=build
+CURRENT_ITERATION=1
+PICKED_ID=mini-agent-test
+BOLD=
+CYAN=
+DIM=
+GREEN=
+NC=
+RED=
+YELLOW=
+
+path_is_cargo_verified_fixture() {{
+    return 1
+}}
+
+sign_test_binaries() {{
+    :
+}}
+
+report_verification_failure() {{
+    return 1
+}}
+
+{relevance_function}
+
+{verification_function}
+
+run_verification HEAD~1 HEAD headless rust
+"""
+
+        with tempfile.TemporaryDirectory() as temp_directory:
+            repository = Path(temp_directory)
+            fake_bin = repository / "fake-bin"
+            fake_bin.mkdir()
+            fake_cargo = fake_bin / "cargo"
+            fake_cargo.write_text("#!/usr/bin/env bash\nexit 0\n")
+            fake_cargo.chmod(0o755)
+
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=repository,
+                check=True,
+            )
+            (repository / "Cargo.toml").write_text(
+                '[package]\nname = "verification-fixture"\nversion = "0.1.0"\n'
+            )
+            subprocess.run(
+                ["git", "add", "Cargo.toml"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Loop Test",
+                    "-c",
+                    "user.email=loop@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "base",
+                ],
+                cwd=repository,
+                check=True,
+            )
+
+            workflow = repository / ".github" / "workflows" / "ci.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("name: CI\n")
+            subprocess.run(
+                ["git", "add", ".github/workflows/ci.yml"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Loop Test",
+                    "-c",
+                    "user.email=loop@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "workflow",
+                ],
+                cwd=repository,
+                check=True,
+            )
+
+            completed = subprocess.run(
+                ["bash", "-c", harness],
+                cwd=repository,
+                env={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("All checks passed", completed.stdout)
+        self.assertNotIn("relevance allowlist", completed.stderr)
 
     def test_reopened_bead_can_be_claimed_again(self) -> None:
         source = LOOP_SCRIPT.read_text()
