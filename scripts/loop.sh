@@ -802,6 +802,7 @@ run_verification() {
 
     local changed_file syntax_output first_line relevant shell_file
     while IFS= read -r changed_file; do
+        path_is_generated_python_bytecode "$changed_file" && continue
         [ -n "$changed_file" ] && [ -f "$changed_file" ] || continue
         relevant=false
         if path_is_relevant_for_profile "$changed_file" "$profile" "$surfaces"; then
@@ -2027,14 +2028,19 @@ path_is_cargo_verified_fixture() {
     esac
 }
 
+path_is_generated_python_bytecode() {
+    case "$1" in
+        */__pycache__/*|*.pyc|*.pyo) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 path_is_relevant_for_profile() {
     local path="$1" profile="$2" surfaces="${3:-rust}"
     # Generated Python bytecode is never an implementation surface. It can
     # appear under scripts/ after a local test run, but has no source verifier
     # and must not make an iteration relevant (or trigger "verifier missing").
-    case "$path" in
-        */__pycache__/*|*.pyc|*.pyo) return 1 ;;
-    esac
+    path_is_generated_python_bytecode "$path" && return 1
     case "$path" in
         src/*|Cargo.toml|Cargo.lock|build.rs|scripts/loop.sh|.github/workflows/*.yml|.github/workflows/*.yaml) return 0 ;;
     esac
