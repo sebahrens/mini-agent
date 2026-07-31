@@ -257,4 +257,10 @@ fn test_build_loop_refreshes_generated_bytecode_policy_before_verification() {
 #[test]
 fn test_workflow_only_headless_relevance_check_executes_embedded_policy() {
     crate::extras::r#loop::verify_workflow_only_headless_relevance().unwrap();
+
+    let workflow = include_str!("../../.github/workflows/ci.yml");
+    assert!(
+        workflow.contains("run: >-\n          cargo test --locked sandbox::"),
+        "the shared sandbox test filter must remain inside a YAML-safe block scalar",
+    );
 }
