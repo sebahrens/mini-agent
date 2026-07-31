@@ -2074,11 +2074,17 @@ current_iteration_has_relevant_changes() {
     return 1
 }
 
-# Stage automatic loop commits without sweeping tracked Beads exports into
-# product history. Return success only when a non-Beads change is staged.
+# Stage automatic loop commits without sweeping tracked Beads exports or
+# generated Python bytecode into product history. Return success only when a
+# product change is staged.
 stage_non_beads_changes() {
+    local path
     git add -A || return 1
     git reset -q -- .beads 2>/dev/null || return 1
+    while IFS= read -r path; do
+        path_is_generated_python_bytecode "$path" || continue
+        git reset -q -- "$path" 2>/dev/null || return 1
+    done < <(git diff --cached --name-only)
     ! git diff --cached --quiet
 }
 
