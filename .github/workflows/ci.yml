@@ -82,6 +82,7 @@ jobs:
         run: cargo test --locked linux_sandbox_policy
 
       - name: Test shared sandbox module
+        # A plain YAML scalar ending in `::` is parsed as an invalid mapping.
         run: |
           cargo test --locked 'sandbox::'
 
