@@ -82,6 +82,15 @@ allow-list restriction, an unknown URL follows the normal permission policy: int
 when available and fail-closed in non-interactive mode. Redirects are disabled or each target
 repeats normalization, allow-list, and permission checks before redirected I/O.
 
+The blocking transport disables automatic redirects, ambient proxy discovery, connection pooling,
+and transparent response decompression. Its default connect and per-read timeouts are three
+seconds, with a separate ten-second wall-clock deadline across the full streamed response. Request
+headers are limited to 64 fields/16 KiB and request bodies to 256 KiB; response headers are limited
+to 128 fields/64 KiB and response bodies to 1 MiB. Header and body limits are checked incrementally
+with overflow-safe accounting. Bodies must be UTF-8. Any `Content-Encoding` other than `identity`
+is rejected, so compressed bytes are never expanded into an unbounded hidden representation.
+Cancellation is checked before the request, after response headers, and between streamed reads.
+
 The host never exposes ambient `fetch`, a general socket API, or an authorization path independent
 of the existing permission service.
 

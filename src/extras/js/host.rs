@@ -6,6 +6,15 @@ use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
+#[cfg(feature = "sandbox")]
+use reqwest::Url;
+#[cfg(feature = "sandbox")]
+use std::io::Read;
+#[cfg(feature = "sandbox")]
+use std::net::SocketAddr;
+#[cfg(feature = "sandbox")]
+use std::time::Instant;
+
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::{
     READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
@@ -352,6 +361,351 @@ impl<'js> IntoJs<'js> for SpawnResult {
         obj.set("stdout_truncated", self.stdout_truncated)?;
         obj.set("stderr_truncated", self.stderr_truncated)?;
         Ok(obj.into())
+    }
+}
+
+#[cfg(feature = "sandbox")]
+const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(feature = "sandbox")]
+const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(feature = "sandbox")]
+const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "sandbox")]
+const FETCH_REQUEST_HEADER_MAX_BYTES: usize = 16 * 1024;
+#[cfg(feature = "sandbox")]
+const FETCH_REQUEST_HEADER_MAX_COUNT: usize = 64;
+#[cfg(feature = "sandbox")]
+const FETCH_REQUEST_BODY_MAX_BYTES: usize = 256 * 1024;
+#[cfg(feature = "sandbox")]
+const FETCH_RESPONSE_HEADER_MAX_BYTES: usize = 64 * 1024;
+#[cfg(feature = "sandbox")]
+const FETCH_RESPONSE_HEADER_MAX_COUNT: usize = 128;
+#[cfg(feature = "sandbox")]
+const FETCH_RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
+
+#[cfg(feature = "sandbox")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FetchResult {
+    pub status: u16,
+    pub text: String,
+}
+
+#[cfg(feature = "sandbox")]
+impl<'js> IntoJs<'js> for FetchResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set("status", self.status)?;
+        object.set("text", self.text)?;
+        Ok(object.into())
+    }
+}
+
+#[cfg(feature = "sandbox")]
+#[derive(Debug, Clone)]
+pub(crate) struct FetchRequest {
+    method: reqwest::Method,
+    headers: reqwest::header::HeaderMap,
+    body: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchRequest {
+    pub(crate) fn get() -> Self {
+        Self {
+            method: reqwest::Method::GET,
+            headers: reqwest::header::HeaderMap::new(),
+            body: None,
+        }
+    }
+}
+
+#[cfg(feature = "sandbox")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FetchError {
+    ClientBuild(String),
+    Cancelled,
+    TimedOut,
+    RequestHeadersTooLarge,
+    RequestBodyTooLarge,
+    RequestFailed(String),
+    ResponseHeadersTooLarge,
+    ResponseBodyTooLarge,
+    UnsupportedContentEncoding,
+    InvalidRedirect,
+    InvalidUtf8,
+}
+
+#[cfg(feature = "sandbox")]
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientBuild(message) => write!(formatter, "fetch client setup failed: {message}"),
+            Self::Cancelled => formatter.write_str("fetch cancelled"),
+            Self::TimedOut => formatter.write_str("fetch timed out"),
+            Self::RequestHeadersTooLarge => {
+                formatter.write_str("fetch request headers exceed the configured limit")
+            }
+            Self::RequestBodyTooLarge => {
+                formatter.write_str("fetch request body exceeds the configured limit")
+            }
+            Self::RequestFailed(message) => write!(formatter, "fetch request failed: {message}"),
+            Self::ResponseHeadersTooLarge => {
+                formatter.write_str("fetch response headers exceed the configured limit")
+            }
+            Self::ResponseBodyTooLarge => {
+                formatter.write_str("fetch response body exceeds the configured limit")
+            }
+            Self::UnsupportedContentEncoding => {
+                formatter.write_str("fetch response content encoding is not supported")
+            }
+            Self::InvalidRedirect => formatter.write_str("fetch response has an invalid redirect"),
+            Self::InvalidUtf8 => formatter.write_str("fetch response body is not valid UTF-8"),
+        }
+    }
+}
+
+#[cfg(feature = "sandbox")]
+impl std::error::Error for FetchError {}
+
+#[cfg(feature = "sandbox")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FetchTransportOutcome {
+    Complete(FetchResult),
+    Redirect(Url),
+}
+
+#[cfg(feature = "sandbox")]
+#[derive(Debug, Clone, Copy)]
+struct FetchLimits {
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    total_timeout: Duration,
+    request_header_max_bytes: usize,
+    request_header_max_count: usize,
+    request_body_max_bytes: usize,
+    response_header_max_bytes: usize,
+    response_header_max_count: usize,
+    response_body_max_bytes: usize,
+}
+
+#[cfg(feature = "sandbox")]
+impl Default for FetchLimits {
+    fn default() -> Self {
+        Self {
+            connect_timeout: FETCH_CONNECT_TIMEOUT,
+            read_timeout: FETCH_READ_TIMEOUT,
+            total_timeout: FETCH_TOTAL_TIMEOUT,
+            request_header_max_bytes: FETCH_REQUEST_HEADER_MAX_BYTES,
+            request_header_max_count: FETCH_REQUEST_HEADER_MAX_COUNT,
+            request_body_max_bytes: FETCH_REQUEST_BODY_MAX_BYTES,
+            response_header_max_bytes: FETCH_RESPONSE_HEADER_MAX_BYTES,
+            response_header_max_count: FETCH_RESPONSE_HEADER_MAX_COUNT,
+            response_body_max_bytes: FETCH_RESPONSE_BODY_MAX_BYTES,
+        }
+    }
+}
+
+#[cfg(feature = "sandbox")]
+#[derive(Clone)]
+pub(crate) struct FetchTransport {
+    client: reqwest::blocking::Client,
+    limits: FetchLimits,
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchTransport {
+    pub(crate) fn new(resolved_host: Option<(&str, &[SocketAddr])>) -> Result<Self, FetchError> {
+        Self::with_limits(FetchLimits::default(), resolved_host)
+    }
+
+    fn with_limits(
+        limits: FetchLimits,
+        resolved_host: Option<(&str, &[SocketAddr])>,
+    ) -> Result<Self, FetchError> {
+        let mut builder = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(limits.connect_timeout)
+            // The blocking client applies this bound to the initial response
+            // wait and every subsequent body read. `execute` separately owns
+            // the total wall-clock deadline across all successful reads.
+            .timeout(limits.read_timeout)
+            .user_agent(concat!("mini-agent-js-fetch/", env!("CARGO_PKG_VERSION")));
+        if let Some((host, addresses)) = resolved_host {
+            builder = builder.resolve_to_addrs(host, addresses);
+        }
+        let client = builder
+            .build()
+            .map_err(|error| FetchError::ClientBuild(error.to_string()))?;
+        Ok(Self { client, limits })
+    }
+
+    pub(crate) fn execute(
+        &self,
+        url: Url,
+        request: &FetchRequest,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<FetchTransportOutcome, FetchError> {
+        if is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+        validate_header_limits(
+            &request.headers,
+            self.limits.request_header_max_count,
+            self.limits.request_header_max_bytes,
+            FetchError::RequestHeadersTooLarge,
+        )?;
+        if request
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > self.limits.request_body_max_bytes)
+        {
+            return Err(FetchError::RequestBodyTooLarge);
+        }
+
+        let started = Instant::now();
+        let mut builder = self
+            .client
+            .request(request.method.clone(), url.clone())
+            .headers(request.headers.clone());
+        if let Some(body) = &request.body {
+            builder = builder.body(body.clone());
+        }
+        let mut response = builder.send().map_err(map_reqwest_error)?;
+        if is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+        if started.elapsed() >= self.limits.total_timeout {
+            return Err(FetchError::TimedOut);
+        }
+
+        validate_header_limits(
+            response.headers(),
+            self.limits.response_header_max_count,
+            self.limits.response_header_max_bytes,
+            FetchError::ResponseHeadersTooLarge,
+        )?;
+        reject_encoded_response(response.headers())?;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or(FetchError::InvalidRedirect)?
+                .to_str()
+                .map_err(|_| FetchError::InvalidRedirect)?;
+            let redirect = url
+                .join(location)
+                .map_err(|_| FetchError::InvalidRedirect)?;
+            return Ok(FetchTransportOutcome::Redirect(redirect));
+        }
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.limits.response_body_max_bytes as u64)
+        {
+            return Err(FetchError::ResponseBodyTooLarge);
+        }
+
+        let mut body = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            if is_cancelled() {
+                return Err(FetchError::Cancelled);
+            }
+            if started.elapsed() >= self.limits.total_timeout {
+                return Err(FetchError::TimedOut);
+            }
+            let read = response.read(&mut buffer).map_err(map_io_error)?;
+            if read == 0 {
+                break;
+            }
+            if body.len().saturating_add(read) > self.limits.response_body_max_bytes {
+                return Err(FetchError::ResponseBodyTooLarge);
+            }
+            body.extend_from_slice(&buffer[..read]);
+        }
+        if started.elapsed() >= self.limits.total_timeout {
+            return Err(FetchError::TimedOut);
+        }
+        let text = String::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)?;
+        Ok(FetchTransportOutcome::Complete(FetchResult {
+            status: response.status().as_u16(),
+            text,
+        }))
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn validate_header_limits(
+    headers: &reqwest::header::HeaderMap,
+    max_count: usize,
+    max_bytes: usize,
+    error: FetchError,
+) -> Result<(), FetchError> {
+    if headers.len() > max_count {
+        return Err(error);
+    }
+    let mut total = 0_usize;
+    for (name, value) in headers {
+        total = total
+            .checked_add(name.as_str().len())
+            .and_then(|total| total.checked_add(value.as_bytes().len()))
+            .and_then(|total| total.checked_add(4))
+            .ok_or_else(|| error.clone())?;
+        if total > max_bytes {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sandbox")]
+fn reject_encoded_response(headers: &reqwest::header::HeaderMap) -> Result<(), FetchError> {
+    for encoding in headers.get_all(reqwest::header::CONTENT_ENCODING) {
+        if !encoding
+            .to_str()
+            .is_ok_and(|encoding| encoding.eq_ignore_ascii_case("identity"))
+        {
+            return Err(FetchError::UnsupportedContentEncoding);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sandbox")]
+fn map_reqwest_error(error: reqwest::Error) -> FetchError {
+    if error.is_timeout() {
+        FetchError::TimedOut
+    } else {
+        FetchError::RequestFailed(error.to_string())
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn map_io_error(error: std::io::Error) -> FetchError {
+    let mut source = std::error::Error::source(&error);
+    let mut timed_out = error.kind() == std::io::ErrorKind::TimedOut
+        || error.to_string().to_ascii_lowercase().contains("timed out");
+    while let Some(current) = source {
+        timed_out |= current
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+            || current
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("timed out");
+        source = current.source();
+    }
+    if timed_out {
+        FetchError::TimedOut
+    } else {
+        FetchError::RequestFailed(error.to_string())
     }
 }
 
@@ -879,6 +1233,331 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(feature = "sandbox")]
+    fn test_fetch_limits() -> FetchLimits {
+        FetchLimits {
+            connect_timeout: Duration::from_millis(100),
+            read_timeout: Duration::from_millis(50),
+            total_timeout: Duration::from_millis(150),
+            request_header_max_bytes: 128,
+            request_header_max_count: 8,
+            request_body_max_bytes: 1024,
+            response_header_max_bytes: 128,
+            response_header_max_count: 8,
+            response_body_max_bytes: 1024,
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    fn serve_fetch_once(
+        handler: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (Url, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handler(stream);
+        });
+        (
+            Url::parse(&format!("http://{address}/start")).unwrap(),
+            thread,
+        )
+    }
+
+    #[cfg(feature = "sandbox")]
+    fn read_fetch_request(stream: &mut std::net::TcpStream) {
+        use std::io::Read as _;
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            assert!(request.len() <= 16 * 1024, "test request headers grew");
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_transport_returns_bounded_utf8_response() {
+        use std::io::Write as _;
+
+        let (url, server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .unwrap();
+        });
+        let transport = FetchTransport::new(None).unwrap();
+
+        let result = transport
+            .execute(url, &FetchRequest::get(), || false)
+            .expect("bounded response should succeed");
+
+        assert_eq!(
+            result,
+            FetchTransportOutcome::Complete(FetchResult {
+                status: 200,
+                text: "hello".to_string(),
+            })
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_transport_hands_redirect_to_authorization_layer() {
+        use std::io::Write as _;
+
+        let (url, server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let expected = url.join("/next").unwrap();
+        let transport = FetchTransport::with_limits(test_fetch_limits(), None).unwrap();
+
+        let result = transport
+            .execute(url, &FetchRequest::get(), || false)
+            .expect("redirect response should be handed off");
+
+        assert_eq!(result, FetchTransportOutcome::Redirect(expected));
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_transport_enforces_header_and_streaming_body_limits() {
+        use std::io::Write as _;
+
+        let (header_url, header_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nX-Large: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "x".repeat(256)
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let transport = FetchTransport::with_limits(test_fetch_limits(), None).unwrap();
+        assert_eq!(
+            transport.execute(header_url, &FetchRequest::get(), || false),
+            Err(FetchError::ResponseHeadersTooLarge)
+        );
+        header_server.join().unwrap();
+
+        let (length_url, length_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        assert_eq!(
+            transport.execute(length_url, &FetchRequest::get(), || false),
+            Err(FetchError::ResponseBodyTooLarge)
+        );
+        length_server.join().unwrap();
+
+        let (stream_url, stream_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            for _ in 0..32 {
+                if stream
+                    .write_all(b"80\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n")
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+        assert_eq!(
+            transport.execute(stream_url, &FetchRequest::get(), || false),
+            Err(FetchError::ResponseBodyTooLarge)
+        );
+        stream_server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_transport_bounds_slow_headers_and_body_then_recovers() {
+        use std::io::Write as _;
+
+        let transport = FetchTransport::with_limits(test_fetch_limits(), None).unwrap();
+        let (slow_headers_url, slow_headers_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        assert_eq!(
+            transport.execute(slow_headers_url, &FetchRequest::get(), || false),
+            Err(FetchError::TimedOut)
+        );
+        slow_headers_server.join().unwrap();
+
+        let (slow_body_url, slow_body_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = stream.write_all(b"hello");
+        });
+        assert_eq!(
+            transport.execute(slow_body_url, &FetchRequest::get(), || false),
+            Err(FetchError::TimedOut)
+        );
+        slow_body_server.join().unwrap();
+
+        let (endless_url, endless_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            for _ in 0..100 {
+                if stream.write_all(b"1\r\nx\r\n").is_err() {
+                    break;
+                }
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert_eq!(
+            transport.execute(endless_url, &FetchRequest::get(), || false),
+            Err(FetchError::TimedOut)
+        );
+        endless_server.join().unwrap();
+
+        let (recovery_url, recovery_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            transport.execute(recovery_url, &FetchRequest::get(), || false),
+            Ok(FetchTransportOutcome::Complete(FetchResult {
+                status: 204,
+                text: String::new(),
+            }))
+        );
+        recovery_server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_transport_rejects_encoding_malformed_utf8_and_response() {
+        use std::io::Write as _;
+
+        let transport = FetchTransport::with_limits(test_fetch_limits(), None).unwrap();
+        let (encoded_url, encoded_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            transport.execute(encoded_url, &FetchRequest::get(), || false),
+            Err(FetchError::UnsupportedContentEncoding)
+        );
+        encoded_server.join().unwrap();
+
+        let (utf8_url, utf8_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\xff\xfe",
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            transport.execute(utf8_url, &FetchRequest::get(), || false),
+            Err(FetchError::InvalidUtf8)
+        );
+        utf8_server.join().unwrap();
+
+        let (malformed_url, malformed_server) = serve_fetch_once(|mut stream| {
+            read_fetch_request(&mut stream);
+            stream.write_all(b"not-http\r\n\r\n").unwrap();
+        });
+        assert!(matches!(
+            transport.execute(malformed_url, &FetchRequest::get(), || false),
+            Err(FetchError::RequestFailed(_))
+        ));
+        malformed_server.join().unwrap();
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn js_fetch_transport_rejects_request_limits_and_cancellation_before_io() {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let transport = FetchTransport::with_limits(test_fetch_limits(), None).unwrap();
+        let url = Url::parse("https://example.com/").unwrap();
+        let mut request = FetchRequest::get();
+        request.body = Some(vec![0; 1025]);
+        assert_eq!(
+            transport.execute(url.clone(), &request, || false),
+            Err(FetchError::RequestBodyTooLarge)
+        );
+
+        let mut request = FetchRequest::get();
+        request.headers.insert(
+            reqwest::header::HeaderName::from_static("x-large"),
+            reqwest::header::HeaderValue::from_str(&"x".repeat(256)).unwrap(),
+        );
+        assert_eq!(
+            transport.execute(url.clone(), &request, || false),
+            Err(FetchError::RequestHeadersTooLarge)
+        );
+        assert_eq!(
+            transport.execute(url, &FetchRequest::get(), || true),
+            Err(FetchError::Cancelled)
+        );
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let server_cancellation = cancellation.clone();
+        let (cancel_url, cancel_server) = serve_fetch_once(move |mut stream| {
+            read_fetch_request(&mut stream);
+            server_cancellation.store(true, Ordering::Release);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            transport.execute(cancel_url, &FetchRequest::get(), || {
+                cancellation.load(Ordering::Acquire)
+            }),
+            Err(FetchError::Cancelled)
+        );
+        cancel_server.join().unwrap();
     }
 
     fn expect_allowed(decision: AuthorizationDecision) -> PathBuf {
