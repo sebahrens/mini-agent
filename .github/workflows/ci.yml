@@ -82,9 +82,8 @@ jobs:
         run: cargo test --locked linux_sandbox_policy
 
       - name: Test shared sandbox module
-        # Fold the command so the `sandbox::` filter is not parsed as a YAML mapping.
-        run: >-
-          cargo test --locked sandbox::
+        # Quote the YAML scalar so the trailing Rust module separator stays literal.
+        run: "cargo test --locked 'sandbox::'"
 
       - name: Test JS spawn parity through the shared sandbox
         run: cargo test --locked --features js,sandbox
