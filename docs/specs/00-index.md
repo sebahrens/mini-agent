@@ -33,7 +33,7 @@ planning context only; it cannot override the cited section.
 | 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | Delivered | Core QuickJS integration, `JsTool`, primitive host globals |
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS process isolation |
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
-| 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Planned | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
+| 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Delivered | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Planned | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
 
 Prior research artifacts superseded by this index:
@@ -102,10 +102,11 @@ The monorepo was flattened: production source and the workspace `Cargo.toml` are
 root. Paths under `zerostack/` in a superseded artifact are historical, not aliases that new
 tracker issues may cite.
 
-Phase 1 and Phase 3 code exists under `src/extras/js/`, with the portable Agent Skills catalog in
-`src/extras/skills/`. Phase 4 admission and Phase 5 evidence learning remain later-phase work.
-Source line numbers are intentionally omitted here because they drift; tracker tasks must resolve
-current symbols before editing.
+Phase 1–3 code exists under `src/extras/js/`, with the portable Agent Skills catalog in
+`src/extras/skills/`. The Phase 4
+proposal, held-out evaluation, approval transaction, and active-only visibility boundary are
+delivered. Phase 5 evidence-learning remains later work. Source line numbers are intentionally
+omitted here because they drift; tracker tasks must resolve current symbols before editing.
 
 ## Build commands (mandatory)
 

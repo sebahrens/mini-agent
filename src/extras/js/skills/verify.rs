@@ -7,19 +7,21 @@
 //! - Declares only valid exports that the source actually defines
 //! - Exercises every export (mutation pass)
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use rquickjs::prelude::{Func, Opt};
 use rquickjs::{Context, Ctx, Error, Object, Runtime, Value};
 
 use crate::extras::js::skills::fakes::{FAKES_VERSION, FakeHostGlobals, FakeTranscript};
+use crate::extras::js::skills::held_out::ExpectedJsValue;
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact,
 };
 use crate::extras::js::types::{MEMORY_LIMIT, STACK_LIMIT};
 
 /// Version of the verification algorithm. Bumping this invalidates existing reports.
-pub const VERIFIER_VERSION: u32 = 1;
+pub const VERIFIER_VERSION: u32 = 2;
 
 /// Timeout for evaluating one artifact's source + tests + mutations.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -118,6 +120,12 @@ pub enum VerificationError {
     /// Mutation pass failed for an export.
     #[error("mutation pass failed for export '{export}': {reason}")]
     MutationPassFailed { export: String, reason: String },
+
+    #[error("held-out expected value mismatch")]
+    HeldOutExpectedMismatch,
+
+    #[error("invalid held-out fake fixture: {0}")]
+    FakeFixtureInvalid(String),
 }
 
 /// Drain pending jobs, returning the first error or timeout if it occurs.
@@ -365,6 +373,69 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
         mutation_outcomes,
         transcript: fakes.transcript(),
     })
+}
+
+/// Execute one hidden case in its own fresh bounded no-effect runtime.
+///
+/// Fixture values and expectations are Rust-owned inputs and are never installed
+/// as inspectable globals. Only declared deterministic fake hosts are registered.
+pub(crate) fn verify_held_out_case(
+    skill: &SkillArtifact,
+    expression: &str,
+    expected: &ExpectedJsValue,
+    fake_files: &BTreeMap<String, String>,
+) -> Result<FakeTranscript, VerificationError> {
+    let rt = Runtime::new()
+        .map_err(|error| VerificationError::RuntimeCreationFailed(error.to_string()))?;
+    rt.set_memory_limit(MEMORY_LIMIT);
+    rt.set_max_stack_size(STACK_LIMIT);
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    rt.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+
+    let fakes = FakeHostGlobals::new(skill.capability.clone());
+    for (path, contents) in fake_files {
+        fakes
+            .seed_file(path, contents)
+            .map_err(VerificationError::FakeFixtureInvalid)?;
+    }
+    let ctx = Context::full(&rt)
+        .map_err(|error| VerificationError::ContextCreationFailed(error.to_string()))?;
+    let matched = ctx.with(|ctx| {
+        register_fakes(&ctx, &fakes, skill.capability.tier)?;
+        ctx.eval::<Value, _>(skill.source.as_str())
+            .map_err(|error| VerificationError::SourceEvaluationFailed(error.to_string()))?;
+        let value = ctx
+            .eval::<Value, _>(expression)
+            .map_err(|error| VerificationError::SourceEvaluationFailed(error.to_string()))?;
+        Ok::<bool, VerificationError>(expected_matches(expected, &value))
+    })?;
+    if let Some(outcome) = drain_jobs(&rt, deadline) {
+        return Err(VerificationError::SourceEvaluationFailed(format!(
+            "{outcome:?}"
+        )));
+    }
+    if !matched {
+        return Err(VerificationError::HeldOutExpectedMismatch);
+    }
+    Ok(fakes.transcript())
+}
+
+fn expected_matches(expected: &ExpectedJsValue, actual: &Value<'_>) -> bool {
+    match expected {
+        ExpectedJsValue::Boolean(expected) => actual.as_bool() == Some(*expected),
+        ExpectedJsValue::String(expected) => actual
+            .as_string()
+            .and_then(|value| value.to_string().ok())
+            .is_some_and(|actual| actual == *expected),
+        ExpectedJsValue::Integer(expected) => actual
+            .as_int()
+            .is_some_and(|actual| i64::from(actual) == *expected),
+        ExpectedJsValue::Float(expected) => actual
+            .as_float()
+            .or_else(|| actual.as_int().map(f64::from))
+            .is_some_and(|actual| actual == *expected),
+        ExpectedJsValue::Null => actual.is_null(),
+    }
 }
 
 /// Register fake host globals based on capability manifest.

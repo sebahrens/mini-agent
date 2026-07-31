@@ -194,14 +194,74 @@ fn register_js_tool(
         cfg.js_fetch_origins.as_deref(),
         cfg.js_fetch_allow_http.unwrap_or(false),
     );
-    let tool = JsTool::new(sandbox, permission, ask_tx, allow_config);
     #[cfg(feature = "skills")]
-    let tool = if let Some(context) = skill_turn_context {
-        tool.with_skill_turn_context(context)
-    } else {
-        tool
+    let mut js_tool = {
+        #[cfg(not(test))]
+        {
+            use crate::extras::js::skills::admission::{AdmissionEvaluator, AdmissionWorker};
+            use crate::extras::js::skills::embed::Embedder;
+            use crate::extras::js::skills::proposal::ProposalQueue;
+            use crate::extras::js::skills::store::SkillStore;
+            use crate::paths::AppPaths;
+            use std::time::Duration;
+
+            let workers = (|| -> Result<_, String> {
+                let paths = AppPaths::from_process(Some(startup_base))
+                    .map_err(|error| error.to_string())?;
+                let proposal_store =
+                    SkillStore::open_at(&paths).map_err(|error| error.to_string())?;
+                let evaluator_store =
+                    SkillStore::open_at(&paths).map_err(|error| error.to_string())?;
+                let embedder = Embedder::from_config(cfg.embedding.as_ref())
+                    .map_err(|error| error.to_string())?;
+                let evaluator = AdmissionEvaluator::new(
+                    evaluator_store,
+                    embedder,
+                    format!("mini-agent-{}", std::process::id()),
+                )
+                .map_err(|error| error.to_string())?;
+                let admission_worker =
+                    AdmissionWorker::start(evaluator).map_err(|error| error.to_string())?;
+                let proposal_worker =
+                    ProposalQueue::start_store_worker(proposal_store, 16, Duration::from_secs(2))
+                        .map_err(|error| error.to_string())?;
+                Ok((proposal_worker, admission_worker))
+            })();
+            match workers {
+                Ok((proposal_worker, admission_worker)) => JsTool::new_with_skill_workers(
+                    sandbox,
+                    permission,
+                    ask_tx,
+                    allow_config,
+                    proposal_worker,
+                    admission_worker,
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "skill proposal storage unavailable; propose_skill is disabled"
+                    );
+                    JsTool::new(sandbox, permission, ask_tx, allow_config)
+                }
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let _ = startup_base;
+            JsTool::new(sandbox, permission, ask_tx, allow_config)
+        }
     };
-    tools.push(Box::new(tool));
+
+    #[cfg(not(feature = "skills"))]
+    let js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config);
+
+    #[cfg(feature = "skills")]
+    if let Some(context) = skill_turn_context {
+        js_tool = js_tool.with_skill_turn_context(context);
+    }
+
+    tools.push(Box::new(js_tool));
 }
 
 #[allow(clippy::too_many_arguments)]

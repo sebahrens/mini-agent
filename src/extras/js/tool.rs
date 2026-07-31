@@ -13,8 +13,14 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::agent::tools::ToolError;
-use crate::extras::js::engine::js_thread_main;
+use crate::extras::js::engine::{NormalExecutionHosts, js_thread_main};
 use crate::extras::js::host::AllowConfig;
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::admission::AdmissionWorker;
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::proposal::{
+    AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalHost, ProposalWorker,
+};
 use crate::extras::js::types::{
     JsOutcome, JsRequest, JsResponse, PermCancellation, PermOutcome, PermRequest,
     PermRequestBuildError, PermResponse, PermResponseRejection, PermissionBackendFailure,
@@ -486,6 +492,10 @@ pub struct JsTool {
     _thread_stopped: Arc<AtomicBool>,
     #[cfg(feature = "skills")]
     skill_turn_context: Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+    #[cfg(feature = "skills")]
+    proposal_worker: Option<ProposalWorker>,
+    #[cfg(feature = "skills")]
+    _admission_worker: Option<AdmissionWorker>,
 }
 
 impl JsTool {
@@ -494,6 +504,61 @@ impl JsTool {
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
         allow_config: AllowConfig,
+    ) -> Self {
+        Self::new_with_hosts(
+            sandbox,
+            permission,
+            ask_tx,
+            allow_config,
+            NormalExecutionHosts::default(),
+        )
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn new_with_proposals(
+        sandbox: Sandbox,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        allow_config: AllowConfig,
+        proposal_worker: ProposalWorker,
+    ) -> Self {
+        let proposal_host = ProposalHost::new(
+            proposal_worker.sender(),
+            AttemptBudget::new(DEFAULT_SESSION_ATTEMPTS),
+        );
+        let mut tool = Self::new_with_hosts(
+            sandbox,
+            permission,
+            ask_tx,
+            allow_config,
+            NormalExecutionHosts::with_proposal(proposal_host),
+        );
+        tool.proposal_worker = Some(proposal_worker);
+        tool
+    }
+
+    #[cfg(feature = "skills")]
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn new_with_skill_workers(
+        sandbox: Sandbox,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        allow_config: AllowConfig,
+        proposal_worker: ProposalWorker,
+        admission_worker: AdmissionWorker,
+    ) -> Self {
+        let mut tool =
+            Self::new_with_proposals(sandbox, permission, ask_tx, allow_config, proposal_worker);
+        tool._admission_worker = Some(admission_worker);
+        tool
+    }
+
+    fn new_with_hosts(
+        sandbox: Sandbox,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        allow_config: AllowConfig,
+        execution_hosts: NormalExecutionHosts,
     ) -> Self {
         let permission_bridge = PermissionBridgeOwner::new(permission, ask_tx, STEP_TIMEOUT);
         let bridge = permission_bridge.bridge();
@@ -507,7 +572,14 @@ impl JsTool {
             .stack_size(THREAD_STACK)
             .spawn(move || {
                 let _stopped = ThreadStopped(thread_stopped_on_exit);
-                js_thread_main(rx, sandbox, bridge, js_runtime, allow_config);
+                js_thread_main(
+                    rx,
+                    sandbox,
+                    bridge,
+                    js_runtime,
+                    allow_config,
+                    execution_hosts,
+                );
             })
             .expect("failed to spawn JS thread");
 
@@ -521,6 +593,10 @@ impl JsTool {
             skill_turn_context: Arc::new(crate::extras::js::skills::turn::SkillTurnContext::new(
                 crate::extras::js::skills::turn::TurnSkillBundle::empty("unconfigured"),
             )),
+            #[cfg(feature = "skills")]
+            proposal_worker: None,
+            #[cfg(feature = "skills")]
+            _admission_worker: None,
         }
     }
 
@@ -587,8 +663,21 @@ impl Tool for JsTool {
         let globals = if cfg!(feature = "sandbox") {
             "read_file(path), write_file(path, content), fetch(url, options), \
              spawn(cmd, args), console.log(...)"
+                .to_string()
         } else {
             "read_file(path), write_file(path, content), spawn(cmd, args), console.log(...)"
+                .to_string()
+        };
+        #[cfg(feature = "skills")]
+        let globals = {
+            let mut globals = globals;
+            if self.proposal_worker.is_some() {
+                globals.push_str(
+                    ", propose_skill({source, description, exports, tests, capability, tags?, \
+                     predecessor_id?})",
+                );
+            }
+            globals
         };
         format!(
             "Execute JavaScript code. Available globals: {globals}. Returns the last expression \

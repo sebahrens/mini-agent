@@ -9,6 +9,8 @@
 
 use crate::paths::AppPaths;
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +20,7 @@ use super::{
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +51,177 @@ pub struct GenerationState {
     pub model_revision: String,
     pub dimensions: usize,
     pub normalized: bool,
+}
+
+pub(crate) const MAX_EVALUATION_ATTEMPTS: u32 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProposalStatus {
+    Pending,
+    Evaluating,
+    Verified,
+    Rejected,
+    AwaitingApproval,
+    Approved,
+}
+
+impl ProposalStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Evaluating => "evaluating",
+            Self::Verified => "verified",
+            Self::Rejected => "rejected",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Approved => "approved",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "evaluating" => Ok(Self::Evaluating),
+            "verified" => Ok(Self::Verified),
+            "rejected" => Ok(Self::Rejected),
+            "awaiting_approval" => Ok(Self::AwaitingApproval),
+            "approved" => Ok(Self::Approved),
+            other => Err(StoreError::CorruptRow(format!(
+                "unknown proposal status {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnqueueStatus {
+    Pending,
+    Verified,
+    Rejected,
+    AwaitingApproval,
+    Approved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnqueueResult {
+    pub proposal_id: String,
+    pub skill_id: String,
+    pub status: EnqueueStatus,
+    pub report_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProposalRecord {
+    pub proposal_id: String,
+    pub skill_id: String,
+    pub predecessor_id: Option<String>,
+    pub status: ProposalStatus,
+    pub attempt_count: u32,
+    pub next_attempt_at: Option<i64>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<i64>,
+    pub report_id: Option<String>,
+    pub reason_code: Option<String>,
+    pub row_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProposalLease {
+    pub proposal_id: String,
+    pub skill_id: String,
+    pub predecessor_id: Option<String>,
+    pub attempt: u32,
+    pub row_version: u64,
+    pub lease_expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EvaluationReportRecord {
+    pub report_id: String,
+    pub proposal_id: String,
+    pub skill_id: String,
+    pub attempt: u32,
+    pub verifier_version: u32,
+    pub fakes_version: u32,
+    pub suite_hashes: Vec<String>,
+    pub predecessor_id: Option<String>,
+    pub embedding_model_id: Option<String>,
+    pub embedding_model_revision: Option<String>,
+    pub outcome: String,
+    pub reason_code: Option<String>,
+    pub summary_json: String,
+    pub created_at: i64,
+}
+
+impl EvaluationReportRecord {
+    pub(crate) fn recompute_id(&self) -> Result<String, StoreError> {
+        let summary = serde_json::from_str::<serde_json::Value>(&self.summary_json)?;
+        let identity = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "proposal_id": self.proposal_id,
+            "skill_id": self.skill_id,
+            "attempt": self.attempt,
+            "predecessor_id": self.predecessor_id,
+            "verifier_version": self.verifier_version,
+            "fakes_version": self.fakes_version,
+            "suite_hashes": self.suite_hashes,
+            "embedding_model_id": self.embedding_model_id,
+            "embedding_model_revision": self.embedding_model_revision,
+            "outcome": self.outcome,
+            "reason_code": self.reason_code,
+            "summary": summary,
+            "created_at": self.created_at
+        }))?;
+        Ok(format!("{:x}", Sha256::digest(identity)))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldOutSuiteRecord {
+    pub suite_id: String,
+    pub selector_json: String,
+    pub cases_json: String,
+    pub content_hash: String,
+    pub canonical_payload: String,
+    pub approved_by: String,
+    pub approved_at: i64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CanaryApprovalInput {
+    pub approval_id: String,
+    pub proposal_id: String,
+    pub skill_id: String,
+    pub report_id: String,
+    pub approver_id: String,
+    pub authenticated_at: i64,
+    pub expected_artifact_version: u64,
+    pub expected_proposal_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanaryApprovalResult {
+    pub skill_id: String,
+    pub generation: u64,
+    pub idempotent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdminIdentity(String);
+
+impl AdminIdentity {
+    pub(crate) fn authenticated(principal: &str) -> Result<Self, StoreError> {
+        let principal = principal.trim();
+        if principal.is_empty() || principal.len() > 256 {
+            return Err(StoreError::Unauthorized);
+        }
+        Ok(Self(principal.to_string()))
+    }
+
+    fn principal(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Skill store errors, typed for caller handling.
@@ -84,8 +257,29 @@ pub enum StoreError {
     #[error("skill verification failed: {0}")]
     Verification(#[from] super::verify::VerificationError),
 
+    #[error("skill already exists: {0}")]
+    AlreadyExists(String),
+
     #[error("constraint violation: {0}")]
     Constraint(String),
+
+    #[error("database locked or busy")]
+    Busy,
+
+    #[error("unauthorized operation")]
+    Unauthorized,
+
+    #[error("proposal lease lost: {0}")]
+    LeaseLost(String),
+
+    #[error("stale proposal state: {0}")]
+    Stale(String),
+
+    #[error("corrupt stored row: {0}")]
+    CorruptRow(String),
+
+    #[error("invalid held-out suite: {0}")]
+    InvalidSuite(String),
 
     #[error("unsupported future schema version: {0}")]
     UnsupportedSchemaVersion(u32),
@@ -621,6 +815,883 @@ impl SkillStore {
         }
     }
 
+    pub(crate) fn schema_version(&self) -> Result<u32, StoreError> {
+        Ok(self
+            .db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    /// Persist one immutable pending revision and its queue record atomically.
+    ///
+    /// Repeated submission of byte-identical canonical content is idempotent.
+    /// A rejected identity stays rejected and returns its original report.
+    pub(crate) fn enqueue_proposal(
+        &mut self,
+        artifact: &SkillArtifact,
+        predecessor_id: Option<&str>,
+        now: i64,
+    ) -> Result<EnqueueResult, StoreError> {
+        artifact.verify_identity()?;
+        validate_full_id(predecessor_id)?;
+
+        let tx = self.db.transaction()?;
+        let tombstoned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM skill_tombstones WHERE id = ?1)",
+            [&artifact.id],
+            |row| row.get(0),
+        )?;
+        if tombstoned {
+            return Err(StoreError::Purged(artifact.id.clone()));
+        }
+        if let Some(predecessor_id) = predecessor_id {
+            let predecessor_status: Option<String> = tx
+                .query_row(
+                    "SELECT status FROM skill_revisions WHERE id = ?1",
+                    [predecessor_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if !matches!(predecessor_status.as_deref(), Some("active" | "canary")) {
+                return Err(StoreError::Constraint(
+                    "predecessor must be an active or canary immutable revision".to_string(),
+                ));
+            }
+        }
+
+        let existing = tx
+            .query_row(
+                "SELECT id, identity_version, source, description, tags_json,
+                        exports_json, tests_json, capability_json, status
+                 FROM skill_revisions WHERE id = ?1",
+                [&artifact.id],
+                read_artifact_row,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let existing = existing?;
+            existing.verify_identity()?;
+            if existing != *artifact {
+                return Err(StoreError::Constraint(format!(
+                    "identity collision for {}",
+                    artifact.id
+                )));
+            }
+            let record = tx
+                .query_row(
+                    "SELECT proposal_id, skill_id, predecessor_id, status, attempt_count,
+                            next_attempt_at, lease_owner, lease_expires_at, report_id,
+                            reason_code, row_version
+                     FROM skill_proposals WHERE skill_id = ?1",
+                    [&artifact.id],
+                    read_proposal_row,
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::AlreadyExists(artifact.id.clone()))?;
+            if record.predecessor_id.as_deref() != predecessor_id {
+                return Err(StoreError::Constraint(
+                    "an existing proposal cannot be rebound to a different predecessor".to_string(),
+                ));
+            }
+            let status = enqueue_status(record.status)?;
+            tx.commit()?;
+            return Ok(EnqueueResult {
+                proposal_id: record.proposal_id,
+                skill_id: record.skill_id,
+                status,
+                report_id: record.report_id,
+            });
+        }
+
+        insert_revision(&tx, artifact, "pending", now)?;
+        tx.execute(
+            "INSERT INTO skill_proposals (
+                proposal_id, skill_id, predecessor_id, proposed_at, status,
+                attempt_count, row_version, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, 1, ?4, ?4)",
+            params![artifact.id, artifact.id, predecessor_id, now],
+        )?;
+        tx.commit()?;
+
+        Ok(EnqueueResult {
+            proposal_id: artifact.id.clone(),
+            skill_id: artifact.id.clone(),
+            status: EnqueueStatus::Pending,
+            report_id: None,
+        })
+    }
+
+    pub(crate) fn get_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<Option<ProposalRecord>, StoreError> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT proposal_id, skill_id, predecessor_id, status, attempt_count,
+                        next_attempt_at, lease_owner, lease_expires_at, report_id,
+                        reason_code, row_version
+                 FROM skill_proposals WHERE proposal_id = ?1",
+                [proposal_id],
+                read_proposal_row,
+            )
+            .optional()?)
+    }
+
+    /// Claim the oldest due proposal. Expired evaluating leases are reclaimable.
+    pub(crate) fn claim_due_proposal(
+        &mut self,
+        worker: &str,
+        now: i64,
+        lease_seconds: i64,
+    ) -> Result<Option<ProposalLease>, StoreError> {
+        if worker.trim().is_empty() || lease_seconds <= 0 {
+            return Err(StoreError::Constraint(
+                "worker and positive lease duration are required".to_string(),
+            ));
+        }
+        let lease_expires_at = now
+            .checked_add(lease_seconds)
+            .ok_or_else(|| StoreError::Constraint("lease deadline overflow".to_string()))?;
+        let tx = self.db.transaction()?;
+        let candidate: Option<(String, String, Option<String>, u32, i64)> = tx
+            .query_row(
+                "SELECT proposal_id, skill_id, predecessor_id, attempt_count, row_version
+                 FROM skill_proposals
+                 WHERE attempt_count < ?1
+                   AND (
+                     (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?2))
+                     OR
+                     (status = 'evaluating' AND lease_expires_at <= ?2)
+                   )
+                 ORDER BY proposed_at, proposal_id
+                 LIMIT 1",
+                params![MAX_EVALUATION_ATTEMPTS, now],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((proposal_id, skill_id, predecessor_id, attempt_count, row_version)) = candidate
+        else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if row_version <= 0 {
+            return Err(StoreError::CorruptRow(
+                "proposal row version must be positive".to_string(),
+            ));
+        }
+        let attempt = attempt_count + 1;
+        let next_version = row_version + 1;
+        let changed = tx.execute(
+            "UPDATE skill_proposals
+             SET status = 'evaluating', attempt_count = ?1, next_attempt_at = NULL,
+                 lease_owner = ?2, lease_expires_at = ?3, row_version = ?4, updated_at = ?5
+             WHERE proposal_id = ?6 AND row_version = ?7
+               AND (
+                 (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?5))
+                 OR
+                 (status = 'evaluating' AND lease_expires_at <= ?5)
+               )",
+            params![
+                attempt,
+                worker,
+                lease_expires_at,
+                next_version,
+                now,
+                proposal_id,
+                row_version
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Stale(proposal_id));
+        }
+        tx.commit()?;
+        Ok(Some(ProposalLease {
+            proposal_id,
+            skill_id,
+            predecessor_id,
+            attempt,
+            row_version: next_version as u64,
+            lease_expires_at,
+        }))
+    }
+
+    pub(crate) fn renew_lease(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        now: i64,
+        lease_seconds: i64,
+    ) -> Result<u64, StoreError> {
+        let expires_at = now
+            .checked_add(lease_seconds)
+            .ok_or_else(|| StoreError::Constraint("lease deadline overflow".to_string()))?;
+        let changed = self.db.execute(
+            "UPDATE skill_proposals
+             SET lease_expires_at = ?1, row_version = row_version + 1, updated_at = ?2
+             WHERE proposal_id = ?3 AND status = 'evaluating'
+               AND lease_owner = ?4 AND lease_expires_at > ?2",
+            params![expires_at, now, proposal_id, worker],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseLost(proposal_id.to_string()));
+        }
+        let version: i64 = self
+            .db
+            .query_row(
+                "SELECT row_version FROM skill_proposals WHERE proposal_id = ?1",
+                [proposal_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)?;
+        u64::try_from(version)
+            .map_err(|_| StoreError::CorruptRow("negative proposal row version".to_string()))
+    }
+
+    pub(crate) fn retry_proposal(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        row_version: u64,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let changed = self.db.execute(
+            "UPDATE skill_proposals
+             SET status = 'pending', next_attempt_at = ?1, lease_owner = NULL,
+                 lease_expires_at = NULL, row_version = row_version + 1, updated_at = ?2
+             WHERE proposal_id = ?3 AND status = 'evaluating'
+               AND lease_owner = ?4 AND row_version = ?5",
+            params![
+                next_attempt_at,
+                now,
+                proposal_id,
+                worker,
+                sql_version(row_version)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseLost(proposal_id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_evaluation(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        row_version: u64,
+        report: &EvaluationReportRecord,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        validate_report_binding(proposal_id, report)?;
+        let tx = self.db.transaction()?;
+        insert_report(&tx, report)?;
+        let changed = tx.execute(
+            "UPDATE skill_proposals
+             SET status = 'awaiting_approval', report_id = ?1, reason_code = NULL,
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 row_version = row_version + 1, updated_at = ?2
+             WHERE proposal_id = ?3 AND skill_id = ?4 AND status = 'evaluating'
+               AND lease_owner = ?5 AND row_version = ?6",
+            params![
+                report.report_id,
+                now,
+                proposal_id,
+                report.skill_id,
+                worker,
+                sql_version(row_version)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseLost(proposal_id.to_string()));
+        }
+        let revision_changed = tx.execute(
+            "UPDATE skill_revisions
+             SET status = 'verified', row_version = row_version + 1, updated_at = ?1
+             WHERE id = ?2 AND status = 'pending'",
+            params![now, report.skill_id],
+        )?;
+        if revision_changed != 1 {
+            return Err(StoreError::Stale(report.skill_id.clone()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn reject_proposal(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        row_version: u64,
+        report: &EvaluationReportRecord,
+        reason_code: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        validate_report_binding(proposal_id, report)?;
+        if reason_code.trim().is_empty() || report.reason_code.as_deref() != Some(reason_code) {
+            return Err(StoreError::Constraint(
+                "rejection report reason binding is invalid".to_string(),
+            ));
+        }
+
+        let tx = self.db.transaction()?;
+        let existing: Option<(String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT status, report_id, reason_code
+                 FROM skill_proposals WHERE proposal_id = ?1",
+                [proposal_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if matches!(
+            existing,
+            Some((ref status, ref report_id, ref reason))
+                if status == "rejected"
+                    && report_id.as_deref() == Some(report.report_id.as_str())
+                    && reason.as_deref() == Some(reason_code)
+        ) {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        insert_report(&tx, report)?;
+        let changed = tx.execute(
+            "UPDATE skill_proposals
+             SET status = 'rejected', report_id = ?1, reason_code = ?2,
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 row_version = row_version + 1, updated_at = ?3
+             WHERE proposal_id = ?4 AND skill_id = ?5 AND status = 'evaluating'
+               AND lease_owner = ?6 AND row_version = ?7",
+            params![
+                report.report_id,
+                reason_code,
+                now,
+                proposal_id,
+                report.skill_id,
+                worker,
+                sql_version(row_version)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseLost(proposal_id.to_string()));
+        }
+        let revision_changed = tx.execute(
+            "UPDATE skill_revisions
+             SET status = 'rejected', row_version = row_version + 1, updated_at = ?1
+             WHERE id = ?2 AND status = 'pending'",
+            params![now, report.skill_id],
+        )?;
+        if revision_changed != 1 {
+            return Err(StoreError::Stale(report.skill_id.clone()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn import_held_out_suite(
+        &mut self,
+        admin: Option<&AdminIdentity>,
+        suite: &HeldOutSuiteRecord,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let admin = admin.ok_or(StoreError::Unauthorized)?;
+        let content_hash = format!("{:x}", Sha256::digest(suite.canonical_payload.as_bytes()));
+        if suite.suite_id != content_hash || suite.content_hash != content_hash {
+            return Err(StoreError::InvalidSuite(
+                "suite ID and content hash must match canonical payload".to_string(),
+            ));
+        }
+        serde_json::from_str::<serde_json::Value>(&suite.selector_json)?;
+        serde_json::from_str::<serde_json::Value>(&suite.cases_json)?;
+        self.db
+            .execute(
+                "INSERT INTO held_out_suites (
+                suite_id, selector_json, cases_json, canonical_payload, approved_by,
+                approved_at, content_hash, enabled, row_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                params![
+                    suite.suite_id,
+                    suite.selector_json,
+                    suite.cases_json,
+                    suite.canonical_payload,
+                    admin.principal(),
+                    now,
+                    content_hash,
+                    i64::from(suite.enabled)
+                ],
+            )
+            .or_else(|error| {
+                if error.to_string().contains("UNIQUE") {
+                    let existing: Option<String> = self
+                        .db
+                        .query_row(
+                            "SELECT content_hash FROM held_out_suites WHERE suite_id = ?1",
+                            [&suite.suite_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if existing.as_deref() == Some(content_hash.as_str()) {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                } else {
+                    Err(error)
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Trusted evaluator-only suite access. Proposal/model APIs do not expose this.
+    pub(crate) fn enabled_held_out_suites(&self) -> Result<Vec<HeldOutSuiteRecord>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT suite_id, selector_json, cases_json, content_hash, canonical_payload,
+                    approved_by, approved_at, enabled
+             FROM held_out_suites
+             WHERE enabled = 1
+             ORDER BY suite_id",
+        )?;
+        let rows = stmt.query_map([], read_held_out_suite)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn revision_status(&self, id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT status FROM skill_revisions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn revision_row_version(&self, id: &str) -> Result<Option<u64>, StoreError> {
+        let version: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT row_version FROM skill_revisions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        version
+            .map(|version| {
+                u64::try_from(version).map_err(|_| {
+                    StoreError::CorruptRow("negative artifact row version".to_string())
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn get_evaluation_report(
+        &self,
+        report_id: &str,
+    ) -> Result<Option<EvaluationReportRecord>, StoreError> {
+        let report = self
+            .db
+            .query_row(
+                "SELECT report_id, proposal_id, skill_id, attempt, verifier_version,
+                        fakes_version, suite_hashes_json, predecessor_id,
+                        embedding_model_id, embedding_model_revision, outcome,
+                        reason_code, summary_json, created_at
+                 FROM evaluation_reports WHERE report_id = ?1",
+                [report_id],
+                read_evaluation_report,
+            )
+            .optional()?;
+        if let Some(report) = report.as_ref()
+            && report.recompute_id()? != report.report_id
+        {
+            return Err(StoreError::CorruptRow(
+                "evaluation report identity mismatch".to_string(),
+            ));
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn has_compatible_embedding(
+        &self,
+        skill_id: &str,
+        model_id: &str,
+        model_revision: &str,
+    ) -> Result<bool, StoreError> {
+        let row: Option<(i64, i64, i64)> = self
+            .db
+            .query_row(
+                "SELECT dimensions, normalized, length(embedding)
+                 FROM skill_embeddings
+                 WHERE skill_id = ?1 AND model_id = ?2 AND model_revision = ?3",
+                params![skill_id, model_id, model_revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(matches!(
+            row,
+            Some((dimensions, normalized, byte_len))
+                if dimensions > 0
+                    && normalized == 1
+                    && usize::try_from(dimensions)
+                        .ok()
+                        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                        == usize::try_from(byte_len).ok()
+        ))
+    }
+
+    pub(crate) fn canary_approval_result(
+        &self,
+        proposal_id: &str,
+    ) -> Result<Option<CanaryApprovalResult>, StoreError> {
+        let row: Option<(String, i64)> = self
+            .db
+            .query_row(
+                "SELECT skill_id, generation FROM skill_approvals WHERE proposal_id = ?1",
+                [proposal_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(skill_id, generation)| {
+            Ok(CanaryApprovalResult {
+                skill_id,
+                generation: u64::try_from(generation)
+                    .map_err(|_| StoreError::CorruptRow("negative generation".to_string()))?,
+                idempotent: true,
+            })
+        })
+        .transpose()
+    }
+
+    pub(super) fn approve_canary_transaction(
+        &mut self,
+        input: &CanaryApprovalInput,
+        now: i64,
+    ) -> Result<CanaryApprovalResult, StoreError> {
+        if input.approval_id.trim().is_empty()
+            || input.approver_id.trim().is_empty()
+            || input.authenticated_at > now
+        {
+            return Err(StoreError::Unauthorized);
+        }
+        let tx = self.db.transaction()?;
+        let existing: Option<(String, String, String, i64)> = tx
+            .query_row(
+                "SELECT proposal_id, skill_id, report_id, generation
+                 FROM skill_approvals WHERE approval_id = ?1",
+                [&input.approval_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((proposal_id, skill_id, report_id, generation)) = existing {
+            if proposal_id == input.proposal_id
+                && skill_id == input.skill_id
+                && report_id == input.report_id
+            {
+                tx.commit()?;
+                return Ok(CanaryApprovalResult {
+                    skill_id,
+                    generation: u64::try_from(generation)
+                        .map_err(|_| StoreError::CorruptRow("negative generation".to_string()))?,
+                    idempotent: true,
+                });
+            }
+            return Err(StoreError::Constraint(
+                "approval identity collision".to_string(),
+            ));
+        }
+
+        let stored_artifact = tx
+            .query_row(
+                "SELECT id, identity_version, source, description, tags_json,
+                        exports_json, tests_json, capability_json, status
+                 FROM skill_revisions WHERE id = ?1",
+                [&input.skill_id],
+                read_artifact_row,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(input.skill_id.clone()))??;
+        stored_artifact.verify_identity()?;
+
+        let proposal = tx
+            .query_row(
+                "SELECT proposal_id, skill_id, predecessor_id, status, attempt_count,
+                        next_attempt_at, lease_owner, lease_expires_at, report_id,
+                        reason_code, row_version
+                 FROM skill_proposals WHERE proposal_id = ?1",
+                [&input.proposal_id],
+                read_proposal_row,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(input.proposal_id.clone()))?;
+        if proposal.status != ProposalStatus::AwaitingApproval
+            || proposal.skill_id != input.skill_id
+            || proposal.report_id.as_deref() != Some(input.report_id.as_str())
+            || proposal.row_version != input.expected_proposal_version
+        {
+            return Err(StoreError::Stale(input.proposal_id.clone()));
+        }
+        let report_skill: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT proposal_id, skill_id, outcome
+                 FROM evaluation_reports WHERE report_id = ?1",
+                [&input.report_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if !matches!(
+            report_skill,
+            Some((ref proposal_id, ref skill_id, ref outcome))
+                if proposal_id == &input.proposal_id
+                    && skill_id == &input.skill_id
+                    && outcome == "passed"
+        ) {
+            return Err(StoreError::Stale(input.report_id.clone()));
+        }
+
+        let artifact_version: i64 = tx.query_row(
+            "SELECT row_version FROM skill_revisions WHERE id = ?1",
+            [&input.skill_id],
+            |row| row.get(0),
+        )?;
+        if u64::try_from(artifact_version).ok() != Some(input.expected_artifact_version) {
+            return Err(StoreError::Stale(input.skill_id.clone()));
+        }
+        let generation: i64 = tx.query_row(
+            "SELECT desired_generation FROM skill_generations WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Constraint("generation overflow".to_string()))?;
+
+        let revision_changed = tx.execute(
+            "UPDATE skill_revisions
+             SET status = 'canary', row_version = row_version + 1, updated_at = ?1
+             WHERE id = ?2 AND status = 'verified' AND row_version = ?3",
+            params![now, input.skill_id, artifact_version],
+        )?;
+        if revision_changed != 1 {
+            return Err(StoreError::Stale(input.skill_id.clone()));
+        }
+        let proposal_changed = tx.execute(
+            "UPDATE skill_proposals
+             SET status = 'approved', row_version = row_version + 1, updated_at = ?1
+             WHERE proposal_id = ?2 AND skill_id = ?3 AND status = 'awaiting_approval'
+               AND report_id = ?4 AND row_version = ?5",
+            params![
+                now,
+                input.proposal_id,
+                input.skill_id,
+                input.report_id,
+                sql_version(input.expected_proposal_version)?
+            ],
+        )?;
+        if proposal_changed != 1 {
+            return Err(StoreError::Stale(input.proposal_id.clone()));
+        }
+        tx.execute(
+            "INSERT INTO skill_approvals (
+                approval_id, proposal_id, skill_id, report_id, approver_id,
+                authenticated_at, approved_at, artifact_version,
+                proposal_version, generation
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                input.approval_id,
+                input.proposal_id,
+                input.skill_id,
+                input.report_id,
+                input.approver_id,
+                input.authenticated_at,
+                now,
+                artifact_version,
+                sql_version(input.expected_proposal_version)?,
+                next_generation
+            ],
+        )?;
+        let generation_changed = tx.execute(
+            "UPDATE skill_generations
+             SET desired_generation = ?1, row_version = row_version + 1, updated_at = ?2
+             WHERE singleton = 1 AND desired_generation = ?3",
+            params![next_generation, now, generation],
+        )?;
+        if generation_changed != 1 {
+            return Err(StoreError::Stale("desired generation".to_string()));
+        }
+        tx.commit()?;
+        Ok(CanaryApprovalResult {
+            skill_id: input.skill_id.clone(),
+            generation: next_generation as u64,
+            idempotent: false,
+        })
+    }
+
+    pub(super) fn deny_approval_transaction(
+        &mut self,
+        proposal_id: &str,
+        expected_proposal_version: u64,
+        reason_code: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        if reason_code.trim().is_empty() {
+            return Err(StoreError::Constraint(
+                "denial reason is required".to_string(),
+            ));
+        }
+        let tx = self.db.transaction()?;
+        let skill_id: String = tx
+            .query_row(
+                "SELECT skill_id FROM skill_proposals
+                 WHERE proposal_id = ?1 AND status = 'awaiting_approval'
+                   AND row_version = ?2",
+                params![proposal_id, sql_version(expected_proposal_version)?],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Stale(proposal_id.to_string()))?;
+        let proposal_changed = tx.execute(
+            "UPDATE skill_proposals
+             SET status = 'rejected', reason_code = ?1,
+                 row_version = row_version + 1, updated_at = ?2
+             WHERE proposal_id = ?3 AND status = 'awaiting_approval'
+               AND row_version = ?4",
+            params![
+                reason_code,
+                now,
+                proposal_id,
+                sql_version(expected_proposal_version)?
+            ],
+        )?;
+        let revision_changed = tx.execute(
+            "UPDATE skill_revisions
+             SET status = 'rejected', row_version = row_version + 1, updated_at = ?1
+             WHERE id = ?2 AND status = 'verified'",
+            params![now, skill_id],
+        )?;
+        if proposal_changed != 1 || revision_changed != 1 {
+            return Err(StoreError::Stale(proposal_id.to_string()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_blocked_evaluation(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        row_version: u64,
+        report: &EvaluationReportRecord,
+        reason_code: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        validate_report_binding(proposal_id, report)?;
+        let tx = self.db.transaction()?;
+        insert_report(&tx, report)?;
+        let proposal_changed = tx.execute(
+            "UPDATE skill_proposals
+             SET status = 'verified', report_id = ?1, reason_code = ?2,
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 row_version = row_version + 1, updated_at = ?3
+             WHERE proposal_id = ?4 AND skill_id = ?5 AND status = 'evaluating'
+               AND lease_owner = ?6 AND row_version = ?7",
+            params![
+                report.report_id,
+                reason_code,
+                now,
+                proposal_id,
+                report.skill_id,
+                worker,
+                sql_version(row_version)?
+            ],
+        )?;
+        let revision_changed = tx.execute(
+            "UPDATE skill_revisions
+             SET status = 'verified', row_version = row_version + 1, updated_at = ?1
+             WHERE id = ?2 AND status = 'pending'",
+            params![now, report.skill_id],
+        )?;
+        if proposal_changed != 1 || revision_changed != 1 {
+            return Err(StoreError::LeaseLost(proposal_id.to_string()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn request_blocked_reevaluation(
+        &mut self,
+        admin: Option<&AdminIdentity>,
+        proposal_id: &str,
+        expected_row_version: u64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        admin.ok_or(StoreError::Unauthorized)?;
+        let tx = self.db.transaction()?;
+        let skill_id: String = tx
+            .query_row(
+                "SELECT skill_id FROM skill_proposals
+                 WHERE proposal_id = ?1 AND status = 'verified'
+                   AND reason_code = 'held_out_suite_required' AND row_version = ?2",
+                params![proposal_id, sql_version(expected_row_version)?],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Stale(proposal_id.to_string()))?;
+        let proposal_changed = tx.execute(
+            "UPDATE skill_proposals
+             SET status = 'pending', next_attempt_at = ?1, report_id = NULL,
+                 reason_code = NULL, row_version = row_version + 1, updated_at = ?1
+             WHERE proposal_id = ?2 AND status = 'verified'
+               AND reason_code = 'held_out_suite_required' AND row_version = ?3",
+            params![now, proposal_id, sql_version(expected_row_version)?],
+        )?;
+        let revision_changed = tx.execute(
+            "UPDATE skill_revisions
+             SET status = 'pending', row_version = row_version + 1, updated_at = ?1
+             WHERE id = ?2 AND status = 'verified'",
+            params![now, skill_id],
+        )?;
+        if proposal_changed != 1 || revision_changed != 1 {
+            return Err(StoreError::Stale(proposal_id.to_string()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn desired_generation(&self) -> Result<u64, StoreError> {
+        let generation: i64 = self.db.query_row(
+            "SELECT desired_generation FROM skill_generations WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        u64::try_from(generation)
+            .map_err(|_| StoreError::CorruptRow("negative generation".to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_revisions(&self) -> Result<u64, StoreError> {
+        let count: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM skill_revisions", [], |row| row.get(0))?;
+        u64::try_from(count).map_err(|_| StoreError::CorruptRow("negative row count".to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_proposals(&self) -> Result<u64, StoreError> {
+        let count: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM skill_proposals", [], |row| row.get(0))?;
+        u64::try_from(count).map_err(|_| StoreError::CorruptRow("negative row count".to_string()))
+    }
+
     pub fn database_path(&self) -> &std::path::Path {
         &self.db_path
     }
@@ -665,6 +1736,25 @@ fn verify_fts5(db: &Connection) -> Result<(), StoreError> {
         }
         Err(_) => Err(StoreError::MissingFts5),
     }
+}
+
+fn ensure_column(
+    db: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), StoreError> {
+    let mut statement = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        db.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Run idempotent schema migrations.
@@ -813,6 +1903,225 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
         )?;
     }
 
+    // Migration 2 -> 3: reconcile the independently developed Phase 3 and
+    // Phase 4 v2 layouts, then add durable proposal/admission state.
+    if current_version < 3 {
+        db.execute_batch("BEGIN IMMEDIATE;")?;
+        let migration = (|| -> Result<(), StoreError> {
+            ensure_column(
+                db,
+                "skill_generations",
+                "applied_generation",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                db,
+                "skill_generations",
+                "model_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            ensure_column(
+                db,
+                "skill_generations",
+                "model_revision",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            ensure_column(
+                db,
+                "skill_generations",
+                "dimensions",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                db,
+                "skill_generations",
+                "normalized",
+                "INTEGER NOT NULL DEFAULT 1",
+            )?;
+            ensure_column(
+                db,
+                "skill_generations",
+                "row_version",
+                "INTEGER NOT NULL DEFAULT 1",
+            )?;
+            ensure_column(
+                db,
+                "skill_generations",
+                "updated_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+
+            db.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS skill_tombstones (
+                    id        TEXT PRIMARY KEY,
+                    purged_at INTEGER NOT NULL,
+                    CHECK (length(id) = 64)
+                );
+
+                DROP TRIGGER IF EXISTS skill_search_ai;
+                DROP TRIGGER IF EXISTS skill_search_ad;
+                DROP TRIGGER IF EXISTS skill_search_au;
+                DELETE FROM skill_search;
+
+                CREATE TRIGGER skill_search_ai AFTER INSERT ON skill_revisions
+                WHEN NEW.status = 'active' BEGIN
+                    INSERT INTO skill_search (rowid, identifier, description, tags, exports)
+                    VALUES (NEW.rowid, NEW.id, NEW.description, NEW.tags_json, NEW.exports_json);
+                END;
+
+                CREATE TRIGGER skill_search_ad AFTER DELETE ON skill_revisions
+                WHEN OLD.status = 'active' BEGIN
+                    DELETE FROM skill_search WHERE rowid = OLD.rowid;
+                END;
+
+                CREATE TRIGGER skill_search_au AFTER UPDATE ON skill_revisions BEGIN
+                    DELETE FROM skill_search WHERE rowid = OLD.rowid;
+                    INSERT INTO skill_search (rowid, identifier, description, tags, exports)
+                    SELECT NEW.rowid, NEW.id, NEW.description, NEW.tags_json, NEW.exports_json
+                    WHERE NEW.status = 'active';
+                END;
+
+                INSERT INTO skill_search (rowid, identifier, description, tags, exports)
+                SELECT rowid, id, description, tags_json, exports_json
+                FROM skill_revisions WHERE status = 'active';
+
+            CREATE TABLE IF NOT EXISTS skill_proposals (
+                proposal_id      TEXT PRIMARY KEY,
+                skill_id         TEXT NOT NULL UNIQUE,
+                predecessor_id   TEXT,
+                proposed_at      INTEGER NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'pending',
+                attempt_count    INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at  INTEGER,
+                lease_owner      TEXT,
+                lease_expires_at INTEGER,
+                report_id        TEXT,
+                reason_code      TEXT,
+                row_version      INTEGER NOT NULL DEFAULT 1,
+                created_at       INTEGER NOT NULL,
+                updated_at       INTEGER NOT NULL,
+                FOREIGN KEY (skill_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                FOREIGN KEY (predecessor_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                CHECK (status IN (
+                    'pending','evaluating','verified','rejected',
+                    'awaiting_approval','approved'
+                )),
+                CHECK (attempt_count >= 0 AND attempt_count <= 8),
+                CHECK (row_version > 0),
+                CHECK (
+                    (status = 'evaluating' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+                    OR
+                    (status <> 'evaluating' AND lease_owner IS NULL AND lease_expires_at IS NULL)
+                ),
+                CHECK (
+                    (status IN ('rejected','awaiting_approval','approved') AND report_id IS NOT NULL)
+                    OR
+                    (status NOT IN ('rejected','awaiting_approval','approved'))
+                ),
+                CHECK (
+                    (status = 'rejected' AND reason_code IS NOT NULL)
+                    OR
+                    (status <> 'rejected')
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS skill_proposals_due_idx
+                ON skill_proposals(status, next_attempt_at, lease_expires_at, proposed_at);
+            CREATE INDEX IF NOT EXISTS skill_proposals_skill_idx
+                ON skill_proposals(skill_id);
+
+            CREATE TABLE IF NOT EXISTS held_out_suites (
+                suite_id          TEXT PRIMARY KEY,
+                selector_json     TEXT NOT NULL,
+                cases_json        TEXT NOT NULL,
+                canonical_payload TEXT NOT NULL,
+                approved_by       TEXT NOT NULL,
+                approved_at       INTEGER NOT NULL,
+                content_hash      TEXT NOT NULL UNIQUE,
+                enabled           INTEGER NOT NULL DEFAULT 1,
+                row_version       INTEGER NOT NULL DEFAULT 1,
+                CHECK (length(suite_id) = 64),
+                CHECK (length(content_hash) = 64),
+                CHECK (length(approved_by) BETWEEN 1 AND 256),
+                CHECK (enabled IN (0, 1)),
+                CHECK (row_version > 0)
+            );
+            CREATE INDEX IF NOT EXISTS held_out_suites_enabled_idx
+                ON held_out_suites(enabled, suite_id);
+
+            CREATE TABLE IF NOT EXISTS evaluation_reports (
+                report_id                TEXT PRIMARY KEY,
+                proposal_id              TEXT NOT NULL,
+                skill_id                 TEXT NOT NULL,
+                attempt                  INTEGER NOT NULL,
+                verifier_version         INTEGER NOT NULL,
+                fakes_version            INTEGER NOT NULL,
+                suite_hashes_json        TEXT NOT NULL,
+                predecessor_id           TEXT,
+                embedding_model_id       TEXT,
+                embedding_model_revision TEXT,
+                outcome                  TEXT NOT NULL,
+                reason_code              TEXT,
+                summary_json             TEXT NOT NULL,
+                created_at               INTEGER NOT NULL,
+                FOREIGN KEY (proposal_id) REFERENCES skill_proposals(proposal_id) ON DELETE RESTRICT,
+                FOREIGN KEY (skill_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                FOREIGN KEY (predecessor_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                UNIQUE (proposal_id, attempt),
+                CHECK (attempt > 0),
+                CHECK (verifier_version > 0),
+                CHECK (fakes_version > 0),
+                CHECK (outcome IN ('passed','rejected','retryable')),
+                CHECK (
+                    (outcome = 'rejected' AND reason_code IS NOT NULL)
+                    OR
+                    (outcome <> 'rejected')
+                ),
+                CHECK (
+                    (embedding_model_id IS NULL AND embedding_model_revision IS NULL)
+                    OR
+                    (embedding_model_id IS NOT NULL AND embedding_model_revision IS NOT NULL)
+                )
+            );
+
+            CREATE TABLE IF NOT EXISTS skill_approvals (
+                approval_id       TEXT PRIMARY KEY,
+                proposal_id       TEXT NOT NULL UNIQUE,
+                skill_id          TEXT NOT NULL UNIQUE,
+                report_id         TEXT NOT NULL UNIQUE,
+                approver_id       TEXT NOT NULL,
+                authenticated_at  INTEGER NOT NULL,
+                approved_at       INTEGER NOT NULL,
+                artifact_version  INTEGER NOT NULL,
+                proposal_version  INTEGER NOT NULL,
+                generation        INTEGER NOT NULL,
+                FOREIGN KEY (proposal_id) REFERENCES skill_proposals(proposal_id) ON DELETE RESTRICT,
+                FOREIGN KEY (skill_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                FOREIGN KEY (report_id) REFERENCES evaluation_reports(report_id) ON DELETE RESTRICT,
+                CHECK (length(approver_id) BETWEEN 1 AND 256),
+                CHECK (artifact_version > 0),
+                CHECK (proposal_version > 0),
+                CHECK (generation > 0)
+            );
+
+
+
+                PRAGMA user_version = 3;
+                ",
+            )?;
+            Ok(())
+        })();
+
+        match migration {
+            Ok(()) => db.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = db.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -850,6 +2159,189 @@ fn read_artifact_row(row: &Row) -> rusqlite::Result<Result<SkillArtifact, StoreE
         Ok(artifact) => Ok(Ok(artifact)),
         Err(e) => Ok(Err(StoreError::MalformedJson(e))),
     }
+}
+
+fn read_proposal_row(row: &Row) -> rusqlite::Result<ProposalRecord> {
+    let status: String = row.get(3)?;
+    let status = ProposalStatus::parse(&status).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let attempt_count: i64 = row.get(4)?;
+    let row_version: i64 = row.get(10)?;
+    if !(0..=i64::from(MAX_EVALUATION_ATTEMPTS)).contains(&attempt_count) || row_version <= 0 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Integer,
+            Box::new(StoreError::CorruptRow(
+                "invalid proposal counter or row version".to_string(),
+            )),
+        ));
+    }
+    Ok(ProposalRecord {
+        proposal_id: row.get(0)?,
+        skill_id: row.get(1)?,
+        predecessor_id: row.get(2)?,
+        status,
+        attempt_count: attempt_count as u32,
+        next_attempt_at: row.get(5)?,
+        lease_owner: row.get(6)?,
+        lease_expires_at: row.get(7)?,
+        report_id: row.get(8)?,
+        reason_code: row.get(9)?,
+        row_version: row_version as u64,
+    })
+}
+
+fn read_held_out_suite(row: &Row) -> rusqlite::Result<HeldOutSuiteRecord> {
+    Ok(HeldOutSuiteRecord {
+        suite_id: row.get(0)?,
+        selector_json: row.get(1)?,
+        cases_json: row.get(2)?,
+        content_hash: row.get(3)?,
+        canonical_payload: row.get(4)?,
+        approved_by: row.get(5)?,
+        approved_at: row.get(6)?,
+        enabled: row.get::<_, i64>(7)? == 1,
+    })
+}
+
+fn read_evaluation_report(row: &Row) -> rusqlite::Result<EvaluationReportRecord> {
+    let suite_hashes_json: String = row.get(6)?;
+    let suite_hashes = serde_json::from_str(&suite_hashes_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let summary_json: String = row.get(12)?;
+    serde_json::from_str::<serde_json::Value>(&summary_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(EvaluationReportRecord {
+        report_id: row.get(0)?,
+        proposal_id: row.get(1)?,
+        skill_id: row.get(2)?,
+        attempt: row.get(3)?,
+        verifier_version: row.get(4)?,
+        fakes_version: row.get(5)?,
+        suite_hashes,
+        predecessor_id: row.get(7)?,
+        embedding_model_id: row.get(8)?,
+        embedding_model_revision: row.get(9)?,
+        outcome: row.get(10)?,
+        reason_code: row.get(11)?,
+        summary_json,
+        created_at: row.get(13)?,
+    })
+}
+
+fn validate_full_id(id: Option<&str>) -> Result<(), StoreError> {
+    if let Some(id) = id
+        && (id.len() != 64
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(StoreError::Constraint(
+            "predecessor ID must be 64 lowercase hexadecimal characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn sql_version(version: u64) -> Result<i64, StoreError> {
+    i64::try_from(version)
+        .map_err(|_| StoreError::Constraint("row version exceeds SQLite range".to_string()))
+}
+
+fn enqueue_status(status: ProposalStatus) -> Result<EnqueueStatus, StoreError> {
+    match status {
+        ProposalStatus::Pending | ProposalStatus::Evaluating => Ok(EnqueueStatus::Pending),
+        ProposalStatus::Verified => Ok(EnqueueStatus::Verified),
+        ProposalStatus::Rejected => Ok(EnqueueStatus::Rejected),
+        ProposalStatus::AwaitingApproval => Ok(EnqueueStatus::AwaitingApproval),
+        ProposalStatus::Approved => Ok(EnqueueStatus::Approved),
+    }
+}
+
+fn insert_revision(
+    tx: &rusqlite::Transaction<'_>,
+    artifact: &SkillArtifact,
+    status: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO skill_revisions (
+            id, identity_version, source, description, tags_json,
+            exports_json, tests_json, capability_json, status,
+            row_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+        params![
+            artifact.id,
+            artifact.identity_version,
+            artifact.source,
+            artifact.description,
+            serde_json::to_string(&artifact.tags)?,
+            serialize_exports(&artifact.exports)?,
+            serde_json::to_string(&artifact.tests)?,
+            serialize_capability(&artifact.capability)?,
+            status,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_report_binding(
+    proposal_id: &str,
+    report: &EvaluationReportRecord,
+) -> Result<(), StoreError> {
+    if report.proposal_id != proposal_id
+        || report.skill_id.len() != 64
+        || report.report_id.trim().is_empty()
+        || report.attempt == 0
+        || report.verifier_version == 0
+        || report.fakes_version == 0
+    {
+        return Err(StoreError::Constraint(
+            "evaluation report binding or version is invalid".to_string(),
+        ));
+    }
+    if report.recompute_id()? != report.report_id {
+        return Err(StoreError::Constraint(
+            "evaluation report identity is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_report(
+    tx: &rusqlite::Transaction<'_>,
+    report: &EvaluationReportRecord,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO evaluation_reports (
+            report_id, proposal_id, skill_id, attempt, verifier_version, fakes_version,
+            suite_hashes_json, predecessor_id, embedding_model_id,
+            embedding_model_revision, outcome, reason_code, summary_json, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+         )",
+        params![
+            report.report_id,
+            report.proposal_id,
+            report.skill_id,
+            report.attempt,
+            report.verifier_version,
+            report.fakes_version,
+            serde_json::to_string(&report.suite_hashes)?,
+            report.predecessor_id,
+            report.embedding_model_id,
+            report.embedding_model_revision,
+            report.outcome,
+            report.reason_code,
+            report.summary_json,
+            report.created_at
+        ],
+    )?;
+    Ok(())
 }
 
 fn validate_embedding_bytes(
@@ -895,7 +2387,7 @@ fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Get current Unix timestamp in seconds.
-fn current_timestamp() -> Result<i64, StoreError> {
+pub(crate) fn current_timestamp() -> Result<i64, StoreError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
