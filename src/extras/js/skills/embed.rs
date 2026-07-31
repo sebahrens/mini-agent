@@ -1113,7 +1113,8 @@ mod tests {
     fn test_model_metadata() {
         let embedder = Embedder::new().unwrap();
         let meta = embedder.model_metadata();
-        assert_eq!(meta.model_id, "BAAI/bge-small-en-v1.5");
+        // The offline backend advertises its own identity, not a real model's.
+        assert_eq!(meta.model_id, "deterministic-hash");
         assert_eq!(meta.dimensions, 384);
         assert!(meta.normalized);
     }
