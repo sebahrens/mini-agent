@@ -16,6 +16,15 @@
 //! - Operational data (timestamps, status, lineage, row version, embeddings) is outside
 //!   identity. There is no update operation for identity-bearing fields.
 
+// Phase 3 is built bottom-up: this module is the persistence, embedding, and
+// verification foundation, while the beads that consume it from the runner
+// (lifecycle CRUD, index snapshots, prompt-time retrieval, turn binding) land
+// later in the phase. Until that wiring exists the whole API is reachable only
+// from tests, so dead-code analysis on a non-test binary flags every item.
+// Remove this attribute once the runner consumes the skill library — see
+// mini-agent-q0i, -y9e, -h3q, and -dqf.
+#![allow(dead_code)]
+
 use std::fmt;
 
 use sha2::{Digest, Sha256};

@@ -152,9 +152,7 @@ impl SkillStore {
              FROM skill_revisions WHERE id = ?",
         )?;
 
-        let row = stmt
-            .query_row(params![id], |row| read_artifact_row(row))
-            .optional()?;
+        let row = stmt.query_row(params![id], read_artifact_row).optional()?;
 
         match row {
             Some(Ok(artifact)) => {
@@ -178,7 +176,7 @@ impl SkillStore {
              ORDER BY id",
         )?;
 
-        let rows = stmt.query_map([], |row| read_artifact_row(row))?;
+        let rows = stmt.query_map([], read_artifact_row)?;
 
         let mut artifacts = Vec::new();
         for result in rows {
@@ -399,12 +397,7 @@ fn current_timestamp() -> Result<i64, StoreError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .map_err(|_| {
-            StoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "system time error",
-            ))
-        })
+        .map_err(|_| StoreError::Io(std::io::Error::other("system time error")))
 }
 
 /// Serialize SkillExport vec to JSON string.
