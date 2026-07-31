@@ -137,8 +137,9 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let sandbox = cli.resolve_sandbox(cfg);
     let sandbox_backend = cli.resolve_sandbox_backend(cfg);
     let shell = cli.resolve_shell(cfg);
-    let sandbox_capabilities =
-        Sandbox::new(sandbox, &sandbox_backend).with_shell(&shell).capability_matrix();
+    let sandbox_capabilities = Sandbox::new(sandbox, &sandbox_backend)
+        .with_shell(&shell)
+        .capability_matrix();
     let edit_system = cli.resolve_edit_system(cfg);
     let compact = cfg.resolve_compact_enabled();
 
@@ -278,10 +279,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
                 sandbox_capabilities.process_namespace.to_string(),
             ),
             ("devices", sandbox_capabilities.devices.to_string()),
-            (
-                "environment",
-                sandbox_capabilities.environment.to_string(),
-            ),
+            ("environment", sandbox_capabilities.environment.to_string()),
             ("network", sandbox_capabilities.network.to_string()),
             (
                 "requested network policy",

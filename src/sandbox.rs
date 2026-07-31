@@ -1,8 +1,8 @@
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Output;
 use std::process::{ExitStatus, Stdio};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -276,15 +276,12 @@ impl Sandbox {
                 SandboxCapabilityMatrix {
                     backend: self.backend.clone(),
                     status: "required-and-available",
-                    filesystem_reads:
-                        "workspace, application cache, explicit read-only runtime assets, and proc kernel metadata",
-                    filesystem_writes:
-                        "workspace, application cache, and private ephemeral /tmp only",
+                    filesystem_reads: "workspace, application cache, explicit read-only runtime assets, and proc kernel metadata",
+                    filesystem_writes: "workspace, application cache, and private ephemeral /tmp only",
                     process_namespace: "user, PID, IPC, UTS, and cgroup namespaces isolated",
                     devices: "minimal synthetic /dev",
                     environment: "cleared, then populated from a non-credential allow-list",
-                    network:
-                        "IP network denied by an isolated namespace; filesystem Unix sockets in writable binds remain reachable",
+                    network: "IP network denied by an isolated namespace; filesystem Unix sockets in writable binds remain reachable",
                     requested_network_policy: BWRAP_REQUESTED_NETWORK_POLICY,
                 }
             }
@@ -297,8 +294,7 @@ impl Sandbox {
                 devices: "backend-defined",
                 environment: "backend-defined",
                 network: "backend-defined; mini-agent makes no network-isolation claim",
-                requested_network_policy:
-                    "backend-defined; mini-agent makes no network-isolation claim",
+                requested_network_policy: "backend-defined; mini-agent makes no network-isolation claim",
             },
         }
     }
@@ -377,23 +373,14 @@ impl Sandbox {
         // Start from bubblewrap's empty root and add only executable/runtime
         // assets. Never read-bind the host root: doing so would expose home
         // directories, credentials, and other unrelated host state.
-        for path in [
-            "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix",
-        ] {
+        for path in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix"] {
             cmd.args(["--ro-bind-try", path, path]);
         }
         cmd.args(["--dir", "/etc"]);
         for path in ["/etc/localtime", "/etc/ld.so.cache"] {
             cmd.args(["--ro-bind-try", path, path]);
         }
-        cmd.args([
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-        ]);
+        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
         cmd.arg("--bind").arg(cwd).arg(cwd);
         cmd.arg("--bind").arg(cache_dir).arg(cache_dir);
         cmd.args([
@@ -408,13 +395,7 @@ impl Sandbox {
             "--chdir",
         ]);
         cmd.arg(cwd);
-        cmd.args([
-            "--die-with-parent",
-            "--",
-            &self.shell,
-            "-c",
-            command,
-        ]);
+        cmd.args(["--die-with-parent", "--", &self.shell, "-c", command]);
         configure_child_lifetime(&mut cmd);
         cmd
     }
@@ -799,7 +780,15 @@ pub(crate) fn kill_process_group(pid: u32) {
 
 fn essential_env() -> Vec<(&'static str, String)> {
     let preserve = [
-        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "COLORTERM",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "COLORTERM",
         "NO_COLOR",
     ];
     let mut vars = Vec::with_capacity(preserve.len());
@@ -812,8 +801,12 @@ fn essential_env() -> Vec<(&'static str, String)> {
 }
 
 fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|error| format!("sandbox: failed to resolve {label} {}: {error}", path.display()))?;
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "sandbox: failed to resolve {label} {}: {error}",
+            path.display()
+        )
+    })?;
     if canonical.parent().is_none() {
         return Err(format!(
             "sandbox: refusing to expose filesystem root as {label}"
@@ -926,9 +919,7 @@ mod sandbox_tests {
             args[0] == "--bind" && args[1] == "/workspace" && args[2] == "/workspace"
         }));
         assert!(args.windows(3).any(|args| {
-            args[0] == "--bind"
-                && args[1] == "/cache/mini-agent"
-                && args[2] == "/cache/mini-agent"
+            args[0] == "--bind" && args[1] == "/cache/mini-agent" && args[2] == "/cache/mini-agent"
         }));
         for credential_variable in [
             "OPENROUTER_API_KEY",
@@ -967,8 +958,7 @@ mod sandbox_tests {
         }
 
         let unique = uuid::Uuid::new_v4();
-        let host_secret =
-            std::env::temp_dir().join(format!("mini-agent-host-secret-{unique}"));
+        let host_secret = std::env::temp_dir().join(format!("mini-agent-host-secret-{unique}"));
         std::fs::write(&host_secret, b"must stay hidden").unwrap();
         let workspace_probe = std::env::current_dir()
             .unwrap()
@@ -1038,13 +1028,10 @@ printf LINUX_SANDBOX_POLICY_PASS
             uuid::Uuid::new_v4()
         ));
         let marker_name = marker.file_name().unwrap().to_string_lossy();
-        let sandbox = Sandbox::new(true, "bwrap")
-            .with_shell("/__mini_agent_missing_sandbox_shell__");
+        let sandbox =
+            Sandbox::new(true, "bwrap").with_shell("/__mini_agent_missing_sandbox_shell__");
         let output = sandbox
-            .output_command_with_limits(
-                &format!("touch {marker_name}"),
-                DEFAULT_COMMAND_LIMITS,
-            )
+            .output_command_with_limits(&format!("touch {marker_name}"), DEFAULT_COMMAND_LIMITS)
             .await
             .unwrap();
 
