@@ -46,11 +46,12 @@ respects Linux XDG variables while placing SQLite under configuration storage.
 ```toml
 # Cargo.toml additions
 [features]
-skills = ["js", "dep:fastembed", "dep:rusqlite"]
+skills = ["js", "dep:rusqlite"]
+skills-embed = ["skills", "dep:fastembed"]
 
 [dependencies]
-fastembed = { version = "3", optional = true }
-rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+fastembed = { version = "5", optional = true }
 ```
 
 `skills` implies `js`; a selectable skills-without-JS state is invalid. Gate skill code behind
@@ -59,6 +60,18 @@ bundled SQLite and must verify that FTS5 is enabled in the pinned build. If it i
 the lexical retriever must fail clearly at startup or use an explicitly tested fallback; it must
 not silently claim hybrid retrieval. The existing mandatory `sha2` dependency is reused; do not
 add a second optional declaration.
+
+**`fastembed` is behind its own `skills-embed` feature, not `skills`.** `fastembed` pulls
+`ort-sys` (ONNX Runtime), which ships no prebuilt binaries for every host — notably
+`x86_64-apple-darwin`, where the build fails outright. Folding it into `skills` would make the
+entire skill library unbuildable on those hosts. `skills` therefore carries only SQLite and
+selects the offline deterministic embedding backend; `skills-embed` adds local BGE inference.
+An external OpenAI-compatible embeddings API is the third option and needs no extra feature —
+see the `[embedding]` section in `docs/agent/CONFIG.md`. Required CI covers the `skills` rows;
+`skills-embed` runs as an optional, non-blocking job.
+
+The original pins in this section (`fastembed = "3"`, `rusqlite = "0.31"`) were stale and did not
+resolve against the current toolchain; the versions above are what is actually built.
 
 ---
 

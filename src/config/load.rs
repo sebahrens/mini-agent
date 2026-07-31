@@ -892,6 +892,9 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
     cfg.mcp_servers = Some(servers);
 }
 
+// Both parameters are consumed only by the `mcp` and `lsp` arms below, so a build
+// with neither feature legitimately uses neither.
+#[cfg_attr(not(any(feature = "mcp", feature = "lsp")), allow(unused_variables))]
 fn verification_sensitive_integrations_match(cfg: &Config, active: bool) -> bool {
     #[cfg(feature = "mcp")]
     let mcp_matches = cfg

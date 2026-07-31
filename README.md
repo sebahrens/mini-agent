@@ -93,6 +93,30 @@ separate boundary; subprocess network isolation does not bypass or replace fetch
 | 4 | Agent proposals, held-out evaluation, human-gated canary | Planned |
 | 5 | Evidence, promotion, quarantine, repair, rollback | Planned |
 
+## Cargo features
+
+| Feature | Implies | Adds |
+|---------|---------|------|
+| `js` | — | QuickJS engine and host globals (`rquickjs`) |
+| `sandbox` | — | Linux/macOS process isolation for `spawn`, and the `fetch` global |
+| `skills` | `js` | Learned-skill store, retrieval, and no-effect verifier (`rusqlite`, bundled SQLite) |
+| `skills-embed` | `skills` | Local BGE embedding inference (`fastembed` → ONNX Runtime) |
+| `mcp` | — | MCP client transports and tool discovery |
+
+Selecting `skills` automatically enables `js`; a skills-without-JS build is not
+selectable. `skills` alone uses an offline deterministic embedding backend, so it
+builds everywhere.
+
+**Platform caveat:** `skills-embed` pulls `ort-sys` (ONNX Runtime), which has no
+prebuilt binaries for some hosts — notably `x86_64-apple-darwin`, where it fails
+to build. That is why it is a separate opt-in feature and why required CI does not
+enable it. For real semantic embeddings without a local model, point the
+`[embedding]` config section at an external OpenAI-compatible API instead; see
+[`docs/agent/CONFIG.md`](docs/agent/CONFIG.md).
+
+Supported combinations exercised in CI: default, `--no-default-features`, `js`,
+`skills`, `js,sandbox`, `mcp`, `js,skills`, and `mcp,js,skills`.
+
 ## Development commands
 
 From the repository root:
