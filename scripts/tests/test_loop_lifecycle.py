@@ -11,6 +11,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 LOOP_SCRIPT = REPOSITORY_ROOT / "scripts" / "loop.sh"
+VERIFICATION_POLICY = REPOSITORY_ROOT / "scripts" / "loop-verification-policy.sh"
 
 
 def extract_function(source: str, name: str, next_name: str) -> str:
@@ -204,7 +205,7 @@ run_with_hard_timeout 5 shell_task
         fixture_function = extract_function(
             source,
             "path_is_cargo_verified_fixture",
-            "path_is_relevant_for_profile",
+            "load_verification_policy",
         )
         harness = f"""
 set -eu
@@ -234,12 +235,7 @@ fi
         self.assertEqual(0, completed.returncode, completed.stderr)
 
     def test_loop_verifier_is_relevant_to_headless_rust_iterations(self) -> None:
-        source = LOOP_SCRIPT.read_text()
-        relevance_function = extract_function(
-            source,
-            "path_is_generated_python_bytecode",
-            "current_iteration_has_relevant_changes",
-        )
+        relevance_function = VERIFICATION_POLICY.read_text()
         harness = f"""
 set -eu
 
@@ -270,8 +266,9 @@ fi
 
     def test_automatic_staging_excludes_tracked_python_bytecode(self) -> None:
         source = LOOP_SCRIPT.read_text()
+        policy = VERIFICATION_POLICY.read_text()
         bytecode_function = extract_function(
-            source,
+            policy,
             "path_is_generated_python_bytecode",
             "path_is_relevant_for_profile",
         )
@@ -352,8 +349,9 @@ git diff --cached --name-only
         self,
     ) -> None:
         source = LOOP_SCRIPT.read_text()
+        policy = VERIFICATION_POLICY.read_text()
         bytecode_function = extract_function(
-            source,
+            policy,
             "path_is_generated_python_bytecode",
             "path_is_relevant_for_profile",
         )
@@ -428,16 +426,13 @@ git diff --cached --name-status
 
     def test_run_verification_accepts_headless_workflow_only_commit(self) -> None:
         source = LOOP_SCRIPT.read_text()
+        policy = VERIFICATION_POLICY.read_text()
         append_function = extract_function(
             source,
             "append_verification_error",
             "report_verification_failure",
         )
-        relevance_function = extract_function(
-            source,
-            "path_is_generated_python_bytecode",
-            "current_iteration_has_relevant_changes",
-        )
+        relevance_function = policy
         verification_function = extract_function(
             source,
             "run_verification",
@@ -571,16 +566,13 @@ run_verification HEAD~1 HEAD headless rust
         self,
     ) -> None:
         source = LOOP_SCRIPT.read_text()
+        policy = VERIFICATION_POLICY.read_text()
         append_function = extract_function(
             source,
             "append_verification_error",
             "report_verification_failure",
         )
-        relevance_function = extract_function(
-            source,
-            "path_is_generated_python_bytecode",
-            "current_iteration_has_relevant_changes",
-        )
+        relevance_function = policy
         verification_function = extract_function(
             source,
             "run_verification",

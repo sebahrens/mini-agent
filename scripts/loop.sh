@@ -2045,41 +2045,14 @@ path_is_cargo_verified_fixture() {
     esac
 }
 
-path_is_generated_python_bytecode() {
-    case "$1" in
-        */__pycache__/*|*.pyc|*.pyo) return 0 ;;
-        *) return 1 ;;
-    esac
+load_verification_policy() {
+    # This source is deliberately repeated immediately before verification:
+    # the parent loop process outlives agent iterations and otherwise retains
+    # stale function definitions after scripts/loop.sh is edited.
+    source "$SCRIPT_DIR/loop-verification-policy.sh"
 }
 
-path_is_relevant_for_profile() {
-    local path="$1" profile="$2" surfaces="${3:-rust}"
-    # Generated Python bytecode is never an implementation surface. It can
-    # appear under scripts/ after a local test run, but has no source verifier
-    # and must not make an iteration relevant (or trigger "verifier missing").
-    path_is_generated_python_bytecode "$path" && return 1
-    case "$path" in
-        src/*|Cargo.toml|Cargo.lock|build.rs|scripts/loop.sh|.github/workflows/*.yml|.github/workflows/*.yaml) return 0 ;;
-    esac
-    case ",$surfaces," in
-        *,script,*) case "$path" in scripts/*) return 0 ;; esac ;;
-    esac
-    case ",$surfaces," in
-        *,data,*) case "$path" in data/*) return 0 ;; esac ;;
-    esac
-    case ",$surfaces," in
-        *,asset,*) case "$path" in assets/*) return 0 ;; esac ;;
-    esac
-    case ",$surfaces," in
-        *,cargo-config,*) case "$path" in .cargo/*) return 0 ;; esac ;;
-    esac
-    if [ "$profile" = packaged-artifact ] && [[ ",$surfaces," == *,packaging,* ]]; then
-        case "$path" in
-            packaging/*|nix/*|tap/*|.github/*|scripts/*|install.sh|justfile|default.nix|release.nix|shell.nix) return 0 ;;
-        esac
-    fi
-    return 1
-}
+load_verification_policy
 
 current_iteration_has_relevant_changes() {
     local start_commit="$1" end_commit="$2" profile="${3:-headless}" surfaces="${4:-rust}" path
@@ -2450,6 +2423,7 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
     [ -n "$iteration_start_commit" ] && [ -n "$commit_after" ] && [ "$iteration_start_commit" != "$commit_after" ] \
         && iteration_committed=true
 
+    load_verification_policy
     run_verification "$iteration_start_commit" "$commit_after" "$verification_profile" "$verification_surfaces" \
         && local verify_ok=0 || local verify_ok=$?
 
@@ -2463,6 +2437,7 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
         commit_after=$(git rev-parse HEAD 2>/dev/null || echo "")
         [ -n "$iteration_start_commit" ] && [ "$iteration_start_commit" != "$commit_after" ] \
             && iteration_committed=true
+        load_verification_policy
         run_verification "$iteration_start_commit" "$commit_after" "$verification_profile" "$verification_surfaces" \
             && verify_ok=0 || verify_ok=$?
         if [ -n "$(git status --porcelain | grep -v '\.beads/' || true)" ]; then
