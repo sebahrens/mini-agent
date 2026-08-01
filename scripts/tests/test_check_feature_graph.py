@@ -243,6 +243,42 @@ class FeatureGraphTests(unittest.TestCase):
             feature_graph.validate_workflow_commands(workflow),
         )
 
+    def test_redirection_operands_do_not_bind_feature_matrix(self) -> None:
+        redirections = (">", "2>", ">>", "2>>", "<", "<<", "<<<")
+        for redirection in redirections:
+            with self.subTest(redirection=redirection):
+                workflow = self.workflow_text.replace(
+                    "cargo test --locked ${{ matrix.features }}",
+                    f"cargo test --locked {redirection} ${{{{ matrix.features }}}}",
+                    1,
+                )
+                self.assertIn(
+                    "test job Cargo command must consume "
+                    "'${{ matrix.features }}'",
+                    feature_graph.validate_workflow_commands(workflow),
+                )
+
+    def test_interpolation_must_be_a_complete_cargo_argument(self) -> None:
+        workflow = self.workflow_text.replace(
+            "cargo test --locked ${{ matrix.features }}",
+            "cargo test --locked prefix-${{ matrix.features }}",
+            1,
+        )
+
+        self.assertIn(
+            "test job Cargo command must consume '${{ matrix.features }}'",
+            feature_graph.validate_workflow_commands(workflow),
+        )
+
+    def test_workflow_command_accepts_quoted_matrix_argument(self) -> None:
+        workflow = self.workflow_text.replace(
+            "cargo test --locked ${{ matrix.features }}",
+            'cargo test --locked "${{ matrix.features }}"',
+            1,
+        )
+
+        self.assertEqual([], feature_graph.validate_workflow_commands(workflow))
+
     def test_workflow_command_accepts_multiline_cargo_invocation(self) -> None:
         workflow = self.workflow_text.replace(
             "run: cargo test --locked ${{ matrix.features }}",

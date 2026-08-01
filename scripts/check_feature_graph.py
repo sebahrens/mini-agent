@@ -383,13 +383,13 @@ def _shell_command_segments(command: str) -> list[str]:
         if character == "#" and (
             index == 0
             or command[index - 1].isspace()
-            or command[index - 1] in ";|&"
+            or command[index - 1] in ";|&<>()"
         ):
             while index < len(command) and command[index] != "\n":
                 index += 1
             finish_segment()
             continue
-        if character == "\n" or character in ";|&":
+        if character == "\n" or character in ";|&<>()":
             finish_segment()
             index += 1
             if index < len(command) and command[index] == character:
@@ -404,21 +404,46 @@ def _shell_command_segments(command: str) -> list[str]:
     return segments
 
 
+def _cargo_invocation_consumes_matrix(
+    invocation: str,
+    subcommand: str,
+    interpolation: str,
+) -> bool:
+    if interpolation not in invocation:
+        return False
+    sentinel = "__CI_MATRIX_FEATURES_ARGUMENT__"
+    while sentinel in invocation:
+        sentinel += "_"
+    try:
+        arguments = shlex.split(invocation.replace(interpolation, sentinel))
+    except ValueError:
+        return False
+    return (
+        len(arguments) >= 3
+        and arguments[0] == "cargo"
+        and arguments[1] == subcommand
+        and sentinel in arguments[2:]
+    )
+
+
 def validate_workflow_commands(text: str) -> list[str]:
     errors: list[str] = []
     interpolation = "${{ matrix.features }}"
     for job, subcommand in (("test", "test"), ("clippy", "clippy")):
         commands = _workflow_run_commands(text, job)
-        cargo_invocations = [
-            segment
+        invocations = [
+            invocation
             for command in commands
-            for segment in _shell_command_segments(command)
-            if re.match(
-                rf"cargo\s+{re.escape(subcommand)}\b",
-                segment,
-            )
+            for invocation in _shell_command_segments(command)
         ]
-        if not any(interpolation in invocation for invocation in cargo_invocations):
+        if not any(
+            _cargo_invocation_consumes_matrix(
+                invocation,
+                subcommand,
+                interpolation,
+            )
+            for invocation in invocations
+        ):
             errors.append(
                 f"{job} job Cargo command must consume {interpolation!r}"
             )
