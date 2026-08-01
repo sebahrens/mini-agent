@@ -601,6 +601,42 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn explicit_seatbelt_capability_denial(result: &ValidationResult) -> bool {
+        if !matches!(
+            result.status,
+            ValidationStatus::Failed | ValidationStatus::NonZeroExit { .. }
+        ) {
+            return false;
+        }
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        stderr.contains("sandbox_apply: Operation not permitted")
+            || stderr.contains("sandbox backend 'seatbelt' is not available")
+            || stderr.contains("sandbox backend 'seatbelt' is not a trusted system executable")
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn seatbelt_capability_available(sandbox: &Sandbox) -> bool {
+        let probe = run_with_limits(
+            sandbox,
+            "printf mini-agent-seatbelt-capability",
+            limits(Duration::from_secs(1)),
+        )
+        .await;
+        if probe.status == (ValidationStatus::Success { exit_code: Some(0) })
+            && probe.stdout == b"mini-agent-seatbelt-capability"
+        {
+            return true;
+        }
+        if explicit_seatbelt_capability_denial(&probe) {
+            return false;
+        }
+        panic!(
+            "Seatbelt capability probe failed unexpectedly: {}",
+            probe.render()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn loop_validation_process_limits_seatbelt_scoped_cancellation_preserves_unrelated_command()
      {
@@ -608,7 +644,23 @@ mod tests {
         if sandbox.policy() != crate::sandbox::SandboxPolicy::RequiredAndAvailable {
             return;
         }
+        if !seatbelt_capability_available(&sandbox).await {
+            return;
+        }
         assert_scoped_cancellation_preserves_unrelated_command(sandbox, "seatbelt").await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn loop_validation_process_limits_seatbelt_probe_never_skips_cleanup_failures() {
+        let cleanup_failure = ValidationResult {
+            status: ValidationStatus::TimedOut,
+            stdout: Vec::new(),
+            stderr: b"sandbox_apply: Operation not permitted".to_vec(),
+            limits: limits(Duration::from_secs(1)),
+            diagnostic_truncated: false,
+        };
+        assert!(!explicit_seatbelt_capability_denial(&cleanup_failure));
     }
 
     #[tokio::test]

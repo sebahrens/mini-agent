@@ -10,6 +10,8 @@ use crate::cli::Cli;
 use crate::config::Config;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
+#[cfg(feature = "loop")]
+use crate::event::ValidationOperationId;
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::extras::status_signals::StatusSignals;
@@ -126,6 +128,12 @@ impl AgentBuildCtx<'_> {
 
 /// Transient state of the main agent run: the agent handle, its event
 /// stream and abort handle, queued user input, and streaming-response scratch.
+#[cfg(feature = "loop")]
+pub(super) struct ActiveValidation {
+    id: ValidationOperationId,
+    cancellation: crate::extras::r#loop::validation::ValidationCancellation,
+}
+
 #[derive(Default)]
 pub(crate) struct AgentRunState {
     pub agent: Option<AnyAgent>,
@@ -133,7 +141,9 @@ pub(crate) struct AgentRunState {
     pub agent_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub main_abort: Option<tokio::task::AbortHandle>,
     #[cfg(feature = "loop")]
-    pub validation_cancel: Option<crate::extras::r#loop::validation::ValidationCancellation>,
+    pub(super) active_validation: Option<ActiveValidation>,
+    #[cfg(feature = "loop")]
+    pub(super) validation_generation: u64,
     pub pending_inputs: VecDeque<String>,
     pub agent_line_started: bool,
     pub response_buf: String,
@@ -142,6 +152,46 @@ pub(crate) struct AgentRunState {
     pub was_reasoning: bool,
     pub turn_trace: Vec<compact_str::CompactString>,
     pub awaiting_compaction_relief: bool,
+}
+
+#[cfg(feature = "loop")]
+impl AgentRunState {
+    pub(crate) fn begin_validation(
+        &mut self,
+        cancellation: crate::extras::r#loop::validation::ValidationCancellation,
+    ) -> ValidationOperationId {
+        self.validation_generation = self
+            .validation_generation
+            .checked_add(1)
+            .expect("validation operation generation exhausted");
+        let id = ValidationOperationId(self.validation_generation);
+        self.active_validation = Some(ActiveValidation { id, cancellation });
+        id
+    }
+
+    pub(crate) fn validation_active(&self) -> bool {
+        self.active_validation.is_some()
+    }
+
+    /// Retires the current generation before signalling its worker. Any
+    /// completion already queued for that generation is stale immediately.
+    pub(crate) fn cancel_validation(&mut self) -> bool {
+        let Some(active) = self.active_validation.take() else {
+            return false;
+        };
+        active.cancellation.cancel();
+        true
+    }
+
+    /// Accepts exactly the operation currently registered in this run state.
+    /// A stale completion must not clear or replace a newer validation.
+    pub(crate) fn complete_validation(&mut self, id: ValidationOperationId) -> bool {
+        if self.active_validation.as_ref().map(|active| active.id) != Some(id) {
+            return false;
+        }
+        self.active_validation = None;
+        true
+    }
 }
 
 /// What happens when the current run finishes: chained prompts, dot-prompt
@@ -180,6 +230,53 @@ pub(crate) struct BtwStats {
     pub cost: f64,
     pub input: u64,
     pub output: u64,
+}
+
+#[cfg(all(test, feature = "loop"))]
+mod validation_generation_tests {
+    use super::*;
+
+    fn cancellation() -> crate::extras::r#loop::validation::ValidationCancellation {
+        crate::extras::r#loop::validation::start(&Sandbox::new(false, "bwrap"), "true")
+            .cancellation()
+    }
+
+    #[test]
+    fn cancelled_validation_then_normal_run_rejects_stale_completion() {
+        let mut run = AgentRunState::default();
+        let stale = run.begin_validation(cancellation());
+        assert!(run.cancel_validation());
+
+        // A normal run may start before the cancelled worker finishes cleanup.
+        run.is_running = true;
+        assert!(!run.complete_validation(stale));
+        assert!(run.is_running);
+        assert!(!run.validation_active());
+    }
+
+    #[test]
+    fn cancelled_validation_then_new_loop_preserves_new_generation() {
+        let mut run = AgentRunState::default();
+        let stale = run.begin_validation(cancellation());
+        assert!(run.cancel_validation());
+        let current = run.begin_validation(cancellation());
+
+        assert_ne!(stale, current);
+        assert!(!run.complete_validation(stale));
+        assert!(run.validation_active());
+        assert!(run.complete_validation(current));
+        assert!(!run.validation_active());
+    }
+
+    #[test]
+    fn current_validation_completion_retires_active_generation() {
+        let mut run = AgentRunState::default();
+        let current = run.begin_validation(cancellation());
+
+        assert!(run.complete_validation(current));
+        assert!(!run.validation_active());
+        assert!(!run.complete_validation(current));
+    }
 }
 
 /// Parameters for a worktree merge-and-return run.

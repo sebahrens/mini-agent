@@ -549,7 +549,7 @@ impl<'a> App<'a> {
                     key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL);
                 if is_ctrl_c || is_ctrl_d {
                     #[cfg(feature = "loop")]
-                    let validation_active = self.run.validation_cancel.is_some();
+                    let validation_active = self.run.validation_active();
                     #[cfg(not(feature = "loop"))]
                     let validation_active = false;
                     match interrupt_target(
@@ -925,7 +925,7 @@ impl<'a> App<'a> {
         &mut self,
         event: crate::event::LoopValidationEvent,
     ) -> anyhow::Result<()> {
-        event_handler::handle_loop_validation_event(
+        let current = event_handler::handle_loop_validation_event(
             event,
             &mut self.renderer,
             &mut self.run,
@@ -933,7 +933,10 @@ impl<'a> App<'a> {
             &mut self.chain,
         )
         .await?;
-        self.finalize_turn(false).await
+        if current {
+            self.finalize_turn(false).await?;
+        }
+        Ok(())
     }
 
     async fn finalize_turn(&mut self, turn_errored: bool) -> anyhow::Result<()> {
@@ -1002,16 +1005,10 @@ impl<'a> App<'a> {
 
     fn abort_main_run(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "loop")]
-        let validation_cancel = self.run.validation_cancel.clone();
-        #[cfg(feature = "loop")]
-        let validation_active = validation_cancel.is_some();
+        let validation_active = self.run.cancel_validation();
         #[cfg(not(feature = "loop"))]
         let validation_active = false;
 
-        #[cfg(feature = "loop")]
-        if let Some(cancellation) = validation_cancel {
-            cancellation.cancel();
-        }
         if !validation_active {
             if let Some(handle) = self.run.main_abort.take() {
                 handle.abort();

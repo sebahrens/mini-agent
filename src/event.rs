@@ -62,8 +62,13 @@ pub enum BtwEvent {
 }
 
 #[cfg(feature = "loop")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidationOperationId(pub(crate) u64);
+
+#[cfg(feature = "loop")]
 #[derive(Debug, Clone)]
 pub(crate) struct LoopValidationEvent {
+    pub operation_id: ValidationOperationId,
     pub response: CompactString,
     pub summary: String,
     pub result: crate::extras::r#loop::validation::ValidationResult,

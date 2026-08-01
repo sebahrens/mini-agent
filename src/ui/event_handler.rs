@@ -425,7 +425,7 @@ async fn handle_agent_done(
 
         if let Some(cmd) = ls.run_cmd.clone() {
             let operation = crate::extras::r#loop::validation::start(&ui.sandbox, &cmd);
-            run.validation_cancel = Some(operation.cancellation());
+            let operation_id = run.begin_validation(operation.cancellation());
             run.main_abort = None;
             // Keep semantic interrupt routing active while the validator runs,
             // but let the main event loop continue consuming `/btw` and keys.
@@ -435,6 +435,7 @@ async fn handle_agent_done(
                 let result = operation.wait().await;
                 let _ = validation_tx
                     .send(UserEvent::LoopValidationDone(LoopValidationEvent {
+                        operation_id,
                         response,
                         summary,
                         result,
@@ -460,10 +461,12 @@ pub(crate) async fn handle_loop_validation_event(
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
     chain: &mut ChainState,
-) -> anyhow::Result<()> {
-    run.validation_cancel = None;
+) -> anyhow::Result<bool> {
+    if !run.complete_validation(event.operation_id) {
+        return Ok(false);
+    }
     if !chain.loop_state.as_ref().is_some_and(|state| state.active) {
-        return Ok(());
+        return Ok(true);
     }
 
     run.is_running = false;
@@ -480,7 +483,7 @@ pub(crate) async fn handle_loop_validation_event(
 
     #[cfg(feature = "git-worktree")]
     finish_worktree_return(renderer, run, ui, chain).await?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(feature = "loop")]
