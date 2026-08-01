@@ -54,6 +54,7 @@ mod skill_targeted_feedback;
 mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
+mod worker_protocol;
 
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::tool::JsTool;
