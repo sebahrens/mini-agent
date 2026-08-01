@@ -38,13 +38,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Explicit supported rows rather than --all-features. --all-features would
+        # Explicit supported rows rather than --all-features. The isolated memory
+        # and sandbox rows catch missing cfg gates that the default row can mask.
+        # --all-features would
         # enable `skills-embed`, pulling ort-sys (ONNX Runtime), which has no
         # prebuilt binaries for some hosts and adds a large native download to
         # every run. That backend is exercised by the optional job below.
         features:
           - ""
           - "--no-default-features"
+          - "--features memory"
+          - "--features sandbox"
           - "--features js,skills"
           - "--features mcp,js,skills"
     runs-on: ubuntu-latest
@@ -63,11 +67,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # The documented supported feature combinations. `skills` implies `js`,
-        # so a skills-without-JS state is unselectable by construction.
+        # The documented supported feature combinations. Isolated memory and
+        # sandbox rows catch missing cfg gates that default features can mask.
+        # `skills` implies `js`, so a skills-without-JS state is unselectable by
+        # construction.
         features:
           - ""
           - "--no-default-features"
+          - "--features memory"
+          - "--features sandbox"
           - "--features js"
           - "--features skills"
           - "--features js,sandbox"
