@@ -91,7 +91,7 @@ separate boundary; subprocess network isolation does not bypass or replace fetch
 | 2 | `fetch`, narrowing allow-lists, Linux/macOS process isolation | Delivered |
 | 3 | Agent Skills, immutable learned skills, and prompt-time retrieval | Delivered |
 | 4 | Agent proposals, held-out evaluation, human-gated canary | Planned |
-| 5 | Evidence, promotion, quarantine, repair, rollback | Planned |
+| 5 | Evidence, promotion, quarantine, repair, rollback | Complete |
 
 ## Cargo features
 

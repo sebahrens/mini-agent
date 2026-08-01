@@ -293,6 +293,12 @@ impl ImmutableSkillIndex {
         self.len() == 0
     }
 
+    pub(crate) fn contains_id(&self, id: &str) -> bool {
+        self.by_id
+            .get(id)
+            .is_some_and(|index| !self.hidden.contains(index))
+    }
+
     pub(crate) fn without_ids(&self, generation: u64, hidden: &HashSet<String>) -> Self {
         let mut masked = self.hidden.as_ref().clone();
         for id in hidden {

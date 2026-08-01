@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use super::coordinator::IndexCoordinator;
 use super::embed::Embedder;
 use super::index::{RetrievalPolicy, SkillIndex};
+use super::router::{FrozenRoute, RouteRequest, route};
 use super::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::extras::skills::catalog::AgentSkillCatalog;
 use crate::extras::skills::index::{AgentSkillIndex, AgentSkillSearchPolicy};
@@ -32,7 +33,7 @@ struct AgentSection {
     rank: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSkill {
     pub id: String,
     pub identity_version: u32,
@@ -44,6 +45,7 @@ pub struct ResolvedSkill {
     pub source: String,
     pub score_bits: u32,
     pub rank: usize,
+    pub route: Option<FrozenRoute>,
 }
 
 impl ResolvedSkill {
@@ -52,8 +54,9 @@ impl ResolvedSkill {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnSkillBundle {
+    pub turn_id: String,
     pub query_fingerprint: String,
     pub embedding_model_revision: String,
     pub index_generation: u64,
@@ -63,6 +66,7 @@ pub struct TurnSkillBundle {
 impl TurnSkillBundle {
     pub fn empty(model_revision: impl Into<String>) -> Self {
         Self {
+            turn_id: uuid::Uuid::new_v4().to_string(),
             query_fingerprint: String::new(),
             embedding_model_revision: model_revision.into(),
             index_generation: 0,
@@ -205,8 +209,30 @@ impl SkillRuntime {
                 None
             }
         };
+        if let Some(coordinator) = &self.learned {
+            match coordinator.needs_refresh() {
+                Ok(true) => {
+                    let coordinator = Arc::clone(coordinator);
+                    match tokio::task::spawn_blocking(move || coordinator.rebuild_and_publish())
+                        .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            diagnostics.push(format!("learned_js_refresh_unavailable:{error}"))
+                        }
+                        Err(error) => diagnostics
+                            .push(format!("learned_js_refresh_worker_unavailable:{error}")),
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    diagnostics.push(format!("learned_js_refresh_state_unavailable:{error}"))
+                }
+            }
+        }
 
         let mut learned_bundle = TurnSkillBundle {
+            turn_id: uuid::Uuid::new_v4().to_string(),
             query_fingerprint: fingerprint,
             embedding_model_revision: self.embedder.model_metadata().model_revision.clone(),
             index_generation: 0,
@@ -235,10 +261,47 @@ impl SkillRuntime {
                     .await
                     {
                         Ok(Ok(skills)) => {
+                            let routing_key = coordinator.routing_key();
                             learned_bundle.skills = skills
                                 .into_iter()
                                 .map(|skill| {
-                                    resolved_skill(&skill.artifact, skill.score, skill.rank)
+                                    let candidate = coordinator
+                                        .replacement_candidate(&skill.artifact.id, skill.generation)
+                                        .ok()
+                                        .flatten();
+                                    let route = routing_key.as_ref().ok().and_then(|key| {
+                                        route(
+                                            key,
+                                            &RouteRequest {
+                                                active_id: skill.artifact.id.clone(),
+                                                active_lineage_root_id: candidate
+                                                    .as_ref()
+                                                    .map(|(_, metadata)| {
+                                                        metadata.lineage_root_id.clone()
+                                                    })
+                                                    .unwrap_or_else(|| skill.artifact.id.clone()),
+                                                turn_id: learned_bundle.turn_id.clone(),
+                                                policy_version: "phase5-v1".to_string(),
+                                                canary_share_basis_points: 1_000,
+                                                retrieval_score: f64::from(skill.score),
+                                                retrieval_rank: skill.rank as u32,
+                                                index_generation: skill.generation,
+                                                candidate: candidate
+                                                    .as_ref()
+                                                    .map(|(_, metadata)| metadata.clone()),
+                                            },
+                                        )
+                                        .ok()
+                                    });
+                                    let artifact = match (&route, candidate) {
+                                        (Some(route), Some((candidate, _)))
+                                            if route.chosen_id == candidate.id =>
+                                        {
+                                            candidate
+                                        }
+                                        _ => skill.artifact.as_ref().clone(),
+                                    };
+                                    resolved_skill(&artifact, skill.score, skill.rank, route)
                                 })
                                 .collect();
                         }
@@ -369,7 +432,7 @@ impl SkillRuntime {
     }
 }
 
-fn shared_coordinator(
+pub(crate) fn shared_coordinator(
     paths: &AppPaths,
     embedder: Arc<Embedder>,
 ) -> Result<(Arc<IndexCoordinator>, bool), super::coordinator::CoordinatorError> {
@@ -394,7 +457,12 @@ fn shared_coordinator(
     Ok((coordinator, true))
 }
 
-fn resolved_skill(artifact: &SkillArtifact, score: f32, rank: usize) -> ResolvedSkill {
+fn resolved_skill(
+    artifact: &SkillArtifact,
+    score: f32,
+    rank: usize,
+    route: Option<FrozenRoute>,
+) -> ResolvedSkill {
     ResolvedSkill {
         id: artifact.id.clone(),
         identity_version: artifact.identity_version,
@@ -406,6 +474,7 @@ fn resolved_skill(artifact: &SkillArtifact, score: f32, rank: usize) -> Resolved
         source: artifact.source.clone(),
         score_bits: score.to_bits(),
         rank,
+        route,
     }
 }
 
@@ -468,6 +537,16 @@ fn render_trusted_context(
             let _ = writeln!(output, "  rank: {}", skill.rank);
             let _ = writeln!(output, "  score: {:.6}", skill.score());
             let _ = writeln!(output, "  capability: {}", skill.capability.tier);
+            if let Some(route) = &skill.route {
+                let _ = writeln!(output, "  route: {:?}", route.route_kind);
+                let _ = writeln!(output, "  route_policy: {}", route.policy_version);
+                let _ = writeln!(
+                    output,
+                    "  route_share_basis_points: {}",
+                    route.canary_share_basis_points
+                );
+                let _ = writeln!(output, "  route_fingerprint: {}", route.route_fingerprint);
+            }
             let _ = writeln!(
                 output,
                 "  description: {}",

@@ -2,9 +2,9 @@
 
 - **Document role**: normative phase specification
 - **Specification version**: 1.0.0
-- **Delivery status**: planned
+- **Delivery status**: complete
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-08-01
 - **Entry dependencies**: Foundation and Phases 1–4 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 5 blocker
 - **Target scale**: up to 100,000 local/shared skill revisions
@@ -410,28 +410,28 @@ as alternatives/supersession candidates or retired after review.
 
 All must pass under `cargo test --features skills` and `cargo test --features js,skills`:
 
-- [ ] Selected-but-unused, invoked-success, invoked-throw, Promise rejection, timeout, OOM, and
+- [x] Selected-but-unused, invoked-success, invoked-throw, Promise rejection, timeout, OOM, and
       capability denial produce distinguishable events and aggregates.
-- [ ] Invocation/event retries are idempotent; looping calls cannot contribute more than one
+- [x] Invocation/event retries are idempotent; looping calls cannot contribute more than one
       promotion evidence unit per revision and user turn.
-- [ ] Raw prompts, arguments, file contents, and known secret fixtures never appear in telemetry.
-- [ ] Initial revisions require human approval before canary.
-- [ ] A lineage-root canary is non-retrievable and reaches active only through a second explicit
+- [x] Raw prompts, arguments, file contents, and known secret fixtures never appear in telemetry.
+- [x] Initial revisions require human approval before canary.
+- [x] A lineage-root canary is non-retrievable and reaches active only through a second explicit
       human decision; predecessor/non-inferiority evidence is never fabricated for it.
-- [ ] Tier 0/1 replacements auto-enter canary only with sufficient inherited and held-out evidence.
-- [ ] Canary routing is deterministic per turn/lineage/policy, occurs before the manifest, never
+- [x] Tier 0/1 replacements auto-enter canary only with sufficient inherited and held-out evidence.
+- [x] Canary routing is deterministic per turn/lineage/policy, occurs before the manifest, never
       injects both candidate and predecessor, and excludes quarantined revisions.
-- [ ] Tier 2 replacements cannot auto-promote under any evidence configuration.
-- [ ] Integrity, capability, held-out, canary timeout, and canary OOM faults quarantine immediately.
-- [ ] Rate-based quarantine respects minimum sample and directly attributed failure requirements.
-- [ ] Quarantined/superseded/retired revisions are absent from new retrieval snapshots.
-- [ ] Repair creates a new ID linked to the predecessor and cannot mutate the predecessor.
-- [ ] Promotion and rollback are atomic under injected transaction failure and concurrent readers.
-- [ ] A lifecycle transition cannot let any newly starting turn read an older eligibility snapshot;
+- [x] Tier 2 replacements cannot auto-promote under any evidence configuration.
+- [x] Integrity, capability, held-out, canary timeout, and canary OOM faults quarantine immediately.
+- [x] Rate-based quarantine respects minimum sample and directly attributed failure requirements.
+- [x] Quarantined/superseded/retired revisions are absent from new retrieval snapshots.
+- [x] Repair creates a new ID linked to the predecessor and cannot mutate the predecessor.
+- [x] Promotion and rollback are atomic under injected transaction failure and concurrent readers.
+- [x] A lifecycle transition cannot let any newly starting turn read an older eligibility snapshot;
       failed rebuilds publish a removal-only emergency snapshot and recover by generation.
-- [ ] Every automatic transition records the exact policy version and evidence snapshot.
-- [ ] Retention compaction is idempotent and preserves aggregates, lineage, and rollback.
-- [ ] At 100,000 retained revisions, lifecycle refresh, canary routing, event batching, compaction,
+- [x] Every automatic transition records the exact policy version and evidence snapshot.
+- [x] Retention compaction is idempotent and preserves aggregates, lineage, and rollback.
+- [x] At 100,000 retained revisions, lifecycle refresh, canary routing, event batching, compaction,
       and retrieval remain within separately documented latency/memory budgets.
 
 Named validation targets:
@@ -450,7 +450,29 @@ Before committing, run `cargo fmt`. Do not use `cargo build`, `cargo check`, or 
 
 ---
 
-## 14. Out of scope
+## 14. Implementation map
+
+Phase 5 production code is split by policy boundary rather than collected into one mutable
+manager:
+
+| Boundary | Module |
+|----------|--------|
+| Schema, typed rows, tombstones | `src/extras/js/skills/store.rs` |
+| Lifecycle, root activation, supersession, rollback | `src/extras/js/skills/lifecycle.rs` |
+| Wrapper events and off-thread ingestion | `src/extras/js/engine.rs`, `types.rs`, `skills/telemetry.rs` |
+| Capability intersection | `src/extras/js/skills/capability.rs`, `src/extras/js/host.rs` |
+| Canary routing | `src/extras/js/skills/router.rs` |
+| Promotion evidence and leases | `src/extras/js/skills/policy.rs`, `scheduler.rs` |
+| Generation publication | `src/extras/js/skills/coordinator.rs` |
+| Feedback, quarantine, and repair | `src/extras/js/skills/feedback.rs`, `quarantine.rs`, `repair.rs` |
+| Redaction, retention, and purge | `src/extras/js/skills/privacy.rs`, `retention.rs` |
+
+This map is descriptive only. Phase completion still requires every acceptance criterion, entry
+dependency, named test, real-binary smoke, performance gate, and Beads child/audit closure.
+
+---
+
+## 15. Out of scope
 
 - Fleet-wide or Internet-shared skill synchronization.
 - Fully autonomous promotion for write/process/network capabilities.

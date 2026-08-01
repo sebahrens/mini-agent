@@ -3,7 +3,13 @@ use rquickjs::promise::PromiseState;
 use rquickjs::{Coerced, Context, Ctx, Error, FromJs, Persistent, Runtime, Value};
 #[cfg(feature = "skills")]
 use rquickjs::{Function, Object};
+#[cfg(feature = "skills")]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "skills")]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
+#[cfg(feature = "skills")]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -272,6 +278,10 @@ pub(crate) fn js_thread_main(
                 req.reply,
                 JsResponse {
                     outcome: JsOutcome::Error("execution cancelled".to_string()),
+                    #[cfg(feature = "skills")]
+                    skill_events: Vec::new(),
+                    #[cfg(feature = "skills")]
+                    evidence_complete: false,
                 },
                 &req.cancellation,
                 ReplyPath::EarlyCancel,
@@ -280,9 +290,10 @@ pub(crate) fn js_thread_main(
         }
         let bridge = permission_bridge.for_invocation(req.cancellation.clone());
         #[cfg(feature = "skills")]
-        let outcome = run_step_with_skills(
+        let response = run_step_with_skills(
             &req.code,
             &req.skill_bundle,
+            &req.skill_tool_call_id,
             &sandbox,
             &bridge,
             &req.cancellation,
@@ -291,21 +302,18 @@ pub(crate) fn js_thread_main(
             &execution_hosts,
         );
         #[cfg(not(feature = "skills"))]
-        let outcome = run_step(
-            &req.code,
-            &sandbox,
-            &bridge,
-            &req.cancellation,
-            &runtime,
-            &allow_config,
-            &execution_hosts,
-        );
-        deliver_reply_or_cancel(
-            req.reply,
-            JsResponse { outcome },
-            &req.cancellation,
-            ReplyPath::Completed,
-        );
+        let response = JsResponse {
+            outcome: run_step(
+                &req.code,
+                &sandbox,
+                &bridge,
+                &req.cancellation,
+                &runtime,
+                &allow_config,
+                &execution_hosts,
+            ),
+        };
+        deliver_reply_or_cancel(req.reply, response, &req.cancellation, ReplyPath::Completed);
     }
 }
 
@@ -330,6 +338,8 @@ pub(crate) fn run_step(
         execution_hosts,
         #[cfg(feature = "skills")]
         None,
+        #[cfg(feature = "skills")]
+        None,
         ExecutionPolicy {
             timeout: STEP_TIMEOUT,
             max_pending_jobs: MAX_PENDING_JOBS,
@@ -342,14 +352,17 @@ pub(crate) fn run_step(
 fn run_step_with_skills(
     code: &str,
     skills: &crate::extras::js::skills::turn::TurnSkillBundle,
+    tool_call_id: &str,
     sandbox: &Sandbox,
     permission_bridge: &PermissionBridge,
     cancellation: &PermCancellation,
     runtime: &tokio::runtime::Handle,
     allow_config: &AllowConfig,
     execution_hosts: &NormalExecutionHosts,
-) -> JsOutcome {
-    run_step_with_policy(
+) -> JsResponse {
+    let execution = SkillExecutionBundle::from_turn_bundle(skills, tool_call_id.to_string());
+    let event_state = Arc::new(Mutex::new(InstrumentedEventState::default()));
+    let outcome = run_step_with_policy(
         code,
         sandbox,
         permission_bridge,
@@ -357,27 +370,209 @@ fn run_step_with_skills(
         runtime,
         allow_config,
         execution_hosts,
-        Some(skills),
+        Some(&execution),
+        Some(&event_state),
         ExecutionPolicy {
             timeout: STEP_TIMEOUT,
             max_pending_jobs: MAX_PENDING_JOBS,
         },
-    )
+    );
+    let mut state = event_state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    state.finalize_pending(&outcome);
+    let evidence_complete =
+        !matches!(outcome, JsOutcome::Timeout | JsOutcome::OomKilled) || state.pending.is_empty();
+    JsResponse {
+        outcome,
+        skill_events: std::mem::take(&mut state.events),
+        evidence_complete,
+    }
+}
+
+#[cfg(feature = "skills")]
+#[derive(Clone)]
+struct EventMetadata {
+    skill_id: String,
+    export_name: Option<String>,
+    turn_id: String,
+    tool_call_id: String,
+    retrieval_score: f64,
+    retrieval_rank: u32,
+    query_fingerprint: Option<String>,
+    index_generation: u64,
+    production: bool,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Default)]
+struct InstrumentedEventState {
+    events: Vec<crate::extras::js::skills::telemetry::SkillEvent>,
+    starts: BTreeMap<String, Instant>,
+    pending: BTreeMap<String, EventMetadata>,
+}
+
+#[cfg(feature = "skills")]
+impl InstrumentedEventState {
+    fn start(&mut self, invocation_id: String, metadata: EventMetadata, argument_shape: String) {
+        self.starts.insert(invocation_id.clone(), Instant::now());
+        self.pending.insert(invocation_id.clone(), metadata.clone());
+        self.events.push(instrumented_event(
+            &metadata,
+            Some(invocation_id),
+            crate::extras::js::skills::telemetry::SkillEventKind::Invoked,
+            None,
+            None,
+            Some(argument_shape),
+        ));
+    }
+
+    fn terminal(&mut self, invocation_id: &str, success: bool, capability_denied: bool) {
+        let Some(metadata) = self.pending.remove(invocation_id) else {
+            return;
+        };
+        let latency = self
+            .starts
+            .remove(invocation_id)
+            .map(|start| start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+        let (kind, outcome) = if success {
+            (
+                crate::extras::js::skills::telemetry::SkillEventKind::Returned,
+                "fulfilled",
+            )
+        } else if capability_denied {
+            (
+                crate::extras::js::skills::telemetry::SkillEventKind::CapabilityDenied,
+                "capability_policy",
+            )
+        } else {
+            (
+                crate::extras::js::skills::telemetry::SkillEventKind::Threw,
+                "exception",
+            )
+        };
+        self.events.push(instrumented_event(
+            &metadata,
+            Some(invocation_id.to_string()),
+            kind,
+            Some(outcome.to_string()),
+            latency,
+            None,
+        ));
+    }
+
+    fn finalize_pending(&mut self, outcome: &JsOutcome) {
+        let pending = self.pending.keys().cloned().collect::<Vec<_>>();
+        for invocation_id in pending {
+            let Some(metadata) = self.pending.remove(&invocation_id) else {
+                continue;
+            };
+            let latency = self
+                .starts
+                .remove(&invocation_id)
+                .map(|start| start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+            let (kind, code) = match outcome {
+                JsOutcome::Timeout => (
+                    crate::extras::js::skills::telemetry::SkillEventKind::TimedOut,
+                    "step_timeout",
+                ),
+                JsOutcome::OomKilled => (
+                    crate::extras::js::skills::telemetry::SkillEventKind::Oom,
+                    "step_oom",
+                ),
+                _ => (
+                    crate::extras::js::skills::telemetry::SkillEventKind::Threw,
+                    "step_cancelled_or_failed",
+                ),
+            };
+            self.events.push(instrumented_event(
+                &metadata,
+                Some(invocation_id),
+                kind,
+                Some(code.to_string()),
+                latency,
+                None,
+            ));
+        }
+        let step_succeeded = matches!(outcome, JsOutcome::Value(_) | JsOutcome::Void);
+        for event in &mut self.events {
+            if event.kind == crate::extras::js::skills::telemetry::SkillEventKind::Returned {
+                event.outcome = Some(
+                    if step_succeeded {
+                        "fulfilled_step_succeeded"
+                    } else {
+                        "fulfilled_step_failed"
+                    }
+                    .to_string(),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "skills")]
+fn instrumented_event(
+    metadata: &EventMetadata,
+    invocation_id: Option<String>,
+    kind: crate::extras::js::skills::telemetry::SkillEventKind,
+    outcome: Option<String>,
+    latency_us: Option<u64>,
+    argument_shape: Option<String>,
+) -> crate::extras::js::skills::telemetry::SkillEvent {
+    crate::extras::js::skills::telemetry::SkillEvent {
+        invocation_id,
+        skill_id: metadata.skill_id.clone(),
+        turn_id: metadata.turn_id.clone(),
+        tool_call_id: Some(metadata.tool_call_id.clone()),
+        kind,
+        export_name: metadata.export_name.clone(),
+        outcome,
+        latency_us,
+        retrieval_score: Some(metadata.retrieval_score),
+        retrieval_rank: Some(metadata.retrieval_rank),
+        query_fingerprint: metadata.query_fingerprint.clone(),
+        index_generation: metadata.index_generation,
+        evidence_complete: true,
+        production: metadata.production,
+        argument_shape,
+        created_at: unix_timestamp(),
+    }
+}
+
+#[cfg(feature = "skills")]
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(feature = "skills")]
 fn install_selected_skills(
     runtime: &Runtime,
     context: &Context,
-    bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
+    bundle: &SkillExecutionBundle,
     gate: &SkillCapabilityGate,
+    state: &Arc<Mutex<InstrumentedEventState>>,
     deadline: Instant,
     cancellation: &PermCancellation,
     permission_bridge: &PermissionBridge,
 ) -> Result<(), JsOutcome> {
-    use std::collections::HashSet;
-
-    let mut declared = HashSet::new();
+    if bundle.turn_id.is_empty()
+        || bundle.turn_id.len() > crate::extras::js::skills::telemetry::MAX_EVENT_ID_BYTES
+        || bundle.tool_call_id.is_empty()
+        || bundle.tool_call_id.len() > crate::extras::js::skills::telemetry::MAX_EVENT_ID_BYTES
+        || bundle.skills.len() > 64
+        || bundle
+            .skills
+            .iter()
+            .any(|skill| !skill.retrieval_score.is_finite())
+    {
+        return Err(JsOutcome::Error(
+            "invalid bounded skill execution metadata".to_string(),
+        ));
+    }
+    let mut declared = BTreeSet::new();
     let wrapper_factory = context.with(|ctx| {
         ctx.eval::<Value, _>(
             crate::extras::js::skills::SKILL_REALM_HARDENING_JS,
@@ -444,7 +639,7 @@ fn install_selected_skills(
                  const clone = (value) => {\n\
                    if (value === null || ['string','number','boolean','undefined'].includes(typeof value)) return value;\n\
                    if (typeof value === 'object') {\n\
-                     if (typeof value.then === 'function') throw new TypeError('skill promises are not supported');\n\
+                     if (typeof value.then === 'function') return value;\n\
                      const encoded = JSON.stringify(value);\n\
                      if (encoded === undefined) throw new TypeError('skill values must be JSON-safe');\n\
                      return JSON.parse(encoded);\n\
@@ -453,7 +648,13 @@ fn install_selected_skills(
                  };\n\
                  return (fn, id) => function(...args) {\n\
                  enter(id);\n\
-                 try { return clone(fn.apply(undefined, args.map(clone))); } finally { exit(); }\n\
+                 try {\n\
+                   const value = fn.apply(undefined, args.map(clone));\n\
+                   if (value && typeof value.then === 'function') {\n\
+                     return Promise.resolve(value).then(clone);\n\
+                   }\n\
+                   return clone(value);\n\
+                 } finally { exit(); }\n\
                  };\n\
                  }",
             )
@@ -489,45 +690,67 @@ fn install_selected_skills(
         return Err(outcome);
     }
 
-    for resolved in &bundle.skills {
-        let artifact = crate::extras::js::skills::SkillArtifact {
-            id: resolved.id.clone(),
-            identity_version: resolved.identity_version,
-            source: resolved.source.clone(),
-            description: resolved.description.clone(),
-            tags: resolved.tags.clone(),
-            exports: resolved.exports.clone(),
-            tests: resolved.tests.clone(),
-            capability: resolved.capability.clone(),
-        };
+    for skill in &bundle.skills {
+        let artifact = skill.artifact.clone();
         if let Err(error) = artifact.verify_identity() {
             return Err(JsOutcome::Error(format!(
                 "selected skill {} failed identity validation: {error}",
-                resolved.id
+                artifact.id
             )));
         }
-        gate.register(resolved.id.clone(), resolved.capability.clone());
+        gate.register(artifact.id.clone(), artifact.capability.clone());
+        let selected_metadata = EventMetadata {
+            skill_id: artifact.id.clone(),
+            export_name: None,
+            turn_id: bundle.turn_id.clone(),
+            tool_call_id: bundle.tool_call_id.clone(),
+            retrieval_score: skill.retrieval_score,
+            retrieval_rank: skill.retrieval_rank,
+            query_fingerprint: skill.query_fingerprint.clone(),
+            index_generation: bundle.index_generation,
+            production: bundle.production,
+        };
+        let mut event_guard = state
+            .lock()
+            .map_err(|_| JsOutcome::Error("skill event state unavailable".to_string()))?;
+        event_guard.events.push(instrumented_event(
+            &selected_metadata,
+            None,
+            crate::extras::js::skills::telemetry::SkillEventKind::Selected,
+            None,
+            None,
+            None,
+        ));
+        event_guard.events.push(instrumented_event(
+            &selected_metadata,
+            None,
+            crate::extras::js::skills::telemetry::SkillEventKind::Injected,
+            None,
+            None,
+            None,
+        ));
+        drop(event_guard);
         context.with(|ctx| {
             let globals = ctx.globals();
-            for export in &resolved.exports {
+            for export in &artifact.exports {
                 if !declared.insert(export.name.clone()) {
                     return Err(JsOutcome::Error(format!(
                         "selected skill {} declares duplicate export {}",
-                        resolved.id, export.name
+                        artifact.id, export.name
                     )));
                 }
                 match globals.contains_key(export.name.as_str()) {
                     Ok(true) => {
                         return Err(JsOutcome::Error(format!(
                             "selected skill {} export {} collides with an existing global",
-                            resolved.id, export.name
+                            artifact.id, export.name
                         )));
                     }
                     Ok(false) => {}
                     Err(error) => {
                         return Err(skill_error_outcome(
                             &ctx,
-                            &resolved.id,
+                            &artifact.id,
                             error,
                             deadline,
                             cancellation,
@@ -541,16 +764,16 @@ fn install_selected_skills(
 
         let private_source = crate::extras::js::skills::private_skill_source(&artifact);
         let namespace = {
-            let _active = gate.enter(resolved.capability.clone());
+            let _active = gate.enter(artifact.capability.clone());
             let namespace = context.with(|ctx| {
                 let mut options = EvalOptions::default();
-                options.filename = Some(format!("skill-{}.js", resolved.id));
+                options.filename = Some(format!("skill-{}.js", artifact.id));
                 ctx.eval_with_options::<Object, _>(private_source.as_bytes(), options)
                     .map(|namespace| Persistent::save(&ctx, namespace))
                     .map_err(|error| {
                         skill_error_outcome(
                             &ctx,
-                            &resolved.id,
+                            &artifact.id,
                             error,
                             deadline,
                             cancellation,
@@ -575,7 +798,7 @@ fn install_selected_skills(
             let namespace = namespace.restore(&ctx).map_err(|error| {
                 skill_error_outcome(
                     &ctx,
-                    &resolved.id,
+                    &artifact.id,
                     error,
                     deadline,
                     cancellation,
@@ -585,30 +808,239 @@ fn install_selected_skills(
             let wrapper_factory = wrapper_factory.clone().restore(&ctx).map_err(|error| {
                 skill_error_outcome(
                     &ctx,
-                    &resolved.id,
+                    &artifact.id,
                     error,
                     deadline,
                     cancellation,
                     permission_bridge,
                 )
             })?;
-            for export in &resolved.exports {
+            for export in &artifact.exports {
                 let original: Function = namespace.get(export.name.as_str()).map_err(|error| {
                     skill_error_outcome(
                         &ctx,
-                        &resolved.id,
+                        &artifact.id,
                         error,
                         deadline,
                         cancellation,
                         permission_bridge,
                     )
                 })?;
-                let wrapper: Function = wrapper_factory
-                    .call((original, resolved.id.clone()))
+                let safe_wrapper: Function = wrapper_factory
+                    .call((original, artifact.id.clone()))
                     .map_err(|error| {
                         skill_error_outcome(
                             &ctx,
-                            &resolved.id,
+                            &artifact.id,
+                            error,
+                            deadline,
+                            cancellation,
+                            permission_bridge,
+                        )
+                    })?;
+                let metadata = EventMetadata {
+                    skill_id: artifact.id.clone(),
+                    export_name: Some(export.name.clone()),
+                    turn_id: bundle.turn_id.clone(),
+                    tool_call_id: bundle.tool_call_id.clone(),
+                    retrieval_score: skill.retrieval_score,
+                    retrieval_rank: skill.retrieval_rank,
+                    query_fingerprint: skill.query_fingerprint.clone(),
+                    index_generation: bundle.index_generation,
+                    production: bundle.production,
+                };
+                let attribution =
+                    crate::extras::js::skills::capability::SkillExecutionAttribution {
+                        skill_id: artifact.id.clone(),
+                        export_name: export.name.clone(),
+                        manifest: artifact.capability.clone(),
+                    };
+                let ordinal = Arc::new(AtomicU32::new(0));
+                let start_ordinal = Arc::clone(&ordinal);
+                let start_state = Arc::clone(state);
+                let start_metadata = metadata.clone();
+                let invocation_context = gate.context();
+                let invocation_attribution = attribution.clone();
+                let on_start = Function::new(ctx.clone(), move |argument_shape: String| {
+                    let ordinal = start_ordinal
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                            value.checked_add(1)
+                        })
+                        .map_err(|_| {
+                            Error::new_from_js_message(
+                                "skill invocation",
+                                "instrumentation",
+                                "invocation ordinal exhausted",
+                            )
+                        })?;
+                    let invocation_id = crate::extras::js::skills::telemetry::stable_invocation_id(
+                        &start_metadata.turn_id,
+                        &start_metadata.tool_call_id,
+                        &start_metadata.skill_id,
+                        start_metadata.export_name.as_deref().unwrap_or(""),
+                        ordinal,
+                    );
+                    let bounded_shape = if argument_shape.len()
+                        <= crate::extras::js::skills::telemetry::MAX_ARGUMENT_SHAPE_BYTES
+                    {
+                        argument_shape
+                    } else {
+                        r#"{"truncated":true}"#.to_string()
+                    };
+                    start_state
+                        .lock()
+                        .map_err(|_| {
+                            Error::new_from_js_message(
+                                "skill invocation",
+                                "instrumentation",
+                                "event state unavailable",
+                            )
+                        })?
+                        .start(invocation_id.clone(), start_metadata.clone(), bounded_shape);
+                    invocation_context
+                        .begin_invocation(invocation_id.clone(), invocation_attribution.clone())
+                        .map_err(|error| {
+                            Error::new_from_js_message(
+                                "skill capability policy",
+                                "invocation",
+                                error.to_string(),
+                            )
+                        })?;
+                    Ok::<String, Error>(invocation_id)
+                })
+                .map_err(|error| {
+                    skill_error_outcome(
+                        &ctx,
+                        &artifact.id,
+                        error,
+                        deadline,
+                        cancellation,
+                        permission_bridge,
+                    )
+                })?;
+                let terminal_state = Arc::clone(state);
+                let terminal_context = gate.context();
+                let on_terminal = Function::new(
+                    ctx.clone(),
+                    move |invocation_id: String, success: bool, capability_denied: bool| {
+                        terminal_state
+                            .lock()
+                            .map_err(|_| {
+                                Error::new_from_js_message(
+                                    "skill invocation",
+                                    "instrumentation",
+                                    "event state unavailable",
+                                )
+                            })?
+                            .terminal(&invocation_id, success, capability_denied);
+                        terminal_context
+                            .end_invocation(&invocation_id)
+                            .map_err(|error| {
+                                Error::new_from_js_message(
+                                    "skill capability policy",
+                                    "invocation",
+                                    error.to_string(),
+                                )
+                            })?;
+                        Ok::<(), Error>(())
+                    },
+                )
+                .map_err(|error| {
+                    skill_error_outcome(
+                        &ctx,
+                        &artifact.id,
+                        error,
+                        deadline,
+                        cancellation,
+                        permission_bridge,
+                    )
+                })?;
+                let telemetry_factory: Function = ctx
+                    .eval(
+                        r#"(function(original, onStart, onTerminal, undeclaredHostReference) {
+                            return function(...args) {
+                                const shape = JSON.stringify({
+                                    argc: args.length,
+                                    types: args.map((value) =>
+                                        value === null ? "null" :
+                                        Array.isArray(value) ? "array" : typeof value
+                                    )
+                                });
+                                const invocationId = onStart(shape);
+                                try {
+                                    const result = Reflect.apply(original, this, args);
+                                    if (result && typeof result.then === "function") {
+                                        return Promise.resolve(result).then(
+                                            (value) => {
+                                                onTerminal(invocationId, true, false);
+                                                return value;
+                                            },
+                                            (error) => {
+                                                const text = String(error);
+                                                const denied =
+                                                    text.includes("skill capability policy") ||
+                                                    text.includes("skill capability") ||
+                                                    undeclaredHostReference ||
+                                                    ["read_file", "write_file", "spawn", "fetch"]
+                                                        .some((host) => text.includes(host));
+                                                onTerminal(invocationId, false, denied);
+                                                throw error;
+                                            }
+                                        );
+                                    }
+                                    onTerminal(invocationId, true, false);
+                                    return result;
+                                } catch (error) {
+                                    const text = String(error);
+                                    const denied =
+                                        text.includes("skill capability policy") ||
+                                        text.includes("skill capability") ||
+                                        undeclaredHostReference ||
+                                        ["read_file", "write_file", "spawn", "fetch"]
+                                            .some((host) => text.includes(host));
+                                    onTerminal(invocationId, false, denied);
+                                    throw error;
+                                }
+                            };
+                        })"#,
+                    )
+                    .map_err(|error| {
+                        skill_error_outcome(
+                            &ctx,
+                            &artifact.id,
+                            error,
+                            deadline,
+                            cancellation,
+                            permission_bridge,
+                        )
+                    })?;
+                let wrapper: Function = telemetry_factory
+                    .call((
+                        safe_wrapper,
+                        on_start,
+                        on_terminal,
+                        [
+                            (
+                                crate::extras::js::skills::HostCapability::ReadFile,
+                                "read_file",
+                            ),
+                            (
+                                crate::extras::js::skills::HostCapability::WriteFile,
+                                "write_file",
+                            ),
+                            (crate::extras::js::skills::HostCapability::Spawn, "spawn"),
+                            (crate::extras::js::skills::HostCapability::Fetch, "fetch"),
+                        ]
+                        .into_iter()
+                        .any(|(capability, name)| {
+                            !artifact.capability.allows(capability)
+                                && artifact.source.contains(name)
+                        }),
+                    ))
+                    .map_err(|error| {
+                        skill_error_outcome(
+                            &ctx,
+                            &artifact.id,
                             error,
                             deadline,
                             cancellation,
@@ -620,7 +1052,7 @@ fn install_selected_skills(
                     .map_err(|error| {
                         skill_error_outcome(
                             &ctx,
-                            &resolved.id,
+                            &artifact.id,
                             error,
                             deadline,
                             cancellation,
@@ -660,7 +1092,8 @@ fn run_step_with_policy(
     runtime: &tokio::runtime::Handle,
     allow_config: &AllowConfig,
     execution_hosts: &NormalExecutionHosts,
-    #[cfg(feature = "skills")] skills: Option<&crate::extras::js::skills::turn::TurnSkillBundle>,
+    #[cfg(feature = "skills")] skills: Option<&SkillExecutionBundle>,
+    #[cfg(feature = "skills")] event_state: Option<&Arc<Mutex<InstrumentedEventState>>>,
     policy: ExecutionPolicy,
 ) -> JsOutcome {
     #[cfg(not(feature = "skills"))]
@@ -714,12 +1147,13 @@ fn run_step_with_policy(
     }
 
     #[cfg(feature = "skills")]
-    if let Some(skills) = skills
+    if let (Some(skills), Some(event_state)) = (skills, event_state)
         && let Err(outcome) = install_selected_skills(
             &rt,
             &ctx,
             skills,
             &skill_gate,
+            event_state,
             deadline,
             cancellation,
             permission_bridge,
@@ -791,11 +1225,52 @@ pub(crate) fn run_step_for_test(
         &NormalExecutionHosts::default(),
         #[cfg(feature = "skills")]
         None,
+        #[cfg(feature = "skills")]
+        None,
         ExecutionPolicy {
             timeout,
             max_pending_jobs,
         },
     )
+}
+
+#[cfg(all(test, feature = "skills"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_instrumented_step_for_test(
+    code: &str,
+    bundle: &SkillExecutionBundle,
+    sandbox: &Sandbox,
+    permission_bridge: &PermissionBridge,
+    cancellation: &PermCancellation,
+    runtime: &tokio::runtime::Handle,
+    allow_config: &AllowConfig,
+) -> JsResponse {
+    let event_state = Arc::new(Mutex::new(InstrumentedEventState::default()));
+    let outcome = run_step_with_policy(
+        code,
+        sandbox,
+        permission_bridge,
+        cancellation,
+        runtime,
+        allow_config,
+        &NormalExecutionHosts::default(),
+        Some(bundle),
+        Some(&event_state),
+        ExecutionPolicy {
+            timeout: STEP_TIMEOUT,
+            max_pending_jobs: MAX_PENDING_JOBS,
+        },
+    );
+    let mut state = event_state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    state.finalize_pending(&outcome);
+    JsResponse {
+        evidence_complete: !matches!(outcome, JsOutcome::Timeout | JsOutcome::OomKilled)
+            || state.pending.is_empty(),
+        outcome,
+        skill_events: std::mem::take(&mut state.events),
+    }
 }
 
 #[cfg(test)]
@@ -820,6 +1295,10 @@ mod tests {
             delivered_reply,
             JsResponse {
                 outcome: JsOutcome::Value("delivered".to_string()),
+                #[cfg(feature = "skills")]
+                skill_events: Vec::new(),
+                #[cfg(feature = "skills")]
+                evidence_complete: true,
             },
             &delivered_cancellation,
             ReplyPath::Completed,
@@ -861,6 +1340,10 @@ mod tests {
             recovery_reply,
             JsResponse {
                 outcome: JsOutcome::Value("recovered".to_string()),
+                #[cfg(feature = "skills")]
+                skill_events: Vec::new(),
+                #[cfg(feature = "skills")]
+                evidence_complete: true,
             },
             &recovery_cancellation,
             ReplyPath::Completed,
@@ -907,6 +1390,8 @@ mod tests {
                 skill_bundle: std::sync::Arc::new(
                     crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
                 ),
+                #[cfg(feature = "skills")]
+                skill_tool_call_id: "abandoned-tool".to_string(),
                 cancellation: abandoned_cancellation,
                 reply: abandoned_reply,
             })
@@ -920,6 +1405,8 @@ mod tests {
                 skill_bundle: std::sync::Arc::new(
                     crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
                 ),
+                #[cfg(feature = "skills")]
+                skill_tool_call_id: "recovery-tool".to_string(),
                 cancellation: PermCancellation::new(),
                 reply: recovery_reply,
             })

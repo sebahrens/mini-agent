@@ -20,7 +20,7 @@ use super::{
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +51,7 @@ pub struct GenerationState {
     pub model_revision: String,
     pub dimensions: usize,
     pub normalized: bool,
+    pub publication_mode: String,
 }
 
 pub(crate) const MAX_EVALUATION_ATTEMPTS: u32 = 8;
@@ -748,7 +749,7 @@ impl SkillStore {
         self.db
             .query_row(
                 "SELECT desired_generation, applied_generation, model_id, model_revision,
-                    dimensions, normalized
+                    dimensions, normalized, publication_mode
              FROM skill_generations WHERE singleton = 1",
                 [],
                 |row| {
@@ -762,6 +763,7 @@ impl SkillStore {
                         model_revision: row.get(3)?,
                         dimensions: usize::try_from(dimensions).unwrap_or(0),
                         normalized: row.get::<_, i64>(5)? == 1,
+                        publication_mode: row.get(6)?,
                     })
                 },
             )
@@ -801,10 +803,34 @@ impl SkillStore {
 
     /// Mark exactly the current desired generation as durable before atomic publication.
     pub fn mark_generation_applied(&mut self, generation: u64) -> Result<(), StoreError> {
+        self.mark_generation_applied_with_mode(generation, "full", None)
+    }
+
+    pub(crate) fn mark_generation_applied_with_mode(
+        &mut self,
+        generation: u64,
+        publication_mode: &str,
+        last_error_code: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if !matches!(publication_mode, "full" | "removal_only") {
+            return Err(StoreError::Constraint(
+                "invalid index publication mode".to_string(),
+            ));
+        }
+        let now = current_timestamp()?;
         let changed = self.db.execute(
-            "UPDATE skill_generations SET applied_generation = ?
+            "UPDATE skill_generations
+             SET applied_generation = ?, publication_mode = ?,
+                 last_error_code = ?, updated_at = ?
              WHERE singleton = 1 AND desired_generation = ? AND applied_generation <= ?",
-            params![generation as i64, generation as i64, generation as i64],
+            params![
+                generation as i64,
+                publication_mode,
+                last_error_code,
+                now,
+                generation as i64,
+                generation as i64
+            ],
         )?;
         if changed == 1 {
             Ok(())
@@ -851,9 +877,13 @@ impl SkillStore {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if !matches!(predecessor_status.as_deref(), Some("active" | "canary")) {
+            if !matches!(
+                predecessor_status.as_deref(),
+                Some("active" | "canary" | "quarantined")
+            ) {
                 return Err(StoreError::Constraint(
-                    "predecessor must be an active or canary immutable revision".to_string(),
+                    "predecessor must be an active, canary, or quarantined immutable revision"
+                        .to_string(),
                 ));
             }
         }
@@ -1696,6 +1726,19 @@ impl SkillStore {
         &self.db_path
     }
 
+    /// Internal connection used exclusively by typed skill services.
+    ///
+    /// The visibility keeps raw SQL inside the skills module so lifecycle,
+    /// evidence, retention, and privacy mutations cannot be bypassed by callers.
+    pub(super) fn connection(&self) -> &Connection {
+        &self.db
+    }
+
+    /// Mutable internal connection used exclusively by typed skill services.
+    pub(super) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.db
+    }
+
     /// Get the database connection for direct queries (testing/internal use).
     ///
     /// Callers must not hold this across potential blocking operations.
@@ -2108,6 +2151,311 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
 
 
                 PRAGMA user_version = 3;
+                ",
+            )?;
+            Ok(())
+        })();
+
+        match migration {
+            Ok(()) => db.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = db.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        }
+    }
+
+    // Migration 3 -> 4: directly attributed evidence, lifecycle automation,
+    // repair/feedback records, and retention state. Phase 5 extends the
+    // generation table introduced by Phase 3 instead of creating a competing
+    // publication authority.
+    if current_version < 4 {
+        db.execute_batch("BEGIN IMMEDIATE;")?;
+        let migration = (|| -> Result<(), StoreError> {
+            ensure_column(db, "skill_revisions", "lineage_root_id", "TEXT")?;
+            ensure_column(db, "skill_revisions", "evaluation_report_id", "TEXT")?;
+            ensure_column(
+                db,
+                "skill_generations",
+                "publication_mode",
+                "TEXT NOT NULL DEFAULT 'full'",
+            )?;
+            ensure_column(db, "skill_generations", "last_error_code", "TEXT")?;
+            ensure_column(db, "skill_tombstones", "reason_code", "TEXT")?;
+            ensure_column(
+                db,
+                "skill_tombstones",
+                "last_generation",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+
+            db.execute_batch(
+                "
+                CREATE INDEX IF NOT EXISTS skill_revisions_status_idx
+                    ON skill_revisions(status, id);
+                CREATE INDEX IF NOT EXISTS skill_revisions_lineage_idx
+                    ON skill_revisions(lineage_root_id, status, id);
+                CREATE TRIGGER IF NOT EXISTS skill_revisions_identity_immutable
+                BEFORE UPDATE OF
+                    identity_version, source, description, tags_json,
+                    exports_json, tests_json, capability_json
+                ON skill_revisions
+                WHEN OLD.identity_version IS NOT NEW.identity_version
+                  OR OLD.source IS NOT NEW.source
+                  OR OLD.description IS NOT NEW.description
+                  OR OLD.tags_json IS NOT NEW.tags_json
+                  OR OLD.exports_json IS NOT NEW.exports_json
+                  OR OLD.tests_json IS NOT NEW.tests_json
+                  OR OLD.capability_json IS NOT NEW.capability_json
+                BEGIN
+                    SELECT RAISE(ABORT, 'immutable skill identity');
+                END;
+                CREATE UNIQUE INDEX IF NOT EXISTS skill_revisions_one_live_successor
+                    ON skill_revisions(supersedes_id)
+                    WHERE supersedes_id IS NOT NULL
+                      AND status IN ('verified', 'canary', 'active');
+
+                UPDATE skill_revisions
+                   SET lineage_root_id = id
+                 WHERE lineage_root_id IS NULL AND supersedes_id IS NULL;
+
+            CREATE TABLE IF NOT EXISTS skill_policy_versions (
+                    policy_version TEXT PRIMARY KEY,
+                    policy_json    TEXT NOT NULL,
+                    created_at     INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS skill_runtime_secrets (
+                name       TEXT PRIMARY KEY,
+                secret     BLOB NOT NULL CHECK(length(secret) = 32),
+                created_at INTEGER NOT NULL
+            );
+
+                CREATE TABLE IF NOT EXISTS skill_events (
+                    event_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    invocation_id      TEXT,
+                    skill_id           TEXT NOT NULL,
+                    turn_id            TEXT NOT NULL,
+                    tool_call_id       TEXT,
+                    event_kind         TEXT NOT NULL,
+                    export_name        TEXT,
+                    outcome            TEXT,
+                    latency_us         INTEGER,
+                    retrieval_score    REAL,
+                    retrieval_rank     INTEGER,
+                    query_fingerprint  TEXT,
+                    index_generation   INTEGER NOT NULL,
+                    evidence_complete  INTEGER NOT NULL DEFAULT 1
+                        CHECK (evidence_complete IN (0, 1)),
+                    production         INTEGER NOT NULL DEFAULT 1
+                        CHECK (production IN (0, 1)),
+                    argument_shape     TEXT,
+                    created_at         INTEGER NOT NULL,
+                    CHECK (event_kind IN (
+                        'selected', 'injected', 'invoked', 'returned', 'threw',
+                        'timed_out', 'oom', 'capability_denied',
+                        'user_positive', 'user_negative', 'observability_lost'
+                    )),
+                    CHECK (latency_us IS NULL OR latency_us >= 0),
+                    CHECK (retrieval_rank IS NULL OR retrieval_rank >= 0),
+                    UNIQUE (invocation_id, event_kind),
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS skill_events_skill_time_idx
+                    ON skill_events(skill_id, created_at, event_id);
+                CREATE INDEX IF NOT EXISTS skill_events_turn_idx
+                    ON skill_events(skill_id, turn_id, invocation_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS skill_events_one_terminal
+                    ON skill_events(invocation_id)
+                    WHERE invocation_id IS NOT NULL
+                      AND event_kind IN (
+                        'returned', 'threw', 'timed_out', 'oom',
+                        'capability_denied'
+                      );
+                CREATE UNIQUE INDEX IF NOT EXISTS skill_events_non_invocation_retry
+                    ON skill_events(skill_id, turn_id, tool_call_id, event_kind)
+                    WHERE invocation_id IS NULL;
+
+                CREATE TABLE IF NOT EXISTS skill_evidence (
+                    evidence_id       TEXT PRIMARY KEY,
+                    skill_id          TEXT NOT NULL,
+                    evidence_kind     TEXT NOT NULL,
+                    payload_json      TEXT NOT NULL,
+                    policy_version    TEXT NOT NULL,
+                    created_at        INTEGER NOT NULL,
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (policy_version)
+                        REFERENCES skill_policy_versions(policy_version)
+                );
+                CREATE INDEX IF NOT EXISTS skill_evidence_skill_idx
+                    ON skill_evidence(skill_id, evidence_kind, created_at);
+
+                CREATE TABLE IF NOT EXISTS skill_transitions (
+                    transition_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key    TEXT NOT NULL UNIQUE,
+                    skill_id           TEXT NOT NULL,
+                    predecessor_id     TEXT,
+                    from_status        TEXT NOT NULL,
+                    to_status          TEXT NOT NULL,
+                    reason             TEXT NOT NULL,
+                    evidence_snapshot  TEXT NOT NULL,
+                    policy_version     TEXT NOT NULL,
+                    row_version_from   INTEGER NOT NULL,
+                    row_version_to     INTEGER NOT NULL,
+                    desired_generation INTEGER NOT NULL,
+                    created_at         INTEGER NOT NULL,
+                    CHECK (from_status IN (
+                        'pending','verified','canary','active','quarantined',
+                        'superseded','retired','rejected'
+                    )),
+                    CHECK (to_status IN (
+                        'pending','verified','canary','active','quarantined',
+                        'superseded','retired','rejected'
+                    )),
+                    CHECK (row_version_to = row_version_from + 1),
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (predecessor_id) REFERENCES skill_revisions(id),
+                    FOREIGN KEY (policy_version)
+                        REFERENCES skill_policy_versions(policy_version)
+                );
+                CREATE INDEX IF NOT EXISTS skill_transitions_skill_idx
+                    ON skill_transitions(skill_id, transition_id);
+
+                CREATE TABLE IF NOT EXISTS skill_stats (
+                    skill_id              TEXT PRIMARY KEY,
+                    selected_count        INTEGER NOT NULL DEFAULT 0,
+                    invoked_count         INTEGER NOT NULL DEFAULT 0,
+                    direct_success_count  INTEGER NOT NULL DEFAULT 0,
+                    direct_failure_count  INTEGER NOT NULL DEFAULT 0,
+                    timeout_count         INTEGER NOT NULL DEFAULT 0,
+                    oom_count             INTEGER NOT NULL DEFAULT 0,
+                    policy_fault_count    INTEGER NOT NULL DEFAULT 0,
+                    user_positive_count   INTEGER NOT NULL DEFAULT 0,
+                    user_negative_count   INTEGER NOT NULL DEFAULT 0,
+                    latency_total_us      INTEGER NOT NULL DEFAULT 0,
+                    updated_at            INTEGER NOT NULL,
+                    CHECK (
+                        selected_count >= 0 AND invoked_count >= 0
+                        AND direct_success_count >= 0 AND direct_failure_count >= 0
+                        AND timeout_count >= 0 AND oom_count >= 0
+                        AND policy_fault_count >= 0
+                        AND user_positive_count >= 0 AND user_negative_count >= 0
+                        AND latency_total_us >= 0
+                    ),
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_daily_stats (
+                    skill_id             TEXT NOT NULL,
+                    day_start            INTEGER NOT NULL,
+                    aggregate_version    INTEGER NOT NULL,
+                    through_event_id     INTEGER NOT NULL,
+                    invoked_count        INTEGER NOT NULL,
+                    direct_success_count INTEGER NOT NULL,
+                    direct_failure_count INTEGER NOT NULL,
+                    timeout_count        INTEGER NOT NULL,
+                    oom_count            INTEGER NOT NULL,
+                    policy_fault_count   INTEGER NOT NULL,
+                    latency_total_us     INTEGER NOT NULL,
+                    PRIMARY KEY (skill_id, day_start, aggregate_version),
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_compaction_watermarks (
+                    worker_name      TEXT PRIMARY KEY,
+                    aggregate_version INTEGER NOT NULL,
+                    through_event_id INTEGER NOT NULL,
+                    updated_at       INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_repair_records (
+                    repair_id            TEXT PRIMARY KEY,
+                    skill_id             TEXT NOT NULL,
+                    export_name          TEXT,
+                    outcome_kind         TEXT NOT NULL,
+                    sanitized_payload    TEXT NOT NULL,
+                    inherited_cases_json TEXT NOT NULL,
+                    query_fingerprint    TEXT,
+                    retrieval_score      REAL,
+                    index_generation     INTEGER NOT NULL,
+                    human_approved       INTEGER NOT NULL DEFAULT 0
+                        CHECK (human_approved IN (0, 1)),
+                    created_at           INTEGER NOT NULL,
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_feedback (
+                    feedback_id    TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    skill_id       TEXT NOT NULL,
+                    invocation_id  TEXT,
+                    actor_id       TEXT NOT NULL,
+                    feedback_kind  TEXT NOT NULL
+                        CHECK (feedback_kind IN ('positive', 'negative', 'severe')),
+                    reason_code    TEXT NOT NULL,
+                    reason_text    TEXT,
+                    state          TEXT NOT NULL
+                        CHECK (state IN ('active', 'resolved', 'retracted')),
+                    version        INTEGER NOT NULL DEFAULT 1,
+                    created_at     INTEGER NOT NULL,
+                    updated_at     INTEGER NOT NULL,
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS skill_feedback_policy_idx
+                    ON skill_feedback(skill_id, state, feedback_kind);
+
+                CREATE TABLE IF NOT EXISTS skill_feedback_audit (
+                    audit_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    feedback_id TEXT NOT NULL,
+                    from_state  TEXT,
+                    to_state    TEXT NOT NULL,
+                    actor_id    TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    version     INTEGER NOT NULL,
+                    created_at  INTEGER NOT NULL,
+                    FOREIGN KEY (feedback_id) REFERENCES skill_feedback(feedback_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_lifecycle_approvals (
+                    approval_id          TEXT PRIMARY KEY,
+                    skill_id             TEXT NOT NULL,
+                    approval_kind        TEXT NOT NULL,
+                    actor_id             TEXT NOT NULL,
+                    artifact_row_version INTEGER NOT NULL,
+                    evaluation_report_id TEXT NOT NULL,
+                    created_at           INTEGER NOT NULL,
+                    UNIQUE (skill_id, approval_kind),
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_decision_jobs (
+                    decision_id       TEXT PRIMARY KEY,
+                    skill_id          TEXT NOT NULL,
+                    policy_version    TEXT NOT NULL,
+                    due_at            INTEGER NOT NULL,
+                    lease_owner       TEXT,
+                    lease_expires_at  INTEGER,
+                    attempts          INTEGER NOT NULL DEFAULT 0,
+                    last_error_code   TEXT,
+                    completed_at      INTEGER,
+                    FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (policy_version)
+                        REFERENCES skill_policy_versions(policy_version)
+                );
+                CREATE INDEX IF NOT EXISTS skill_decision_jobs_due_idx
+                    ON skill_decision_jobs(completed_at, due_at, lease_expires_at);
+
+                PRAGMA user_version = 4;
                 ",
             )?;
             Ok(())

@@ -1,4 +1,6 @@
 use std::fmt;
+#[cfg(feature = "skills")]
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::{
     Arc,
@@ -496,6 +498,10 @@ pub struct JsTool {
     proposal_worker: Option<ProposalWorker>,
     #[cfg(feature = "skills")]
     _admission_worker: Option<AdmissionWorker>,
+    #[cfg(feature = "skills")]
+    telemetry: Option<crate::extras::js::skills::telemetry::TelemetryDispatcher>,
+    #[cfg(feature = "skills")]
+    skill_tool_call_ordinal: AtomicU64,
 }
 
 impl JsTool {
@@ -597,6 +603,10 @@ impl JsTool {
             proposal_worker: None,
             #[cfg(feature = "skills")]
             _admission_worker: None,
+            #[cfg(feature = "skills")]
+            telemetry: None,
+            #[cfg(feature = "skills")]
+            skill_tool_call_ordinal: AtomicU64::new(0),
         }
     }
 
@@ -606,6 +616,16 @@ impl JsTool {
         context: Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     ) -> Self {
         self.skill_turn_context = context;
+        self
+    }
+
+    #[cfg(feature = "skills")]
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn with_telemetry(
+        mut self,
+        telemetry: crate::extras::js::skills::telemetry::TelemetryDispatcher,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
         self
     }
 
@@ -705,13 +725,23 @@ impl Tool for JsTool {
         let cancellation = PermCancellation::new();
         let mut cancel_on_drop = CancelOnDrop::new(cancellation.clone());
         let (reply_tx, reply_rx) = oneshot::channel();
+        #[cfg(feature = "skills")]
+        let skill_bundle = self.skill_turn_context.snapshot();
+        #[cfg(feature = "skills")]
+        let skill_tool_call_id = format!(
+            "{}:js:{}",
+            skill_bundle.turn_id,
+            self.skill_tool_call_ordinal.fetch_add(1, Ordering::Relaxed)
+        );
         self.tx
             .as_ref()
             .ok_or_else(|| ToolError::Msg("JS engine thread disconnected".into()))?
             .send(JsRequest {
                 code: args.code,
                 #[cfg(feature = "skills")]
-                skill_bundle: self.skill_turn_context.snapshot(),
+                skill_bundle,
+                #[cfg(feature = "skills")]
+                skill_tool_call_id,
                 cancellation,
                 reply: reply_tx,
             })
@@ -719,6 +749,30 @@ impl Tool for JsTool {
 
         let response = await_js_response(reply_rx, STEP_TIMEOUT).await?;
         cancel_on_drop.disarm();
+
+        #[cfg(feature = "skills")]
+        if !response.skill_events.is_empty() {
+            match crate::extras::js::skills::telemetry::EventBatch::new(response.skill_events) {
+                Ok(batch) => {
+                    if let Some(dispatcher) = &self.telemetry {
+                        if let Err(error) = dispatcher.try_dispatch(batch) {
+                            tracing::error!(
+                                error = %error,
+                                "skill telemetry queue unavailable; turn evidence was excluded"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "skill telemetry dispatcher is not configured; turn evidence was excluded"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "invalid skill event batch was excluded"
+                ),
+            }
+        }
 
         match response.outcome {
             JsOutcome::Value(value) => Ok(value),

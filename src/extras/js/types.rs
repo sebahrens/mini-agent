@@ -17,6 +17,8 @@ pub struct JsRequest {
     pub code: String,
     #[cfg(feature = "skills")]
     pub skill_bundle: Arc<crate::extras::js::skills::turn::TurnSkillBundle>,
+    #[cfg(feature = "skills")]
+    pub skill_tool_call_id: String,
     pub cancellation: PermCancellation,
     pub reply: tokio::sync::oneshot::Sender<JsResponse>,
 }
@@ -36,6 +38,16 @@ impl fmt::Debug for JsRequest {
                     0usize
                 }
             })
+            .field("skill_tool_call_id", &{
+                #[cfg(feature = "skills")]
+                {
+                    self.skill_tool_call_id.as_str()
+                }
+                #[cfg(not(feature = "skills"))]
+                {
+                    ""
+                }
+            })
             .field("cancellation", &self.cancellation)
             .field("reply", &"<oneshot sender>")
             .finish()
@@ -44,13 +56,75 @@ impl fmt::Debug for JsRequest {
 
 pub struct JsResponse {
     pub outcome: JsOutcome,
+    #[cfg(feature = "skills")]
+    pub skill_events: Vec<crate::extras::js::skills::telemetry::SkillEvent>,
+    #[cfg(feature = "skills")]
+    pub evidence_complete: bool,
 }
 
 impl fmt::Debug for JsResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JsResponse")
-            .field("outcome", &self.outcome)
-            .finish()
+        let mut debug = f.debug_struct("JsResponse");
+        debug.field("outcome", &self.outcome);
+        #[cfg(feature = "skills")]
+        debug
+            .field("skill_event_count", &self.skill_events.len())
+            .field("evidence_complete", &self.evidence_complete);
+        debug.finish()
+    }
+}
+
+#[cfg(feature = "skills")]
+#[derive(Debug, Clone)]
+pub struct InstrumentedSkill {
+    pub artifact: crate::extras::js::skills::SkillArtifact,
+    pub retrieval_score: f64,
+    pub retrieval_rank: u32,
+    pub query_fingerprint: Option<String>,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Debug, Clone)]
+pub struct SkillExecutionBundle {
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub index_generation: u64,
+    pub production: bool,
+    pub skills: Vec<InstrumentedSkill>,
+}
+
+#[cfg(feature = "skills")]
+impl SkillExecutionBundle {
+    pub fn from_turn_bundle(
+        bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
+        tool_call_id: String,
+    ) -> Self {
+        Self {
+            turn_id: bundle.turn_id.clone(),
+            tool_call_id,
+            index_generation: bundle.index_generation,
+            production: true,
+            skills: bundle
+                .skills
+                .iter()
+                .map(|resolved| InstrumentedSkill {
+                    artifact: crate::extras::js::skills::SkillArtifact {
+                        id: resolved.id.clone(),
+                        identity_version: resolved.identity_version,
+                        source: resolved.source.clone(),
+                        description: resolved.description.clone(),
+                        tags: resolved.tags.clone(),
+                        exports: resolved.exports.clone(),
+                        tests: resolved.tests.clone(),
+                        capability: resolved.capability.clone(),
+                    },
+                    retrieval_score: f64::from(resolved.score()),
+                    retrieval_rank: u32::try_from(resolved.rank).unwrap_or(u32::MAX),
+                    query_fingerprint: (!bundle.query_fingerprint.is_empty())
+                        .then(|| bundle.query_fingerprint.clone()),
+                })
+                .collect(),
+        }
     }
 }
 

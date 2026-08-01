@@ -3,17 +3,41 @@ mod agent_skill_catalog;
 #[cfg(feature = "skills")]
 mod auto_admission_end_to_end;
 #[cfg(feature = "skills")]
+mod evidence_policy_scheduler;
+#[cfg(feature = "skills")]
+mod evidence_promotion_policy;
+#[cfg(feature = "skills")]
+mod phase5_operations_benchmark;
+#[cfg(feature = "skills")]
 mod propose_skill_host;
+#[cfg(feature = "skills")]
+mod self_learning_end_to_end;
+#[cfg(feature = "skills")]
+mod self_learning_failure_matrix;
 #[cfg(feature = "skills")]
 mod skill_admission_gate;
 #[cfg(feature = "skills")]
 mod skill_admission_schema;
 #[cfg(feature = "skills")]
+mod skill_canary_routing;
+#[cfg(feature = "skills")]
+mod skill_capability_enforcement;
+#[cfg(feature = "skills")]
 mod skill_embedder;
+#[cfg(feature = "skills")]
+mod skill_event_attribution;
 #[cfg(feature = "skills")]
 mod skill_held_out_evaluator;
 #[cfg(feature = "skills")]
 mod skill_index;
+#[cfg(feature = "skills")]
+mod skill_lifecycle_schema;
+#[cfg(feature = "skills")]
+mod skill_quarantine_policy;
+#[cfg(feature = "skills")]
+mod skill_repair_and_rollback;
+#[cfg(feature = "skills")]
+mod skill_repair_records;
 #[cfg(feature = "skills")]
 mod skill_retrieval_benchmark;
 #[cfg(feature = "skills")]
@@ -24,6 +48,10 @@ mod skill_runtime_prompt;
 mod skill_store_identity;
 #[cfg(feature = "skills")]
 mod skill_store_schema;
+#[cfg(feature = "skills")]
+mod skill_targeted_feedback;
+#[cfg(feature = "skills")]
+mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
 
@@ -540,6 +568,8 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
             skill_bundle: std::sync::Arc::new(
                 crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
             ),
+            #[cfg(feature = "skills")]
+            skill_tool_call_id: "completed-tool".to_string(),
             cancellation: PermCancellation::new(),
             reply: completed_reply,
         })
@@ -556,6 +586,8 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
             skill_bundle: std::sync::Arc::new(
                 crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
             ),
+            #[cfg(feature = "skills")]
+            skill_tool_call_id: "cancelled-tool".to_string(),
             cancellation,
             reply: cancelled_reply,
         })
@@ -569,6 +601,8 @@ async fn test_js_reply_receiver_drop_is_non_fatal() {
             skill_bundle: std::sync::Arc::new(
                 crate::extras::js::skills::turn::TurnSkillBundle::empty("test"),
             ),
+            #[cfg(feature = "skills")]
+            skill_tool_call_id: "recovery-tool".to_string(),
             cancellation: PermCancellation::new(),
             reply: recovery_reply,
         })

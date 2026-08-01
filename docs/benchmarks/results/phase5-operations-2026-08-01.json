@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "profile": "debug",
+  "corpus": { "retained_revisions": 100000 },
+  "machine": { "os": "macos", "arch": "x86_64" },
+  "latency_us": {
+    "seed_100000": 4882828,
+    "routing_100000": 826323,
+    "ingestion_256": 30837,
+    "policy_10000": 978692,
+    "compaction_256": 5196,
+    "generation_state": 102,
+    "privacy_purge": 49219
+  },
+  "budgets_us": {
+    "routing_100000": 2000000,
+    "ingestion_256": 500000,
+    "policy_10000": 5000000,
+    "compaction_256": 1000000,
+    "generation_state": 100000,
+    "privacy_purge": 1000000
+  },
+  "passed": true
+}

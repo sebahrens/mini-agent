@@ -38,6 +38,7 @@ pub(crate) struct SkillCapabilityGate {
             std::collections::HashMap<String, crate::extras::js::skills::CapabilityManifest>,
         >,
     >,
+    context: crate::extras::js::skills::capability::CapabilityContext,
 }
 
 #[cfg(feature = "skills")]
@@ -98,18 +99,24 @@ impl SkillCapabilityGate {
         capability: crate::extras::js::skills::HostCapability,
     ) -> rquickjs::Result<()> {
         let stack = self.stack.lock().unwrap_or_else(|error| error.into_inner());
-        if stack
-            .last()
-            .is_none_or(|manifest| manifest.allows(capability))
-        {
-            Ok(())
-        } else {
-            Err(rquickjs::Error::new_from_js_message(
+        if stack.iter().any(|manifest| !manifest.allows(capability)) {
+            return Err(rquickjs::Error::new_from_js_message(
                 "skill capability",
                 capability.as_token(),
                 "selected skill did not declare this host capability",
-            ))
+            ));
         }
+        self.context.authorize(capability, true).map_err(|error| {
+            rquickjs::Error::new_from_js_message(
+                "skill capability policy",
+                capability.as_token(),
+                error.to_string(),
+            )
+        })
+    }
+
+    pub(crate) fn context(&self) -> crate::extras::js::skills::capability::CapabilityContext {
+        self.context.clone()
     }
 }
 

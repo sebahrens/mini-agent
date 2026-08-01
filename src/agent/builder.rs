@@ -202,6 +202,7 @@ fn register_js_tool(
             use crate::extras::js::skills::embed::Embedder;
             use crate::extras::js::skills::proposal::ProposalQueue;
             use crate::extras::js::skills::store::SkillStore;
+            use crate::extras::js::skills::telemetry::TelemetryDispatcher;
             use crate::paths::AppPaths;
             use std::time::Duration;
 
@@ -214,6 +215,15 @@ fn register_js_tool(
                     SkillStore::open_at(&paths).map_err(|error| error.to_string())?;
                 let embedder = Embedder::from_config(cfg.embedding.as_ref())
                     .map_err(|error| error.to_string())?;
+                let telemetry_embedder = std::sync::Arc::new(
+                    Embedder::from_config(cfg.embedding.as_ref())
+                        .map_err(|error| error.to_string())?,
+                );
+                let (coordinator, _) =
+                    crate::extras::js::skills::turn::shared_coordinator(&paths, telemetry_embedder)
+                        .map_err(|error| error.to_string())?;
+                let telemetry = TelemetryDispatcher::spawn_with_coordinator(&paths, coordinator)
+                    .map_err(|error| error.to_string())?;
                 let evaluator = AdmissionEvaluator::new(
                     evaluator_store,
                     embedder,
@@ -225,17 +235,20 @@ fn register_js_tool(
                 let proposal_worker =
                     ProposalQueue::start_store_worker(proposal_store, 16, Duration::from_secs(2))
                         .map_err(|error| error.to_string())?;
-                Ok((proposal_worker, admission_worker))
+                Ok((proposal_worker, admission_worker, telemetry))
             })();
             match workers {
-                Ok((proposal_worker, admission_worker)) => JsTool::new_with_skill_workers(
-                    sandbox,
-                    permission,
-                    ask_tx,
-                    allow_config,
-                    proposal_worker,
-                    admission_worker,
-                ),
+                Ok((proposal_worker, admission_worker, telemetry)) => {
+                    JsTool::new_with_skill_workers(
+                        sandbox,
+                        permission,
+                        ask_tx,
+                        allow_config,
+                        proposal_worker,
+                        admission_worker,
+                    )
+                    .with_telemetry(telemetry)
+                }
                 Err(error) => {
                     tracing::error!(
                         error = %error,

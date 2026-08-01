@@ -80,23 +80,19 @@ fn skill_store_identity_tamper_and_collision_fail_closed() {
     let mut store = SkillStore::open_at(&temp.paths).expect("open store");
     let artifact = artifact();
     store.insert_verified(&artifact).expect("insert");
-    store
+    let tamper = store
         .conn_mut()
         .execute(
             "UPDATE skill_revisions SET source = 'function increment() { return 99; }' WHERE id = ?",
             [&artifact.id],
         )
-        .unwrap();
-
-    assert!(matches!(
-        store.get(&artifact.id),
-        Err(StoreError::IdentityValidation(_))
-    ));
-    assert!(store.list_retrievable().unwrap().is_empty());
-    assert!(matches!(
-        store.insert_verified(&artifact),
-        Err(StoreError::Collision(_))
-    ));
+        .unwrap_err();
+    assert!(tamper.to_string().contains("immutable skill identity"));
+    assert_eq!(store.get(&artifact.id).unwrap(), Some(artifact.clone()));
+    assert_eq!(store.list_retrievable().unwrap(), vec![artifact.clone()]);
+    store
+        .insert_verified(&artifact)
+        .expect("exact immutable retry remains idempotent");
 }
 
 #[test]

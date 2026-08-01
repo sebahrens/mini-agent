@@ -39,11 +39,13 @@ fn resolved(artifact: &SkillArtifact, rank: usize) -> ResolvedSkill {
         source: artifact.source.clone(),
         score_bits: 1.0_f32.to_bits(),
         rank,
+        route: None,
     }
 }
 
 fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
     Arc::new(SkillTurnContext::new(TurnSkillBundle {
+        turn_id: "binding-turn".to_string(),
         query_fingerprint: "binding-test".to_string(),
         embedding_model_revision: "test-model".to_string(),
         index_generation: 7,
@@ -309,6 +311,7 @@ fn turn_context_replacement_does_not_mutate_existing_snapshots() {
     let frozen = turn_context.snapshot();
 
     turn_context.replace(TurnSkillBundle {
+        turn_id: "next-turn-id".to_string(),
         query_fingerprint: "next-turn".to_string(),
         embedding_model_revision: "test-model".to_string(),
         index_generation: 8,
