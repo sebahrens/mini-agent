@@ -57,6 +57,7 @@ mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
 mod worker_protocol;
+mod worker_runtime;
 
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::tool::JsTool;

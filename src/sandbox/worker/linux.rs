@@ -1,4 +1,6 @@
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::FileTypeExt;
 use std::process::{Child, ExitStatus};
 
 use super::{WorkerBackend, WorkerContainmentStatus, WorkerLaunchError, WorkerProcess};
@@ -6,6 +8,18 @@ use super::{WorkerBackend, WorkerContainmentStatus, WorkerLaunchError, WorkerPro
 const BACKEND: WorkerBackend = WorkerBackend::Bubblewrap;
 const UNAVAILABLE_REASON: &str =
     "the broker-only bubblewrap/seccomp/rlimit backend has not been delivered";
+
+pub(super) fn standard_streams_are_protocol_pipes() -> bool {
+    fn is_pipe(fd: RawFd) -> bool {
+        std::fs::metadata(format!("/proc/self/fd/{fd}"))
+            .map(|metadata| metadata.file_type().is_fifo())
+            .unwrap_or(false)
+    }
+
+    is_pipe(std::io::stdin().as_raw_fd())
+        && is_pipe(std::io::stdout().as_raw_fd())
+        && is_pipe(std::io::stderr().as_raw_fd())
+}
 
 pub(super) fn containment_status() -> WorkerContainmentStatus {
     WorkerContainmentStatus::Unavailable {
