@@ -19,6 +19,9 @@ class FeatureGraphTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.manifest = feature_graph.load_manifest(REPOSITORY_ROOT / "Cargo.toml")
+        cls.workflow_text = (
+            REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
         cls.workflow_matrices = feature_graph.load_workflow_matrices(
             REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
         )
@@ -123,6 +126,39 @@ class FeatureGraphTests(unittest.TestCase):
         self.assertEqual(
             [], feature_graph.validate_workflow_matrices(self.workflow_matrices)
         )
+        self.assertEqual(
+            [], feature_graph.validate_workflow_commands(self.workflow_text)
+        )
+
+    def test_workflow_parser_accepts_inline_comments(self) -> None:
+        workflow = self.workflow_text.replace(
+            '          - ""', '          - "" # default row'
+        )
+
+        matrices = {
+            job: feature_graph.workflow_matrix_values(workflow, job)
+            for job in ("test", "clippy")
+        }
+        self.assertEqual([], feature_graph.validate_workflow_matrices(matrices))
+
+    def test_workflow_parser_accepts_deeper_sequence_indentation(self) -> None:
+        workflow = self.workflow_text.replace("\n          - ", "\n              - ")
+
+        matrices = {
+            job: feature_graph.workflow_matrix_values(workflow, job)
+            for job in ("test", "clippy")
+        }
+        self.assertEqual([], feature_graph.validate_workflow_matrices(matrices))
+
+    def test_workflow_parser_rejects_malformed_quoted_values(self) -> None:
+        workflow = self.workflow_text.replace(
+            '          - "--no-default-features"',
+            '          - "--no-default-features',
+            1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "unterminated quoted scalar"):
+            feature_graph.workflow_matrix_values(workflow, "clippy")
 
     def test_workflow_rejects_missing_memory_and_sandbox_rows(self) -> None:
         matrices = copy.deepcopy(feature_graph.expected_workflow_matrices())
@@ -144,6 +180,27 @@ class FeatureGraphTests(unittest.TestCase):
         )
 
         self.assertEqual([], feature_graph.validate_workflow_matrices(matrices))
+
+    def test_workflow_commands_must_consume_their_feature_matrix(self) -> None:
+        mutations = {
+            "test": self.workflow_text.replace(
+                "cargo test --locked ${{ matrix.features }}",
+                "cargo test --locked",
+                1,
+            ),
+            "clippy": self.workflow_text.replace(
+                "cargo clippy --locked ${{ matrix.features }}",
+                "cargo clippy --locked ${{ matrix.feature_args }}",
+                1,
+            ),
+        }
+        for job, workflow in mutations.items():
+            with self.subTest(job=job):
+                self.assertIn(
+                    f"{job} job Cargo command must consume "
+                    "'${{ matrix.features }}'",
+                    feature_graph.validate_workflow_commands(workflow),
+                )
 
 
 if __name__ == "__main__":

@@ -155,47 +155,188 @@ def parse_cargo_invocation(arguments: str) -> CargoInvocation:
 
 
 def _yaml_string(value: str) -> str:
-    value = value.strip()
+    value = _strip_yaml_comment(value).strip()
+    if not value:
+        raise ValueError("matrix row must be a non-empty YAML string")
     if value.startswith('"'):
-        decoded = json.loads(value)
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid double-quoted YAML scalar: {value}") from error
         if not isinstance(decoded, str):
             raise ValueError(f"matrix row must be a string: {value}")
         return decoded
-    if value.startswith("'") and value.endswith("'"):
+    if value.startswith("'"):
+        if not re.fullmatch(r"'(?:[^']|'')*'", value):
+            raise ValueError(f"invalid single-quoted YAML scalar: {value}")
         return value[1:-1].replace("''", "'")
     return value
 
 
+def _strip_yaml_comment(value: str) -> str:
+    quote: str | None = None
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote == "'":
+            if character == "'":
+                if index + 1 < len(value) and value[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = None
+        elif quote == '"':
+            if character == "\\":
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+        elif character in {'"', "'"}:
+            quote = character
+        elif character == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+        index += 1
+    if quote is not None:
+        raise ValueError("unterminated quoted scalar in feature matrix")
+    return value.rstrip()
+
+
+def _mapping_entry(line: str) -> tuple[int, str] | None:
+    match = re.fullmatch(r"( *)([A-Za-z0-9_-]+):(?: *#.*)?", line)
+    if not match:
+        return None
+    return len(match.group(1)), match.group(2)
+
+
+def _child_section(
+    lines: list[str],
+    key: str,
+    start: int,
+    end: int,
+    parent_indent: int,
+) -> tuple[int, int, int]:
+    entries = [
+        (index, entry[0], entry[1])
+        for index in range(start, end)
+        if (entry := _mapping_entry(lines[index])) is not None
+        and entry[0] > parent_indent
+    ]
+    if not entries:
+        raise ValueError(f"workflow mapping {key!r} is missing")
+    child_indent = min(indent for _, indent, _ in entries)
+    try:
+        section_start = next(
+            index
+            for index, indent, name in entries
+            if indent == child_indent and name == key
+        )
+    except StopIteration as error:
+        raise ValueError(f"workflow mapping {key!r} is missing") from error
+
+    section_end = end
+    for index in range(section_start + 1, end):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(lines[index]) - len(lines[index].lstrip(" "))
+        if indent <= child_indent:
+            section_end = index
+            break
+    return section_start, section_end, child_indent
+
+
+def _workflow_job_section(
+    lines: list[str], job: str
+) -> tuple[int, int, int]:
+    jobs_start, jobs_end, jobs_indent = _child_section(
+        lines, "jobs", 0, len(lines), -1
+    )
+    return _child_section(lines, job, jobs_start + 1, jobs_end, jobs_indent)
+
+
 def workflow_matrix_values(text: str, job: str) -> list[str]:
     lines = text.splitlines()
-    job_line = f"  {job}:"
-    try:
-        job_start = lines.index(job_line)
-    except ValueError as error:
-        raise ValueError(f"workflow job {job!r} is missing") from error
-
-    job_end = len(lines)
-    for index in range(job_start + 1, len(lines)):
-        if re.fullmatch(r"  [A-Za-z0-9_-]+:", lines[index]):
-            job_end = index
-            break
-
-    matrix_start = None
-    for index in range(job_start + 1, job_end):
-        if lines[index] == "        features:":
-            matrix_start = index + 1
-            break
-    if matrix_start is None:
-        raise ValueError(f"workflow job {job!r} has no feature matrix")
+    job_start, job_end, job_indent = _workflow_job_section(lines, job)
+    strategy_start, strategy_end, strategy_indent = _child_section(
+        lines, "strategy", job_start + 1, job_end, job_indent
+    )
+    matrix_start, matrix_end, matrix_indent = _child_section(
+        lines,
+        "matrix",
+        strategy_start + 1,
+        strategy_end,
+        strategy_indent,
+    )
+    features_start, features_end, features_indent = _child_section(
+        lines, "features", matrix_start + 1, matrix_end, matrix_indent
+    )
 
     values: list[str] = []
-    for line in lines[matrix_start:job_end]:
-        match = re.fullmatch(r"          - (.+)", line)
-        if match:
-            values.append(_yaml_string(match.group(1)))
-        elif line.strip() and not line.lstrip().startswith("#"):
-            break
+    item_indent: int | None = None
+    for line in lines[features_start + 1 : features_end]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.fullmatch(r"( *)-\s+(.+)", line)
+        if not match or len(match.group(1)) <= features_indent:
+            raise ValueError(f"{job} feature matrix must be a flat string sequence")
+        current_indent = len(match.group(1))
+        if item_indent is None:
+            item_indent = current_indent
+        elif current_indent != item_indent:
+            raise ValueError(f"{job} feature matrix has inconsistent indentation")
+        values.append(_yaml_string(match.group(2)))
     return values
+
+
+def _workflow_run_commands(text: str, job: str) -> list[str]:
+    lines = text.splitlines()
+    job_start, job_end, _ = _workflow_job_section(lines, job)
+    commands: list[str] = []
+    index = job_start + 1
+    while index < job_end:
+        match = re.fullmatch(r"( *)run:\s*(.*)", lines[index])
+        if not match:
+            index += 1
+            continue
+        run_indent = len(match.group(1))
+        value = match.group(2).strip()
+        if re.fullmatch(r"[>|][+-]?", value):
+            block: list[str] = []
+            index += 1
+            while index < job_end:
+                line = lines[index]
+                if line.strip():
+                    indent = len(line) - len(line.lstrip(" "))
+                    if indent <= run_indent:
+                        break
+                block.append(line)
+                index += 1
+            commands.append("\n".join(block))
+            continue
+        commands.append(value)
+        index += 1
+    return commands
+
+
+def validate_workflow_commands(text: str) -> list[str]:
+    errors: list[str] = []
+    interpolation = "${{ matrix.features }}"
+    for job, subcommand in (("test", "test"), ("clippy", "clippy")):
+        commands = _workflow_run_commands(text, job)
+        cargo_commands = [
+            command
+            for command in commands
+            if re.search(
+                rf"(?:^|[;&|][ \t]*)[ \t]*cargo\s+{re.escape(subcommand)}\b",
+                command,
+                flags=re.MULTILINE,
+            )
+        ]
+        if not any(interpolation in command for command in cargo_commands):
+            errors.append(
+                f"{job} job Cargo command must consume {interpolation!r}"
+            )
+    return errors
 
 
 def load_workflow_matrices(path: Path) -> dict[str, list[str]]:
@@ -383,11 +524,17 @@ def validate_activation(packages_by_row: dict[str, set[str]]) -> list[str]:
 def main() -> int:
     errors = validate_manifest(load_manifest(ROOT / "Cargo.toml"))
     try:
+        workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
+        workflow_text = workflow_path.read_text(encoding="utf-8")
         errors.extend(
             validate_workflow_matrices(
-                load_workflow_matrices(ROOT / ".github" / "workflows" / "ci.yml")
+                {
+                    job: workflow_matrix_values(workflow_text, job)
+                    for job in ("test", "clippy")
+                }
             )
         )
+        errors.extend(validate_workflow_commands(workflow_text))
         packages_by_row = {
             feature_row.name: cargo_tree_packages(feature_row, ROOT)
             for feature_row in FEATURE_ROWS
