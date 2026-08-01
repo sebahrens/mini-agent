@@ -5,7 +5,7 @@ use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
 use rig::completion::{CompletionModel, Message};
-use rig::message::{ToolResult, ToolResultContent};
+use rig::message::{AssistantContent, ToolResult, ToolResultContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use tokio::sync::mpsc;
 
@@ -138,6 +138,71 @@ fn charge_nonterminal_eof(
     }
 
     Ok(())
+}
+
+fn append_streamed_text(interactions: &mut Vec<Message>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(Message::Assistant { content, .. }) = interactions.last_mut()
+        && let AssistantContent::Text(previous) = content.last_mut()
+        && previous.additional_params.is_none()
+    {
+        previous.text.push_str(text);
+        return;
+    }
+
+    interactions.push(Message::assistant(text.to_string()));
+}
+
+fn reconcile_terminal_response(response: &mut String, stream_start: usize, terminal: &str) {
+    if response.len() > stream_start {
+        return;
+    }
+
+    response.push_str(terminal);
+}
+
+#[derive(Clone, Default)]
+struct RunnerStreamPolicy {
+    #[cfg(test)]
+    drop_terminal_responses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RunnerStreamPolicy {
+    #[cfg(test)]
+    fn drop_next_terminal_responses(count: usize) -> Self {
+        Self {
+            drop_terminal_responses: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                count,
+            )),
+        }
+    }
+
+    fn apply<R>(&self, stream: StreamingResult<R>) -> StreamingResult<R>
+    where
+        R: Send + 'static,
+    {
+        #[cfg(test)]
+        if self
+            .drop_terminal_responses
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| (remaining > 0).then(|| remaining - 1),
+            )
+            .is_ok()
+        {
+            return stream
+                .filter(|item| {
+                    std::future::ready(!matches!(item, Ok(MultiTurnStreamItem::FinalResponse(_))))
+                })
+                .boxed();
+        }
+
+        stream
+    }
 }
 
 /// Spawn an isolated, single-turn, tool-less side-question run. The full result
@@ -435,6 +500,32 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    spawn_agent_with_stream_policy(
+        agent,
+        prompt,
+        history,
+        retry_config,
+        RunnerStreamPolicy::default(),
+        #[cfg(feature = "skills")]
+        turn_guard,
+        #[cfg(feature = "hooks")]
+        loop_info,
+    )
+}
+
+fn spawn_agent_with_stream_policy<M>(
+    agent: Agent<M>,
+    prompt: String,
+    history: Vec<Message>,
+    retry_config: RetryConfig,
+    stream_policy: RunnerStreamPolicy,
+    #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+) -> AgentRunner
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
 
     #[cfg(feature = "subagents")]
@@ -458,6 +549,8 @@ where
         let max_turns = agent.default_max_turns.unwrap_or(1);
         let mut turns_used = 0usize;
         let mut turns_at_stream_start = turns_used;
+        let mut response = String::new();
+        let mut response_len_at_stream_start = response.len();
         let mut cumulative_usage = Usage::new();
         // Overrides the next continuation message (bottom of the outer
         // `loop`); set when a `Stop` hook forces continuation instead of the
@@ -470,7 +563,16 @@ where
         #[cfg(feature = "hooks")]
         const MAX_STOP_BLOCKS: u32 = 8;
 
-        let mut stream: StreamingResult<M::StreamingResponse> = {
+        if max_turns == 0 {
+            let _ = event_tx
+                .send(AgentEvent::Error(CompactString::from(
+                    "Agent exhausted its maximum turn budget (0) before starting.",
+                )))
+                .await;
+            return;
+        }
+
+        let stream: StreamingResult<M::StreamingResponse> = {
             let mut attempt: usize = 0;
             let mut backoff = std::time::Duration::from_millis(retry_config.initial_backoff_ms);
             let max_backoff = std::time::Duration::from_millis(retry_config.max_backoff_ms);
@@ -515,6 +617,7 @@ where
                 }
             }
         };
+        let mut stream = stream_policy.apply(stream);
 
         loop {
             let mut terminal_response_seen = false;
@@ -528,6 +631,8 @@ where
 
                         match content {
                             StreamedAssistantContent::Text(text) => {
+                                response.push_str(&text.text);
+                                append_streamed_text(&mut tool_interactions, &text.text);
                                 let _ = event_tx
                                     .send(AgentEvent::Token(CompactString::from(text.text)))
                                     .await;
@@ -597,6 +702,11 @@ where
                         terminal_response_seen = true;
                         let usage = res.usage();
                         let response_text = res.output;
+                        reconcile_terminal_response(
+                            &mut response,
+                            response_len_at_stream_start,
+                            &response_text,
+                        );
                         tracing::info!(
                             "agent done: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}",
                             usage.input_tokens,
@@ -630,7 +740,7 @@ where
                             }
                             let _ = event_tx
                                 .send(AgentEvent::Done {
-                                    response: CompactString::from(response_text),
+                                    response: CompactString::from(response.clone()),
                                     input_tokens: usage.input_tokens,
                                     output_tokens: usage.output_tokens,
                                     cached_input_tokens: usage.cached_input_tokens,
@@ -727,16 +837,19 @@ where
                 .take()
                 .unwrap_or_else(|| retry_prompt.clone());
             let new_tool_interactions = take_new_tool_interactions(&mut tool_interactions);
-            stream = continue_prompt_injector(
-                &agent,
-                &injected_prompt,
-                &retry_history,
-                &new_tool_interactions,
-                &retry_config,
-                remaining_turns,
-            )
-            .await;
+            stream = stream_policy.apply(
+                continue_prompt_injector(
+                    &agent,
+                    &injected_prompt,
+                    &retry_history,
+                    &new_tool_interactions,
+                    &retry_config,
+                    remaining_turns,
+                )
+                .await,
+            );
             turns_at_stream_start = turns_used;
+            response_len_at_stream_start = response.len();
         }
     };
 
@@ -779,18 +892,50 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    run_print_with_stream_policy(
+        agent,
+        prompt,
+        pure_stdout,
+        retry_config,
+        history,
+        RunnerStreamPolicy::default(),
+        #[cfg(feature = "hooks")]
+        loop_info,
+    )
+    .await
+}
+
+async fn run_print_with_stream_policy<M>(
+    agent: &Agent<M>,
+    prompt: &str,
+    pure_stdout: bool,
+    retry_config: &RetryConfig,
+    history: Vec<Message>,
+    stream_policy: RunnerStreamPolicy,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+) -> anyhow::Result<(String, rig::completion::Usage)>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
     let max_turns = agent.default_max_turns.unwrap_or(1);
-    let mut stream = retry::retry_stream_chat(retry_config, || {
+    if max_turns == 0 {
+        anyhow::bail!("Agent exhausted its maximum turn budget (0) before starting.");
+    }
+
+    let stream = retry::retry_stream_chat(retry_config, || {
         let p = prompt.to_string();
         let h = history.clone();
         async move { agent.stream_chat(p, h).max_turns(max_turns).await }
     })
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut stream = stream_policy.apply(stream);
 
     let retry_history: Vec<Message> = history;
     let mut tool_interactions: Vec<Message> = Vec::new();
     let mut full_response = String::new();
+    let mut response_len_at_stream_start = full_response.len();
     let mut last_tool_name: Option<String> = None;
     let mut usage = rig::completion::Usage::new();
     let mut cumulative_usage = Usage::new();
@@ -817,6 +962,7 @@ where
                     text,
                 ))) => {
                     full_response.push_str(&text.text);
+                    append_streamed_text(&mut tool_interactions, &text.text);
                     print!("{}", text.text);
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
@@ -874,6 +1020,11 @@ where
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                     terminal_response_seen = true;
                     usage = res.usage();
+                    reconcile_terminal_response(
+                        &mut full_response,
+                        response_len_at_stream_start,
+                        &res.output,
+                    );
                     #[cfg(feature = "hooks")]
                     if let crate::extras::hooks::StopGate::Continue { reason } =
                         crate::extras::hooks::dispatch_stop(
@@ -941,16 +1092,19 @@ where
             // persists the returned string as the assistant message, so
             // clearing it here would drop turn-1 output the user already saw
             // and desync the saved transcript from the terminal.
-            stream = continue_prompt_injector(
-                agent,
-                &injected_prompt,
-                &retry_history,
-                &new_tool_interactions,
-                retry_config,
-                remaining_turns,
-            )
-            .await;
+            stream = stream_policy.apply(
+                continue_prompt_injector(
+                    agent,
+                    &injected_prompt,
+                    &retry_history,
+                    &new_tool_interactions,
+                    retry_config,
+                    remaining_turns,
+                )
+                .await,
+            );
             turns_at_stream_start = turns_used;
+            response_len_at_stream_start = full_response.len();
         }
     }
 
@@ -1095,8 +1249,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        NonTerminalStreamExhausted, attributed_tool_result, charge_nonterminal_eof,
-        streamed_reasoning_text, warn_unknown_stream_item,
+        NonTerminalStreamExhausted, RunnerStreamPolicy, attributed_tool_result,
+        charge_nonterminal_eof, streamed_reasoning_text, warn_unknown_stream_item,
     };
     use rig::OneOrMany;
     use rig::agent::{AgentBuilder, MultiTurnStreamItem};
@@ -1663,6 +1817,315 @@ mod tests {
         assert_eq!(model.requests().len(), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(response.as_deref(), Some("finished"));
+    }
+
+    #[tokio::test]
+    async fn runner_eof_without_terminal_event_repeated_immediate_eof_stops_exactly_at_limit() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent_with_stream_policy(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            RunnerStreamPolicy::drop_next_terminal_responses(3),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut error = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Error(message) => {
+                    error = Some(message.to_string());
+                    break;
+                }
+                crate::event::AgentEvent::Done { response, .. } => {
+                    panic!("unexpected completion after repeated EOF: {response}")
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(model.requests().len(), 3);
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "Agent stream ended without a terminal response; provider attempt budget exhausted (3/3)."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_eof_without_terminal_event_partial_text_is_persisted_and_replayed() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("prefix "),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("suffix"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(2)
+            .build();
+        let mut runner = super::spawn_agent_with_stream_policy(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            RunnerStreamPolicy::drop_next_terminal_responses(1),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut streamed = String::new();
+        let mut done = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Token(text) => streamed.push_str(&text),
+                crate::event::AgentEvent::Done { response, .. } => {
+                    done = Some(response.to_string());
+                    break;
+                }
+                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(streamed, "prefix suffix");
+        assert_eq!(done.as_deref(), Some("prefix suffix"));
+        assert!(
+            requests[1].chat_history.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::Assistant { content, .. }
+                        if content.iter().any(|item| matches!(
+                            item,
+                            AssistantContent::Text(text) if text.text == "prefix "
+                        ))
+                )
+            }),
+            "the continuation request must include the partial assistant prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_eof_without_terminal_event_tool_result_and_text_are_replayed_in_order() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "tool-before-eof",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("partial "),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("complete"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent_with_stream_policy(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            RunnerStreamPolicy::drop_next_terminal_responses(1),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut done = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { response, .. } => {
+                    done = Some(response.to_string());
+                    break;
+                }
+                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(done.as_deref(), Some("partial complete"));
+        let continuation_history = &requests[2].chat_history;
+        let tool_call_index = continuation_history
+            .iter()
+            .position(|message| matches!(message, Message::Assistant { content, .. } if content.iter().any(|item| matches!(item, AssistantContent::ToolCall(call) if call.id == "tool-before-eof"))))
+            .expect("continuation contains tool call");
+        let tool_result_index = continuation_history
+            .iter()
+            .position(|message| matches!(message, Message::User { content } if content.iter().any(|item| matches!(item, rig::message::UserContent::ToolResult(result) if result.id == "tool-before-eof"))))
+            .expect("continuation contains tool result");
+        let partial_text_index = continuation_history
+            .iter()
+            .position(|message| matches!(message, Message::Assistant { content, .. } if content.iter().any(|item| matches!(item, AssistantContent::Text(text) if text.text == "partial "))))
+            .expect("continuation contains partial text");
+        assert!(tool_call_index < tool_result_index && tool_result_index < partial_text_index);
+    }
+
+    #[tokio::test]
+    async fn runner_eof_without_terminal_event_headless_recovers_without_duplicate_text() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("prefix "),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("suffix"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(2)
+            .build();
+
+        let (response, _) = super::run_print_with_stream_policy(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            Vec::new(),
+            RunnerStreamPolicy::drop_next_terminal_responses(1),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("headless EOF recovery succeeds");
+
+        assert_eq!(model.requests().len(), 2);
+        assert_eq!(response, "prefix suffix");
+        assert!(model.requests()[1].chat_history.iter().any(|message| {
+            matches!(message, Message::Assistant { content, .. } if content.iter().any(
+                |item| matches!(item, AssistantContent::Text(text) if text.text == "prefix ")
+            ))
+        }));
+    }
+
+    #[tokio::test]
+    async fn runner_eof_without_terminal_event_headless_exhaustion_has_exact_call_count() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(2)
+            .build();
+
+        let error = super::run_print_with_stream_policy(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            Vec::new(),
+            RunnerStreamPolicy::drop_next_terminal_responses(2),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect_err("repeated headless EOF must exhaust");
+
+        assert_eq!(model.requests().len(), 2);
+        assert_eq!(
+            error.to_string(),
+            "Agent stream ended without a terminal response; provider attempt budget exhausted (2/2)."
+        );
+    }
+
+    #[test]
+    fn terminal_without_aggregate_does_not_erase_already_streamed_text() {
+        let mut response = "prefix".to_string();
+
+        super::reconcile_terminal_response(&mut response, 0, "");
+
+        assert_eq!(response, "prefix");
+    }
+
+    #[tokio::test]
+    async fn runner_zero_turn_budget_starts_no_provider_calls_on_both_surfaces() {
+        let interactive_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("must not run"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let interactive_agent = AgentBuilder::new(interactive_model.clone())
+            .default_max_turns(0)
+            .build();
+        let mut runner = super::spawn_agent(
+            interactive_agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let interactive_error = loop {
+            match runner.event_rx.recv().await {
+                Some(crate::event::AgentEvent::Error(error)) => break error.to_string(),
+                Some(crate::event::AgentEvent::Done { response, .. }) => {
+                    panic!("zero budget unexpectedly completed: {response}")
+                }
+                Some(_) => {}
+                None => panic!("runner ended without a diagnostic"),
+            }
+        };
+
+        let headless_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("must not run"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let headless_agent = AgentBuilder::new(headless_model.clone())
+            .default_max_turns(0)
+            .build();
+        let headless_error = super::run_print(
+            &headless_agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect_err("zero headless budget must fail before starting");
+
+        assert!(interactive_model.requests().is_empty());
+        assert!(headless_model.requests().is_empty());
+        assert_eq!(
+            interactive_error,
+            "Agent exhausted its maximum turn budget (0) before starting."
+        );
+        assert_eq!(headless_error.to_string(), interactive_error);
     }
 
     #[test]
