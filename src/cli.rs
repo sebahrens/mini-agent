@@ -207,6 +207,13 @@ pub struct Cli {
     pub sandbox: bool,
 
     #[arg(
+        long = "no-sandbox",
+        conflicts_with = "sandbox",
+        help = "Run subprocesses unsandboxed, overriding the default-on sandbox"
+    )]
+    pub no_sandbox: bool,
+
+    #[arg(
         long = "sandbox-backend",
         help = "Sandbox backend: bwrap (Linux default), seatbelt (macOS default), or zerobox"
     )]
@@ -440,8 +447,21 @@ impl Cli {
         self.no_tools || cfg.no_tools.unwrap_or(false)
     }
 
+    /// Sandboxing is on unless explicitly refused. `--no-sandbox` outranks
+    /// config so a host without a working backend can still start.
     pub fn resolve_sandbox(&self, cfg: &config::Config) -> bool {
-        self.sandbox || cfg.sandbox.unwrap_or(false)
+        if self.no_sandbox {
+            return false;
+        }
+        self.sandbox || cfg.sandbox.unwrap_or(true)
+    }
+
+    /// Whether the operator asked for a sandbox rather than inheriting the
+    /// default. An explicit request stays fail-closed when the backend is
+    /// missing; the default degrades to unsandboxed with a warning, because
+    /// Windows has no backend at all and would otherwise be unable to start.
+    pub fn sandbox_explicitly_requested(&self, cfg: &config::Config) -> bool {
+        !self.no_sandbox && (self.sandbox || cfg.sandbox == Some(true))
     }
 
     pub fn resolve_sandbox_backend(&self, cfg: &config::Config) -> String {
@@ -558,5 +578,25 @@ mod tests {
 
         cli.sandbox_backend = Some("command-line".to_string());
         assert_eq!(cli.resolve_sandbox_backend(&cfg), "command-line");
+    }
+
+    #[test]
+    fn sandbox_is_on_by_default_and_refusable() {
+        let mut cli = Cli::default();
+        let mut cfg = config::Config::default();
+        assert!(cli.resolve_sandbox(&cfg));
+
+        cfg.sandbox = Some(false);
+        assert!(!cli.resolve_sandbox(&cfg));
+
+        cli.sandbox = true;
+        assert!(cli.resolve_sandbox(&cfg));
+
+        // --no-sandbox is the escape hatch the startup error points users to,
+        // so it has to outrank both the flag and the config.
+        cli.no_sandbox = true;
+        assert!(!cli.resolve_sandbox(&cfg));
+        cfg.sandbox = Some(true);
+        assert!(!cli.resolve_sandbox(&cfg));
     }
 }

@@ -580,10 +580,17 @@ impl Startup {
         )
         .with_shell(&self.cli.resolve_shell(&self.cfg));
         if self.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
-            anyhow::bail!(
-                "sandbox backend '{}' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)",
-                self.cli.resolve_sandbox_backend(&self.cfg)
+            let backend = self.cli.resolve_sandbox_backend(&self.cfg);
+            if self.cli.sandbox_explicitly_requested(&self.cfg) {
+                anyhow::bail!(
+                    "sandbox backend '{backend}' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
+                );
+            }
+            tracing::warn!(
+                "sandbox backend '{backend}' was not found — continuing UNSANDBOXED; pass --sandbox to fail closed instead"
             );
+            self.sandbox =
+                Sandbox::new(false, &backend).with_shell(&self.cli.resolve_shell(&self.cfg));
         }
         let edit_system = self.cli.resolve_edit_system(&self.cfg);
         tools::set_edit_system(edit_system);
