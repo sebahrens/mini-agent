@@ -244,6 +244,13 @@ anonymous protocol and bounded-diagnostic handles, and narrowly required system 
 visible. Inherited descriptors/handles are closed except for an exact allow-list. Parent teardown
 kills the entire containment/process group.
 
+The platform-neutral launcher owns its target-selected child control object and three anonymous
+protocol/diagnostic pipes as ordinary files. Its common control surface is limited to process ID,
+tree termination, nonblocking status, and reaping; it does not require a Windows process created
+through Win32 APIs to masquerade as `std::process::Child`. The unconfined launcher is compiled only
+for tests. Until a target's real containment launcher is delivered and probed, its production
+status and every production launch attempt remain unavailable.
+
 | Platform | Required worker containment |
 |----------|-----------------------------|
 | Linux | A broker-only bubblewrap profile with no workspace/cache bind; isolated namespaces and environment; validated OS resource limits; and an in-worker seccomp deny policy for process creation and execution. |
