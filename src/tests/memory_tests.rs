@@ -892,6 +892,7 @@ fn bak_files_never_surface_in_list_or_search() {
     cleanup(&m);
 }
 
+#[cfg(feature = "subagents")]
 #[test]
 fn subagent_memory_tool_set_excludes_memory_edit() {
     use crate::extras::memory::MemoryEdit;
@@ -916,6 +917,7 @@ fn subagent_memory_tool_set_excludes_memory_edit() {
     assert_eq!(MemoryEdit::NAME, "memory_edit");
 }
 
+#[cfg(feature = "subagents")]
 #[tokio::test]
 async fn subagent_filesystem_permissions_memory_tools_inherit_parent_denial() {
     use std::sync::{Arc, Mutex};

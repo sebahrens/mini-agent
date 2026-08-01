@@ -113,6 +113,7 @@ pub struct EvidenceSnapshot {
 }
 
 impl EvidenceSnapshot {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         artifact_id: impl Into<String>,
         predecessor_id: Option<String>,

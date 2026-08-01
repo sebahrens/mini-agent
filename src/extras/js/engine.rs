@@ -548,6 +548,7 @@ fn unix_timestamp() -> i64 {
 }
 
 #[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
 fn install_selected_skills(
     runtime: &Runtime,
     context: &Context,

@@ -8,6 +8,16 @@ use super::store::SkillStore;
 
 pub const MAX_FEEDBACK_REASON_BYTES: usize = 512;
 
+type ExistingFeedback = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorKind {
     Owner,
@@ -144,15 +154,7 @@ impl<'a> FeedbackService<'a> {
             }
         }
         let feedback_id = feedback_id(command);
-        let existing: Option<(
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-            Option<String>,
-        )> = tx
+        let existing: Option<ExistingFeedback> = tx
             .query_row(
                 "SELECT feedback_id, skill_id, invocation_id, actor_id,
                         feedback_kind, reason_code, reason_text

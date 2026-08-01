@@ -112,7 +112,7 @@ omitted here because they drift; tracker tasks must resolve current symbols befo
 
 ```bash
 cargo fmt                         # before every commit
-cargo test --features js          # type-check + run tests
+cargo test --no-default-features --features js # isolated JS type-check + tests
 cargo install --path . --debug    # install development binary
 # Never: cargo build, cargo check, --release
 ```

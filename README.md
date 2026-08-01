@@ -97,8 +97,9 @@ separate boundary; subprocess network isolation does not bypass or replace fetch
 
 | Feature | Implies | Adds |
 |---------|---------|------|
+| `memory` | — | Project memory loading, editing, and context injection |
 | `js` | — | QuickJS engine and host globals (`rquickjs`) |
-| `sandbox` | — | Linux/macOS process isolation for `spawn`, and the `fetch` global |
+| `sandbox` | — | Shared Linux/macOS process isolation; with `js`, sandboxed `spawn` and the permission-gated `fetch` global |
 | `skills` | `js` | Agent Skills catalog plus learned-skill store, hybrid retrieval, and no-effect verifier |
 | `skills-embed` | `skills` | Local BGE embedding inference (`fastembed` → ONNX Runtime) |
 | `skills-embed-dynamic` | `skills-embed` | Links ONNX Runtime at run time via `ORT_DYLIB_PATH`, for hosts without prebuilt `ort-sys` binaries |
@@ -116,8 +117,13 @@ required CI because of the native download. For real embeddings with no local
 model at all, `[embedding] backend = "external"` reuses the OpenRouter endpoint
 and key the LLM already uses; see [`docs/agent/CONFIG.md`](docs/agent/CONFIG.md).
 
-Supported combinations exercised in CI: default, `--no-default-features`, `js`,
-`skills`, `js,sandbox`, `mcp`, `js,skills`, and `mcp,js,skills`.
+Supported combinations exercised in CI are the default build and these focused
+`--no-default-features` rows: no optional features, `memory`, `js`, `sandbox`,
+`skills` (which proves `skills` implies `js`), `js,sandbox`, `mcp`, `js,skills`,
+and the full supported core row `mcp,js,sandbox,skills,memory`. The feature-graph
+gate also verifies that optional dependencies are absent whenever their owning
+feature is disabled. `skills-embed` remains an explicitly non-blocking native
+backend row for the platform reasons above.
 
 ## Development commands
 
@@ -125,7 +131,7 @@ From the repository root:
 
 ```bash
 cargo fmt
-cargo test --features js
+cargo test --no-default-features --features js
 cargo install --path . --debug
 ```
 
