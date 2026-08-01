@@ -278,7 +278,11 @@ impl<'a> App<'a> {
 
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
         let running = Arc::new(AtomicBool::new(true));
-        let event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
+        let event_handle = Some(spawn_event_thread(
+            user_tx.clone(),
+            running.clone(),
+            ui.sandbox.clone(),
+        ));
 
         let (prebuild_tx, prebuild_rx_raw) = mpsc::channel::<PrebuildPayload>(1);
         let prebuild_rx = Some(prebuild_rx_raw);
@@ -1779,6 +1783,7 @@ impl<'a> App<'a> {
         self.event_handle = Some(spawn_event_thread(
             self.user_tx.clone(),
             self.running.clone(),
+            self.ui.sandbox.clone(),
         ));
     }
 

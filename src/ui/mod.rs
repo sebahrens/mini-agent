@@ -33,6 +33,7 @@ use crate::permission::ask::AskReceiver;
 use crate::permission::checker::PermCheck;
 use crate::permission::{self, SecurityMode};
 use crate::provider::AnyAgent;
+use crate::sandbox::Sandbox;
 use crate::session::{MessageRole, Session};
 use crate::ui::event_handler::ensure_agent;
 #[cfg(feature = "advisor")]
@@ -244,6 +245,7 @@ impl PasteBurst {
 pub(crate) fn spawn_event_thread(
     user_tx: mpsc::Sender<UserEvent>,
     running: Arc<AtomicBool>,
+    sandbox: Sandbox,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut paste_burst = PasteBurst::default();
@@ -259,6 +261,13 @@ pub(crate) fn spawn_event_thread(
                 Ok(event::Event::Key(key)) => {
                     if key.kind != KeyEventKind::Press {
                         continue;
+                    }
+                    // The async UI handler can be awaiting loop validation and
+                    // therefore unable to consume this key immediately. Kill
+                    // active process groups from the independent input thread;
+                    // the queued event still performs the normal state abort.
+                    if is_process_cancel_key(&key) {
+                        sandbox.kill_active();
                     }
                     // A paste-newline key (bare Enter, or Ctrl+J — a raw
                     // pasted '\n' on Unix) is either a submit/normal key or
@@ -323,6 +332,11 @@ pub(crate) fn spawn_event_thread(
             }
         }
     })
+}
+
+pub(crate) fn is_process_cancel_key(key: &event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// Lazily initialise the MCP client manager (connects only on first use).

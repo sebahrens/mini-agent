@@ -210,6 +210,16 @@ Requires the `subagents` feature (default-on; see [SUBAGENTS.md](SUBAGENTS.md)).
 
 ## Loop (feature-gated)
 
+The optional `--loop-run <command>` validator uses the selected process sandbox
+and the platform's existing shell contract (`-c` normally, PowerShell
+`-Command` on Windows). Headless and interactive loops share one
+bounded runner: each validation has a 30-second deadline, 1 MiB caps for stdout
+and stderr, and a 1.5 MiB combined cap. Timeout, cancellation, output-limit,
+launch-failure, and nonzero-exit results are recorded with explicit status and
+separate sanitized stdout/stderr sections. Resource-limit cancellation reaps
+the direct validator everywhere and, on Unix, kills its complete process group
+before the next iteration.
+
 | Command | Description |
 | ------- | ----------- |
 | `/loop [prompt]` | Start the iterative coding loop. |

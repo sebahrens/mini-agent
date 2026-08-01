@@ -8,6 +8,7 @@ use crate::context::ContextFiles;
 use crate::extras::r#loop as loop_mod;
 use crate::extras::status_signals::StatusSignals;
 use crate::provider::AnyAgent;
+use crate::sandbox::Sandbox;
 
 pub(crate) async fn run_headless_loop(
     agent: AnyAgent,
@@ -15,6 +16,7 @@ pub(crate) async fn run_headless_loop(
     cfg: &Config,
     _context: &ContextFiles,
     status_signals: Option<StatusSignals>,
+    sandbox: &Sandbox,
 ) -> anyhow::Result<()> {
     let prompt = cli
         .loop_prompt
@@ -100,32 +102,14 @@ pub(crate) async fn run_headless_loop(
         state.last_summary = Some(summary.clone());
 
         let validation_output = if let Some(cmd) = &state.run_cmd {
-            eprintln!("--- Validation: {} ---", cmd);
-            let shell = if cfg!(windows) { "powershell" } else { "sh" };
-            let shell_arg = if cfg!(windows) { "-Command" } else { "-c" };
-            match tokio::process::Command::new(shell)
-                .arg(shell_arg)
-                .arg(cmd)
-                .output()
-                .await
-            {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    let combined = if stderr.is_empty() {
-                        stdout
-                    } else {
-                        format!("{}\n{}", stdout, stderr)
-                    };
-                    eprintln!("{}", combined);
-                    Some(combined)
-                }
-                Err(e) => {
-                    let msg = format!("error: {}", e);
-                    eprintln!("{}", msg);
-                    Some(msg)
-                }
-            }
+            eprintln!(
+                "--- Validation: {} ---",
+                loop_mod::validation::display_command(cmd)
+            );
+            let result = loop_mod::validation::run(sandbox, cmd).await;
+            let diagnostic = result.render();
+            eprintln!("{}", diagnostic);
+            Some(diagnostic)
         } else {
             None
         };

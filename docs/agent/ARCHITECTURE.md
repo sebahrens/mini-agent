@@ -148,6 +148,7 @@ reproducing code; focus on structure, relationships, and rationale.
 - `src/provider/` — LLM provider abstraction (OpenAI, Anthropic, etc.)
 - `src/config/` — Config parsing, validation, resolution
 - `src/extras/` — Optional features gated behind Cargo features
+- `src/extras/loop/validation.rs` — Shared bounded, sandboxed loop-validator execution and diagnostics
 
 ## Key Types
 - `AnyAgent` / `AnyClient` — type-erased agent and LLM client
