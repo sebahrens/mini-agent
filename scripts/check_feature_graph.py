@@ -299,8 +299,9 @@ def _workflow_run_commands(text: str, job: str) -> list[str]:
             index += 1
             continue
         run_indent = len(match.group(1))
-        value = match.group(2).strip()
-        if re.fullmatch(r"[>|][+-]?", value):
+        value = match.group(2)
+        header = _strip_yaml_comment(value).strip()
+        if re.fullmatch(r"[>|][+-]?", header):
             block: list[str] = []
             index += 1
             while index < job_end:
@@ -313,9 +314,94 @@ def _workflow_run_commands(text: str, job: str) -> list[str]:
                 index += 1
             commands.append("\n".join(block))
             continue
-        commands.append(value)
+        commands.append(_yaml_run_command(value))
         index += 1
     return commands
+
+
+def _yaml_run_command(value: str) -> str:
+    value = _strip_yaml_comment(value).strip()
+    if not value:
+        return ""
+    if value.startswith('"'):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid double-quoted run command: {value}") from error
+        if not isinstance(decoded, str):
+            raise ValueError(f"run command must be a string: {value}")
+        return decoded
+    if value.startswith("'"):
+        if not re.fullmatch(r"'(?:[^']|'')*'", value):
+            raise ValueError(f"invalid single-quoted run command: {value}")
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def _shell_command_segments(command: str) -> list[str]:
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+
+    def finish_segment() -> None:
+        segment = "".join(current).strip()
+        if segment:
+            segments.append(segment)
+        current.clear()
+
+    while index < len(command):
+        character = command[index]
+        if quote == "'":
+            current.append(character)
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            current.append(character)
+            if character == "\\" and index + 1 < len(command):
+                current.append(command[index + 1])
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            current.append(character)
+            index += 1
+            continue
+        if character == "\\" and index + 1 < len(command):
+            if command[index + 1] == "\n":
+                current.append(" ")
+            else:
+                current.extend((character, command[index + 1]))
+            index += 2
+            continue
+        if character == "#" and (
+            index == 0
+            or command[index - 1].isspace()
+            or command[index - 1] in ";|&"
+        ):
+            while index < len(command) and command[index] != "\n":
+                index += 1
+            finish_segment()
+            continue
+        if character == "\n" or character in ";|&":
+            finish_segment()
+            index += 1
+            if index < len(command) and command[index] == character:
+                index += 1
+            continue
+        current.append(character)
+        index += 1
+
+    if quote is not None:
+        raise ValueError("unterminated shell quote in workflow run command")
+    finish_segment()
+    return segments
 
 
 def validate_workflow_commands(text: str) -> list[str]:
@@ -323,16 +409,16 @@ def validate_workflow_commands(text: str) -> list[str]:
     interpolation = "${{ matrix.features }}"
     for job, subcommand in (("test", "test"), ("clippy", "clippy")):
         commands = _workflow_run_commands(text, job)
-        cargo_commands = [
-            command
+        cargo_invocations = [
+            segment
             for command in commands
-            if re.search(
-                rf"(?:^|[;&|][ \t]*)[ \t]*cargo\s+{re.escape(subcommand)}\b",
-                command,
-                flags=re.MULTILINE,
+            for segment in _shell_command_segments(command)
+            if re.match(
+                rf"cargo\s+{re.escape(subcommand)}\b",
+                segment,
             )
         ]
-        if not any(interpolation in command for command in cargo_commands):
+        if not any(interpolation in invocation for invocation in cargo_invocations):
             errors.append(
                 f"{job} job Cargo command must consume {interpolation!r}"
             )
