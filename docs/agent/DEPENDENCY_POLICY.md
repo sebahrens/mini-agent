@@ -23,9 +23,10 @@ changes the lockfile.
   relationships, verifies every optional dependency through its owning
   feature's semantic closure, and runs focused `cargo tree
   --no-default-features` checks. It also normalizes the required test and
-  Clippy matrices in `.github/workflows/ci.yml`, so optional JS, skill,
-  embedding, MCP, ACP, and LSP dependencies cannot leak into disabled rows and
-  required CI rows cannot silently disappear.
+  Clippy matrices in `.github/workflows/ci.yml` and verifies their Cargo steps
+  consume `matrix.features`, so optional JS, skill, embedding, MCP, ACP, and LSP
+  dependencies cannot leak into disabled rows and required CI rows cannot
+  silently disappear or become disconnected from their commands.
 
 The Monday scheduled CI run executes the dependency gate even when no source
 or lockfile changed. Pull requests and pushes run it as part of normal CI.
