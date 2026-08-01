@@ -267,6 +267,29 @@ location and start with only the protocol handles. Failure for a location leaves
 disabled there. A restricted-token worker, unsafe broad ACL change, or unconfined fallback is
 forbidden.
 
+### Windows image-loading feasibility gate
+
+The A03 research spike provides a Windows-only ignored real-backend test named
+`windows_lpac_can_load_current_exe_with_only_protocol_handles`. It creates or derives one stable
+zero-capability AppContainer profile, opts out of `ALL APPLICATION PACKAGES` for LPAC, supplies an
+exact three-handle anonymous protocol/diagnostic list, and assigns an unnamed kill-on-close,
+single-process Job through the creation-time attribute list. Its child must emit a fixed readiness
+frame, report access denied when opening a parent-created workspace sentinel, and prove an
+inheritable canary handle deliberately omitted from `HANDLE_LIST` is invalid in the child.
+
+The probe classifies only current-user-owned Cargo build, Cargo install, and user-profile/archive
+locations as candidates. It first checks the existing file DACL and, only when required, adds one
+non-inheritable read/execute ACE for the exact AppContainer SID to the executable file, restoring
+the original DACL after the probe. It never grants `Everyone`, `ALL APPLICATION PACKAGES`, or a
+writable directory. Protected machine-wide and unknown locations are unsupported and fail closed.
+
+This source-level gate has not been executed on Windows as part of the macOS-authored change. Its
+result remains unverified until the ignored test passes on `windows-latest` and a standard-user
+Windows installation for every location that will be advertised. Production Windows worker status
+therefore remains unavailable: this spike does not deliver the A26 launcher, does not permit a
+restricted-token or unconfined fallback, and does not satisfy the separate `mini-agent-uq5c`
+general-command sandbox.
+
 ## Failure semantics
 
 Every production failure uses a closed sanitized diagnostic contract. `class` is one of `syntax`,
