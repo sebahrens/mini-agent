@@ -95,8 +95,12 @@ impl BuildIdentity {
     }
 
     pub(crate) fn current() -> Self {
-        let identity = option_env!("MINI_AGENT_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION"));
-        Self::new(identity).expect("package/build identity is a valid wire identity")
+        Self::new(concat!(
+            env!("CARGO_PKG_VERSION"),
+            "+",
+            env!("MINI_AGENT_BUILD_FINGERPRINT")
+        ))
+        .expect("exact build identity is a valid wire identity")
     }
 
     pub(crate) fn as_str(&self) -> &str {
