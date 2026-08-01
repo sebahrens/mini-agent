@@ -95,10 +95,11 @@ mod feasibility {
         WinLocalSystemSid, WinWorldSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES,
-        FILE_WRITE_DATA, FILE_WRITE_EA, GetDriveTypeW, OPEN_EXISTING, WRITE_DAC, WRITE_OWNER,
+        CreateFileW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS,
+        FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, GetDriveTypeW, OPEN_EXISTING,
+        WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Console::{
         GetConsoleCP, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
@@ -252,7 +253,7 @@ mod feasibility {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum InstallLocation {
+    pub(super) enum InstallLocation {
         CargoBuild,
         CargoInstall,
         UserArchive,
@@ -699,19 +700,46 @@ mod feasibility {
         })
     }
 
+    pub(super) fn mapped_file_mask(mask: u32) -> u32 {
+        let generic = mask & (GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+        let mut mapped = mask & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+        if generic & GENERIC_READ != 0 {
+            mapped |= FILE_GENERIC_READ;
+        }
+        if generic & GENERIC_WRITE != 0 {
+            mapped |= FILE_GENERIC_WRITE;
+        }
+        if generic & GENERIC_EXECUTE != 0 {
+            mapped |= FILE_GENERIC_EXECUTE;
+        }
+        if generic & GENERIC_ALL != 0 {
+            mapped |= FILE_ALL_ACCESS;
+        }
+        mapped
+    }
+
+    fn required_image_mask() -> u32 {
+        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+    }
+
+    pub(super) fn package_allow_set_is_exact(aces: &[(u32, u8)]) -> bool {
+        aces.len() == 1
+            && u32::from(aces[0].1) == NO_INHERITANCE
+            && mapped_file_mask(aces[0].0) == required_image_mask()
+    }
+
     pub(super) fn dangerous_write_mask(mask: u32) -> bool {
-        mask & (FILE_WRITE_DATA
-            | FILE_APPEND_DATA
-            | FILE_ADD_FILE
-            | FILE_ADD_SUBDIRECTORY
-            | FILE_DELETE_CHILD
-            | FILE_WRITE_ATTRIBUTES
-            | FILE_WRITE_EA
-            | DELETE
-            | WRITE_DAC
-            | WRITE_OWNER
-            | GENERIC_WRITE
-            | GENERIC_ALL)
+        mapped_file_mask(mask)
+            & (FILE_WRITE_DATA
+                | FILE_APPEND_DATA
+                | FILE_ADD_FILE
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_DELETE_CHILD
+                | FILE_WRITE_ATTRIBUTES
+                | FILE_WRITE_EA
+                | DELETE
+                | WRITE_DAC
+                | WRITE_OWNER)
             != 0
     }
 
@@ -734,8 +762,8 @@ mod feasibility {
         {
             return Err(last_error("enumerate DACL"));
         }
-        let required = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-        let mut exact_rx_aces = 0u32;
+        let required = required_image_mask();
+        let mut appcontainer_allows = Vec::new();
         for index in 0..information.AceCount {
             let mut raw_ace = null_mut();
             if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
@@ -767,40 +795,33 @@ mod feasibility {
                 }
                 continue;
             }
-            if policy.broad(sid) && (reject_broad_access || dangerous_write_mask(ace.Mask)) {
+            let mapped_mask = mapped_file_mask(ace.Mask);
+            if policy.broad(sid) && (reject_broad_access || dangerous_write_mask(mapped_mask)) {
                 return Err(GateError(
                     "broad-principal allow ACE is forbidden".to_string(),
                 ));
             }
-            if reject_broad_access
-                && ace.Mask & required != 0
-                && !policy.trusted_writer(sid)
-                && !sid_equal(sid, appcontainer_sid)
-            {
+            if sid_equal(sid, appcontainer_sid) {
+                appcontainer_allows.push((ace.Mask, header.AceFlags));
+                continue;
+            }
+            if reject_broad_access && mapped_mask & required != 0 && !policy.trusted_writer(sid) {
                 return Err(GateError(
                     "an unexpected principal can read or execute the image".to_string(),
                 ));
             }
-            if dangerous_write_mask(ace.Mask) && !policy.trusted_writer(sid) {
+            if dangerous_write_mask(mapped_mask) && !policy.trusted_writer(sid) {
                 return Err(GateError(
                     "another principal can write, modify, or delete the path".to_string(),
                 ));
             }
-            if sid_equal(sid, appcontainer_sid) {
-                if u32::from(header.AceFlags) != NO_INHERITANCE
-                    || ace.Mask & required != required
-                    || dangerous_write_mask(ace.Mask)
-                {
-                    return Err(GateError(
-                        "AppContainer ACE is not exact non-inheriting RX".to_string(),
-                    ));
-                }
-                exact_rx_aces += 1;
-            }
         }
-        if require_exact_appcontainer_rx && exact_rx_aces != 1 {
+        if (require_exact_appcontainer_rx || !appcontainer_allows.is_empty())
+            && !package_allow_set_is_exact(&appcontainer_allows)
+        {
             return Err(GateError(format!(
-                "expected one exact AppContainer RX ACE, found {exact_rx_aces}"
+                "expected one exact AppContainer RX ACE, found {} package allow ACEs",
+                appcontainer_allows.len()
             )));
         }
         Ok(())
@@ -868,8 +889,8 @@ mod feasibility {
                 result,
             ));
         }
-        let required = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-        if rights & required != required {
+        let required = required_image_mask();
+        if mapped_file_mask(rights) & required != required {
             let entry = EXPLICIT_ACCESS_W {
                 grfAccessPermissions: required,
                 grfAccessMode: GRANT_ACCESS,
@@ -916,7 +937,10 @@ mod feasibility {
         let mut effective = 0u32;
         let result =
             unsafe { GetEffectiveRightsFromAclW(committed.dacl, &trustee, &mut effective) };
-        if result != 0 || effective & required != required || dangerous_write_mask(effective) {
+        if result != 0
+            || mapped_file_mask(effective) & required != required
+            || dangerous_write_mask(effective)
+        {
             return Err(GateError(
                 "committed AppContainer access is not read/execute-only".to_string(),
             ));
@@ -1238,10 +1262,10 @@ mod feasibility {
         Ok(job)
     }
 
-    #[derive(Debug, Clone, Copy)]
-    enum ProbeKind {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ProbeKind {
         Harness,
-        VersionBinary,
+        ImageLoadingOnly,
     }
 
     fn command_line(executable: &Path, probe: ProbeKind) -> Result<Vec<u16>, GateError> {
@@ -1255,7 +1279,7 @@ mod feasibility {
             ProbeKind::Harness => {
                 format!("--exact {CHILD_TEST_NAME} --nocapture --test-threads=1")
             }
-            ProbeKind::VersionBinary => "--version".to_string(),
+            ProbeKind::ImageLoadingOnly => "--version".to_string(),
         };
         Ok(wide_string(&format!("\"{display}\" {arguments}")))
     }
@@ -1316,15 +1340,65 @@ mod feasibility {
     struct DisposableArtifact {
         executable: PathBuf,
         directory: PathBuf,
-        expected: InstallLocation,
+        destination_expected: InstallLocation,
         probe: ProbeKind,
         cleaned: bool,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ArtifactSource {
+        Harness,
+        Installed,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct ArtifactContract {
+        pub(super) source: ArtifactSource,
+        pub(super) source_location: InstallLocation,
+        pub(super) destination: InstallLocation,
+        pub(super) probe: ProbeKind,
+    }
+
+    pub(super) fn artifact_contracts() -> [ArtifactContract; 5] {
+        [
+            ArtifactContract {
+                source: ArtifactSource::Harness,
+                source_location: InstallLocation::CargoBuild,
+                destination: InstallLocation::CargoBuild,
+                probe: ProbeKind::Harness,
+            },
+            ArtifactContract {
+                source: ArtifactSource::Harness,
+                source_location: InstallLocation::CargoBuild,
+                destination: InstallLocation::CargoInstall,
+                probe: ProbeKind::Harness,
+            },
+            ArtifactContract {
+                source: ArtifactSource::Harness,
+                source_location: InstallLocation::CargoBuild,
+                destination: InstallLocation::UserArchive,
+                probe: ProbeKind::Harness,
+            },
+            ArtifactContract {
+                source: ArtifactSource::Installed,
+                source_location: InstallLocation::CargoInstall,
+                destination: InstallLocation::CargoInstall,
+                probe: ProbeKind::ImageLoadingOnly,
+            },
+            ArtifactContract {
+                source: ArtifactSource::Installed,
+                source_location: InstallLocation::CargoInstall,
+                destination: InstallLocation::UserArchive,
+                probe: ProbeKind::ImageLoadingOnly,
+            },
+        ]
+    }
+
     struct ArtifactSpec {
         source: PathBuf,
+        source_expected: InstallLocation,
         directory: PathBuf,
-        expected: InstallLocation,
+        destination_expected: InstallLocation,
         probe: ProbeKind,
     }
 
@@ -1333,7 +1407,7 @@ mod feasibility {
             source: &Path,
             source_lock: WinHandle,
             directory: PathBuf,
-            expected: InstallLocation,
+            destination_expected: InstallLocation,
             probe: ProbeKind,
         ) -> Result<Self, GateError> {
             std::fs::create_dir(&directory).map_err(|error| {
@@ -1351,22 +1425,22 @@ mod feasibility {
                 };
             }
             drop(source_lock);
-            if classify_install_location(&executable) != expected {
+            if classify_install_location(&executable) != destination_expected {
                 let file_cleanup = std::fs::remove_file(&executable);
                 let directory_cleanup = std::fs::remove_dir(&directory);
                 if let Err(error) = file_cleanup.and(directory_cleanup) {
                     return Err(GateError(format!(
-                        "disposable artifact did not retain expected {expected:?} location; cleanup also failed: {error}"
+                        "disposable artifact did not retain expected {destination_expected:?} location; cleanup also failed: {error}"
                     )));
                 }
                 return Err(GateError(format!(
-                    "disposable artifact did not retain expected {expected:?} location"
+                    "disposable artifact did not retain expected {destination_expected:?} location"
                 )));
             }
             Ok(Self {
                 executable,
                 directory,
-                expected,
+                destination_expected,
                 probe,
                 cleaned: false,
             })
@@ -1415,7 +1489,7 @@ mod feasibility {
             .map(PathBuf::from)
             .ok_or_else(|| {
                 GateError(format!(
-                    "{INSTALLED_EXE_ENV} must name a real `cargo install --path . --debug` artifact"
+                    "{INSTALLED_EXE_ENV} must name a real locked debug install with only the js feature"
                 ))
             })?;
         reject_unc_or_remote_syntax(&installed)?;
@@ -1438,41 +1512,39 @@ mod feasibility {
         }
 
         let suffix = format!("{}-{}", std::process::id(), PROFILE_NAME.len());
-        let build_dir = build
+        let build_parent = build
             .parent()
-            .ok_or_else(|| GateError("build harness has no parent".to_string()))?
-            .join(format!(".mini-agent-lpac-build-{suffix}"));
-        let install_dir = installed
+            .ok_or_else(|| GateError("build harness has no parent".to_string()))?;
+        let install_parent = installed
             .parent()
-            .ok_or_else(|| GateError("installed artifact has no parent".to_string()))?
-            .join(format!(".mini-agent-lpac-install-{suffix}"));
+            .ok_or_else(|| GateError("installed artifact has no parent".to_string()))?;
         let archive_root = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .ok_or_else(|| {
                 GateError("LOCALAPPDATA is required for the archive case".to_string())
             })?;
-        let archive_dir = archive_root.join(format!("mini-agent-lpac-archive-{suffix}"));
+        let directories = [
+            build_parent.join(format!(".mini-agent-lpac-containment-build-{suffix}")),
+            install_parent.join(format!(".mini-agent-lpac-containment-install-{suffix}")),
+            archive_root.join(format!("mini-agent-lpac-containment-archive-{suffix}")),
+            install_parent.join(format!(".mini-agent-lpac-image-install-{suffix}")),
+            archive_root.join(format!("mini-agent-lpac-image-archive-{suffix}")),
+        ];
 
-        Ok(vec![
-            ArtifactSpec {
-                source: build,
-                directory: build_dir,
-                expected: InstallLocation::CargoBuild,
-                probe: ProbeKind::Harness,
-            },
-            ArtifactSpec {
-                source: installed.clone(),
-                directory: install_dir,
-                expected: InstallLocation::CargoInstall,
-                probe: ProbeKind::VersionBinary,
-            },
-            ArtifactSpec {
-                source: installed,
-                directory: archive_dir,
-                expected: InstallLocation::UserArchive,
-                probe: ProbeKind::VersionBinary,
-            },
-        ])
+        Ok(artifact_contracts()
+            .into_iter()
+            .zip(directories)
+            .map(|(contract, directory)| ArtifactSpec {
+                source: match contract.source {
+                    ArtifactSource::Harness => build.clone(),
+                    ArtifactSource::Installed => installed.clone(),
+                },
+                source_expected: contract.source_location,
+                directory,
+                destination_expected: contract.destination,
+                probe: contract.probe,
+            })
+            .collect())
     }
 
     fn wait_for_child(process: &WinHandle) -> Result<u32, GateError> {
@@ -1536,21 +1608,24 @@ mod feasibility {
             for specification in artifact_matrix()? {
                 let source_lock = validate_source_artifact(
                     &specification.source,
-                    specification.expected,
+                    specification.source_expected,
                     &policy,
                 )?;
                 let artifact = DisposableArtifact::copy_into(
                     &specification.source,
                     source_lock,
                     specification.directory,
-                    specification.expected,
+                    specification.destination_expected,
                     specification.probe,
                 )?;
-                eprintln!("LPAC real-artifact candidate: {:?}", artifact.expected);
+                eprintln!(
+                    "LPAC artifact destination: {:?}; evidence: {:?}",
+                    artifact.destination_expected, artifact.probe
+                );
                 let probe = (|| {
                     let (executable, location, image_lock) =
                         prepare_executable_acl(&artifact.executable, profile.sid, &policy)?;
-                    if location != artifact.expected {
+                    if location != artifact.destination_expected {
                         return Err(GateError(
                             "artifact location changed after canonicalization".to_string(),
                         ));
@@ -1739,7 +1814,7 @@ mod feasibility {
                     )));
                 }
             }
-            ProbeKind::VersionBinary => {
+            ProbeKind::ImageLoadingOnly => {
                 if !output
                     .windows(b"mini-agent".len())
                     .any(|bytes| bytes == b"mini-agent")
@@ -1960,15 +2035,86 @@ mod tests {
 
     #[test]
     fn windows_lpac_acl_policy_distinguishes_rx_from_mutation() {
+        use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ};
         use windows_sys::Win32::Storage::FileSystem::{
             DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_WRITE_DATA,
         };
 
+        let mapped_generic = super::feasibility::mapped_file_mask(GENERIC_READ | GENERIC_EXECUTE);
+        assert_eq!(
+            mapped_generic & (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+        );
         assert!(!super::feasibility::dangerous_write_mask(
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
         ));
         assert!(super::feasibility::dangerous_write_mask(FILE_WRITE_DATA));
         assert!(super::feasibility::dangerous_write_mask(DELETE));
+        assert!(super::feasibility::package_allow_set_is_exact(&[(
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            0
+        )]));
+        assert!(super::feasibility::package_allow_set_is_exact(&[(
+            GENERIC_READ | GENERIC_EXECUTE,
+            0
+        )]));
+        assert!(!super::feasibility::package_allow_set_is_exact(&[
+            (FILE_GENERIC_READ, 0),
+            (FILE_GENERIC_EXECUTE, 0),
+        ]));
+        assert!(!super::feasibility::package_allow_set_is_exact(&[(
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_WRITE_DATA,
+            0,
+        )]));
+        assert!(!super::feasibility::package_allow_set_is_exact(&[(
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            1,
+        )]));
+    }
+
+    #[test]
+    fn windows_lpac_matrix_full_probes_every_location_and_splits_copy_expectations() {
+        use super::feasibility::{ArtifactSource, InstallLocation, ProbeKind, artifact_contracts};
+
+        let contracts = artifact_contracts();
+        assert_eq!(
+            contracts
+                .iter()
+                .filter(|contract| contract.probe == ProbeKind::Harness)
+                .count(),
+            3
+        );
+        for destination in [
+            InstallLocation::CargoBuild,
+            InstallLocation::CargoInstall,
+            InstallLocation::UserArchive,
+        ] {
+            assert!(contracts.iter().any(|contract| {
+                contract.destination == destination
+                    && contract.source == ArtifactSource::Harness
+                    && contract.source_location == InstallLocation::CargoBuild
+                    && contract.probe == ProbeKind::Harness
+            }));
+        }
+        assert!(contracts.iter().any(|contract| {
+            contract.destination == InstallLocation::UserArchive
+                && contract.source == ArtifactSource::Installed
+                && contract.source_location == InstallLocation::CargoInstall
+                && contract.probe == ProbeKind::ImageLoadingOnly
+        }));
+        assert_eq!(
+            contracts
+                .iter()
+                .filter(|contract| contract.probe == ProbeKind::ImageLoadingOnly)
+                .count(),
+            2
+        );
+        assert!(contracts.iter().any(|contract| {
+            contract.destination == InstallLocation::CargoInstall
+                && contract.source == ArtifactSource::Installed
+                && contract.source_location == InstallLocation::CargoInstall
+                && contract.probe == ProbeKind::ImageLoadingOnly
+        }));
     }
 
     #[test]

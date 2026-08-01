@@ -270,22 +270,34 @@ forbidden.
 ### Windows image-loading feasibility gate
 
 The A03 research spike provides a Windows-only ignored real-backend test named
-`windows_lpac_can_load_current_exe_with_only_protocol_handles`. It is a required three-artifact
-matrix: the Cargo-built libtest harness, a real binary produced by
-`cargo install --path . --debug`, and a copy of that installed binary staged as a user archive
-artifact under `%LOCALAPPDATA%`. `MINI_AGENT_LPAC_CARGO_INSTALL_EXE` must name the installed
-binary; a missing variable, a path outside the active Cargo home, or an omitted matrix row fails
-the gate. The installed and archive rows execute `--version`; the harness row additionally runs
-the containment probes. Thus no unexecuted install layout is reported as passing.
+`windows_lpac_can_load_current_exe_with_only_protocol_handles`. Its containment matrix copies the
+full-probe-capable Cargo-built libtest harness into each of the three supported destination
+classes: Cargo build, Cargo install, and a user archive under `%LOCALAPPDATA%`. Every one of those
+three rows runs the same token, capability, console, Job, handle, and workspace-denial readiness
+probe. The source location and destination location are validated independently, so the archive
+row correctly treats its harness source as Cargo build while requiring its copy to classify as a
+user archive.
+
+A real binary produced by `cargo install --locked --no-default-features --features js --path .
+--debug` supplies two additional, explicitly narrower image-loading rows: a disposable copy
+under the active Cargo home and another under the user-archive root. Those rows execute
+`--version` and prove only that `CreateProcessW` accepts the production image with the requested
+attribute list and that the image reaches its version path. They do not prove the resulting token,
+capability, console, handle, sentinel, or other child-side containment assertions and are never
+reported as doing so. `MINI_AGENT_LPAC_CARGO_INSTALL_EXE` must name that installed binary. A
+missing variable, a source outside the active Cargo home, or any omitted or failed row fails the
+whole gate.
 
 For every row the gate makes a private disposable copy within that row's real location class and
 changes only the copy. It rejects NULL DACLs; inherited-deny ambiguity; broad executable access
 for Everyone, Authenticated Users, Builtin Users, `ALL APPLICATION PACKAGES`, or `ALL RESTRICTED
 APPLICATION PACKAGES`; and write, modify, ACL, ownership, or delete authority held by any
-untrusted principal. It enumerates the committed ACEs, requires exactly one non-inheriting
-read/execute ACE for the exact package SID, checks effective access, and holds the executable open
-without share-write or share-delete until `CreateProcessW` returns. It never restores a stale
-whole DACL. Every ancestor through the classified trust root must be local, fixed-drive,
+untrusted principal. It maps generic file rights before evaluation, rejects generic or specific
+read/execute grants to every unexpected principal, counts every package-SID allow ACE, and
+requires exactly one package allow ACE whose mapped mask is exactly non-inheriting read/execute.
+It then checks effective access and holds the executable open without share-write or share-delete
+until `CreateProcessW` returns. It never restores a stale whole DACL. Every ancestor through the
+classified trust root must be local, fixed-drive,
 non-reparse, non-NULL-DACL, and protected from other-principal mutation or deletion. UNC, remote,
 protected machine-wide, and unknown roots fail closed.
 
@@ -302,10 +314,10 @@ are part of the gate result rather than silently treated as success.
 On a standard-user Windows checkout, prepare and run the complete gate with:
 
 ```powershell
-cargo install --path . --debug
+cargo install --locked --no-default-features --features js --path . --debug
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $cargoHome 'bin\mini-agent.exe'
-cargo test windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --exact
+cargo test --locked --no-default-features --features js windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --nocapture --exact
 ```
 
 This source-level gate has not been executed on Windows as part of the macOS-authored change. Its

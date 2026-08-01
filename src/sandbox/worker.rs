@@ -288,6 +288,40 @@ mod tests {
     }
 
     #[test]
+    fn windows_lpac_gate_source_keeps_truthful_matrix_and_exact_acl_policy() {
+        let source = include_str!("worker/windows.rs");
+        assert_eq!(
+            source.matches("probe: ProbeKind::Harness,").count(),
+            3,
+            "every supported destination needs a full harness probe"
+        );
+        assert_eq!(
+            source
+                .matches("probe: ProbeKind::ImageLoadingOnly,")
+                .count(),
+            2,
+            "installed-image evidence must remain separate from containment evidence"
+        );
+        assert!(source.contains("source_expected: contract.source_location"));
+        assert!(source.contains("destination_expected: contract.destination"));
+        assert!(source.contains("mapped_file_mask(ace.Mask)"));
+        assert!(source.contains("package_allow_set_is_exact(&appcontainer_allows)"));
+        assert!(!source.contains("ProbeKind::VersionBinary"));
+
+        let specification = include_str!("../../docs/specs/phase-6-brokered-js-runtime.md");
+        assert!(specification.contains(
+            "cargo install --locked --no-default-features --features js --path . --debug"
+        ));
+        assert!(specification.contains(
+            "cargo test --locked --no-default-features --features js windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --nocapture --exact"
+        ));
+        assert!(specification.contains(
+            "prove only that `CreateProcessW` accepts the production image with the requested"
+        ));
+        assert!(specification.contains("They do not prove the resulting token"));
+    }
+
+    #[test]
     fn worker_launcher_test_process_owns_piped_stdio_and_can_be_reaped() {
         let mut process = TestWorkerLauncher::current_test_process()
             .launch()
