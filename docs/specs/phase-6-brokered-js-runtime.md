@@ -293,6 +293,66 @@ location and start with only the protocol handles. Failure for a location leaves
 disabled there. A restricted-token worker, unsafe broad ACL change, or unconfined fallback is
 forbidden.
 
+### Windows image-loading feasibility gate
+
+The A03 research spike provides a Windows-only ignored real-backend test named
+`windows_lpac_can_load_current_exe_with_only_protocol_handles`. Its containment matrix copies the
+full-probe-capable Cargo-built libtest harness into each of the three supported destination
+classes: Cargo build, Cargo install, and a user archive under `%LOCALAPPDATA%`. Every one of those
+three rows runs the same token, capability, console, Job, handle, and workspace-denial readiness
+probe. The source location and destination location are validated independently, so the archive
+row correctly treats its harness source as Cargo build while requiring its copy to classify as a
+user archive.
+
+A real binary produced by `cargo install --locked --no-default-features --features js --path .
+--debug` supplies two additional, explicitly narrower image-loading rows: a disposable copy
+under the active Cargo home and another under the user-archive root. Those rows execute
+`--version` and prove only that `CreateProcessW` accepts the production image with the requested
+attribute list and that the image reaches its version path. They do not prove the resulting token,
+capability, console, handle, sentinel, or other child-side containment assertions and are never
+reported as doing so. `MINI_AGENT_LPAC_CARGO_INSTALL_EXE` must name that installed binary. A
+missing variable, a source outside the active Cargo home, or any omitted or failed row fails the
+whole gate.
+
+For every row the gate makes a private disposable copy within that row's real location class and
+changes only the copy. It rejects NULL DACLs; inherited-deny ambiguity; broad executable access
+for Everyone, Authenticated Users, Builtin Users, `ALL APPLICATION PACKAGES`, or `ALL RESTRICTED
+APPLICATION PACKAGES`; and write, modify, ACL, ownership, or delete authority held by any
+untrusted principal. It maps generic file rights before evaluation, rejects generic or specific
+read/execute grants to every unexpected principal, counts every package-SID allow ACE, and
+requires exactly one package allow ACE whose mapped mask is exactly non-inheriting read/execute.
+It then checks effective access and holds the executable open without share-write or share-delete
+until `CreateProcessW` returns. It never restores a stale whole DACL. Every ancestor through the
+classified trust root must be local, fixed-drive,
+non-reparse, non-NULL-DACL, and protected from other-principal mutation or deletion. UNC, remote,
+protected machine-wide, and unknown roots fail closed.
+
+The launch creates or derives one stable zero-capability AppContainer profile, opts out of `ALL
+APPLICATION PACKAGES` for LPAC, uses `DETACHED_PROCESS`, supplies an exact three-handle anonymous
+protocol/diagnostic list, and assigns an unnamed kill-on-close, single-process Job through the
+creation-time attribute list. The parent verifies membership in that exact Job. The harness child
+must verify `TokenIsAppContainer`, `TokenIsLessPrivilegedAppContainer`, zero token capabilities,
+no console window or `CONIN$`/`CONOUT$`, the three distinct standard protocol handles, rejection of
+an inheritable canary omitted from `HANDLE_LIST`, and access denial for a parent-created workspace
+sentinel before emitting its fixed readiness frame. Profile and disposable-artifact cleanup errors
+are part of the gate result rather than silently treated as success.
+
+On a standard-user Windows checkout, prepare and run the complete gate with:
+
+```powershell
+cargo install --locked --no-default-features --features js --path . --debug
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $cargoHome 'bin\mini-agent.exe'
+cargo test --locked --no-default-features --features js windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --nocapture --exact
+```
+
+This source-level gate has not been executed on Windows as part of the macOS-authored change. Its
+result remains unverified until the ignored test passes on `windows-latest` and a standard-user
+Windows installation for every location that will be advertised. Production Windows worker status
+therefore remains unavailable: this spike does not deliver the A26 launcher, does not permit a
+restricted-token or unconfined fallback, and does not satisfy the separate `mini-agent-uq5c`
+general-command sandbox.
+
 ## Failure semantics
 
 Every production failure uses a closed sanitized diagnostic contract. `class` is one of `syntax`,
