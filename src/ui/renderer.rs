@@ -1354,38 +1354,76 @@ pub(crate) fn windows_open_request(url: &str) -> Option<WindowsOpenRequest> {
     })
 }
 
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn open_url_windows(url: &str) -> anyhow::Result<()> {
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+/// Execute the production Windows dispatch contract through a supplied
+/// `ShellExecuteW` leaf. Tests replace only that OS call and therefore exercise
+/// the same validation, operand selection, and status mapping as production.
+#[cfg(any(test, windows))]
+pub(crate) fn dispatch_windows_open(
+    url: &str,
+    shell_execute: impl FnOnce(&[u16], &[u16], Option<&[u16]>, Option<&[u16]>) -> isize,
+) -> anyhow::Result<()> {
+    let request = windows_open_request(url)
+        .ok_or_else(|| anyhow::anyhow!("refusing to dispatch invalid Windows browser URL"))?;
+    let result = shell_execute(
+        &request.verb,
+        &request.target,
+        request.parameters.as_deref(),
+        None,
+    );
 
-    let request = windows_open_request(url).expect("open_url validates before platform dispatch");
-    let parameters = request
-        .parameters
-        .as_ref()
-        .map_or(std::ptr::null(), |value| value.as_ptr());
-    // SAFETY: each string is an immutable, NUL-terminated UTF-16 allocation
-    // that remains alive for the duration of the call. Null handles and the
-    // null parameters/directory pointers are explicitly supported by this API.
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            request.verb.as_ptr(),
-            request.target.as_ptr(),
-            parameters,
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    if result as isize > 32 {
+    if result > 32 {
         Ok(())
     } else {
         anyhow::bail!(
             "Windows browser opener failed with ShellExecuteW code {}",
-            result as isize
+            result
         )
     }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn shell_execute_windows(
+    operation: &[u16],
+    file: &[u16],
+    parameters: Option<&[u16]>,
+    directory: Option<&[u16]>,
+) -> isize {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    if !is_nul_terminated_utf16(operation)
+        || !is_nul_terminated_utf16(file)
+        || parameters.is_some_and(|value| !is_nul_terminated_utf16(value))
+        || directory.is_some_and(|value| !is_nul_terminated_utf16(value))
+    {
+        return 0;
+    }
+    let parameters = parameters.map_or(std::ptr::null(), <[u16]>::as_ptr);
+    let directory = directory.map_or(std::ptr::null(), <[u16]>::as_ptr);
+    // SAFETY: every non-null slice is an immutable, NUL-terminated UTF-16
+    // allocation that remains alive for the duration of the call. Null handles
+    // and null parameters/directory pointers are supported by ShellExecuteW.
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            parameters,
+            directory,
+            SW_SHOWNORMAL,
+        ) as isize
+    }
+}
+
+#[cfg(any(test, windows))]
+pub(crate) fn is_nul_terminated_utf16(value: &[u16]) -> bool {
+    value.last() == Some(&0) && !value[..value.len().saturating_sub(1)].contains(&0)
+}
+
+#[cfg(windows)]
+fn open_url_windows(url: &str) -> anyhow::Result<()> {
+    dispatch_windows_open(url, shell_execute_windows)
 }
 
 /// Open `url` in the system browser. The URL is validated first; the error

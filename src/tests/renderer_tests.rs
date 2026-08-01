@@ -1,4 +1,9 @@
-use crate::ui::renderer::{base64_encode, copy_to_clipboard, is_safe_url, windows_open_request};
+use std::cell::{Cell, RefCell};
+
+use crate::ui::renderer::{
+    base64_encode, copy_to_clipboard, dispatch_windows_open, is_nul_terminated_utf16, is_safe_url,
+    windows_open_request,
+};
 
 #[test]
 fn base64_encode_empty() {
@@ -148,6 +153,101 @@ fn windows_open_request_rejects_before_constructing_an_os_request() {
         assert!(
             windows_open_request(url).is_none(),
             "unexpectedly accepted: {url:?}"
+        );
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct CapturedWindowsOpen {
+    operation: Vec<u16>,
+    file: Vec<u16>,
+    parameters: Option<Vec<u16>>,
+    directory: Option<Vec<u16>>,
+}
+
+#[test]
+fn windows_open_request_dispatch_passes_sentinel_url_only_as_shell_execute_file_data() {
+    let sentinel = "MINI_AGENT_DISPATCH_SENTINEL";
+    let url = format!("https://example.com/a&b|c^d?q=\"{sentinel}\"%25#(fragment)");
+    let captured = RefCell::new(None);
+
+    dispatch_windows_open(&url, |operation, file, parameters, directory| {
+        captured.replace(Some(CapturedWindowsOpen {
+            operation: operation.to_vec(),
+            file: file.to_vec(),
+            parameters: parameters.map(<[u16]>::to_vec),
+            directory: directory.map(<[u16]>::to_vec),
+        }));
+        33
+    })
+    .expect("ShellExecuteW success code should pass");
+
+    assert_eq!(
+        captured.into_inner().unwrap(),
+        CapturedWindowsOpen {
+            operation: "open".encode_utf16().chain([0]).collect(),
+            file: url.encode_utf16().chain([0]).collect(),
+            parameters: None,
+            directory: None,
+        }
+    );
+}
+
+#[test]
+fn windows_open_request_dispatch_maps_shell_execute_boundary_codes() {
+    for code in [33, isize::MAX] {
+        assert!(
+            dispatch_windows_open("https://example.com", |_, _, _, _| code).is_ok(),
+            "code {code} should indicate success"
+        );
+    }
+
+    for code in [isize::MIN, 0, 1, 31, 32] {
+        let error = dispatch_windows_open("https://example.com", |_, _, _, _| code)
+            .expect_err("code at or below 32 should fail");
+        assert!(error.to_string().contains(&code.to_string()));
+    }
+}
+
+#[test]
+fn windows_open_request_dispatch_rejects_before_calling_shell_execute() {
+    let called = Cell::new(false);
+    let result = dispatch_windows_open("javascript:alert(1)", |_, _, _, _| {
+        called.set(true);
+        33
+    });
+
+    assert!(result.is_err());
+    assert!(!called.get());
+}
+
+#[test]
+fn windows_open_request_ffi_strings_require_one_trailing_nul() {
+    assert!(is_nul_terminated_utf16(&[0]));
+    assert!(is_nul_terminated_utf16(
+        &"open".encode_utf16().chain([0]).collect::<Vec<_>>()
+    ));
+
+    assert!(!is_nul_terminated_utf16(&[]));
+    assert!(!is_nul_terminated_utf16(&[b'o' as u16]));
+    assert!(!is_nul_terminated_utf16(&[b'o' as u16, 0, b'p' as u16, 0,]));
+}
+
+#[test]
+fn windows_open_request_source_has_no_cmd_interpreter_fallback() {
+    let source: String = include_str!("../ui/renderer.rs")
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    for forbidden in [
+        "command::new(\"cmd\")",
+        "command::new(\"cmd.exe\")",
+        "\"cmd\",&[\"/c\",\"start\"",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "Windows URL opener must not reintroduce command interpreter syntax: {forbidden}"
         );
     }
 }
