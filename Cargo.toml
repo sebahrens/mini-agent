@@ -129,6 +129,9 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }
 
+[build-dependencies]
+sha2 = "0.10"
+
 [profile.dev]
 opt-level = 0
 debug = false

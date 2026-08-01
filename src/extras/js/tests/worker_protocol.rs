@@ -119,11 +119,36 @@ fn encode<M: serde::Serialize>(frame: &M) -> Vec<u8> {
 
 #[test]
 fn worker_protocol_codec_round_trips_a_frame() {
-    assert!(!BuildIdentity::current().as_str().is_empty());
+    let current = BuildIdentity::current();
+    let fingerprint = current
+        .as_str()
+        .strip_prefix(concat!(env!("CARGO_PKG_VERSION"), "+"))
+        .expect("ordinary builds must bind an exact fingerprint after the package version");
+    assert_eq!(fingerprint.len(), 64);
+    assert!(
+        fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
     assert_eq!(grant().get(), Uuid::from_u128(1));
     let expected = run(2);
     let actual: ParentWireFrame = read_frame(&mut Cursor::new(encode(&expected))).unwrap();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn worker_protocol_rejects_same_version_with_a_different_build_fingerprint() {
+    let parent_build =
+        BuildIdentity::new(format!("{}+{}", env!("CARGO_PKG_VERSION"), "a".repeat(64))).unwrap();
+    let worker_build =
+        BuildIdentity::new(format!("{}+{}", env!("CARGO_PKG_VERSION"), "b".repeat(64))).unwrap();
+    let mut parent = ParentProtocol::new(parent_build);
+    let frame = WireFrame::connection(worker_build, 0, ParentFrame::Hello(ParentHello {}));
+
+    assert!(matches!(
+        parent.on_send(&frame),
+        Err(ProtocolError::BuildMismatch { .. })
+    ));
 }
 
 #[test]

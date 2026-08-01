@@ -100,6 +100,12 @@ over-limit prefix before allocating its payload buffer. Message enums are closed
 carries the protocol version, build identity, and monotonic sequence; every invocation frame also
 carries a parent-created invocation ID.
 
+The build identity combines the package version with a deterministic SHA-256 fingerprint of the
+production compile inputs, dependency lockfile, enabled features, target/profile settings, and
+Rust compiler version. Ordinary local and packaged builds therefore reject a same-version peer
+built from different inputs without relying on Git metadata, network access, timestamps, or random
+values.
+
 After a versioned hello/ready exchange, the only invocation flow is:
 
 ```text
