@@ -19,6 +19,9 @@ class FeatureGraphTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.manifest = feature_graph.load_manifest(REPOSITORY_ROOT / "Cargo.toml")
+        cls.workflow_matrices = feature_graph.load_workflow_matrices(
+            REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+        )
 
     def test_repository_manifest_encodes_supported_relationships(self) -> None:
         self.assertEqual([], feature_graph.validate_manifest(self.manifest))
@@ -28,7 +31,7 @@ class FeatureGraphTests(unittest.TestCase):
         manifest["features"]["skills"].remove("js")
 
         self.assertIn(
-            "feature 'skills' must imply 'js'",
+            "feature 'skills' must imply feature 'js'",
             feature_graph.validate_manifest(manifest),
         )
 
@@ -39,6 +42,46 @@ class FeatureGraphTests(unittest.TestCase):
         self.assertIn(
             "feature 'sandbox' must not imply 'js'",
             feature_graph.validate_manifest(manifest),
+        )
+
+    def test_dependency_ownership_uses_semantic_feature_closure(self) -> None:
+        manifest = copy.deepcopy(self.manifest)
+        manifest["features"]["js-runtime"] = manifest["features"]["js"]
+        manifest["features"]["js"] = ["js-runtime"]
+
+        self.assertEqual([], feature_graph.validate_manifest(manifest))
+
+    def test_clearing_optional_owner_features_is_rejected(self) -> None:
+        expectations = {
+            "acp": "feature 'acp' must activate optional dependency 'agent-client-protocol'",
+            "lsp": "feature 'lsp' must activate optional dependency 'lsp-types'",
+            "skills-embed-dynamic": (
+                "feature 'skills-embed-dynamic' must imply feature 'skills-embed'"
+            ),
+        }
+        for owner, expected in expectations.items():
+            with self.subTest(owner=owner):
+                manifest = copy.deepcopy(self.manifest)
+                manifest["features"][owner] = []
+                self.assertIn(expected, feature_graph.validate_manifest(manifest))
+
+    def test_optional_owner_rows_cover_acp_lsp_and_dynamic_embedding(self) -> None:
+        rows = {row.name: row for row in feature_graph.FEATURE_ROWS}
+
+        self.assertEqual(
+            {"agent-client-protocol", "blocking"}, rows["acp"].required
+        )
+        self.assertEqual({"lsp-types"}, rows["lsp"].required)
+        self.assertEqual(
+            {
+                "fastembed",
+                "hnsw_rs",
+                "matrixmultiply",
+                "ort",
+                "rquickjs",
+                "rusqlite",
+            },
+            rows["skills-embed-dynamic"].required,
         )
 
     def test_every_optional_dependency_must_be_classified(self) -> None:
@@ -75,6 +118,32 @@ class FeatureGraphTests(unittest.TestCase):
         for row in feature_graph.FEATURE_ROWS:
             command = feature_graph.cargo_tree_command(row)
             self.assertIn("--no-default-features", command, row.name)
+
+    def test_repository_workflow_matches_required_feature_rows(self) -> None:
+        self.assertEqual(
+            [], feature_graph.validate_workflow_matrices(self.workflow_matrices)
+        )
+
+    def test_workflow_rejects_missing_memory_and_sandbox_rows(self) -> None:
+        matrices = copy.deepcopy(feature_graph.expected_workflow_matrices())
+        matrices["test"].remove("--no-default-features --features memory")
+        matrices["clippy"].remove("--no-default-features --features sandbox")
+
+        errors = feature_graph.validate_workflow_matrices(matrices)
+        self.assertIn("test matrix is missing focused row 'memory'", errors)
+        self.assertIn("clippy matrix is missing focused row 'sandbox'", errors)
+
+    def test_workflow_comparison_is_semantic(self) -> None:
+        matrices = copy.deepcopy(feature_graph.expected_workflow_matrices())
+        full = "--no-default-features --features mcp,js,sandbox,skills,memory"
+        matrices["test"][matrices["test"].index(full)] = (
+            "--features skills,memory,mcp,js,sandbox --no-default-features"
+        )
+        matrices["clippy"][matrices["clippy"].index(full)] = (
+            "--features sandbox,js,memory,skills,mcp --no-default-features"
+        )
+
+        self.assertEqual([], feature_graph.validate_workflow_matrices(matrices))
 
 
 if __name__ == "__main__":
