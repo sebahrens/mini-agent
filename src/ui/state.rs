@@ -132,6 +132,8 @@ pub(crate) struct AgentRunState {
     pub is_running: bool,
     pub agent_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub main_abort: Option<tokio::task::AbortHandle>,
+    #[cfg(feature = "loop")]
+    pub validation_cancel: Option<crate::extras::r#loop::validation::ValidationCancellation>,
     pub pending_inputs: VecDeque<String>,
     pub agent_line_started: bool,
     pub response_buf: String,

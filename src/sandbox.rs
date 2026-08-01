@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Debug, Clone)]
 pub struct Sandbox {
@@ -58,6 +58,38 @@ pub(crate) struct CommandOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub status: CommandStatus,
+}
+
+/// Cancellation signal for one captured subprocess operation.
+///
+/// Unlike [`Sandbox::kill_active`], this token never reaches other commands
+/// using the same sandbox. The output worker that owns the direct child
+/// observes the signal, kills that child's process group, and reaps it before
+/// reporting [`CommandStatus::Cancelled`].
+#[derive(Debug, Clone)]
+#[cfg(feature = "loop")]
+pub(crate) struct CommandCancellation {
+    sender: watch::Sender<bool>,
+}
+
+#[cfg(feature = "loop")]
+impl CommandCancellation {
+    pub(crate) fn new() -> Self {
+        let (sender, _) = watch::channel(false);
+        Self { sender }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.sender.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.sender.subscribe()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -536,6 +568,35 @@ impl Sandbox {
         command: &str,
         limits: CommandLimits,
     ) -> std::io::Result<CommandOutput> {
+        self.output_command_with_limits_scoped(command, limits, None)
+            .await
+    }
+
+    #[cfg(feature = "loop")]
+    pub(crate) async fn output_command_with_limits_cancelled(
+        &self,
+        command: &str,
+        limits: CommandLimits,
+        cancellation: &CommandCancellation,
+    ) -> std::io::Result<CommandOutput> {
+        if cancellation.is_cancelled() {
+            return Ok(CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: CommandStatus::Cancelled,
+            });
+        }
+        self.output_command_with_limits_scoped(command, limits, Some(cancellation.subscribe()))
+            .await
+    }
+
+    async fn output_command_with_limits_scoped(
+        &self,
+        command: &str,
+        limits: CommandLimits,
+        cancellation: Option<watch::Receiver<bool>>,
+    ) -> std::io::Result<CommandOutput> {
         let cmd = match self.wrap_command(command) {
             Ok(cmd) => cmd,
             Err(error) => {
@@ -547,7 +608,8 @@ impl Sandbox {
                 });
             }
         };
-        self.output_built_command_with_limits(cmd, limits).await
+        self.output_built_command_with_limits_scoped(cmd, limits, cancellation)
+            .await
     }
 
     pub(crate) async fn output_built_command_with_limits(
@@ -555,11 +617,21 @@ impl Sandbox {
         cmd: Command,
         limits: CommandLimits,
     ) -> std::io::Result<CommandOutput> {
+        self.output_built_command_with_limits_scoped(cmd, limits, None)
+            .await
+    }
+
+    async fn output_built_command_with_limits_scoped(
+        &self,
+        cmd: Command,
+        limits: CommandLimits,
+        cancellation: Option<watch::Receiver<bool>>,
+    ) -> std::io::Result<CommandOutput> {
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
         tokio::spawn(async move {
             sandbox
-                .run_built_output_command(cmd, limits, response_tx)
+                .run_built_output_command(cmd, limits, cancellation, response_tx)
                 .await;
         });
         response_rx.await.map_err(|_| {
@@ -571,8 +643,21 @@ impl Sandbox {
         &self,
         mut cmd: Command,
         limits: CommandLimits,
+        mut cancellation: Option<watch::Receiver<bool>>,
         mut response_tx: oneshot::Sender<CommandOutput>,
     ) {
+        if cancellation
+            .as_ref()
+            .is_some_and(|receiver| *receiver.borrow())
+        {
+            let _ = response_tx.send(CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: CommandStatus::Cancelled,
+            });
+            return;
+        }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -606,6 +691,8 @@ impl Sandbox {
         );
 
         let termination = tokio::select! {
+            biased;
+            _ = wait_for_command_cancellation(cancellation.as_mut()) => CommandTermination::Cancelled,
             status = child.wait() => CommandTermination::Exited(status),
             Some(error) = reader_error_rx.recv() => CommandTermination::ReaderError(error),
             _ = tokio::time::sleep(limits.timeout) => CommandTermination::TimedOut,
@@ -721,6 +808,21 @@ impl Sandbox {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&pid)
         })
+    }
+}
+
+async fn wait_for_command_cancellation(cancellation: Option<&mut watch::Receiver<bool>>) {
+    let Some(cancellation) = cancellation else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 

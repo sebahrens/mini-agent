@@ -83,19 +83,11 @@ fn enter_returns_buffer_and_resets() {
 }
 
 #[test]
-fn process_cancel_keys_require_ctrl_c_or_ctrl_d() {
-    for character in ['c', 'd'] {
-        assert!(crate::ui::is_process_cancel_key(&KeyEvent::new(
-            KeyCode::Char(character),
-            KeyModifiers::CONTROL
-        )));
-    }
-    assert!(!crate::ui::is_process_cancel_key(&KeyEvent::new(
-        KeyCode::Char('c'),
-        KeyModifiers::empty()
-    )));
-    assert!(!crate::ui::is_process_cancel_key(&KeyEvent::new(
-        KeyCode::Char('x'),
-        KeyModifiers::CONTROL
-    )));
+fn semantic_interrupt_routing_preserves_btw_and_validation_isolation() {
+    use crate::ui::{InterruptTarget, interrupt_target};
+
+    assert_eq!(interrupt_target(1, true, true), InterruptTarget::Btw);
+    assert_eq!(interrupt_target(0, true, true), InterruptTarget::Validation);
+    assert_eq!(interrupt_target(0, false, true), InterruptTarget::MainRun);
+    assert_eq!(interrupt_target(0, false, false), InterruptTarget::Exit);
 }

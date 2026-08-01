@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::io;
 use std::path::PathBuf;
 
 use uuid::Uuid;
@@ -9,6 +11,31 @@ use crate::extras::r#loop as loop_mod;
 use crate::extras::status_signals::StatusSignals;
 use crate::provider::AnyAgent;
 use crate::sandbox::Sandbox;
+
+async fn await_validation_or_interrupt<F>(
+    operation: loop_mod::validation::ValidationOperation,
+    interrupt: F,
+) -> io::Result<(loop_mod::validation::ValidationResult, bool)>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    let cancellation = operation.cancellation();
+    let wait = operation.wait();
+    tokio::pin!(wait);
+    tokio::pin!(interrupt);
+
+    tokio::select! {
+        result = &mut wait => Ok((result, false)),
+        signal = &mut interrupt => {
+            cancellation.cancel();
+            // The scoped worker reports only after the validator group is
+            // terminated and its direct child is reaped.
+            let result = wait.await;
+            signal?;
+            Ok((result, true))
+        }
+    }
+}
 
 pub(crate) async fn run_headless_loop(
     agent: AnyAgent,
@@ -106,9 +133,15 @@ pub(crate) async fn run_headless_loop(
                 "--- Validation: {} ---",
                 loop_mod::validation::display_command(cmd)
             );
-            let result = loop_mod::validation::run(sandbox, cmd).await;
+            let operation = loop_mod::validation::start(sandbox, cmd);
+            let (result, interrupted) =
+                await_validation_or_interrupt(operation, tokio::signal::ctrl_c()).await?;
             let diagnostic = result.render();
             eprintln!("{}", diagnostic);
+            if interrupted {
+                eprintln!("[loop] interrupted during validation");
+                return Ok(());
+            }
             Some(diagnostic)
         } else {
             None
@@ -130,4 +163,31 @@ pub(crate) async fn run_headless_loop(
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::extras::r#loop::validation::ValidationStatus;
+
+    #[tokio::test]
+    async fn headless_sigint_path_cancels_and_awaits_scoped_validation() {
+        let operation = loop_mod::validation::start(
+            &Sandbox::new(false, "bwrap"),
+            "trap '' TERM; while :; do :; done",
+        );
+        let started = Instant::now();
+        let (result, interrupted) = await_validation_or_interrupt(operation, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(interrupted);
+        assert_eq!(result.status, ValidationStatus::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 }

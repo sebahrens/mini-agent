@@ -5,6 +5,8 @@ use crate::agent::tools::todo::TODO_LIST;
 use crate::cli::Cli;
 use crate::config::ResolvedShowToolDetails;
 use crate::event::AgentEvent;
+#[cfg(feature = "loop")]
+use crate::event::{LoopValidationEvent, UserEvent};
 use crate::provider::AnyAgent;
 use crate::session::storage::save_session;
 use crate::session::{MessageRole, Session};
@@ -50,6 +52,7 @@ pub async fn handle_agent_event(
     ui: &mut UiContext<'_>,
     slash: &SlashState,
     chain: &mut ChainState,
+    #[cfg(feature = "loop")] validation_tx: &tokio::sync::mpsc::Sender<UserEvent>,
 ) -> anyhow::Result<()> {
     match event {
         AgentEvent::Reasoning(text) => {
@@ -219,6 +222,8 @@ pub async fn handle_agent_event(
                 run,
                 ui,
                 chain,
+                #[cfg(feature = "loop")]
+                validation_tx,
             )
             .await?;
         }
@@ -311,6 +316,7 @@ async fn handle_agent_done(
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
     chain: &mut ChainState,
+    #[cfg(feature = "loop")] validation_tx: &tokio::sync::mpsc::Sender<UserEvent>,
 ) -> anyhow::Result<()> {
     // `chain` is only read by the /loop-respawn and worktree-return paths.
     #[cfg(not(any(feature = "loop", feature = "git-worktree")))]
@@ -424,80 +430,155 @@ async fn handle_agent_done(
             .collect();
         ls.last_summary = Some(summary.clone());
 
-        let validation_output = if let Some(cmd) = &ls.run_cmd {
-            Some(
-                crate::extras::r#loop::validation::run(&ui.sandbox, cmd)
-                    .await
-                    .render(),
-            )
-        } else {
-            None
-        };
-        ls.last_run_output = validation_output.clone();
-
-        if let Err(e) = crate::extras::r#loop::transcript::save_iteration(
-            &ui.session.id,
-            ls.iteration,
-            &ls.build_prompt(),
-            &response,
-            validation_output.as_deref(),
-            &summary,
-        ) {
-            renderer.write_line(
-                &format!("warning: failed to save loop transcript: {}", e),
-                C_ERROR,
-            )?;
-        }
-
-        ls.iteration += 1;
-
-        if ls.should_stop() {
-            renderer.write_line(
-                &format!(
-                    "[loop] max iterations ({}) reached, stopping",
-                    ls.iteration - 1
-                ),
-                C_AGENT,
-            )?;
-            ls.active = false;
-            chain.loop_label = None;
-        } else {
-            let prompt = ls.build_prompt();
-            run.agent = Some(
-                ui.agent_build_ctx()
-                    .rebuild_agent(&ui.session.model, true)
-                    .await,
-            );
-            let runner = run
-                .agent
-                .as_ref()
-                .unwrap()
-                .clone()
-                .spawn_runner(
-                    prompt,
-                    Vec::new(),
-                    ui.cfg.retry.clone(),
-                    #[cfg(feature = "hooks")]
-                    Some(crate::extras::hooks::LoopInfo {
-                        iteration: ls.iteration,
-                        active: ls.active,
-                    }),
-                )
-                .await;
-            run.agent_rx = Some(runner.event_rx);
+        if let Some(cmd) = ls.run_cmd.clone() {
+            let operation = crate::extras::r#loop::validation::start(&ui.sandbox, &cmd);
+            run.validation_cancel = Some(operation.cancellation());
+            run.main_abort = None;
+            // Keep semantic interrupt routing active while the validator runs,
+            // but let the main event loop continue consuming `/btw` and keys.
             run.is_running = true;
-            if let Some(ss) = ui.status_signals.as_ref() {
-                ss.send_start();
-            }
-            chain.loop_label = Some(ls.iteration_label());
-            renderer.write_line(
-                &format!("[loop] launching {}", ls.iteration_label()),
-                C_AGENT,
-            )?;
+            let validation_tx = validation_tx.clone();
+            tokio::spawn(async move {
+                let result = operation.wait().await;
+                let _ = validation_tx
+                    .send(UserEvent::LoopValidationDone(LoopValidationEvent {
+                        response,
+                        summary,
+                        result,
+                    }))
+                    .await;
+            });
+            return Ok(());
         }
+
+        finish_loop_iteration(response.as_str(), summary, None, renderer, run, ui, chain).await?;
     }
 
     #[cfg(feature = "git-worktree")]
+    finish_worktree_return(renderer, run, ui, chain).await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "loop")]
+pub(crate) async fn handle_loop_validation_event(
+    event: LoopValidationEvent,
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    chain: &mut ChainState,
+) -> anyhow::Result<()> {
+    run.validation_cancel = None;
+    if !chain.loop_state.as_ref().is_some_and(|state| state.active) {
+        return Ok(());
+    }
+
+    run.is_running = false;
+    finish_loop_iteration(
+        event.response.as_str(),
+        event.summary,
+        Some(event.result.render()),
+        renderer,
+        run,
+        ui,
+        chain,
+    )
+    .await?;
+
+    #[cfg(feature = "git-worktree")]
+    finish_worktree_return(renderer, run, ui, chain).await?;
+    Ok(())
+}
+
+#[cfg(feature = "loop")]
+async fn finish_loop_iteration(
+    response: &str,
+    summary: String,
+    validation_output: Option<String>,
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    chain: &mut ChainState,
+) -> anyhow::Result<()> {
+    let Some(ls) = chain.loop_state.as_mut() else {
+        return Ok(());
+    };
+    if !ls.active {
+        return Ok(());
+    }
+    ls.last_run_output = validation_output.clone();
+
+    if let Err(error) = crate::extras::r#loop::transcript::save_iteration(
+        &ui.session.id,
+        ls.iteration,
+        &ls.build_prompt(),
+        response,
+        validation_output.as_deref(),
+        &summary,
+    ) {
+        renderer.write_line(
+            &format!("warning: failed to save loop transcript: {error}"),
+            C_ERROR,
+        )?;
+    }
+
+    ls.iteration += 1;
+    if ls.should_stop() {
+        renderer.write_line(
+            &format!(
+                "[loop] max iterations ({}) reached, stopping",
+                ls.iteration - 1
+            ),
+            C_AGENT,
+        )?;
+        ls.active = false;
+        chain.loop_label = None;
+        return Ok(());
+    }
+
+    let prompt = ls.build_prompt();
+    run.agent = Some(
+        ui.agent_build_ctx()
+            .rebuild_agent(&ui.session.model, true)
+            .await,
+    );
+    let runner = run
+        .agent
+        .as_ref()
+        .expect("loop agent was rebuilt")
+        .clone()
+        .spawn_runner(
+            prompt,
+            Vec::new(),
+            ui.cfg.retry.clone(),
+            #[cfg(feature = "hooks")]
+            Some(crate::extras::hooks::LoopInfo {
+                iteration: ls.iteration,
+                active: ls.active,
+            }),
+        )
+        .await;
+    run.agent_rx = Some(runner.event_rx);
+    run.main_abort = Some(runner.abort_handle);
+    run.is_running = true;
+    if let Some(signals) = ui.status_signals.as_ref() {
+        signals.send_start();
+    }
+    chain.loop_label = Some(ls.iteration_label());
+    renderer.write_line(
+        &format!("[loop] launching {}", ls.iteration_label()),
+        C_AGENT,
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "git-worktree")]
+async fn finish_worktree_return(
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    chain: &mut ChainState,
+) -> anyhow::Result<()> {
     if let Some((main_path, wt_path, branch, force)) = chain.wt_return_path.take() {
         crate::extras::git_worktree::cleanup_worktree(&wt_path, &branch, &main_path, force);
         match std::env::set_current_dir(&main_path) {
