@@ -48,7 +48,7 @@ its original phase.
 
 | Earlier authority | Superseded or extended concern | Phase 6 authority | Preserved concern |
 |-------------------|--------------------------------|-------------------|-------------------|
-| Phase 1, `Threading model`, `Runtime lifecycle`, and `Builder registration` | In-parent per-`JsTool` thread ownership and independent host-call deadline wording | `Worker lifecycle`, `Failure semantics` | Language behavior, fresh-runtime rule, heap/stack/I/O limits, bounded errors |
+| Phase 1, `Threading model`, `Runtime lifecycle`, `Error surfacing`, and `Builder registration` | In-parent per-`JsTool` thread ownership, independent host-call deadline wording, and arbitrary exception message/stack disclosure | `Worker lifecycle`, `Failure semantics` | Language behavior, fresh-runtime rule, heap/stack/I/O limits, stable typed error distinctions |
 | Phase 2, `General subprocess integration` | Using a workspace-visible general-process profile for the native JS worker; executing JS host effects in worker-owned closures | `Capability broker`, `Platform containment` | URL/path narrowing and the general command path reached through `Sandbox::wrap_command` |
 | Phase 3, `Immutable skill artifact` | Identity-v1 flat host list as the current identity contract | `Persistence boundary` | Immutable full-payload identity, SQLite authority, manual admission, retrieval |
 | Phase 3, `Runtime binding` and `No-effect skill verification` | Same-context source binding and parent/in-thread verifier runtime ownership | `Capability broker`, `Verification parity` | Frozen turn bundle, declared exports, deterministic fake semantics, exact-true tests |

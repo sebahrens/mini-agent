@@ -12,9 +12,11 @@ The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). Overview documents and dated blueprints cannot override this file.
 
 [`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md) supersedes only this phase's
-in-parent process/thread ownership. The host behavior, permission semantics, runtime freshness,
-limits, error bounds, and evaluation rules below remain the historical contract that the Phase 6
-worker and parent broker must preserve. Phase 6 is planned; this notice is not a delivery claim.
+in-parent process/thread ownership, independent host-call deadline wording, and exception
+disclosure. The host behavior, permission semantics, runtime freshness, resource limits, stable
+error categories, and evaluation rules below otherwise remain the historical contract that the
+Phase 6 worker and parent broker must preserve. Phase 6 is planned; this notice is not a delivery
+claim.
 
 ## Overview
 
@@ -201,12 +203,14 @@ cancellation path in Phase 1. Host calls do not inherit safety merely from the e
 Timeout/cancellation kills the child process group where the platform supports it and returns a
 bounded JS error.
 
-## Error surfacing
+## Historical error surfacing (superseded by Phase 6)
 
-Exceptions are returned to the model for self-correction and include bounded message and stack
-text, including line information when QuickJS supplies it. Syntax errors, host errors, Promise
-rejections, timeout, cancellation, OOM, and pending-job exhaustion are distinguished. Error
-formatting never panics because an exception lacks a message or stack.
+Delivered Phase 1 returned bounded exception message and stack text to the model for
+self-correction. Phase 6 explicitly supersedes that disclosure because authorized file/fetch
+content can be copied into a thrown value, message, or stack-associated source text. Phase 6 keeps
+stable distinctions for syntax errors, runtime exceptions, Promise rejections, host errors,
+timeout, cancellation, OOM, and pending-job exhaustion, plus validated source-free numeric location
+metadata. It never returns arbitrary exception message/stack text or a thrown value.
 
 ## Builder registration
 
@@ -231,7 +235,7 @@ Later-phase modules remain behind their own feature gates.
 
 Tests cover, at minimum:
 
-- return values, void, syntax errors, and stack-bearing runtime errors;
+- return values, void, syntax errors, and historically stack-bearing Phase 1 runtime errors;
 - fresh runtime state after success, timeout, and OOM;
 - exact memory/stack/deadline setup and bounded pending jobs;
 - mandatory allow/deny/ask behavior for both file globals and process spawn;

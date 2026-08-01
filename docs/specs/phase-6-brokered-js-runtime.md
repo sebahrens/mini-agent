@@ -13,9 +13,10 @@ The corpus authority and conflict rules are defined in
 worker protocol, runtime ownership, brokered effects, effect audit, and production/verification
 realm parity. It is a contract for future implementation, not a claim that Phase 6 is delivered.
 
-Phase 1 remains the authority for the JavaScript language surface, limits, error bounds, and
-permission semantics that this phase preserves. Its in-parent, per-`JsTool` thread ownership is
-historical and superseded by this phase. Phase 2 remains the authority for URL/path narrowing and
+Phase 1 remains the authority for the JavaScript language surface, resource limits, stable error
+categories, and permission semantics that this phase preserves. Its exception text/stack
+disclosure and in-parent, per-`JsTool` thread ownership are historical and superseded by this phase.
+Phase 2 remains the authority for URL/path narrowing and
 the general subprocess sandbox used by parent-brokered commands. Its workspace-visible process
 profiles must never contain the JavaScript worker. Phase 3 remains authoritative for immutable
 storage, manual admission, and retrieval, while Phase 6 supersedes its identity-v1 capability
@@ -79,10 +80,10 @@ Every runtime preserves the Phase 1 resource limits: a 30-second total request d
 QuickJS heap, and 512 KiB QuickJS stack. The one total deadline supersedes Phase 1's independent
 per-host-call deadline wording; operation-specific timeouts may be shorter but never extend the
 request budget. The runtime installs its memory limit, stack limit, and interrupt deadline before
-source evaluation. Pending jobs, console output, error text, stacks, file/fetch bodies, and spawn
-output are bounded. The parent deadline includes worker IPC and brokered host calls rather than
-pausing while an effect is serviced. Platform process limits are defense in depth and do not
-replace these runtime limits.
+source evaluation. Pending jobs, console output, sanitized typed diagnostics, file/fetch bodies,
+and spawn output are bounded. Arbitrary exception text and stacks are never serialized. The parent
+deadline includes worker IPC and brokered host calls rather than pausing while an effect is
+serviced. Platform process limits are defense in depth and do not replace these runtime limits.
 
 The worker handles exactly one invocation at a time. Parent cancellation, timeout, transport
 failure, or shutdown kills and reaps the entire containment/process group; no unsolicited cancel
@@ -183,8 +184,10 @@ identical. Verification grant IDs resolve only to the deterministic fake respond
 by the production effect broker; verification cannot reach real effects or persistence services.
 
 The realm delivery gate is mandatory: cross-`Context` function identity, promise continuation,
-bounded exception transfer, ambient-global absence, and declared JSON cloning must pass the
-QuickJS proof before private realms or the verifier are implemented. Failure stops Phase 6; a
+exception classification/location behavior, ambient-global absence, and declared JSON cloning
+must pass the QuickJS proof before private realms or the verifier are implemented. The feasibility
+test may inspect bounded QuickJS message/stack behavior entirely inside its test process, but no
+production wire/result/log surface may preserve that arbitrary text. Failure stops Phase 6; a
 shared-global wrapper is not an accepted fallback. Passing proves a source-level realm contract,
 not native containment.
 
@@ -259,6 +262,24 @@ forbidden.
 
 ## Failure semantics
 
+Every production failure uses a closed sanitized diagnostic contract. `class` is one of `syntax`,
+`javascript_exception`, `promise_rejection`, `host`, `permission`, `validation`, `timeout`,
+`cancelled`, `out_of_memory`, `pending_job_limit`, `protocol`, `containment`, `audit`, or
+`internal`. `code` comes from a versioned parent/worker allow-list; a worker-provided unknown code
+is a protocol fault. Optional corrective metadata is limited to a source-free location: closed
+`stage` and `script_role` enums plus validated one-based numeric line/column values within the
+submitted script. It contains no filename, function name, property/key name, target, ordinal,
+effect result, or other source-derived string.
+
+If QuickJS cannot be classified without trusting exception-controlled text, the worker returns the
+generic `javascript_exception` or `promise_rejection` code. Arbitrary exception `name`, message,
+stack, thrown value, source line/snippet, cause, aggregate members, effect result, console-derived
+text, prompt, argument, file/fetch content, and secret never cross the production worker protocol
+as a diagnostic and never enter model output, stderr, logs, audit, telemetry, evaluation reports,
+or repair records. The worker discards those values after deriving the closed class and validated
+source-free location. Parent-generated fixed templates may render the stable code and safe metadata
+for correction, but must not interpolate worker-controlled text.
+
 The system fails closed at every trust boundary:
 
 - unavailable or failed containment makes JS unavailable; production never retries in-process or
@@ -274,8 +295,8 @@ The system fails closed at every trust boundary:
   denies the effect;
 - parent shutdown or a closed protocol pipe causes worker exit, while parent process control
   remains responsible for forced cleanup; and
-- worker errors and diagnostics disclose no source, prompts, contents, environment, credentials,
-  or secrets.
+- worker errors and diagnostics disclose no arbitrary message/stack, thrown value, source snippet,
+  effect result, target, prompt, argument, content, environment, credential, or secret.
 
 An external effect can complete immediately before the worker or transport fails. Such an outcome
 is recorded as completed or ambiguous and returned without automatic retry. Phase 6 promises
@@ -295,8 +316,8 @@ planned until the index exit rule is satisfied.
 | Wire protocol | Codec/state-machine tests reject oversized, malformed, unknown, replayed, out-of-order, cross-invocation, and wrong-terminal frames. |
 | Capability broker | Permission/policy/grant intersection tests cover every typed effect, expiry, scope, Windows spawn denial, and malicious attribution. |
 | Persistence boundary | Tests prove no worker database/path authority, pure initialization, no writer in stored realms, identity-v1 quarantine, and parent-only canonical persistence. |
-| Verification parity | The QuickJS realm gate passes; production and all verifier modes use one loader/ABI path with only declared deterministic fake capabilities. |
+| Verification parity | The QuickJS realm gate passes; production and all verifier modes use one loader/ABI path with only declared deterministic fake capabilities and the same sanitized typed diagnostic contract. |
 | Effect audit | Recovery and failure-injection tests prove durable intent before every real effect, bounded completion, hash-chain integrity, HMAC target correlation/redaction, key rotation/failure, retention, and no replay. |
 | Platform containment | Real Linux/macOS/Windows probes prove the broker-only capability matrix; the LPAC install-location gate passes wherever Windows JS is enabled. |
-| Failure semantics | Crash, OOM, timeout, cancellation, audit failure, backend absence, parent death, and ambiguous-effect tests all fail closed with bounded diagnostics and cleanup. |
+| Failure semantics | Crash, OOM, timeout, cancellation, audit failure, backend absence, parent death, ambiguous-effect, and secret-in-thrown-value tests all fail closed with only stable class/code and source-free location metadata. |
 | Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded, indexes this planned spec, and marks no Phase 6 feature delivered. |

@@ -129,7 +129,9 @@ prevent a proposal from naming a different artifact after enqueue.
 Claims use persisted leases and retries so a crash cannot strand a row in `evaluating`.
 Evaluation reports bind proposal ID, artifact ID, verifier version, matched held-out suite hashes,
 predecessor ID, attempt number, and timestamps. Reason codes are stable; human-readable messages
-are supplementary.
+are supplementary, generated only from fixed templates and sanitized typed fields, and never embed
+an arbitrary JS exception message/stack, thrown value, source snippet, effect result, prompt, or
+content.
 
 Deterministic failures reject that immutable revision permanently. Retryable infrastructure errors
 use bounded exponential backoff and preserve the row. A changed artifact always gets a new ID;

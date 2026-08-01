@@ -1,23 +1,20 @@
 # mini-agent — Claude Instructions
 
-This workspace contains a QuickJS PoC spike (`main.rs`) and the `zerostack/` coding agent.
-The primary implementation target is `zerostack/`. All production code goes there.
+The production Rust crate is the repository root: `Cargo.toml`, `src/`, and `docs/`. The separate
+`spike/` crate is a QuickJS research artifact and is never a production target.
 
 ## Build rules
 
 ```bash
-# Spike (research only)
-cargo run                      # runs main.rs directly
-
-# zerostack (ALWAYS use these, never plain cargo build)
-cd zerostack
+# Run from the repository root
 cargo fmt                      # required before every commit
-cargo test                     # unit tests — use instead of cargo check
-cargo install --path . --debug # install development binary
+cargo test                     # type checking and tests; use instead of cargo check
+cargo install --path . --debug # required development build/install command
 ```
 
-**Never** run `cargo build` in zerostack. **Never** use `--release` during development.
+**Never** run `cargo build`. **Never** use `--release` during development.
 **Never** run `cargo check` — `cargo test` catches type errors and tests in one pass.
+Write tests for new non-TUI production code and update `docs/` when adding modules.
 
 ## JS engine implementation
 
@@ -27,14 +24,15 @@ The integration lives at `src/extras/js/`. Key Phase 6 invariants to uphold:
 2. **`JsTool` is `Send + Sync`** — never store a QuickJS `Context`, `Runtime`, or value in `JsTool` or anywhere in the production parent process.
 3. **Fresh `Runtime` per request** — recreate it for every `RunStep` and every whole `VerifyArtifact`; never reuse after success, OOM, timeout, or cancellation.
 4. **Install limits before eval** — every runtime gets the 64 MiB heap limit, 512 KiB JS stack limit, and interrupt deadline before `ctx.eval(...)`.
-5. **Drain bounded pending jobs and preserve errors** — use `eval::<Value, _>`, bound the microtask drain, and return bounded exception message/stack data for model self-correction.
+5. **Drain bounded pending jobs and sanitize errors** — use `eval::<Value, _>`, bound the microtask drain, and return only a closed error class/code plus validated source-free stage/script-role/line/column metadata. Never disclose arbitrary JS messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
 6. **Broker every effect in the parent** — worker hosts emit typed requests. Parent policy, permissions, target narrowing, deadlines, output limits, and audit are authoritative.
 7. **Brokered spawn uses the general sandbox** — the parent creates a requested command through `Sandbox::wrap_command`. The JS worker itself uses the separate broker-only fail-closed launcher, never the workspace-readable general-process profile.
 
 ## Feature gate
 
-The JS engine is gated behind `features = ["js"]` in `Cargo.toml`. Add `dep:rquickjs` as optional.
-Do not enable by default until Phase 1 passes full test coverage.
+The existing JS engine is gated by the root `Cargo.toml`'s `js` feature. Preserve the default build,
+keep QuickJS optional, and do not treat a Cargo feature as proof that Phase 6 containment is
+available or delivered.
 
 ## Testing new JS host functions
 
@@ -55,18 +53,12 @@ integration tests that launch the contained worker. See `src/extras/js/tests/`.
 - Hook subprocess.rs uses `("sh", "-c")` on unix / `("powershell", "-Command")` on Windows — do not change this without updating the hooks module
 - `sandbox.rs`: `kill_process_group` is `#[cfg(unix)]` with empty Windows arm — keep it that way
 
-## Crate additions
+## Dependency changes
 
-When adding `rquickjs` to `zerostack/Cargo.toml`:
-```toml
-[features]
-js = ["dep:rquickjs"]
-
-[dependencies]
-rquickjs = { version = "0.12", features = ["full"], optional = true }
-```
-
-Also add `birdcage` (Phase 2) and an embedding crate (Phase 3) as optional under their own feature gates.
+Edit only the root `Cargo.toml` and `Cargo.lock`. Reuse existing dependencies instead of adding a
+second version, keep optional/platform-specific dependencies behind their owning feature or target,
+and preserve the Phase 6 minimal QuickJS feature-surface requirement. Validate changes with
+`cargo test` and `cargo install --path . --debug`, never `cargo build` or `cargo check`.
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->

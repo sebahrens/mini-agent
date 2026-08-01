@@ -138,6 +138,10 @@ skill ID, export, and call ordinal. A retry of the same acknowledged tool call r
 event insertion is idempotent. A genuinely new call gets a new ordinal. `turn_id` is allocated
 once when a user prompt starts and survives model/tool retries until that turn settles.
 
+Exception and rejection events persist only the Phase 6 sanitized class, stable code, and
+source-free numeric location. They never persist a raw thrown value, message, stack, source
+snippet, effect result, prompt/content field, or secret.
+
 The runtime distinguishes these events:
 
 ```rust
@@ -367,7 +371,7 @@ Quarantine creates a repair record containing only the evidence needed to reprod
 
 - failing revision ID and export;
 - sanitized argument shape or deterministic fixture;
-- direct exception, rejection, timeout, or policy result;
+- sanitized exception/rejection class, stable code, source-free location, timeout, or policy result;
 - expected behavior when known;
 - inherited regression case IDs;
 - retrieval query fingerprint, score, and index generation.

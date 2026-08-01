@@ -4,14 +4,13 @@
 
 ```
 mini-agent/
-├── main.rs              # QuickJS PoC spike (research artifact, not production)
-├── zerostack/           # The coding agent — ALL production work happens here
-│   ├── src/
-│   │   ├── agent/tools/ # Tool implementations (bash.rs, js.rs coming)
-│   │   ├── extras/js/   # JS engine module (to be created — Phase 1)
-│   │   └── sandbox.rs   # Process sandboxing
-│   ├── docs/            # Architecture docs and specs
-│   └── Cargo.toml
+├── Cargo.toml           # Production crate manifest
+├── src/
+│   ├── agent/tools/     # Agent tool implementations
+│   ├── extras/js/       # JavaScript engine, skills, and Phase 6 worker modules
+│   └── sandbox.rs       # General process sandbox; worker containment is a submodule
+├── docs/                # Architecture docs, normative specs, and agent documentation
+├── spike/               # QuickJS research crate; never a production target
 ├── ARCHITECTURE.md      # JS engine integration architecture
 ├── SPEC.md              # Implementation specification
 └── README.md            # Project overview
@@ -19,7 +18,7 @@ mini-agent/
 
 ## Compilation rules (STRICT)
 
-Working inside `zerostack/`:
+Run production crate commands from the repository root:
 - **ALWAYS** `cargo fmt` before committing
 - **ALWAYS** use `cargo install --path . --debug` to build
 - **ALWAYS** use `cargo test` for type checking and tests
@@ -51,6 +50,7 @@ Register `JsTool` in `src/agent/builder.rs` under `#[cfg(feature = "js")]`, alon
 4. `set_memory_limit(64 * 1024 * 1024)` and `set_max_stack_size(512 * 1024)` on every new `Runtime`.
 5. `set_interrupt_handler` deadline must be set before `ctx.eval(...)` is called.
 6. All JS effects are typed requests executed by the parent capability broker. A brokered `spawn()` must create its general command through `Sandbox::wrap_command`; the JS worker itself uses the separate broker-only fail-closed launcher and never the workspace-readable general-process profile.
+7. Production diagnostics expose only a closed error class/code and validated source-free stage/script-role/line/column metadata. Never return or log arbitrary JS exception messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
 
 ## Skill library (Phase 3) invariants
 
@@ -67,7 +67,8 @@ Register `JsTool` in `src/agent/builder.rs` under `#[cfg(feature = "js")]`, alon
 - Do not expose `require()` or `import()` in the JS sandbox — no module system
 - Do not use `.cargo/config.toml` link flags for stack size — not honored by `cargo install`
 - Do not reuse `Runtime` across steps even if no OOM occurred — allocation state is unpredictable
-- Do not add `fetch()` until Phase 2 permission routing is implemented
+- Keep `fetch()` parent-brokered under the delivered Phase 2 URL, permission, and narrowing
+  contract; never grant the worker direct network access
 
 ## Testing the binary
 
