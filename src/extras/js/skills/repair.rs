@@ -210,9 +210,9 @@ pub fn submit_repair_proposal(
         || candidate.capability.tier > predecessor.capability.tier
         || candidate
             .capability
-            .allowed_hosts
+            .grants
             .iter()
-            .any(|host| !predecessor.capability.allowed_hosts.contains(host))
+            .any(|grant| !predecessor.capability.grants.contains(grant))
     {
         return Err(RepairError::InvalidProposal);
     }
