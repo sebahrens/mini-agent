@@ -191,6 +191,26 @@ production wire/result/log surface may preserve that arbitrary text. Failure sto
 shared-global wrapper is not an accepted fallback. Passing proves a source-level realm contract,
 not native containment.
 
+### Realm isolation
+
+The locked realm gate passes with `rquickjs`, `rquickjs-core`, and `rquickjs-sys` 0.12.1, whose
+vendored QuickJS reports version 0.15.1. Within one `Runtime`, a `Persistent<Function>` created in
+one full `Context` restores and can be invoked while an agent `Context` is active, but resolves
+`globalThis` from its defining skill context. A promise returned by that function remains pending
+until the runtime executes its queued continuation, then settles with the defining context's
+global. An exception thrown by the restored function remains available through the function's
+context with its message, function name, and source filename intact so the test can apply bounded,
+UTF-8-safe message and stack extraction.
+
+The same gate installs mock `read_file`, `write_file`, `fetch`, `spawn`, and `propose_skill`
+globals in the agent context and observes each as exactly `undefined` in the skill context. Plain
+JSON-compatible objects and arrays cross only after strict validation, bounded JSON serialization,
+and parsing in the receiving context; functions, symbols, BigInts, accessors, host objects, cycles,
+sparse arrays, unsupported nested values, and oversized encodings are rejected. These results
+establish the source-level operations required by the future loader. They do not make QuickJS
+contexts a native security boundary, and they do not authorize arbitrary exception text on any
+production result, wire, diagnostic, or log surface.
+
 ## Effect audit
 
 Before every real brokered call—including `read_file`—the parent appends and durably syncs an
