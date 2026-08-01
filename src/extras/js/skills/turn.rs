@@ -596,7 +596,11 @@ fn render_agent_section(section: &AgentSection) -> String {
         "BEGIN_{delimiter} rank={} score={:.6}",
         section.rank, section.score
     );
-    output.push_str(&section.markdown);
+    output.push_str(
+        &section
+            .markdown
+            .replace("</trusted_skill_context>", "&lt;/trusted_skill_context&gt;"),
+    );
     if !section.markdown.ends_with('\n') {
         output.push('\n');
     }
@@ -617,7 +621,9 @@ fn render_agent_section(section: &AgentSection) -> String {
                 let resource_delimiter =
                     format!("AGENT_SKILL_RESOURCE_{}_{}", section.digest, sha256);
                 let _ = writeln!(output, "BEGIN_{resource_delimiter} path={path}");
-                output.push_str(text);
+                output.push_str(
+                    &text.replace("</trusted_skill_context>", "&lt;/trusted_skill_context&gt;"),
+                );
                 if !text.ends_with('\n') {
                     output.push('\n');
                 }
