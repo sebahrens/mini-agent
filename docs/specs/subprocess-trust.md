@@ -108,12 +108,14 @@ Command::new | tokio::process | .spawn( | .output( | .status(
 
 The inventory excludes dedicated test directories, retains inline test and false-positive matches
 as `TEST-ONLY`/`NON-PROCESS`, and assigns every remaining match to one current class above. An
-explicit current-class allow-list excludes `TC-BROKER-JS-WORKER`, while source-family ownership
-rules prevent a launch from satisfying the check with an unrelated class token. It counts identical
-fingerprints per file, so adding a second identical `Command::new("git")` still fails. A new or
-changed match fails the default test until its owner audits the full launch contract, updates this
-normative table when needed, and adds both the classification and source-family ownership reference.
-Removing a site also fails until the stale inventory and ownership rule are removed.
+explicit current-class allow-list excludes `TC-BROKER-JS-WORKER`. Every disposition and every site
+in a file with multiple production classes has an exact fingerprint-and-occurrence ownership rule;
+only files whose remaining launches share one production principal use a file-family rule. Thus a
+launch cannot satisfy the check by borrowing another site or comment's class token. The inventory
+counts identical fingerprints per file, so adding a second identical `Command::new("git")` still
+fails. A new or changed match fails the default test until its owner audits the full launch contract,
+updates this normative table when needed, and adds the required site or single-class-family ownership
+reference. Removing a site also fails until the stale inventory and ownership rule are removed.
 
 The audit currently resolves as follows:
 
@@ -135,9 +137,11 @@ The audit currently resolves as follows:
 ## Review and change rules
 
 - A new launch site must update the checked inventory in the same change.
-- Every current launch classification must be in the current-class allow-list and permitted by its
-  source-family ownership rule. `TC-BROKER-JS-WORKER` remains forbidden until an actual Phase 6
-  worker boundary exists and its contract is reviewed.
+- Every current launch classification must be in the current-class allow-list. `TEST-ONLY`,
+  `NON-PROCESS`, and sites in mixed-production-class files require exact fingerprint-and-occurrence
+  ownership; file-family ownership is valid only when every remaining launch has one production
+  principal. `TC-BROKER-JS-WORKER` remains forbidden until an actual Phase 6 worker boundary exists
+  and its contract is reviewed.
 - A new trust class or broader authority must update this file before implementation.
 - Moving an existing launch to a shared runner must preserve its class; sharing code never merges
   principals.
