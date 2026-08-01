@@ -1,21 +1,28 @@
 # Phase 1 — Core JS Engine Integration
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.0.0
+- **Specification version**: 1.1.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-31
+- **Last reconciled**: 2026-08-01
 - **Entry dependency**: none for the non-persistent engine
 - **Exit dependency**: every acceptance criterion below and every Phase 1 blocker
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). Overview documents and dated blueprints cannot override this file.
 
+[`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md) supersedes only this phase's
+in-parent process/thread ownership. The host behavior, permission semantics, runtime freshness,
+limits, error bounds, and evaluation rules below remain the historical contract that the Phase 6
+worker and parent broker must preserve. Phase 6 is planned; this notice is not a delivery claim.
+
 ## Overview
 
-Phase 1 adds a bounded in-process QuickJS action primitive. It delivers portable JavaScript
-evaluation, file globals, process spawning through the existing `Sandbox` abstraction, and the
-permission bridge needed by synchronous host functions.
+As delivered, Phase 1 added a bounded in-process QuickJS action primitive. That placement is
+historical and superseded as the normative target by Phase 6. Phase 1 delivered portable
+JavaScript evaluation, file globals, process spawning through the existing `Sandbox` abstraction,
+and the permission bridge needed by synchronous host functions; Phase 6 preserves those behavior
+contracts while moving execution and effects across a worker boundary.
 
 “Sandbox” has two distinct meanings:
 
@@ -44,7 +51,7 @@ Production files live at the repository root:
 
 | Concern | Location |
 |---------|----------|
-| Runtime lifecycle and JS thread | `src/extras/js/engine.rs` |
+| Historical Phase 1 runtime lifecycle and JS thread | `src/extras/js/engine.rs` (superseded ownership; behavior/limits retained) |
 | `JsTool` implementation | `src/extras/js/tool.rs` |
 | Host globals and secure file operations | `src/extras/js/host.rs` |
 | Request/response and permission-bridge types | `src/extras/js/types.rs` |
@@ -66,14 +73,19 @@ fixed:
 - process results contain bounded stdout/stderr, exit status, and truncation/timeout metadata; and
 - all channel payloads are `Send`; no payload contains a QuickJS value or context.
 
-The Phase 1 limits are 30 seconds per step/host call, 64 MiB heap, 512 KiB JS stack, 8 MiB OS thread
-stack, and 1 MiB per file read/write. One shared constants module owns these values.
+The Phase 1 limits are 30 seconds per step/host call, 64 MiB heap, 512 KiB JS stack, 8 MiB historical
+OS-thread stack, and 1 MiB per file read/write. Phase 6 retains the heap, JS stack, and I/O limits,
+but replaces independent step/host-call deadline wording with one 30-second total request budget and
+adds process/protocol bounds; it does not require the superseded thread stack. One shared constants
+module owns the currently applicable values.
 
-## Threading model
+## Historical threading model (superseded for JS)
 
-Each `JsTool` instance owns exactly one dedicated OS thread. That thread owns every QuickJS
-`Runtime`, `Context`, and value derived from them. QuickJS types, `Rc`, and `RefCell` never cross
-the channel and are never fields of `JsTool`.
+The dedicated OS thread model below records delivered Phase 1 behavior and is superseded for JS by
+Phase 6. Under that historical model, each `JsTool` instance owns one thread, and that thread owns
+every QuickJS `Runtime`, `Context`, and derived value. QuickJS types, `Rc`, and `RefCell` never cross
+the channel and are never fields of `JsTool`. Under Phase 6, those values instead remain inside the
+contained worker and never cross the wire.
 
 ```rust
 std::thread::Builder::new()
@@ -83,11 +95,13 @@ std::thread::Builder::new()
 
 ## `JsTool`
 
-Every `JsTool` field must be `Send + Sync`. The tool may own channel endpoints, permission-bridge
-state, a Tokio handle, cancellation state, and the JS thread join handle.
+Every `JsTool` field must be `Send + Sync`. Under the historical Phase 1 model, the tool may own
+channel endpoints, permission-bridge state, a Tokio handle, cancellation state, and the JS thread
+join handle. Phase 6 retains the `Send + Sync` requirement but not the join-handle ownership.
 
-The tool shuts down its permission bridge, closes the request channel, and joins a finished thread
-without leaving new work able to enter a shutting-down instance.
+The Phase 1 tool shuts down its permission bridge, closes the request channel, and joins its
+historical engine thread without leaving new work able to enter a shutting-down instance. Phase 6
+replaces that lifecycle with parent-owned worker kill-and-reap semantics.
 
 ### Import paths
 
@@ -103,8 +117,10 @@ tracker issue or overview document.
 
 ## Runtime lifecycle
 
-Every JS step creates a new `Runtime` and drops it after evaluation. Runtime reuse is forbidden,
-including after a successful step, because an OOM can poison allocator state.
+Runtime freshness and limits remain authoritative, while Phase 6 supersedes their location and
+owner. Every JS step creates a new `Runtime` and drops it after evaluation. Phase 6 creates it in
+the worker and additionally treats one whole verification request as a runtime unit. Runtime reuse
+is forbidden, including after a successful step, because an OOM can poison allocator state.
 
 Every new runtime applies these limits before evaluation:
 
@@ -117,14 +133,14 @@ rt.set_interrupt_handler(/* deadline/cancellation handler */);
 The interrupt deadline is installed before `ctx.eval(...)`. Evaluation uses
 `eval::<Value, _>`, never `eval::<(), _>`.
 
-After every evaluation attempt, the engine drains pending jobs. The baseline rule is:
+After every evaluation attempt, the execution side drains pending jobs. The baseline rule is:
 
 ```rust
 while rt.execute_pending_job() == Ok(true) {}
 ```
 
 An implementation may add a deadline and finite job-count guard, but it may not skip the drain or
-allow a self-replenishing microtask chain to monopolize the JS thread. Promise rejection, job
+allow a self-replenishing microtask chain to monopolize JavaScript execution. Promise rejection, job
 errors, timeout, cancellation, and OOM are returned as bounded outcomes.
 
 ## Host globals
@@ -195,8 +211,9 @@ formatting never panics because an exception lacks a message or stack.
 ## Builder registration
 
 `src/agent/builder.rs` registers one `JsTool` under `#[cfg(feature = "js")]` before the tool
-allow-list is applied. `JsTool::new` owns creation of its dedicated thread so one tool cannot
-accidentally share a QuickJS runtime with another.
+allow-list is applied. Historically, `JsTool::new` created the engine thread so one tool could not
+share a QuickJS runtime with another. Phase 6 supersedes that construction rule with one lazily
+started contained worker and a fresh runtime for each request.
 
 Registration does not remove or silently replace another action tool. Windows availability is
 controlled by verified platform support in code and CI, not by an overview-document claim.
@@ -221,13 +238,15 @@ Tests cover, at minimum:
 - canonical permission paths, symlink races, non-regular files, UTF-8, and 1 MiB boundaries;
 - atomic/no-follow write behavior and “no effect on denial/failure”;
 - process argument safety, wrapper use, output bounds, timeout, cancellation, and shutdown;
-- one dedicated 8 MiB thread per `JsTool` and clean tool drop; and
+- the historical, superseded Phase 1 8 MiB thread and clean tool drop; and
 - default and `js` feature builds, plus every platform configuration for which support is claimed.
 
 ## Acceptance criteria
 
-- [x] All threading, runtime, limit, eval, microtask, and exception invariants above are tested.
-- [x] `JsTool` and all of its fields satisfy `Send + Sync`; QuickJS state stays on its thread.
+- [x] All historical Phase 1 threading plus retained runtime, limit, eval, microtask, and exception
+      invariants above are tested.
+- [x] `JsTool` and all of its fields satisfy `Send + Sync`; under the superseded Phase 1 model,
+      QuickJS state stayed on its thread.
 - [x] Every file operation is permission-gated on the resolved target and fails without effects.
 - [x] Every process spawn is permission-gated, argument-safe, bounded, and created by
       `Sandbox::wrap_command`.

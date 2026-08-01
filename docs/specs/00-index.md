@@ -1,10 +1,10 @@
 # Spec Index — mini-agent JS Engine
 
 - **Document role**: normative authority map
-- **Specification version**: 1.0.0
+- **Specification version**: 1.1.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-31
+- **Last reconciled**: 2026-08-01
 
 ## Authority and conflict resolution
 
@@ -31,10 +31,11 @@ planning context only; it cannot override the cited section.
 |-------|----------------|-----------------|------|
 | Foundation | [platform-paths.md](platform-paths.md) | In progress | Typed Linux/macOS/Windows roots, artifact ownership, secure migration |
 | 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | Delivered | Core QuickJS integration, `JsTool`, primitive host globals |
-| 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS process isolation |
+| 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS general-process isolation |
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Delivered | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Planned | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
+| 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Planned | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
 
 Prior research artifacts superseded by this index:
 
@@ -44,7 +45,8 @@ Prior research artifacts superseded by this index:
 
 Cargo features are not phase-completion claims:
 
-- `js` enables the Phase 1 engine and primitive host API.
+- `js` currently enables the delivered Phase 1 engine and primitive host API. Phase 6 defines the
+  required replacement runtime architecture but does not claim that replacement is implemented.
 - `sandbox` is independent of `js` and extends the shared process sandbox. `js,sandbox` enables
   Phase 2 integrations; `js` alone still uses the existing `Sandbox::wrap_command` behavior.
 - `skills` implies `js`; it does not imply `sandbox`. Phase 3 verification remains no-effect in
@@ -53,17 +55,22 @@ Cargo features are not phase-completion claims:
   permission checks.
 - Phases 4 and 5 extend the `skills` implementation; they do not grant a candidate a new Cargo
   feature or a path around lifecycle gates.
+- Phase 6 does not create a trust-bearing Cargo-feature relationship. When delivered, its contained
+  worker is mandatory for every JavaScript feature combination; backend absence disables JS rather
+  than selecting the Phase 1 execution path.
 
 ## Cross-phase dependencies
 
 | Dependency | Produces | Consumed by |
 |-----------|---------|------------|
 | Typed `AppPaths`, storage-class ownership, and secure migration | Foundation | Every persistent feature and Phases 3–5 |
-| Bounded QuickJS runtime builder with explicit host mode | Phase 1/2 | Phase 3 no-effect verification and turn execution |
+| Historical bounded QuickJS runtime builder with explicit host mode | Phase 1/2 | Phase 3 delivery baseline; Phase 6 supersedes its execution ownership |
 | Agent Skills catalog, `SkillStore`, immutable `SkillArtifact`, and typed indexes | Phase 3 | Prompt-time discovery, Phase 4 proposal/admission, and Phase 5 lifecycle |
 | `SkillTurnContext` + `TurnSkillBundle` | Phase 3 | Model manifest, exact runtime binding, Phase 5 attribution |
 | Pending/verified/canary states and held-out evaluation cases | Phase 4 | Phase 5 evidence policy |
 | Invocation events and lineage transitions | Phase 5 | Automatic quarantine, repair, promotion, and rollback |
+| Historical fresh-runtime limits and host semantics | Phase 1/2 | Phase 6 worker runtime and parent capability broker |
+| Broker-only worker containment, protocol, realm loader, and effect audit | Phase 6 | All production and verification JavaScript execution after Phase 6 delivery |
 
 ## Phase entry and exit rules
 
@@ -71,10 +78,11 @@ Cargo features are not phase-completion claims:
 |-------|------------------|--------------|
 | Foundation | None | The resolver, ownership matrix, migration, secure creation, and platform tests in `platform-paths.md` pass. |
 | 1 | None for the non-persistent engine; Foundation for any persistent artifact or unqualified platform-storage claim | The Phase 1 acceptance criteria pass, including mandatory permissions, bounded host calls, fresh runtimes, and `Sandbox::wrap_command` routing. |
-| 2 | Phase 1 | Phase 2 acceptance criteria pass on Linux and macOS. Windows process isolation remains explicitly unsupported until a separate normative phase adds and verifies it. |
+| 2 | Phase 1 | Phase 2 acceptance criteria pass on Linux and macOS. Windows isolation for the general subprocess path remains explicitly unsupported until a separate normative phase adds and verifies it. |
 | 3 | Foundation and Phase 1; Phase 2 is optional | Manual admission, full artifact identity, no-effect verification, prompt-time retrieval, and turn binding pass. |
 | 4 | Foundation, Phase 1, and Phase 3 | Proposals can reach human-approved, non-retrievable canary state; no proposal can become active automatically. |
 | 5 | Phases 1–4 and Foundation | Evidence attribution, deterministic routing, permitted Tier 0/1 replacement promotion, quarantine, repair, rollback, and retention gates pass. |
+| 6 | Preserved Phase 1–5 contracts and both Phase 6 feasibility gates | The brokered runtime acceptance matrix passes on every enabled platform; no production JavaScript path runs in the parent or in an uncontained worker. |
 
 A phase may be decomposed while a prerequisite is open, but it cannot be marked delivered until
 every entry dependency, acceptance criterion, delivery epic, and direct blocker is closed.
@@ -95,6 +103,9 @@ The following rules remain cross-phase invariants:
   fakes that can never touch the real filesystem, process table, or network.
 - Phase 5 never mutates active source in place. Repair creates a new immutable revision and all
   automatic decisions retain evidence and a reversible predecessor link.
+- Phase 6 keeps credentials, persistence, permissions, external effects, and audit in the parent.
+  Stored-skill initialization has no effect or writer authority, and no unavailable containment
+  backend may fall back to parent-process or uncontained JavaScript execution.
 
 ## Current implementation note
 
@@ -105,8 +116,10 @@ tracker issues may cite.
 Phase 1–3 code exists under `src/extras/js/`, with the portable Agent Skills catalog in
 `src/extras/skills/`. The Phase 4
 proposal, held-out evaluation, approval transaction, and active-only visibility boundary are
-delivered. Phase 5 evidence-learning remains later work. Source line numbers are intentionally
-omitted here because they drift; tracker tasks must resolve current symbols before editing.
+delivered. Phase 5 evidence-learning remains later work. Current code still contains Phase 1's
+in-process implementation; Phase 6 explicitly supersedes that delivery baseline as the normative
+target, but the replacement is not yet delivered. Source line numbers are intentionally omitted
+here because they drift; tracker tasks must resolve current symbols before editing.
 
 ## Build commands (mandatory)
 

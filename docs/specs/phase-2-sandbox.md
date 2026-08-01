@@ -1,10 +1,10 @@
 # Phase 2 — Sandbox Hardening
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.0.0
+- **Specification version**: 1.1.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-31
+- **Last reconciled**: 2026-08-01
 - **Entry dependency**: Phase 1 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 2 blocker
 
@@ -12,16 +12,22 @@ The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). Phase 2 extends Phase 1; it does not weaken Phase 1 permissions,
 resource bounds, secure file resolution, or `Sandbox::wrap_command` routing.
 
+[`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md) supersedes Phase 2 only for the
+native JavaScript worker and the placement of JS host effects. This phase remains authoritative for
+the general subprocess path, parent-brokered command containment, `fetch()` validation, and
+file/URL narrowing. The workspace-visible profiles below are forbidden for the JS worker.
+
 ## Overview
 
 Phase 2 adds:
 
 1. permission-gated `fetch(url, opts?)` with URL allow-lists and bounded responses;
 2. read/write path allow-lists that can only narrow Phase 1 file authorization; and
-3. effective child-process isolation on Linux and macOS through the shared `Sandbox` abstraction.
+3. effective general child-process isolation on Linux and macOS through the shared `Sandbox`
+   abstraction.
 
-Phase 2 does not deliver Windows process isolation. JavaScript VM limits are not a substitute for
-child-process isolation on any platform.
+Phase 2 does not deliver Windows isolation for the general subprocess path. JavaScript VM limits
+are not a substitute for child-process isolation on any platform.
 
 ## Cargo.toml additions
 
@@ -44,14 +50,15 @@ effective. Runtime diagnostics continue to report the actual backend state.
 ### reqwest note
 
 The repository has one `reqwest` dependency. Enable its blocking client feature on that existing
-entry; do not add another version. `fetch()` runs from the dedicated JS thread but all waits still
-have finite deadlines and cancellation.
+entry; do not add another version. Historically, `fetch()` ran from the Phase 1 JS thread; Phase 6
+supersedes that placement with parent-broker execution. All waits retain finite deadlines and
+cancellation.
 
 ## Target files
 
 | Concern | Location |
 |---------|----------|
-| Shared process isolation | `src/sandbox.rs` |
+| Shared general-process isolation (not the Phase 6 JS worker) | `src/sandbox.rs` |
 | Fetch and file allow-lists | `src/extras/js/host.rs` |
 | Phase 2 feature/dependencies | `Cargo.toml` |
 | Configuration schema | existing typed config modules |
@@ -134,29 +141,32 @@ The allow-list helper authorizes only; it does not perform file I/O. Final reads
 separately revalidate the target or parent identity immediately before operating. Allow-list
 failure, permission denial, races, timeout, and I/O errors have no read/write effect.
 
-## birdcage integration
+## General subprocess integration
 
-Phase 2 extends the existing `Sandbox` implementation rather than creating a JS-only subprocess
-path. `spawn()` continues to use `Sandbox::wrap_command`; the wrapper selects and configures the
-effective backend.
+Phase 2 extends the existing `Sandbox` implementation for general commands rather than creating a
+JS-only command path. Model-authored `spawn()` continues to reach `Sandbox::wrap_command`; after
+Phase 6 it reaches that wrapper through the parent capability broker. The wrapper selects and
+configures the effective general-process backend. It must not be used to launch the Phase 6 worker,
+whose broker-only containment has no workspace/cache visibility and fails closed independently.
 
-| Platform | Phase 2 process guarantee |
+| Platform | Phase 2 general-process guarantee |
 |----------|---------------------------|
 | Linux | Effective configured isolation using the supported Linux backend, verified by escape/denial tests |
 | macOS | Seatbelt denies network and writes outside the workspace/cache/temp boundary; host-readable files, devices, and process namespaces are explicitly not claimed as isolated |
 | Windows | No Phase 2 process-isolation guarantee; execution is disabled or explicitly reported as non-isolated according to product policy |
 
 Backend absence or setup failure never masquerades as isolation. Whether fallback execution is
-allowed is an explicit user/product policy decision and remains visible to the caller. Phase 2
-does not claim Job Objects, AppContainer, `rappct`, or Windows child termination.
+allowed is an explicit user/product policy decision for the general subprocess path and remains
+visible to the caller. It is never permission for an uncontained JS worker fallback. Phase 2 does
+not claim Job Objects, AppContainer, `rappct`, or Windows child termination.
 
 The implementation must not add a parallel raw `std::process::Command` path for JS. Any blocking
 adapter remains behind the shared wrapper and preserves Phase 1 permission, argument, timeout,
 cancellation, and output bounds.
 
-### Linux `bwrap` capability matrix
+### Linux general-process `bwrap` capability matrix
 
-The default Linux subprocess policy is opt-in (`--sandbox` or `sandbox = true`). When disabled,
+The default Linux general-subprocess policy is opt-in (`--sandbox` or `sandbox = true`). When disabled,
 the wrapper intentionally inherits host capabilities and reports that state. When enabled with
 the default `bwrap` backend, the following matrix is normative:
 
@@ -187,12 +197,13 @@ or child setup error fail closed. No command is retried outside the backend. Cap
 must distinguish disabled, requested-and-available, and requested-but-unavailable states and must
 list the actual bwrap flags/mount policy above.
 
-Subprocess networking and the in-process `fetch()` global are separate capabilities. The bwrap
-subprocess policy always denies networking. A permission-approved `fetch()` runs in the parent
-host implementation and remains subject to its URL validation, allow-list, redirect, deadline,
-and response bounds; it does not grant network access to spawned processes.
+General-subprocess networking and Phase 2's historically in-process `fetch()` global are separate
+capabilities. Phase 6 supersedes that placement by keeping `fetch()` in the parent capability
+broker. The bwrap general-subprocess policy always denies networking. A permission-approved
+`fetch()` remains subject to its URL validation, allow-list, redirect, deadline, and response
+bounds; it does not grant network access to spawned processes or to the JS worker.
 
-### macOS `seatbelt` capability matrix
+### macOS general-process `seatbelt` capability matrix
 
 macOS defaults to the fixed `/usr/bin/sandbox-exec` backend. The executable and every parent
 directory must be root-owned and not group/world-writable. The generated profile denies by
@@ -210,10 +221,11 @@ no requested child and is never retried unsandboxed.
 
 ## Windows behavior
 
-The in-process QuickJS engine may compile and run on Windows, but Phase 2 does not make the full
-action primitive secure or release-ready there. No document may describe Windows spawn as
-sandboxed until a later normative specification defines the backend, lifecycle/termination
-semantics, ACL interactions, CI, and release gate.
+Phase 2's in-process QuickJS placement is historical and superseded by Phase 6; Phase 2 did not
+make the full action primitive secure or release-ready on Windows. Phase 6 separately defines a
+contained JS worker but keeps parent-brokered JS `spawn` disabled until the general Windows command
+sandbox has its own normative backend, lifecycle/termination semantics, ACL interactions, CI, and
+release gate.
 
 ## Acceptance criteria
 
@@ -225,7 +237,8 @@ semantics, ACL interactions, CI, and release gate.
 - [x] Linux and macOS process escape/denial tests prove their documented backend guarantees.
 - [x] Backend absence/failure and Windows non-isolation are visible and never reported as
       sandboxed.
-- [x] JS process spawn still uses the one shared `Sandbox::wrap_command` path.
+- [x] The general command created for JS `spawn` still uses the one shared
+      `Sandbox::wrap_command` path; this is not the Phase 6 worker-launch path.
 - [x] Default and `js`-only behavior deny JS file access until roots or explicit unrestricted
       opt-ins are configured; non-file JS behavior remains unchanged.
 - [x] Linux `bwrap` filesystem, namespace, device, environment, and network policy is explicit,
@@ -233,7 +246,8 @@ semantics, ACL interactions, CI, and release gate.
 
 ## Out of scope for Phase 2
 
-- Windows process isolation and Windows child-process lifecycle enforcement
+- Windows general-process isolation and Windows child-process lifecycle enforcement
+- broker-only JS worker containment (Phase 6)
 - UI for editing allow-lists
 - portable/learned skill libraries (Phase 3)
 - proposal/admission or evidence lifecycle (Phases 4–5)
