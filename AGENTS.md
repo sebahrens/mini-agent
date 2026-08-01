@@ -33,10 +33,11 @@ Working inside `zerostack/`:
 
 | Concern | Location |
 |---------|----------|
-| Runtime lifecycle, JS thread | `src/extras/js/engine.rs` |
+| Worker lifecycle and fresh QuickJS runtimes (Phase 6) | `src/extras/js/worker.rs`, `src/extras/js/realm.rs` |
+| Parent worker supervision and effect broker (Phase 6) | `src/extras/js/supervisor.rs`, `src/extras/js/broker.rs` |
 | JsTool (rig Tool impl) | `src/extras/js/tool.rs` |
-| Host function implementations | `src/extras/js/host.rs` |
-| Request/response channel types | `src/extras/js/types.rs` |
+| Host conversion and parent effect services | `src/extras/js/host.rs` |
+| Wire protocol and parent-local result types | `src/extras/js/protocol.rs`, `src/extras/js/types.rs` |
 | Skill store (Phase 3) | `src/extras/js/skills/` |
 | Unit tests | `src/extras/js/tests/` |
 
@@ -44,18 +45,19 @@ Register `JsTool` in `src/agent/builder.rs` under `#[cfg(feature = "js")]`, alon
 
 ## Invariants — never break these
 
-1. `JsTool` struct fields must all be `Send + Sync`. QuickJS types (`Runtime`, `Context`) must never be fields.
-2. One dedicated OS thread per `JsTool` instance. That thread owns the `Runtime`/`Context` lifecycle.
-3. `Runtime` is dropped and recreated for **every** JS step. No exceptions.
+1. `JsTool` struct fields must all be `Send + Sync`. QuickJS types (`Runtime`, `Context`) must never be fields or exist in the production parent process.
+2. The parent lazily keeps at most one contained JS worker process live at a time and reuses its process-wide supervisor across `JsTool`/agent rebuilds. No production in-process or uncontained fallback is allowed.
+3. The worker drops and recreates `Runtime` for **every** `RunStep` and every whole `VerifyArtifact` request. No QuickJS heap survives a request.
 4. `set_memory_limit(64 * 1024 * 1024)` and `set_max_stack_size(512 * 1024)` on every new `Runtime`.
 5. `set_interrupt_handler` deadline must be set before `ctx.eval(...)` is called.
-6. All `spawn()` calls from JS must go through `Sandbox::wrap_command` — same sandboxing as bash.
+6. All JS effects are typed requests executed by the parent capability broker. A brokered `spawn()` must create its general command through `Sandbox::wrap_command`; the JS worker itself uses the separate broker-only fail-closed launcher and never the workspace-readable general-process profile.
 
 ## Skill library (Phase 3) invariants
 
-- Content-addressed by `sha256(source)` — the ID is the hash
+- Identity version 2 is content-addressed by SHA-256 of the full canonical execution/discovery payload, ABI version, and structured capability scopes — never source alone
 - Skills ship with `tests: Vec<String>` (JS expressions evaluating to `true`)
 - Mutating tests changes the hash → invalidates the skill (integrity enforced structurally)
+- Identity-v1 artifacts are quarantined under Phase 6 until explicitly reproposed and reverified; never infer version-2 scopes
 - Retrieval via embedding cosine similarity on description field
 - Auto-admission (Phase 4) requires a held-out Rust integration test to pass
 

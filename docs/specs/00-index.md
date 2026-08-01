@@ -34,12 +34,26 @@ planning context only; it cannot override the cited section.
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS general-process isolation |
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Delivered | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
-| 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Planned | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
+| 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Complete | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
 | 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Planned | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
 
 Prior research artifacts superseded by this index:
 
 - `docs/specs/2026-07-27-js-engine-blueprint.md`
+
+### Explicit Phase 6 supersession map
+
+Phase 6 changes earlier contracts only in the rows below. Every unlisted concern remains owned by
+its original phase.
+
+| Earlier authority | Superseded or extended concern | Phase 6 authority | Preserved concern |
+|-------------------|--------------------------------|-------------------|-------------------|
+| Phase 1, `Threading model`, `Runtime lifecycle`, and `Builder registration` | In-parent per-`JsTool` thread ownership and independent host-call deadline wording | `Worker lifecycle`, `Failure semantics` | Language behavior, fresh-runtime rule, heap/stack/I/O limits, bounded errors |
+| Phase 2, `General subprocess integration` | Using a workspace-visible general-process profile for the native JS worker; executing JS host effects in worker-owned closures | `Capability broker`, `Platform containment` | URL/path narrowing and the general command path reached through `Sandbox::wrap_command` |
+| Phase 3, `Immutable skill artifact` | Identity-v1 flat host list as the current identity contract | `Persistence boundary` | Immutable full-payload identity, SQLite authority, manual admission, retrieval |
+| Phase 3, `Runtime binding` and `No-effect skill verification` | Same-context source binding and parent/in-thread verifier runtime ownership | `Capability broker`, `Verification parity` | Frozen turn bundle, declared exports, deterministic fake semantics, exact-true tests |
+| Phase 4, `propose_skill()` and proposal persistence | Identity-v1 flat capability payload, JS-thread host placement, and direct access to durable enqueue | `Capability broker`, `Persistence boundary` | Proposal field bounds, held-out evaluation, human approval gates |
+| Phase 5, `Lifecycle and immutable lineage` and `Automatic quarantine` | Normal lifecycle treatment of identity-v1 artifacts during Phase 6 migration | `Persistence boundary`, `Failure semantics` | Evidence policy, transactional lifecycle/index coordination, repair/rollback for eligible identities, retention |
 
 ## Feature relationships
 
@@ -116,7 +130,7 @@ tracker issues may cite.
 Phase 1–3 code exists under `src/extras/js/`, with the portable Agent Skills catalog in
 `src/extras/skills/`. The Phase 4
 proposal, held-out evaluation, approval transaction, and active-only visibility boundary are
-delivered. Phase 5 evidence-learning remains later work. Current code still contains Phase 1's
+delivered. Phase 5 evidence-learning is complete. Current code still contains Phase 1's
 in-process implementation; Phase 6 explicitly supersedes that delivery baseline as the normative
 target, but the replacement is not yet delivered. Source line numbers are intentionally omitted
 here because they drift; tracker tasks must resolve current symbols before editing.

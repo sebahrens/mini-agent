@@ -16,6 +16,13 @@ The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). Phase 5 owns evidence-based lifecycle automation. It cannot bypass
 Phase 4 verification, held-out evaluation, immutable identity, or required human gates.
 
+Phase 5 is complete. [`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md) extends only
+its handling of identity-version migration: identity-v1 artifacts become ineligible and
+quarantined before Phase 6 execution, rollback cannot reactivate them, and explicit reproposal is
+required for identity version 2. Phase 5's evidence thresholds, transactional lifecycle/index
+coordination, immutable lineage, repair, rollback mechanics for eligible artifacts, privacy, and
+retention remain authoritative. Phase 6 is planned; this extension is not marked delivered here.
+
 ---
 
 ## 1. Goal and safety boundary
@@ -62,6 +69,30 @@ Normal lifecycle operations never delete source, evidence, or predecessor links.
 privacy purge may physically remove data after also removing dependent embeddings, events,
 evaluation cases, and index entries.
 
+### Phase 6 identity-v1 migration extension
+
+Before Phase 6 can advertise JS availability, a parent-owned migration runs under the same
+exclusive lifecycle/index-generation gate used for quarantine. It removes every identity-v1
+artifact from retrievable and canary snapshots before any worker request can name it. A version-1
+row in `pending`, `verified`, `canary`, `active`, or `superseded` transitions transactionally to
+`quarantined` with an explicit `phase6_identity_v1` reason; an already quarantined row remains so.
+`rejected` and `retired` retain their stricter terminal stored labels but are classified as
+identity-quarantined by Phase 6 and denied by the same identity-version eligibility gate. No
+identity-v1 row may execute, verify as a Phase 6 artifact, receive evidence, promote, or be selected
+as a rollback target.
+
+Migration never mutates source, tests, exports, or a flat capability list into version-2 identity
+fields, and it never infers a structured scope. Explicit reproposal supplies the complete
+identity-v2 ABI and structured capability scopes, creates a new immutable ID in `pending`, and
+links the preserved version-1 predecessor through the trusted migration-only Phase 4 exception for
+audit without reactivating it. That link provides no fallback or non-inferiority evidence. The new
+revision then passes the ordinary Phase 4 verification/admission and Phase 5 evidence gates.
+
+The database status changes, identity-version eligibility gate, desired index generation, and
+removal-only snapshot publish are one fail-closed migration unit. Failure leaves Phase 6 JS
+unavailable; startup must not expose an old snapshot or retry an identity-v1 artifact in the
+historical runtime.
+
 ---
 
 ## 3. Capability tiers
@@ -73,15 +104,18 @@ evaluation cases, and index entries.
 | 2 | File writes, process spawn, or network | Never; explicit human approval required |
 | 3 | Administrative/security-sensitive effects | Not admitted as a learned reusable skill |
 
-The runtime tracks the currently executing skill wrapper. A host call is allowed only when both
-the normal session permission policy and the skill's immutable capability manifest allow it.
+The delivered runtime tracked the currently executing skill wrapper. Phase 6 replaces that
+attribution mechanism with parent-created invocation/grant bindings and identity-v2 structured
+scopes. A brokered host call is allowed only when the normal session permission policy, target
+narrowing, and the skill's immutable structured capability manifest all allow it.
 Ambient session permission never upgrades a skill. Undeclared capability use is a directly
 attributed policy fault and causes immediate quarantine.
 
-The manifest contains both tier and an exact allow-list of host operations. Tier validates the
-maximum kind of authority; it does not grant every operation in that tier. Unknown operations,
-administrative/security-sensitive hosts, and tier/list mismatches are unrepresentable or rejected
-at admission.
+The delivered identity-v1 manifest contained both tier and an exact flat allow-list of host
+operations. Phase 6 identity v2 replaces that list with exact structured scopes. Tier still
+validates the maximum kind of authority and never grants every operation in that tier. Unknown
+operations, administrative/security-sensitive hosts, and tier/scope mismatches are unrepresentable
+or rejected at admission.
 
 A replacement that increases its capability tier cannot promote automatically, even if all
 quality gates pass.
@@ -206,10 +240,11 @@ CREATE TABLE skill_stats (
 Foreign keys, lifecycle value checks, and schema versions are required. Evidence snapshots use
 canonical JSON so the same decision inputs produce the same audit record.
 
-Event ingestion batches records off the JS thread through a bounded channel. A `JsResponse`
-contains its wrapper events so the tokio side can durably append them before they become eligible
-for an automatic decision. Queue overflow or SQLite failure marks the turn's evidence incomplete;
-the user-visible tool result remains valid, but the turn contributes no promotion or rate-based
+The delivered Phase 5 implementation batched records off the historical JS thread through a
+bounded channel. Phase 6 carries bounded worker-attributed events in the terminal protocol result
+and validates them against the parent invocation/grant table before parent-side durable ingestion.
+Queue overflow, attribution mismatch, or SQLite failure marks the turn's evidence incomplete; the
+user-visible tool result remains valid, but the turn contributes no promotion or rate-based
 quarantine evidence.
 
 ---
@@ -295,6 +330,7 @@ Tier 2 replacements always require human approval after all automated checks pas
 
 Quarantine is immediate for:
 
+- identity version 1 when Phase 6 migration/eligibility is active;
 - canonical identity or stored-content mismatch;
 - undeclared capability use;
 - sandbox or permission-policy violation;
@@ -358,12 +394,15 @@ Successful replacement promotion is one transaction:
 Rollback is also one transaction:
 
 1. Quarantine the replacement with the rollback reason.
-2. Reactivate the exact predecessor revision.
+2. Reactivate the exact predecessor revision only if it is eligible under the current identity
+   version; identity v1 is never eligible under Phase 6.
 3. Persist the transition/evidence record.
 4. Increment index generation and atomically publish the rebuilt snapshot.
 
-Missing predecessors, lineage cycles, stale row versions, or transaction failures leave every
-status unchanged and return a typed error. Rollback does not delete the failed replacement.
+Missing or identity-ineligible predecessors, lineage cycles, stale row versions, or transaction
+failures leave every status unchanged and return a typed error. When no eligible predecessor
+exists, the lineage remains unavailable rather than falling back to identity v1. Rollback does not
+delete the failed replacement.
 
 ---
 
@@ -397,6 +436,8 @@ as alternatives/supersession candidates or retired after review.
 - Telemetry write failure must not turn a successful JS result into a failed user task, but it
   disables automatic promotion/quarantine for the affected turn and emits an operational error.
 - Lifecycle and index-generation changes are fail-closed and transactional.
+- Identity-v1 migration or eligibility-check failure keeps Phase 6 JS unavailable and cannot
+  restore a version-1 revision to retrieval.
 - Embedding or index unavailability returns an empty learned-skill bundle plus an operational
   diagnostic; primitive JS remains available and no unscored skill is injected.
 - A policy evaluator panic/error cannot promote a skill.

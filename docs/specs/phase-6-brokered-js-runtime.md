@@ -17,9 +17,13 @@ Phase 1 remains the authority for the JavaScript language surface, limits, error
 permission semantics that this phase preserves. Its in-parent, per-`JsTool` thread ownership is
 historical and superseded by this phase. Phase 2 remains the authority for URL/path narrowing and
 the general subprocess sandbox used by parent-brokered commands. Its workspace-visible process
-profiles must never contain the JavaScript worker. Phases 3–5 remain authoritative for artifact
-storage, retrieval, admission, and evidence lifecycle except that Phase 6 owns how untrusted
-artifact source is loaded, attributed, and executed.
+profiles must never contain the JavaScript worker. Phase 3 remains authoritative for immutable
+storage, manual admission, and retrieval, while Phase 6 supersedes its identity-v1 capability
+shape, same-context runtime binding, and verifier runtime ownership. Phase 4's proposal and human
+approval gates remain authoritative, while Phase 6 moves proposal transport and persistence behind
+the broker. Phase 5's completed evidence policy and transactional lifecycle remain authoritative,
+while Phase 6 adds the identity-v1 quarantine migration and forbids rollback to identity v1. The
+index contains the exhaustive concern-level supersession map.
 
 The following invariants are unconditional:
 
@@ -152,6 +156,11 @@ includes structured capability scopes in the canonical manifest identity. Any id
 artifact is quarantined until explicitly reproposed and reverified; scope must never be inferred
 automatically.
 
+Explicit identity migration reproposal is a parent-owned operation. It may preserve a quarantined
+identity-v1 predecessor link for audit, but the old artifact contributes no grant, scope,
+verification result, non-inferiority evidence, execution fallback, or rollback eligibility to the
+identity-v2 revision. Model-authored proposals cannot invoke this migration exception.
+
 Stored-skill source initialization is pure. The worker installs neither effect hosts nor
 `propose_skill` while evaluating stored source, and initialization must leave no pending jobs.
 Declared exports are validated only after initialization completes. Proposal drafts and execution
@@ -184,9 +193,32 @@ not native containment.
 Before every real brokered call—including `read_file`—the parent appends and durably syncs an
 authorization/intent record. Audit failure denies the effect. The record is parent-attributed and
 contains the invocation ID, authoritative artifact/export identity when applicable, grant ID,
-normalized operation and target metadata, policy decision, sequence, timestamp, and previous-record
-hash. It contains no source, prompt, argument or file content, response body, environment value,
-credential, or secret.
+normalized operation and redacted target metadata, policy decision, sequence, timestamp, and
+previous-record hash. It contains no source, prompt, argument or file content, response body,
+environment value, credential, secret, raw filesystem path, URL user information, URL path/query,
+or command argument.
+
+Target correlation uses HMAC-SHA-256 with a dedicated parent-only audit key and an explicit
+metadata allow-list; plain unkeyed hashes are forbidden because paths and URLs are often guessable.
+Each tag covers a length-prefixed, domain-separated tuple of operation, metadata kind, and canonical
+target bytes, and the record stores the full 32-byte tag. A file record stores only its storage
+class, operation, and target tag for the canonical UTF-8 path—never a basename or path component. A
+fetch record stores only method, normalized scheme/effective port, one target tag for the
+normalized host, and a separate target tag for the canonical path and query; host labels, query
+names, and query values are never stored in plaintext.
+A command record stores its operation and a keyed digest of the resolved executable, with no
+arguments or environment. Redirect targets receive independent records. The target-correlation
+digest is separate from the audit chain hash, is domain-separated by operation and metadata type,
+and supports equality correlation only; it cannot be used as authorization or reversed to recover
+the target.
+
+The audit key is created in private parent-owned storage, identified by a non-secret key version,
+and never enters the worker or diagnostics. Rotation retains old keys only for the configured audit
+retention window. A missing, unreadable, or corrupt required key makes audit recovery fail and JS
+remain unavailable rather than falling back to plaintext metadata or an unkeyed digest.
+
+The same metadata allow-list and target-tag rules apply to completion records, recovery messages,
+and audit errors; none may reintroduce a raw target while describing a result.
 
 After an attempted effect, the parent appends a bounded completion record describing success,
 denial, timeout, cancellation, truncation, or an ambiguous outcome. The audit is append-only,
@@ -264,7 +296,7 @@ planned until the index exit rule is satisfied.
 | Capability broker | Permission/policy/grant intersection tests cover every typed effect, expiry, scope, Windows spawn denial, and malicious attribution. |
 | Persistence boundary | Tests prove no worker database/path authority, pure initialization, no writer in stored realms, identity-v1 quarantine, and parent-only canonical persistence. |
 | Verification parity | The QuickJS realm gate passes; production and all verifier modes use one loader/ABI path with only declared deterministic fake capabilities. |
-| Effect audit | Recovery and failure-injection tests prove durable intent before every real effect, bounded completion, hash-chain integrity, redaction, retention, and no replay. |
+| Effect audit | Recovery and failure-injection tests prove durable intent before every real effect, bounded completion, hash-chain integrity, HMAC target correlation/redaction, key rotation/failure, retention, and no replay. |
 | Platform containment | Real Linux/macOS/Windows probes prove the broker-only capability matrix; the LPAC install-location gate passes wherever Windows JS is enabled. |
 | Failure semantics | Crash, OOM, timeout, cancellation, audit failure, backend absence, parent death, and ambiguous-effect tests all fail closed with bounded diagnostics and cleanup. |
 | Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded, indexes this planned spec, and marks no Phase 6 feature delivered. |

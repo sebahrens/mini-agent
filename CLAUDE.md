@@ -21,14 +21,15 @@ cargo install --path . --debug # install development binary
 
 ## JS engine implementation
 
-The integration lives at `zerostack/src/extras/js/`. Key invariants to uphold:
+The integration lives at `src/extras/js/`. Key Phase 6 invariants to uphold:
 
-1. **Fresh `Runtime` per step** — never reuse across calls. OOM poisons the allocator.
-2. **`JsTool` holds only `mpsc::Sender<JsRequest>`** — never a `Context` or `Runtime` (both `!Send`).
-3. **Stack size via `std::thread::Builder::new().stack_size(8 * 1024 * 1024)`** — NOT `.cargo/config.toml`.
-4. **Drain microtask queue** after every `eval`: `while rt.execute_pending_job() == Ok(true) {}`.
-5. **Use `eval::<Value, _>`** — not `eval::<(), _>`. Extract `exception.stack()` for LLM self-correction.
-6. **Interrupt handler fires only during JS bytecode** — add `tokio::time::timeout` on blocking host calls.
+1. **Parent-owned contained worker** — lazily keep at most one JS worker process live at a time and reuse its supervisor across `JsTool`/agent rebuilds. Never execute untrusted JS in the parent or fall back to an uncontained worker.
+2. **`JsTool` is `Send + Sync`** — never store a QuickJS `Context`, `Runtime`, or value in `JsTool` or anywhere in the production parent process.
+3. **Fresh `Runtime` per request** — recreate it for every `RunStep` and every whole `VerifyArtifact`; never reuse after success, OOM, timeout, or cancellation.
+4. **Install limits before eval** — every runtime gets the 64 MiB heap limit, 512 KiB JS stack limit, and interrupt deadline before `ctx.eval(...)`.
+5. **Drain bounded pending jobs and preserve errors** — use `eval::<Value, _>`, bound the microtask drain, and return bounded exception message/stack data for model self-correction.
+6. **Broker every effect in the parent** — worker hosts emit typed requests. Parent policy, permissions, target narrowing, deadlines, output limits, and audit are authoritative.
+7. **Brokered spawn uses the general sandbox** — the parent creates a requested command through `Sandbox::wrap_command`. The JS worker itself uses the separate broker-only fail-closed launcher, never the workspace-readable general-process profile.
 
 ## Feature gate
 
@@ -37,20 +38,20 @@ Do not enable by default until Phase 1 passes full test coverage.
 
 ## Testing new JS host functions
 
-Host functions must be tested both at the Rust unit level (mock channel) and via integration tests
-that actually spawn the JS thread. See `zerostack/src/extras/js/tests/` when it exists.
+Host functions must be tested both at the Rust unit level (typed protocol/broker boundary) and via
+integration tests that launch the contained worker. See `src/extras/js/tests/`.
 
 ## Adding a new host global
 
-1. Define handler in `js_thread_main` — receives from `oneshot` back to tokio for async permission checks
-2. Register via `ctx.globals().set(name, Func::from(...))`
-3. Add corresponding `JsRequest` variant
-4. Route permission check through `check_perm` (same path as BashTool)
-5. Write a unit test that exercises the handler in isolation
+1. Add a closed typed effect operation to the worker protocol.
+2. Register only the worker-side closure appropriate to the agent realm; stored-skill realms receive no effect or writer globals.
+3. Implement parent broker validation and bind it to a parent-created invocation grant.
+4. Route permission and target narrowing through the owning parent policy; for `spawn`, create the command through `Sandbox::wrap_command`.
+5. Write broker unit tests plus a contained-worker integration test covering denial and bounded failure.
 
 ## Platform notes
 
-- On Windows: bash feature is compiled out; `js` feature becomes the only action primitive
+- On Windows, JS remains disabled unless the LPAC supported-install-location gate passes; parent-brokered JS `spawn` remains disabled until the separate general Windows command sandbox is delivered
 - Hook subprocess.rs uses `("sh", "-c")` on unix / `("powershell", "-Command")` on Windows — do not change this without updating the hooks module
 - `sandbox.rs`: `kill_process_group` is `#[cfg(unix)]` with empty Windows arm — keep it that way
 

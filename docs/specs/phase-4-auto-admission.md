@@ -16,6 +16,12 @@ The corpus authority and conflict rules are defined in
 auto-admit or auto-activate agent-authored code. It owns proposal evaluation and explicit human
 approval into a non-retrievable canary. Phase 5 alone owns evidence-based automatic transitions.
 
+Phase 6 supersedes this phase's identity-v1 flat proposal capability payload, JS-thread host
+placement, and verifier runtime ownership. Identity-v2 proposals carry complete structured scopes,
+cross worker IPC as bounded drafts, and are canonicalized/persisted only by the parent. Phase 4's
+field bounds, independent held-out evaluation, immutable reports, and human approval gates remain
+authoritative. Phase 6 is planned; the delivered checkmarks below remain Phase 4 evidence only.
+
 ---
 
 ## Scope and safety boundary
@@ -30,8 +36,8 @@ agent proposal → pending → evaluating → verified → awaiting approval →
 
 The evaluator:
 
-1. recomputes and validates the full artifact identity from Phase 3;
-2. runs embedded tests in a fresh, bounded no-effect QuickJS context;
+1. recomputes and validates the full artifact identity under its owning identity version;
+2. runs embedded tests through the owning fresh, bounded no-effect verifier contract;
 3. runs inherited predecessor regressions for replacement proposals;
 4. runs independent content-addressed held-out cases from trusted data storage;
 5. verifies declared exports, capability, and duplicate policy;
@@ -71,9 +77,11 @@ mutable copy of canonical source that could drift from the final artifact.
 | `src/extras/js/host.rs` | EXTENDED | Bounded `propose_skill` host implementation |
 | `src/extras/js/engine.rs` | EXTENDED | Register the host only in normal `skills` execution mode; verifier modes omit it |
 
-The implementation keeps proposal persistence on a dedicated bounded worker, not the QuickJS
-thread. A separate bounded-lifecycle admission worker opens its own store connection and advances
-durable proposals off the JS and async executor threads. `AdmissionEvaluator` is the sole
+The delivered Phase 4 implementation keeps proposal persistence on a dedicated bounded parent-side
+admission worker, not the historical QuickJS thread. Phase 6 preserves that parent-owned
+persistence boundary: the contained JS worker sends a bounded proposal draft over the protocol and
+never opens the store. The admission worker opens its own store connection and advances durable
+proposals off the JS execution path and async executor threads. `AdmissionEvaluator` is the sole
 evaluator/reviewer service. Its private
 `admission_store` dependency owns the only Phase 4 canary transaction; neither `SkillStore`'s
 public surface nor a JS global exposes an active transition. Active-only visibility snapshots
@@ -133,6 +141,10 @@ existing rejection/report idempotently; only changed identity-bearing content cr
 
 ## `propose_skill()` host global
 
+The example below is the delivered identity-v1 payload. Under Phase 6, `allowed_hosts` is replaced
+by canonical structured `scopes`; omission, ambiguity, or a flat version-1 list is rejected rather
+than widened or inferred.
+
 ```javascript
 propose_skill({
   source,
@@ -155,10 +167,18 @@ propose_skill({
 | `tags` | string[] | Optional normalized retrieval tags with count/length limits |
 | `predecessor_id` | string | Optional full immutable revision ID for a replacement proposal |
 
-The host canonicalizes the proposal and computes the Phase 3 full identity. Duplicate submissions
-of the same artifact are idempotent. A predecessor must resolve to an eligible active/canary
-revision. The complete canonical payload and per-session proposal count have fixed limits. Queue
-backpressure returns a typed retryable error rather than growing memory without bound.
+The delivered host canonicalized the proposal and computed the Phase 3 identity-v1 full identity.
+Under Phase 6, the parent canonicalizes the bounded wire draft and computes identity v2 including
+the ABI and complete structured scopes. Duplicate submissions of the same artifact/version are
+idempotent. A predecessor must resolve to an eligible active/canary revision. The complete
+canonical payload and per-session proposal count have fixed limits. Queue backpressure returns a
+typed retryable error rather than growing memory without bound.
+
+The sole exception to predecessor eligibility is Phase 6's explicit parent-owned identity
+migration reproposal path. It may link a quarantined identity-v1 predecessor to the new identity-v2
+revision for immutable audit lineage, but that predecessor supplies no execution, rollback,
+non-inferiority, or capability-scope authority. Ordinary model-authored proposals cannot select
+this exception.
 
 ```rust
 pub fn make_propose_skill(
@@ -341,7 +361,9 @@ All must pass under `cargo test --features js,skills`:
       audit data, and bumps index generation; stale rows and simulated failures fully roll back.
 - [x] Without Phase 5 routing, canary revisions remain absent from model manifests and JS bundles.
 - [x] Phase 4 has no path that automatically marks an agent proposal active.
-- [x] Proposal submission remains non-blocking from the JS thread and respects queue/session bounds.
+- [x] Proposal submission was non-blocking from the delivered Phase 4 JS thread and respected
+      queue/session bounds; Phase 6 preserves those bounds through worker IPC and parent-owned
+      durable enqueue.
 - [x] Logs and reports omit source, tests, held-out values, raw prompts, arguments, and secrets.
 - [x] `cargo test --features js` without `skills` passes unchanged.
 

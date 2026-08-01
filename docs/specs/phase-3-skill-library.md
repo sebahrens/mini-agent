@@ -14,8 +14,16 @@ execution.
 **Target scale**: up to 100,000 local/shared skill revisions.
 
 The corpus authority and conflict rules are defined in
-[`00-index.md`](00-index.md). Phase 3 owns learned-skill identity, manual admission, retrieval, and
-no-effect verification. It does not own agent proposal admission or evidence-based promotion.
+[`00-index.md`](00-index.md). Phase 3 owns the delivered identity-v1/full-payload baseline, manual
+admission, retrieval, and no-effect verification semantics. It does not own agent proposal
+admission or evidence-based promotion.
+
+[`phase-6-brokered-js-runtime.md`](phase-6-brokered-js-runtime.md) explicitly supersedes this
+phase's identity-v1 flat capability shape, same-context runtime binding, and verifier runtime
+ownership. Phase 3 remains authoritative for immutable full-payload identity, SQLite storage,
+manual admission, frozen turn bundles, retrieval, declared exports, and deterministic verifier
+semantics. The index maps the exact section-level boundary; Phase 6 is planned, so this notice does
+not mark its identity-v2 or worker implementation delivered.
 
 ---
 
@@ -30,7 +38,9 @@ same immutable source snapshot.
 Retrieving inside `engine::run_step` from model-generated JavaScript is prohibited. At that point
 the model has already written its code and cannot discover an injected function, and embedding
 raw JS against English descriptions produces a cross-domain query. Embedding and retrieval live
-in the tokio runner/session layer; the dedicated JS thread only evaluates a resolved bundle.
+in the tokio runner/session layer. The delivered Phase 3 implementation sent the resolved bundle
+to a dedicated JS thread; Phase 6 replaces that historical evaluator with a contained worker while
+keeping retrieval and database access in the parent.
 
 Phase 3 supports manual admission after verification. Agent proposals and human-gated canary
 admission are Phase 4. Evidence-driven promotion, quarantine, repair, and rollback are Phase 5.
@@ -101,6 +111,12 @@ is a sibling feature so its resources are never mistaken for verified JS globals
 
 ## Immutable skill artifact — `src/extras/js/skills/mod.rs`
 
+The type shape below records delivered identity version 1. Its flat `allowed_hosts` list is
+superseded for new Phase 6 artifacts by identity version 2 structured capability scopes. Identity
+version 2 retains every other execution/discovery-bearing field, includes its ABI version and the
+complete canonical structured scopes in the hash, and is governed by Phase 6's `Persistence
+boundary`. No reader may interpret this version-1 example as permission to infer version-2 scopes.
+
 ```rust
 pub struct SkillArtifact {
     pub id: String,
@@ -137,9 +153,10 @@ pub enum HostCapability {
 }
 ```
 
-`id` is the full 64-character SHA-256 of a versioned canonical serialization containing source,
-ordered tests, ordered exports/signatures, description, normalized ordered tags, and the full
-capability manifest.
+For delivered identity version 1, `id` is the full 64-character SHA-256 of a versioned canonical
+serialization containing source, ordered tests, ordered exports/signatures, description,
+normalized ordered tags, and the full flat capability manifest. Identity version 2 applies the
+same full-payload rule to its structured capability manifest and ABI version.
 Exact UTF-8 bytes are preserved for source/tests/description; no implicit whitespace or newline
 normalization occurs. Length-prefix every field and list item to avoid ambiguous concatenation.
 
@@ -148,7 +165,8 @@ only read-only operations; `SideEffecting` may declare only the supported Tier 0
 duplicate, or administrative/security-sensitive capabilities are rejected. Runtime and verifier
 checks use the exact list, never a broad tier-wide ambient grant.
 
-Changing any execution- or discovery-bearing field creates a new ID. Timestamps, status,
+Changing any execution- or discovery-bearing field creates a new ID. Changing identity/ABI version
+or any structured capability scope also creates a new ID. Timestamps, status,
 telemetry, lineage, row version, and embedding bytes are operational data outside identity. There
 is no update operation for identity-bearing columns. The store recomputes identity on insert and
 every active read; caller-provided IDs are never trusted.
@@ -386,13 +404,15 @@ runner. The manifest contains no source:
 </available_js_skills>
 ```
 
-The JS tool snapshots the exact bundle when the tool call begins and includes it in `JsRequest`.
-The JS thread performs no database access, embedding, or ranking.
+The JS tool snapshots the exact bundle when the tool call begins and includes it in the execution
+request. Under the delivered Phase 3 implementation, the JS thread performed no database access,
+embedding, or ranking. Phase 6 preserves that boundary: the contained worker receives a frozen
+bundle and no database, while all retrieval and ranking remain parent-owned.
 
-### Runtime binding
+### Historical runtime binding (superseded by Phase 6)
 
-Evaluate selected skill sources as script 1, validate and wrap the declared exports, then evaluate
-model-authored code as script 2 in the same fresh context:
+Delivered Phase 3 evaluated selected skill sources as script 1, validated and wrapped the declared
+exports, then evaluated model-authored code as script 2 in the same fresh context:
 
 ```javascript
 // Script 1, generated by zerostack from the frozen bundle
@@ -402,7 +422,9 @@ function parseJson(s) { /* immutable selected source */ }
 parseJson(input)
 ```
 
-Separate scripts preserve agent-code line numbers. Skill-source failures identify the full skill ID
+Phase 6 replaces the shared context with its private skill realm, agent realm, hidden immutable
+invocation capability object, and declared JSON-clone boundary. The separate-script line-number
+and frozen-bundle requirements remain. Skill-source failures identify the full skill ID
 and never rewrite the agent script. Missing/duplicate exports, source exceptions, capability
 violations, and bundle identity mismatches fail closed. If the bundle is empty, evaluate only the
 agent script and add no manifest.
@@ -410,6 +432,11 @@ agent script and add no manifest.
 ---
 
 ## No-effect skill verification — `src/extras/js/skills/verify.rs`
+
+The no-real-effect, exact-true, deterministic-fake, mutation, and error semantics in this section
+remain authoritative. Its delivered parent/thread runtime ownership and same-context loader are
+superseded by Phase 6 `Verification parity`, which requires the contained worker and the production
+private-realm loader/ABI path.
 
 ```rust
 pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, VerificationError> {
@@ -430,9 +457,11 @@ Trusted held-out cases may supply hidden fake responses and assert the recorded 
 Embedded tests cannot inspect hidden fixtures or replace fake implementations.
 
 Verification errors include the stage/test index and bounded stack information but never activate
-or persist the artifact. Each skill verification gets a new runtime and new fake state; tests
-within one verification run execute in declared order in the same fresh context and may observe
-source state and earlier deterministic fake effects. Mutation passes and every new artifact
+or persist the artifact. In delivered Phase 3, each skill verification got a new runtime and fake
+state, and tests within one run executed in declared order in the same fresh context. Phase 6 keeps
+one fresh runtime/fake state for the whole `VerifyArtifact` request but moves source into the same
+private skill realm and ABI used by production. Tests may observe source state and earlier
+deterministic fake effects. Mutation passes and every new artifact
 verification use new contexts and new fake state. No test can observe a hidden fixture or a prior
 verification run.
 
