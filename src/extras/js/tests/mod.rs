@@ -3,6 +3,8 @@ mod agent_skill_catalog;
 #[cfg(feature = "skills")]
 mod auto_admission_end_to_end;
 #[cfg(feature = "skills")]
+mod capability_manifest_v2;
+#[cfg(feature = "skills")]
 mod evidence_policy_scheduler;
 #[cfg(feature = "skills")]
 mod evidence_promotion_policy;
@@ -54,6 +56,7 @@ mod skill_targeted_feedback;
 mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
+mod worker_protocol;
 
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::tool::JsTool;
