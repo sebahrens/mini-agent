@@ -105,6 +105,41 @@ fn exhausted_token_budget(usage: Usage, budget: Option<u64>) -> Option<(u64, u64
     (used >= budget).then_some((used, budget))
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "Agent stream ended without a terminal response; provider attempt budget exhausted ({attempts}/{limit})."
+)]
+struct NonTerminalStreamExhausted {
+    attempts: usize,
+    limit: usize,
+}
+
+/// Charge a provider stream that reached EOF without a terminal response.
+///
+/// Rig normally emits one `CompletionCall` for each provider call, including
+/// calls whose raw stream ends without a provider final marker. Some provider
+/// adapters can end before that accounting event, though, so an EOF must cost
+/// at least one turn. The `turns_at_stream_start` snapshot lets this compose
+/// with normal completion-call accounting without double-charging it.
+fn charge_nonterminal_eof(
+    turns_used: &mut usize,
+    turns_at_stream_start: usize,
+    max_turns: usize,
+) -> Result<(), NonTerminalStreamExhausted> {
+    if *turns_used == turns_at_stream_start {
+        *turns_used = turns_used.saturating_add(1);
+    }
+
+    if *turns_used >= max_turns {
+        return Err(NonTerminalStreamExhausted {
+            attempts: *turns_used,
+            limit: max_turns,
+        });
+    }
+
+    Ok(())
+}
+
 /// Spawn an isolated, single-turn, tool-less side-question run. The full result
 /// is delivered as a single [`BtwEvent::Done`] (or [`BtwEvent::Error`]) tagged
 /// with `id`. Unlike [`spawn_agent`], it never registers a subagent event sink
@@ -422,6 +457,7 @@ where
         const MAX_EMPTY_RESPONSES: u32 = 3;
         let max_turns = agent.default_max_turns.unwrap_or(1);
         let mut turns_used = 0usize;
+        let mut turns_at_stream_start = turns_used;
         let mut cumulative_usage = Usage::new();
         // Overrides the next continuation message (bottom of the outer
         // `loop`); set when a `Stop` hook forces continuation instead of the
@@ -481,6 +517,7 @@ where
         };
 
         loop {
+            let mut terminal_response_seen = false;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
@@ -557,6 +594,7 @@ where
                         tool_interactions.push(tool_result.clone().into());
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                        terminal_response_seen = true;
                         let usage = res.usage();
                         let response_text = res.output;
                         tracing::info!(
@@ -645,6 +683,21 @@ where
                 }
             }
 
+            if !terminal_response_seen
+                && let Err(error) =
+                    charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
+            {
+                tracing::warn!(
+                    attempts = error.attempts,
+                    limit = error.limit,
+                    "agent stream EOF budget exhausted"
+                );
+                let _ = event_tx
+                    .send(AgentEvent::Error(CompactString::new(error.to_string())))
+                    .await;
+                return;
+            }
+
             let remaining_turns = max_turns.saturating_sub(turns_used);
             if remaining_turns == 0 {
                 tracing::warn!(
@@ -683,6 +736,7 @@ where
                 remaining_turns,
             )
             .await;
+            turns_at_stream_start = turns_used;
         }
     };
 
@@ -734,17 +788,16 @@ where
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    #[cfg(feature = "hooks")]
     let retry_history: Vec<Message> = history;
-    #[cfg(feature = "hooks")]
     let mut tool_interactions: Vec<Message> = Vec::new();
     let mut full_response = String::new();
     let mut last_tool_name: Option<String> = None;
     let mut usage = rig::completion::Usage::new();
     let mut cumulative_usage = Usage::new();
     let mut turns_used = 0usize;
-    // Set true only when a `Stop` hook forces another turn; drives the outer
-    // loop. Stays false (single pass, no continuation) in the hooks-off build.
+    let mut turns_at_stream_start = turns_used;
+    // Drives the outer loop for either a `Stop`-forced continuation or recovery
+    // from a provider stream that ended without a terminal response.
     let mut continue_turn = true;
     #[cfg(feature = "hooks")]
     let mut next_instruction: Option<String> = None;
@@ -757,6 +810,7 @@ where
 
     while continue_turn {
         continue_turn = false;
+        let mut terminal_response_seen = false;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
@@ -782,7 +836,6 @@ where
                         println!("\n◈ {} {}", name, summary);
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
-                    #[cfg(feature = "hooks")]
                     tool_interactions.push(tool_call.clone().into());
                 }
                 Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
@@ -806,7 +859,6 @@ where
                         }
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
-                    #[cfg(feature = "hooks")]
                     tool_interactions.push(tool_result.clone().into());
                 }
                 Ok(MultiTurnStreamItem::CompletionCall(call)) => {
@@ -820,6 +872,7 @@ where
                     );
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    terminal_response_seen = true;
                     usage = res.usage();
                     #[cfg(feature = "hooks")]
                     if let crate::extras::hooks::StopGate::Continue { reason } =
@@ -857,7 +910,12 @@ where
             }
         }
 
-        #[cfg(feature = "hooks")]
+        if !terminal_response_seen {
+            charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
+                .map_err(anyhow::Error::new)?;
+            continue_turn = true;
+        }
+
         if continue_turn {
             let remaining_turns = max_turns.saturating_sub(turns_used);
             if remaining_turns == 0 {
@@ -872,9 +930,12 @@ where
                      completing. Compact the session or increase max_tokens before retrying."
                 );
             }
+            #[cfg(feature = "hooks")]
             let injected_prompt = next_instruction
                 .take()
                 .unwrap_or_else(|| prompt.to_string());
+            #[cfg(not(feature = "hooks"))]
+            let injected_prompt = prompt.to_string();
             let new_tool_interactions = take_new_tool_interactions(&mut tool_interactions);
             // Keep the text already streamed to stdout this turn: the caller
             // persists the returned string as the assistant message, so
@@ -889,6 +950,7 @@ where
                 remaining_turns,
             )
             .await;
+            turns_at_stream_start = turns_used;
         }
     }
 
@@ -1032,7 +1094,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{attributed_tool_result, streamed_reasoning_text, warn_unknown_stream_item};
+    use super::{
+        NonTerminalStreamExhausted, attributed_tool_result, charge_nonterminal_eof,
+        streamed_reasoning_text, warn_unknown_stream_item,
+    };
     use rig::OneOrMany;
     use rig::agent::{AgentBuilder, MultiTurnStreamItem};
     use rig::completion::{Message, Usage};
@@ -1404,6 +1469,200 @@ mod tests {
                 .is_some_and(|message| message.contains("110/100")),
             "the runner must report cumulative token-budget exhaustion"
         );
+    }
+
+    #[test]
+    fn runner_eof_without_terminal_event_repeated_immediate_eof_is_bounded() {
+        let max_turns = 3;
+        let mut turns_used = 0;
+        let mut provider_calls = 0;
+
+        let error = loop {
+            provider_calls += 1;
+            let turns_at_stream_start = turns_used;
+            match charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns) {
+                Ok(()) => continue,
+                Err(error) => break error,
+            }
+        };
+
+        assert_eq!(
+            provider_calls, max_turns,
+            "EOF retries must stop exactly at the shared turn limit"
+        );
+        assert_eq!(
+            error,
+            NonTerminalStreamExhausted {
+                attempts: 3,
+                limit: 3,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "Agent stream ended without a terminal response; provider attempt budget exhausted (3/3)."
+        );
+    }
+
+    #[test]
+    fn runner_eof_without_terminal_event_partial_text_still_consumes_attempt() {
+        let mut turns_used = 0;
+        let turns_at_stream_start = turns_used;
+        let partial_text = "provider output that must not appear in the diagnostic";
+
+        let error = charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, 1)
+            .expect_err("a partial nonterminal stream still exhausts a one-turn budget");
+
+        assert_eq!(turns_used, 1);
+        assert!(!error.to_string().contains(partial_text));
+    }
+
+    #[test]
+    fn runner_eof_without_terminal_event_malformed_item_does_not_double_charge_completion() {
+        let turns_at_stream_start = 4;
+        let mut turns_used = 5;
+
+        charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, 6)
+            .expect("the already-accounted attempt remains within budget");
+
+        assert_eq!(
+            turns_used, 5,
+            "an observed CompletionCall is the same provider attempt"
+        );
+    }
+
+    #[test]
+    fn runner_eof_without_terminal_event_transient_eof_leaves_room_for_completion() {
+        let mut turns_used = 0;
+        let turns_at_stream_start = turns_used;
+
+        charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, 2)
+            .expect("one transient EOF may recover within the shared budget");
+
+        assert_eq!(turns_used, 1);
+        // A terminal response on the next provider call bypasses EOF charging;
+        // normal CompletionCall accounting consumes the remaining turn.
+        turns_used += 1;
+        assert_eq!(turns_used, 2);
+    }
+
+    #[test]
+    fn runner_eof_without_terminal_event_tool_call_and_result_then_eof_is_bounded() {
+        // A tool-bearing provider call normally emits CompletionCall before its
+        // ToolCall/ToolResult pair. EOF after those events must use that same
+        // charged turn rather than adding or losing an attempt.
+        let turns_at_stream_start = 0;
+        let mut turns_used = 1;
+
+        let error = charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, 1)
+            .expect_err("the already-charged tool turn exhausted the shared budget");
+
+        assert_eq!(turns_used, 1);
+        assert_eq!(error.attempts, 1);
+        assert_eq!(error.limit, 1);
+    }
+
+    #[test]
+    fn runner_eof_without_terminal_event_interactive_headless_diagnostic_parity() {
+        let exhaust = || {
+            let mut turns_used = 0;
+            charge_nonterminal_eof(&mut turns_used, 0, 1)
+                .expect_err("one-turn EOF must exhaust")
+                .to_string()
+        };
+
+        let interactive_diagnostic = exhaust();
+        let headless_diagnostic = anyhow::Error::new({
+            let mut turns_used = 0;
+            charge_nonterminal_eof(&mut turns_used, 0, 1).expect_err("one-turn EOF must exhaust")
+        })
+        .to_string();
+
+        assert_eq!(interactive_diagnostic, headless_diagnostic);
+        assert_eq!(
+            interactive_diagnostic,
+            "Agent stream ended without a terminal response; provider attempt budget exhausted (1/1)."
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_eof_without_terminal_event_terminal_completion_is_unchanged() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(2)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut response = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { response: done, .. } => {
+                    response = Some(done.to_string());
+                    break;
+                }
+                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(model.requests().len(), 1);
+        assert_eq!(response.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn runner_eof_without_terminal_event_valid_tool_continuation_is_unchanged() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("tool-ok", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("finished"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(2)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut response = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { response: done, .. } => {
+                    response = Some(done.to_string());
+                    break;
+                }
+                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(model.requests().len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.as_deref(), Some("finished"));
     }
 
     #[test]
