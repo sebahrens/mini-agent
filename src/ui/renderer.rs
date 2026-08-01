@@ -1301,16 +1301,19 @@ impl Renderer {
     }
 }
 
-/// Validate that a URL is safe to hand to the OS opener: an absolute
-/// http(s) URL with a non-empty host, no whitespace or control characters,
-/// and a sane length. Anything else (file:, javascript:, bare paths, ...)
-/// is rejected so a malicious or malformed link cannot reach the shell.
+/// Validate that a URL is safe to hand to the OS opener: an absolute http(s)
+/// URL with a non-empty host, no control characters, and a sane length.
+/// Literal spaces are accepted after the host because browser launch APIs
+/// preserve or encode them as URL data. Anything else (file:, javascript:,
+/// bare paths, ...) is rejected before it reaches an OS API.
 pub(crate) fn is_safe_url(url: &str) -> bool {
-    let url = url.trim();
     if url.is_empty() || url.len() > 2048 {
         return false;
     }
-    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    if url
+        .chars()
+        .any(|c| c.is_control() || (c.is_whitespace() && c != ' '))
+    {
         return false;
     }
     let Some(rest) = url
@@ -1320,7 +1323,69 @@ pub(crate) fn is_safe_url(url: &str) -> bool {
         return false;
     };
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    !host.is_empty()
+    !host.is_empty() && !host.chars().any(char::is_whitespace)
+}
+
+/// The complete data passed to `ShellExecuteW`. There is deliberately no
+/// command line: `target` is the file/URL operand and `parameters` stays null.
+/// Keeping construction platform-neutral makes this security boundary testable
+/// on every host as well as in the Windows CI row.
+#[cfg(any(test, windows))]
+pub(crate) struct WindowsOpenRequest {
+    pub(crate) verb: Vec<u16>,
+    pub(crate) target: Vec<u16>,
+    pub(crate) parameters: Option<Vec<u16>>,
+}
+
+#[cfg(any(test, windows))]
+impl WindowsOpenRequest {
+    #[cfg(test)]
+    pub(crate) fn verb_text(&self) -> String {
+        String::from_utf16_lossy(&self.verb[..self.verb.len().saturating_sub(1)])
+    }
+}
+
+#[cfg(any(test, windows))]
+pub(crate) fn windows_open_request(url: &str) -> Option<WindowsOpenRequest> {
+    is_safe_url(url).then(|| WindowsOpenRequest {
+        verb: "open".encode_utf16().chain([0]).collect(),
+        target: url.encode_utf16().chain([0]).collect(),
+        parameters: None,
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn open_url_windows(url: &str) -> anyhow::Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let request = windows_open_request(url).expect("open_url validates before platform dispatch");
+    let parameters = request
+        .parameters
+        .as_ref()
+        .map_or(std::ptr::null(), |value| value.as_ptr());
+    // SAFETY: each string is an immutable, NUL-terminated UTF-16 allocation
+    // that remains alive for the duration of the call. Null handles and the
+    // null parameters/directory pointers are explicitly supported by this API.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            request.verb.as_ptr(),
+            request.target.as_ptr(),
+            parameters,
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize > 32 {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Windows browser opener failed with ShellExecuteW code {}",
+            result as isize
+        )
+    }
 }
 
 /// Open `url` in the system browser. The URL is validated first; the error
@@ -1331,11 +1396,16 @@ pub fn open_url(url: &str) -> anyhow::Result<()> {
         let preview: String = url.chars().take(80).collect();
         anyhow::bail!("refusing to open invalid or non-http(s) URL: {}", preview);
     }
+
+    #[cfg(windows)]
+    return open_url_windows(url);
+
+    #[cfg(not(windows))]
     let openers: &[(&str, &[&str])] = &[
         ("xdg-open", &[url]),
-        ("open", &[url]),               // macOS
-        ("cmd", &["/c", "start", url]), // Windows
+        ("open", &[url]), // macOS
     ];
+    #[cfg(not(windows))]
     for &(cmd, args) in openers {
         let Ok(mut child) = std::process::Command::new(cmd)
             .args(args)
@@ -1351,7 +1421,8 @@ pub fn open_url(url: &str) -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    anyhow::bail!("no working opener found (tried xdg-open, open, cmd)")
+    #[cfg(not(windows))]
+    anyhow::bail!("no working opener found (tried xdg-open and open)")
 }
 
 /// Copy `text` to the system clipboard. Tries external tools (checking
