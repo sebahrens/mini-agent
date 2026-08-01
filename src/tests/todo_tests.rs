@@ -2,6 +2,15 @@ use crate::agent::tools::WriteTodoList;
 use crate::agent::tools::todo::{TODO_LIST, TodoItem, TodoWriteArgs};
 use compact_str::CompactString;
 use rig::tool::Tool;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+static TODO_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_todo_tests() -> MutexGuard<'static, ()> {
+    TODO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 fn reset_todo_list() {
     let mut list = TODO_LIST
@@ -34,6 +43,7 @@ async fn definition_parameters_has_required_fields() {
 
 #[tokio::test]
 async fn call_with_empty_todos() {
+    let _guard = lock_todo_tests();
     reset_todo_list();
     let tool = WriteTodoList::new(None, None);
     let args = TodoWriteArgs { todos: vec![] };
@@ -45,6 +55,7 @@ async fn call_with_empty_todos() {
 
 #[tokio::test]
 async fn call_formats_todo_items_with_icons() {
+    let _guard = lock_todo_tests();
     reset_todo_list();
     let tool = WriteTodoList::new(None, None);
     let args = TodoWriteArgs {
@@ -93,6 +104,7 @@ async fn call_formats_todo_items_with_icons() {
 
 #[tokio::test]
 async fn call_updates_global_todo_list() {
+    let _guard = lock_todo_tests();
     reset_todo_list();
     let tool = WriteTodoList::new(None, None);
     let args = TodoWriteArgs {
@@ -121,6 +133,7 @@ async fn call_updates_global_todo_list() {
 
 #[tokio::test]
 async fn call_overwrites_previous_list() {
+    let _guard = lock_todo_tests();
     reset_todo_list();
     let tool = WriteTodoList::new(None, None);
 
