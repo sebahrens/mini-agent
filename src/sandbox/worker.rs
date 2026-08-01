@@ -11,6 +11,19 @@ use std::fs::File;
 use std::io;
 use std::process::ExitStatus;
 
+pub(crate) const INTERNAL_WORKER_MARKER: &str = "MINI_AGENT_INTERNAL_JS_WORKER";
+pub(crate) const INTERNAL_WORKER_MARKER_VALUE: &str = "brokered-v1";
+
+pub(crate) fn is_internal_worker_marker_present() -> bool {
+    std::env::var_os(INTERNAL_WORKER_MARKER).is_some()
+}
+
+pub(crate) fn standard_streams_are_protocol_pipes() -> bool {
+    // This rejects terminals, files, null devices, and sockets. It intentionally makes no
+    // same-user identity claim: Unix FIFOs and Windows named/anonymous pipes share an OS type.
+    platform::standard_streams_are_protocol_pipes()
+}
+
 #[cfg(target_os = "linux")]
 #[path = "worker/linux.rs"]
 mod platform;
@@ -161,13 +174,37 @@ impl Drop for WorkerProcess {
 }
 
 #[cfg(test)]
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct TestWorkerLauncher;
+#[derive(Debug, Clone, Copy)]
+enum TestWorkerTarget {
+    LauncherProbe,
+    InternalWorker,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TestWorkerLauncher {
+    target: TestWorkerTarget,
+}
+
+#[cfg(test)]
+impl Default for TestWorkerLauncher {
+    fn default() -> Self {
+        Self::current_test_process()
+    }
+}
 
 #[cfg(test)]
 impl TestWorkerLauncher {
     pub(crate) const fn current_test_process() -> Self {
-        Self
+        Self {
+            target: TestWorkerTarget::LauncherProbe,
+        }
+    }
+
+    pub(crate) const fn internal_worker_process() -> Self {
+        Self {
+            target: TestWorkerTarget::InternalWorker,
+        }
     }
 }
 
@@ -184,17 +221,35 @@ impl WorkerLauncher for TestWorkerLauncher {
         let executable =
             std::env::current_exe().map_err(|source| WorkerLaunchError::Io { backend, source })?;
         let mut command = Command::new(executable);
+        // Seed representative secrets before clearing the command environment. The bootstrap
+        // child asserts these values are absent, proving the launcher does not inherit parent
+        // credentials, configuration, workspace hints, or PATH.
         command
+            .env("OPENROUTER_API_KEY", "A07_CREDENTIAL_CANARY_MUST_NOT_LEAK")
+            .env("MINI_AGENT_CONFIG", "A07_CONFIG_CANARY_MUST_NOT_LEAK")
+            .env("MINI_AGENT_WORKSPACE", "A07_WORKSPACE_CANARY_MUST_NOT_LEAK")
             .env_clear()
-            .env("MINI_AGENT_TEST_WORKER_PROCESS", "1")
-            .args([
-                "--exact",
-                "sandbox::worker::tests::worker_launcher_test_child",
-                "--nocapture",
-            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        match self.target {
+            TestWorkerTarget::LauncherProbe => {
+                command.env("MINI_AGENT_TEST_WORKER_PROCESS", "1").args([
+                    "--exact",
+                    "sandbox::worker::tests::worker_launcher_test_child",
+                    "--nocapture",
+                ]);
+            }
+            TestWorkerTarget::InternalWorker => {
+                command
+                    .env(INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE)
+                    .args([
+                        "--exact",
+                        "extras::js::tests::worker_runtime::worker_bootstrap_test_child",
+                        "--nocapture",
+                    ]);
+            }
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;

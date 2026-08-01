@@ -5,6 +5,7 @@ pub(crate) mod protocol;
 pub mod skills;
 pub mod tool;
 pub mod types;
+pub(crate) mod worker;
 
 #[cfg(test)]
 mod tests;
