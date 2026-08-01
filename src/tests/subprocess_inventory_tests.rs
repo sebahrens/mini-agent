@@ -361,6 +361,129 @@ const MIXED_SITES: &[(&str, &str, &[&str])] = &[(
     &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
 )];
 
+const ALLOWED_CURRENT_CLASSES: &[&str] = &[
+    "NON-PROCESS",
+    "TEST-ONLY",
+    "TC-EXPLICIT-USER-SHELL",
+    "TC-INTERNAL-GIT",
+    "TC-INTERNAL-VERIFICATION",
+    "TC-LIFECYCLE-HELPER",
+    "TC-LOOP-VALIDATION",
+    "TC-LSP-SERVICE",
+    "TC-MCP-STDIO",
+    "TC-MODEL-ACTION",
+    "TC-PROJECT-AUTOMATION",
+    "TC-SUPPORT-UTILITY",
+];
+
+/// Allowed classes per source family. This prevents a known source site from
+/// satisfying the lexical inventory by borrowing an unrelated class token.
+const FAMILY_CLASSES: &[(&str, &[&str])] = &[
+    ("src/agent/tools/bash.rs", &["TEST-ONLY"]),
+    ("src/docs.rs", &["TC-SUPPORT-UTILITY"]),
+    ("src/extras/acp/mod.rs", &["NON-PROCESS"]),
+    ("src/extras/export.rs", &["NON-PROCESS"]),
+    (
+        "src/extras/git_worktree/mod.rs",
+        &["TC-INTERNAL-GIT", "NON-PROCESS"],
+    ),
+    ("src/extras/hooks/subprocess.rs", &["TC-PROJECT-AUTOMATION"]),
+    ("src/extras/js/engine.rs", &["NON-PROCESS"]),
+    ("src/extras/js/host.rs", &["NON-PROCESS"]),
+    ("src/extras/js/skills/admission.rs", &["NON-PROCESS"]),
+    ("src/extras/js/skills/embed.rs", &["NON-PROCESS"]),
+    ("src/extras/js/skills/proposal.rs", &["NON-PROCESS"]),
+    ("src/extras/js/skills/telemetry.rs", &["NON-PROCESS"]),
+    ("src/extras/js/skills/turn.rs", &["NON-PROCESS"]),
+    ("src/extras/js/skills/verify.rs", &["NON-PROCESS"]),
+    ("src/extras/js/tool.rs", &["NON-PROCESS"]),
+    ("src/extras/loop/headless.rs", &["TC-LOOP-VALIDATION"]),
+    ("src/extras/loop/mod.rs", &["TC-INTERNAL-VERIFICATION"]),
+    ("src/extras/lsp/client.rs", &["TC-LSP-SERVICE"]),
+    ("src/extras/mcp/client.rs", &["TC-MCP-STDIO"]),
+    (
+        "src/sandbox.rs",
+        &["TC-MODEL-ACTION", "TC-LIFECYCLE-HELPER"],
+    ),
+    ("src/session/mod.rs", &["TC-INTERNAL-GIT"]),
+    ("src/startup.rs", &["TC-EXPLICIT-USER-SHELL"]),
+    (
+        "src/ui/app.rs",
+        &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
+    ),
+    ("src/ui/event_handler.rs", &["TC-LOOP-VALIDATION"]),
+    ("src/ui/input/mod.rs", &["TC-SUPPORT-UTILITY"]),
+    ("src/ui/renderer.rs", &["TC-SUPPORT-UTILITY"]),
+    ("src/ui/slash/memory.rs", &["TC-SUPPORT-UTILITY"]),
+    ("src/ui/slash/session.rs", &["TC-INTERNAL-GIT"]),
+];
+
+fn checked_inventory() -> BTreeMap<(String, String, usize), &'static str> {
+    let mut expected = BTreeMap::new();
+    for &(path, source, count, classification) in UNIFORM_SITES {
+        for occurrence in 1..=count {
+            assert!(
+                expected
+                    .insert(
+                        (path.to_string(), source.to_string(), occurrence),
+                        classification,
+                    )
+                    .is_none(),
+                "duplicate checked inventory entry for {path} occurrence {occurrence}: {source}"
+            );
+        }
+    }
+    for &(path, source, classifications) in MIXED_SITES {
+        for (index, &classification) in classifications.iter().enumerate() {
+            let occurrence = index + 1;
+            assert!(
+                expected
+                    .insert(
+                        (path.to_string(), source.to_string(), occurrence),
+                        classification,
+                    )
+                    .is_none(),
+                "duplicate checked inventory entry for {path} occurrence {occurrence}: {source}"
+            );
+        }
+    }
+    expected
+}
+
+fn validate_current_class_assignments() -> Result<(), String> {
+    let expected = checked_inventory();
+    let inventory_paths: BTreeSet<_> = expected.keys().map(|(path, _, _)| path.as_str()).collect();
+
+    for ((path, source, occurrence), classification) in &expected {
+        if *classification == "TC-BROKER-JS-WORKER" {
+            return Err(format!(
+                "broker-only JS worker cannot classify a current site: {path} occurrence {occurrence}: {source}"
+            ));
+        }
+        if !ALLOWED_CURRENT_CLASSES.contains(classification) {
+            return Err(format!(
+                "class {classification} is not allowed for current launch inventory"
+            ));
+        }
+        let family_classes = FAMILY_CLASSES
+            .iter()
+            .find_map(|(family, classes)| (*family == path).then_some(*classes))
+            .ok_or_else(|| format!("source family {path} has no ownership rule"))?;
+        if !family_classes.contains(classification) {
+            return Err(format!(
+                "class {classification} cannot own {path} occurrence {occurrence}: {source}"
+            ));
+        }
+    }
+
+    for (path, _) in FAMILY_CLASSES {
+        if !inventory_paths.contains(path) {
+            return Err(format!("stale source-family ownership rule for {path}"));
+        }
+    }
+    Ok(())
+}
+
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut sources = Vec::new();
@@ -415,34 +538,7 @@ fn production_subprocess_sites_have_a_trust_classification() {
         }
     }
 
-    let mut expected = BTreeMap::<(String, String, usize), &str>::new();
-    for &(path, source, count, classification) in UNIFORM_SITES {
-        for occurrence in 1..=count {
-            assert!(
-                expected
-                    .insert(
-                        (path.to_string(), source.to_string(), occurrence),
-                        classification,
-                    )
-                    .is_none(),
-                "duplicate checked inventory entry for {path} occurrence {occurrence}: {source}"
-            );
-        }
-    }
-    for &(path, source, classifications) in MIXED_SITES {
-        for (index, &classification) in classifications.iter().enumerate() {
-            let occurrence = index + 1;
-            assert!(
-                expected
-                    .insert(
-                        (path.to_string(), source.to_string(), occurrence),
-                        classification,
-                    )
-                    .is_none(),
-                "duplicate checked inventory entry for {path} occurrence {occurrence}: {source}"
-            );
-        }
-    }
+    let expected = checked_inventory();
 
     let unclassified: Vec<_> = observed
         .iter()
@@ -460,9 +556,24 @@ fn production_subprocess_sites_have_a_trust_classification() {
     let specification = std::fs::read_to_string(root.join("docs/specs/subprocess-trust.md"))
         .expect("the normative subprocess trust specification must exist");
     for classification in expected.values() {
-        assert!(
-            specification.contains(&format!("`{classification}`")),
-            "inventory classification {classification} has no normative specification entry"
-        );
+        if classification.starts_with("TC-") {
+            let table_prefix = format!("| `{classification}`");
+            assert!(
+                specification
+                    .lines()
+                    .any(|line| line.starts_with(&table_prefix)),
+                "inventory classification {classification} has no normative contract-table row"
+            );
+        } else {
+            assert!(
+                specification.contains(&format!("`{classification}`")),
+                "inventory disposition {classification} has no specification entry"
+            );
+        }
     }
+}
+
+#[test]
+fn current_subprocess_inventory_rejects_broker_and_cross_family_classes() {
+    validate_current_class_assignments().expect("current subprocess classes must be allowed");
 }
