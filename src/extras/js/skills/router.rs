@@ -51,6 +51,7 @@ pub struct FrozenRoute {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[allow(clippy::enum_variant_names)]
 pub enum RouterError {
     #[error("canary share exceeds the configured ten-percent ceiling")]
     InvalidShare,

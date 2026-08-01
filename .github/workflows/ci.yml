@@ -33,6 +33,12 @@ jobs:
       - name: Test loop lifecycle
         run: python3 -m unittest scripts.tests.test_loop_lifecycle
 
+      - name: Test Cargo feature graph gate
+        run: python3 -m unittest scripts.tests.test_check_feature_graph
+
+      - name: Verify Cargo feature graph
+        run: python3 scripts/check_feature_graph.py
+
   clippy:
     if: github.event_name != 'schedule'
     strategy:
@@ -40,17 +46,17 @@ jobs:
       matrix:
         # Explicit supported rows rather than --all-features. The isolated memory
         # and sandbox rows catch missing cfg gates that the default row can mask.
-        # --all-features would
-        # enable `skills-embed`, pulling ort-sys (ONNX Runtime), which has no
-        # prebuilt binaries for some hosts and adds a large native download to
-        # every run. That backend is exercised by the optional job below.
+        # --all-features would enable `skills-embed`, pulling ort-sys (ONNX
+        # Runtime), which has no prebuilt binaries for some hosts and adds a
+        # large native download to every run. That backend is exercised by the
+        # optional job below.
         features:
           - ""
           - "--no-default-features"
-          - "--features memory"
-          - "--features sandbox"
-          - "--features js,skills"
-          - "--features mcp,js,skills"
+          - "--no-default-features --features memory"
+          - "--no-default-features --features sandbox"
+          - "--no-default-features --features js,skills"
+          - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,14 +80,14 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          - "--features memory"
-          - "--features sandbox"
-          - "--features js"
-          - "--features skills"
-          - "--features js,sandbox"
-          - "--features mcp"
-          - "--features js,skills"
-          - "--features mcp,js,skills"
+          - "--no-default-features --features memory"
+          - "--no-default-features --features js"
+          - "--no-default-features --features sandbox"
+          - "--no-default-features --features skills"
+          - "--no-default-features --features js,sandbox"
+          - "--no-default-features --features mcp"
+          - "--no-default-features --features js,skills"
+          - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -93,12 +99,12 @@ jobs:
         run: cargo test --locked ${{ matrix.features }}
 
       - name: Validate deterministic skill retrieval benchmark metrics
-        if: matrix.os == 'ubuntu-latest' && matrix.features == '--features js,skills'
-        run: cargo test --locked --features js,skills skill_retrieval_benchmark_smoke -- --nocapture
+        if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills'
+        run: cargo test --locked --no-default-features --features js,skills skill_retrieval_benchmark_smoke -- --nocapture
 
       - name: Compile the full Phase 5 operations audit
-        if: matrix.os == 'ubuntu-latest' && matrix.features == '--features js,skills'
-        run: cargo test --locked --features js,skills phase5_operations_benchmark
+        if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills'
+        run: cargo test --locked --no-default-features --features js,skills phase5_operations_benchmark
 
   # The local ONNX/BGE embedding backend. Kept out of the required matrix because
   # ort-sys ships no prebuilt binaries for every host (notably x86_64-apple-darwin)
@@ -114,8 +120,8 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      - name: Test (--features js,skills,skills-embed)
-        run: cargo test --locked --features js,skills,skills-embed
+      - name: Test (--no-default-features --features skills-embed)
+        run: cargo test --locked --no-default-features --features skills-embed
 
   linux-sandbox-policy:
     if: github.event_name != 'schedule'
