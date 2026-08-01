@@ -1,5 +1,5 @@
 #[cfg(feature = "memory")]
-use crate::extras::memory::{Mem, WriteMode, WriteTarget};
+use crate::extras::memory::{Mem, WriteMode, WriteTarget, is_safe_daily_name};
 use crate::ui::slash::SlashCtx;
 use crate::ui::slash::write_error;
 #[cfg(feature = "memory")]
@@ -107,29 +107,41 @@ fn handle_search(parts: &[&str], ctx: &mut SlashCtx<'_>) {
 
 #[cfg(feature = "memory")]
 fn handle_read(parts: &[&str], ctx: &mut SlashCtx<'_>) {
+    handle_read_with_mem(parts, ctx.renderer, &Mem::open());
+}
+
+#[cfg(feature = "memory")]
+fn handle_read_with_mem(parts: &[&str], renderer: &mut crate::ui::renderer::Renderer, mem: &Mem) {
     if parts.len() < 3 {
-        write_error(ctx.renderer, "usage: /memory read <source> [name]");
+        write_error(renderer, "usage: /memory read <source> [YYYY-MM-DD|name]");
         write_result(
-            ctx.renderer,
-            "  sources: long_term, scratchpad, daily, note",
+            renderer,
+            "  sources: long_term, scratchpad, daily [YYYY-MM-DD], note <name>",
         );
         return;
     }
-    let mem = Mem::open();
     let source = parts[2].to_lowercase();
     let path = match source.as_str() {
         "long_term" | "long" => Some(mem.memory_md()),
         "scratchpad" => Some(mem.scratchpad()),
-        "daily" => Some(mem.daily_file(&mem.today)),
+        "daily" => {
+            let date = parts.get(3).copied().unwrap_or(&mem.today);
+            if is_safe_daily_name(date) {
+                Some(mem.daily_file(date))
+            } else {
+                write_error(renderer, "invalid daily date name (expected YYYY-MM-DD)");
+                None
+            }
+        }
         "note" => {
             let name = parts.get(3);
             name.and_then(|n| mem.note_path(n))
         }
         _ => {
-            write_error(ctx.renderer, format!("unknown source: {source}"));
+            write_error(renderer, format!("unknown source: {source}"));
             write_result(
-                ctx.renderer,
-                "  sources: long_term, scratchpad, daily, note",
+                renderer,
+                "  sources: long_term, scratchpad, daily [YYYY-MM-DD], note <name>",
             );
             None
         }
@@ -142,12 +154,12 @@ fn handle_read(parts: &[&str], ctx: &mut SlashCtx<'_>) {
                 } else {
                     s
                 };
-                write_ok(ctx.renderer, format!("{} ({source}):", p.display()));
+                write_ok(renderer, format!("{} ({source}):", p.display()));
                 for line in capped.lines() {
-                    write_result(ctx.renderer, line);
+                    write_result(renderer, line);
                 }
             }
-            Err(e) => write_error(ctx.renderer, format!("read error: {e}")),
+            Err(e) => write_error(renderer, format!("read error: {e}")),
         }
     }
 }
@@ -379,6 +391,63 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    fn rendered_text(renderer: &crate::ui::renderer::Renderer) -> String {
+        let width = 4096;
+        let line_count = renderer.feed().line_count(width);
+        if line_count == 0 {
+            return String::new();
+        }
+        renderer
+            .feed()
+            .selected_text(width, 0, line_count - 1)
+            .unwrap()
+    }
+
+    #[test]
+    fn memory_read_daily_uses_requested_date_and_rejects_invalid_names() {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-memory-read-{}", uuid::Uuid::new_v4()));
+        let mem = Mem {
+            root: root.clone(),
+            project: "proj".to_string(),
+            today: "2026-05-25".to_string(),
+        };
+        std::fs::create_dir_all(mem.daily_file(&mem.today).parent().unwrap()).unwrap();
+        std::fs::write(mem.daily_file("2026-05-15"), "REQUESTED DAILY CONTENT").unwrap();
+
+        let mut valid_renderer = crate::ui::renderer::Renderer::new().unwrap();
+        handle_read_with_mem(
+            &["/memory", "read", "daily", "2026-05-15"],
+            &mut valid_renderer,
+            &mem,
+        );
+        let valid_output = rendered_text(&valid_renderer);
+        assert!(valid_output.contains("2026-05-15.md (daily):"));
+        assert!(valid_output.contains("REQUESTED DAILY CONTENT"));
+
+        std::fs::write(mem.daily_file(&mem.today), "TODAY DAILY CONTENT").unwrap();
+        let mut default_renderer = crate::ui::renderer::Renderer::new().unwrap();
+        handle_read_with_mem(&["/memory", "read", "daily"], &mut default_renderer, &mem);
+        let default_output = rendered_text(&default_renderer);
+        assert!(default_output.contains("2026-05-25.md (daily):"));
+        assert!(default_output.contains("TODAY DAILY CONTENT"));
+
+        let escaped_path = root.join("projects/etc/passwd.md");
+        std::fs::create_dir_all(escaped_path.parent().unwrap()).unwrap();
+        std::fs::write(&escaped_path, "TRAVERSAL CONTENT").unwrap();
+        let mut invalid_renderer = crate::ui::renderer::Renderer::new().unwrap();
+        handle_read_with_mem(
+            &["/memory", "read", "daily", "../../etc/passwd"],
+            &mut invalid_renderer,
+            &mem,
+        );
+        let invalid_output = rendered_text(&invalid_renderer);
+        assert!(invalid_output.contains("invalid daily date name"));
+        assert!(!invalid_output.contains("TRAVERSAL CONTENT"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

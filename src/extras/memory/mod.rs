@@ -70,7 +70,7 @@ fn normalize_line(line: &str) -> String {
 /// sanitization, so an unchecked name like `../../secret` would traverse out of
 /// the memory store. Allow ASCII digits and hyphens only (enough for a
 /// `YYYY-MM-DD` date), which forbids `.`, `/`, and `\`.
-fn is_safe_daily_name(name: &str) -> bool {
+pub(crate) fn is_safe_daily_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_digit() || c == '-')
 }
 
