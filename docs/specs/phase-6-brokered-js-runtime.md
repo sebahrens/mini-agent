@@ -270,18 +270,43 @@ forbidden.
 ### Windows image-loading feasibility gate
 
 The A03 research spike provides a Windows-only ignored real-backend test named
-`windows_lpac_can_load_current_exe_with_only_protocol_handles`. It creates or derives one stable
-zero-capability AppContainer profile, opts out of `ALL APPLICATION PACKAGES` for LPAC, supplies an
-exact three-handle anonymous protocol/diagnostic list, and assigns an unnamed kill-on-close,
-single-process Job through the creation-time attribute list. Its child must emit a fixed readiness
-frame, report access denied when opening a parent-created workspace sentinel, and prove an
-inheritable canary handle deliberately omitted from `HANDLE_LIST` is invalid in the child.
+`windows_lpac_can_load_current_exe_with_only_protocol_handles`. It is a required three-artifact
+matrix: the Cargo-built libtest harness, a real binary produced by
+`cargo install --path . --debug`, and a copy of that installed binary staged as a user archive
+artifact under `%LOCALAPPDATA%`. `MINI_AGENT_LPAC_CARGO_INSTALL_EXE` must name the installed
+binary; a missing variable, a path outside the active Cargo home, or an omitted matrix row fails
+the gate. The installed and archive rows execute `--version`; the harness row additionally runs
+the containment probes. Thus no unexecuted install layout is reported as passing.
 
-The probe classifies only current-user-owned Cargo build, Cargo install, and user-profile/archive
-locations as candidates. It first checks the existing file DACL and, only when required, adds one
-non-inheritable read/execute ACE for the exact AppContainer SID to the executable file, restoring
-the original DACL after the probe. It never grants `Everyone`, `ALL APPLICATION PACKAGES`, or a
-writable directory. Protected machine-wide and unknown locations are unsupported and fail closed.
+For every row the gate makes a private disposable copy within that row's real location class and
+changes only the copy. It rejects NULL DACLs; inherited-deny ambiguity; broad executable access
+for Everyone, Authenticated Users, Builtin Users, `ALL APPLICATION PACKAGES`, or `ALL RESTRICTED
+APPLICATION PACKAGES`; and write, modify, ACL, ownership, or delete authority held by any
+untrusted principal. It enumerates the committed ACEs, requires exactly one non-inheriting
+read/execute ACE for the exact package SID, checks effective access, and holds the executable open
+without share-write or share-delete until `CreateProcessW` returns. It never restores a stale
+whole DACL. Every ancestor through the classified trust root must be local, fixed-drive,
+non-reparse, non-NULL-DACL, and protected from other-principal mutation or deletion. UNC, remote,
+protected machine-wide, and unknown roots fail closed.
+
+The launch creates or derives one stable zero-capability AppContainer profile, opts out of `ALL
+APPLICATION PACKAGES` for LPAC, uses `DETACHED_PROCESS`, supplies an exact three-handle anonymous
+protocol/diagnostic list, and assigns an unnamed kill-on-close, single-process Job through the
+creation-time attribute list. The parent verifies membership in that exact Job. The harness child
+must verify `TokenIsAppContainer`, `TokenIsLessPrivilegedAppContainer`, zero token capabilities,
+no console window or `CONIN$`/`CONOUT$`, the three distinct standard protocol handles, rejection of
+an inheritable canary omitted from `HANDLE_LIST`, and access denial for a parent-created workspace
+sentinel before emitting its fixed readiness frame. Profile and disposable-artifact cleanup errors
+are part of the gate result rather than silently treated as success.
+
+On a standard-user Windows checkout, prepare and run the complete gate with:
+
+```powershell
+cargo install --path . --debug
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $cargoHome 'bin\mini-agent.exe'
+cargo test windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --exact
+```
 
 This source-level gate has not been executed on Windows as part of the macOS-authored change. Its
 result remains unverified until the ignored test passes on `windows-latest` and a standard-user
