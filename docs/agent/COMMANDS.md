@@ -222,6 +222,9 @@ before the next iteration. Cancellation is operation-scoped: headless SIGINT
 waits for that validator's cleanup before exiting, while interactive
 Ctrl-C/Ctrl-D is routed semantically (`/btw` first, then validation or the main
 run) and never uses validation cancellation to stop unrelated sandbox commands.
+Interactive validators carry generation IDs, so cancelling and starting a new
+run or loop immediately retires the old generation; a late cleanup completion
+cannot advance or respawn the replacement loop.
 
 | Command | Description |
 | ------- | ----------- |
