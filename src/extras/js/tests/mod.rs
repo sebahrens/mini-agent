@@ -3,6 +3,8 @@ mod agent_skill_catalog;
 #[cfg(feature = "skills")]
 mod auto_admission_end_to_end;
 #[cfg(feature = "skills")]
+mod capability_manifest_v2;
+#[cfg(feature = "skills")]
 mod evidence_policy_scheduler;
 #[cfg(feature = "skills")]
 mod evidence_promotion_policy;

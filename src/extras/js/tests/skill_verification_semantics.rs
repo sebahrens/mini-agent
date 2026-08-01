@@ -16,6 +16,7 @@ mod tests {
     };
     use crate::extras::js::skills::{
         CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
+        test_manifest,
     };
 
     // Helper to create a skill.
@@ -26,7 +27,7 @@ mod tests {
         tier: CapabilityTier,
         capabilities: Vec<HostCapability>,
     ) -> SkillArtifact {
-        let capability = CapabilityManifest::new(tier, capabilities).unwrap();
+        let capability = test_manifest(tier, capabilities).unwrap();
         let exports_vec = exports
             .into_iter()
             .map(|(name, sig)| SkillExport {
@@ -544,7 +545,7 @@ mod tests {
 mod required_behaviour_probes {
     use crate::extras::js::skills::verify::verify_skill;
     use crate::extras::js::skills::{
-        CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
+        CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
     };
 
     fn artifact(
@@ -566,7 +567,7 @@ mod required_behaviour_probes {
                 })
                 .collect(),
             tests.into_iter().map(str::to_string).collect(),
-            CapabilityManifest::new(tier, hosts).expect("valid manifest"),
+            test_manifest(tier, hosts).expect("valid manifest"),
         )
         .expect("valid artifact")
     }
@@ -669,7 +670,7 @@ mod required_behaviour_probes {
 mod fake_integrity_probes {
     use crate::extras::js::skills::verify::verify_skill;
     use crate::extras::js::skills::{
-        CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
+        CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
     };
 
     fn artifact(source: &str, tests: Vec<&str>, hosts: Vec<HostCapability>) -> SkillArtifact {
@@ -682,7 +683,7 @@ mod fake_integrity_probes {
                 signature: "f(): boolean".to_string(),
             }],
             tests.into_iter().map(str::to_string).collect(),
-            CapabilityManifest::new(CapabilityTier::SideEffecting, hosts).expect("manifest"),
+            test_manifest(CapabilityTier::SideEffecting, hosts).expect("manifest"),
         )
         .expect("artifact")
     }

@@ -122,14 +122,14 @@ fn seed_v2(paths: &AppPaths, generations: &str) {
 fn skill_admission_schema_migrates_and_reopens() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("fresh store");
-    assert_eq!(store.schema_version().expect("version"), 4);
+    assert_eq!(store.schema_version().expect("version"), 5);
     drop(store);
     assert_eq!(
         SkillStore::open_at(&paths)
             .expect("reopen")
             .schema_version()
             .expect("version"),
-        4
+        5
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -155,7 +155,7 @@ fn skill_admission_schema_upgrades_phase3_v2_without_losing_generation_shape() {
     );
 
     let store = SkillStore::open_at(&paths).expect("upgrade Phase 3 v2");
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     let state = store.generation_state().expect("generation state");
     assert_eq!(state.desired_generation, 7);
     assert_eq!(state.applied_generation, 6);
@@ -180,13 +180,107 @@ fn skill_admission_schema_upgrades_legacy_phase4_v2_collision() {
     );
 
     let store = SkillStore::open_at(&paths).expect("upgrade legacy Phase 4 v2");
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     let state = store
         .generation_state()
         .expect("normalized generation state");
     assert_eq!(state.desired_generation, 3);
     assert_eq!(state.applied_generation, 0);
     assert_eq!(store.count_proposals().unwrap(), 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_admission_schema_quarantines_all_identity_v1_tiers_without_inference() {
+    let (root, paths) = paths();
+    drop(SkillStore::open_at(&paths).expect("create current schema"));
+    let database = paths.local_data_dir.join("skills/skills.db");
+    let connection = Connection::open(&database).expect("open fixture database");
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA user_version = 4;
+            INSERT INTO skill_revisions (
+                id, identity_version, source, description, tags_json, exports_json,
+                tests_json, capability_json, status, lineage_root_id, supersedes_id,
+                row_version, created_at, updated_at
+            ) VALUES
+                ('1111111111111111111111111111111111111111111111111111111111111111', 1,
+                 'pure-v1-source', 'pure v1', '[]', '[]', '["true"]',
+                 '{"tier":"pure","allowed_hosts":[]}', 'active',
+                 '1111111111111111111111111111111111111111111111111111111111111111', NULL,
+                 7, 10, 10),
+                ('2222222222222222222222222222222222222222222222222222222222222222', 1,
+                 'read-v1-source', 'read v1', '[]', '[]', '["true"]',
+                 '{"tier":"read_only","allowed_hosts":["read_file"]}', 'canary',
+                 '1111111111111111111111111111111111111111111111111111111111111111',
+                 '1111111111111111111111111111111111111111111111111111111111111111',
+                 8, 11, 11),
+                ('3333333333333333333333333333333333333333333333333333333333333333', 1,
+                 'effect-v1-source', 'effect v1', '[]', '[]', '["true"]',
+                 '{"tier":"side_effecting","allowed_hosts":["write_file","fetch","spawn"]}',
+                 'verified',
+                 '1111111111111111111111111111111111111111111111111111111111111111',
+                 '2222222222222222222222222222222222222222222222222222222222222222',
+                 9, 12, 12);
+            "#,
+        )
+        .expect("seed identity-v1 fixtures");
+    drop(connection);
+
+    let mut store = SkillStore::open_at(&paths).expect("migrate identity v1");
+    assert_eq!(store.schema_version().unwrap(), 5);
+    assert!(store.list_retrievable().unwrap().is_empty());
+
+    let rows = store
+        .conn_mut()
+        .prepare(
+            "SELECT id, source, capability_json, status, quarantine_reason,
+                    lineage_root_id, supersedes_id, row_version
+               FROM skill_revisions WHERE identity_version = 1 ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].1, "pure-v1-source");
+    assert_eq!(rows[1].1, "read-v1-source");
+    assert_eq!(rows[2].1, "effect-v1-source");
+    assert!(rows.iter().all(|row| row.3 == "quarantined"));
+    assert!(
+        rows.iter()
+            .all(|row| row.4.as_deref() == Some("manifest_scope_required"))
+    );
+    assert!(rows[1].2.contains("allowed_hosts"));
+    assert_eq!(rows[1].6.as_deref(), Some(rows[0].0.as_str()));
+    assert_eq!(rows[2].6.as_deref(), Some(rows[1].0.as_str()));
+    assert_eq!(
+        rows.iter().map(|row| row.7).collect::<Vec<_>>(),
+        vec![8, 9, 10]
+    );
+    assert_eq!(
+        store
+            .conn_mut()
+            .query_row("SELECT COUNT(*) FROM skill_search", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
     let _ = std::fs::remove_dir_all(root);
 }
 
