@@ -101,6 +101,8 @@ mod statusline_tests;
 #[cfg(all(test, feature = "subagents"))]
 mod subagents_tests;
 #[cfg(test)]
+mod subprocess_inventory_tests;
+#[cfg(test)]
 mod todo_tests;
 #[cfg(test)]
 mod tools_filter_tests;
