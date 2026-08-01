@@ -37,6 +37,8 @@ mod skill_lifecycle_schema;
 #[cfg(feature = "skills")]
 mod skill_quarantine_policy;
 #[cfg(feature = "skills")]
+mod skill_realm_isolation;
+#[cfg(feature = "skills")]
 mod skill_repair_and_rollback;
 #[cfg(feature = "skills")]
 mod skill_repair_records;
