@@ -1,4 +1,4 @@
-# Spec Index — mini-agent JS Engine
+# Spec Index — mini-agent
 
 - **Document role**: normative authority map
 - **Specification version**: 1.1.0
@@ -8,7 +8,7 @@
 
 ## Authority and conflict resolution
 
-The documents indexed below are the only normative JS design corpus. `ARCHITECTURE.md` is an
+The documents indexed below are the only normative design corpus. `ARCHITECTURE.md` is an
 architecture overview and `SPEC.md` is an implementation overview; they explain the normative
 corpus but cannot add, remove, or override requirements. Dated blueprints are superseded research
 artifacts and must not be used for implementation.
@@ -16,11 +16,13 @@ artifacts and must not be used for implementation.
 Apply normative text in this order:
 
 1. `platform-paths.md` controls storage, path, archive, and credential concerns in every phase.
-2. The phase spec that owns a concern controls that concern. A later phase changes an earlier
+2. `subprocess-trust.md` controls subprocess class selection and launch contracts; a phase spec
+   controls the concrete boundary for the class it owns.
+3. The phase spec that owns a concern controls that concern. A later phase changes an earlier
    contract only where it explicitly says that it extends or replaces that contract.
-3. This index controls corpus authority, phase dependencies, feature relationships, and exit
+4. This index controls corpus authority, phase dependencies, feature relationships, and exit
    semantics.
-4. If two normative passages still conflict, implementation stops until this index or the owning
+5. If two normative passages still conflict, implementation stops until this index or the owning
    phase spec is corrected. Tracker text, overview text, examples, and current code do not break
    the tie.
 
@@ -30,6 +32,7 @@ planning context only; it cannot override the cited section.
 | Phase | Normative spec | Delivery status | Owns |
 |-------|----------------|-----------------|------|
 | Foundation | [platform-paths.md](platform-paths.md) | In progress | Typed Linux/macOS/Windows roots, artifact ownership, secure migration |
+| Cross-cutting | [subprocess-trust.md](subprocess-trust.md) | Contract delivered | Subprocess principals, trust classes, launch fields, fail-closed backend selection, checked launch inventory |
 | 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | Delivered | Core QuickJS integration, `JsTool`, primitive host globals |
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS general-process isolation |
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
