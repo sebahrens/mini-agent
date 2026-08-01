@@ -14,13 +14,11 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{
-    CapabilityManifest, CapabilityTier, HostCapability, IdentityError, SkillArtifact, SkillExport,
-};
+use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact, SkillExport};
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +35,7 @@ pub struct StoredEmbedding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillRecordMetadata {
     pub status: String,
+    pub quarantine_reason: Option<String>,
     pub supersedes_id: Option<String>,
     pub superseded_by_id: Option<String>,
     pub row_version: u64,
@@ -285,6 +284,9 @@ pub enum StoreError {
     #[error("unsupported future schema version: {0}")]
     UnsupportedSchemaVersion(u32),
 
+    #[error("identity-v1 artifact is quarantined: manifest_scope_required")]
+    LegacyIdentityQuarantined,
+
     #[error("FTS5 is not available in this SQLite build")]
     MissingFts5,
 }
@@ -357,7 +359,7 @@ impl SkillStore {
         let tags_json = serde_json::to_string(&artifact.tags)?;
         let exports_json = serialize_exports(&artifact.exports)?;
         let tests_json = serde_json::to_string(&artifact.tests)?;
-        let capability_json = serialize_capability(&artifact.capability)?;
+        let capability_json = serialize_capability(artifact)?;
 
         let now = current_timestamp()?;
 
@@ -459,6 +461,7 @@ impl SkillStore {
             "SELECT id, identity_version, source, description, tags_json,
                     exports_json, tests_json, capability_json, status
              FROM skill_revisions WHERE status = 'active'
+               AND identity_version = 2
              ORDER BY id",
         )?;
 
@@ -483,7 +486,8 @@ impl SkillStore {
 
     pub fn active_count(&self) -> Result<usize, StoreError> {
         let count = self.db.query_row(
-            "SELECT COUNT(*) FROM skill_revisions WHERE status = 'active'",
+            "SELECT COUNT(*) FROM skill_revisions
+              WHERE status = 'active' AND identity_version = 2",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -509,7 +513,7 @@ impl SkillStore {
              FROM skill_revisions r
              LEFT JOIN skill_embeddings e
                ON e.skill_id = r.id AND e.model_id = ? AND e.model_revision = ?
-             WHERE r.status = 'active'
+             WHERE r.status = 'active' AND r.identity_version = 2
              ORDER BY r.id",
         )?;
         let rows = statement.query_map(params![model_id, model_revision], |row| {
@@ -543,6 +547,7 @@ impl SkillStore {
             }
             let metadata = SkillRecordMetadata {
                 status: "active".to_string(),
+                quarantine_reason: None,
                 supersedes_id,
                 superseded_by_id,
                 row_version: u64::try_from(row_version).unwrap_or(0),
@@ -665,15 +670,16 @@ impl SkillStore {
     pub fn metadata(&self, id: &str) -> Result<Option<SkillRecordMetadata>, StoreError> {
         self.db
             .query_row(
-                "SELECT status, supersedes_id, superseded_by_id, row_version
+                "SELECT status, quarantine_reason, supersedes_id, superseded_by_id, row_version
              FROM skill_revisions WHERE id = ?",
                 params![id],
                 |row| {
-                    let row_version: i64 = row.get(3)?;
+                    let row_version: i64 = row.get(4)?;
                     Ok(SkillRecordMetadata {
                         status: row.get(0)?,
-                        supersedes_id: row.get(1)?,
-                        superseded_by_id: row.get(2)?,
+                        quarantine_reason: row.get(1)?,
+                        supersedes_id: row.get(2)?,
+                        superseded_by_id: row.get(3)?,
                         row_version: u64::try_from(row_version).unwrap_or(0),
                     })
                 },
@@ -2470,6 +2476,64 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
         }
     }
 
+    // Migration 4 -> 5: identity-v2 manifests bind ABI v2 and structured scopes.
+    // Identity-v1 bytes and lineage remain immutable, but every legacy row is
+    // operationally quarantined with a stable reason. FTS is rebuilt behind an
+    // identity-v2 predicate. No legacy flat host list is interpreted.
+    if current_version < 5 {
+        db.execute_batch("BEGIN IMMEDIATE;")?;
+        let migration = (|| -> Result<(), StoreError> {
+            ensure_column(db, "skill_revisions", "quarantine_reason", "TEXT")?;
+            db.execute(
+                "UPDATE skill_revisions
+                    SET status = 'quarantined',
+                        quarantine_reason = 'manifest_scope_required',
+                        row_version = row_version + 1,
+                        updated_at = CASE WHEN updated_at < 1 THEN 1 ELSE updated_at END
+                  WHERE identity_version = 1",
+                [],
+            )?;
+            db.execute_batch(
+                "DROP TRIGGER IF EXISTS skill_search_ai;
+                 DROP TRIGGER IF EXISTS skill_search_ad;
+                 DROP TRIGGER IF EXISTS skill_search_au;
+                 DELETE FROM skill_search;
+
+                 CREATE TRIGGER skill_search_ai AFTER INSERT ON skill_revisions
+                 WHEN NEW.status = 'active' AND NEW.identity_version = 2 BEGIN
+                     INSERT INTO skill_search (rowid, identifier, description, tags, exports)
+                     VALUES (NEW.rowid, NEW.id, NEW.description, NEW.tags_json, NEW.exports_json);
+                 END;
+
+                 CREATE TRIGGER skill_search_ad AFTER DELETE ON skill_revisions BEGIN
+                     DELETE FROM skill_search WHERE rowid = OLD.rowid;
+                 END;
+
+                 CREATE TRIGGER skill_search_au AFTER UPDATE ON skill_revisions BEGIN
+                     DELETE FROM skill_search WHERE rowid = OLD.rowid;
+                     INSERT INTO skill_search (rowid, identifier, description, tags, exports)
+                     SELECT NEW.rowid, NEW.id, NEW.description, NEW.tags_json, NEW.exports_json
+                      WHERE NEW.status = 'active' AND NEW.identity_version = 2;
+                 END;
+
+                 INSERT INTO skill_search (rowid, identifier, description, tags, exports)
+                 SELECT rowid, id, description, tags_json, exports_json
+                   FROM skill_revisions
+                  WHERE status = 'active' AND identity_version = 2;
+
+                 PRAGMA user_version = 5;",
+            )?;
+            Ok(())
+        })();
+        match migration {
+            Ok(()) => db.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = db.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2485,15 +2549,24 @@ fn read_artifact_row(row: &Row) -> rusqlite::Result<Result<SkillArtifact, StoreE
     let capability_json: String = row.get(7)?;
 
     // Parse JSON fields; return error if malformed.
-    let parse_result = (|| {
+    let parse_result = (|| -> Result<SkillArtifact, StoreError> {
         let tags: Vec<String> = serde_json::from_str(&tags_json)?;
         let exports = deserialize_exports(&exports_json)?;
         let tests: Vec<String> = serde_json::from_str(&tests_json)?;
-        let capability = deserialize_capability(&capability_json)?;
+        if identity_version == 1 {
+            return Err(StoreError::LegacyIdentityQuarantined);
+        }
+        if identity_version != super::IDENTITY_VERSION {
+            return Err(StoreError::IdentityValidation(
+                IdentityError::UnsupportedIdentityVersion(identity_version),
+            ));
+        }
+        let (abi_version, capability) = deserialize_capability(&capability_json)?;
 
         Ok(SkillArtifact {
             id,
             identity_version,
+            abi_version,
             source,
             description,
             tags,
@@ -2505,7 +2578,7 @@ fn read_artifact_row(row: &Row) -> rusqlite::Result<Result<SkillArtifact, StoreE
 
     match parse_result {
         Ok(artifact) => Ok(Ok(artifact)),
-        Err(e) => Ok(Err(StoreError::MalformedJson(e))),
+        Err(error) => Ok(Err(error)),
     }
 }
 
@@ -2629,7 +2702,7 @@ fn insert_revision(
             serde_json::to_string(&artifact.tags)?,
             serialize_exports(&artifact.exports)?,
             serde_json::to_string(&artifact.tests)?,
-            serialize_capability(&artifact.capability)?,
+            serialize_capability(artifact)?,
             status,
             now
         ],
@@ -2793,75 +2866,29 @@ fn deserialize_exports(json: &str) -> Result<Vec<SkillExport>, serde_json::Error
 }
 
 /// Serialize CapabilityManifest to JSON string.
-fn serialize_capability(capability: &CapabilityManifest) -> Result<String, StoreError> {
-    let hosts: Vec<String> = capability
-        .allowed_hosts
-        .iter()
-        .map(|h| h.as_token().to_string())
-        .collect();
-
+fn serialize_capability(artifact: &SkillArtifact) -> Result<String, StoreError> {
     let json = serde_json::json!({
-        "tier": capability.tier.as_token(),
-        "allowed_hosts": hosts,
+        "abi_version": artifact.abi_version,
+        "manifest": artifact.capability,
     });
     Ok(serde_json::to_string(&json)?)
 }
 
 /// Deserialize CapabilityManifest from JSON string.
-fn deserialize_capability(json: &str) -> Result<CapabilityManifest, serde_json::Error> {
-    let obj = serde_json::from_str::<serde_json::Value>(json)?
-        .as_object()
-        .ok_or_else(|| {
-            serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "capability is not an object",
-            ))
-        })?
-        .clone();
-
-    let tier_str = obj.get("tier").and_then(|v| v.as_str()).ok_or_else(|| {
-        serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing tier field",
-        ))
-    })?;
-
-    let tier = CapabilityTier::from_token(tier_str).ok_or_else(|| {
-        serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unknown capability tier",
-        ))
-    })?;
-
-    let hosts_array = obj
-        .get("allowed_hosts")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "missing or invalid allowed_hosts field",
-            ))
-        })?;
-
-    let mut allowed_hosts = Vec::new();
-    for host_value in hosts_array {
-        let host_str = host_value.as_str().ok_or_else(|| {
-            serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "host capability is not a string",
-            ))
-        })?;
-        let capability = HostCapability::from_token(host_str).ok_or_else(|| {
-            serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unknown host capability",
-            ))
-        })?;
-        allowed_hosts.push(capability);
+fn deserialize_capability(json: &str) -> Result<(u16, CapabilityManifest), serde_json::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredCapability {
+        abi_version: u16,
+        manifest: CapabilityManifest,
     }
 
-    Ok(CapabilityManifest {
-        tier,
-        allowed_hosts,
-    })
+    let stored: StoredCapability = serde_json::from_str(json)?;
+    if stored.abi_version != SKILL_ABI_VERSION {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported skill ABI version",
+        )));
+    }
+    Ok((stored.abi_version, stored.manifest))
 }

@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use super::store::{EnqueueResult, SkillStore, StoreError, current_timestamp};
 use super::{
-    CapabilityManifest, CapabilityTier, HostCapability, IdentityError, SkillArtifact, SkillExport,
+    CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, IdentityError, SkillArtifact,
+    SkillExport,
 };
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 32 * 1024;
@@ -36,7 +37,24 @@ pub(crate) struct JsExport {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct JsCapability {
     pub tier: String,
-    pub allowed_hosts: Vec<String>,
+    pub grants: Vec<JsCapabilityScope>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum JsCapabilityScope {
+    ReadFile {
+        workspace_prefixes: Vec<String>,
+    },
+    WriteFile {
+        workspace_prefixes: Vec<String>,
+    },
+    Fetch {
+        origins: Vec<String>,
+        methods: Vec<String>,
+    },
+    Spawn {
+        programs: Vec<String>,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -103,7 +121,7 @@ impl JsProposal {
                     field: "capability",
                     reason: "must be an object",
                 })?;
-        reject_unknown_keys(&capability, &["tier", "allowed_hosts"], "capability")?;
+        reject_unknown_keys(&capability, &["tier", "grants"], "capability")?;
 
         Ok(Self {
             source: required_string(object, "source", MAX_SOURCE_BYTES)?,
@@ -112,13 +130,16 @@ impl JsProposal {
             tests: required_string_array(object, "tests", 1, MAX_TESTS, MAX_TEST_BYTES)?,
             capability: JsCapability {
                 tier: required_string(&capability, "tier", MAX_TAG_BYTES)?,
-                allowed_hosts: required_string_array(
-                    &capability,
-                    "allowed_hosts",
-                    0,
-                    4,
-                    MAX_TAG_BYTES,
-                )?,
+                grants: required_array(&capability, "grants", 0, 4)?
+                    .iter::<Object<'_>>()
+                    .map(|scope| {
+                        let scope = scope.map_err(|_| ProposalError::InvalidField {
+                            field: "capability.grants",
+                            reason: "must be an array of objects",
+                        })?;
+                        parse_capability_scope(&scope)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             },
             tags: optional_string_array(object, "tags", MAX_TAGS, MAX_TAG_BYTES)?,
             predecessor_id: object
@@ -188,6 +209,18 @@ impl JsProposal {
             validate_text("tags", tag, MAX_TAG_BYTES, false)?;
             aggregate = aggregate.saturating_add(tag.len());
         }
+        for grant in &self.capability.grants {
+            aggregate = aggregate.saturating_add(match grant {
+                JsCapabilityScope::ReadFile { workspace_prefixes }
+                | JsCapabilityScope::WriteFile { workspace_prefixes } => {
+                    workspace_prefixes.iter().map(String::len).sum()
+                }
+                JsCapabilityScope::Fetch { origins, methods } => {
+                    origins.iter().chain(methods).map(String::len).sum()
+                }
+                JsCapabilityScope::Spawn { programs } => programs.iter().map(String::len).sum(),
+            });
+        }
         if aggregate > MAX_CANONICAL_INPUT_BYTES {
             return Err(ProposalError::PayloadTooLarge);
         }
@@ -197,22 +230,39 @@ impl JsProposal {
 
         let tier = CapabilityTier::from_token(&self.capability.tier)
             .ok_or_else(|| ProposalError::InvalidCapability("unknown or forbidden tier".into()))?;
-        if self.capability.allowed_hosts.len() > 4 {
+        if self.capability.grants.len() > 4 {
             return Err(ProposalError::InvalidCapability(
-                "too many allowed hosts".into(),
+                "too many capability grants".into(),
             ));
         }
-        let hosts = self
+        let grants = self
             .capability
-            .allowed_hosts
+            .grants
             .into_iter()
-            .map(|host| {
-                HostCapability::from_token(&host).ok_or_else(|| {
-                    ProposalError::InvalidCapability(format!("unknown or forbidden host {host}"))
-                })
+            .map(|scope| match scope {
+                JsCapabilityScope::ReadFile { workspace_prefixes } => {
+                    Ok(CapabilityScope::ReadFile { workspace_prefixes })
+                }
+                JsCapabilityScope::WriteFile { workspace_prefixes } => {
+                    Ok(CapabilityScope::WriteFile { workspace_prefixes })
+                }
+                JsCapabilityScope::Fetch { origins, methods } => {
+                    let methods = methods
+                        .into_iter()
+                        .map(|method| match method.as_str() {
+                            "GET" => Ok(HttpMethod::Get),
+                            "POST" => Ok(HttpMethod::Post),
+                            _ => Err(ProposalError::InvalidCapability(format!(
+                                "unknown or non-canonical HTTP method {method}"
+                            ))),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(CapabilityScope::Fetch { origins, methods })
+                }
+                JsCapabilityScope::Spawn { programs } => Ok(CapabilityScope::Spawn { programs }),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let capability = CapabilityManifest::new(tier, hosts)
+        let capability = CapabilityManifest::new(tier, grants)
             .map_err(|error| ProposalError::InvalidCapability(error.to_string()))?;
         SkillArtifact::new(
             self.source,
@@ -223,6 +273,52 @@ impl JsProposal {
             capability,
         )
         .map_err(ProposalError::Identity)
+    }
+}
+
+fn parse_capability_scope(object: &Object<'_>) -> Result<JsCapabilityScope, ProposalError> {
+    let kind = required_string(object, "kind", MAX_TAG_BYTES)?;
+    match kind.as_str() {
+        "read_file" => {
+            reject_unknown_keys(object, &["kind", "workspace_prefixes"], "capability grant")?;
+            Ok(JsCapabilityScope::ReadFile {
+                workspace_prefixes: required_string_array(
+                    object,
+                    "workspace_prefixes",
+                    1,
+                    32,
+                    MAX_DESCRIPTION_BYTES,
+                )?,
+            })
+        }
+        "write_file" => {
+            reject_unknown_keys(object, &["kind", "workspace_prefixes"], "capability grant")?;
+            Ok(JsCapabilityScope::WriteFile {
+                workspace_prefixes: required_string_array(
+                    object,
+                    "workspace_prefixes",
+                    1,
+                    32,
+                    MAX_DESCRIPTION_BYTES,
+                )?,
+            })
+        }
+        "fetch" => {
+            reject_unknown_keys(object, &["kind", "origins", "methods"], "capability grant")?;
+            Ok(JsCapabilityScope::Fetch {
+                origins: required_string_array(object, "origins", 1, 32, MAX_DESCRIPTION_BYTES)?,
+                methods: required_string_array(object, "methods", 1, 2, MAX_TAG_BYTES)?,
+            })
+        }
+        "spawn" => {
+            reject_unknown_keys(object, &["kind", "programs"], "capability grant")?;
+            Ok(JsCapabilityScope::Spawn {
+                programs: required_string_array(object, "programs", 1, 32, MAX_TAG_BYTES)?,
+            })
+        }
+        _ => Err(ProposalError::InvalidCapability(format!(
+            "unknown or forbidden capability grant {kind}"
+        ))),
     }
 }
 
