@@ -202,6 +202,58 @@ class FeatureGraphTests(unittest.TestCase):
                     feature_graph.validate_workflow_commands(workflow),
                 )
 
+    def test_workflow_commands_reject_interpolation_in_comments(self) -> None:
+        mutations = {
+            "clippy YAML comment": (
+                "clippy",
+                self.workflow_text.replace(
+                    "cargo clippy --locked ${{ matrix.features }} -- -D warnings",
+                    "cargo clippy --locked -- -D warnings # ${{ matrix.features }}",
+                    1,
+                ),
+            ),
+            "test block shell comment": (
+                "test",
+                self.workflow_text.replace(
+                    "run: cargo test --locked ${{ matrix.features }}",
+                    "run: |\n"
+                    "          # ${{ matrix.features }}\n"
+                    "          cargo test --locked",
+                    1,
+                ),
+            ),
+        }
+        for name, (job, workflow) in mutations.items():
+            with self.subTest(name=name):
+                self.assertIn(
+                    f"{job} job Cargo command must consume "
+                    "'${{ matrix.features }}'",
+                    feature_graph.validate_workflow_commands(workflow),
+                )
+
+    def test_interpolation_in_another_shell_command_does_not_bind_matrix(self) -> None:
+        workflow = self.workflow_text.replace(
+            "cargo test --locked ${{ matrix.features }}",
+            "cargo test --locked; echo ${{ matrix.features }}",
+            1,
+        )
+
+        self.assertIn(
+            "test job Cargo command must consume '${{ matrix.features }}'",
+            feature_graph.validate_workflow_commands(workflow),
+        )
+
+    def test_workflow_command_accepts_multiline_cargo_invocation(self) -> None:
+        workflow = self.workflow_text.replace(
+            "run: cargo test --locked ${{ matrix.features }}",
+            "run: |\n"
+            "          cargo test --locked \\\n"
+            "            ${{ matrix.features }}",
+            1,
+        )
+
+        self.assertEqual([], feature_graph.validate_workflow_commands(workflow))
+
 
 if __name__ == "__main__":
     unittest.main()
