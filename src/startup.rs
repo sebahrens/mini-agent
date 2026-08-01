@@ -1194,7 +1194,46 @@ mod tests {
     };
     use crate::cli::Cli;
     use crate::config::Config;
+    use crate::sandbox::{Sandbox, SandboxPolicy};
     use crate::session::Session;
+
+    /// Pins the two inputs that decide whether a missing backend bails or
+    /// degrades. An unknown backend is never "available" on any platform, so
+    /// this reproduces Windows (no backend at all) and bwrap-less Linux
+    /// without depending on the host.
+    #[test]
+    fn missing_backend_bails_only_when_the_sandbox_was_explicitly_requested() {
+        let unavailable = Sandbox::new(true, "definitely-not-a-real-backend");
+        assert_eq!(unavailable.policy(), SandboxPolicy::RequiredButUnavailable);
+
+        // Inheriting the default: attempt to sandbox, but degrade rather than
+        // refuse to start, since some platforms have no backend to offer.
+        let cli = Cli::default();
+        let cfg = Config::default();
+        assert!(cli.resolve_sandbox(&cfg));
+        assert!(!cli.sandbox_explicitly_requested(&cfg));
+
+        // Asking for it explicitly keeps the fail-closed guarantee.
+        let explicit = Cli {
+            sandbox: true,
+            ..Cli::default()
+        };
+        assert!(explicit.sandbox_explicitly_requested(&cfg));
+
+        let configured = Config {
+            sandbox: Some(true),
+            ..Config::default()
+        };
+        assert!(Cli::default().sandbox_explicitly_requested(&configured));
+
+        // Refusing it outranks everything and never bails.
+        let refused = Cli {
+            no_sandbox: true,
+            ..Cli::default()
+        };
+        assert!(!refused.resolve_sandbox(&configured));
+        assert!(!refused.sandbox_explicitly_requested(&configured));
+    }
 
     #[test]
     fn session_resume_provider_identity_restores_saved_identity_under_changed_defaults() {
