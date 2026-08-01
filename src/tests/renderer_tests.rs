@@ -1,4 +1,4 @@
-use crate::ui::renderer::{base64_encode, copy_to_clipboard, is_safe_url};
+use crate::ui::renderer::{base64_encode, copy_to_clipboard, is_safe_url, windows_open_request};
 
 #[test]
 fn base64_encode_empty() {
@@ -53,6 +53,10 @@ fn safe_url_accepts_http_and_https() {
     assert!(is_safe_url("https://example.com"));
     assert!(is_safe_url("http://example.com/path?q=1#frag"));
     assert!(is_safe_url("https://user@example.com:8080/x"));
+    assert!(is_safe_url(
+        "https://example.com/a path?q=hello world#part two"
+    ));
+    assert!(is_safe_url("https://例え.テスト/資料?q=雪"));
 }
 
 #[test]
@@ -71,8 +75,9 @@ fn safe_url_rejects_missing_host() {
 }
 
 #[test]
-fn safe_url_rejects_whitespace_and_control_chars() {
-    assert!(!is_safe_url("https://example.com/a b"));
+fn safe_url_rejects_host_whitespace_and_non_space_control_chars() {
+    assert!(!is_safe_url("https://exa mple.com/path"));
+    assert!(!is_safe_url("https://example.com/a\tb"));
     assert!(!is_safe_url("https://example.com/\nevil"));
     assert!(!is_safe_url("https://example.com/\x07"));
 }
@@ -81,6 +86,80 @@ fn safe_url_rejects_whitespace_and_control_chars() {
 fn safe_url_rejects_overlong_urls() {
     let long = format!("https://example.com/{}", "a".repeat(2100));
     assert!(!is_safe_url(&long));
+}
+
+fn decoded_windows_target(url: &str) -> String {
+    let request = windows_open_request(url).expect("valid URL should produce a launch request");
+    assert_eq!(
+        request.target.last(),
+        Some(&0),
+        "target must be NUL terminated"
+    );
+    assert_eq!(
+        request.target.iter().filter(|&&unit| unit == 0).count(),
+        1,
+        "target must contain exactly one terminating NUL"
+    );
+    String::from_utf16(&request.target[..request.target.len() - 1]).unwrap()
+}
+
+#[test]
+fn windows_open_request_preserves_safe_urls_as_one_data_target() {
+    let urls = [
+        "https://example.com/a path?q=hello world#part two",
+        "https://例え.テスト/資料?q=雪#章",
+        "https://example.com/path?first=1&second=2",
+        "https://example.com/a|b^c(d)e",
+        "https://example.com/%26%7C%5E%22%28%29%25",
+        "https://example.com/path?q=\"quoted\"&rate=100%",
+    ];
+
+    for url in urls {
+        let request = windows_open_request(url).expect("URL should be accepted");
+        assert_eq!(
+            request.verb,
+            "open".encode_utf16().chain([0]).collect::<Vec<_>>()
+        );
+        assert_eq!(decoded_windows_target(url), url);
+    }
+}
+
+#[test]
+fn windows_open_request_has_no_shell_or_extra_command_channel() {
+    let sentinel = "MINI_AGENT_URL_OPENER_SENTINEL";
+    let url = format!(
+        "https://example.com/path?x=1&echo {sentinel}|powershell^(Write-Output '{sentinel}'^)%25"
+    );
+    let request = windows_open_request(&url).expect("metacharacters remain safe URL data");
+
+    assert_eq!(decoded_windows_target(&url), url);
+    assert_eq!(request.parameters, None);
+    assert_eq!(request.verb_text(), "open");
+}
+
+#[test]
+fn windows_open_request_rejects_before_constructing_an_os_request() {
+    for url in [
+        "file:///C:/Windows/System32/calc.exe",
+        "javascript:alert(1)",
+        "https://example.com/path\0sentinel",
+        "https://example.com/path\r\ncmd",
+    ] {
+        assert!(
+            windows_open_request(url).is_none(),
+            "unexpectedly accepted: {url:?}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_open_request_shell_execute_uses_file_target_without_parameters() {
+    let url = "https://example.com/a&b|c^d(quoted)%25?q=\"value\"#fragment";
+    let request = windows_open_request(url).unwrap();
+
+    assert_eq!(decoded_windows_target(url), url);
+    assert!(request.parameters.is_none());
 }
 
 #[test]
