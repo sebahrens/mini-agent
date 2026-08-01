@@ -1,7 +1,9 @@
 use crate::extras::js::skills::capability::{
     CapabilityContext, CapabilityDenialReason, CapabilityError, SkillExecutionAttribution,
 };
-use crate::extras::js::skills::{CapabilityManifest, CapabilityTier, HostCapability};
+use crate::extras::js::skills::{
+    CapabilityManifest, CapabilityTier, HostCapability, test_manifest,
+};
 
 fn id(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
@@ -14,11 +16,8 @@ fn skill_and_session_permissions_are_both_required() {
         .enter(SkillExecutionAttribution {
             skill_id: id('a'),
             export_name: "run".into(),
-            manifest: CapabilityManifest::new(
-                CapabilityTier::ReadOnly,
-                vec![HostCapability::ReadFile],
-            )
-            .unwrap(),
+            manifest: test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])
+                .unwrap(),
         })
         .unwrap();
     assert!(context.authorize(HostCapability::ReadFile, true).is_ok());
@@ -42,7 +41,7 @@ fn skill_capability_nested_manifests_intersect_and_guards_clear_context() {
             .enter(SkillExecutionAttribution {
                 skill_id: id('a'),
                 export_name: "caller".into(),
-                manifest: CapabilityManifest::new(
+                manifest: test_manifest(
                     CapabilityTier::SideEffecting,
                     vec![HostCapability::ReadFile, HostCapability::Spawn],
                 )
@@ -54,7 +53,7 @@ fn skill_capability_nested_manifests_intersect_and_guards_clear_context() {
                 .enter(SkillExecutionAttribution {
                     skill_id: id('b'),
                     export_name: "callee".into(),
-                    manifest: CapabilityManifest::new(
+                    manifest: test_manifest(
                         CapabilityTier::ReadOnly,
                         vec![HostCapability::ReadFile],
                     )
@@ -79,11 +78,8 @@ async fn skill_capability_async_scope_survives_yield_and_cleans_up() {
             .enter(SkillExecutionAttribution {
                 skill_id: id('d'),
                 export_name: "async_export".into(),
-                manifest: CapabilityManifest::new(
-                    CapabilityTier::ReadOnly,
-                    vec![HostCapability::ReadFile],
-                )
-                .unwrap(),
+                manifest: test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])
+                    .unwrap(),
             })
             .unwrap();
         tokio::task::yield_now().await;

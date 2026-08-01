@@ -3,6 +3,8 @@ mod agent_skill_catalog;
 #[cfg(feature = "skills")]
 mod auto_admission_end_to_end;
 #[cfg(feature = "skills")]
+mod capability_manifest_v2;
+#[cfg(feature = "skills")]
 mod evidence_policy_scheduler;
 #[cfg(feature = "skills")]
 mod evidence_promotion_policy;
@@ -35,6 +37,8 @@ mod skill_lifecycle_schema;
 #[cfg(feature = "skills")]
 mod skill_quarantine_policy;
 #[cfg(feature = "skills")]
+mod skill_realm_isolation;
+#[cfg(feature = "skills")]
 mod skill_repair_and_rollback;
 #[cfg(feature = "skills")]
 mod skill_repair_records;
@@ -54,6 +58,8 @@ mod skill_targeted_feedback;
 mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
+mod worker_protocol;
+mod worker_runtime;
 
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::tool::JsTool;
