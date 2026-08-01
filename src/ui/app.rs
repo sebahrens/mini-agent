@@ -44,6 +44,30 @@ use super::{C_PERM, apply_current_prompt_mode};
 
 const TURN_TRACE_MAX: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptTarget {
+    Btw,
+    Validation,
+    MainRun,
+    Exit,
+}
+
+pub(crate) fn interrupt_target(
+    btw_inflight: usize,
+    validation_active: bool,
+    main_running: bool,
+) -> InterruptTarget {
+    if btw_inflight > 0 {
+        InterruptTarget::Btw
+    } else if validation_active {
+        InterruptTarget::Validation
+    } else if main_running {
+        InterruptTarget::MainRun
+    } else {
+        InterruptTarget::Exit
+    }
+}
+
 pub(crate) struct App<'a> {
     ui: UiContext<'a>,
     run: AgentRunState,
@@ -278,11 +302,7 @@ impl<'a> App<'a> {
 
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
         let running = Arc::new(AtomicBool::new(true));
-        let event_handle = Some(spawn_event_thread(
-            user_tx.clone(),
-            running.clone(),
-            ui.sandbox.clone(),
-        ));
+        let event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
 
         let (prebuild_tx, prebuild_rx_raw) = mpsc::channel::<PrebuildPayload>(1);
         let prebuild_rx = Some(prebuild_rx_raw);
@@ -514,6 +534,10 @@ impl<'a> App<'a> {
             UserEvent::Paste(data) => {
                 self.input.handle_paste(data);
             }
+            #[cfg(feature = "loop")]
+            UserEvent::LoopValidationDone(event) => {
+                self.handle_loop_validation_event(event).await?;
+            }
             #[cfg(feature = "mcp")]
             UserEvent::McpLoginDone { server, error } => {
                 self.handle_mcp_login_done(server, error).await?;
@@ -524,16 +548,26 @@ impl<'a> App<'a> {
                 let is_ctrl_d =
                     key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL);
                 if is_ctrl_c || is_ctrl_d {
-                    if self.btw_inflight > 0 {
-                        for (_, h) in self.btw_abort.drain(..) {
-                            h.abort();
+                    #[cfg(feature = "loop")]
+                    let validation_active = self.run.validation_cancel.is_some();
+                    #[cfg(not(feature = "loop"))]
+                    let validation_active = false;
+                    match interrupt_target(
+                        self.btw_inflight,
+                        validation_active,
+                        self.run.is_running,
+                    ) {
+                        InterruptTarget::Btw => {
+                            for (_, handle) in self.btw_abort.drain(..) {
+                                handle.abort();
+                            }
+                            self.btw_inflight = 0;
+                            self.renderer.write_line("btw cancelled", C_ERROR)?;
                         }
-                        self.btw_inflight = 0;
-                        self.renderer.write_line("btw cancelled", C_ERROR)?;
-                    } else if self.run.is_running {
-                        self.abort_main_run()?;
-                    } else {
-                        return Ok(ControlFlow::Break(()));
+                        InterruptTarget::Validation | InterruptTarget::MainRun => {
+                            self.abort_main_run()?;
+                        }
+                        InterruptTarget::Exit => return Ok(ControlFlow::Break(())),
                     }
                     self.refresh()?;
                     return Ok(ControlFlow::Continue(()));
@@ -877,11 +911,29 @@ impl<'a> App<'a> {
             &mut self.ui,
             &self.slash,
             &mut self.chain,
+            #[cfg(feature = "loop")]
+            &self.user_tx,
         )
         .await?;
 
         self.finalize_turn(turn_errored).await?;
         Ok(())
+    }
+
+    #[cfg(feature = "loop")]
+    async fn handle_loop_validation_event(
+        &mut self,
+        event: crate::event::LoopValidationEvent,
+    ) -> anyhow::Result<()> {
+        event_handler::handle_loop_validation_event(
+            event,
+            &mut self.renderer,
+            &mut self.run,
+            &mut self.ui,
+            &mut self.chain,
+        )
+        .await?;
+        self.finalize_turn(false).await
     }
 
     async fn finalize_turn(&mut self, turn_errored: bool) -> anyhow::Result<()> {
@@ -949,10 +1001,23 @@ impl<'a> App<'a> {
     }
 
     fn abort_main_run(&mut self) -> anyhow::Result<()> {
-        if let Some(h) = self.run.main_abort.take() {
-            h.abort();
+        #[cfg(feature = "loop")]
+        let validation_cancel = self.run.validation_cancel.clone();
+        #[cfg(feature = "loop")]
+        let validation_active = validation_cancel.is_some();
+        #[cfg(not(feature = "loop"))]
+        let validation_active = false;
+
+        #[cfg(feature = "loop")]
+        if let Some(cancellation) = validation_cancel {
+            cancellation.cancel();
         }
-        self.ui.sandbox.kill_active();
+        if !validation_active {
+            if let Some(handle) = self.run.main_abort.take() {
+                handle.abort();
+            }
+            self.ui.sandbox.kill_active();
+        }
         self.run.is_running = false;
         if let Some(ss) = self.ui.status_signals.as_ref() {
             ss.send_stop();
@@ -1783,7 +1848,6 @@ impl<'a> App<'a> {
         self.event_handle = Some(spawn_event_thread(
             self.user_tx.clone(),
             self.running.clone(),
-            self.ui.sandbox.clone(),
         ));
     }
 
@@ -2065,6 +2129,8 @@ impl<'a> App<'a> {
                                     &mut self.ui,
                                     &self.slash,
                                     &mut self.chain,
+                                    #[cfg(feature = "loop")]
+                                    &self.user_tx,
                                 )
                                 .await?;
                             }

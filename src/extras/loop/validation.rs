@@ -6,8 +6,8 @@
 use std::process::ExitStatus;
 
 use crate::sandbox::{
-    CommandLimits, CommandOutput, CommandOutputLimit, CommandStatus, DEFAULT_COMMAND_LIMITS,
-    Sandbox,
+    CommandCancellation, CommandLimits, CommandOutput, CommandOutputLimit, CommandStatus,
+    DEFAULT_COMMAND_LIMITS, Sandbox,
 };
 
 /// Loop validators inherit the same hard process budget as the Bash tool.
@@ -33,6 +33,47 @@ pub(crate) struct ValidationResult {
     pub stderr: Vec<u8>,
     limits: CommandLimits,
     diagnostic_truncated: bool,
+}
+
+/// Operation-scoped cancellation for exactly one loop validator.
+///
+/// Clones all address the same validation worker. Cancelling does not touch
+/// Bash, JS, `/btw`, or other commands that happen to share its [`Sandbox`].
+#[derive(Debug, Clone)]
+pub(crate) struct ValidationCancellation {
+    command: CommandCancellation,
+}
+
+impl ValidationCancellation {
+    pub(crate) fn cancel(&self) {
+        self.command.cancel();
+    }
+}
+
+/// A validation that has its cancellation identity before it starts running.
+/// This lets signal and UI routing retain a scoped handle while another task
+/// owns and awaits the subprocess lifecycle.
+pub(crate) struct ValidationOperation {
+    sandbox: Sandbox,
+    command: String,
+    limits: CommandLimits,
+    cancellation: ValidationCancellation,
+}
+
+impl ValidationOperation {
+    pub(crate) fn cancellation(&self) -> ValidationCancellation {
+        self.cancellation.clone()
+    }
+
+    pub(crate) async fn wait(self) -> ValidationResult {
+        run_with_limits_and_cancellation(
+            &self.sandbox,
+            &self.command,
+            self.limits,
+            &self.cancellation,
+        )
+        .await
+    }
 }
 
 impl ValidationResult {
@@ -212,14 +253,39 @@ fn bound_captured_streams(
     (stdout, stderr, bounded_len < original_len)
 }
 
-pub(crate) async fn run(sandbox: &Sandbox, command: &str) -> ValidationResult {
-    run_with_limits(sandbox, command, LOOP_VALIDATION_LIMITS).await
+pub(crate) fn start(sandbox: &Sandbox, command: &str) -> ValidationOperation {
+    start_with_limits(sandbox, command, LOOP_VALIDATION_LIMITS)
 }
 
+fn start_with_limits(
+    sandbox: &Sandbox,
+    command: &str,
+    limits: CommandLimits,
+) -> ValidationOperation {
+    ValidationOperation {
+        sandbox: sandbox.clone(),
+        command: command.to_string(),
+        limits,
+        cancellation: ValidationCancellation {
+            command: CommandCancellation::new(),
+        },
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn run_with_limits(
     sandbox: &Sandbox,
     command: &str,
     limits: CommandLimits,
+) -> ValidationResult {
+    start_with_limits(sandbox, command, limits).wait().await
+}
+
+async fn run_with_limits_and_cancellation(
+    sandbox: &Sandbox,
+    command: &str,
+    limits: CommandLimits,
+    cancellation: &ValidationCancellation,
 ) -> ValidationResult {
     #[cfg(windows)]
     let sandbox = sandbox
@@ -228,7 +294,10 @@ pub(crate) async fn run_with_limits(
     #[cfg(not(windows))]
     let sandbox = sandbox.clone();
 
-    match sandbox.output_command_with_limits(command, limits).await {
+    match sandbox
+        .output_command_with_limits_cancelled(command, limits, &cancellation.command)
+        .await
+    {
         Ok(output) => ValidationResult::from_command_output(output, limits),
         Err(error) => ValidationResult::failed(error, limits),
     }
@@ -251,7 +320,11 @@ mod tests {
     }
 
     fn temp_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        #[cfg(target_os = "macos")]
+        let temp_dir = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let temp_dir = std::env::temp_dir();
+        temp_dir.join(format!(
             "mini-agent-loop-validation-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
@@ -263,7 +336,7 @@ mod tests {
     }
 
     fn process_exists(pid: u32) -> bool {
-        std::process::Command::new("kill")
+        std::process::Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -427,32 +500,84 @@ mod tests {
         let _ = std::fs::remove_file(pid_file);
     }
 
-    #[tokio::test]
-    async fn loop_validation_process_limits_explicit_cancellation_kills_tree_and_recovers() {
-        let pid_file = temp_path("cancel-pid");
-        let sandbox = Sandbox::new(false, "bwrap");
-        let command = format!(
-            "(while :; do sleep 1; done) & child=$!; printf '%s' \"$child\" > {}; wait",
-            shell_quote(&pid_file)
+    async fn assert_scoped_cancellation_preserves_unrelated_command(sandbox: Sandbox, label: &str) {
+        let validator_pid_file = temp_path(&format!("{label}-validator-pid"));
+        let unrelated_pid_file = temp_path(&format!("{label}-unrelated-pid"));
+        let unrelated_stop_file = temp_path(&format!("{label}-unrelated-stop"));
+        let unrelated_command = format!(
+            "printf '%s' \"$$\" > {}; while [ ! -f {} ]; do :; done",
+            shell_quote(&unrelated_pid_file),
+            shell_quote(&unrelated_stop_file)
         );
-        let task = tokio::spawn({
+        let mut unrelated_task = tokio::spawn({
             let sandbox = sandbox.clone();
-            async move { run_with_limits(&sandbox, &command, limits(Duration::from_secs(5))).await }
+            async move {
+                sandbox
+                    .output_command_with_limits(
+                        &unrelated_command,
+                        CommandLimits {
+                            timeout: Duration::from_secs(5),
+                            stdout_bytes: 128,
+                            stderr_bytes: 128,
+                            combined_bytes: 192,
+                        },
+                    )
+                    .await
+            }
         });
+        let unrelated_pid = tokio::select! {
+            pid = wait_for_pid(&unrelated_pid_file) => pid,
+            result = &mut unrelated_task => {
+                let result = result
+                    .expect("unrelated task panicked before creating its pid file")
+                    .expect("unrelated command runner failed before creating its pid file");
+                panic!("unrelated command ended before creating its pid file: status={:?} stderr={}",
+                    result.status, String::from_utf8_lossy(&result.stderr));
+            }
+        };
 
-        let pid = wait_for_pid(&pid_file).await;
+        let validator_command = format!(
+            "(while :; do :; done) & child=$!; printf '%s' \"$child\" > {}; wait",
+            shell_quote(&validator_pid_file)
+        );
+        let operation =
+            start_with_limits(&sandbox, &validator_command, limits(Duration::from_secs(5)));
+        let cancellation = operation.cancellation();
+        let mut validation_task = tokio::spawn(operation.wait());
+
+        let validator_pid = tokio::select! {
+            pid = wait_for_pid(&validator_pid_file) => pid,
+            result = &mut validation_task => {
+                let result = result.expect("validation task panicked before creating its pid file");
+                panic!("validation ended before creating its pid file: {}", result.render());
+            }
+        };
         wait_until(
-            || sandbox.active_group_count() == 1,
-            "active validator process group",
+            || sandbox.active_group_count() == 2,
+            "validator and unrelated process groups",
         )
         .await;
-        sandbox.kill_active();
-        let cancelled = tokio::time::timeout(Duration::from_secs(2), task)
+        cancellation.cancel();
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), validation_task)
             .await
             .expect("cancelled validation remained blocked")
             .expect("validation task panicked");
         assert_eq!(cancelled.status, ValidationStatus::Cancelled);
-        assert_process_gone(pid).await;
+        assert_process_gone(validator_pid).await;
+        assert!(
+            process_exists(unrelated_pid),
+            "scoped validation cancellation killed an unrelated sandbox command"
+        );
+        assert!(!unrelated_task.is_finished());
+        assert_eq!(sandbox.active_group_count(), 1);
+
+        std::fs::write(&unrelated_stop_file, b"stop").unwrap();
+        let unrelated = tokio::time::timeout(Duration::from_secs(2), unrelated_task)
+            .await
+            .expect("unrelated command did not finish")
+            .expect("unrelated command task panicked")
+            .expect("unrelated command runner failed");
+        assert_eq!(unrelated.status, CommandStatus::Completed);
         assert_eq!(sandbox.active_group_count(), 0);
 
         let recovery =
@@ -461,7 +586,29 @@ mod tests {
             recovery.status,
             ValidationStatus::Success { exit_code: Some(0) }
         );
-        let _ = std::fs::remove_file(pid_file);
+        let _ = std::fs::remove_file(validator_pid_file);
+        let _ = std::fs::remove_file(unrelated_pid_file);
+        let _ = std::fs::remove_file(unrelated_stop_file);
+    }
+
+    #[tokio::test]
+    async fn loop_validation_process_limits_scoped_cancellation_preserves_unrelated_command() {
+        assert_scoped_cancellation_preserves_unrelated_command(
+            Sandbox::new(false, "bwrap"),
+            "disabled",
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn loop_validation_process_limits_seatbelt_scoped_cancellation_preserves_unrelated_command()
+     {
+        let sandbox = Sandbox::new(true, "seatbelt");
+        if sandbox.policy() != crate::sandbox::SandboxPolicy::RequiredAndAvailable {
+            return;
+        }
+        assert_scoped_cancellation_preserves_unrelated_command(sandbox, "seatbelt").await;
     }
 
     #[tokio::test]
@@ -519,6 +666,17 @@ mod tests {
         assert_eq!(oversized.status, ValidationStatus::Failed);
         assert!(oversized.render().contains("diagnostic_truncated=true"));
         assert!(oversized.stderr.len() <= 512);
+
+        let pre_cancelled = start_with_limits(
+            &Sandbox::new(true, "__mini_agent_missing_loop_sandbox__"),
+            "printf must-not-run",
+            failure_limits,
+        );
+        pre_cancelled.cancellation().cancel();
+        assert_eq!(
+            pre_cancelled.wait().await.status,
+            ValidationStatus::Cancelled
+        );
     }
 
     #[test]
@@ -540,8 +698,8 @@ mod tests {
     fn loop_validation_process_limits_headless_and_interactive_use_one_runner() {
         let headless = include_str!("headless.rs");
         let interactive = include_str!("../../ui/event_handler.rs");
-        assert!(headless.contains("loop_mod::validation::run(sandbox, cmd)"));
-        assert!(interactive.contains("loop::validation::run(&ui.sandbox, cmd)"));
+        assert!(headless.contains("loop_mod::validation::start(sandbox, cmd)"));
+        assert!(interactive.contains("loop::validation::start(&ui.sandbox, &cmd)"));
         assert!(!headless.contains("tokio::process::Command::new"));
         assert!(!interactive.contains("tokio::process::Command::new"));
     }

@@ -61,6 +61,14 @@ pub enum BtwEvent {
     },
 }
 
+#[cfg(feature = "loop")]
+#[derive(Debug, Clone)]
+pub(crate) struct LoopValidationEvent {
+    pub response: CompactString,
+    pub summary: String,
+    pub result: crate::extras::r#loop::validation::ValidationResult,
+}
+
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     Key(crossterm::event::KeyEvent),
@@ -68,6 +76,8 @@ pub enum UserEvent {
     ScrollDown,
     Resize,
     Paste(String),
+    #[cfg(feature = "loop")]
+    LoopValidationDone(LoopValidationEvent),
     #[allow(dead_code)]
     MouseDown {
         row: u16,

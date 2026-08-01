@@ -218,7 +218,10 @@ and stderr, and a 1.5 MiB combined cap. Timeout, cancellation, output-limit,
 launch-failure, and nonzero-exit results are recorded with explicit status and
 separate sanitized stdout/stderr sections. Resource-limit cancellation reaps
 the direct validator everywhere and, on Unix, kills its complete process group
-before the next iteration.
+before the next iteration. Cancellation is operation-scoped: headless SIGINT
+waits for that validator's cleanup before exiting, while interactive
+Ctrl-C/Ctrl-D is routed semantically (`/btw` first, then validation or the main
+run) and never uses validation cancellation to stop unrelated sandbox commands.
 
 | Command | Description |
 | ------- | ----------- |
