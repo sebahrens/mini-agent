@@ -14,6 +14,7 @@ pub struct Sandbox {
     enabled: bool,
     backend: String,
     shell: String,
+    shell_command_arg: String,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
 }
@@ -250,6 +251,7 @@ impl Sandbox {
             enabled,
             backend: backend.to_string(),
             shell: "bash".to_string(),
+            shell_command_arg: "-c".to_string(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -342,9 +344,19 @@ impl Sandbox {
         }
     }
 
-    pub fn with_shell(mut self, shell: &str) -> Self {
+    pub fn with_shell(self, shell: &str) -> Self {
+        self.with_shell_command_arg(shell, "-c")
+    }
+
+    /// Selects a shell whose script flag differs from the POSIX `-c`
+    /// contract. The flag is passed as one literal argument; it is never
+    /// concatenated with the command text.
+    pub(crate) fn with_shell_command_arg(mut self, shell: &str, command_arg: &str) -> Self {
         if !shell.is_empty() {
             self.shell = shell.to_string();
+        }
+        if !command_arg.is_empty() {
+            self.shell_command_arg = command_arg.to_string();
         }
         self
     }
@@ -353,7 +365,7 @@ impl Sandbox {
         match self.policy() {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
-                cmd.arg("-c").arg(command);
+                cmd.arg(&self.shell_command_arg).arg(command);
                 configure_child_lifetime(&mut cmd);
                 return Ok(cmd);
             }
@@ -376,7 +388,7 @@ impl Sandbox {
             cmd.arg(cwd.as_os_str());
             cmd.arg("--");
             cmd.arg(&self.shell);
-            cmd.arg("-c");
+            cmd.arg(&self.shell_command_arg);
             cmd.arg(command);
             configure_child_lifetime(&mut cmd);
             return Ok(cmd);
@@ -438,7 +450,9 @@ impl Sandbox {
             cmd.arg(format!("{key}={value}"));
         }
         cmd.arg("TMPDIR=/private/tmp");
-        cmd.arg(&self.shell).arg("-c").arg(command);
+        cmd.arg(&self.shell)
+            .arg(&self.shell_command_arg)
+            .arg(command);
         configure_child_lifetime(&mut cmd);
         Ok(cmd)
     }
@@ -482,7 +496,13 @@ impl Sandbox {
             "--chdir",
         ]);
         cmd.arg(cwd);
-        cmd.args(["--die-with-parent", "--", &self.shell, "-c", command]);
+        cmd.args([
+            "--die-with-parent",
+            "--",
+            &self.shell,
+            &self.shell_command_arg,
+            command,
+        ]);
         configure_child_lifetime(&mut cmd);
         cmd
     }
@@ -932,6 +952,23 @@ mod sandbox_tests {
     #[test]
     fn sandbox_disabled_policy_is_disabled() {
         assert_eq!(disabled().policy(), SandboxPolicy::Disabled);
+    }
+
+    #[test]
+    fn sandbox_custom_shell_command_arg_is_a_literal_operand() {
+        let command = disabled()
+            .with_shell_command_arg("custom-shell", "-Command")
+            .wrap_command("literal; script")
+            .unwrap();
+        assert_eq!(command.as_std().get_program(), "custom-shell");
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(
+            args,
+            [
+                std::ffi::OsStr::new("-Command"),
+                std::ffi::OsStr::new("literal; script")
+            ]
+        );
     }
 
     #[test]

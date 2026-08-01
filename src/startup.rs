@@ -1130,6 +1130,7 @@ impl Startup {
             &self.cfg,
             &self.context,
             self.status_signals,
+            &self.sandbox,
         )
         .await;
         #[cfg(feature = "hooks")]

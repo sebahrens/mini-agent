@@ -3,6 +3,7 @@ use std::path::PathBuf;
 pub(crate) mod headless;
 pub mod plan;
 pub mod transcript;
+pub(crate) mod validation;
 
 pub const DEFAULT_PLAN_FILENAME: &str = "LOOP_PLAN.md";
 pub const SUMMARY_TRUNCATION_CHARS: usize = 1024;

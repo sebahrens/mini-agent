@@ -425,29 +425,11 @@ async fn handle_agent_done(
         ls.last_summary = Some(summary.clone());
 
         let validation_output = if let Some(cmd) = &ls.run_cmd {
-            let shell = if cfg!(windows) { "powershell" } else { "sh" };
-            let shell_arg = if cfg!(windows) { "-Command" } else { "-c" };
-            match tokio::process::Command::new(shell)
-                .arg(shell_arg)
-                .arg(cmd)
-                .output()
-                .await
-            {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    let combined = if stderr.is_empty() {
-                        stdout
-                    } else {
-                        format!("{}\n{}", stdout, stderr)
-                    };
-                    Some(combined)
-                }
-                Err(e) => {
-                    let msg = format!("error: {}", e);
-                    Some(msg)
-                }
-            }
+            Some(
+                crate::extras::r#loop::validation::run(&ui.sandbox, cmd)
+                    .await
+                    .render(),
+            )
         } else {
             None
         };
