@@ -100,9 +100,14 @@ pub async fn handle_agent_event(
         }
         AgentEvent::ToolCall { name, args } => {
             run.was_reasoning = false;
+            finalize_response_segment(renderer, run)?;
             if run.agent_line_started {
                 renderer.write_line("", Color::White)?;
                 run.agent_line_started = false;
+            }
+            if !run.response_buf.is_empty() {
+                ui.session
+                    .add_message(MessageRole::Assistant, &run.response_buf);
             }
             run.response_buf.clear();
             run.response_start_block = None;
@@ -317,20 +322,8 @@ async fn handle_agent_done(
     let _ = &chain;
     run.was_reasoning = false;
 
-    if !run.response_buf.is_empty() {
-        if let Some(start) = run.response_start_block {
-            // Drop anything interleaved after the streaming block, then
-            // finalize it: the full response (including the last line) is
-            // parsed as markdown once, here.
-            renderer.feed_mut().truncate_blocks(start + 1);
-            renderer.feed_mut().finalize_last();
-        } else {
-            renderer
-                .feed_mut()
-                .push_block(BlockStyle::Agent, run.response_buf.as_str());
-        }
-        renderer.render_viewport()?;
-    } else if !run.agent_line_started {
+    finalize_response_segment(renderer, run)?;
+    if run.response_buf.is_empty() && !run.agent_line_started {
         renderer.feed_mut().push_line(BlockStyle::Agent, "< ");
     }
 
@@ -545,5 +538,27 @@ async fn handle_agent_done(
         }
     }
 
+    Ok(())
+}
+
+fn finalize_response_segment(
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+) -> anyhow::Result<()> {
+    if run.response_buf.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(start) = run.response_start_block {
+        // Drop anything interleaved after the streaming block, then finalize
+        // the full segment (including its last line) as markdown.
+        renderer.feed_mut().truncate_blocks(start + 1);
+        renderer.feed_mut().finalize_last();
+    } else {
+        renderer
+            .feed_mut()
+            .push_block(BlockStyle::Agent, run.response_buf.as_str());
+    }
+    renderer.render_viewport()?;
     Ok(())
 }

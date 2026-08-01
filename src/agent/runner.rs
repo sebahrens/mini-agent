@@ -5,7 +5,7 @@ use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
 use rig::completion::{CompletionModel, Message};
-use rig::message::{AssistantContent, ToolResult, ToolResultContent};
+use rig::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use tokio::sync::mpsc;
 
@@ -154,6 +154,14 @@ fn append_streamed_text(interactions: &mut Vec<Message>, text: &str) {
     }
 
     interactions.push(Message::assistant(text.to_string()));
+}
+
+fn append_tool_call(interactions: &mut Vec<Message>, tool_call: &ToolCall) {
+    if let Some(Message::Assistant { content, .. }) = interactions.last_mut() {
+        content.push(AssistantContent::ToolCall(tool_call.clone()));
+    } else {
+        interactions.push(tool_call.clone().into());
+    }
 }
 
 fn reconcile_terminal_response(response: &mut String, stream_start: usize, terminal: &str) {
@@ -423,9 +431,10 @@ fn document_media_type(mime: &str) -> DocumentMediaType {
 
 async fn continue_prompt_injector<M>(
     agent: &Agent<M>,
-    retry_prompt: &str,
+    original_prompt: &str,
+    continuation_instruction: &str,
     retry_history: &[Message],
-    new_tool_interactions: &[Message],
+    new_interactions: &[Message],
     retry_config: &RetryConfig,
     max_turns: usize,
 ) -> StreamingResult<M::StreamingResponse>
@@ -434,17 +443,15 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
     let mut new_history = retry_history.to_vec();
-    new_history.extend_from_slice(new_tool_interactions);
-    new_history.push(Message::user(retry_prompt.to_string()));
-    new_history.push(Message::assistant(String::new()));
+    new_history.push(Message::user(original_prompt.to_string()));
+    new_history.extend_from_slice(new_interactions);
+    if matches!(new_history.last(), Some(Message::User { .. })) {
+        new_history.push(Message::assistant(String::new()));
+    }
     match retry::retry_stream_chat(retry_config, || {
         let h = new_history.clone();
-        async move {
-            agent
-                .stream_chat("Please continue.", h)
-                .max_turns(max_turns)
-                .await
-        }
+        let instruction = continuation_instruction.to_string();
+        async move { agent.stream_chat(instruction, h).max_turns(max_turns).await }
     })
     .await
     {
@@ -453,13 +460,13 @@ where
     }
 }
 
-fn take_new_tool_interactions(tool_interactions: &mut Vec<Message>) -> Vec<Message> {
-    let new_tool_interactions = std::mem::take(tool_interactions);
+fn take_new_interactions(interactions: &mut Vec<Message>) -> Vec<Message> {
+    let new_interactions = std::mem::take(interactions);
     tracing::debug!(
-        "agent injecting continue prompt, new_tool_interactions={}",
-        new_tool_interactions.len(),
+        "agent injecting continue prompt, new_interactions={}",
+        new_interactions.len(),
     );
-    new_tool_interactions
+    new_interactions
 }
 
 /// Builds the forked context for a `/btw` side question: the committed
@@ -542,7 +549,7 @@ where
         );
         let retry_prompt = prompt.clone();
         let retry_history: Vec<Message> = history.clone();
-        let mut tool_interactions: Vec<Message> = Vec::new();
+        let mut interactions: Vec<Message> = Vec::new();
         let mut last_tool_name: Option<String> = None;
         let mut empty_response_count: u32 = 0;
         const MAX_EMPTY_RESPONSES: u32 = 3;
@@ -632,7 +639,7 @@ where
                         match content {
                             StreamedAssistantContent::Text(text) => {
                                 response.push_str(&text.text);
-                                append_streamed_text(&mut tool_interactions, &text.text);
+                                append_streamed_text(&mut interactions, &text.text);
                                 let _ = event_tx
                                     .send(AgentEvent::Token(CompactString::from(text.text)))
                                     .await;
@@ -645,7 +652,9 @@ where
                                     tool_call.function.arguments.to_string().len(),
                                 );
                                 last_tool_name = Some(tool_name.clone());
-                                tool_interactions.push(tool_call.clone().into());
+                                response.clear();
+                                response_len_at_stream_start = 0;
+                                append_tool_call(&mut interactions, &tool_call);
                                 let _ = event_tx
                                     .send(AgentEvent::ToolCall {
                                         name: CompactString::from(tool_call.function.name),
@@ -696,7 +705,7 @@ where
                                 output: CompactString::from(output),
                             })
                             .await;
-                        tool_interactions.push(tool_result.clone().into());
+                        interactions.push(tool_result.clone().into());
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                         terminal_response_seen = true;
@@ -833,16 +842,17 @@ where
                     .await;
                 return;
             }
-            let injected_prompt = next_instruction
+            let continuation_instruction = next_instruction
                 .take()
-                .unwrap_or_else(|| retry_prompt.clone());
-            let new_tool_interactions = take_new_tool_interactions(&mut tool_interactions);
+                .unwrap_or_else(|| "Please continue.".to_string());
+            let new_interactions = take_new_interactions(&mut interactions);
             stream = stream_policy.apply(
                 continue_prompt_injector(
                     &agent,
-                    &injected_prompt,
+                    &retry_prompt,
+                    &continuation_instruction,
                     &retry_history,
-                    &new_tool_interactions,
+                    &new_interactions,
                     &retry_config,
                     remaining_turns,
                 )
@@ -933,7 +943,7 @@ where
     let mut stream = stream_policy.apply(stream);
 
     let retry_history: Vec<Message> = history;
-    let mut tool_interactions: Vec<Message> = Vec::new();
+    let mut interactions: Vec<Message> = Vec::new();
     let mut full_response = String::new();
     let mut response_len_at_stream_start = full_response.len();
     let mut last_tool_name: Option<String> = None;
@@ -962,7 +972,7 @@ where
                     text,
                 ))) => {
                     full_response.push_str(&text.text);
-                    append_streamed_text(&mut tool_interactions, &text.text);
+                    append_streamed_text(&mut interactions, &text.text);
                     print!("{}", text.text);
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
@@ -982,7 +992,7 @@ where
                         println!("\n◈ {} {}", name, summary);
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
-                    tool_interactions.push(tool_call.clone().into());
+                    append_tool_call(&mut interactions, &tool_call);
                 }
                 Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
                     tool_result,
@@ -1005,7 +1015,7 @@ where
                         }
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
-                    tool_interactions.push(tool_result.clone().into());
+                    interactions.push(tool_result.clone().into());
                 }
                 Ok(MultiTurnStreamItem::CompletionCall(call)) => {
                     turns_used = turns_used.saturating_add(1);
@@ -1082,12 +1092,12 @@ where
                 );
             }
             #[cfg(feature = "hooks")]
-            let injected_prompt = next_instruction
+            let continuation_instruction = next_instruction
                 .take()
-                .unwrap_or_else(|| prompt.to_string());
+                .unwrap_or_else(|| "Please continue.".to_string());
             #[cfg(not(feature = "hooks"))]
-            let injected_prompt = prompt.to_string();
-            let new_tool_interactions = take_new_tool_interactions(&mut tool_interactions);
+            let continuation_instruction = "Please continue.".to_string();
+            let new_interactions = take_new_interactions(&mut interactions);
             // Keep the text already streamed to stdout this turn: the caller
             // persists the returned string as the assistant message, so
             // clearing it here would drop turn-1 output the user already saw
@@ -1095,9 +1105,10 @@ where
             stream = stream_policy.apply(
                 continue_prompt_injector(
                     agent,
-                    &injected_prompt,
+                    prompt,
+                    &continuation_instruction,
                     &retry_history,
-                    &new_tool_interactions,
+                    &new_interactions,
                     retry_config,
                     remaining_turns,
                 )
@@ -1909,18 +1920,14 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(streamed, "prefix suffix");
         assert_eq!(done.as_deref(), Some("prefix suffix"));
-        assert!(
-            requests[1].chat_history.iter().any(|message| {
-                matches!(
-                    message,
-                    Message::Assistant { content, .. }
-                        if content.iter().any(|item| matches!(
-                            item,
-                            AssistantContent::Text(text) if text.text == "prefix "
-                        ))
-                )
-            }),
-            "the continuation request must include the partial assistant prefix"
+        assert_eq!(
+            requests[1].chat_history.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                Message::user("start"),
+                Message::assistant("prefix "),
+                Message::user("Please continue."),
+            ],
+            "continuation history must preserve causal prompt/output order"
         );
     }
 
@@ -1978,6 +1985,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(done.as_deref(), Some("partial complete"));
         let continuation_history = &requests[2].chat_history;
+        assert_eq!(continuation_history.len(), 5);
+        assert_eq!(continuation_history.first_ref(), &Message::user("start"));
         let tool_call_index = continuation_history
             .iter()
             .position(|message| matches!(message, Message::Assistant { content, .. } if content.iter().any(|item| matches!(item, AssistantContent::ToolCall(call) if call.id == "tool-before-eof"))))
@@ -1990,7 +1999,84 @@ mod tests {
             .iter()
             .position(|message| matches!(message, Message::Assistant { content, .. } if content.iter().any(|item| matches!(item, AssistantContent::Text(text) if text.text == "partial "))))
             .expect("continuation contains partial text");
-        assert!(tool_call_index < tool_result_index && tool_result_index < partial_text_index);
+        assert_eq!(
+            (tool_call_index, tool_result_index, partial_text_index),
+            (1, 2, 3)
+        );
+        assert_eq!(
+            continuation_history.last_ref(),
+            &Message::user("Please continue.")
+        );
+    }
+
+    #[tokio::test]
+    async fn text_and_tool_eof_history_is_causal_and_protocol_complete() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("checking"),
+                MockStreamEvent::tool_call(
+                    "causal-tool",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![
+                MockStreamEvent::text("answer"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent_with_stream_policy(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            RunnerStreamPolicy::drop_next_terminal_responses(1),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut done = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { response, .. } => {
+                    done = Some(response.to_string());
+                    break;
+                }
+                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(done.as_deref(), Some("answer"));
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3);
+        let history = &requests[2].chat_history;
+        assert_eq!(history.len(), 5);
+        assert_eq!(history.first_ref(), &Message::user("start"));
+        assert!(matches!(
+            history.iter().nth(1),
+            Some(Message::Assistant { content, .. })
+                if matches!(content.iter().next(), Some(AssistantContent::Text(text)) if text.text == "checking")
+                    && matches!(content.iter().nth(1), Some(AssistantContent::ToolCall(call)) if call.id == "causal-tool")
+                    && content.len() == 2
+        ));
+        assert!(matches!(
+            history.iter().nth(2),
+            Some(Message::User { content })
+                if matches!(content.first_ref(), rig::message::UserContent::ToolResult(result) if result.id == "causal-tool")
+        ));
+        assert_eq!(history.iter().nth(3), Some(&Message::assistant("")));
+        assert_eq!(history.last_ref(), &Message::user("Please continue."));
     }
 
     #[tokio::test]
@@ -2024,11 +2110,102 @@ mod tests {
 
         assert_eq!(model.requests().len(), 2);
         assert_eq!(response, "prefix suffix");
-        assert!(model.requests()[1].chat_history.iter().any(|message| {
-            matches!(message, Message::Assistant { content, .. } if content.iter().any(
-                |item| matches!(item, AssistantContent::Text(text) if text.text == "prefix ")
-            ))
-        }));
+        assert_eq!(
+            model.requests()[1]
+                .chat_history
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                Message::user("start"),
+                Message::assistant("prefix "),
+                Message::user("Please continue."),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn text_before_tool_and_final_answer_keep_session_chronology() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("checking"),
+                MockStreamEvent::tool_call(
+                    "chronology-tool",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("answer"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(2)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut session = crate::session::Session::new("test", "mock", 4096, "chronology");
+        let mut buffered_segment = String::new();
+        let mut rendered = String::new();
+        let mut done = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Token(text) => {
+                    buffered_segment.push_str(&text);
+                    rendered.push_str(&text);
+                }
+                crate::event::AgentEvent::ToolCall { name, args } => {
+                    if !buffered_segment.is_empty() {
+                        session
+                            .add_message(crate::session::MessageRole::Assistant, &buffered_segment);
+                        buffered_segment.clear();
+                    }
+                    session.add_tool_call(&name, &args);
+                }
+                crate::event::AgentEvent::ToolResult { name, output } => {
+                    session.add_tool_result(&name, &output);
+                }
+                crate::event::AgentEvent::Done { response, .. } => {
+                    session.add_message(crate::session::MessageRole::Assistant, &response);
+                    done = Some(response.to_string());
+                    break;
+                }
+                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rendered, "checkinganswer");
+        assert_eq!(done.as_deref(), Some("answer"));
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::session::MessageRole::Assistant,
+                crate::session::MessageRole::ToolCall,
+                crate::session::MessageRole::ToolResult,
+                crate::session::MessageRole::Assistant,
+            ]
+        );
+        assert_eq!(session.messages[0].content, "checking");
+        assert_eq!(session.messages[3].content, "answer");
     }
 
     #[tokio::test]
