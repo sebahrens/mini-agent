@@ -440,6 +440,11 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             .lock()
             .map_err(|_| HostEffectError::AuditFailure)
             .and_then(|mut audit| {
+                // The shared writer can be contended by another invocation. Authority is a
+                // lease, so recheck it after acquiring that lock and before persisting intent.
+                if Instant::now() >= grant.expires_at {
+                    return Err(HostEffectError::ExpiredGrant);
+                }
                 let normalized_target = sanitize_target(&audit, capability, audit_target)?;
                 audit
                     .append_intent(EffectIntent {
@@ -456,7 +461,11 @@ impl<S: ParentEffectService> InvocationBroker<S> {
                     })
                     .map_err(HostEffectError::from)
             });
-        if intent_result.is_err() {
+        if let Err(error) = intent_result {
+            if error == HostEffectError::ExpiredGrant {
+                let _ = self.ensure_grant_unexpired(&request.grant_id, grant.expires_at);
+                return Err(error);
+            }
             self.erase_authority(InvocationState::Terminal);
             return Err(HostEffectError::AuditFailure);
         }

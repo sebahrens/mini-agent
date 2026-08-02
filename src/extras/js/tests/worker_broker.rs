@@ -745,6 +745,57 @@ async fn worker_broker_grants_expiring_during_ask_never_execute() {
 }
 
 #[tokio::test]
+async fn worker_broker_grants_expiring_while_waiting_for_audit_never_execute() {
+    let invocation_id = invocation("inv-expiring-audit-lock");
+    let case = operation_cases(&invocation_id).remove(0);
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures: ServiceFailures::default(),
+        pending_permission: false,
+        permission_delay_until: None,
+        record: Arc::clone(&record),
+    };
+    let audit_root = AuditTempRoot::new("expiring-audit-lock");
+    let audit = Arc::new(Mutex::new(EffectAudit::open(audit_root.owner()).unwrap()));
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let locked_audit = Arc::clone(&audit);
+    let holder = std::thread::spawn(move || {
+        let _guard = locked_audit.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+    });
+    locked_rx.recv().unwrap();
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_millis(40),
+    );
+    let effect = request(&case, &grant);
+    let mut broker = InvocationBroker::new(
+        invocation_id,
+        vec![grant],
+        HostCapability::all(),
+        service,
+        Arc::clone(&audit),
+    )
+    .unwrap();
+
+    assert_eq!(
+        broker.dispatch(effect, PermCancellation::new()).await,
+        Err(HostEffectError::ExpiredGrant)
+    );
+    holder.join().unwrap();
+    assert!(broker.audit_records_for_test().is_empty());
+    let record = record.lock().unwrap();
+    assert_eq!(record.authorizations, 1);
+    assert_eq!(
+        record.execute_calls, 0,
+        "expired audit waiter reached execute"
+    );
+    assert_eq!(record.executions, 0);
+}
+
+#[tokio::test]
 async fn worker_broker_grants_execute_cancellation_erases_authority_before_redispatch() {
     let invocation_id = invocation("inv-execute-cancel");
     let mut cases = operation_cases(&invocation_id);

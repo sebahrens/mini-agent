@@ -740,6 +740,14 @@ struct PreparedFetchEffect {
     request: FetchRequest,
     control: Arc<FetchCallControl>,
     deadline: Instant,
+    redirect_mode: FetchRedirectMode,
+}
+
+#[cfg(feature = "sandbox")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FetchRedirectMode {
+    Follow,
+    DenyUnaudited,
 }
 
 #[cfg(feature = "sandbox")]
@@ -905,6 +913,7 @@ impl FetchExecutor {
             request,
             control,
             deadline,
+            redirect_mode: FetchRedirectMode::Follow,
         })
     }
 
@@ -949,6 +958,9 @@ impl FetchExecutor {
             )? {
                 FetchTransportOutcome::Complete(result) => return Ok(result),
                 FetchTransportOutcome::Redirect(redirect) => {
+                    if prepared.redirect_mode == FetchRedirectMode::DenyUnaudited {
+                        return Err(FetchError::UnauditedRedirectDenied);
+                    }
                     if redirect_count == FETCH_MAX_REDIRECTS {
                         return Err(FetchError::TooManyRedirects);
                     }
@@ -1286,6 +1298,7 @@ pub(crate) enum FetchError {
     TooManyRedirects,
     RedirectReplayDenied,
     CrossOriginRedirectDenied,
+    UnauditedRedirectDenied,
     InvalidOptions(String),
     ClientBuild(String),
     Cancelled,
@@ -1335,6 +1348,9 @@ impl std::fmt::Display for FetchError {
             Self::CrossOriginRedirectDenied => formatter.write_str(
                 "fetch refuses to forward caller headers across an origin-changing redirect",
             ),
+            Self::UnauditedRedirectDenied => {
+                formatter.write_str("fetch redirect requires an independent durable audit record")
+            }
             Self::InvalidOptions(message) => write!(formatter, "invalid fetch options: {message}"),
             Self::ClientBuild(message) => write!(formatter, "fetch client setup failed: {message}"),
             Self::Cancelled => formatter.write_str("fetch cancelled"),
@@ -2198,7 +2214,8 @@ fn fetch_service_error(error: &FetchError) -> EffectServiceError {
         | FetchError::DestinationDenied
         | FetchError::TooManyDestinations
         | FetchError::CrossOriginRedirectDenied
-        | FetchError::RedirectReplayDenied => EffectServiceError::TargetDenied,
+        | FetchError::RedirectReplayDenied
+        | FetchError::UnauditedRedirectDenied => EffectServiceError::TargetDenied,
         FetchError::Permission(error) => *error,
         FetchError::Cancelled => EffectServiceError::Cancelled,
         FetchError::TimedOut => EffectServiceError::TimedOut,
@@ -2209,10 +2226,10 @@ fn fetch_service_error(error: &FetchError) -> EffectServiceError {
             EffectServiceError::OutputLimit
         }
         FetchError::InvalidUtf8 => EffectServiceError::InvalidBody,
+        FetchError::OutcomeUnknown => EffectServiceError::OutcomeUnknown,
         FetchError::DnsResolutionFailed
         | FetchError::TooManyRedirects
         | FetchError::ClientBuild(_)
-        | FetchError::OutcomeUnknown
         | FetchError::RequestFailed(_)
         | FetchError::UnsupportedContentEncoding => EffectServiceError::BackendFailure,
     }
@@ -2723,10 +2740,14 @@ impl ParentEffectService for ParentHostEffectService {
                     let request = FetchRequest::try_new(method, &headers, body.clone())
                         .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
                     let control = Arc::new(FetchCallControl::new());
-                    let prepared = fetch
+                    let mut prepared = fetch
                         .authorize(url.clone(), request, cancellation, control)
                         .await
                         .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
+                    // One broker request owns one durable audit envelope. Until redirect hops
+                    // receive independent child records, a brokered fetch must never issue a
+                    // second network send under the first target's intent.
+                    prepared.redirect_mode = FetchRedirectMode::DenyUnaudited;
                     let normalized_url = prepared.target.url.as_str().to_string();
                     (
                         PreparedParentEffect::Fetch(prepared),
@@ -2920,6 +2941,8 @@ pub(crate) fn register_host_globals(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "sandbox")]
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     #[cfg(feature = "sandbox")]
     use std::sync::Condvar;
@@ -2927,7 +2950,17 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    #[cfg(feature = "sandbox")]
+    use crate::extras::js::audit::{AuditFailurePoint, AuditState, EffectAudit};
+    #[cfg(feature = "sandbox")]
+    use crate::extras::js::broker::{
+        GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant,
+    };
+    #[cfg(feature = "sandbox")]
+    use crate::extras::js::protocol::{AdvisoryAttribution, EffectRequest, InvocationId};
     use crate::extras::js::tool::PermissionBridgeOwner;
+    #[cfg(feature = "sandbox")]
+    use crate::paths::AppPaths;
     use crate::permission::ask::{AskSender, UserDecision};
     use crate::permission::checker::{PermCheck, PermissionChecker};
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
@@ -3452,6 +3485,160 @@ mod tests {
             status: 200,
             text: "ok".to_string(),
         })
+    }
+
+    #[cfg(feature = "sandbox")]
+    fn brokered_fetch(
+        directory: &TempDir,
+        tag: &str,
+        responses: Vec<Result<FetchTransportOutcome, FetchError>>,
+    ) -> (
+        InvocationBroker<ParentHostEffectService>,
+        EffectRequest,
+        Arc<FakeFetchSender>,
+        PermissionBridgeOwner,
+    ) {
+        let owner =
+            PermissionBridgeOwner::new(Some(fetch_permission(Action::Allow)), None, STEP_TIMEOUT);
+        let sender = Arc::new(FakeFetchSender::new(responses));
+        let fetch = FetchEffectService {
+            executor: Arc::new(FetchExecutor {
+                policy: FetchPolicy::from_settings(None, false),
+                resolver: Arc::new(FakeFetchResolver::new(vec![
+                    Ok(vec![public_address()]),
+                    Ok(vec![public_address()]),
+                ])),
+                sender: sender.clone(),
+                permission_bridge: owner.bridge(),
+            }),
+            permission_bridge: owner.bridge(),
+            runtime: tokio::runtime::Handle::current(),
+            timeout: Duration::from_secs(1),
+        };
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(directory.path()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        )
+        .with_fetch(fetch);
+        let invocation = InvocationId::new(format!("fetch-{tag}")).unwrap();
+        let grant = InvocationGrant::issue(
+            invocation.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: format!("call-{tag}"),
+            },
+            BTreeSet::from([HostCapability::Fetch]),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let request = EffectRequest {
+            effect_ordinal: 0,
+            grant_id: grant.grant_id().clone(),
+            advisory: AdvisoryAttribution::default(),
+            operation: EffectOperation::Fetch {
+                url: "https://example.com/start".to_string(),
+                method: crate::extras::js::protocol::HttpMethod::Get,
+                headers: Vec::new(),
+                body: None,
+            },
+        };
+        let audit_root = directory.path().join(format!("audit-{tag}"));
+        let audit = EffectAudit::open(
+            AppPaths {
+                config_dir: audit_root.join("config"),
+                data_dir: audit_root.join("data"),
+                local_data_dir: audit_root.join("local"),
+                state_dir: audit_root.join("state"),
+                cache_dir: audit_root.join("cache"),
+                credentials_dir: audit_root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap();
+        let broker = InvocationBroker::new(
+            invocation,
+            vec![grant],
+            BTreeSet::from([HostCapability::Fetch]),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        (broker, request, sender, owner)
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_brokered_fetch_redirect_has_no_unaudited_second_send() {
+        let directory = TempDir::new();
+        let redirect = Url::parse("https://example.com/redirected").unwrap();
+        let (mut broker, request, sender, _owner) = brokered_fetch(
+            &directory,
+            "redirect",
+            vec![
+                Ok(FetchTransportOutcome::Redirect(redirect)),
+                Ok(completed_fetch()),
+            ],
+        );
+
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::TargetDenied)
+        );
+        assert_eq!(
+            sender.call_count(),
+            1,
+            "redirect send was not independently audited"
+        );
+        let records = broker.audit_records_for_test();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].state, AuditState::Intent);
+        assert_eq!(records[1].state, AuditState::Completed);
+
+        let (mut broker, request, sender, _owner) = brokered_fetch(
+            &directory,
+            "redirect-audit-failure",
+            vec![Ok(FetchTransportOutcome::Redirect(
+                Url::parse("https://example.com/redirected").unwrap(),
+            ))],
+        );
+        broker.fail_next_audit_durability_for_test(AuditFailurePoint::Append);
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::AuditFailure)
+        );
+        assert_eq!(
+            sender.call_count(),
+            0,
+            "audit failure reached the redirect chain"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_brokered_fetch_persists_real_outcome_unknown() {
+        let directory = TempDir::new();
+        let (mut broker, request, sender, _owner) = brokered_fetch(
+            &directory,
+            "outcome-unknown",
+            vec![Err(FetchError::OutcomeUnknown)],
+        );
+
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::OutcomeUnknown)
+        );
+        assert_eq!(sender.call_count(), 1);
+        let records = broker.audit_records_for_test();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].state, AuditState::Intent);
+        assert_eq!(records[1].state, AuditState::OutcomeUnknown);
     }
 
     #[cfg(feature = "sandbox")]
