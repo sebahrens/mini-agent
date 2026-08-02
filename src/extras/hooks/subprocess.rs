@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
+use crate::process_creation::TokioCommandCreationExt;
 use crate::sandbox::{ProcessGroupGuard, configure_child_lifetime, kill_process_group};
 
 /// Hard output limits for one hook subprocess.
@@ -165,7 +166,7 @@ pub(crate) async fn run_hook_with_limits(
     cmd.stderr(Stdio::piped());
     configure_child_lifetime(&mut cmd);
 
-    let mut child = match cmd.spawn() {
+    let mut child = match cmd.spawn_guarded() {
         Ok(child) => child,
         Err(e) => {
             return HookOutput {

@@ -205,13 +205,16 @@ jobs:
           $actual = @(
             $output |
               ForEach-Object { $_.ToString().Trim() } |
-              Where-Object { $_ -match '^sandbox::worker::.*windows_production_.*: test$' } |
+              Where-Object { $_ -match '^.*windows_production_.*: test$' } |
               Sort-Object
           )
           $expected = @(
+            'extras::js::tests::worker_runtime::windows_production_supervisor_rejects_until_runtime_probe_passes: test'
             'sandbox::worker::platform::tests::windows_production_failure_child: test'
             'sandbox::worker::platform::tests::windows_production_failure_injection_closes_raii_handles_and_reaps_children: test'
+            'sandbox::worker::platform::tests::windows_production_creation_boundary_excludes_ordinary_piped_child: test'
             'sandbox::worker::platform::tests::windows_production_inheriting_process_lock_serializes_launch_windows: test'
+            'sandbox::worker::platform::tests::windows_production_launch_returns_typed_unavailable_without_child: test'
             'sandbox::worker::platform::tests::windows_production_policy_has_required_limits_and_compatible_mitigations: test'
             'sandbox::worker::platform::tests::windows_production_status_waits_for_runtime_containment_probe: test'
             'sandbox::worker::tests::windows_production_launcher_source_keeps_creation_time_authority_closed: test'

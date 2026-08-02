@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use crate::process_creation::StdCommandCreationExt;
+
 pub(crate) mod headless;
 pub mod plan;
 pub mod transcript;
@@ -22,7 +25,7 @@ pub(crate) fn verify_workflow_only_headless_relevance() -> anyhow::Result<()> {
     let status = std::process::Command::new("bash")
         .arg("-c")
         .arg(harness)
-        .status()
+        .status_guarded()
         .context("failed to execute the embedded loop verification policy")?;
 
     anyhow::ensure!(

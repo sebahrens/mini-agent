@@ -106,6 +106,16 @@ production-source line found by the required lexical audit:
 Command::new | tokio::process | .spawn( | .output( | .status(
 ```
 
+Guarded process terminals normalize to their original lexical fingerprint so moving a site behind
+the crate-wide creation boundary does not change its trust class. A separate inventory assertion
+requires every Windows-capable `TC-*` terminal to use the guarded standard-library, Tokio, or RMCP
+helper. The helpers hold the Windows creation mutex only through synchronous spawn, never through
+`wait`, `wait_with_output`, or an async suspension. Target-specific Linux/macOS worker terminals and
+explicit `TEST-ONLY` sites are outside this Windows race boundary.
+The lexical trust inventory excludes `src/process_creation.rs` itself: that module cannot assign a
+principal because it preserves the caller's class, and dedicated source assertions pin its one
+mutex plus standard-library, Tokio, and RMCP helper implementations.
+
 The inventory excludes dedicated test directories, retains inline test and false-positive matches
 as `TEST-ONLY`/`NON-PROCESS`, and assigns every remaining match to one current class above. An
 explicit current-class allow-list permits `TC-BROKER-JS-WORKER` only at the reviewed Linux worker

@@ -516,13 +516,16 @@ an inheritable canary omitted from `HANDLE_LIST`, and access denial for a parent
 sentinel before emitting its fixed readiness frame. Profile and disposable-artifact cleanup errors
 are part of the gate result rather than silently treated as success.
 
-Windows handle inheritance is process-global state. Every mini-agent `CreateProcessW` call with
-`bInheritHandles=TRUE` uses one shared creation lock, acquired before the first handle is made
-inheritable and released only after every intended child endpoint and excluded canary has had its
-inherit bit cleared or its handle closed. The production and feasibility launchers share this
-lock. Inheritable-handle owners also clear their bit during drop on every error path before the
-earlier-acquired lock guard is released. Any future inheriting Windows launcher is inside this
-boundary and must reuse the same lock.
+Windows handle inheritance is process-global state. The LPAC launcher and every production
+standard-library, Tokio, or reviewed third-party process terminal in mini-agent use one crate-wide
+creation lock. LPAC acquires it before the first handle is made inheritable and releases it only
+after every intended child endpoint and excluded canary has had its inherit bit cleared or its
+handle closed. Ordinary command helpers acquire the same outer lock before entering Rust's private
+Windows creation lock and release it immediately after synchronous spawn; no guard crosses a wait
+or async suspension. Inheritable-handle owners also clear their bit during drop on every error path
+before the earlier-acquired lock guard is released. The checked subprocess inventory rejects a
+Windows-capable production terminal that bypasses this boundary. Any future raw or third-party
+Windows launcher is inside the same boundary and must reuse it.
 
 On a standard-user Windows checkout, prepare and run the complete gate with:
 
@@ -538,8 +541,10 @@ prove that Windows accepts the combined token, Job, mitigation, handle, console,
 controls or that the resulting child observes them. Production Windows worker status therefore
 remains unavailable until a sacrificial launch probes those combined controls on the running host.
 Neither the construction preflight nor the narrower image-loading rows may report availability.
-There is no restricted-token or unconfined fallback, and this worker boundary does not satisfy the
-separate `mini-agent-uq5c` general-command sandbox.
+While status is unavailable, the production launcher returns the typed unavailable error without
+calling `CreateProcessW`; only the internal sacrificial-probe/test seam may call the raw production
+launcher. There is no restricted-token or unconfined fallback, and this worker boundary does not
+satisfy the separate `mini-agent-uq5c` general-command sandbox.
 
 ## Failure semantics
 

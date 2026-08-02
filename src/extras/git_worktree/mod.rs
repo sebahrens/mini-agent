@@ -6,6 +6,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::process_creation::StdCommandCreationExt;
+
 /// RAII guard that restores the original working directory on drop. Ensures
 /// the process CWD is restored even on panic. The `set_current_dir` approach
 /// is process-global — under the `multithread` feature, other threads' CWD
@@ -82,7 +84,7 @@ pub struct MergeState {
 pub fn detect() -> Option<WorktreeInfo> {
     let output = Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
-        .output()
+        .output_guarded()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -91,7 +93,7 @@ pub fn detect() -> Option<WorktreeInfo> {
 
     let output = Command::new("git")
         .args(["rev-parse", "--git-dir"])
-        .output()
+        .output_guarded()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -153,7 +155,7 @@ pub fn detect() -> Option<WorktreeInfo> {
 pub fn current_branch() -> Option<String> {
     let output = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
+        .output_guarded()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -168,7 +170,7 @@ pub fn default_branch(repo_path: &Path) -> Option<String> {
             .arg("-C")
             .arg(repo_path)
             .args(["rev-parse", "--verify", name])
-            .output()
+            .output_guarded()
             .ok();
         if let Some(out) = output
             && out.status.success()
@@ -188,7 +190,7 @@ pub fn create(name: &str, base_dir: Option<&Path>) -> Result<(PathBuf, WorktreeI
     let output = Command::new("git")
         .args(["worktree", "add", "-b", name])
         .arg(&target)
-        .output()
+        .output_guarded()
         .map_err(|e| format!("failed to run git: {}", e))?;
 
     if !output.status.success() {
@@ -404,11 +406,11 @@ pub fn cleanup_worktree(wt_path: &str, branch: &str, main_repo_path: &str, force
     let remove_output = if force {
         Command::new("git")
             .args(["worktree", "remove", "--force", wt_path])
-            .output()
+            .output_guarded()
     } else {
         Command::new("git")
             .args(["worktree", "remove", wt_path])
-            .output()
+            .output_guarded()
     };
     if let Ok(out) = &remove_output {
         if out.status.success() {
@@ -426,7 +428,7 @@ pub fn cleanup_worktree(wt_path: &str, branch: &str, main_repo_path: &str, force
     let branch_flag = if force { "-D" } else { "-d" };
     let branch_output = Command::new("git")
         .args(["branch", branch_flag, branch])
-        .output();
+        .output_guarded();
     if let Ok(out) = &branch_output {
         if out.status.success() {
             tracing::info!(branch, "cleanup_worktree: deleted branch");
@@ -473,7 +475,7 @@ pub fn cancel_merge(state: &MergeState) -> Result<(), String> {
 pub fn has_merge_conflict() -> bool {
     let output = Command::new("git")
         .args(["rev-parse", "--git-dir"])
-        .output()
+        .output_guarded()
         .ok();
     if let Some(out) = output
         && out.status.success()
@@ -486,7 +488,7 @@ pub fn has_merge_conflict() -> bool {
     }
     let output = Command::new("git")
         .args(["diff", "--name-only", "--diff-filter=U"])
-        .output();
+        .output_guarded();
     match output {
         Ok(out) if out.status.success() => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
         _ => false,
@@ -497,7 +499,7 @@ pub fn has_merge_conflict() -> bool {
 pub fn conflicted_files() -> Vec<String> {
     let output = Command::new("git")
         .args(["diff", "--name-only", "--diff-filter=U"])
-        .output();
+        .output_guarded();
     match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
             .trim()
@@ -513,7 +515,7 @@ pub fn conflicted_files() -> Vec<String> {
 fn run_git<const N: usize>(args: [&str; N]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
-        .output()
+        .output_guarded()
         .map_err(|e| format!("git failed: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -525,7 +527,7 @@ fn run_git<const N: usize>(args: [&str; N]) -> Result<String, String> {
 }
 
 fn run_git_quiet<const N: usize>(args: [&str; N]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    let output = Command::new("git").args(args).output_guarded().ok()?;
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -538,7 +540,7 @@ fn run_git_quiet<const N: usize>(args: [&str; N]) -> Option<String> {
 fn run_git_quiet_logged<const N: usize>(args: [&str; N], context: &str) -> Result<(), String> {
     let output = Command::new("git")
         .args(args)
-        .output()
+        .output_guarded()
         .map_err(|e| format!("git failed: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -555,7 +557,9 @@ fn run_git_quiet_logged<const N: usize>(args: [&str; N], context: &str) -> Resul
 }
 
 fn has_uncommitted_changes() -> bool {
-    let output = Command::new("git").args(["status", "--porcelain"]).output();
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output_guarded();
     match output {
         Ok(out) if out.status.success() => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
         _ => false,
@@ -567,7 +571,7 @@ pub fn worktree_has_uncommitted(wt_path: &Path) -> bool {
         .arg("-C")
         .arg(wt_path)
         .args(["status", "--porcelain"])
-        .output();
+        .output_guarded();
     match output {
         Ok(out) if out.status.success() => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
         _ => false,
@@ -581,7 +585,7 @@ pub fn worktree_auto_commit_all(wt_path: &Path) -> Result<(), String> {
         .arg("-C")
         .arg(wt_path)
         .args(["add", "-u"])
-        .output()
+        .output_guarded()
         .map_err(|e| format!("git add failed: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -591,7 +595,7 @@ pub fn worktree_auto_commit_all(wt_path: &Path) -> Result<(), String> {
         .arg("-C")
         .arg(wt_path)
         .args(["commit", "-m", "auto-commit: save changes before merge"])
-        .output()
+        .output_guarded()
         .map_err(|e| format!("git commit failed: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
