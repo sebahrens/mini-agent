@@ -12,11 +12,16 @@ use crate::extras::js::audit::{
 };
 use crate::extras::js::broker::{
     AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, GrantPrincipal,
-    HostCapability, HostEffectError, InvocationBroker, InvocationGrant, ParentEffectService,
+    HostCapability, HostEffectError, InvocationBroker, InvocationGrant, NormalizedTarget,
+    ParentEffectService, resolve_program_identity,
 };
 use crate::extras::js::protocol::{
     AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpHeader, HttpMethod, InvocationId,
     SkillProposalDraft,
+};
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::{
+    CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod as SkillHttpMethod,
 };
 use crate::extras::js::supervisor::InvocationEffectHandler;
 use crate::extras::js::types::PermCancellation;
@@ -42,6 +47,7 @@ struct ServiceRecord {
 
 struct RecordingService {
     failures: ServiceFailures,
+    normalized_target: Option<Result<NormalizedTarget, HostEffectError>>,
     pending_permission: bool,
     permission_delay_until: Option<Instant>,
     record: Arc<Mutex<ServiceRecord>>,
@@ -62,6 +68,19 @@ impl ParentEffectService for RecordingService {
         _operation: &EffectOperation,
     ) -> Result<(), HostEffectError> {
         self.failures.backend.map_or(Ok(()), Err)
+    }
+
+    fn normalize_target<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<NormalizedTarget, HostEffectError>> {
+        let target = self
+            .normalized_target
+            .clone()
+            .unwrap_or_else(|| normalized_target(operation));
+        Box::pin(async move { target })
     }
 
     fn authorize<'a>(
@@ -105,6 +124,33 @@ impl ParentEffectService for RecordingService {
             record.authorized.push(authorized);
             Ok(result)
         })
+    }
+}
+
+fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, HostEffectError> {
+    match operation {
+        EffectOperation::ReadFile { path } => Ok(NormalizedTarget::ReadFile {
+            workspace_relative: Some(path.clone()),
+        }),
+        EffectOperation::WriteFile { path, .. } => Ok(NormalizedTarget::WriteFile {
+            workspace_relative: Some(path.clone()),
+        }),
+        EffectOperation::Fetch { url, method, .. } => {
+            let url = reqwest::Url::parse(url).map_err(|_| HostEffectError::InvalidTarget)?;
+            Ok(NormalizedTarget::Fetch {
+                origin: url.origin().ascii_serialization(),
+                method: match method {
+                    HttpMethod::Get => "GET",
+                    HttpMethod::Post => "POST",
+                }
+                .into(),
+            })
+        }
+        EffectOperation::Spawn { program, .. } => Ok(NormalizedTarget::Spawn {
+            program: program.clone(),
+            resolved_executable: resolve_program_identity(program)?,
+        }),
+        EffectOperation::ProposeSkill { .. } => Ok(NormalizedTarget::ProposeSkill),
     }
 }
 
@@ -248,12 +294,62 @@ fn grant(
     invocation_id: &InvocationId,
     expires_at: Instant,
 ) -> InvocationGrant {
+    #[cfg(feature = "skills")]
+    if case.capability != HostCapability::ProposeSkill
+        && matches!(case.principal, GrantPrincipal::Skill { .. })
+    {
+        return scoped_skill_grant(case, invocation_id, manifest_for(case, true), expires_at);
+    }
     InvocationGrant::issue(
         invocation_id.clone(),
         case.principal.clone(),
         BTreeSet::from([case.capability]),
         expires_at,
     )
+}
+
+#[cfg(feature = "skills")]
+fn scoped_skill_grant(
+    case: &OperationCase,
+    invocation_id: &InvocationId,
+    manifest: CapabilityManifest,
+    expires_at: Instant,
+) -> InvocationGrant {
+    InvocationGrant::issue_scoped_skill(
+        invocation_id.clone(),
+        case.principal.clone(),
+        manifest,
+        expires_at,
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "skills")]
+fn manifest_for(case: &OperationCase, allow_target: bool) -> CapabilityManifest {
+    let grant = match case.capability {
+        HostCapability::ReadFile => CapabilityScope::ReadFile {
+            workspace_prefixes: vec![if allow_target { "docs" } else { "docs-private" }.into()],
+        },
+        HostCapability::WriteFile => CapabilityScope::WriteFile {
+            workspace_prefixes: vec![if allow_target { "tmp" } else { "tmp-private" }.into()],
+        },
+        HostCapability::Fetch => CapabilityScope::Fetch {
+            origins: vec![
+                if allow_target {
+                    "https://example.test"
+                } else {
+                    "https://other.test"
+                }
+                .into(),
+            ],
+            methods: vec![SkillHttpMethod::Get],
+        },
+        HostCapability::Spawn => CapabilityScope::Spawn {
+            programs: vec![if allow_target { "printf" } else { "echo" }.into()],
+        },
+        HostCapability::ProposeSkill => unreachable!("skill manifests cannot propose skills"),
+    };
+    CapabilityManifest::new(CapabilityTier::SideEffecting, vec![grant]).unwrap()
 }
 
 fn request(case: &OperationCase, grant: &InvocationGrant) -> EffectRequest {
@@ -275,9 +371,24 @@ fn broker(
     Arc<Mutex<ServiceRecord>>,
     AuditTempRoot,
 ) {
+    broker_with_normalized_target(invocation_id, grants, session_allowed, failures, None)
+}
+
+fn broker_with_normalized_target(
+    invocation_id: InvocationId,
+    grants: Vec<InvocationGrant>,
+    session_allowed: BTreeSet<HostCapability>,
+    failures: ServiceFailures,
+    normalized_target: Option<Result<NormalizedTarget, HostEffectError>>,
+) -> (
+    InvocationBroker<RecordingService>,
+    Arc<Mutex<ServiceRecord>>,
+    AuditTempRoot,
+) {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures,
+        normalized_target,
         pending_permission: false,
         permission_delay_until: None,
         record: Arc::clone(&record),
@@ -325,6 +436,219 @@ async fn assert_denied_before_execute(
         "{} reached the effect service",
         case.name
     );
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_capability_intersection_enforces_manifest_before_session_permission_audit_and_effect()
+ {
+    let invocation_id = invocation("inv-scoped-cross-product");
+    for case in operation_cases(&invocation_id)
+        .into_iter()
+        .filter(|case| case.capability != HostCapability::ProposeSkill)
+    {
+        let allowed = scoped_skill_grant(
+            &case,
+            &invocation_id,
+            manifest_for(&case, true),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (mut allowed_broker, allowed_record, _audit_root) = broker(
+            invocation_id.clone(),
+            vec![allowed.clone()],
+            BTreeSet::from([case.capability]),
+            ServiceFailures::default(),
+        );
+        assert_eq!(
+            allowed_broker
+                .dispatch(request(&case, &allowed), PermCancellation::new())
+                .await,
+            Ok(success_for(&case.operation)),
+            "{} did not pass the full intersection",
+            case.name
+        );
+        assert_eq!(allowed_record.lock().unwrap().authorizations, 1);
+        assert_eq!(allowed_record.lock().unwrap().executions, 1);
+        assert_eq!(allowed_broker.audit_records_for_test().len(), 2);
+
+        let manifest_denied = scoped_skill_grant(
+            &case,
+            &invocation_id,
+            manifest_for(&case, false),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (mut denied_broker, denied_record, _audit_root) = broker(
+            invocation_id.clone(),
+            vec![manifest_denied.clone()],
+            BTreeSet::from([case.capability]),
+            ServiceFailures::default(),
+        );
+        assert_eq!(
+            denied_broker
+                .dispatch(request(&case, &manifest_denied), PermCancellation::new())
+                .await,
+            Err(HostEffectError::ManifestDenied),
+            "{} did not identify the manifest layer",
+            case.name
+        );
+        assert_eq!(denied_record.lock().unwrap().authorizations, 0);
+        assert_eq!(denied_record.lock().unwrap().executions, 0);
+        assert!(denied_broker.audit_records_for_test().is_empty());
+
+        let session_denied = scoped_skill_grant(
+            &case,
+            &invocation_id,
+            manifest_for(&case, true),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (mut denied_broker, denied_record, _audit_root) = broker(
+            invocation_id.clone(),
+            vec![session_denied.clone()],
+            BTreeSet::new(),
+            ServiceFailures::default(),
+        );
+        assert_eq!(
+            denied_broker
+                .dispatch(request(&case, &session_denied), PermCancellation::new())
+                .await,
+            Err(HostEffectError::SessionDenied),
+            "{} did not identify the session layer",
+            case.name
+        );
+        assert_eq!(denied_record.lock().unwrap().authorizations, 0);
+        assert_eq!(denied_record.lock().unwrap().executions, 0);
+        assert!(denied_broker.audit_records_for_test().is_empty());
+    }
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_capability_intersection_keeps_model_authored_grants_session_only() {
+    let invocation_id = invocation("inv-model-session-only");
+    let case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::ProposeSkill)
+        .unwrap();
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(10),
+    );
+    let (mut broker, record, _audit_root) = broker(
+        invocation_id,
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::ProposeSkill]),
+        ServiceFailures {
+            backend: Some(HostEffectError::BackendFailure),
+            ..ServiceFailures::default()
+        },
+    );
+    assert_eq!(
+        broker
+            .dispatch(request(&case, &grant), PermCancellation::new())
+            .await,
+        Err(HostEffectError::BackendFailure)
+    );
+    assert_eq!(record.lock().unwrap().authorizations, 0);
+    assert!(broker.audit_records_for_test().is_empty());
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_capability_intersection_normalizes_fetch_method_and_spawn_identity() {
+    let invocation_id = invocation("inv-scoped-normalized-targets");
+    let mut fetch_case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::Fetch)
+        .unwrap();
+    fetch_case.operation = EffectOperation::Fetch {
+        url: "https://example.test:443/api".into(),
+        method: HttpMethod::Get,
+        headers: vec![],
+        body: None,
+    };
+    let grant = scoped_skill_grant(
+        &fetch_case,
+        &invocation_id,
+        manifest_for(&fetch_case, true),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let (mut default_port_broker, record, _audit_root) = broker(
+        invocation_id.clone(),
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::Fetch]),
+        ServiceFailures::default(),
+    );
+    assert!(
+        default_port_broker
+            .dispatch(request(&fetch_case, &grant), PermCancellation::new())
+            .await
+            .is_ok()
+    );
+    assert_eq!(record.lock().unwrap().executions, 1);
+
+    fetch_case.operation = EffectOperation::Fetch {
+        url: "https://example.test/api".into(),
+        method: HttpMethod::Post,
+        headers: vec![],
+        body: Some("body".into()),
+    };
+    let grant = scoped_skill_grant(
+        &fetch_case,
+        &invocation_id,
+        CapabilityManifest::new(
+            CapabilityTier::SideEffecting,
+            vec![CapabilityScope::Fetch {
+                origins: vec!["https://example.test".into()],
+                methods: vec![SkillHttpMethod::Get],
+            }],
+        )
+        .unwrap(),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let (mut method_broker, record, _audit_root) = broker(
+        invocation_id.clone(),
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::Fetch]),
+        ServiceFailures::default(),
+    );
+    assert_eq!(
+        method_broker
+            .dispatch(request(&fetch_case, &grant), PermCancellation::new())
+            .await,
+        Err(HostEffectError::ManifestDenied)
+    );
+    assert_eq!(record.lock().unwrap().authorizations, 0);
+    assert!(method_broker.audit_records_for_test().is_empty());
+
+    let spawn_case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::Spawn)
+        .unwrap();
+    let grant = scoped_skill_grant(
+        &spawn_case,
+        &invocation_id,
+        manifest_for(&spawn_case, true),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let (mut identity_broker, record, _audit_root) = broker_with_normalized_target(
+        invocation_id,
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::Spawn]),
+        ServiceFailures::default(),
+        Some(Ok(NormalizedTarget::Spawn {
+            program: "printf".into(),
+            resolved_executable: "/different/path/printf".into(),
+        })),
+    );
+    assert_eq!(
+        identity_broker
+            .dispatch(request(&spawn_case, &grant), PermCancellation::new())
+            .await,
+        Err(HostEffectError::ManifestDenied)
+    );
+    assert_eq!(record.lock().unwrap().authorizations, 0);
+    assert!(identity_broker.audit_records_for_test().is_empty());
 }
 
 #[tokio::test]
@@ -642,6 +966,7 @@ async fn worker_broker_grants_cancel_a_pending_ask_before_execution() {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures: ServiceFailures::default(),
+        normalized_target: None,
         pending_permission: true,
         permission_delay_until: None,
         record: Arc::clone(&record),
@@ -713,6 +1038,7 @@ async fn worker_broker_grants_expiring_during_ask_never_execute() {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures: ServiceFailures::default(),
+        normalized_target: None,
         pending_permission: false,
         permission_delay_until: Some(expires_at),
         record: Arc::clone(&record),
@@ -751,6 +1077,7 @@ async fn worker_broker_grants_expiring_while_waiting_for_audit_never_execute() {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures: ServiceFailures::default(),
+        normalized_target: None,
         pending_permission: false,
         permission_delay_until: None,
         record: Arc::clone(&record),
@@ -851,6 +1178,7 @@ async fn js_effect_audit_ordering_requires_durable_intent_before_read_file() {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures: ServiceFailures::default(),
+        normalized_target: None,
         pending_permission: false,
         permission_delay_until: None,
         record,
@@ -950,6 +1278,16 @@ impl ParentEffectService for OrderingService {
     ) -> Result<(), HostEffectError> {
         self.record.lock().unwrap().backend_checks += 1;
         Ok(())
+    }
+
+    fn normalize_target<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<NormalizedTarget, HostEffectError>> {
+        let target = normalized_target(operation);
+        Box::pin(async move { target })
     }
 
     fn authorize<'a>(

@@ -8,6 +8,7 @@ use rquickjs::prelude::Opt;
 use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
+use unicode_normalization::UnicodeNormalization;
 
 #[cfg(feature = "sandbox")]
 use reqwest::Url;
@@ -24,7 +25,8 @@ use std::sync::{
 use std::time::Instant;
 
 use crate::extras::js::broker::{
-    AuthorizedEffect, AuthorizedTarget, HostEffectError, ParentEffectFuture, ParentEffectService,
+    AuthorizedEffect, AuthorizedTarget, HostEffectError, NormalizedTarget, ParentEffectFuture,
+    ParentEffectService, resolve_program_identity,
 };
 use crate::extras::js::protocol::{EffectOperation, EffectResult};
 #[cfg(feature = "skills")]
@@ -578,7 +580,14 @@ impl FetchPolicy {
     }
 
     fn authorize(&self, raw_url: &str) -> Result<Url, FetchError> {
-        let url = normalize_fetch_url(raw_url, self.allow_http)?;
+        let url = normalize_fetch_url(raw_url, true)?;
+        self.authorize_normalized(url)
+    }
+
+    fn authorize_normalized(&self, url: Url) -> Result<Url, FetchError> {
+        if url.scheme() == "http" && !self.allow_http {
+            return Err(FetchError::SchemeDenied);
+        }
         let origin = fetch_origin(&url)?;
         match &self.origins {
             FetchOriginPolicy::Unrestricted => Ok(url),
@@ -917,12 +926,49 @@ impl FetchExecutor {
         })
     }
 
+    fn prepare_normalized(
+        &self,
+        url: Url,
+        request: FetchRequest,
+        control: Arc<FetchCallControl>,
+        deadline: Instant,
+    ) -> Result<PreparedFetchEffect, FetchError> {
+        let permission_bridge = self
+            .permission_bridge
+            .for_host_call(control.cancellation.clone());
+        let target = self.prepare_normalized_target(url, &permission_bridge)?;
+        Ok(PreparedFetchEffect {
+            target,
+            request,
+            control,
+            deadline,
+            redirect_mode: FetchRedirectMode::Follow,
+        })
+    }
+
     fn prepare_target(
         &self,
         raw_url: &str,
         permission_bridge: &PermissionBridge,
     ) -> Result<PreparedFetchTarget, FetchError> {
         let url = self.policy.authorize(raw_url)?;
+        self.prepare_authorized_target(url, permission_bridge)
+    }
+
+    fn prepare_normalized_target(
+        &self,
+        url: Url,
+        permission_bridge: &PermissionBridge,
+    ) -> Result<PreparedFetchTarget, FetchError> {
+        let url = self.policy.authorize_normalized(url)?;
+        self.prepare_authorized_target(url, permission_bridge)
+    }
+
+    fn prepare_authorized_target(
+        &self,
+        url: Url,
+        permission_bridge: &PermissionBridge,
+    ) -> Result<PreparedFetchTarget, FetchError> {
         let host = url.host_str().ok_or(FetchError::MissingHost)?;
         let port = url.port_or_known_default().ok_or(FetchError::MissingPort)?;
         let mut addresses = self.resolver.resolve(host, port, permission_bridge)?;
@@ -2160,6 +2206,33 @@ impl FetchEffectService {
         Ok(prepared)
     }
 
+    async fn authorize_normalized(
+        &self,
+        url: Url,
+        request: FetchRequest,
+        cancellation: PermCancellation,
+        control: Arc<FetchCallControl>,
+        deadline: Instant,
+    ) -> Result<PreparedFetchEffect, FetchError> {
+        if cancellation.is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+        let mut cancel_on_drop = CancelFetchPrepareOnDrop::new(control.clone());
+        let task_control = control.clone();
+        let executor = self.executor.clone();
+        let call = self.runtime.spawn_blocking(move || {
+            executor.prepare_normalized(url, request, task_control, deadline)
+        });
+        let bridge = self.permission_bridge.for_host_call(cancellation);
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(FetchError::TimedOut)?
+            .min(self.timeout);
+        let prepared = await_fetch_prepare(&bridge, remaining, call, control).await?;
+        cancel_on_drop.disarm();
+        Ok(prepared)
+    }
+
     async fn execute_prepared(
         &self,
         prepared: PreparedFetchEffect,
@@ -2435,7 +2508,7 @@ impl SpawnEffectService {
             .check_structured_async("bash", &subject, policy_input)
             .await
             .map_err(permission_service_error)?;
-        let program = resolve_spawn_executable(program)?;
+        let program = resolve_program_identity(program)?;
         Ok(PreparedSpawnEffect {
             program,
             arguments: arguments.to_vec(),
@@ -2496,65 +2569,6 @@ impl SpawnEffectService {
     }
 }
 
-fn resolve_spawn_executable(program: &str) -> Result<String, EffectServiceError> {
-    let source = Path::new(program);
-    let candidates = if source.is_absolute() || source.components().count() > 1 {
-        spawn_executable_candidates(source.to_path_buf())
-    } else {
-        let path = std::env::var_os("PATH").ok_or(EffectServiceError::InvalidTarget)?;
-        std::env::split_paths(&path)
-            .flat_map(|directory| spawn_executable_candidates(directory.join(source)))
-            .collect()
-    };
-    for candidate in candidates {
-        let Ok(metadata) = std::fs::metadata(&candidate) else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
-                continue;
-            }
-        }
-        let canonical =
-            std::fs::canonicalize(candidate).map_err(|_| EffectServiceError::InvalidTarget)?;
-        return canonical
-            .to_str()
-            .map(str::to_string)
-            .ok_or(EffectServiceError::InvalidTarget);
-    }
-    Err(EffectServiceError::InvalidTarget)
-}
-
-fn spawn_executable_candidates(path: PathBuf) -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        if path.extension().is_some() {
-            return vec![path];
-        }
-        let extensions = std::env::var_os("PATHEXT")
-            .and_then(|value| value.into_string().ok())
-            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
-        return extensions
-            .split(';')
-            .filter(|extension| !extension.is_empty())
-            .map(|extension| {
-                let mut candidate = path.as_os_str().to_os_string();
-                candidate.push(extension.to_ascii_lowercase());
-                PathBuf::from(candidate)
-            })
-            .collect();
-    }
-    #[cfg(not(windows))]
-    {
-        vec![path]
-    }
-}
-
 enum PreparedParentEffect {
     Read(PreparedReadEffect),
     Write {
@@ -2564,6 +2578,40 @@ enum PreparedParentEffect {
     Spawn(PreparedSpawnEffect),
     #[cfg(feature = "sandbox")]
     Fetch(PreparedFetchEffect),
+    #[cfg(feature = "sandbox")]
+    FetchPending {
+        url: Url,
+        request: FetchRequest,
+        control: Arc<FetchCallControl>,
+        deadline: Instant,
+    },
+}
+
+fn workspace_relative_path(base: &Path, target: &Path) -> Result<Option<String>, HostEffectError> {
+    use std::path::Component;
+
+    let Ok(relative) = target.strip_prefix(base) else {
+        return Ok(None);
+    };
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(HostEffectError::InvalidTarget);
+        };
+        let component = component
+            .to_str()
+            .ok_or(HostEffectError::InvalidTarget)?
+            .nfc()
+            .collect::<String>();
+        if component.is_empty() {
+            return Err(HostEffectError::InvalidTarget);
+        }
+        components.push(component);
+    }
+    if components.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(components.join("/")))
 }
 
 /// Concrete implementation of the A11 parent effect seam. Authorization
@@ -2658,68 +2706,65 @@ impl ParentEffectService for ParentHostEffectService {
         }
     }
 
-    fn authorize<'a>(
+    fn normalize_target<'a>(
         &'a mut self,
         _authorized: &'a AuthorizedEffect,
         operation: &'a EffectOperation,
         cancellation: PermCancellation,
-    ) -> ParentEffectFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
+    ) -> ParentEffectFuture<'a, Result<NormalizedTarget, HostEffectError>> {
         Box::pin(async move {
             self.prepared = None;
-            let (prepared, audit_target) = match operation {
+            match operation {
                 EffectOperation::ReadFile { path } => {
-                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
-                    let prepared = self
-                        .file
-                        .authorize_read(path, bridge)
-                        .await
-                        .map_err(HostEffectError::from)?;
-                    let canonical_path = prepared
-                        .0
-                        .path
-                        .to_str()
-                        .ok_or(HostEffectError::InvalidTarget)?
-                        .to_string();
-                    (
-                        PreparedParentEffect::Read(prepared),
-                        AuthorizedTarget::ReadFile { canonical_path },
-                    )
+                    let target = tokio::select! {
+                        result = timeout(self.file.timeout, resolve_read_target(path)) => {
+                            result.map_err(|_| HostEffectError::EffectTimedOut)?
+                                .map_err(HostEffectError::from)?
+                        }
+                        _ = cancellation.cancelled() => {
+                            return Err(HostEffectError::InvocationCancelled);
+                        }
+                    };
+                    let workspace_relative =
+                        workspace_relative_path(&self.file.allow_config.base, &target.path)?;
+                    self.prepared = Some(PreparedParentEffect::Read(PreparedReadEffect(target)));
+                    Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
                 EffectOperation::WriteFile { path, content } => {
-                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
-                    let target = self
-                        .file
-                        .authorize_write(path, bridge)
-                        .await
-                        .map_err(HostEffectError::from)?;
-                    let canonical_path = target
-                        .0
-                        .path
-                        .to_str()
-                        .ok_or(HostEffectError::InvalidTarget)?
-                        .to_string();
-                    (
-                        PreparedParentEffect::Write {
-                            target,
-                            content: content.clone(),
-                        },
-                        AuthorizedTarget::WriteFile { canonical_path },
-                    )
+                    let target = tokio::select! {
+                        result = timeout(self.file.timeout, resolve_write_target(path)) => {
+                            result.map_err(|_| HostEffectError::EffectTimedOut)?
+                                .map_err(HostEffectError::from)?
+                        }
+                        _ = cancellation.cancelled() => {
+                            return Err(HostEffectError::InvocationCancelled);
+                        }
+                    };
+                    let workspace_relative =
+                        workspace_relative_path(&self.file.allow_config.base, &target.path)?;
+                    self.prepared = Some(PreparedParentEffect::Write {
+                        target: PreparedWriteEffect(target),
+                        content: content.clone(),
+                    });
+                    Ok(NormalizedTarget::WriteFile { workspace_relative })
                 }
                 EffectOperation::Spawn { program, arguments } => {
-                    let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
-                    let prepared = self
-                        .spawn
-                        .authorize(program, arguments, bridge)
-                        .await
-                        .map_err(HostEffectError::from)?;
-                    let resolved_executable = prepared.program.clone();
-                    (
-                        PreparedParentEffect::Spawn(prepared),
-                        AuthorizedTarget::Spawn {
-                            resolved_executable,
-                        },
-                    )
+                    if program.is_empty()
+                        || program.contains('\0')
+                        || arguments.iter().any(|argument| argument.contains('\0'))
+                    {
+                        return Err(HostEffectError::InvalidTarget);
+                    }
+                    let resolved =
+                        resolve_program_identity(program).map_err(HostEffectError::from)?;
+                    self.prepared = Some(PreparedParentEffect::Spawn(PreparedSpawnEffect {
+                        program: resolved.clone(),
+                        arguments: arguments.clone(),
+                    }));
+                    Ok(NormalizedTarget::Spawn {
+                        program: program.nfc().collect(),
+                        resolved_executable: resolved,
+                    })
                 }
                 #[cfg(feature = "sandbox")]
                 EffectOperation::Fetch {
@@ -2728,8 +2773,9 @@ impl ParentEffectService for ParentHostEffectService {
                     headers,
                     body,
                 } => {
-                    let fetch = self.fetch.as_ref().ok_or(HostEffectError::BackendFailure)?;
-                    let method = match method {
+                    let url = normalize_fetch_url(url, true)
+                        .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
+                    let method_name = match method {
                         crate::extras::js::protocol::HttpMethod::Get => "GET",
                         crate::extras::js::protocol::HttpMethod::Post => "POST",
                     };
@@ -2737,31 +2783,149 @@ impl ParentEffectService for ParentHostEffectService {
                         .iter()
                         .map(|header| (header.name.clone(), header.value.clone()))
                         .collect::<Vec<_>>();
-                    let request = FetchRequest::try_new(method, &headers, body.clone())
+                    let request = FetchRequest::try_new(method_name, &headers, body.clone())
                         .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
                     let control = Arc::new(FetchCallControl::new());
+                    self.prepared = Some(PreparedParentEffect::FetchPending {
+                        url: url.clone(),
+                        request,
+                        control,
+                        deadline: Instant::now()
+                            + self
+                                .fetch
+                                .as_ref()
+                                .map_or(STEP_TIMEOUT, |fetch| fetch.timeout),
+                    });
+                    Ok(NormalizedTarget::Fetch {
+                        origin: url.origin().ascii_serialization(),
+                        method: method_name.to_string(),
+                    })
+                }
+                #[cfg(not(feature = "sandbox"))]
+                EffectOperation::Fetch { .. } => Err(HostEffectError::BackendFailure),
+                EffectOperation::ProposeSkill { .. } => Ok(NormalizedTarget::ProposeSkill),
+            }
+        })
+    }
+
+    fn authorize<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        _operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ParentEffectFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
+        Box::pin(async move {
+            let prepared = self
+                .prepared
+                .take()
+                .ok_or(HostEffectError::BackendFailure)?;
+            let (prepared, audit_target) = match prepared {
+                PreparedParentEffect::Read(target) => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    let call = async {
+                        if let AuthorizationDecision::Denied(reason) =
+                            self.file.allow_config.authorize_read(&target.0.path)
+                        {
+                            return Err(file_policy_service_error(reason));
+                        }
+                        let permission_path = permission_path(&target.0.path)?;
+                        bridge
+                            .check_path_async("js/read_file", &permission_path)
+                            .await
+                            .map_err(permission_service_error)?;
+                        Ok::<_, EffectServiceError>(())
+                    };
+                    tokio::select! {
+                        result = timeout(self.file.timeout, call) => {
+                            result.map_err(|_| HostEffectError::EffectTimedOut)?
+                                .map_err(HostEffectError::from)?;
+                        }
+                        _ = bridge.cancelled() => return Err(HostEffectError::InvocationCancelled),
+                    }
+                    let canonical_path =
+                        permission_path(&target.0.path).map_err(HostEffectError::from)?;
+                    (
+                        PreparedParentEffect::Read(target),
+                        AuthorizedTarget::ReadFile { canonical_path },
+                    )
+                }
+                PreparedParentEffect::Write { target, content } => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    let call = async {
+                        if let AuthorizationDecision::Denied(reason) =
+                            self.file.allow_config.authorize_write(&target.0.path)
+                        {
+                            return Err(file_policy_service_error(reason));
+                        }
+                        let permission_path = permission_path(&target.0.path)?;
+                        bridge
+                            .check_path_async("js/write_file", &permission_path)
+                            .await
+                            .map_err(permission_service_error)?;
+                        Ok::<_, EffectServiceError>(())
+                    };
+                    tokio::select! {
+                        result = timeout(self.file.timeout, call) => {
+                            result.map_err(|_| HostEffectError::EffectTimedOut)?
+                                .map_err(HostEffectError::from)?;
+                        }
+                        _ = bridge.cancelled() => return Err(HostEffectError::InvocationCancelled),
+                    }
+                    let canonical_path =
+                        permission_path(&target.0.path).map_err(HostEffectError::from)?;
+                    (
+                        PreparedParentEffect::Write { target, content },
+                        AuthorizedTarget::WriteFile { canonical_path },
+                    )
+                }
+                PreparedParentEffect::Spawn(target) => {
+                    if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
+                        return Err(HostEffectError::BackendFailure);
+                    }
+                    let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
+                    let subject =
+                        canonical_spawn_permission_subject(&target.program, &target.arguments)
+                            .map_err(HostEffectError::from)?;
+                    let policy_input = spawn_policy_input(&target.program, &target.arguments);
+                    bridge
+                        .check_structured_async("bash", &subject, policy_input)
+                        .await
+                        .map_err(permission_service_error)
+                        .map_err(HostEffectError::from)?;
+                    let resolved_executable = target.program.clone();
+                    (
+                        PreparedParentEffect::Spawn(target),
+                        AuthorizedTarget::Spawn {
+                            resolved_executable,
+                        },
+                    )
+                }
+                #[cfg(feature = "sandbox")]
+                PreparedParentEffect::FetchPending {
+                    url,
+                    request,
+                    control,
+                    deadline,
+                } => {
+                    let fetch = self.fetch.as_ref().ok_or(HostEffectError::BackendFailure)?;
+                    let method = request.method.as_str().to_string();
                     let mut prepared = fetch
-                        .authorize(url.clone(), request, cancellation, control)
+                        .authorize_normalized(url, request, cancellation, control, deadline)
                         .await
                         .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
-                    // One broker request owns one durable audit envelope. Until redirect hops
-                    // receive independent child records, a brokered fetch must never issue a
-                    // second network send under the first target's intent.
+                    // Preserve A14: redirects remain denied until each hop has its own intent.
                     prepared.redirect_mode = FetchRedirectMode::DenyUnaudited;
                     let normalized_url = prepared.target.url.as_str().to_string();
                     (
                         PreparedParentEffect::Fetch(prepared),
                         AuthorizedTarget::Fetch {
                             normalized_url,
-                            method: method.to_string(),
+                            method,
                         },
                     )
                 }
-                #[cfg(not(feature = "sandbox"))]
-                EffectOperation::Fetch { .. } => return Err(HostEffectError::BackendFailure),
-                EffectOperation::ProposeSkill { .. } => {
-                    return Err(HostEffectError::BackendFailure);
-                }
+                #[cfg(feature = "sandbox")]
+                PreparedParentEffect::Fetch(_) => return Err(HostEffectError::BackendFailure),
             };
             self.prepared = Some(prepared);
             Ok(audit_target)
@@ -2827,6 +2991,8 @@ impl ParentEffectService for ParentHostEffectService {
                         truncated: false,
                     })
                 }
+                #[cfg(feature = "sandbox")]
+                PreparedParentEffect::FetchPending { .. } => Err(HostEffectError::BackendFailure),
             }
         })
     }
@@ -2941,25 +3107,31 @@ pub(crate) fn register_host_globals(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "sandbox")]
+    #[cfg(any(feature = "sandbox", feature = "skills"))]
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     #[cfg(feature = "sandbox")]
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    #[cfg(feature = "skills")]
+    use std::time::Instant;
 
     use super::*;
     #[cfg(feature = "sandbox")]
-    use crate::extras::js::audit::{AuditFailurePoint, AuditState, EffectAudit};
-    #[cfg(feature = "sandbox")]
+    use crate::extras::js::audit::AuditFailurePoint;
+    #[cfg(any(feature = "sandbox", feature = "skills"))]
+    use crate::extras::js::audit::{AuditState, EffectAudit};
+    #[cfg(any(feature = "sandbox", feature = "skills"))]
     use crate::extras::js::broker::{
         GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant,
     };
-    #[cfg(feature = "sandbox")]
+    #[cfg(any(feature = "sandbox", feature = "skills"))]
     use crate::extras::js::protocol::{AdvisoryAttribution, EffectRequest, InvocationId};
+    #[cfg(feature = "skills")]
+    use crate::extras::js::skills::{CapabilityManifest, CapabilityScope, CapabilityTier};
     use crate::extras::js::tool::PermissionBridgeOwner;
-    #[cfg(feature = "sandbox")]
+    #[cfg(any(feature = "sandbox", feature = "skills"))]
     use crate::paths::AppPaths;
     use crate::permission::ask::{AskSender, UserDecision};
     use crate::permission::checker::{PermCheck, PermissionChecker};
@@ -3571,6 +3743,162 @@ mod tests {
         )
         .unwrap();
         (broker, request, sender, owner)
+    }
+
+    #[cfg(feature = "skills")]
+    fn scoped_host_broker(
+        directory: &TempDir,
+        tag: &str,
+        service: ParentHostEffectService,
+        scope: CapabilityScope,
+        operation: EffectOperation,
+    ) -> (InvocationBroker<ParentHostEffectService>, EffectRequest) {
+        let invocation = InvocationId::new(format!("scoped-{tag}")).unwrap();
+        let principal = GrantPrincipal::Skill {
+            artifact_id: format!("artifact-{tag}"),
+            export: "run".to_string(),
+            invocation_id: invocation.to_string(),
+        };
+        let grant = InvocationGrant::issue_scoped_skill(
+            invocation.clone(),
+            principal,
+            CapabilityManifest::new(CapabilityTier::SideEffecting, vec![scope]).unwrap(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        let request = EffectRequest {
+            effect_ordinal: 0,
+            grant_id: grant.grant_id().clone(),
+            advisory: AdvisoryAttribution {
+                artifact_id: Some(format!("artifact-{tag}")),
+                export: Some("run".to_string()),
+            },
+            operation,
+        };
+        let capability = match &request.operation {
+            EffectOperation::ReadFile { .. } => HostCapability::ReadFile,
+            EffectOperation::WriteFile { .. } => HostCapability::WriteFile,
+            EffectOperation::Fetch { .. } => HostCapability::Fetch,
+            EffectOperation::Spawn { .. } => HostCapability::Spawn,
+            EffectOperation::ProposeSkill { .. } => HostCapability::ProposeSkill,
+        };
+        let audit_root = directory.path().join(format!("audit-{tag}"));
+        let audit = EffectAudit::open(
+            AppPaths {
+                config_dir: audit_root.join("config"),
+                data_dir: audit_root.join("data"),
+                local_data_dir: audit_root.join("local"),
+                state_dir: audit_root.join("state"),
+                cache_dir: audit_root.join("cache"),
+                credentials_dir: audit_root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap();
+        let broker = InvocationBroker::new(
+            invocation,
+            vec![grant],
+            BTreeSet::from([capability]),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        (broker, request)
+    }
+
+    #[cfg(all(feature = "skills", unix))]
+    #[tokio::test]
+    async fn scoped_capability_intersection_real_host_file_scope_is_symlink_and_race_safe() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new();
+        let workspace = directory.path().join("workspace");
+        let allowed = workspace.join("allowed");
+        let denied = workspace.join("denied");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+        let denied_target = denied.join("secret.txt");
+        std::fs::write(&denied_target, "secret").unwrap();
+        let escape_link = workspace.join("looks-allowed.txt");
+        symlink(&denied_target, &escape_link).unwrap();
+
+        let permission = host_permission(workspace.clone(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(2);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(&workspace),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let (mut broker, request) = scoped_host_broker(
+            &directory,
+            "symlink-denied",
+            service,
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["allowed".to_string()],
+            },
+            EffectOperation::ReadFile {
+                path: escape_link.to_string_lossy().into_owned(),
+            },
+        );
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::ManifestDenied)
+        );
+        assert!(
+            ask_rx.try_recv().is_err(),
+            "manifest denial reached permission"
+        );
+        assert!(broker.audit_records_for_test().is_empty());
+
+        let source = allowed.join("source.txt");
+        let original = allowed.join("original.txt");
+        std::fs::write(&source, "approved identity").unwrap();
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(&workspace),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let (mut broker, request) = scoped_host_broker(
+            &directory,
+            "race-denied",
+            service,
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["allowed".to_string()],
+            },
+            EffectOperation::ReadFile {
+                path: source.to_string_lossy().into_owned(),
+            },
+        );
+        let dispatch = tokio::spawn(async move {
+            let result = broker.dispatch(request, PermCancellation::new()).await;
+            (result, broker)
+        });
+        let prompt = ask_rx.recv().await.expect("read should request permission");
+        std::fs::rename(&source, &original).unwrap();
+        symlink(&denied_target, &source).unwrap();
+        prompt.reply.send(UserDecision::AllowOnce).unwrap();
+        let (result, broker) = dispatch.await.unwrap();
+        assert_eq!(result, Err(HostEffectError::InvalidTarget));
+        let records = broker.audit_records_for_test();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].state, AuditState::Intent);
+        assert_eq!(records[1].state, AuditState::Completed);
     }
 
     #[cfg(feature = "sandbox")]

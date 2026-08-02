@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -21,6 +22,11 @@ use super::protocol::{
     AdvisoryAttribution, EffectError, EffectErrorCode, EffectRequest, GrantId, InvocationId,
 };
 pub(crate) use super::protocol::{EffectOperation, EffectResult};
+#[cfg(feature = "skills")]
+use super::skills::{
+    CapabilityManifest, CapabilityScope, HostCapability as SkillHostCapability,
+    HttpMethod as SkillHttpMethod,
+};
 use super::supervisor::{EffectFuture, InvocationEffectHandler};
 use super::types::EffectServiceError;
 use super::types::PermCancellation;
@@ -81,6 +87,10 @@ pub(crate) struct InvocationGrant {
     allowed: BTreeSet<HostCapability>,
     bound_invocation: InvocationId,
     expires_at: Instant,
+    #[cfg(feature = "skills")]
+    manifest: Option<CapabilityManifest>,
+    #[cfg(feature = "skills")]
+    spawn_program_identities: BTreeSet<String>,
 }
 
 impl InvocationGrant {
@@ -97,7 +107,51 @@ impl InvocationGrant {
             allowed,
             bound_invocation,
             expires_at,
+            #[cfg(feature = "skills")]
+            manifest: None,
+            #[cfg(feature = "skills")]
+            spawn_program_identities: BTreeSet::new(),
         }
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn issue_scoped_skill(
+        bound_invocation: InvocationId,
+        principal: GrantPrincipal,
+        manifest: CapabilityManifest,
+        expires_at: Instant,
+    ) -> Result<Self, BrokerBuildError> {
+        if !matches!(principal, GrantPrincipal::Skill { .. }) {
+            return Err(BrokerBuildError::InvalidScopedPrincipal);
+        }
+        manifest
+            .validate()
+            .map_err(|_| BrokerBuildError::InvalidManifest)?;
+        let spawn_program_identities = manifest
+            .grants
+            .iter()
+            .filter_map(|scope| match scope {
+                CapabilityScope::Spawn { programs } => Some(programs),
+                _ => None,
+            })
+            .flatten()
+            .map(|program| resolve_program_identity(program))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|_| BrokerBuildError::UnavailableManifestProgram)?;
+        let allowed = manifest
+            .grants
+            .iter()
+            .map(|scope| match scope.capability() {
+                SkillHostCapability::ReadFile => HostCapability::ReadFile,
+                SkillHostCapability::WriteFile => HostCapability::WriteFile,
+                SkillHostCapability::Fetch => HostCapability::Fetch,
+                SkillHostCapability::Spawn => HostCapability::Spawn,
+            })
+            .collect();
+        let mut grant = Self::issue(bound_invocation, principal, allowed, expires_at);
+        grant.manifest = Some(manifest);
+        grant.spawn_program_identities = spawn_program_identities;
+        Ok(grant)
     }
 
     pub(crate) fn grant_id(&self) -> &GrantId {
@@ -128,6 +182,8 @@ pub(crate) enum HostEffectError {
     SessionDenied,
     #[error("invocation grant denies the operation")]
     CapabilityDenied,
+    #[error("skill manifest denies the operation target")]
+    ManifestDenied,
     #[error("operation target is invalid")]
     InvalidTarget,
     #[error("operation target is outside the allowed scope")]
@@ -167,6 +223,7 @@ impl HostEffectError {
             | Self::InvocationRecycled
             | Self::SessionDenied
             | Self::CapabilityDenied
+            | Self::ManifestDenied
             | Self::PermissionDenied => EffectErrorCode::Denied,
         }
     }
@@ -237,6 +294,26 @@ pub(crate) enum AuthorizedTarget {
     ProposeSkill,
 }
 
+/// Parent-normalized, source-free target used only for manifest intersection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NormalizedTarget {
+    ReadFile {
+        workspace_relative: Option<String>,
+    },
+    WriteFile {
+        workspace_relative: Option<String>,
+    },
+    Fetch {
+        origin: String,
+        method: String,
+    },
+    Spawn {
+        program: String,
+        resolved_executable: String,
+    },
+    ProposeSkill,
+}
+
 impl AuthorizedEffect {
     pub(crate) fn invocation_id(&self) -> &InvocationId {
         &self.invocation_id
@@ -269,6 +346,13 @@ pub(crate) trait ParentEffectService: Send {
         operation: &EffectOperation,
     ) -> Result<(), HostEffectError>;
 
+    fn normalize_target<'a>(
+        &'a mut self,
+        authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ParentEffectFuture<'a, Result<NormalizedTarget, HostEffectError>>;
+
     fn authorize<'a>(
         &'a mut self,
         authorized: &'a AuthorizedEffect,
@@ -296,6 +380,12 @@ enum InvocationState {
 pub(crate) enum BrokerBuildError {
     #[error("duplicate invocation grant")]
     DuplicateGrant,
+    #[error("scoped grant principal is not a learned skill")]
+    InvalidScopedPrincipal,
+    #[error("scoped grant manifest is invalid")]
+    InvalidManifest,
+    #[error("scoped grant manifest names an unavailable executable")]
+    UnavailableManifestProgram,
 }
 
 /// One invocation's parent-owned grant table and policy state.
@@ -377,9 +467,6 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         if !grant.allowed.contains(&capability) {
             return Err(HostEffectError::CapabilityDenied);
         }
-        if !self.session_allowed.contains(&capability) {
-            return Err(HostEffectError::SessionDenied);
-        }
         if capability == HostCapability::ProposeSkill
             && matches!(grant.principal, GrantPrincipal::Skill { .. })
         {
@@ -388,12 +475,34 @@ impl<S: ParentEffectService> InvocationBroker<S> {
 
         let authorized = AuthorizedEffect {
             invocation_id: self.invocation_id.clone(),
-            grant_id: grant.grant_id,
-            principal: grant.principal,
+            grant_id: grant.grant_id.clone(),
+            principal: grant.principal.clone(),
             capability,
         };
         self.service
             .validate_target(&authorized, &request.operation)?;
+
+        let normalization_result = {
+            let normalization = self.service.normalize_target(
+                &authorized,
+                &request.operation,
+                cancellation.clone(),
+            );
+            tokio::pin!(normalization);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(HostEffectError::InvocationCancelled),
+                result = &mut normalization => result,
+            }
+        };
+        if normalization_result == Err(HostEffectError::InvocationCancelled) {
+            self.cancel_invocation();
+        }
+        let normalized_target = normalization_result?;
+        enforce_manifest_scope(&grant, capability, &normalized_target)?;
+        if !self.session_allowed.contains(&capability) {
+            return Err(HostEffectError::SessionDenied);
+        }
         self.service
             .ensure_backend(&authorized, &request.operation)?;
 
@@ -576,6 +685,148 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         self.grants.clear();
         self.retired_grants.clear();
         self.state = state;
+    }
+}
+
+#[cfg(feature = "skills")]
+fn enforce_manifest_scope(
+    grant: &InvocationGrant,
+    capability: HostCapability,
+    target: &NormalizedTarget,
+) -> Result<(), HostEffectError> {
+    if matches!(grant.principal, GrantPrincipal::ModelAuthored { .. }) {
+        return Ok(());
+    }
+    let manifest = grant
+        .manifest
+        .as_ref()
+        .ok_or(HostEffectError::ManifestDenied)?;
+    let allowed = match (manifest.scope(skill_capability(capability)), target) {
+        (
+            Some(CapabilityScope::ReadFile { workspace_prefixes }),
+            NormalizedTarget::ReadFile { workspace_relative },
+        )
+        | (
+            Some(CapabilityScope::WriteFile { workspace_prefixes }),
+            NormalizedTarget::WriteFile { workspace_relative },
+        ) => workspace_prefixes.iter().any(|prefix| {
+            workspace_relative
+                .as_deref()
+                .is_some_and(|target| path_scope_contains(prefix, target))
+        }),
+        (
+            Some(CapabilityScope::Fetch { origins, methods }),
+            NormalizedTarget::Fetch { origin, method },
+        ) => {
+            origins.contains(origin)
+                && methods.iter().any(|allowed| {
+                    matches!(
+                        (allowed, method.as_str()),
+                        (SkillHttpMethod::Get, "GET") | (SkillHttpMethod::Post, "POST")
+                    )
+                })
+        }
+        (
+            Some(CapabilityScope::Spawn { programs }),
+            NormalizedTarget::Spawn {
+                program,
+                resolved_executable,
+            },
+        ) => {
+            programs.contains(program)
+                && grant.spawn_program_identities.contains(resolved_executable)
+        }
+        _ => false,
+    };
+    allowed.then_some(()).ok_or(HostEffectError::ManifestDenied)
+}
+
+#[cfg(not(feature = "skills"))]
+fn enforce_manifest_scope(
+    _grant: &InvocationGrant,
+    _capability: HostCapability,
+    _target: &NormalizedTarget,
+) -> Result<(), HostEffectError> {
+    Ok(())
+}
+
+#[cfg(feature = "skills")]
+fn skill_capability(capability: HostCapability) -> SkillHostCapability {
+    match capability {
+        HostCapability::ReadFile => SkillHostCapability::ReadFile,
+        HostCapability::WriteFile => SkillHostCapability::WriteFile,
+        HostCapability::Fetch => SkillHostCapability::Fetch,
+        HostCapability::Spawn => SkillHostCapability::Spawn,
+        HostCapability::ProposeSkill => unreachable!("skills cannot receive proposal grants"),
+    }
+}
+
+#[cfg(feature = "skills")]
+fn path_scope_contains(prefix: &str, target: &str) -> bool {
+    target == prefix
+        || target
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Resolve a program once to the executable identity carried through scope,
+/// permission, durable audit, and execution.
+pub(crate) fn resolve_program_identity(program: &str) -> Result<String, EffectServiceError> {
+    let source = Path::new(program);
+    let candidates = if source.is_absolute() || source.components().count() > 1 {
+        spawn_executable_candidates(source.to_path_buf())
+    } else {
+        let path = std::env::var_os("PATH").ok_or(EffectServiceError::InvalidTarget)?;
+        std::env::split_paths(&path)
+            .flat_map(|directory| spawn_executable_candidates(directory.join(source)))
+            .collect()
+    };
+    for candidate in candidates {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        let canonical =
+            std::fs::canonicalize(candidate).map_err(|_| EffectServiceError::InvalidTarget)?;
+        return canonical
+            .to_str()
+            .map(str::to_string)
+            .ok_or(EffectServiceError::InvalidTarget);
+    }
+    Err(EffectServiceError::InvalidTarget)
+}
+
+fn spawn_executable_candidates(path: PathBuf) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        if path.extension().is_some() {
+            return vec![path];
+        }
+        let extensions = std::env::var_os("PATHEXT")
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+        return extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| {
+                let mut candidate = path.as_os_str().to_os_string();
+                candidate.push(extension.to_ascii_lowercase());
+                PathBuf::from(candidate)
+            })
+            .collect();
+    }
+    #[cfg(not(windows))]
+    {
+        vec![path]
     }
 }
 
