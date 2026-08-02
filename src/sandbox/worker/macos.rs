@@ -45,6 +45,13 @@ pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
     })
 }
 
+#[cfg(test)]
+pub(super) fn launch_executable_for_benchmark(
+    _executable: &std::path::Path,
+) -> Result<WorkerProcess, WorkerLaunchError> {
+    launch()
+}
+
 fn unavailable_reason() -> String {
     if !trusted_system_executable(Path::new(SANDBOX_EXEC)) {
         return missing_sandbox_exec_reason();

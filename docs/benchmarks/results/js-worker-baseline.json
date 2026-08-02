@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "benchmark": "mini-agent-js-worker",
+  "evidence_state": "pending_external_runs",
+  "profile": "debug",
+  "sampling": {
+    "warmups": 10,
+    "samples": 100,
+    "percentile": "nearest-rank",
+    "variance": "unbiased sample variance in microseconds squared",
+    "documented_p95_variance_ratio": 0.15
+  },
+  "targets": {
+    "cold_ready_us": {
+      "linux": 250000.0,
+      "macos": 300000.0,
+      "windows": 750000.0
+    },
+    "warm_pure_call_us": 10000.0,
+    "broker_ipc_4kib_us": 10000.0,
+    "idle_private_bytes": 33554432,
+    "post_cancel_recovery_us": 1000000.0,
+    "maximum_worker_processes": 1,
+    "idle_runtimes": 0
+  },
+  "security_ceilings": {
+    "native_memory_bytes": 268435456,
+    "native_cpu_seconds": 35,
+    "relationship_to_targets": "enforced security ceilings; never inferred from benchmark measurements",
+    "verification": "verified by the platform containment probe job, separately from this benchmark"
+  },
+  "platform_evidence": []
+}

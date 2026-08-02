@@ -57,6 +57,26 @@ pub(super) fn containment_status() -> WorkerContainmentStatus {
 }
 
 pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
+    launch_executable(worker_executable()?, production_worker_args())
+}
+
+#[cfg(test)]
+pub(super) fn launch_executable_for_benchmark(
+    executable: &Path,
+) -> Result<WorkerProcess, WorkerLaunchError> {
+    let executable = executable
+        .canonicalize()
+        .map_err(|source| WorkerLaunchError::Io {
+            backend: BACKEND,
+            source,
+        })?;
+    launch_executable(executable, &[])
+}
+
+fn launch_executable(
+    executable: PathBuf,
+    worker_args: &[&str],
+) -> Result<WorkerProcess, WorkerLaunchError> {
     match containment_status() {
         WorkerContainmentStatus::Available {
             backend: BACKEND,
@@ -79,12 +99,11 @@ pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
         backend: BACKEND,
         reason: "trusted bubblewrap executable is unavailable".into(),
     })?;
-    let executable = worker_executable()?;
     let mut command = broker_only_command(
         &bwrap,
         &executable,
         INTERNAL_WORKER_MARKER_VALUE,
-        production_worker_args(),
+        worker_args,
     )?;
     command
         .stdin(Stdio::piped())

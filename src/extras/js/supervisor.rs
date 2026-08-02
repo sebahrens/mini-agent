@@ -434,6 +434,15 @@ impl JsWorkerSupervisor {
         Self::new(Arc::new(launcher), true, STEP_TIMEOUT)
     }
 
+    /// Test-owned supervisor for benchmarking an installed production executable. Unlike
+    /// libtest worker launchers, the installed binary emits no test-runner preamble.
+    #[cfg(test)]
+    pub(crate) fn with_production_launcher_for_benchmark(
+        launcher: impl WorkerLauncher + 'static,
+    ) -> Self {
+        Self::new(Arc::new(launcher), false, STEP_TIMEOUT)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_launcher_and_watchdog_for_test(
         launcher: impl WorkerLauncher + 'static,
@@ -720,6 +729,44 @@ impl JsWorkerSupervisor {
             .idle
             .as_ref()
             .map(|connection| connection.process.id())
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) async fn windows_process_observation_for_test(
+        &self,
+    ) -> std::io::Result<Option<crate::sandbox::worker::WindowsWorkerProcessObservation>> {
+        self.0
+            .transport
+            .lock()
+            .await
+            .idle
+            .as_ref()
+            .map(|connection| connection.process.windows_process_observation_for_test())
+            .transpose()
+    }
+
+    /// Launch through the configured production containment backend and stop at the authenticated
+    /// `Ready` boundary. This exists only for the reproducible worker benchmark: ordinary callers
+    /// must continue to launch lazily as part of an invocation.
+    #[cfg(test)]
+    pub(crate) async fn prepare_ready_for_benchmark_for_test(&self) -> Result<(), WorkerError> {
+        let cancellation = PermCancellation::new();
+        let deadline = Instant::now() + self.0.watchdog;
+        let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
+        if state.idle.is_none() {
+            let generation = allocate_counter(&mut state.next_generation)?;
+            let connection = launch_connection(
+                self.0.launcher.clone(),
+                self.0.launch_gate.clone(),
+                generation,
+                self.0.accepts_test_preamble,
+                &cancellation,
+                deadline,
+            )
+            .await?;
+            store_idle_with_retirement(&self.0, &mut state, connection);
+        }
+        Ok(())
     }
 
     #[cfg(test)]

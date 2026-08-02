@@ -15,6 +15,8 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 
+#[cfg(test)]
+use super::WindowsWorkerProcessObservation;
 use super::{
     WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus, WorkerLaunchError,
     WorkerProcess,
@@ -156,6 +158,24 @@ pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
     }
 }
 
+#[cfg(test)]
+pub(super) fn launch_executable_for_benchmark(
+    executable: &std::path::Path,
+) -> Result<WorkerProcess, WorkerLaunchError> {
+    match containment_status() {
+        WorkerContainmentStatus::Unavailable {
+            backend, reason, ..
+        } => Err(WorkerLaunchError::Unavailable { backend, reason }),
+        WorkerContainmentStatus::Available { .. } => feasibility::launch_production(
+            feasibility::ProductionLaunchHooks::installed_worker(executable.to_path_buf()),
+        )
+        .map_err(|error| WorkerLaunchError::Io {
+            backend: BACKEND,
+            source: io::Error::other(error.0),
+        }),
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct WorkerChild {
     inner: WorkerChildInner,
@@ -229,6 +249,29 @@ impl WorkerChild {
             feasibility::GateError("Windows containment Job was already closed".to_string())
         })?;
         feasibility::verify_runtime_controls(process, job)
+    }
+
+    #[cfg(test)]
+    pub(super) fn process_observation_for_test(
+        &self,
+    ) -> io::Result<WindowsWorkerProcessObservation> {
+        let WorkerChildInner::Contained {
+            job, process_id, ..
+        } = &self.inner
+        else {
+            return Err(io::Error::other(
+                "benchmark requires a production-contained Windows worker",
+            ));
+        };
+        let job = job
+            .as_ref()
+            .ok_or_else(|| io::Error::other("benchmark Windows worker Job was already closed"))?;
+        let active_job_processes =
+            feasibility::active_job_processes(job).map_err(|error| io::Error::other(error.0))?;
+        Ok(WindowsWorkerProcessObservation {
+            exact_worker_pid: *process_id,
+            active_job_processes,
+        })
     }
 
     #[cfg(test)]
@@ -3580,21 +3623,7 @@ mod feasibility {
             ));
         }
 
-        let mut accounting = JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION::default();
-        // SAFETY: the Job handle is live and `accounting` is an initialized exact-size output.
-        if unsafe {
-            QueryInformationJobObject(
-                job.raw(),
-                JobObjectBasicAndIoAccountingInformation,
-                (&mut accounting as *mut JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION).cast(),
-                size_of::<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION>() as u32,
-                null_mut(),
-            )
-        } == 0
-        {
-            return Err(last_error("query single active JavaScript worker process"));
-        }
-        if accounting.BasicInfo.ActiveProcesses != 1 {
+        if active_job_processes(job)? != 1 {
             return Err(GateError(
                 "creation-time Job did not contain exactly one active process".to_string(),
             ));
@@ -3625,6 +3654,24 @@ mod feasibility {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn active_job_processes(job: &WinHandle) -> Result<u32, GateError> {
+        let mut accounting = JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the Job handle is live and `accounting` is an initialized exact-size output.
+        if unsafe {
+            QueryInformationJobObject(
+                job.raw(),
+                JobObjectBasicAndIoAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("query active JavaScript worker Job processes"));
+        }
+        Ok(accounting.BasicInfo.ActiveProcesses)
     }
 
     pub(super) fn run_containment_child_probe() -> io::Result<()> {

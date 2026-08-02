@@ -9,6 +9,8 @@
 use std::fmt;
 use std::fs::File;
 use std::io;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
@@ -191,6 +193,34 @@ impl WorkerLauncher for ProductionWorkerLauncher {
     }
 }
 
+/// Launches the installed debug application through the production containment path.
+///
+/// Resource benchmarks must measure the application worker entry point, not the libtest
+/// protocol child used by launcher unit tests.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct BenchmarkWorkerLauncher {
+    executable: PathBuf,
+}
+
+#[cfg(test)]
+impl BenchmarkWorkerLauncher {
+    pub(crate) fn new(executable: PathBuf) -> Self {
+        Self { executable }
+    }
+}
+
+#[cfg(test)]
+impl WorkerLauncher for BenchmarkWorkerLauncher {
+    fn containment_status(&self) -> WorkerContainmentStatus {
+        platform::containment_status()
+    }
+
+    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        platform::launch_executable_for_benchmark(&self.executable)
+    }
+}
+
 pub(crate) fn containment_status() -> WorkerContainmentStatus {
     ProductionWorkerLauncher.containment_status()
 }
@@ -212,9 +242,23 @@ pub(crate) struct WorkerProcess {
     force_tree_termination_error: bool,
 }
 
+#[cfg(all(test, windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowsWorkerProcessObservation {
+    pub(crate) exact_worker_pid: u32,
+    pub(crate) active_job_processes: u32,
+}
+
 impl WorkerProcess {
     pub(crate) fn id(&self) -> u32 {
         self.process.id()
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn windows_process_observation_for_test(
+        &self,
+    ) -> io::Result<WindowsWorkerProcessObservation> {
+        self.process.process_observation_for_test()
     }
 
     pub(crate) fn terminate_tree(&mut self) -> io::Result<()> {
