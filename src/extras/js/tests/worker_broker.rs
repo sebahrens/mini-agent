@@ -3,7 +3,10 @@ use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 use std::time::{Duration, Instant};
 
 use crate::extras::js::audit::{
@@ -12,9 +15,10 @@ use crate::extras::js::audit::{
 };
 use crate::extras::js::broker::{
     AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, ExecutableCopyError,
-    GrantPrincipal, HostCapability, HostEffectError, InvocationBroker, InvocationGrant,
-    MAX_SPAWN_EXECUTABLE_BYTES, NormalizedTarget, ParentEffectService, copy_and_hash_executable,
-    resolve_program_identity,
+    ExecutablePreparationWaitError, GrantPrincipal, HostCapability, HostEffectError,
+    InvocationBroker, InvocationGrant, MAX_SPAWN_EXECUTABLE_BYTES, NormalizedTarget,
+    ParentEffectService, copy_and_hash_executable, copy_and_hash_executable_controlled,
+    resolve_program_identity, run_executable_preparation,
 };
 use crate::extras::js::protocol::{
     AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpHeader, HttpMethod, InvocationId,
@@ -321,11 +325,12 @@ fn scoped_skill_grant(
     manifest: CapabilityManifest,
     expires_at: Instant,
 ) -> InvocationGrant {
-    InvocationGrant::issue_scoped_skill(
+    InvocationGrant::issue_scoped_skill_with_resolver(
         invocation_id.clone(),
         case.principal.clone(),
         manifest,
         expires_at,
+        resolve_program_identity,
     )
     .unwrap()
 }
@@ -863,6 +868,125 @@ fn executable_snapshot_copy_is_bounded_and_reports_destination_failure() {
         copy_and_hash_executable(&mut b"approved executable".as_slice(), &mut FailingWriter),
         Err(ExecutableCopyError::Write)
     );
+}
+
+struct ControllablyBlockingExecutableSource {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    started: Arc<tokio::sync::Semaphore>,
+    announced: bool,
+}
+
+impl Read for ControllablyBlockingExecutableSource {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        if !self.announced {
+            self.announced = true;
+            self.started.add_permits(1);
+        }
+        let (released, wake) = &*self.gate;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = wake.wait(released).unwrap();
+        }
+        Ok(0)
+    }
+}
+
+struct TrackedSnapshotResource {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Write for TrackedSnapshotResource {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for TrackedSnapshotResource {
+    fn drop(&mut self) {
+        self.dropped.store(true, AtomicOrdering::Release);
+    }
+}
+
+async fn assert_blocked_executable_preparation_returns_promptly(cancel: bool) {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let cancellation = PermCancellation::new();
+    let deadline = Instant::now()
+        + if cancel {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(75)
+        };
+    let task_gate = gate.clone();
+    let task_started = started.clone();
+    let task_dropped = dropped.clone();
+    let task_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        run_executable_preparation(deadline, task_cancellation, move |control| {
+            let mut source = ControllablyBlockingExecutableSource {
+                gate: task_gate,
+                started: task_started,
+                announced: false,
+            };
+            let mut snapshot = TrackedSnapshotResource {
+                dropped: task_dropped,
+            };
+            copy_and_hash_executable_controlled(&mut source, &mut snapshot, &control)
+        })
+        .await
+    });
+
+    started.acquire().await.unwrap().forget();
+    let return_started = Instant::now();
+    if cancel {
+        cancellation.cancel();
+    }
+    let result = tokio::time::timeout(Duration::from_millis(300), task)
+        .await
+        .expect("blocked executable preparation did not return promptly")
+        .unwrap();
+    assert_eq!(
+        result,
+        Err(if cancel {
+            ExecutablePreparationWaitError::Cancelled
+        } else {
+            ExecutablePreparationWaitError::TimedOut
+        })
+    );
+    assert!(
+        return_started.elapsed() < Duration::from_millis(300),
+        "cancellation/deadline waited for a blocked source"
+    );
+    assert!(
+        !dropped.load(AtomicOrdering::Acquire),
+        "the source should still control when its worker unwinds"
+    );
+
+    let (released, wake) = &*gate;
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !dropped.load(AtomicOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late snapshot resource was not closed after the source unwound");
+}
+
+#[tokio::test]
+async fn executable_preparation_cancellation_returns_before_blocked_source_and_closes_snapshot() {
+    assert_blocked_executable_preparation_returns_promptly(true).await;
+}
+
+#[tokio::test]
+async fn executable_preparation_deadline_returns_before_blocked_source_and_closes_snapshot() {
+    assert_blocked_executable_preparation_returns_promptly(false).await;
 }
 
 #[cfg(unix)]

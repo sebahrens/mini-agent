@@ -11,7 +11,10 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -101,6 +104,126 @@ pub(crate) struct InvocationGrant {
 const MAX_SPAWN_PROGRAM_BINDINGS: usize = 256;
 const MAX_RESOLVED_EXECUTABLE_BYTES: usize = 4096;
 pub(crate) const MAX_SPAWN_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CONCURRENT_EXECUTABLE_PREPARATIONS: usize = 4;
+
+fn executable_preparation_slots() -> Arc<tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SLOTS
+        .get_or_init(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_EXECUTABLE_PREPARATIONS,
+            ))
+        })
+        .clone()
+}
+
+/// Cooperative stop state shared with one bounded executable-preparation worker.
+///
+/// Filesystem calls such as a FUSE `read` can remain blocked in the kernel, so the async caller
+/// never waits for worker termination after cancellation. The worker keeps its bounded slot and
+/// observes this state before the next filesystem/copy step; any late result is dropped by the
+/// closed result channel, which closes owned files and sealed snapshots.
+pub(crate) struct ExecutablePreparationControl {
+    cancelled: AtomicBool,
+    deadline: Instant,
+}
+
+impl ExecutablePreparationControl {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            deadline,
+        }
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<(), ExecutablePreparationWaitError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(ExecutablePreparationWaitError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ExecutablePreparationWaitError::TimedOut);
+        }
+        Ok(())
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(deadline: Instant) -> Self {
+        Self::new(deadline)
+    }
+}
+
+struct CancelExecutablePreparationOnDrop(Arc<ExecutablePreparationControl>);
+
+impl Drop for CancelExecutablePreparationOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutablePreparationWaitError {
+    Cancelled,
+    TimedOut,
+    WorkerFailed,
+}
+
+/// Runs potentially blocking executable resolution/snapshot work without occupying an async
+/// runtime thread. Queueing and work share one absolute deadline, and blocked calls cannot grow
+/// the runtime's blocking pool without bound because the permit lives until the worker unwinds.
+pub(crate) async fn run_executable_preparation<T, F>(
+    deadline: Instant,
+    cancellation: PermCancellation,
+    work: F,
+) -> Result<T, ExecutablePreparationWaitError>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<ExecutablePreparationControl>) -> T + Send + 'static,
+{
+    if cancellation.is_cancelled() {
+        return Err(ExecutablePreparationWaitError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ExecutablePreparationWaitError::TimedOut);
+    }
+
+    let control = Arc::new(ExecutablePreparationControl::new(deadline));
+    let _cancel_on_drop = CancelExecutablePreparationOnDrop(control.clone());
+    let slots = executable_preparation_slots();
+    let permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            return Err(ExecutablePreparationWaitError::Cancelled);
+        }
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            return Err(ExecutablePreparationWaitError::TimedOut);
+        }
+        permit = slots.acquire_owned() => {
+            permit.map_err(|_| ExecutablePreparationWaitError::WorkerFailed)?
+        }
+    };
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let result = work(control);
+        // If the caller has cancelled or timed out, dropping the failed send closes all resources
+        // owned by a late prepared result on this worker thread.
+        let _ = sender.send(result);
+    });
+
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ExecutablePreparationWaitError::Cancelled),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            Err(ExecutablePreparationWaitError::TimedOut)
+        }
+        result = receiver => result.map_err(|_| ExecutablePreparationWaitError::WorkerFailed),
+    }
+}
 
 /// Stable parent-owned identity for one resolved executable. The canonical path is the
 /// permission/audit label; platform identity rejects path replacement and the bounded content
@@ -162,6 +285,8 @@ pub(crate) enum ExecutableCopyError {
     Read,
     Write,
     TooLarge,
+    Cancelled,
+    TimedOut,
 }
 
 /// Copies and hashes one executable version without ever accepting an unbounded input.
@@ -169,13 +294,31 @@ pub(crate) fn copy_and_hash_executable(
     source: &mut impl Read,
     destination: &mut impl Write,
 ) -> Result<ExecutableContent, ExecutableCopyError> {
+    copy_and_hash_executable_inner(source, destination, None)
+}
+
+pub(crate) fn copy_and_hash_executable_controlled(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+    control: &ExecutablePreparationControl,
+) -> Result<ExecutableContent, ExecutableCopyError> {
+    copy_and_hash_executable_inner(source, destination, Some(control))
+}
+
+fn copy_and_hash_executable_inner(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+    control: Option<&ExecutablePreparationControl>,
+) -> Result<ExecutableContent, ExecutableCopyError> {
     let mut digest = Sha256::new();
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        executable_copy_checkpoint(control)?;
         let read = source
             .read(&mut buffer)
             .map_err(|_| ExecutableCopyError::Read)?;
+        executable_copy_checkpoint(control)?;
         if read == 0 {
             break;
         }
@@ -194,6 +337,19 @@ pub(crate) fn copy_and_hash_executable(
         sha256: format!("{:x}", digest.finalize()),
         bytes: total,
     })
+}
+
+fn executable_copy_checkpoint(
+    control: Option<&ExecutablePreparationControl>,
+) -> Result<(), ExecutableCopyError> {
+    match control.map(ExecutablePreparationControl::checkpoint) {
+        Some(Err(ExecutablePreparationWaitError::Cancelled)) => Err(ExecutableCopyError::Cancelled),
+        Some(Err(ExecutablePreparationWaitError::TimedOut)) => Err(ExecutableCopyError::TimedOut),
+        Some(Err(ExecutablePreparationWaitError::WorkerFailed)) => {
+            unreachable!("worker failure cannot originate inside preparation work")
+        }
+        Some(Ok(())) | None => Ok(()),
+    }
 }
 
 impl InvocationGrant {
@@ -218,19 +374,31 @@ impl InvocationGrant {
     }
 
     #[cfg(feature = "skills")]
-    pub(crate) fn issue_scoped_skill(
+    pub(crate) async fn issue_scoped_skill(
         bound_invocation: InvocationId,
         principal: GrantPrincipal,
         manifest: CapabilityManifest,
         expires_at: Instant,
+        cancellation: PermCancellation,
     ) -> Result<Self, BrokerBuildError> {
-        Self::issue_scoped_skill_with_resolver_inner(
-            bound_invocation,
-            principal,
-            manifest,
-            expires_at,
-            resolve_program_identity,
-        )
+        let result = run_executable_preparation(expires_at, cancellation, move |control| {
+            Self::issue_scoped_skill_with_resolver_inner(
+                bound_invocation,
+                principal,
+                manifest,
+                expires_at,
+                |program| resolve_program_identity_controlled(program, &control),
+            )
+        })
+        .await
+        .map_err(|error| match error {
+            ExecutablePreparationWaitError::Cancelled => BrokerBuildError::Cancelled,
+            ExecutablePreparationWaitError::TimedOut => BrokerBuildError::TimedOut,
+            ExecutablePreparationWaitError::WorkerFailed => {
+                BrokerBuildError::ExecutablePreparationFailed
+            }
+        })?;
+        result
     }
 
     #[cfg(feature = "skills")]
@@ -260,8 +428,11 @@ impl InvocationGrant {
             if spawn_program_identities.len() >= MAX_SPAWN_PROGRAM_BINDINGS {
                 return Err(BrokerBuildError::InvalidManifest);
             }
-            let identity =
-                resolver(program).map_err(|_| BrokerBuildError::UnavailableManifestProgram)?;
+            let identity = resolver(program).map_err(|error| match error {
+                EffectServiceError::Cancelled => BrokerBuildError::Cancelled,
+                EffectServiceError::TimedOut => BrokerBuildError::TimedOut,
+                _ => BrokerBuildError::UnavailableManifestProgram,
+            })?;
             if identity.canonical_path.len() > MAX_RESOLVED_EXECUTABLE_BYTES {
                 return Err(BrokerBuildError::InvalidManifest);
             }
@@ -540,6 +711,12 @@ pub(crate) enum BrokerBuildError {
     InvalidManifest,
     #[error("scoped grant manifest names an unavailable executable")]
     UnavailableManifestProgram,
+    #[error("scoped grant construction was cancelled")]
+    Cancelled,
+    #[error("scoped grant construction exceeded its deadline")]
+    TimedOut,
+    #[error("scoped grant executable preparation worker failed")]
+    ExecutablePreparationFailed,
 }
 
 /// One invocation's parent-owned grant table and policy state.
@@ -953,6 +1130,21 @@ fn path_scope_contains(prefix: &str, target: &str) -> bool {
 pub(crate) fn resolve_program_identity(
     program: &str,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {
+    resolve_program_identity_inner(program, None)
+}
+
+pub(crate) fn resolve_program_identity_controlled(
+    program: &str,
+    control: &ExecutablePreparationControl,
+) -> Result<SpawnExecutableIdentity, EffectServiceError> {
+    resolve_program_identity_inner(program, Some(control))
+}
+
+fn resolve_program_identity_inner(
+    program: &str,
+    control: Option<&ExecutablePreparationControl>,
+) -> Result<SpawnExecutableIdentity, EffectServiceError> {
+    executable_identity_checkpoint(control)?;
     let source = Path::new(program);
     let candidates = if source.is_absolute() || source.components().count() > 1 {
         spawn_executable_candidates(source.to_path_buf())
@@ -963,6 +1155,7 @@ pub(crate) fn resolve_program_identity(
             .collect()
     };
     for candidate in candidates {
+        executable_identity_checkpoint(control)?;
         let Ok(metadata) = std::fs::metadata(&candidate) else {
             continue;
         };
@@ -978,6 +1171,7 @@ pub(crate) fn resolve_program_identity(
         }
         let canonical =
             std::fs::canonicalize(candidate).map_err(|_| EffectServiceError::InvalidTarget)?;
+        executable_identity_checkpoint(control)?;
         let canonical_path = canonical
             .to_str()
             .map(str::to_string)
@@ -987,6 +1181,7 @@ pub(crate) fn resolve_program_identity(
         }
         let mut file =
             std::fs::File::open(&canonical).map_err(|_| EffectServiceError::InvalidTarget)?;
+        executable_identity_checkpoint(control)?;
         let metadata = file
             .metadata()
             .map_err(|_| EffectServiceError::InvalidTarget)?;
@@ -997,8 +1192,13 @@ pub(crate) fn resolve_program_identity(
         if platform_executable_identity(&current) != Some(platform.clone()) {
             return Err(EffectServiceError::TargetChanged);
         }
-        let content = copy_and_hash_executable(&mut file, &mut std::io::sink())
-            .map_err(|_| EffectServiceError::InvalidTarget)?;
+        let content = match control {
+            Some(control) => {
+                copy_and_hash_executable_controlled(&mut file, &mut std::io::sink(), control)
+            }
+            None => copy_and_hash_executable(&mut file, &mut std::io::sink()),
+        }
+        .map_err(executable_copy_service_error)?;
         return Ok(SpawnExecutableIdentity {
             canonical_path,
             platform,
@@ -1007,6 +1207,29 @@ pub(crate) fn resolve_program_identity(
         });
     }
     Err(EffectServiceError::InvalidTarget)
+}
+
+fn executable_identity_checkpoint(
+    control: Option<&ExecutablePreparationControl>,
+) -> Result<(), EffectServiceError> {
+    match control.map(ExecutablePreparationControl::checkpoint) {
+        Some(Err(ExecutablePreparationWaitError::Cancelled)) => Err(EffectServiceError::Cancelled),
+        Some(Err(ExecutablePreparationWaitError::TimedOut)) => Err(EffectServiceError::TimedOut),
+        Some(Err(ExecutablePreparationWaitError::WorkerFailed)) => {
+            Err(EffectServiceError::BackendFailure)
+        }
+        Some(Ok(())) | None => Ok(()),
+    }
+}
+
+fn executable_copy_service_error(error: ExecutableCopyError) -> EffectServiceError {
+    match error {
+        ExecutableCopyError::Cancelled => EffectServiceError::Cancelled,
+        ExecutableCopyError::TimedOut => EffectServiceError::TimedOut,
+        ExecutableCopyError::Read | ExecutableCopyError::Write | ExecutableCopyError::TooLarge => {
+            EffectServiceError::InvalidTarget
+        }
+    }
 }
 
 #[cfg(unix)]

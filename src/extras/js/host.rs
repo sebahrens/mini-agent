@@ -3,7 +3,7 @@ use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "sandbox", test))]
 use rquickjs::prelude::Opt;
@@ -13,6 +13,28 @@ use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::extras::js::broker::{
+    AuthorizedEffect, AuthorizedTarget, ExecutablePreparationControl,
+    ExecutablePreparationWaitError, GrantPrincipal, HostEffectError, NormalizedTarget,
+    ParentEffectFuture, ParentEffectService, SpawnExecutableIdentity,
+    resolve_program_identity_controlled, run_executable_preparation,
+};
+#[cfg(target_os = "linux")]
+use crate::extras::js::broker::{ExecutableCopyError, copy_and_hash_executable_controlled};
+use crate::extras::js::protocol::{EffectOperation, EffectResult};
+#[cfg(all(feature = "skills", test))]
+use crate::extras::js::skills::proposal::{
+    JsProposal, ProposalEffectService, ProposalError, ProposalHost,
+};
+use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
+use crate::extras::js::types::PermCancellation;
+use crate::extras::js::types::{
+    EffectServiceError, READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
+    canonical_spawn_permission_subject, spawn_policy_input,
+};
+#[cfg(any(target_os = "linux", not(unix)))]
+use crate::sandbox::SandboxCommand;
+use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox, SandboxPolicy};
 #[cfg(feature = "sandbox")]
 use reqwest::Url;
 #[cfg(feature = "sandbox")]
@@ -24,31 +46,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
 };
-#[cfg(feature = "sandbox")]
-use std::time::Instant;
-
-use crate::extras::js::broker::{
-    AuthorizedEffect, AuthorizedTarget, GrantPrincipal, HostEffectError, NormalizedTarget,
-    ParentEffectFuture, ParentEffectService, SpawnExecutableIdentity, resolve_program_identity,
-};
-#[cfg(target_os = "linux")]
-use crate::extras::js::broker::{ExecutableCopyError, copy_and_hash_executable};
-use crate::extras::js::protocol::{EffectOperation, EffectResult};
-#[cfg(all(feature = "skills", test))]
-use crate::extras::js::skills::proposal::{
-    JsProposal, ProposalEffectService, ProposalError, ProposalHost,
-};
-use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
-use crate::extras::js::types::PermCancellation;
-#[cfg(test)]
-use crate::extras::js::types::STEP_TIMEOUT;
-use crate::extras::js::types::{
-    EffectServiceError, READ_FILE_MAX_BYTES, SpawnResult, WRITE_FILE_MAX_BYTES,
-    canonical_spawn_permission_subject, spawn_policy_input,
-};
-#[cfg(any(target_os = "linux", not(unix)))]
-use crate::sandbox::SandboxCommand;
-use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox, SandboxPolicy};
 
 #[cfg(all(feature = "skills", test))]
 #[derive(Clone, Default)]
@@ -2491,17 +2488,38 @@ enum PreparedSpawnTarget {
 }
 
 impl PreparedSpawnEffect {
-    fn capture(
+    async fn capture_async(
+        program: String,
+        arguments: Vec<String>,
+        immutable_snapshot: bool,
+        deadline: Instant,
+        cancellation: PermCancellation,
+    ) -> Result<Self, EffectServiceError> {
+        run_executable_preparation(deadline, cancellation, move |control| {
+            Self::capture_controlled(&program, arguments, immutable_snapshot, &control)
+        })
+        .await
+        .map_err(executable_preparation_service_error)?
+    }
+
+    fn capture_controlled(
         program: &str,
         arguments: Vec<String>,
         immutable_snapshot: bool,
+        control: &ExecutablePreparationControl,
     ) -> Result<Self, EffectServiceError> {
-        let executable = resolve_program_identity(program)?;
+        control
+            .checkpoint()
+            .map_err(executable_preparation_service_error)?;
+        let executable = resolve_program_identity_controlled(program, control)?;
         if immutable_snapshot {
             #[cfg(target_os = "linux")]
             {
                 let mut source = std::fs::File::open(executable.canonical_path())
                     .map_err(|_| EffectServiceError::InvalidTarget)?;
+                control
+                    .checkpoint()
+                    .map_err(executable_preparation_service_error)?;
                 let opened = source
                     .metadata()
                     .map_err(|_| EffectServiceError::InvalidTarget)?;
@@ -2513,7 +2531,7 @@ impl PreparedSpawnEffect {
                 {
                     return Err(EffectServiceError::TargetChanged);
                 }
-                let (snapshot, content) = create_sealed_executable_snapshot(&mut source)?;
+                let (snapshot, content) = create_sealed_executable_snapshot(&mut source, control)?;
                 let executable = executable.with_content(content);
                 return Ok(Self {
                     executable,
@@ -2530,6 +2548,9 @@ impl PreparedSpawnEffect {
         let target = {
             let file = std::fs::File::open(executable.canonical_path())
                 .map_err(|_| EffectServiceError::InvalidTarget)?;
+            control
+                .checkpoint()
+                .map_err(executable_preparation_service_error)?;
             let opened = file
                 .metadata()
                 .map_err(|_| EffectServiceError::InvalidTarget)?;
@@ -2550,6 +2571,17 @@ impl PreparedSpawnEffect {
             arguments,
             target,
         })
+    }
+
+    #[cfg(test)]
+    fn capture(
+        program: &str,
+        arguments: Vec<String>,
+        immutable_snapshot: bool,
+    ) -> Result<Self, EffectServiceError> {
+        let control =
+            ExecutablePreparationControl::new_for_test(Instant::now() + Duration::from_secs(30));
+        Self::capture_controlled(program, arguments, immutable_snapshot, &control)
     }
 
     fn revalidate(&self) -> Result<(), EffectServiceError> {
@@ -2586,6 +2618,7 @@ impl PreparedSpawnEffect {
 #[allow(unsafe_code)]
 fn create_sealed_executable_snapshot(
     source: &mut std::fs::File,
+    control: &ExecutablePreparationControl,
 ) -> Result<(std::fs::File, crate::extras::js::broker::ExecutableContent), EffectServiceError> {
     use std::os::fd::FromRawFd;
 
@@ -2602,11 +2635,16 @@ fn create_sealed_executable_snapshot(
     }
     // SAFETY: `raw_fd` is a newly-created owned descriptor and is transferred exactly once.
     let mut snapshot = unsafe { std::fs::File::from_raw_fd(raw_fd) };
-    let content = copy_and_hash_executable(source, &mut snapshot).map_err(|error| match error {
-        ExecutableCopyError::Read => EffectServiceError::TargetChanged,
-        ExecutableCopyError::Write => EffectServiceError::BackendFailure,
-        ExecutableCopyError::TooLarge => EffectServiceError::InvalidTarget,
-    })?;
+    let content =
+        copy_and_hash_executable_controlled(source, &mut snapshot, control).map_err(|error| {
+            match error {
+                ExecutableCopyError::Read => EffectServiceError::TargetChanged,
+                ExecutableCopyError::Write => EffectServiceError::BackendFailure,
+                ExecutableCopyError::TooLarge => EffectServiceError::InvalidTarget,
+                ExecutableCopyError::Cancelled => EffectServiceError::Cancelled,
+                ExecutableCopyError::TimedOut => EffectServiceError::TimedOut,
+            }
+        })?;
     snapshot
         .seek(SeekFrom::Start(0))
         .map_err(|_| EffectServiceError::BackendFailure)?;
@@ -2617,6 +2655,16 @@ fn create_sealed_executable_snapshot(
     }
     verify_executable_snapshot_seals(&snapshot)?;
     Ok((snapshot, content))
+}
+
+fn executable_preparation_service_error(
+    error: ExecutablePreparationWaitError,
+) -> EffectServiceError {
+    match error {
+        ExecutablePreparationWaitError::Cancelled => EffectServiceError::Cancelled,
+        ExecutablePreparationWaitError::TimedOut => EffectServiceError::TimedOut,
+        ExecutablePreparationWaitError::WorkerFailed => EffectServiceError::BackendFailure,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2679,8 +2727,20 @@ impl SpawnEffectService {
         arguments: &[String],
         cancellation: PermCancellation,
     ) -> Result<SpawnResult, EffectServiceError> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or(EffectServiceError::TimedOut)?;
+        let preparation_cancellation = cancellation.clone();
         let bridge = self.permission_bridge.for_host_call(cancellation);
-        let prepared = self.authorize(program, arguments, bridge.clone()).await?;
+        let prepared = self
+            .authorize(
+                program,
+                arguments,
+                bridge.clone(),
+                deadline,
+                preparation_cancellation,
+            )
+            .await?;
         self.execute_prepared(prepared, bridge).await
     }
 
@@ -2689,6 +2749,8 @@ impl SpawnEffectService {
         program: &str,
         arguments: &[String],
         bridge: PermissionBridge,
+        deadline: Instant,
+        cancellation: PermCancellation,
     ) -> Result<PreparedSpawnEffect, EffectServiceError> {
         if self.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
             return Err(EffectServiceError::BackendFailure);
@@ -2706,11 +2768,14 @@ impl SpawnEffectService {
             .check_structured_async("bash", &subject, policy_input)
             .await
             .map_err(permission_service_error)?;
-        PreparedSpawnEffect::capture(
-            program,
+        PreparedSpawnEffect::capture_async(
+            program.to_string(),
             arguments.to_vec(),
             self.sandbox.supports_immutable_executable_snapshot(),
+            deadline,
+            cancellation,
         )
+        .await
     }
 
     async fn execute_prepared(
@@ -2950,7 +3015,7 @@ impl ParentEffectService for ParentHostEffectService {
 
     fn normalize_target<'a>(
         &'a mut self,
-        authorized: &'a AuthorizedEffect,
+        _authorized: &'a AuthorizedEffect,
         operation: &'a EffectOperation,
         cancellation: PermCancellation,
     ) -> ParentEffectFuture<'a, Result<NormalizedTarget, HostEffectError>> {
@@ -2997,18 +3062,19 @@ impl ParentEffectService for ParentHostEffectService {
                     {
                         return Err(HostEffectError::InvalidTarget);
                     }
-                    let learned_skill =
-                        matches!(authorized.principal(), GrantPrincipal::Skill { .. });
                     let snapshot_available =
                         self.spawn.sandbox.supports_immutable_executable_snapshot();
-                    if learned_skill && !snapshot_available {
-                        return Err(HostEffectError::BackendFailure);
-                    }
-                    let prepared = PreparedSpawnEffect::capture(
-                        program,
+                    let deadline = Instant::now()
+                        .checked_add(self.spawn.timeout)
+                        .ok_or(HostEffectError::EffectTimedOut)?;
+                    let prepared = PreparedSpawnEffect::capture_async(
+                        program.clone(),
                         arguments.clone(),
                         snapshot_available,
+                        deadline,
+                        cancellation,
                     )
+                    .await
                     .map_err(HostEffectError::from)?;
                     let resolved = prepared.executable.clone();
                     self.prepared = Some(PreparedParentEffect::Spawn(prepared));
@@ -4012,6 +4078,7 @@ mod tests {
         service: ParentHostEffectService,
         scope: CapabilityScope,
         operation: EffectOperation,
+        session_allows_capability: bool,
     ) -> (InvocationBroker<ParentHostEffectService>, EffectRequest) {
         let invocation = InvocationId::new(format!("scoped-{tag}")).unwrap();
         let principal = GrantPrincipal::Skill {
@@ -4019,11 +4086,12 @@ mod tests {
             export: "run".to_string(),
             invocation_id: invocation.to_string(),
         };
-        let grant = InvocationGrant::issue_scoped_skill(
+        let grant = InvocationGrant::issue_scoped_skill_with_resolver(
             invocation.clone(),
             principal,
             CapabilityManifest::new(CapabilityTier::SideEffecting, vec![scope]).unwrap(),
             Instant::now() + Duration::from_secs(10),
+            crate::extras::js::broker::resolve_program_identity,
         )
         .unwrap();
         let request = EffectRequest {
@@ -4056,15 +4124,77 @@ mod tests {
             .effect_audit(),
         )
         .unwrap();
+        let session_allowed = if session_allows_capability {
+            BTreeSet::from([capability])
+        } else {
+            BTreeSet::new()
+        };
         let broker = InvocationBroker::new(
             invocation,
             vec![grant],
-            BTreeSet::from([capability]),
+            session_allowed,
             service,
             Arc::new(Mutex::new(audit)),
         )
         .unwrap();
         (broker, request)
+    }
+
+    #[cfg(all(feature = "skills", unix))]
+    #[tokio::test]
+    async fn unavailable_snapshot_backend_preserves_manifest_then_session_denial_order() {
+        for (tag, declared_program, session_allows_capability, expected) in [
+            (
+                "manifest-before-backend",
+                "true",
+                true,
+                HostEffectError::ManifestDenied,
+            ),
+            (
+                "session-before-backend",
+                "printf",
+                false,
+                HostEffectError::SessionDenied,
+            ),
+        ] {
+            let directory = TempDir::new();
+            let permission =
+                host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
+            let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+            let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+            let service = ParentHostEffectService::new(
+                FileEffectService::new(
+                    owner.bridge(),
+                    AllowConfig::unrestricted(directory.path()),
+                    Duration::from_secs(1),
+                ),
+                SpawnEffectService::new(
+                    Sandbox::new(false, "bwrap"),
+                    owner.bridge(),
+                    Duration::from_secs(1),
+                ),
+            );
+            let (mut broker, request) = scoped_host_broker(
+                &directory,
+                tag,
+                service,
+                CapabilityScope::Spawn {
+                    programs: vec![declared_program.to_string()],
+                },
+                EffectOperation::Spawn {
+                    program: "printf".to_string(),
+                    arguments: vec!["must-not-run".to_string()],
+                },
+                session_allows_capability,
+            );
+
+            assert_eq!(
+                broker.dispatch(request, PermCancellation::new()).await,
+                Err(expected)
+            );
+            assert!(ask_rx.try_recv().is_err(), "denial reached permission");
+            assert!(broker.audit_records_for_test().is_empty());
+        }
     }
 
     #[cfg(all(feature = "skills", unix))]
@@ -4108,6 +4238,7 @@ mod tests {
             EffectOperation::ReadFile {
                 path: escape_link.to_string_lossy().into_owned(),
             },
+            true,
         );
         assert_eq!(
             broker.dispatch(request, PermCancellation::new()).await,
@@ -4144,6 +4275,7 @@ mod tests {
             EffectOperation::ReadFile {
                 path: source.to_string_lossy().into_owned(),
             },
+            true,
         );
         let dispatch = tokio::spawn(async move {
             let result = broker.dispatch(request, PermCancellation::new()).await;
@@ -4429,9 +4561,11 @@ mod tests {
             .unwrap();
         drop(file);
         let mut source = std::fs::File::open(&executable).unwrap();
+        let control =
+            ExecutablePreparationControl::new_for_test(Instant::now() + Duration::from_secs(30));
         let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
         assert!(matches!(
-            create_sealed_executable_snapshot(&mut source),
+            create_sealed_executable_snapshot(&mut source, &control),
             Err(EffectServiceError::InvalidTarget)
         ));
         let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
@@ -4490,6 +4624,7 @@ mod tests {
                 program: "printf".to_string(),
                 arguments: vec!["denied".to_string()],
             },
+            true,
         );
         assert_eq!(
             broker.dispatch(request, PermCancellation::new()).await,
@@ -4610,6 +4745,7 @@ mod tests {
                 program: "printf".into(),
                 arguments: vec!["must-not-run".into()],
             },
+            true,
         );
 
         assert_eq!(
@@ -4651,6 +4787,7 @@ mod tests {
                 program: "cmd".into(),
                 arguments: vec!["/C".into(), "exit".into(), "0".into()],
             },
+            true,
         );
 
         assert_eq!(
