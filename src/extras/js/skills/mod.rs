@@ -23,7 +23,10 @@
 
 use std::fmt;
 
+use reqwest::Url;
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 pub mod admission;
 mod admission_store;
@@ -50,7 +53,10 @@ pub mod verify;
 pub mod visibility;
 
 /// Version of the canonical serialization scheme. Bumping this changes every identity.
-pub const IDENTITY_VERSION: u32 = 1;
+pub const IDENTITY_VERSION: u32 = 2;
+
+/// Version of the learned-skill invocation ABI included in every artifact identity.
+pub const SKILL_ABI_VERSION: u16 = 2;
 
 /// Harden the shared QuickJS realm before any untrusted skill source is evaluated.
 /// Dynamic-code constructors and prototype mutation would otherwise recover the
@@ -191,7 +197,8 @@ impl fmt::Display for CapabilityTier {
 /// This list is closed. Administrative and security-sensitive operations (permission
 /// mutation, MCP trust, sandbox configuration) are intentionally absent and can never be
 /// declared by a learned skill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HostCapability {
     ReadFile,
     WriteFile,
@@ -241,14 +248,163 @@ pub struct SkillExport {
     pub signature: String,
 }
 
+/// The closed set of HTTP methods a learned skill may request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum HttpMethod {
+    #[serde(rename = "GET")]
+    Get,
+    #[serde(rename = "POST")]
+    Post,
+}
+
+impl HttpMethod {
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+        }
+    }
+}
+
+/// One target-narrowed host operation declared by an identity-v2 artifact.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapabilityScope {
+    ReadFile {
+        workspace_prefixes: Vec<String>,
+    },
+    WriteFile {
+        workspace_prefixes: Vec<String>,
+    },
+    Fetch {
+        origins: Vec<String>,
+        methods: Vec<HttpMethod>,
+    },
+    Spawn {
+        programs: Vec<String>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RawCapabilityScope {
+    ReadFile {
+        workspace_prefixes: Vec<String>,
+    },
+    WriteFile {
+        workspace_prefixes: Vec<String>,
+    },
+    Fetch {
+        origins: Vec<String>,
+        methods: Vec<HttpMethod>,
+    },
+    Spawn {
+        programs: Vec<String>,
+    },
+}
+
+impl From<RawCapabilityScope> for CapabilityScope {
+    fn from(scope: RawCapabilityScope) -> Self {
+        match scope {
+            RawCapabilityScope::ReadFile { workspace_prefixes } => {
+                Self::ReadFile { workspace_prefixes }
+            }
+            RawCapabilityScope::WriteFile { workspace_prefixes } => {
+                Self::WriteFile { workspace_prefixes }
+            }
+            RawCapabilityScope::Fetch { origins, methods } => Self::Fetch { origins, methods },
+            RawCapabilityScope::Spawn { programs } => Self::Spawn { programs },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        RawCapabilityScope::deserialize(deserializer).map(Into::into)
+    }
+}
+
+impl CapabilityScope {
+    pub fn capability(&self) -> HostCapability {
+        match self {
+            Self::ReadFile { .. } => HostCapability::ReadFile,
+            Self::WriteFile { .. } => HostCapability::WriteFile,
+            Self::Fetch { .. } => HostCapability::Fetch,
+            Self::Spawn { .. } => HostCapability::Spawn,
+        }
+    }
+
+    fn canonicalize(self) -> Result<Self, IdentityError> {
+        match self {
+            Self::ReadFile { workspace_prefixes } => Ok(Self::ReadFile {
+                workspace_prefixes: canonicalize_unique_strings(
+                    workspace_prefixes,
+                    "read_file.workspace_prefixes",
+                    canonical_workspace_prefix,
+                )?,
+            }),
+            Self::WriteFile { workspace_prefixes } => Ok(Self::WriteFile {
+                workspace_prefixes: canonicalize_unique_strings(
+                    workspace_prefixes,
+                    "write_file.workspace_prefixes",
+                    canonical_workspace_prefix,
+                )?,
+            }),
+            Self::Fetch { origins, methods } => {
+                let origins =
+                    canonicalize_unique_strings(origins, "fetch.origins", canonical_fetch_origin)?;
+                if methods.is_empty() {
+                    return Err(IdentityError::EmptyCapabilityScope("fetch.methods"));
+                }
+                let mut canonical_methods = methods;
+                canonical_methods.sort_unstable();
+                if canonical_methods.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err(IdentityError::DuplicateScopeValue("fetch.methods"));
+                }
+                Ok(Self::Fetch {
+                    origins,
+                    methods: canonical_methods,
+                })
+            }
+            Self::Spawn { programs } => Ok(Self::Spawn {
+                programs: canonicalize_unique_strings(
+                    programs,
+                    "spawn.programs",
+                    canonical_program,
+                )?,
+            }),
+        }
+    }
+}
+
 /// The exact set of host operations a skill is allowed to perform.
 ///
-/// Runtime and verifier checks consult [`Self::allowed_hosts`] directly. The tier is a
+/// Runtime and verifier checks consult [`Self::grants`] directly. The tier is a
 /// consistency constraint and a display aid — it never confers an ambient tier-wide grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CapabilityManifest {
     pub tier: CapabilityTier,
-    pub allowed_hosts: Vec<HostCapability>,
+    pub grants: Vec<CapabilityScope>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCapabilityManifest {
+    tier: CapabilityTier,
+    grants: Vec<CapabilityScope>,
+}
+
+impl<'de> Deserialize<'de> for CapabilityManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawCapabilityManifest::deserialize(deserializer)?;
+        Self::new(raw.tier, raw.grants).map_err(serde::de::Error::custom)
+    }
 }
 
 impl CapabilityManifest {
@@ -256,35 +412,33 @@ impl CapabilityManifest {
     pub fn pure() -> Self {
         Self {
             tier: CapabilityTier::Pure,
-            allowed_hosts: Vec::new(),
+            grants: Vec::new(),
         }
     }
 
     /// Build and validate a manifest.
     ///
-    /// `allowed_hosts` is stored sorted and is rejected if it contains duplicates or an
-    /// operation the tier does not permit.
-    pub fn new(
-        tier: CapabilityTier,
-        allowed_hosts: Vec<HostCapability>,
-    ) -> Result<Self, IdentityError> {
+    /// Grants and their target lists are canonicalized and sorted. Duplicate operation
+    /// scopes and duplicate normalized targets are rejected rather than silently merged.
+    pub fn new(tier: CapabilityTier, grants: Vec<CapabilityScope>) -> Result<Self, IdentityError> {
+        let mut canonical = grants
+            .into_iter()
+            .map(CapabilityScope::canonicalize)
+            .collect::<Result<Vec<_>, _>>()?;
+        canonical.sort_unstable();
         let manifest = Self {
             tier,
-            allowed_hosts,
+            grants: canonical,
         };
         manifest.validate()?;
-        let mut normalized = manifest.allowed_hosts;
-        normalized.sort_unstable();
-        Ok(Self {
-            tier,
-            allowed_hosts: normalized,
-        })
+        Ok(manifest)
     }
 
     /// Enforce tier consistency and reject duplicates.
     pub fn validate(&self) -> Result<(), IdentityError> {
-        let mut seen: Vec<HostCapability> = Vec::with_capacity(self.allowed_hosts.len());
-        for &capability in &self.allowed_hosts {
+        let mut seen: Vec<HostCapability> = Vec::with_capacity(self.grants.len());
+        for scope in &self.grants {
+            let capability = scope.capability();
             if seen.contains(&capability) {
                 return Err(IdentityError::DuplicateCapability(capability));
             }
@@ -296,14 +450,58 @@ impl CapabilityManifest {
             }
             seen.push(capability);
         }
+        let mut canonical = self
+            .grants
+            .clone()
+            .into_iter()
+            .map(CapabilityScope::canonicalize)
+            .collect::<Result<Vec<_>, _>>()?;
+        canonical.sort_unstable();
+        if canonical != self.grants {
+            return Err(IdentityError::NonCanonicalManifest);
+        }
         Ok(())
     }
 
     /// Whether `capability` is declared. This is the only authorization question the
     /// runtime and verifier ask.
     pub fn allows(&self, capability: HostCapability) -> bool {
-        self.allowed_hosts.contains(&capability)
+        self.grants
+            .iter()
+            .any(|scope| scope.capability() == capability)
     }
+
+    pub fn scope(&self, capability: HostCapability) -> Option<&CapabilityScope> {
+        self.grants
+            .iter()
+            .find(|scope| scope.capability() == capability)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_manifest(
+    tier: CapabilityTier,
+    capabilities: Vec<HostCapability>,
+) -> Result<CapabilityManifest, IdentityError> {
+    let grants = capabilities
+        .into_iter()
+        .map(|capability| match capability {
+            HostCapability::ReadFile => CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["fixtures".to_string()],
+            },
+            HostCapability::WriteFile => CapabilityScope::WriteFile {
+                workspace_prefixes: vec!["tmp".to_string()],
+            },
+            HostCapability::Fetch => CapabilityScope::Fetch {
+                origins: vec!["https://example.com".to_string()],
+                methods: vec![HttpMethod::Get, HttpMethod::Post],
+            },
+            HostCapability::Spawn => CapabilityScope::Spawn {
+                programs: vec!["printf".to_string()],
+            },
+        })
+        .collect();
+    CapabilityManifest::new(tier, grants)
 }
 
 /// An immutable learned-JS skill revision.
@@ -315,6 +513,7 @@ impl CapabilityManifest {
 pub struct SkillArtifact {
     pub id: String,
     pub identity_version: u32,
+    pub abi_version: u16,
     pub source: String,
     pub description: String,
     pub tags: Vec<String>,
@@ -356,18 +555,10 @@ impl SkillArtifact {
 
         let tags = normalize_tags(tags);
 
-        // Sort the manifest so that two manifests differing only in declaration order
-        // produce one identity.
-        let mut allowed_hosts = capability.allowed_hosts;
-        allowed_hosts.sort_unstable();
-        let capability = CapabilityManifest {
-            tier: capability.tier,
-            allowed_hosts,
-        };
-
         let mut artifact = Self {
             id: String::new(),
             identity_version: IDENTITY_VERSION,
+            abi_version: SKILL_ABI_VERSION,
             source,
             description,
             tags,
@@ -389,6 +580,7 @@ impl SkillArtifact {
 
         push_field(&mut canonical, IDENTITY_DOMAIN);
         push_u64(&mut canonical, u64::from(self.identity_version));
+        push_u64(&mut canonical, u64::from(self.abi_version));
         push_field(&mut canonical, self.source.as_bytes());
         push_field(&mut canonical, self.description.as_bytes());
 
@@ -409,9 +601,25 @@ impl SkillArtifact {
         }
 
         push_field(&mut canonical, self.capability.tier.as_token().as_bytes());
-        push_u64(&mut canonical, self.capability.allowed_hosts.len() as u64);
-        for capability in &self.capability.allowed_hosts {
-            push_field(&mut canonical, capability.as_token().as_bytes());
+        push_u64(&mut canonical, self.capability.grants.len() as u64);
+        for scope in &self.capability.grants {
+            push_field(&mut canonical, scope.capability().as_token().as_bytes());
+            match scope {
+                CapabilityScope::ReadFile { workspace_prefixes }
+                | CapabilityScope::WriteFile { workspace_prefixes } => {
+                    push_string_list(&mut canonical, workspace_prefixes);
+                }
+                CapabilityScope::Fetch { origins, methods } => {
+                    push_string_list(&mut canonical, origins);
+                    push_u64(&mut canonical, methods.len() as u64);
+                    for method in methods {
+                        push_field(&mut canonical, method.as_token().as_bytes());
+                    }
+                }
+                CapabilityScope::Spawn { programs } => {
+                    push_string_list(&mut canonical, programs);
+                }
+            }
         }
 
         hasher.update(&canonical);
@@ -428,7 +636,15 @@ impl SkillArtifact {
                 self.identity_version,
             ));
         }
-        if self.id.len() != 64 || !self.id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if self.abi_version != SKILL_ABI_VERSION {
+            return Err(IdentityError::UnsupportedAbiVersion(self.abi_version));
+        }
+        if self.id.len() != 64
+            || !self
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
             return Err(IdentityError::MalformedId(self.id.clone()));
         }
         let expected = self.compute_identity();
@@ -439,6 +655,87 @@ impl SkillArtifact {
             });
         }
         self.capability.validate()
+    }
+}
+
+fn canonicalize_unique_strings(
+    values: Vec<String>,
+    field: &'static str,
+    canonicalize: fn(&str) -> Result<String, IdentityError>,
+) -> Result<Vec<String>, IdentityError> {
+    if values.is_empty() {
+        return Err(IdentityError::EmptyCapabilityScope(field));
+    }
+    let mut values = values
+        .iter()
+        .map(|value| canonicalize(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    values.sort();
+    if values.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(IdentityError::DuplicateScopeValue(field));
+    }
+    Ok(values)
+}
+
+fn canonical_workspace_prefix(raw: &str) -> Result<String, IdentityError> {
+    if raw.is_empty()
+        || raw.starts_with('/')
+        || raw.ends_with('/')
+        || raw.contains('\\')
+        || raw.contains(':')
+        || raw.chars().any(char::is_control)
+    {
+        return Err(IdentityError::InvalidWorkspacePrefix(raw.to_string()));
+    }
+    let components = raw.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        return Err(IdentityError::InvalidWorkspacePrefix(raw.to_string()));
+    }
+    Ok(components
+        .into_iter()
+        .map(|component| component.nfc().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+fn canonical_program(raw: &str) -> Result<String, IdentityError> {
+    if raw.is_empty()
+        || matches!(raw, "." | "..")
+        || raw.contains(['/', '\\', ':'])
+        || raw.chars().any(char::is_control)
+    {
+        return Err(IdentityError::InvalidProgram(raw.to_string()));
+    }
+    Ok(raw.nfc().collect())
+}
+
+fn canonical_fetch_origin(raw: &str) -> Result<String, IdentityError> {
+    let url = Url::parse(raw).map_err(|_| IdentityError::InvalidFetchOrigin(raw.to_string()))?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+        || url.path() != "/"
+    {
+        return Err(IdentityError::InvalidFetchOrigin(raw.to_string()));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| IdentityError::InvalidFetchOrigin(raw.to_string()))?;
+    if host.is_empty() || host.ends_with('.') {
+        return Err(IdentityError::InvalidFetchOrigin(raw.to_string()));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+fn push_string_list(out: &mut Vec<u8>, values: &[String]) {
+    push_u64(out, values.len() as u64);
+    for value in values {
+        push_field(out, value.as_bytes());
     }
 }
 
@@ -486,6 +783,24 @@ pub enum IdentityError {
     #[error("capability {0} declared more than once")]
     DuplicateCapability(HostCapability),
 
+    #[error("capability scope {0} must contain at least one target")]
+    EmptyCapabilityScope(&'static str),
+
+    #[error("capability scope {0} contains a duplicate normalized target")]
+    DuplicateScopeValue(&'static str),
+
+    #[error("invalid portable workspace prefix: {0}")]
+    InvalidWorkspacePrefix(String),
+
+    #[error("invalid exact fetch origin: {0}")]
+    InvalidFetchOrigin(String),
+
+    #[error("invalid separator-free executable name: {0}")]
+    InvalidProgram(String),
+
+    #[error("capability manifest is not in canonical form")]
+    NonCanonicalManifest,
+
     #[error("export {0} declared more than once")]
     DuplicateExport(String),
 
@@ -503,6 +818,9 @@ pub enum IdentityError {
 
     #[error("unsupported identity version: {0}")]
     UnsupportedIdentityVersion(u32),
+
+    #[error("unsupported skill ABI version: {0}")]
+    UnsupportedAbiVersion(u16),
 }
 
 #[cfg(test)]
@@ -514,6 +832,31 @@ mod tests {
             name: name.to_string(),
             signature: signature.to_string(),
         }
+    }
+
+    fn scope(capability: HostCapability) -> CapabilityScope {
+        match capability {
+            HostCapability::ReadFile => CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["fixtures".to_string()],
+            },
+            HostCapability::WriteFile => CapabilityScope::WriteFile {
+                workspace_prefixes: vec!["tmp".to_string()],
+            },
+            HostCapability::Spawn => CapabilityScope::Spawn {
+                programs: vec!["program".to_string()],
+            },
+            HostCapability::Fetch => CapabilityScope::Fetch {
+                origins: vec!["https://example.com".to_string()],
+                methods: vec![HttpMethod::Get],
+            },
+        }
+    }
+
+    fn manifest(
+        tier: CapabilityTier,
+        capabilities: Vec<HostCapability>,
+    ) -> Result<CapabilityManifest, IdentityError> {
+        CapabilityManifest::new(tier, capabilities.into_iter().map(scope).collect())
     }
 
     /// A representative artifact. Each test perturbs exactly one identity-bearing field.
@@ -644,7 +987,7 @@ mod tests {
             pure.tags.clone(),
             pure.exports.clone(),
             pure.tests.clone(),
-            CapabilityManifest::new(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])
+            manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])
                 .expect("valid manifest"),
         )
         .expect("valid");
@@ -739,7 +1082,7 @@ mod tests {
 
     #[test]
     fn pure_tier_cannot_declare_any_host() {
-        let error = CapabilityManifest::new(CapabilityTier::Pure, vec![HostCapability::ReadFile])
+        let error = manifest(CapabilityTier::Pure, vec![HostCapability::ReadFile])
             .expect_err("Tier 0 must declare nothing");
         assert!(
             matches!(error, IdentityError::CapabilityExceedsTier { .. }),
@@ -754,7 +1097,7 @@ mod tests {
             HostCapability::Spawn,
             HostCapability::Fetch,
         ] {
-            let error = CapabilityManifest::new(CapabilityTier::ReadOnly, vec![capability])
+            let error = manifest(CapabilityTier::ReadOnly, vec![capability])
                 .expect_err("Tier 1 must reject non-read-only capabilities");
             assert!(
                 matches!(error, IdentityError::CapabilityExceedsTier { .. }),
@@ -762,13 +1105,13 @@ mod tests {
             );
         }
         // The one capability Tier 1 does permit.
-        CapabilityManifest::new(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])
+        manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])
             .expect("Tier 1 must permit read_file");
     }
 
     #[test]
     fn duplicate_capability_is_rejected() {
-        let error = CapabilityManifest::new(
+        let error = manifest(
             CapabilityTier::SideEffecting,
             vec![HostCapability::ReadFile, HostCapability::ReadFile],
         )
@@ -782,16 +1125,16 @@ mod tests {
     #[test]
     fn manifest_declaration_order_does_not_change_identity() {
         let build = |hosts: Vec<HostCapability>| {
-            CapabilityManifest::new(CapabilityTier::SideEffecting, hosts).expect("valid")
+            manifest(CapabilityTier::SideEffecting, hosts).expect("valid")
         };
         let forward = build(vec![HostCapability::ReadFile, HostCapability::Spawn]);
         let reversed = build(vec![HostCapability::Spawn, HostCapability::ReadFile]);
-        assert_eq!(forward.allowed_hosts, reversed.allowed_hosts);
+        assert_eq!(forward.grants, reversed.grants);
     }
 
     #[test]
     fn allows_consults_the_exact_list_not_the_tier() {
-        let manifest = CapabilityManifest::new(
+        let manifest = manifest(
             CapabilityTier::SideEffecting,
             vec![HostCapability::ReadFile],
         )

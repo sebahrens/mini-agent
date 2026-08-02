@@ -595,9 +595,9 @@ fn capability_is_non_escalating(
 ) -> bool {
     candidate.tier <= predecessor.tier
         && candidate
-            .allowed_hosts
+            .grants
             .iter()
-            .all(|host| predecessor.allowed_hosts.contains(host))
+            .all(|grant| predecessor.grants.contains(grant))
 }
 
 fn success_report(
