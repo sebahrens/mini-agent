@@ -47,7 +47,7 @@ fn paths() -> (PathBuf, AppPaths) {
 
 fn artifact() -> SkillArtifact {
     SkillArtifact::new(
-        "function normalize(v) { return String(v).trim(); }".to_string(),
+        "function normalize(_cap, v) { return String(v).trim(); }".to_string(),
         "Normalize a value.".to_string(),
         vec!["normalize".to_string()],
         vec![SkillExport {
@@ -580,7 +580,7 @@ fn authenticated_approval_authorization_rejects_tampered_exact_binding() {
         .authorize_canary_for_test("exact-binding", "reviewer", &artifact, &report_id, 21, 30)
         .unwrap();
     let other = SkillArtifact::new(
-        "function run() { return 2; }".to_string(),
+        "function run(_cap) { return 2; }".to_string(),
         "Other authorization artifact".to_string(),
         vec!["authorization".to_string()],
         vec![SkillExport {

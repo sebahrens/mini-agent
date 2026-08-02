@@ -39,7 +39,7 @@ impl Drop for TempPaths {
 
 fn artifact(name: &str, description: &str, tag: &str) -> SkillArtifact {
     SkillArtifact::new(
-        format!("function {name}(value) {{ return value; }}"),
+        format!("function {name}(_cap, value) {{ return value; }}"),
         description.to_string(),
         vec![tag.to_string()],
         vec![SkillExport {

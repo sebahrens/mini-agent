@@ -161,7 +161,7 @@ impl From<GrantId> for Uuid {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WireFrame<M> {
     pub(crate) protocol_version: u16,
@@ -201,7 +201,7 @@ impl<M> WireFrame<M> {
 pub(crate) type ParentWireFrame = WireFrame<ParentFrame>;
 pub(crate) type WorkerWireFrame = WireFrame<WorkerFrame>;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     content = "data",
@@ -341,13 +341,17 @@ pub(crate) struct SkillCallResponse {
     pub(crate) authorization: Option<SkillInvocationGrant>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VerifyArtifact {
+    #[cfg(feature = "skills")]
+    pub(crate) artifact: super::skills::SkillArtifact,
+    #[cfg(not(feature = "skills"))]
     pub(crate) artifact: ArtifactInput,
     pub(crate) cases: Vec<VerificationCase>,
 }
 
+#[cfg(not(feature = "skills"))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArtifactInput {
@@ -358,11 +362,39 @@ pub(crate) struct ArtifactInput {
     pub(crate) tests: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VerificationCase {
     pub(crate) case_id: String,
     pub(crate) script: String,
+    #[cfg(feature = "skills")]
+    pub(crate) kind: VerificationCaseKind,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum VerificationCaseKind {
+    Embedded,
+    Mutation {
+        export_name: String,
+    },
+    Inherited,
+    HeldOut {
+        expected: VerificationExpectedValue,
+        fake_files: std::collections::BTreeMap<String, String>,
+    },
+}
+
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub(crate) enum VerificationExpectedValue {
+    Boolean(bool),
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Null,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -665,6 +697,8 @@ pub(crate) struct VerificationCaseResult {
     pub(crate) case_id: String,
     pub(crate) passed: bool,
     pub(crate) diagnostic: Option<Diagnostic>,
+    #[cfg(feature = "skills")]
+    pub(crate) transcript: super::skills::fakes::FakeTranscript,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

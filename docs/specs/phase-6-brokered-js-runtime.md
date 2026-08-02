@@ -71,10 +71,17 @@ package, VM service, or privileged system service.
 
 The process may remain warm between requests, but QuickJS state never does. `RunStep` creates one
 fresh bounded `Runtime` for the agent step. `VerifyArtifact` creates one fresh bounded `Runtime`
-for the entire verification request so source initialization and all tests share only the state
-defined by the verification contract. The runtime and every `Context`, function, promise, and
-value derived from it are dropped before the terminal result is sent. Runtime reuse after success,
-timeout, cancellation, OOM, or any other outcome is forbidden.
+for the entire verification request; each verification case creates a fresh `Context` and reloads
+source, so no source state, fake state, transcript, or pending job crosses a case boundary. The
+runtime and every `Context`, function, promise, and value derived from it are dropped before the
+terminal result is sent. Runtime reuse after success, timeout, cancellation, OOM, or any other
+outcome is forbidden.
+
+Verification fake transcripts have one aggregate call/serialized-byte reservation budget for the
+whole request even though their contents remain isolated per case. Each fake effect reserves its
+worst-case JSON wire size before cloning record values. A limit breach produces a bounded typed
+verification result and terminates remaining cases, so a complete terminal frame always remains
+below the protocol frame limit.
 
 Every runtime preserves the Phase 1 resource limits: a 30-second total request deadline, 64 MiB
 QuickJS heap, and 512 KiB QuickJS stack. The one total deadline supersedes Phase 1's independent
@@ -270,7 +277,10 @@ Production execution, embedded tests, inherited regression tests, mutation tests
 tests use one worker-owned artifact loader and the same private-realm, pure-initialization,
 declared-export, hidden-capability-object, JSON-clone, and pending-job contract. No verifier may
 construct a QuickJS runtime in the parent or use a source wrapper that production does not use.
-One complete `VerifyArtifact` request owns one fresh runtime.
+One complete `VerifyArtifact` request owns one fresh runtime. Within it, every embedded, mutation,
+inherited, and held-out case reloads the artifact through that production loader in a fresh context
+with fresh grants, fake state, transcript, and job drain. Mutation substitutes only the selected
+post-validation export bridge; it does not introduce a second source wrapper or loader.
 
 Verification supplies deterministic fake capability objects through the same capability
 registration path used by production. Fakes are limited to the artifact's declared structured

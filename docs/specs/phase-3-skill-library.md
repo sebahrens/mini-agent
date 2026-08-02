@@ -440,10 +440,9 @@ private-realm loader/ABI path.
 
 ```rust
 pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, VerificationError> {
-    // One fresh bounded Runtime/Context for this verification.
-    // Register no real-effect host globals. Tier 0 gets none; Tier 1/2 get only declared fakes.
-    // Evaluate source as one script, then each test as a separate script in the same context.
-    // Require at least one test and exact JavaScript boolean true for every test.
+    // Send the complete bounded artifact and cases to the contained JS worker.
+    // The worker uses the production realm loader and hidden capability ABI for every case.
+    // Require at least one test and exact JavaScript boolean true for every embedded test.
 }
 ```
 
@@ -460,15 +459,22 @@ Delivered Phase 3 verification errors included the stage/test index and bounded 
 but never activated or persisted the artifact. Phase 6 supersedes stack/message disclosure with its
 stable sanitized error code, closed stage/script role, and source-free numeric location metadata.
 In delivered Phase 3, each skill verification got a new runtime and fake state, and tests within one
-run executed in declared order in the same fresh context. Phase 6 keeps one fresh runtime/fake state
-for the whole `VerifyArtifact` request but moves source into the same private skill realm and ABI
-used by production. Tests may observe source state and earlier deterministic fake effects. Mutation
-passes and every new artifact
-verification use new contexts and new fake state. No test can observe a hidden fixture or a prior
-verification run.
+run executed in declared order in the same fresh context. Phase 6 moves all QuickJS ownership out
+of `skills/{verify,held_out,admission}.rs`: the parent sends a bounded `VerifyArtifact` request to
+the contained supervisor. The worker creates one bounded runtime for that request, then reloads the
+exact production private-realm loader and hidden-capability ABI into a fresh context for every
+embedded, mutation, inherited, and held-out case. Each case also gets fresh deterministic fake
+state, a fresh transcript, fresh one-invocation grants, and an independent pending-job drain. Tests
+therefore cannot observe source state, fake effects, hidden fixtures, or jobs from another case.
+Inherited predecessor scripts are sent as typed cases against the unchanged candidate artifact;
+the verifier never rewrites the candidate's identity-bearing embedded tests. Although fake state
+remains isolated per case, transcript accounting is shared across the whole request. Fake calls
+reserve a conservative serialized-byte bound before cloning effect values, and a call or byte
+limit breach returns a closed verification failure rather than overflowing the protocol frame.
 
 The verifier also performs an anti-vacuity mutation pass. For each declared export, rerun the suite
-with that export replaced by a throwing stub; at least one embedded test must then fail for the
+with that export replaced by a throwing stub after the ordinary production loader has validated the
+original artifact; at least one embedded test must then fail for the
 expected reason. This proves that every public export is exercised, not that its behavior is fully
 correct. Mutation runs use fresh contexts and the same resource bounds. An empty, always-true, or
 unrelated suite cannot verify an artifact.

@@ -1998,6 +1998,592 @@ fn runtime_is_near_heap_limit(runtime: &Runtime) -> bool {
     usage.malloc_size >= (MEMORY_LIMIT.saturating_sub(1024 * 1024)) as i64
 }
 
+#[cfg(feature = "skills")]
+fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> VerificationResult {
+    if request.cases.is_empty()
+        || request.cases.len() > MAX_VERIFICATION_CASES
+        || request.cases.iter().any(|case| {
+            case.case_id.is_empty()
+                || case.case_id.len() > MAX_VERIFICATION_CASE_ID_BYTES
+                || case.script.len() > MAX_RESULT_BYTES
+        })
+    {
+        return VerificationResult {
+            passed: false,
+            cases: Vec::new(),
+            loader_version: VERIFICATION_LOADER_VERSION,
+        };
+    }
+    let runtime = match Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(_) => return failed_skill_verification(&request, DiagnosticClass::Internal),
+    };
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let deadline = Instant::now() + limits.timeout;
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupt_flag = interrupted.clone();
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        let expired = Instant::now() >= deadline;
+        if expired {
+            interrupt_flag.store(true, Ordering::Relaxed);
+        }
+        expired
+    })));
+
+    let mut results = Vec::with_capacity(request.cases.len());
+    let transcript_budget = super::skills::fakes::VerificationTranscriptBudget::new();
+    let mut transcript_calls_remaining = super::skills::fakes::VERIFICATION_TRANSCRIPT_MAX_CALLS;
+    let mut terminal = None;
+    for (case_index, case) in request.cases.iter().enumerate() {
+        if let Some(diagnostic) = terminal.clone() {
+            results.push(failed_case(case.case_id.clone(), diagnostic));
+            continue;
+        }
+        if runtime.is_job_pending() {
+            let diagnostic = diagnostic(
+                DiagnosticClass::Contract,
+                DiagnosticStage::JobDrain,
+                verification_case_role(&case.kind),
+            );
+            terminal = Some(diagnostic.clone());
+            results.push(failed_case(case.case_id.clone(), diagnostic));
+            continue;
+        }
+        let mut result = execute_isolated_skill_verification_case(
+            &runtime,
+            &request.artifact,
+            case,
+            case_index,
+            deadline,
+            &interrupted,
+            limits.max_pending_jobs,
+            transcript_budget.clone(),
+        );
+        if transcript_budget.exceeded() {
+            let limit_diagnostic = diagnostic(
+                DiagnosticClass::Contract,
+                DiagnosticStage::Verification,
+                verification_case_role(&case.kind),
+            );
+            result = failed_case(case.case_id.clone(), limit_diagnostic.clone());
+            terminal = Some(limit_diagnostic);
+        }
+        if result.transcript.call_count() > transcript_calls_remaining {
+            if result.passed {
+                result = failed_case(
+                    case.case_id.clone(),
+                    diagnostic(
+                        DiagnosticClass::Contract,
+                        DiagnosticStage::Verification,
+                        verification_case_role(&case.kind),
+                    ),
+                );
+            }
+            result
+                .transcript
+                .limit_call_count(&mut transcript_calls_remaining);
+        } else {
+            transcript_calls_remaining -= result.transcript.call_count();
+        }
+        if result.diagnostic.as_ref().is_some_and(|diagnostic| {
+            diagnostic.class == DiagnosticClass::ResourceLimit
+                || diagnostic.stage == DiagnosticStage::JobDrain
+        }) {
+            terminal = result.diagnostic.clone();
+        }
+        results.push(result);
+    }
+    VerificationResult {
+        passed: results.iter().all(|case| case.passed),
+        cases: results,
+        loader_version: VERIFICATION_LOADER_VERSION,
+    }
+}
+
+#[cfg(feature = "skills")]
+fn verification_case_role(kind: &super::protocol::VerificationCaseKind) -> ScriptRole {
+    use super::protocol::VerificationCaseKind;
+    match kind {
+        VerificationCaseKind::Embedded => ScriptRole::EmbeddedTest,
+        VerificationCaseKind::Mutation { .. } => ScriptRole::MutationTest,
+        VerificationCaseKind::Inherited => ScriptRole::InheritedTest,
+        VerificationCaseKind::HeldOut { .. } => ScriptRole::HeldOutTest,
+    }
+}
+
+#[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
+fn execute_isolated_skill_verification_case(
+    runtime: &Runtime,
+    artifact: &super::skills::SkillArtifact,
+    case: &super::protocol::VerificationCase,
+    case_index: usize,
+    deadline: Instant,
+    interrupted: &AtomicBool,
+    max_pending_jobs: usize,
+    transcript_budget: super::skills::fakes::VerificationTranscriptBudget,
+) -> VerificationCaseResult {
+    use super::protocol::VerificationCaseKind;
+    use super::skills::fakes::{FakeHostGlobals, FakeTranscript};
+
+    let role = verification_case_role(&case.kind);
+    let fakes =
+        FakeHostGlobals::with_transcript_budget(artifact.capability.clone(), transcript_budget);
+    if let VerificationCaseKind::HeldOut { fake_files, .. } = &case.kind {
+        if fake_files.len() > 32
+            || fake_files.iter().any(|(path, contents)| {
+                path.is_empty() || path.len() > 4 * 1024 || contents.len() > 64 * 1024
+            })
+            || fake_files
+                .iter()
+                .any(|(path, contents)| fakes.seed_file(path, contents).is_err())
+        {
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    DiagnosticClass::Contract,
+                    DiagnosticStage::Initialization,
+                    role,
+                )),
+                transcript: FakeTranscript::default(),
+            };
+        }
+    }
+    let dispatch_fakes = fakes.clone();
+    let manifest = artifact.capability.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |effect| {
+        execute_verification_fake(&manifest, &dispatch_fakes, effect.request.operation)
+    });
+    let bindings = match prepare_verification_bindings(artifact, &capabilities, case_index) {
+        Ok(bindings) => bindings,
+        Err(()) => {
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    DiagnosticClass::Internal,
+                    DiagnosticStage::Initialization,
+                    role,
+                )),
+                transcript: fakes.transcript().bounded_for_wire(),
+            };
+        }
+    };
+    let context = match Context::full(runtime) {
+        Ok(context) => context,
+        Err(_) => {
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    DiagnosticClass::Internal,
+                    DiagnosticStage::Initialization,
+                    role,
+                )),
+                transcript: fakes.transcript().bounded_for_wire(),
+            };
+        }
+    };
+    let mutated_export = match &case.kind {
+        VerificationCaseKind::Mutation { export_name } => Some(export_name.as_str()),
+        _ => None,
+    };
+    let loaded = match super::realm::load_artifact_with_bound_exports_for_verification(
+        runtime,
+        &context,
+        artifact,
+        capabilities.clone(),
+        bindings,
+        mutated_export,
+    ) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let class = match error {
+                super::realm::RealmError::Identity
+                | super::realm::RealmError::InvalidExport
+                | super::realm::RealmError::DuplicateExport
+                | super::realm::RealmError::ExportCollision
+                | super::realm::RealmError::MissingExport
+                | super::realm::RealmError::PendingInitializationJobs => DiagnosticClass::Contract,
+                super::realm::RealmError::Initialization
+                | super::realm::RealmError::WrapperInstallation => DiagnosticClass::Exception,
+            };
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    class,
+                    DiagnosticStage::Initialization,
+                    ScriptRole::SkillSource,
+                )),
+                transcript: fakes.transcript().bounded_for_wire(),
+            };
+        }
+    };
+    let mut remaining_jobs = max_pending_jobs;
+    let mut result = match &case.kind {
+        VerificationCaseKind::Embedded | VerificationCaseKind::Inherited => {
+            execute_verification_case(
+                runtime,
+                &context,
+                case.case_id.clone(),
+                &case.script,
+                role,
+                deadline,
+                interrupted,
+                &mut remaining_jobs,
+            )
+            .0
+        }
+        VerificationCaseKind::HeldOut { expected, .. } => execute_held_out_verification_case(
+            runtime,
+            &context,
+            case,
+            expected,
+            deadline,
+            interrupted,
+            &mut remaining_jobs,
+        ),
+        VerificationCaseKind::Mutation { .. } => execute_mutation_verification_case(
+            runtime,
+            &context,
+            artifact,
+            &case.case_id,
+            deadline,
+            interrupted,
+            &mut remaining_jobs,
+        ),
+    };
+    drop(loaded);
+    drop(context);
+    if runtime.is_job_pending() && result.passed {
+        result = failed_case(
+            case.case_id.clone(),
+            diagnostic(DiagnosticClass::Contract, DiagnosticStage::JobDrain, role),
+        );
+    }
+    let transcript = fakes.transcript();
+    if transcript.exceeds_wire_call_limit() && result.passed {
+        result = failed_case(
+            case.case_id.clone(),
+            diagnostic(
+                DiagnosticClass::Contract,
+                DiagnosticStage::Verification,
+                role,
+            ),
+        );
+    }
+    result.transcript = transcript.bounded_for_wire();
+    result
+}
+
+#[cfg(feature = "skills")]
+fn prepare_verification_bindings(
+    artifact: &super::skills::SkillArtifact,
+    capabilities: &InvocationCapabilityRuntime,
+    case_index: usize,
+) -> Result<std::collections::HashMap<String, super::realm::BoundExportInvocation>, ()> {
+    use std::collections::HashMap;
+
+    let mut bindings = HashMap::with_capacity(artifact.exports.len());
+    for (export_index, export) in artifact.exports.iter().enumerate() {
+        let capabilities = capabilities.clone();
+        let artifact_id = artifact.id.clone();
+        let export_name = export.name.clone();
+        let manifest = artifact.capability.clone();
+        let authorize = Arc::new(move |call_ordinal: u32| {
+            let invocation = format!("verify-{case_index}-{export_index}-{call_ordinal}");
+            let invocation_id =
+                super::protocol::InvocationId::new(invocation.clone()).map_err(|_| ())?;
+            let authorization = InvocationAuthorization::new(
+                invocation_id,
+                artifact_id.clone(),
+                export_name.clone(),
+                manifest.clone(),
+                manifest.grants.iter().map(|scope| {
+                    (
+                        scope.capability(),
+                        super::protocol::GrantId::new(uuid::Uuid::new_v4())
+                            .expect("random verification grant is non-nil"),
+                    )
+                }),
+            )
+            .map_err(|_| ())?;
+            let handle = capabilities.prepare(authorization).map_err(|_| ())?;
+            Ok((handle, invocation))
+        });
+        bindings.insert(
+            export.name.clone(),
+            super::realm::BoundExportInvocation {
+                authorize,
+                on_start: Arc::new(|_, _| Ok(())),
+                on_terminal: Arc::new(|_, _| Ok(())),
+            },
+        );
+    }
+    Ok(bindings)
+}
+
+#[cfg(feature = "skills")]
+fn execute_verification_fake(
+    manifest: &super::skills::CapabilityManifest,
+    fakes: &super::skills::fakes::FakeHostGlobals,
+    operation: EffectOperation,
+) -> Result<EffectResult, super::skills::capability::CapabilityError> {
+    use super::skills::capability::CapabilityError;
+    if !verification_scope_allows(manifest, &operation) {
+        return Err(CapabilityError::DispatchDenied);
+    }
+    match operation {
+        EffectOperation::ReadFile { path } => fakes
+            .read_file(&path)
+            .map(|content| EffectResult::ReadFile { content })
+            .map_err(|_| CapabilityError::DispatchDenied),
+        EffectOperation::WriteFile { path, content } => fakes
+            .write_file(&path, &content)
+            .map(|()| EffectResult::WriteFile)
+            .map_err(|_| CapabilityError::DispatchDenied),
+        EffectOperation::Spawn { program, arguments } => fakes
+            .spawn(&program, &arguments)
+            .map(|_| EffectResult::Spawn {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+            .map_err(|_| CapabilityError::DispatchDenied),
+        EffectOperation::Fetch { url, method, .. } => {
+            let method = match method {
+                super::protocol::HttpMethod::Get => "GET",
+                super::protocol::HttpMethod::Post => "POST",
+            };
+            fakes
+                .fetch(&url, method)
+                .map(|body| EffectResult::Fetch {
+                    status: 200,
+                    headers: Vec::new(),
+                    body,
+                    truncated: false,
+                })
+                .map_err(|_| CapabilityError::DispatchDenied)
+        }
+        EffectOperation::ProposeSkill { .. } => Err(CapabilityError::DispatchDenied),
+    }
+}
+
+#[cfg(feature = "skills")]
+fn verification_scope_allows(
+    manifest: &super::skills::CapabilityManifest,
+    operation: &EffectOperation,
+) -> bool {
+    use super::skills::{CapabilityScope, HostCapability, HttpMethod as SkillHttpMethod};
+    match operation {
+        EffectOperation::ReadFile { path } => manifest
+            .scope(HostCapability::ReadFile)
+            .and_then(|scope| match scope {
+                CapabilityScope::ReadFile { workspace_prefixes } => Some(workspace_prefixes),
+                _ => None,
+            })
+            .is_some_and(|prefixes| {
+                prefixes
+                    .iter()
+                    .any(|prefix| virtual_path_in_scope(prefix, path))
+            }),
+        EffectOperation::WriteFile { path, .. } => manifest
+            .scope(HostCapability::WriteFile)
+            .and_then(|scope| match scope {
+                CapabilityScope::WriteFile { workspace_prefixes } => Some(workspace_prefixes),
+                _ => None,
+            })
+            .is_some_and(|prefixes| {
+                prefixes
+                    .iter()
+                    .any(|prefix| virtual_path_in_scope(prefix, path))
+            }),
+        EffectOperation::Spawn { program, .. } => manifest
+            .scope(HostCapability::Spawn)
+            .and_then(|scope| match scope {
+                CapabilityScope::Spawn { programs } => Some(programs),
+                _ => None,
+            })
+            .is_some_and(|programs| programs.contains(program)),
+        EffectOperation::Fetch { url, method, .. } => {
+            let Ok(url) = reqwest::Url::parse(url) else {
+                return false;
+            };
+            let origin = url.origin().ascii_serialization();
+            manifest
+                .scope(HostCapability::Fetch)
+                .and_then(|scope| match scope {
+                    CapabilityScope::Fetch { origins, methods } => Some((origins, methods)),
+                    _ => None,
+                })
+                .is_some_and(|(origins, methods)| {
+                    origins.contains(&origin)
+                        && methods.iter().any(|allowed| {
+                            matches!(
+                                (allowed, method),
+                                (SkillHttpMethod::Get, super::protocol::HttpMethod::Get)
+                                    | (SkillHttpMethod::Post, super::protocol::HttpMethod::Post)
+                            )
+                        })
+                })
+        }
+        EffectOperation::ProposeSkill { .. } => false,
+    }
+}
+
+#[cfg(feature = "skills")]
+fn virtual_path_in_scope(prefix: &str, path: &str) -> bool {
+    !path.starts_with('/')
+        && !path.split('/').any(|component| component == "..")
+        && (path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+#[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
+fn execute_held_out_verification_case(
+    runtime: &Runtime,
+    context: &Context,
+    case: &super::protocol::VerificationCase,
+    expected: &super::protocol::VerificationExpectedValue,
+    deadline: Instant,
+    interrupted: &AtomicBool,
+    remaining_jobs: &mut usize,
+) -> VerificationCaseResult {
+    let role = ScriptRole::HeldOutTest;
+    let outcome =
+        evaluate(context, &case.script, runtime, deadline, interrupted, role).and_then(|value| {
+            drain_jobs(runtime, deadline, interrupted, remaining_jobs, role)?;
+            context.with(|ctx| {
+                let value = value.restore(&ctx).map_err(|error| {
+                    classify_ctx_error(
+                        &ctx,
+                        error,
+                        deadline,
+                        interrupted,
+                        DiagnosticStage::Verification,
+                        role,
+                    )
+                })?;
+                verification_expected_matches(expected, &value)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        ClosedFailure::error(
+                            JsErrorCode::InvalidResult,
+                            DiagnosticStage::Verification,
+                            role,
+                        )
+                    })
+            })
+        });
+    match outcome {
+        Ok(()) => VerificationCaseResult {
+            case_id: case.case_id.clone(),
+            passed: true,
+            diagnostic: None,
+            transcript: Default::default(),
+        },
+        Err(failure) => failed_case(case.case_id.clone(), failure.diagnostic),
+    }
+}
+
+#[cfg(feature = "skills")]
+fn verification_expected_matches(
+    expected: &super::protocol::VerificationExpectedValue,
+    actual: &Value<'_>,
+) -> bool {
+    use super::protocol::VerificationExpectedValue;
+    match expected {
+        VerificationExpectedValue::Boolean(expected) => actual.as_bool() == Some(*expected),
+        VerificationExpectedValue::String(expected) => actual
+            .as_string()
+            .and_then(|value| value.to_string().ok())
+            .is_some_and(|actual| actual == *expected),
+        VerificationExpectedValue::Integer(expected) => actual
+            .as_int()
+            .is_some_and(|actual| i64::from(actual) == *expected),
+        VerificationExpectedValue::Float(expected) => actual
+            .as_float()
+            .or_else(|| actual.as_int().map(f64::from))
+            .is_some_and(|actual| actual == *expected),
+        VerificationExpectedValue::Null => actual.is_null(),
+    }
+}
+
+#[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
+fn execute_mutation_verification_case(
+    runtime: &Runtime,
+    context: &Context,
+    artifact: &super::skills::SkillArtifact,
+    case_id: &str,
+    deadline: Instant,
+    interrupted: &AtomicBool,
+    remaining_jobs: &mut usize,
+) -> VerificationCaseResult {
+    for test in &artifact.tests {
+        let (result, terminal) = execute_verification_case(
+            runtime,
+            context,
+            case_id.to_string(),
+            test,
+            ScriptRole::MutationTest,
+            deadline,
+            interrupted,
+            remaining_jobs,
+        );
+        if !result.passed {
+            if terminal {
+                return result;
+            }
+            return VerificationCaseResult {
+                case_id: case_id.to_string(),
+                passed: true,
+                diagnostic: None,
+                transcript: Default::default(),
+            };
+        }
+    }
+    failed_case(
+        case_id.to_string(),
+        diagnostic(
+            DiagnosticClass::Contract,
+            DiagnosticStage::Verification,
+            ScriptRole::MutationTest,
+        ),
+    )
+}
+
+#[cfg(feature = "skills")]
+fn failed_skill_verification(
+    request: &VerifyArtifact,
+    class: DiagnosticClass,
+) -> VerificationResult {
+    let diagnostic = diagnostic(
+        class,
+        DiagnosticStage::Initialization,
+        ScriptRole::SkillSource,
+    );
+    VerificationResult {
+        passed: false,
+        cases: request
+            .cases
+            .iter()
+            .map(|case| failed_case(case.case_id.clone(), diagnostic.clone()))
+            .collect(),
+        loader_version: VERIFICATION_LOADER_VERSION,
+    }
+}
+
+#[cfg(not(feature = "skills"))]
 fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> VerificationResult {
     let case_count = request
         .artifact
@@ -2118,6 +2704,7 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
     }
 }
 
+#[cfg(not(feature = "skills"))]
 fn ensure_source_settled(
     runtime: &Runtime,
     context: &Context,
@@ -2253,6 +2840,8 @@ fn execute_verification_case(
                 case_id,
                 passed: true,
                 diagnostic: None,
+                #[cfg(feature = "skills")]
+                transcript: Default::default(),
             },
             false,
         ),
@@ -2273,9 +2862,12 @@ fn failed_case(case_id: String, diagnostic: Diagnostic) -> VerificationCaseResul
         case_id,
         passed: false,
         diagnostic: Some(diagnostic),
+        #[cfg(feature = "skills")]
+        transcript: Default::default(),
     }
 }
 
+#[cfg(not(feature = "skills"))]
 fn failed_verification(request: &VerifyArtifact, class: DiagnosticClass) -> VerificationResult {
     failed_verification_with(
         request,
@@ -2287,6 +2879,7 @@ fn failed_verification(request: &VerifyArtifact, class: DiagnosticClass) -> Veri
     )
 }
 
+#[cfg(not(feature = "skills"))]
 fn failed_verification_with(
     request: &VerifyArtifact,
     diagnostic: Diagnostic,
