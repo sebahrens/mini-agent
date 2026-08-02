@@ -11,11 +11,32 @@ pub(crate) use private::{
     ensure_directory as ensure_private_directory, open_existing as open_private_file,
 };
 
+#[derive(Debug)]
+struct PathChangedError(PathBuf);
+
+impl std::fmt::Display for PathChangedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Path changed after permission check: {}",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for PathChangedError {}
+
 fn path_changed_error(path: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
-        format!("Path changed after permission check: {}", path.display()),
+        PathChangedError(path.to_path_buf()),
     )
+}
+
+pub(crate) fn is_path_changed_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<PathChangedError>().is_some())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

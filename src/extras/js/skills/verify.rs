@@ -444,7 +444,7 @@ fn evaluate_private_source<'js>(
     skill: &SkillArtifact,
 ) -> Result<(), VerificationError> {
     let namespace: Object = ctx
-        .eval(super::private_skill_source(skill))
+        .eval(super::legacy_private_skill_source(skill))
         .map_err(|error| {
             VerificationError::SourceEvaluationFailed(match error {
                 Error::Allocation => "OutOfMemory".to_string(),

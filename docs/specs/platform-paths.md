@@ -140,6 +140,7 @@ new config file under the data root merely because no config file exists yet.
 | Global prompts, themes, docs, imported portable Agent Skill trees | `data_dir` | Durable user content that may roam |
 | Learned JS `skills.db`, embeddings, held-out suites, lifecycle/evidence DB | `local_data_dir/skills` | SQLite and mutable indexes are machine-local and unsafe to roam concurrently |
 | Sessions, transcripts, tool output, loop state, turn telemetry, crash state, logs | `state_dir` | Durable operational state, not configuration or skill evidence |
+| Brokered JavaScript effect audit | `state_dir/audit/js-effects` | Private machine-local security evidence with one exclusive writer and hash-linked segments |
 | Embedding model downloads, query cache, rebuildable dense snapshots, import staging | `cache_dir` | Safe to delete and reconstruct |
 | MCP OAuth refresh/access tokens and future secret material | `credentials_dir` | Requires stronger access controls and must not roam by default |
 | System-managed hook settings | `/etc/zerostack` (Linux), `/Library/Application Support/zerostack` (macOS), `%ProgramData%\zerostack` (Windows) | Explicit read-only administrator-policy exception; no user override |
@@ -147,6 +148,28 @@ new config file under the data root merely because no config file exists yet.
 An artifact has exactly one owner and one canonical root. A module may receive a fully resolved
 artifact path or an `AppPaths` reference; it may not reinterpret another root. Rebuildable cache
 loss must never delete the authoritative skill database or disable primitive JS execution.
+
+### Brokered JavaScript effect audit
+
+`AppPaths::effect_audit()` is the only owner of the effect-audit location. It fixes the directory
+at `<state_dir>/audit/js-effects`, the writer lock at `writer.lock`, and opaque monotonically
+numbered segment names. Its parent-only target-correlation key is fixed at `target-hmac-v1.key`;
+an initialization marker outside the segment directory makes disappearance of a previously
+initialized chain distinguishable from first use. Effect IDs and target metadata never become
+path components. The directory
+is private (`0700` on Unix and the platform private-directory DACL on Windows), while the lock,
+target-correlation key, and segments are private files (`0600` on Unix and the platform
+private-file DACL on Windows).
+
+The audit has one non-blocking exclusive writer. Required path validation, lock acquisition, file
+sync, directory sync, segment validation, or recovery failure makes the audit unavailable rather
+than selecting another root or creating a current-directory fallback. There is no legacy audit
+migration: a missing chain starts a new first segment only at the canonical owner, while any
+present chain must validate completely before use.
+
+Retention is explicitly bounded to 256 segments of at most 4 MiB each (plus bounded close/open
+anchor overhead). The writer fails closed before opening a 257th segment; it does not silently
+delete or overwrite security evidence and thereby break validation of the complete chain.
 
 ### Phase 3 skill storage
 

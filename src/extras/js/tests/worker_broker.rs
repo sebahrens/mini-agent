@@ -1,0 +1,1799 @@
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::extras::js::audit::{
+    AuditCapability, AuditDecision, AuditError, AuditFailurePoint, AuditOpenOptions,
+    AuditResultCode, AuditState, EffectAudit, EffectCompletion, EffectIntent, SanitizedTarget,
+};
+use crate::extras::js::broker::{
+    AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, GrantPrincipal,
+    HostCapability, HostEffectError, InvocationBroker, InvocationGrant, ParentEffectService,
+};
+use crate::extras::js::protocol::{
+    AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpHeader, HttpMethod, InvocationId,
+    SkillProposalDraft,
+};
+use crate::extras::js::supervisor::InvocationEffectHandler;
+use crate::extras::js::types::PermCancellation;
+use crate::paths::{AppPaths, EffectAuditPathOwner};
+
+type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ServiceFailures {
+    target: Option<HostEffectError>,
+    backend: Option<HostEffectError>,
+    permission: Option<HostEffectError>,
+    execution: Option<HostEffectError>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ServiceRecord {
+    authorizations: usize,
+    execute_calls: usize,
+    executions: usize,
+    authorized: Vec<AuthorizedEffect>,
+}
+
+struct RecordingService {
+    failures: ServiceFailures,
+    pending_permission: bool,
+    permission_delay_until: Option<Instant>,
+    record: Arc<Mutex<ServiceRecord>>,
+}
+
+impl ParentEffectService for RecordingService {
+    fn validate_target(
+        &mut self,
+        _authorized: &AuthorizedEffect,
+        _operation: &EffectOperation,
+    ) -> Result<(), HostEffectError> {
+        self.failures.target.map_or(Ok(()), Err)
+    }
+
+    fn ensure_backend(
+        &mut self,
+        _authorized: &AuthorizedEffect,
+        _operation: &EffectOperation,
+    ) -> Result<(), HostEffectError> {
+        self.failures.backend.map_or(Ok(()), Err)
+    }
+
+    fn authorize<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        _operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
+        let result = self.failures.permission.map_or(Ok(()), Err);
+        let target = authorized_target(_operation);
+        self.record.lock().unwrap().authorizations += 1;
+        if self.pending_permission {
+            Box::pin(std::future::pending())
+        } else if let Some(delay_until) = self.permission_delay_until {
+            Box::pin(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(delay_until)).await;
+                result.map(|()| target)
+            })
+        } else {
+            Box::pin(async move { result.map(|()| target) })
+        }
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<EffectResult, HostEffectError>> {
+        let failure = self.failures.execution;
+        let result = success_for(operation);
+        let authorized = authorized.clone();
+        let record = Arc::clone(&self.record);
+        Box::pin(async move {
+            let mut record = record.lock().unwrap();
+            record.execute_calls += 1;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            record.executions += 1;
+            record.authorized.push(authorized);
+            Ok(result)
+        })
+    }
+}
+
+fn authorized_target(operation: &EffectOperation) -> AuthorizedTarget {
+    match operation {
+        EffectOperation::ReadFile { path } => AuthorizedTarget::ReadFile {
+            canonical_path: path.clone(),
+        },
+        EffectOperation::WriteFile { path, .. } => AuthorizedTarget::WriteFile {
+            canonical_path: path.clone(),
+        },
+        EffectOperation::Fetch { url, method, .. } => AuthorizedTarget::Fetch {
+            normalized_url: url.clone(),
+            method: match method {
+                HttpMethod::Get => "GET",
+                HttpMethod::Post => "POST",
+            }
+            .to_string(),
+        },
+        EffectOperation::Spawn { program, .. } => AuthorizedTarget::Spawn {
+            resolved_executable: program.clone(),
+        },
+        EffectOperation::ProposeSkill { .. } => AuthorizedTarget::ProposeSkill,
+    }
+}
+
+#[derive(Clone)]
+struct OperationCase {
+    name: &'static str,
+    operation: EffectOperation,
+    capability: HostCapability,
+    principal: GrantPrincipal,
+    advisory: AdvisoryAttribution,
+}
+
+fn invocation(value: &str) -> InvocationId {
+    InvocationId::new(value).unwrap()
+}
+
+fn operation_cases(invocation_id: &InvocationId) -> Vec<OperationCase> {
+    let skill = |suffix: &str| GrantPrincipal::Skill {
+        artifact_id: format!("artifact-{suffix}"),
+        export: format!("export-{suffix}"),
+        invocation_id: invocation_id.to_string(),
+    };
+    let advisory = |suffix: &str| AdvisoryAttribution {
+        artifact_id: Some(format!("artifact-{suffix}")),
+        export: Some(format!("export-{suffix}")),
+    };
+
+    vec![
+        OperationCase {
+            name: "read_file",
+            operation: EffectOperation::ReadFile {
+                path: "docs/input.txt".into(),
+            },
+            capability: HostCapability::ReadFile,
+            principal: skill("read"),
+            advisory: advisory("read"),
+        },
+        OperationCase {
+            name: "write_file",
+            operation: EffectOperation::WriteFile {
+                path: "tmp/output.txt".into(),
+                content: "output".into(),
+            },
+            capability: HostCapability::WriteFile,
+            principal: skill("write"),
+            advisory: advisory("write"),
+        },
+        OperationCase {
+            name: "fetch",
+            operation: EffectOperation::Fetch {
+                url: "https://example.test/api".into(),
+                method: HttpMethod::Get,
+                headers: vec![],
+                body: None,
+            },
+            capability: HostCapability::Fetch,
+            principal: skill("fetch"),
+            advisory: advisory("fetch"),
+        },
+        OperationCase {
+            name: "spawn",
+            operation: EffectOperation::Spawn {
+                program: "printf".into(),
+                arguments: vec!["%s".into(), "hello".into()],
+            },
+            capability: HostCapability::Spawn,
+            principal: skill("spawn"),
+            advisory: advisory("spawn"),
+        },
+        OperationCase {
+            name: "propose_skill",
+            operation: EffectOperation::ProposeSkill {
+                draft: SkillProposalDraft {
+                    source: "function run() { return true; }".into(),
+                    description: "test proposal".into(),
+                    exports: vec!["run".into()],
+                    tests: vec!["run() === true".into()],
+                },
+            },
+            capability: HostCapability::ProposeSkill,
+            principal: GrantPrincipal::ModelAuthored {
+                tool_call_id: "tool-call-1".into(),
+            },
+            advisory: AdvisoryAttribution::default(),
+        },
+    ]
+}
+
+fn success_for(operation: &EffectOperation) -> EffectResult {
+    match operation {
+        EffectOperation::ReadFile { .. } => EffectResult::ReadFile {
+            content: "contents".into(),
+        },
+        EffectOperation::WriteFile { .. } => EffectResult::WriteFile,
+        EffectOperation::Fetch { .. } => EffectResult::Fetch {
+            status: 200,
+            headers: vec![HttpHeader {
+                name: "content-type".into(),
+                value: "text/plain".into(),
+            }],
+            body: "ok".into(),
+            truncated: false,
+        },
+        EffectOperation::Spawn { .. } => EffectResult::Spawn {
+            stdout: "hello".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        },
+        EffectOperation::ProposeSkill { .. } => EffectResult::ProposalAccepted,
+    }
+}
+
+fn grant(
+    case: &OperationCase,
+    invocation_id: &InvocationId,
+    expires_at: Instant,
+) -> InvocationGrant {
+    InvocationGrant::issue(
+        invocation_id.clone(),
+        case.principal.clone(),
+        BTreeSet::from([case.capability]),
+        expires_at,
+    )
+}
+
+fn request(case: &OperationCase, grant: &InvocationGrant) -> EffectRequest {
+    EffectRequest {
+        effect_ordinal: 1,
+        grant_id: grant.grant_id().clone(),
+        advisory: case.advisory.clone(),
+        operation: case.operation.clone(),
+    }
+}
+
+fn broker(
+    invocation_id: InvocationId,
+    grants: Vec<InvocationGrant>,
+    session_allowed: BTreeSet<HostCapability>,
+    failures: ServiceFailures,
+) -> (
+    InvocationBroker<RecordingService>,
+    Arc<Mutex<ServiceRecord>>,
+    AuditTempRoot,
+) {
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures,
+        pending_permission: false,
+        permission_delay_until: None,
+        record: Arc::clone(&record),
+    };
+    let root = AuditTempRoot::new("broker");
+    let audit = EffectAudit::open(root.owner()).unwrap();
+    (
+        InvocationBroker::new(
+            invocation_id,
+            grants,
+            session_allowed,
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap(),
+        record,
+        root,
+    )
+}
+
+async fn assert_denied_before_execute(
+    case: &OperationCase,
+    expected: HostEffectError,
+    grant: InvocationGrant,
+    broker_invocation: InvocationId,
+    session_allowed: BTreeSet<HostCapability>,
+    failures: ServiceFailures,
+    cancellation: PermCancellation,
+    mutate_request: impl FnOnce(&mut EffectRequest),
+) {
+    let mut effect = request(case, &grant);
+    mutate_request(&mut effect);
+    let (mut broker, record, _audit_root) =
+        broker(broker_invocation, vec![grant], session_allowed, failures);
+
+    assert_eq!(
+        broker.dispatch(effect, cancellation).await,
+        Err(expected),
+        "{} used the wrong denial",
+        case.name
+    );
+    assert_eq!(
+        record.lock().unwrap().executions,
+        0,
+        "{} reached the effect service",
+        case.name
+    );
+}
+
+#[tokio::test]
+async fn worker_broker_grants_all_closed_operations_from_parent_identity() {
+    let invocation_id = invocation("inv-success");
+    let cases = operation_cases(&invocation_id);
+    let expires_at = Instant::now() + Duration::from_secs(30);
+    let grants: Vec<_> = cases
+        .iter()
+        .map(|case| grant(case, &invocation_id, expires_at))
+        .collect();
+    let grant_ids: BTreeSet<_> = grants.iter().map(|grant| grant.grant_id().get()).collect();
+    assert_eq!(grant_ids.len(), cases.len(), "grant IDs must be unique");
+    assert!(grant_ids.iter().all(|id| !id.is_nil()));
+
+    let (mut broker, record, _audit_root) = broker(
+        invocation_id.clone(),
+        grants.clone(),
+        HostCapability::all(),
+        ServiceFailures::default(),
+    );
+
+    for (ordinal, (case, grant)) in cases.iter().zip(&grants).enumerate() {
+        let mut effect = request(case, grant);
+        effect.effect_ordinal = u32::try_from(ordinal).unwrap();
+        assert_eq!(
+            broker.dispatch(effect, PermCancellation::new()).await,
+            Ok(success_for(&case.operation)),
+            "{} was not dispatched",
+            case.name
+        );
+    }
+
+    let record = record.lock().unwrap();
+    assert_eq!(record.executions, cases.len());
+    for ((authorized, case), grant) in record.authorized.iter().zip(&cases).zip(&grants) {
+        assert_eq!(authorized.invocation_id(), &invocation_id);
+        assert_eq!(authorized.grant_id(), grant.grant_id());
+        assert_eq!(authorized.principal(), &case.principal);
+        assert_eq!(authorized.capability(), case.capability);
+    }
+}
+
+#[tokio::test]
+async fn worker_broker_grants_deny_forged_unknown_replayed_expired_and_wrong_invocation() {
+    for case in operation_cases(&invocation("inv-denials")) {
+        let current = invocation("inv-denials");
+        let live = grant(&case, &current, Instant::now() + Duration::from_secs(30));
+        let forged = grant(&case, &current, Instant::now() + Duration::from_secs(30));
+        assert_denied_before_execute(
+            &case,
+            HostEffectError::UnknownGrant,
+            live.clone(),
+            current.clone(),
+            HostCapability::all(),
+            ServiceFailures::default(),
+            PermCancellation::new(),
+            |request| request.grant_id = forged.grant_id().clone(),
+        )
+        .await;
+
+        let (mut replay_broker, record, _audit_root) = broker(
+            current.clone(),
+            vec![live.clone()],
+            HostCapability::all(),
+            ServiceFailures::default(),
+        );
+        assert!(replay_broker.revoke_grant(live.grant_id()));
+        assert_eq!(
+            replay_broker
+                .dispatch(request(&case, &live), PermCancellation::new())
+                .await,
+            Err(HostEffectError::ReplayedGrant)
+        );
+        assert_eq!(record.lock().unwrap().executions, 0);
+
+        let expired = grant(&case, &current, Instant::now() - Duration::from_secs(1));
+        let expired_request = request(&case, &expired);
+        let (mut expired_broker, record, _audit_root) = broker(
+            current.clone(),
+            vec![expired],
+            HostCapability::all(),
+            ServiceFailures::default(),
+        );
+        assert_eq!(
+            expired_broker
+                .dispatch(expired_request.clone(), PermCancellation::new())
+                .await,
+            Err(HostEffectError::ExpiredGrant)
+        );
+        assert_eq!(
+            expired_broker
+                .dispatch(expired_request, PermCancellation::new())
+                .await,
+            Err(HostEffectError::ReplayedGrant)
+        );
+        assert_eq!(record.lock().unwrap().executions, 0);
+
+        let other = invocation("inv-other");
+        let wrong = grant(&case, &other, Instant::now() + Duration::from_secs(30));
+        assert_denied_before_execute(
+            &case,
+            HostEffectError::WrongInvocation,
+            wrong,
+            current,
+            HostCapability::all(),
+            ServiceFailures::default(),
+            PermCancellation::new(),
+            |_| {},
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn worker_broker_grants_deny_attribution_cancel_session_capability_and_preflights() {
+    let invocation_id = invocation("inv-policy");
+    for case in operation_cases(&invocation_id) {
+        let make_grant = || {
+            grant(
+                &case,
+                &invocation_id,
+                Instant::now() + Duration::from_secs(30),
+            )
+        };
+
+        assert_denied_before_execute(
+            &case,
+            HostEffectError::AttributionMismatch,
+            make_grant(),
+            invocation_id.clone(),
+            HostCapability::all(),
+            ServiceFailures::default(),
+            PermCancellation::new(),
+            |request| request.advisory.artifact_id = Some("forged-artifact".into()),
+        )
+        .await;
+
+        let cancellation = PermCancellation::new();
+        cancellation.cancel();
+        assert_denied_before_execute(
+            &case,
+            HostEffectError::InvocationCancelled,
+            make_grant(),
+            invocation_id.clone(),
+            HostCapability::all(),
+            ServiceFailures::default(),
+            cancellation,
+            |_| {},
+        )
+        .await;
+
+        assert_denied_before_execute(
+            &case,
+            HostEffectError::SessionDenied,
+            make_grant(),
+            invocation_id.clone(),
+            BTreeSet::new(),
+            ServiceFailures::default(),
+            PermCancellation::new(),
+            |_| {},
+        )
+        .await;
+
+        let no_capability = InvocationGrant::issue(
+            invocation_id.clone(),
+            case.principal.clone(),
+            BTreeSet::new(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_denied_before_execute(
+            &case,
+            HostEffectError::CapabilityDenied,
+            no_capability,
+            invocation_id.clone(),
+            HostCapability::all(),
+            ServiceFailures::default(),
+            PermCancellation::new(),
+            |_| {},
+        )
+        .await;
+
+        for target_error in [
+            HostEffectError::InvalidTarget,
+            HostEffectError::TargetDenied,
+        ] {
+            assert_denied_before_execute(
+                &case,
+                target_error,
+                make_grant(),
+                invocation_id.clone(),
+                HostCapability::all(),
+                ServiceFailures {
+                    target: Some(target_error),
+                    ..ServiceFailures::default()
+                },
+                PermCancellation::new(),
+                |_| {},
+            )
+            .await;
+        }
+
+        for permission_error in [
+            HostEffectError::PermissionDenied,
+            HostEffectError::AskTimedOut,
+        ] {
+            assert_denied_before_execute(
+                &case,
+                permission_error,
+                make_grant(),
+                invocation_id.clone(),
+                HostCapability::all(),
+                ServiceFailures {
+                    permission: Some(permission_error),
+                    ..ServiceFailures::default()
+                },
+                PermCancellation::new(),
+                |_| {},
+            )
+            .await;
+        }
+
+        assert_denied_before_execute(
+            &case,
+            HostEffectError::BackendFailure,
+            make_grant(),
+            invocation_id.clone(),
+            HostCapability::all(),
+            ServiceFailures {
+                backend: Some(HostEffectError::BackendFailure),
+                ..ServiceFailures::default()
+            },
+            PermCancellation::new(),
+            |_| {},
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn worker_broker_grants_erase_authority_on_terminal_cancel_and_recycle() {
+    for (transition, expected) in [
+        ("terminal", HostEffectError::InvocationTerminal),
+        ("cancel", HostEffectError::InvocationCancelled),
+        ("recycle", HostEffectError::InvocationRecycled),
+    ] {
+        let invocation_id = invocation(&format!("inv-{transition}"));
+        let case = operation_cases(&invocation_id).remove(0);
+        let grant = grant(
+            &case,
+            &invocation_id,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let effect = request(&case, &grant);
+        let (mut broker, record, _audit_root) = broker(
+            invocation_id,
+            vec![grant],
+            HostCapability::all(),
+            ServiceFailures::default(),
+        );
+        match transition {
+            "terminal" => broker.finish(),
+            "cancel" => broker.cancel_invocation(),
+            "recycle" => broker.recycle(),
+            _ => unreachable!(),
+        }
+        assert_eq!(broker.tracked_grant_count(), 0);
+        assert_eq!(
+            broker.dispatch(effect, PermCancellation::new()).await,
+            Err(expected)
+        );
+        assert_eq!(record.lock().unwrap().executions, 0);
+    }
+}
+
+#[tokio::test]
+async fn worker_broker_grants_callback_returns_only_closed_wire_errors() {
+    let invocation_id = invocation("inv-callback");
+    let case = operation_cases(&invocation_id).remove(0);
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let effect = request(&case, &grant);
+    let (mut broker, record, _audit_root) = broker(
+        invocation_id,
+        vec![grant],
+        HostCapability::all(),
+        ServiceFailures {
+            permission: Some(HostEffectError::AskTimedOut),
+            ..ServiceFailures::default()
+        },
+    );
+
+    let result =
+        InvocationEffectHandler::handle_effect(&mut broker, effect, PermCancellation::new()).await;
+    assert!(matches!(
+        result,
+        EffectResult::Error(error) if error.code == EffectErrorCode::TimedOut
+    ));
+    assert_eq!(record.lock().unwrap().executions, 0);
+}
+
+#[tokio::test]
+async fn worker_broker_grants_cancel_a_pending_ask_before_execution() {
+    let invocation_id = invocation("inv-pending-ask");
+    let case = operation_cases(&invocation_id).remove(0);
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let effect = request(&case, &grant);
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures: ServiceFailures::default(),
+        pending_permission: true,
+        permission_delay_until: None,
+        record: Arc::clone(&record),
+    };
+    let audit_root = AuditTempRoot::new("pending-ask");
+    let audit = EffectAudit::open(audit_root.owner()).unwrap();
+    let mut broker = InvocationBroker::new(
+        invocation_id,
+        vec![grant],
+        HostCapability::all(),
+        service,
+        Arc::new(Mutex::new(audit)),
+    )
+    .unwrap();
+    let cancellation = PermCancellation::new();
+    let canceller = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        canceller.cancel();
+    });
+
+    assert_eq!(
+        broker.dispatch(effect, cancellation).await,
+        Err(HostEffectError::InvocationCancelled)
+    );
+    assert_eq!(broker.tracked_grant_count(), 0);
+    assert_eq!(record.lock().unwrap().executions, 0);
+}
+
+#[tokio::test]
+async fn worker_broker_grants_never_allow_a_skill_to_propose_another_skill() {
+    let invocation_id = invocation("inv-skill-proposal");
+    let mut case = operation_cases(&invocation_id).remove(4);
+    case.principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-proposer".into(),
+        export: "propose".into(),
+        invocation_id: invocation_id.to_string(),
+    };
+    case.advisory = AdvisoryAttribution {
+        artifact_id: Some("artifact-proposer".into()),
+        export: Some("propose".into()),
+    };
+    let skill_grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+
+    assert_denied_before_execute(
+        &case,
+        HostEffectError::CapabilityDenied,
+        skill_grant,
+        invocation_id,
+        HostCapability::all(),
+        ServiceFailures::default(),
+        PermCancellation::new(),
+        |_| {},
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn worker_broker_grants_expiring_during_ask_never_execute() {
+    let invocation_id = invocation("inv-expiring-ask");
+    let case = operation_cases(&invocation_id).remove(0);
+    let expires_at = Instant::now() + Duration::from_secs(1);
+    let grant = grant(&case, &invocation_id, expires_at);
+    let effect = request(&case, &grant);
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures: ServiceFailures::default(),
+        pending_permission: false,
+        permission_delay_until: Some(expires_at),
+        record: Arc::clone(&record),
+    };
+    let audit_root = AuditTempRoot::new("expiring-ask");
+    let audit = EffectAudit::open(audit_root.owner()).unwrap();
+    let mut broker = InvocationBroker::new(
+        invocation_id,
+        vec![grant],
+        HostCapability::all(),
+        service,
+        Arc::new(Mutex::new(audit)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        broker
+            .dispatch(effect.clone(), PermCancellation::new())
+            .await,
+        Err(HostEffectError::ExpiredGrant)
+    );
+    assert_eq!(
+        broker.dispatch(effect, PermCancellation::new()).await,
+        Err(HostEffectError::ReplayedGrant)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.authorizations, 1, "the Ask preflight must run");
+    assert_eq!(record.execute_calls, 0, "an expired grant reached execute");
+    assert_eq!(record.executions, 0);
+}
+
+#[tokio::test]
+async fn worker_broker_grants_expiring_while_waiting_for_audit_never_execute() {
+    let invocation_id = invocation("inv-expiring-audit-lock");
+    let case = operation_cases(&invocation_id).remove(0);
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures: ServiceFailures::default(),
+        pending_permission: false,
+        permission_delay_until: None,
+        record: Arc::clone(&record),
+    };
+    let audit_root = AuditTempRoot::new("expiring-audit-lock");
+    let audit = Arc::new(Mutex::new(EffectAudit::open(audit_root.owner()).unwrap()));
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let locked_audit = Arc::clone(&audit);
+    let holder = std::thread::spawn(move || {
+        let _guard = locked_audit.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+    });
+    locked_rx.recv().unwrap();
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_millis(40),
+    );
+    let effect = request(&case, &grant);
+    let mut broker = InvocationBroker::new(
+        invocation_id,
+        vec![grant],
+        HostCapability::all(),
+        service,
+        Arc::clone(&audit),
+    )
+    .unwrap();
+
+    assert_eq!(
+        broker.dispatch(effect, PermCancellation::new()).await,
+        Err(HostEffectError::ExpiredGrant)
+    );
+    holder.join().unwrap();
+    assert!(broker.audit_records_for_test().is_empty());
+    let record = record.lock().unwrap();
+    assert_eq!(record.authorizations, 1);
+    assert_eq!(
+        record.execute_calls, 0,
+        "expired audit waiter reached execute"
+    );
+    assert_eq!(record.executions, 0);
+}
+
+#[tokio::test]
+async fn worker_broker_grants_execute_cancellation_erases_authority_before_redispatch() {
+    let invocation_id = invocation("inv-execute-cancel");
+    let mut cases = operation_cases(&invocation_id);
+    let first_case = cases.remove(0);
+    let second_case = cases.remove(0);
+    let first_grant = grant(
+        &first_case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let second_grant = grant(
+        &second_case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let first_effect = request(&first_case, &first_grant);
+    let second_effect = request(&second_case, &second_grant);
+    let (mut broker, record, _audit_root) = broker(
+        invocation_id,
+        vec![first_grant, second_grant],
+        HostCapability::all(),
+        ServiceFailures {
+            execution: Some(HostEffectError::InvocationCancelled),
+            ..ServiceFailures::default()
+        },
+    );
+
+    assert_eq!(
+        broker.dispatch(first_effect, PermCancellation::new()).await,
+        Err(HostEffectError::InvocationCancelled)
+    );
+    assert_eq!(broker.tracked_grant_count(), 0);
+    assert_eq!(
+        broker
+            .dispatch(second_effect, PermCancellation::new())
+            .await,
+        Err(HostEffectError::InvocationCancelled)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.execute_calls, 1, "redispatch reached the service");
+    assert_eq!(record.executions, 0);
+}
+
+#[tokio::test]
+async fn js_effect_audit_ordering_requires_durable_intent_before_read_file() {
+    let invocation_id = invocation("inv-audit-ordering-red");
+    let case = operation_cases(&invocation_id).remove(0);
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures: ServiceFailures::default(),
+        pending_permission: false,
+        permission_delay_until: None,
+        record,
+    };
+    let root = AuditTempRoot::new("ordering-red");
+    let audit = EffectAudit::open(root.owner()).unwrap();
+    let mut broker = InvocationBroker::new(
+        invocation_id,
+        vec![grant.clone()],
+        HostCapability::all(),
+        service,
+        Arc::new(Mutex::new(audit)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        {
+            let mut first = request(&case, &grant);
+            first.effect_ordinal = 0;
+            broker.dispatch(first, PermCancellation::new()).await
+        },
+        Ok(success_for(&case.operation))
+    );
+    assert_eq!(broker.audit_records_for_test().len(), 2);
+}
+
+struct AuditTempRoot(PathBuf);
+
+impl AuditTempRoot {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-js-effect-audit-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn owner(&self) -> EffectAuditPathOwner {
+        AppPaths {
+            config_dir: self.0.join("config"),
+            data_dir: self.0.join("data"),
+            local_data_dir: self.0.join("local"),
+            state_dir: self.0.join("state"),
+            cache_dir: self.0.join("cache"),
+            credentials_dir: self.0.join("credentials"),
+            project_dir: None,
+        }
+        .effect_audit()
+    }
+}
+
+impl Drop for AuditTempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum OrderingExecutionFailure {
+    #[default]
+    None,
+    BeforeEffect,
+    AfterEffect,
+}
+
+#[derive(Debug, Default)]
+struct OrderingRecord {
+    validations: usize,
+    backend_checks: usize,
+    authorizations: usize,
+    execute_calls: usize,
+    effects: usize,
+    saw_durable_intent: usize,
+}
+
+struct OrderingService {
+    owner: EffectAuditPathOwner,
+    failure: OrderingExecutionFailure,
+    record: Arc<Mutex<OrderingRecord>>,
+}
+
+impl ParentEffectService for OrderingService {
+    fn validate_target(
+        &mut self,
+        _authorized: &AuthorizedEffect,
+        _operation: &EffectOperation,
+    ) -> Result<(), HostEffectError> {
+        self.record.lock().unwrap().validations += 1;
+        Ok(())
+    }
+
+    fn ensure_backend(
+        &mut self,
+        _authorized: &AuthorizedEffect,
+        _operation: &EffectOperation,
+    ) -> Result<(), HostEffectError> {
+        self.record.lock().unwrap().backend_checks += 1;
+        Ok(())
+    }
+
+    fn authorize<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
+        self.record.lock().unwrap().authorizations += 1;
+        let target = authorized_target(operation);
+        Box::pin(async move { Ok(target) })
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<EffectResult, HostEffectError>> {
+        let owner = self.owner.clone();
+        let failure = self.failure;
+        let record = Arc::clone(&self.record);
+        let result = success_for(operation);
+        Box::pin(async move {
+            let bytes = audit_bytes(&owner);
+            let durable_intents = String::from_utf8_lossy(&bytes)
+                .matches("\"state\":\"intent\"")
+                .count();
+            let mut record = record.lock().unwrap();
+            record.execute_calls += 1;
+            record.saw_durable_intent += usize::from(durable_intents > 0);
+            if matches!(failure, OrderingExecutionFailure::BeforeEffect) {
+                return Err(HostEffectError::BackendFailure);
+            }
+            record.effects += 1;
+            if matches!(failure, OrderingExecutionFailure::AfterEffect) {
+                return Err(HostEffectError::OutcomeUnknown);
+            }
+            Ok(result)
+        })
+    }
+}
+
+fn ordering_service(
+    owner: EffectAuditPathOwner,
+    failure: OrderingExecutionFailure,
+) -> (OrderingService, Arc<Mutex<OrderingRecord>>) {
+    let record = Arc::new(Mutex::new(OrderingRecord::default()));
+    (
+        OrderingService {
+            owner,
+            failure,
+            record: Arc::clone(&record),
+        },
+        record,
+    )
+}
+
+fn audit_intent(effect_id: &str, target: SanitizedTarget) -> EffectIntent {
+    EffectIntent {
+        effect_id: effect_id.into(),
+        invocation_id: "inv-audit".into(),
+        grant_id: "grant-audit".into(),
+        sequence: 1,
+        timestamp_ms: 1_800_000_000_000,
+        artifact_id: Some("artifact-audit".into()),
+        export: Some("run".into()),
+        capability: AuditCapability::ReadFile,
+        normalized_target: target,
+        decision: AuditDecision::Authorized,
+    }
+}
+
+fn audit_segments(owner: &EffectAuditPathOwner) -> Vec<PathBuf> {
+    let mut segments = std::fs::read_dir(owner.directory())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("segment-") && name.ends_with(".audit"))
+        })
+        .collect::<Vec<_>>();
+    segments.sort();
+    segments
+}
+
+fn audit_bytes(owner: &EffectAuditPathOwner) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for segment in audit_segments(owner) {
+        bytes.extend(std::fs::read(segment).unwrap());
+    }
+    bytes
+}
+
+fn raw_effect_fragments(operation: &EffectOperation) -> Vec<&str> {
+    match operation {
+        EffectOperation::ReadFile { path } => vec![path],
+        EffectOperation::WriteFile { path, content } => vec![path, content],
+        EffectOperation::Fetch { .. } => vec!["example.test", "/api"],
+        EffectOperation::Spawn { program, arguments } => {
+            let mut fragments = vec![program.as_str()];
+            fragments.extend(arguments.iter().map(String::as_str));
+            fragments
+        }
+        EffectOperation::ProposeSkill { draft } => {
+            vec![draft.source.as_str(), draft.description.as_str()]
+        }
+    }
+}
+
+#[tokio::test]
+async fn js_effect_audit_ordering_covers_every_operation_and_parent_identity() {
+    let invocation_id = invocation("inv-ordering-success");
+    for case in operation_cases(&invocation_id) {
+        let root = AuditTempRoot::new(case.name);
+        let owner = root.owner();
+        let audit = EffectAudit::open(owner.clone()).unwrap();
+        let grant = grant(
+            &case,
+            &invocation_id,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let (service, service_record) =
+            ordering_service(owner.clone(), OrderingExecutionFailure::None);
+        let mut broker = InvocationBroker::new(
+            invocation_id.clone(),
+            vec![grant.clone()],
+            HostCapability::all(),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        let mut effect = request(&case, &grant);
+        effect.effect_ordinal = 0;
+
+        assert_eq!(
+            broker.dispatch(effect, PermCancellation::new()).await,
+            Ok(success_for(&case.operation)),
+            "{} did not complete",
+            case.name
+        );
+        let service_record = service_record.lock().unwrap();
+        assert_eq!(service_record.validations, 1, "{} validation", case.name);
+        assert_eq!(service_record.backend_checks, 1, "{} backend", case.name);
+        assert_eq!(
+            service_record.authorizations, 1,
+            "{} authorization",
+            case.name
+        );
+        assert_eq!(service_record.execute_calls, 1, "{} execution", case.name);
+        assert_eq!(service_record.effects, 1, "{} effect", case.name);
+        assert_eq!(
+            service_record.saw_durable_intent, 1,
+            "{} executed before its durable intent",
+            case.name
+        );
+        drop(service_record);
+
+        let records = broker.audit_records_for_test();
+        assert_eq!(records.len(), 2, "{} audit count", case.name);
+        assert_eq!(records[0].state, AuditState::Intent, "{} intent", case.name);
+        assert_eq!(
+            records[1].state,
+            AuditState::Completed,
+            "{} completion",
+            case.name
+        );
+        assert_eq!(records[0].invocation_id, invocation_id.as_str());
+        assert_eq!(records[0].grant_id, grant.grant_id().get().to_string());
+        assert_eq!(
+            records[0].sequence, 1,
+            "zero-based wire ordinal maps safely"
+        );
+        let expected_identity = match &case.principal {
+            GrantPrincipal::ModelAuthored { .. } => (None, None),
+            GrantPrincipal::Skill {
+                artifact_id,
+                export,
+                ..
+            } => (Some(artifact_id.as_str()), Some(export.as_str())),
+        };
+        assert_eq!(records[0].artifact_id.as_deref(), expected_identity.0);
+        assert_eq!(records[0].export.as_deref(), expected_identity.1);
+
+        let bytes = String::from_utf8_lossy(&audit_bytes(&owner)).into_owned();
+        for fragment in raw_effect_fragments(&case.operation) {
+            assert!(
+                !bytes.contains(fragment),
+                "{} persisted raw target/content fragment {fragment:?}",
+                case.name
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn js_effect_audit_ordering_pre_intent_failures_execute_nothing() {
+    let invocation_id = invocation("inv-ordering-pre-intent");
+    for case in operation_cases(&invocation_id) {
+        for failure in [AuditFailurePoint::Append, AuditFailurePoint::FileSync] {
+            let root = AuditTempRoot::new(case.name);
+            let owner = root.owner();
+            let audit = EffectAudit::open(owner.clone()).unwrap();
+            let grant = grant(
+                &case,
+                &invocation_id,
+                Instant::now() + Duration::from_secs(30),
+            );
+            let (service, service_record) = ordering_service(owner, OrderingExecutionFailure::None);
+            let mut broker = InvocationBroker::new(
+                invocation_id.clone(),
+                vec![grant.clone()],
+                HostCapability::all(),
+                service,
+                Arc::new(Mutex::new(audit)),
+            )
+            .unwrap();
+            broker.fail_next_audit_durability_for_test(failure);
+
+            assert_eq!(
+                broker
+                    .dispatch(request(&case, &grant), PermCancellation::new())
+                    .await,
+                Err(HostEffectError::AuditFailure),
+                "{} {failure:?}",
+                case.name
+            );
+            let service_record = service_record.lock().unwrap();
+            assert_eq!(service_record.execute_calls, 0, "{} {failure:?}", case.name);
+            assert_eq!(service_record.effects, 0, "{} {failure:?}", case.name);
+        }
+
+        let target_grant = grant(
+            &case,
+            &invocation_id,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let (mut target_broker, target_record, _target_root) = broker(
+            invocation_id.clone(),
+            vec![target_grant.clone()],
+            HostCapability::all(),
+            ServiceFailures {
+                target: Some(HostEffectError::TargetDenied),
+                ..ServiceFailures::default()
+            },
+        );
+        assert_eq!(
+            target_broker
+                .dispatch(request(&case, &target_grant), PermCancellation::new())
+                .await,
+            Err(HostEffectError::TargetDenied)
+        );
+        assert_eq!(target_record.lock().unwrap().execute_calls, 0);
+        assert!(target_broker.audit_records_for_test().is_empty());
+
+        let session_grant = grant(
+            &case,
+            &invocation_id,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let (mut session_broker, session_record, _session_root) = broker(
+            invocation_id.clone(),
+            vec![session_grant.clone()],
+            BTreeSet::new(),
+            ServiceFailures::default(),
+        );
+        assert_eq!(
+            session_broker
+                .dispatch(request(&case, &session_grant), PermCancellation::new())
+                .await,
+            Err(HostEffectError::SessionDenied)
+        );
+        assert_eq!(session_record.lock().unwrap().execute_calls, 0);
+        assert!(session_broker.audit_records_for_test().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn js_effect_audit_ordering_records_attempt_outcomes_and_denies_replay() {
+    let invocation_id = invocation("inv-ordering-outcomes");
+    for case in operation_cases(&invocation_id) {
+        for (failure, expected, state, code, expected_effects) in [
+            (
+                OrderingExecutionFailure::BeforeEffect,
+                HostEffectError::BackendFailure,
+                AuditState::Completed,
+                "backend_failure",
+                0,
+            ),
+            (
+                OrderingExecutionFailure::AfterEffect,
+                HostEffectError::OutcomeUnknown,
+                AuditState::OutcomeUnknown,
+                "outcome_unknown",
+                1,
+            ),
+        ] {
+            let root = AuditTempRoot::new(case.name);
+            let owner = root.owner();
+            let audit = EffectAudit::open(owner.clone()).unwrap();
+            let grant = grant(
+                &case,
+                &invocation_id,
+                Instant::now() + Duration::from_secs(30),
+            );
+            let (service, service_record) = ordering_service(owner, failure);
+            let mut broker = InvocationBroker::new(
+                invocation_id.clone(),
+                vec![grant.clone()],
+                HostCapability::all(),
+                service,
+                Arc::new(Mutex::new(audit)),
+            )
+            .unwrap();
+            assert_eq!(
+                broker
+                    .dispatch(request(&case, &grant), PermCancellation::new())
+                    .await,
+                Err(expected),
+                "{} {failure:?}",
+                case.name
+            );
+            assert_eq!(service_record.lock().unwrap().effects, expected_effects);
+            let records = broker.audit_records_for_test();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[1].state, state);
+            assert_eq!(records[1].result_code.as_deref(), Some(code));
+        }
+
+        let root = AuditTempRoot::new(case.name);
+        let owner = root.owner();
+        let audit = EffectAudit::open(owner.clone()).unwrap();
+        let grant = grant(
+            &case,
+            &invocation_id,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let effect = request(&case, &grant);
+        let (service, service_record) = ordering_service(owner, OrderingExecutionFailure::None);
+        let mut broker = InvocationBroker::new(
+            invocation_id.clone(),
+            vec![grant],
+            HostCapability::all(),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        assert!(
+            broker
+                .dispatch(effect.clone(), PermCancellation::new())
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            broker.dispatch(effect, PermCancellation::new()).await,
+            Err(HostEffectError::AuditFailure),
+            "{} duplicate was accepted",
+            case.name
+        );
+        assert_eq!(service_record.lock().unwrap().effects, 1);
+    }
+}
+
+#[tokio::test]
+async fn js_effect_audit_ordering_completion_append_failure_recovers_unknown() {
+    let invocation_id = invocation("inv-ordering-completion-failure");
+    for case in operation_cases(&invocation_id) {
+        let root = AuditTempRoot::new(case.name);
+        let owner = root.owner();
+        let audit = EffectAudit::open(owner.clone()).unwrap();
+        let grant = grant(
+            &case,
+            &invocation_id,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let (service, service_record) =
+            ordering_service(owner.clone(), OrderingExecutionFailure::None);
+        let mut broker = InvocationBroker::new(
+            invocation_id.clone(),
+            vec![grant.clone()],
+            HostCapability::all(),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        broker.fail_next_completion_durability_for_test(AuditFailurePoint::Append);
+
+        assert_eq!(
+            broker
+                .dispatch(request(&case, &grant), PermCancellation::new())
+                .await,
+            Err(HostEffectError::AuditFailure),
+            "{} did not surface completion append failure",
+            case.name
+        );
+        assert_eq!(service_record.lock().unwrap().effects, 1);
+        assert_eq!(broker.audit_records_for_test().len(), 1);
+        assert_eq!(broker.audit_records_for_test()[0].state, AuditState::Intent);
+        drop(broker);
+
+        let recovered = EffectAudit::open(owner).unwrap();
+        assert_eq!(recovered.records().len(), 2);
+        assert_eq!(recovered.records()[1].state, AuditState::OutcomeUnknown);
+        assert_eq!(
+            recovered.records()[1].result_code.as_deref(),
+            Some("outcome_unknown")
+        );
+    }
+}
+
+#[test]
+fn js_effect_audit_storage_private_path_and_exclusive_writer_fail_closed() {
+    let root = AuditTempRoot::new("private-lock");
+    let owner = root.owner();
+    let audit = EffectAudit::open(owner.clone()).unwrap();
+
+    assert!(owner.directory().starts_with(&owner.state_root()));
+    assert!(owner.directory().is_dir());
+    assert!(owner.lock_file().is_file());
+    assert!(matches!(
+        EffectAudit::open(owner.clone()),
+        Err(AuditError::WriterLocked)
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(owner.directory())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(owner.lock_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(owner.target_key_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(owner.initialization_marker())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        for segment in audit_segments(&owner) {
+            assert_eq!(
+                std::fs::metadata(segment).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    drop(audit);
+    EffectAudit::open(owner).unwrap();
+}
+
+#[test]
+fn js_effect_audit_storage_hash_chain_privacy_and_crash_recovery_are_truthful() {
+    let root = AuditTempRoot::new("privacy-recovery");
+    let owner = root.owner();
+    let path_secret = "workspace/credential-super-secret.txt?token=path-secret";
+    let url_secret = "https://user:password@example.test/private?token=query-secret";
+    let argv_secret = "--password=argv-secret";
+    let file_target_tag;
+
+    {
+        let mut audit = EffectAudit::open(owner.clone()).unwrap();
+        let file_target = audit.file_target(path_secret);
+        file_target_tag = file_target.clone();
+        assert_ne!(file_target, audit.file_target("workspace/other.txt"));
+        audit
+            .append_intent(audit_intent("effect-file", file_target))
+            .unwrap();
+        audit
+            .append_completion(EffectCompletion {
+                effect_id: "effect-file".into(),
+                result_code: AuditResultCode::Succeeded,
+            })
+            .unwrap();
+        let write_target = audit.write_file_target(path_secret);
+        let mut write = audit_intent("effect-write", write_target);
+        write.capability = AuditCapability::WriteFile;
+        audit.append_intent(write).unwrap();
+        audit
+            .append_completion(EffectCompletion {
+                effect_id: "effect-write".into(),
+                result_code: AuditResultCode::Succeeded,
+            })
+            .unwrap();
+        let fetch_target = audit.fetch_target(url_secret, "post").unwrap();
+        let mut fetch = audit_intent("effect-fetch", fetch_target);
+        fetch.capability = AuditCapability::Fetch;
+        audit.append_intent(fetch).unwrap();
+        let spawn_target = audit.spawn_target("helper");
+        let mut spawn = audit_intent("effect-spawn", spawn_target);
+        spawn.capability = AuditCapability::Spawn;
+        audit.append_intent(spawn).unwrap();
+        let mut proposal = audit_intent("effect-proposal", audit.proposal_target());
+        proposal.capability = AuditCapability::ProposeSkill;
+        audit.append_intent(proposal).unwrap();
+        audit
+            .append_completion(EffectCompletion {
+                effect_id: "effect-proposal".into(),
+                result_code: AuditResultCode::Succeeded,
+            })
+            .unwrap();
+    }
+
+    let stored = audit_bytes(&owner);
+    for secret in [
+        path_secret,
+        url_secret,
+        "password",
+        "query-secret",
+        argv_secret,
+    ] {
+        assert!(
+            !stored
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "audit persisted secret fixture {secret:?}"
+        );
+    }
+
+    let recovered = EffectAudit::open(owner.clone()).unwrap();
+    assert_eq!(recovered.file_target(path_secret), file_target_tag);
+    for effect_id in ["effect-fetch", "effect-spawn"] {
+        assert!(recovered.records().iter().any(|record| {
+            record.effect_id == effect_id && record.state == AuditState::OutcomeUnknown
+        }));
+    }
+    let unknown_count = recovered
+        .records()
+        .iter()
+        .filter(|record| record.state == AuditState::OutcomeUnknown)
+        .count();
+    drop(recovered);
+    let reopened = EffectAudit::open(owner).unwrap();
+    assert_eq!(
+        reopened
+            .records()
+            .iter()
+            .filter(|record| record.state == AuditState::OutcomeUnknown)
+            .count(),
+        unknown_count,
+        "restart duplicated recovered unknown outcomes"
+    );
+}
+
+#[test]
+fn js_effect_audit_storage_truncated_tail_recovers_but_interior_corruption_fails() {
+    let root = AuditTempRoot::new("truncation");
+    let owner = root.owner();
+    {
+        let mut audit = EffectAudit::open(owner.clone()).unwrap();
+        let target = audit.file_target("safe/path");
+        audit
+            .append_intent(audit_intent("effect-tail", target))
+            .unwrap();
+    }
+    let segment = audit_segments(&owner).pop().unwrap();
+    let valid_length = std::fs::metadata(&segment).unwrap().len();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .unwrap();
+    file.write_all(&128_u32.to_be_bytes()).unwrap();
+    file.write_all(br#"{"partial":true"#).unwrap();
+    drop(file);
+
+    let recovered = EffectAudit::open(owner.clone()).unwrap();
+    assert!(std::fs::metadata(&segment).unwrap().len() >= valid_length);
+    assert!(recovered.records().iter().any(|record| {
+        record.effect_id == "effect-tail" && record.state == AuditState::OutcomeUnknown
+    }));
+    drop(recovered);
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&segment)
+        .unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    file.seek(SeekFrom::Current(-1)).unwrap();
+    byte[0] ^= 1;
+    file.write_all(&byte).unwrap();
+    file.sync_all().unwrap();
+    assert!(matches!(
+        EffectAudit::open(owner),
+        Err(AuditError::CorruptRecord) | Err(AuditError::HashMismatch)
+    ));
+}
+
+#[test]
+fn js_effect_audit_storage_final_prefix_corruption_is_not_truncated_as_a_crash_tail() {
+    let root = AuditTempRoot::new("prefix-corruption");
+    let owner = root.owner();
+    {
+        let mut audit = EffectAudit::open(owner.clone()).unwrap();
+        let target = audit.file_target("safe/path");
+        audit
+            .append_intent(audit_intent("effect-prefix", target))
+            .unwrap();
+    }
+    let segment = audit_segments(&owner).pop().unwrap();
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let mut offset = 0_usize;
+    let mut final_offset = 0_usize;
+    while offset < bytes.len() {
+        final_offset = offset;
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += length + 8;
+    }
+    let length = u32::from_be_bytes(bytes[final_offset..final_offset + 4].try_into().unwrap());
+    bytes[final_offset..final_offset + 4].copy_from_slice(&(length + 1).to_be_bytes());
+    std::fs::write(segment, bytes).unwrap();
+
+    assert!(matches!(
+        EffectAudit::open(owner),
+        Err(AuditError::CorruptRecord)
+    ));
+}
+
+#[test]
+fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fail_closed() {
+    let root = AuditTempRoot::new("rotation");
+    let owner = root.owner();
+    let options = AuditOpenOptions::for_test(1_024);
+    {
+        let mut audit = EffectAudit::open_with_options(owner.clone(), options.clone()).unwrap();
+        for index in 0..12 {
+            let effect_id = format!("effect-{index}");
+            let target = audit.file_target(&format!("safe/path/{index}"));
+            let mut intent = audit_intent(&effect_id, target);
+            intent.sequence = index + 1;
+            audit.append_intent(intent.clone()).unwrap();
+            assert!(matches!(
+                audit.append_intent(intent),
+                Err(AuditError::ReplayedEffect)
+            ));
+            let completion = EffectCompletion {
+                effect_id,
+                result_code: AuditResultCode::Succeeded,
+            };
+            audit.append_completion(completion.clone()).unwrap();
+            assert!(matches!(
+                audit.append_completion(completion),
+                Err(AuditError::ReplayedEffect)
+            ));
+        }
+        assert!(audit.rotation_anchor_count() >= 2);
+    }
+    let segments = audit_segments(&owner);
+    assert!(
+        segments.len() >= 3,
+        "rotation did not create linked segments"
+    );
+
+    let missing_root = AuditTempRoot::new("missing-segment");
+    let missing_owner = missing_root.owner();
+    std::fs::create_dir_all(missing_owner.directory()).unwrap();
+    std::fs::copy(owner.target_key_file(), missing_owner.target_key_file()).unwrap();
+    for segment in &segments {
+        std::fs::copy(
+            segment,
+            missing_owner.directory().join(segment.file_name().unwrap()),
+        )
+        .unwrap();
+    }
+    std::fs::remove_file(
+        missing_owner
+            .directory()
+            .join(segments[1].file_name().unwrap()),
+    )
+    .unwrap();
+    assert!(matches!(
+        EffectAudit::open_with_options(missing_owner, options.clone()),
+        Err(AuditError::MissingSegment)
+    ));
+
+    let hash_root = AuditTempRoot::new("hash-mismatch");
+    let hash_owner = hash_root.owner();
+    std::fs::create_dir_all(hash_owner.directory()).unwrap();
+    std::fs::copy(owner.target_key_file(), hash_owner.target_key_file()).unwrap();
+    for segment in &segments {
+        std::fs::copy(
+            segment,
+            hash_owner.directory().join(segment.file_name().unwrap()),
+        )
+        .unwrap();
+    }
+    let last = audit_segments(&hash_owner).pop().unwrap();
+    let mut bytes = std::fs::read(&last).unwrap();
+    let marker = b"record_hash";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap();
+    let hash_start = bytes[offset..]
+        .windows(2)
+        .position(|window| window == b":\"")
+        .unwrap()
+        + offset
+        + 2;
+    bytes[hash_start] = if bytes[hash_start] == b'a' {
+        b'b'
+    } else {
+        b'a'
+    };
+    std::fs::write(&last, bytes).unwrap();
+    assert!(matches!(
+        EffectAudit::open_with_options(hash_owner, options.clone()),
+        Err(AuditError::HashMismatch)
+    ));
+
+    let key = std::fs::read(owner.target_key_file()).unwrap();
+    let mut corrupted_key = key.clone();
+    corrupted_key[0] ^= 1;
+    std::fs::write(owner.target_key_file(), &corrupted_key).unwrap();
+    assert!(matches!(
+        EffectAudit::open_with_options(owner.clone(), options.clone()),
+        Err(AuditError::KeyUnavailable)
+    ));
+    std::fs::write(owner.target_key_file(), key).unwrap();
+    std::fs::remove_file(owner.target_key_file()).unwrap();
+    assert!(matches!(
+        EffectAudit::open(owner.clone()),
+        Err(AuditError::KeyUnavailable)
+    ));
+
+    let initialized_root = AuditTempRoot::new("initialized-missing-chain");
+    let initialized_owner = initialized_root.owner();
+    {
+        EffectAudit::open(initialized_owner.clone()).unwrap();
+    }
+    for segment in audit_segments(&initialized_owner) {
+        std::fs::remove_file(segment).unwrap();
+    }
+    assert!(matches!(
+        EffectAudit::open(initialized_owner),
+        Err(AuditError::MissingSegment)
+    ));
+}
+
+#[test]
+fn js_effect_audit_storage_retention_limit_poisoning_is_fail_closed() {
+    let root = AuditTempRoot::new("retention-limit");
+    let owner = root.owner();
+    let options = AuditOpenOptions::for_test(2_048).with_max_segments(1);
+    let mut audit = EffectAudit::open_with_options(owner, options).unwrap();
+
+    let first_target = audit.file_target("safe/first");
+    audit
+        .append_intent(audit_intent("effect-first", first_target))
+        .unwrap();
+    audit
+        .append_completion(EffectCompletion {
+            effect_id: "effect-first".into(),
+            result_code: AuditResultCode::Succeeded,
+        })
+        .unwrap();
+
+    let second_target = audit.file_target("safe/second");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-second", second_target)),
+        Err(AuditError::RetentionLimit)
+    ));
+    let later_target = audit.file_target("safe/later");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-later", later_target)),
+        Err(AuditError::Unavailable)
+    ));
+}
+
+#[test]
+fn js_effect_audit_storage_required_path_and_sync_failures_are_typed() {
+    for failure in [
+        AuditFailurePoint::FileSync,
+        AuditFailurePoint::DirectorySync,
+    ] {
+        let root = AuditTempRoot::new("sync-failure");
+        let owner = root.owner();
+        let options = AuditOpenOptions::for_test(4_096).with_failure(failure);
+        assert!(matches!(
+            EffectAudit::open_with_options(owner, options),
+            Err(AuditError::SyncFailed)
+        ));
+    }
+
+    let root = AuditTempRoot::new("bad-path");
+    let owner = root.owner();
+    std::fs::create_dir_all(owner.directory().parent().unwrap()).unwrap();
+    std::fs::write(owner.directory(), b"not a directory").unwrap();
+    assert!(matches!(
+        EffectAudit::open(owner),
+        Err(AuditError::PathUnavailable)
+    ));
+
+    let root = AuditTempRoot::new("poison-after-sync");
+    let owner = root.owner();
+    let mut audit = EffectAudit::open(owner).unwrap();
+    audit.fail_next_durability_for_test(AuditFailurePoint::FileSync);
+    let target = audit.file_target("safe/path");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-sync-failed", target)),
+        Err(AuditError::SyncFailed)
+    ));
+    let target = audit.file_target("safe/other");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-after-failure", target)),
+        Err(AuditError::Unavailable)
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let root = AuditTempRoot::new("linked-component");
+        let owner = root.owner();
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(owner.state_root()).unwrap();
+        symlink(&outside, owner.state_root().join("audit")).unwrap();
+        assert!(matches!(
+            EffectAudit::open(owner),
+            Err(AuditError::PathUnavailable)
+        ));
+        assert!(!outside.join("js-effects").exists());
+    }
+}
