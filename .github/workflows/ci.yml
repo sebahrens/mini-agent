@@ -143,6 +143,17 @@ jobs:
         run: >-
           cargo test --locked sandbox::
 
+      - name: Verify Linux JS worker containment test is present
+        shell: bash
+        run: |
+          cargo test --locked --no-default-features --features js -- --list \
+            | grep -F 'extras::js::tests::worker_containment::linux_js_worker_containment: test'
+
+      - name: Test Linux JS worker containment
+        run: >-
+          cargo test --locked --no-default-features --features js
+          linux_js_worker_containment -- --ignored --nocapture
+
       - name: Test JS spawn parity through the shared sandbox
         run: cargo test --locked --features js,sandbox
 

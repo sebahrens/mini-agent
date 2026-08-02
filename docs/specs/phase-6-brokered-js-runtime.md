@@ -298,6 +298,33 @@ status and every production launch attempt remain unavailable.
 | macOS | A broker-only Seatbelt profile, explicit descriptor closing, sanitized environment, and validated rlimits. `/usr/bin/sandbox-exec` is a deprecated, weaker, best-effort MAC backstop, so real probes must report its exact denials and process-creation behavior and the parent must always kill the whole process group. |
 | Windows | A zero-capability LPAC/AppContainer, compatible process mitigations, creation-time Job Object assignment, child-process denial, validated resource limits, and an exact inherited-handle list. |
 
+The Linux launcher is a dedicated broker-only bubblewrap profile, not the general command
+sandbox. It starts from an empty root, mounts only the exact worker executable and the exact
+root-owned, non-group/other-writable regular system files already mapped into the parent runtime
+(shared objects need not carry an executable mode bit), creates private
+proc/dev/tmp views, clears the environment, closes non-protocol descriptors, and requests user, PID,
+network, IPC, UTS, and (where supported) cgroup namespaces while dropping every capability. After
+the authenticated `Hello` and before `Ready`, the already-exec'd worker applies
+validated address-space, CPU, descriptor, core, and file-size ceilings, disables process
+dumpability, sets `no_new_privs`, and
+installs a seccomp filter denying fork, vfork, clone, clone3, execve, execveat, socket, and
+socketpair, along with namespace and mount mutation. On x86_64 a preceding BPF range guard denies
+every syscall number carrying the x32 ABI bit, so alternate-ABI numbers cannot bypass the exact
+deny set. The post-handshake evaluator therefore cannot create private or external network
+listeners even inside its isolated network namespace. Any trusted-path, namespace, mount, limit,
+`no_new_privs`, or seccomp failure emits no `Ready`; there is no unconfined retry. Availability is
+cached only after an actual namespace/limit/seccomp preflight succeeds.
+
+The ignored `linux_js_worker_containment` probe is the runtime evidence gate. It must run on a real
+Linux host with trusted bubblewrap and must be listed explicitly before execution so a cfg error
+cannot produce a zero-test success. macOS development can verify source ordering, owned teardown,
+and fail-closed construction, but cannot claim this Linux runtime evidence. The real gate requires
+an exact SIGXCPU outcome after an armed soft limit, a non-dumpable sacrificial SIGABRT child that
+reports no core dump and leaves no artifact under `RLIMIT_CORE=0` (including on hosts whose
+`core_pattern` pipes dumps to a handler), a malformed frame and explicit termination only after a
+completed Hello/Ready handshake and valid contained `RunStep`,
+and disappearance of the exact controlled sleeper PID/start-time after process-group teardown.
+
 Containment availability and the real backend are probed before JS is advertised. Linux and
 Windows separately deny process creation/exec. macOS must probe the weaker backend's process
 behavior and report it without upgrading the claim. A backend that is absent, untrusted,

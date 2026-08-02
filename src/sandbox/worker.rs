@@ -13,6 +13,8 @@ use std::process::ExitStatus;
 
 pub(crate) const INTERNAL_WORKER_MARKER: &str = "MINI_AGENT_INTERNAL_JS_WORKER";
 pub(crate) const INTERNAL_WORKER_MARKER_VALUE: &str = "brokered-v1";
+#[cfg(target_os = "linux")]
+pub(crate) const LINUX_PREFLIGHT_MARKER_VALUE: &str = "linux-preflight-v1";
 
 pub(crate) fn is_internal_worker_marker_present() -> bool {
     std::env::var_os(INTERNAL_WORKER_MARKER).is_some()
@@ -22,6 +24,42 @@ pub(crate) fn standard_streams_are_protocol_pipes() -> bool {
     // This rejects terminals, files, null devices, and sockets. It intentionally makes no
     // same-user identity claim: Unix FIFOs and Windows named/anonymous pipes share an OS type.
     platform::standard_streams_are_protocol_pipes()
+}
+
+pub(crate) fn finalize_internal_worker() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return platform::finalize_worker();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_linux_containment_probe() -> io::Result<()> {
+    platform::run_containment_probe()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_linux_containment_child_probe() -> io::Result<()> {
+    platform::run_containment_child_probe()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_linux_cpu_limit_child_probe() -> io::Result<()> {
+    platform::run_cpu_limit_child_probe()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_linux_core_limit_child_probe() -> io::Result<()> {
+    platform::run_core_limit_child_probe()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_linux_core_crash_child_probe() -> io::Result<()> {
+    platform::run_core_crash_child_probe()
 }
 
 #[cfg(target_os = "linux")]
@@ -362,19 +400,19 @@ fn missing_test_pipe(child: &mut std::process::Child, pipe: &'static str) -> Wor
     WorkerLaunchError::MissingPipe { pipe }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 fn child_stdin_file(pipe: std::process::ChildStdin) -> File {
     use std::os::fd::OwnedFd;
     File::from(OwnedFd::from(pipe))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 fn child_stdout_file(pipe: std::process::ChildStdout) -> File {
     use std::os::fd::OwnedFd;
     File::from(OwnedFd::from(pipe))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 fn child_stderr_file(pipe: std::process::ChildStderr) -> File {
     use std::os::fd::OwnedFd;
     File::from(OwnedFd::from(pipe))
@@ -404,6 +442,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn worker_launcher_production_is_fail_closed_until_backend_delivery() {
         let WorkerContainmentStatus::Unavailable {
             backend,

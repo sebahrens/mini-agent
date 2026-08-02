@@ -22,8 +22,8 @@ use super::protocol::{
 };
 use super::types::{MEMORY_LIMIT, STACK_LIMIT, STEP_TIMEOUT};
 use crate::sandbox::worker::{
-    INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, is_internal_worker_marker_present,
-    standard_streams_are_protocol_pipes,
+    INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, finalize_internal_worker,
+    is_internal_worker_marker_present, standard_streams_are_protocol_pipes,
 };
 
 const EXIT_FAILURE: i32 = 1;
@@ -335,6 +335,20 @@ pub(crate) fn maybe_run_internal_worker() -> Option<ExitCode> {
     if !is_internal_worker_marker_present() {
         return None;
     }
+    #[cfg(target_os = "linux")]
+    if std::env::var_os(INTERNAL_WORKER_MARKER).as_deref()
+        == Some(std::ffi::OsStr::new(
+            crate::sandbox::worker::LINUX_PREFLIGHT_MARKER_VALUE,
+        ))
+    {
+        return Some(
+            if standard_streams_are_protocol_pipes() && finalize_internal_worker().is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            },
+        );
+    }
     Some(if run_marked_worker() == 0 {
         ExitCode::SUCCESS
     } else {
@@ -373,6 +387,8 @@ fn bootstrap(input: &mut impl std::io::Read, output: &mut impl Write) -> Result<
         return Err(());
     }
     protocol.on_receive(&hello).map_err(|_| ())?;
+
+    finalize_internal_worker().map_err(|_| ())?;
 
     let ready: WorkerWireFrame =
         WireFrame::connection(build.clone(), 1, WorkerFrame::Ready(WorkerReady {}));
