@@ -183,9 +183,15 @@ proposal service never infers omitted scopes or identity fields.
 Model-authored step code retains bounded file, fetch, and spawn effect globals. The
 `propose_skill` global is intentionally unavailable and is not advertised until A18 supplies its
 full typed identity-v2 protocol; the parent-owned proposal and admission workers remain outside
-the worker authority boundary. Telemetry accepts only authenticated structured worker events, so
-a selected-skill invocation with no such events is explicitly marked evidence-incomplete and
-cannot create positive evidence. Stored learned-skill realms receive no effect or writer
+the worker authority boundary. Telemetry treats every structured worker field as an untrusted
+execution claim. The parent requires an exact match to the selected artifact/export and the
+parent-derived turn, tool-call, deterministic invocation, and step outcome before rebuilding a
+canonical event with its own retrieval metadata, index generation, production flag, timestamp,
+and evidence status. Worker feedback, selection, observability, and capability-policy kinds are
+rejected. Positive evidence exists only after a complete canonical batch is accepted by the
+bounded dispatcher. Invalid, incomplete, saturated, disconnected, or failed dispatch records a
+parent-owned `ObservabilityLost` signal and cannot trigger feedback or quarantine. Stored
+learned-skill realms receive no effect or writer
 globals. Learned-skill ABI v2 instead passes one hidden, immutable invocation capability object as
 the first export argument. It contains only the methods declared by the stored artifact. Each
 method closure embeds a parent-created grant ID and becomes unusable when the export promise

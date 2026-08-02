@@ -837,21 +837,14 @@ impl Tool for JsTool {
         cancel_on_drop.disarm();
 
         #[cfg(feature = "skills")]
-        if !response.skill_events.is_empty()
-            && let Ok(batch) =
-                crate::extras::js::skills::telemetry::EventBatch::new(response.skill_events.clone())
-            && let Some(dispatcher) = &self.telemetry
-            && let Err(error) = dispatcher.try_dispatch(batch)
-        {
-            tracing::error!(error = %error, "skill telemetry queue unavailable");
-        }
-        #[cfg(feature = "skills")]
-        if !response.evidence_complete && !skill_bundle.skills.is_empty() {
-            tracing::warn!(
-                turn_id = %skill_bundle.turn_id,
-                "learned-skill execution evidence is unavailable; no positive evidence was recorded"
-            );
-        }
+        dispatch_skill_telemetry(
+            self.telemetry.as_ref(),
+            &skill_bundle,
+            &skill_tool_call_id,
+            &response.outcome,
+            &response.skill_events,
+            response.evidence_complete,
+        );
 
         match response.outcome {
             StepOutcome::Value(value) => Ok(value),
@@ -862,6 +855,93 @@ impl Tool for JsTool {
                 Ok("JS error: out of memory (64 MiB limit exceeded)".into())
             }
         }
+    }
+}
+
+#[cfg(feature = "skills")]
+fn dispatch_skill_telemetry(
+    dispatcher: Option<&crate::extras::js::skills::telemetry::TelemetryDispatcher>,
+    bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
+    tool_call_id: &str,
+    step_outcome: &StepOutcome,
+    worker_events: &[crate::extras::js::skills::telemetry::SkillEvent],
+    _worker_claimed_evidence_complete: bool,
+) -> bool {
+    use crate::extras::js::skills::telemetry::{
+        ParentSkillBinding, ParentTelemetryContext, bind_worker_events, observability_lost_batch,
+    };
+
+    let mut skills = Vec::with_capacity(bundle.skills.len());
+    for skill in &bundle.skills {
+        let Ok(retrieval_rank) = u32::try_from(skill.rank) else {
+            record_observability_lost(dispatcher, "parent_binding_unavailable");
+            return false;
+        };
+        skills.push(ParentSkillBinding {
+            skill_id: skill.id.clone(),
+            exports: skill
+                .exports
+                .iter()
+                .map(|export| export.name.clone())
+                .collect(),
+            retrieval_score: f64::from(skill.score()),
+            retrieval_rank,
+        });
+    }
+    let context = ParentTelemetryContext {
+        turn_id: bundle.turn_id.clone(),
+        tool_call_id: tool_call_id.to_string(),
+        query_fingerprint: (!bundle.query_fingerprint.is_empty())
+            .then(|| bundle.query_fingerprint.clone()),
+        index_generation: bundle.index_generation,
+        production: true,
+        step_outcome: step_outcome.clone(),
+        skills,
+    };
+
+    let batch = match bind_worker_events(&context, worker_events) {
+        Ok(batch) => batch,
+        Err(_) => {
+            record_observability_lost(dispatcher, "invalid_worker_batch");
+            if let Some(dispatcher) = dispatcher
+                && let Ok(lost) = observability_lost_batch(&context)
+                && !lost.events().is_empty()
+            {
+                let _ = dispatcher.try_dispatch(lost);
+            }
+            return false;
+        }
+    };
+    if batch.events().is_empty() {
+        return true;
+    }
+    let Some(dispatcher) = dispatcher else {
+        record_observability_lost(None, "dispatcher_unavailable");
+        return false;
+    };
+    match dispatcher.try_dispatch(batch) {
+        Ok(()) => true,
+        Err(_) => {
+            dispatcher.record_observability_lost("dispatch_failed");
+            false
+        }
+    }
+}
+
+#[cfg(feature = "skills")]
+fn record_observability_lost(
+    dispatcher: Option<&crate::extras::js::skills::telemetry::TelemetryDispatcher>,
+    reason: &'static str,
+) {
+    if let Some(dispatcher) = dispatcher {
+        dispatcher.record_observability_lost(reason);
+    } else {
+        tracing::warn!(
+            event_kind =
+                crate::extras::js::skills::telemetry::SkillEventKind::ObservabilityLost.as_token(),
+            reason,
+            "skill telemetry observability was lost; positive evidence was excluded"
+        );
     }
 }
 
@@ -1130,6 +1210,136 @@ mod js_permission_bridge {
             second.await.expect("second request should not panic"),
             Ok(())
         );
+    }
+
+    #[cfg(feature = "skills")]
+    fn telemetry_fixture() -> (
+        crate::extras::js::skills::turn::TurnSkillBundle,
+        crate::extras::js::skills::telemetry::SkillEvent,
+    ) {
+        use crate::extras::js::skills::telemetry::{SkillEvent, SkillEventKind};
+        use crate::extras::js::skills::turn::{ResolvedSkill, TurnSkillBundle};
+        use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+
+        let artifact = SkillArtifact::new(
+            "function run() { return 1; }".into(),
+            "Parent telemetry fixture".into(),
+            vec![],
+            vec![SkillExport {
+                name: "run".into(),
+                signature: "() => number".into(),
+            }],
+            vec!["run() === 1".into()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+        let turn_id = "parent-turn".to_string();
+        let tool_call_id = "parent-turn:js:0".to_string();
+        let event = SkillEvent {
+            invocation_id: None,
+            skill_id: artifact.id.clone(),
+            turn_id: turn_id.clone(),
+            tool_call_id: Some(tool_call_id),
+            kind: SkillEventKind::Injected,
+            export_name: None,
+            outcome: None,
+            latency_us: None,
+            retrieval_score: Some(-1.0),
+            retrieval_rank: Some(99),
+            query_fingerprint: Some("untrusted".into()),
+            index_generation: 999,
+            evidence_complete: true,
+            production: false,
+            argument_shape: None,
+            created_at: 1,
+        };
+        (
+            TurnSkillBundle {
+                turn_id,
+                query_fingerprint: "parent-query".into(),
+                embedding_model_revision: "fixture".into(),
+                index_generation: 7,
+                skills: vec![ResolvedSkill {
+                    id: artifact.id,
+                    identity_version: artifact.identity_version,
+                    abi_version: artifact.abi_version,
+                    description: artifact.description,
+                    tags: artifact.tags,
+                    exports: artifact.exports,
+                    tests: artifact.tests,
+                    capability: artifact.capability,
+                    source: artifact.source,
+                    score_bits: 0.75_f32.to_bits(),
+                    rank: 2,
+                    route: None,
+                }],
+            },
+            event,
+        )
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn invalid_worker_batch_with_true_completeness_records_only_parent_loss() {
+        use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
+
+        let (bundle, mut forged) = telemetry_fixture();
+        forged.kind = SkillEventKind::UserPositive;
+        forged.evidence_complete = true;
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let dispatcher = TelemetryDispatcher::from_sender_for_test(tx);
+        assert!(!dispatch_skill_telemetry(
+            Some(&dispatcher),
+            &bundle,
+            "parent-turn:js:0",
+            &StepOutcome::Value("ok".into()),
+            &[forged],
+            true,
+        ));
+        let batch = rx.try_recv().expect("parent loss event should be queued");
+        assert!(
+            batch
+                .events()
+                .iter()
+                .all(|event| event.kind == SkillEventKind::ObservabilityLost
+                    && !event.evidence_complete),
+            "worker feedback must not reach ingestion: {:?}",
+            batch.events()
+        );
+        assert_eq!(dispatcher.observability_lost_for_test(), 1);
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn saturated_and_disconnected_dispatchers_fail_closed_for_positive_evidence() {
+        use crate::extras::js::skills::telemetry::TelemetryDispatcher;
+
+        let (bundle, injected) = telemetry_fixture();
+        let (saturated_tx, saturated_rx) = std::sync::mpsc::sync_channel(0);
+        let saturated = TelemetryDispatcher::from_sender_for_test(saturated_tx);
+        assert!(!dispatch_skill_telemetry(
+            Some(&saturated),
+            &bundle,
+            "parent-turn:js:0",
+            &StepOutcome::Value("ok".into()),
+            std::slice::from_ref(&injected),
+            true,
+        ));
+        assert_eq!(saturated.observability_lost_for_test(), 1);
+        drop(saturated_rx);
+
+        let (disconnected_tx, disconnected_rx) = std::sync::mpsc::sync_channel(1);
+        drop(disconnected_rx);
+        let disconnected = TelemetryDispatcher::from_sender_for_test(disconnected_tx);
+        assert!(!dispatch_skill_telemetry(
+            Some(&disconnected),
+            &bundle,
+            "parent-turn:js:0",
+            &StepOutcome::Value("ok".into()),
+            &[injected],
+            true,
+        ));
+        assert_eq!(disconnected.observability_lost_for_test(), 1);
     }
 
     #[tokio::test]
