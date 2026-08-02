@@ -18,6 +18,14 @@ fn path_changed_error(path: &Path) -> std::io::Error {
     )
 }
 
+fn normalize_approved_path_error(path: &Path, error: std::io::Error) -> std::io::Error {
+    if crate::fs::is_symlink_loop_error(&error) {
+        path_changed_error(path)
+    } else {
+        error
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod bound_platform {
@@ -461,9 +469,11 @@ impl BoundDirectory {
         if !approved_metadata.is_dir() || !bound_platform::is_safe_entry(approved_metadata) {
             return Err(path_changed_error(approved_root));
         }
-        let root = bound_platform::open_root(approved_root)?;
+        let root = bound_platform::open_root(approved_root)
+            .map_err(|error| normalize_approved_path_error(approved_root, error))?;
         let opened_metadata = crate::fs::checked_file_metadata(&root)?;
-        let current_metadata = crate::fs::checked_path_metadata(approved_root)?;
+        let current_metadata = crate::fs::checked_path_metadata(approved_root)
+            .map_err(|error| normalize_approved_path_error(approved_root, error))?;
         if current_metadata.file_type().is_symlink()
             || !bound_platform::is_safe_entry(&opened_metadata)
         {
@@ -1149,6 +1159,27 @@ mod tests {
 
         assert_eq!(names.len(), 2);
         assert!(!names.iter().any(|name| name == secret));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_directory_symlink_replacement_reports_path_changed() {
+        let container = TempDir::new("bound_root_symlink_replacement");
+        let authorized = container.path().join("authorized");
+        let moved = container.path().join("moved");
+        let replacement = container.path().join("replacement");
+        std::fs::create_dir_all(&authorized).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        let approved_metadata = crate::fs::checked_path_metadata(&authorized).unwrap();
+
+        std::fs::rename(&authorized, &moved).unwrap();
+        std::os::unix::fs::symlink(&replacement, &authorized).unwrap();
+
+        let error = match BoundDirectory::open(&authorized, &approved_metadata) {
+            Ok(_) => panic!("bound traversal accepted a symlink replacement"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Path changed"));
     }
 
     #[tokio::test]
