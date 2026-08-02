@@ -15,6 +15,7 @@ use super::{
     CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, IdentityError, SkillArtifact,
     SkillExport,
 };
+use crate::extras::js::protocol::{ProposalStatus, SkillProposalDraft, SkillProposalScope};
 use crate::extras::js::types::{EffectServiceError, PermCancellation};
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 32 * 1024;
@@ -274,6 +275,48 @@ impl JsProposal {
             capability,
         )
         .map_err(ProposalError::Identity)
+    }
+}
+
+impl From<SkillProposalDraft> for JsProposal {
+    fn from(draft: SkillProposalDraft) -> Self {
+        Self {
+            source: draft.source,
+            description: draft.description,
+            exports: draft
+                .exports
+                .into_iter()
+                .map(|export| JsExport {
+                    name: export.name,
+                    signature: export.signature,
+                })
+                .collect(),
+            tests: draft.tests,
+            capability: JsCapability {
+                tier: draft.capability.tier,
+                grants: draft
+                    .capability
+                    .grants
+                    .into_iter()
+                    .map(|scope| match scope {
+                        SkillProposalScope::ReadFile { workspace_prefixes } => {
+                            JsCapabilityScope::ReadFile { workspace_prefixes }
+                        }
+                        SkillProposalScope::WriteFile { workspace_prefixes } => {
+                            JsCapabilityScope::WriteFile { workspace_prefixes }
+                        }
+                        SkillProposalScope::Fetch { origins, methods } => {
+                            JsCapabilityScope::Fetch { origins, methods }
+                        }
+                        SkillProposalScope::Spawn { programs } => {
+                            JsCapabilityScope::Spawn { programs }
+                        }
+                    })
+                    .collect(),
+            },
+            tags: draft.tags,
+            predecessor_id: draft.predecessor_id,
+        }
     }
 }
 
@@ -587,7 +630,7 @@ pub(crate) struct ProposalEffectService {
 pub(crate) struct ProposalEffectResult {
     pub(crate) skill_id: String,
     pub(crate) proposal_id: String,
-    pub(crate) status: &'static str,
+    pub(crate) status: ProposalStatus,
     pub(crate) report_id: Option<String>,
 }
 
@@ -639,6 +682,25 @@ impl ProposalEffectService {
         }
     }
 
+    pub(crate) async fn execute_prepared_cancellable(
+        &self,
+        prepared: PreparedProposalEffect,
+        cancellation: PermCancellation,
+    ) -> Result<ProposalEffectResult, EffectServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(EffectServiceError::Cancelled);
+        }
+        let service = self.clone();
+        let execution = tokio::task::spawn_blocking(move || service.execute_prepared(prepared));
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(EffectServiceError::OutcomeUnknown),
+            result = execution => result
+                .map_err(|_| EffectServiceError::BackendFailure)?
+                .map_err(proposal_service_error),
+        }
+    }
+
     pub(crate) fn reserve_attempt(&self) -> Result<(), ProposalError> {
         self.host.budget.consume()
     }
@@ -672,11 +734,11 @@ impl ProposalEffectService {
             .sender
             .enqueue(prepared.artifact, prepared.predecessor_id)?;
         let status = match result.status {
-            super::store::EnqueueStatus::Pending => "pending",
-            super::store::EnqueueStatus::Verified => "verified",
-            super::store::EnqueueStatus::Rejected => "rejected",
-            super::store::EnqueueStatus::AwaitingApproval => "awaiting_approval",
-            super::store::EnqueueStatus::Approved => "approved",
+            super::store::EnqueueStatus::Pending => ProposalStatus::Pending,
+            super::store::EnqueueStatus::Verified => ProposalStatus::Verified,
+            super::store::EnqueueStatus::Rejected => ProposalStatus::Rejected,
+            super::store::EnqueueStatus::AwaitingApproval => ProposalStatus::AwaitingApproval,
+            super::store::EnqueueStatus::Approved => ProposalStatus::Approved,
         };
         Ok(ProposalEffectResult {
             skill_id: result.skill_id,
@@ -687,7 +749,7 @@ impl ProposalEffectService {
     }
 }
 
-fn proposal_service_error(error: ProposalError) -> EffectServiceError {
+pub(crate) fn proposal_service_error(error: ProposalError) -> EffectServiceError {
     match error {
         ProposalError::InvalidField { .. }
         | ProposalError::UnknownField { .. }
@@ -735,6 +797,16 @@ pub(crate) struct ProposalReceiver {
 
 #[cfg(test)]
 impl ProposalReceiver {
+    pub(crate) fn is_empty(&self) -> bool {
+        match self.receiver.try_recv() {
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => true,
+            Ok(command) => {
+                let _ = command.reply.send(Err(ProposalError::QueueClosed));
+                false
+            }
+        }
+    }
+
     pub(crate) fn respond_next(
         &self,
         delay: Duration,

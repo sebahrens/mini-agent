@@ -167,9 +167,11 @@ File services preserve stable path identity across authorization and I/O; fetch 
 origin and public-address checks plus an outer deadline; spawn passes structured argv to the
 general command sandbox. Spawn permission identity is versioned canonical JSON containing the
 program and argument array, so argument boundaries are never collapsed into a shell-like string.
-The provisional broker `SkillProposalDraft` omits identity-v2 capability and signature fields, so
-that broker operation fails closed until the full typed proposal protocol lands; the direct parent
-proposal service never infers omitted scopes or identity fields.
+The broker `SkillProposalDraft` carries the complete bounded identity-v2 proposal shape: source,
+description, export names and signatures, tests, structured capability tier/scopes, tags, and an
+optional predecessor identity. The parent converts that closed wire value into the existing
+proposal validator, canonicalizes the complete artifact, writes the durable proposal audit intent,
+and only then enqueues it. It never infers omitted scopes, signatures, tags, or identity fields.
 
 Model-authored step code retains bounded effect globals and a bounded `propose_skill` writer host.
 Durable proposal enqueue is parent-owned. Stored learned-skill realms receive no effect or writer
@@ -178,6 +180,10 @@ the first export argument. It contains only the methods declared by the stored a
 method closure embeds a parent-created grant ID and becomes unusable when the export promise
 settles, the invocation is cancelled, or its runtime ends. A skill cannot inspect or manufacture a
 grant ID, and retaining an object or method cannot transfer useful authority to a later invocation.
+Only a parent-issued `ModelAuthored` grant may authorize `ProposeSkill`; the broker rejects every
+stored-skill principal before target validation, audit, or enqueue. Direct, indirect, constructor,
+prototype, initialization, export-body, and promise-continuation lookups in a stored realm therefore
+have no writer binding and cannot create proposal traffic.
 
 `src/extras/js/skills/capability.rs` owns the worker-local binding from an explicit invocation ID
 and exact manifest to one opaque grant per declared method. `src/extras/js/realm.rs` constructs a

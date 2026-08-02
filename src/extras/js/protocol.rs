@@ -326,8 +326,43 @@ pub(crate) struct HttpHeader {
 pub(crate) struct SkillProposalDraft {
     pub(crate) source: String,
     pub(crate) description: String,
-    pub(crate) exports: Vec<String>,
+    pub(crate) exports: Vec<SkillProposalExport>,
     pub(crate) tests: Vec<String>,
+    pub(crate) capability: SkillProposalCapability,
+    pub(crate) tags: Vec<String>,
+    pub(crate) predecessor_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillProposalExport {
+    pub(crate) name: String,
+    pub(crate) signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillProposalCapability {
+    pub(crate) tier: String,
+    pub(crate) grants: Vec<SkillProposalScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum SkillProposalScope {
+    ReadFile {
+        workspace_prefixes: Vec<String>,
+    },
+    WriteFile {
+        workspace_prefixes: Vec<String>,
+    },
+    Fetch {
+        origins: Vec<String>,
+        methods: Vec<String>,
+    },
+    Spawn {
+        programs: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -363,8 +398,35 @@ pub(crate) enum EffectResult {
         stdout_truncated: bool,
         stderr_truncated: bool,
     },
-    ProposalAccepted,
+    ProposalAccepted {
+        skill_id: String,
+        proposal_id: String,
+        status: ProposalStatus,
+        report_id: Option<String>,
+    },
     Error(EffectError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProposalStatus {
+    Pending,
+    Verified,
+    Rejected,
+    AwaitingApproval,
+    Approved,
+}
+
+impl ProposalStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Verified => "verified",
+            Self::Rejected => "rejected",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Approved => "approved",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

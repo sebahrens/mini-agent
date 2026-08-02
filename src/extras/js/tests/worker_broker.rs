@@ -203,8 +203,17 @@ fn operation_cases(invocation_id: &InvocationId) -> Vec<OperationCase> {
                 draft: SkillProposalDraft {
                     source: "function run() { return true; }".into(),
                     description: "test proposal".into(),
-                    exports: vec!["run".into()],
+                    exports: vec![crate::extras::js::protocol::SkillProposalExport {
+                        name: "run".into(),
+                        signature: "run(): boolean".into(),
+                    }],
                     tests: vec!["run() === true".into()],
+                    capability: crate::extras::js::protocol::SkillProposalCapability {
+                        tier: "pure".into(),
+                        grants: Vec::new(),
+                    },
+                    tags: Vec::new(),
+                    predecessor_id: None,
                 },
             },
             capability: HostCapability::ProposeSkill,
@@ -239,7 +248,12 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
             stdout_truncated: false,
             stderr_truncated: false,
         },
-        EffectOperation::ProposeSkill { .. } => EffectResult::ProposalAccepted,
+        EffectOperation::ProposeSkill { .. } => EffectResult::ProposalAccepted {
+            skill_id: "a".repeat(64),
+            proposal_id: "proposal-test".into(),
+            status: crate::extras::js::protocol::ProposalStatus::Pending,
+            report_id: None,
+        },
     }
 }
 

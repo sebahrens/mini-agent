@@ -29,7 +29,8 @@ use crate::extras::js::broker::{
 use crate::extras::js::protocol::{EffectOperation, EffectResult};
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::proposal::{
-    JsProposal, ProposalEffectService, ProposalError, ProposalHost,
+    JsProposal, PreparedProposalEffect, ProposalEffectService, ProposalError, ProposalHost,
+    proposal_service_error,
 };
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::PermCancellation;
@@ -2560,6 +2561,8 @@ enum PreparedParentEffect {
     Spawn(PreparedSpawnEffect),
     #[cfg(feature = "sandbox")]
     Fetch(PreparedFetchEffect),
+    #[cfg(feature = "skills")]
+    Proposal(PreparedProposalEffect),
 }
 
 /// Concrete implementation of the A11 parent effect seam. Authorization
@@ -2569,6 +2572,10 @@ pub(crate) struct ParentHostEffectService {
     spawn: SpawnEffectService,
     #[cfg(feature = "sandbox")]
     fetch: Option<FetchEffectService>,
+    #[cfg(feature = "skills")]
+    proposal: Option<ProposalEffectService>,
+    #[cfg(feature = "skills")]
+    prepared_proposal: Option<PreparedProposalEffect>,
     prepared: Option<PreparedParentEffect>,
 }
 
@@ -2579,6 +2586,10 @@ impl ParentHostEffectService {
             spawn,
             #[cfg(feature = "sandbox")]
             fetch: None,
+            #[cfg(feature = "skills")]
+            proposal: None,
+            #[cfg(feature = "skills")]
+            prepared_proposal: None,
             prepared: None,
         }
     }
@@ -2586,6 +2597,12 @@ impl ParentHostEffectService {
     #[cfg(feature = "sandbox")]
     pub(crate) fn with_fetch(mut self, fetch: FetchEffectService) -> Self {
         self.fetch = Some(fetch);
+        self
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_proposal(mut self, proposal: ProposalEffectService) -> Self {
+        self.proposal = Some(proposal);
         self
     }
 }
@@ -2597,6 +2614,10 @@ impl ParentEffectService for ParentHostEffectService {
         operation: &EffectOperation,
     ) -> Result<(), HostEffectError> {
         self.prepared = None;
+        #[cfg(feature = "skills")]
+        {
+            self.prepared_proposal = None;
+        }
         match operation {
             EffectOperation::ReadFile { path } if path.is_empty() || path.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
@@ -2617,14 +2638,24 @@ impl ParentEffectService for ParentHostEffectService {
             EffectOperation::Fetch { url, .. } if url.is_empty() || url.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
             }
-            EffectOperation::ProposeSkill { draft }
-                if draft.source.is_empty()
-                    || draft.description.is_empty()
-                    || draft.exports.is_empty()
-                    || draft.tests.is_empty() =>
-            {
-                Err(HostEffectError::InvalidTarget)
+            #[cfg(feature = "skills")]
+            EffectOperation::ProposeSkill { draft } => {
+                let proposal = self
+                    .proposal
+                    .as_ref()
+                    .ok_or(HostEffectError::BackendFailure)?;
+                proposal
+                    .reserve_attempt()
+                    .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
+                self.prepared_proposal = Some(
+                    proposal
+                        .authorize_reserved(JsProposal::from(draft.clone()))
+                        .map_err(|error| HostEffectError::from(proposal_service_error(error)))?,
+                );
+                Ok(())
             }
+            #[cfg(not(feature = "skills"))]
+            EffectOperation::ProposeSkill { .. } => Err(HostEffectError::BackendFailure),
             _ => Ok(()),
         }
     }
@@ -2646,9 +2677,11 @@ impl ParentEffectService for ParentHostEffectService {
             {
                 Err(HostEffectError::BackendFailure)
             }
-            // A12's direct proposal service accepts the complete v2 proposal.
-            // The provisional worker draft omits identity-bearing fields, so
-            // the broker must fail closed instead of inventing them.
+            #[cfg(feature = "skills")]
+            EffectOperation::ProposeSkill { .. } if self.proposal.is_none() => {
+                Err(HostEffectError::BackendFailure)
+            }
+            #[cfg(not(feature = "skills"))]
             EffectOperation::ProposeSkill { .. } => Err(HostEffectError::BackendFailure),
             _ => Ok(()),
         }
@@ -2755,6 +2788,18 @@ impl ParentEffectService for ParentHostEffectService {
                 }
                 #[cfg(not(feature = "sandbox"))]
                 EffectOperation::Fetch { .. } => return Err(HostEffectError::BackendFailure),
+                #[cfg(feature = "skills")]
+                EffectOperation::ProposeSkill { .. } => {
+                    let prepared = self
+                        .prepared_proposal
+                        .take()
+                        .ok_or(HostEffectError::BackendFailure)?;
+                    (
+                        PreparedParentEffect::Proposal(prepared),
+                        AuthorizedTarget::ProposeSkill,
+                    )
+                }
+                #[cfg(not(feature = "skills"))]
                 EffectOperation::ProposeSkill { .. } => {
                     return Err(HostEffectError::BackendFailure);
                 }
@@ -2821,6 +2866,23 @@ impl ParentEffectService for ParentHostEffectService {
                         headers: Vec::new(),
                         body: result.text,
                         truncated: false,
+                    })
+                }
+                #[cfg(feature = "skills")]
+                PreparedParentEffect::Proposal(prepared) => {
+                    let proposal = self
+                        .proposal
+                        .as_ref()
+                        .ok_or(HostEffectError::BackendFailure)?;
+                    let result = proposal
+                        .execute_prepared_cancellable(prepared, cancellation)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    Ok(EffectResult::ProposalAccepted {
+                        skill_id: result.skill_id,
+                        proposal_id: result.proposal_id,
+                        status: result.status,
+                        report_id: result.report_id,
                     })
                 }
             }
