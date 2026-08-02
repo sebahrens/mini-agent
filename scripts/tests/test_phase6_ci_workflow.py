@@ -144,6 +144,9 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("exit 12", standard_user_step)
         self.assertIn("exit 13", standard_user_step)
         self.assertIn("-UseNewEnvironment", standard_user_step)
+        self.assertIn("$installedBinary --print-config", standard_user_step)
+        self.assertIn("$requiredStatus", standard_user_step)
+        self.assertIn("public_cached_status = 'available-enforced'", standard_user_step)
         self.assertIn("-WorkingDirectory $standardRoot", standard_user_step)
         self.assertIn("[Parameter(Mandatory)][string] $UserHome", standard_user_step)
         self.assertIn("[Parameter(Mandatory)][string] $UserTemp", standard_user_step)
@@ -154,6 +157,43 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             )
         for forbidden in ("ACTIONS_", "GITHUB_", "RUNNER_", "MINI_AGENT_"):
             self.assertIn(forbidden, standard_user_step)
+
+    def test_phase6_jobs_clear_setup_rust_warning_injection(self) -> None:
+        for job in (
+            "linux-sandbox-policy",
+            "macos-worker-containment-gate",
+            "windows-worker-launcher-unit",
+            "windows-worker-containment-gate",
+            "phase6-cross-platform-gate",
+        ):
+            with self.subTest(job=job):
+                body = job_body(self.workflow, job)
+                install = body.split("name: Install Rust", 1)[1].split("- name:", 1)[0]
+                self.assertIn("rustflags: ''", install)
+
+        self.assertNotIn("rustflags: ''", job_body(self.workflow, "clippy"))
+
+    def test_windows_installed_status_requires_the_runtime_preflight_claims(self) -> None:
+        body = job_body(self.workflow, "windows-worker-containment-gate")
+        status_step = body.split(
+            "name: Verify installed binary reports validated Windows containment",
+            1,
+        )[1].split("name: Archive Windows containment evidence", 1)[0]
+        self.assertIn("--print-config", status_step)
+        for claim in (
+            "windows-lpac",
+            "available",
+            "enforced",
+            "enabled with validated containment",
+            "1 worker process",
+            "256 MiB",
+            "35 seconds",
+            "disabled on Windows",
+        ):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, status_step)
+        self.assertIn("$evidence -notmatch", status_step)
+        self.assertNotIn("continue-on-error", status_step)
 
     def test_each_platform_runs_and_uploads_the_a32_resource_hook(self) -> None:
         for job in (

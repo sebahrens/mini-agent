@@ -5,6 +5,7 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 use std::process::Child;
@@ -23,6 +24,9 @@ use super::{
 };
 
 const BACKEND: WorkerBackend = WorkerBackend::WindowsLpac;
+const PREFLIGHT_FAILURE_REASON: &str = "Windows LPAC production runtime preflight failed";
+
+static STATUS: OnceLock<WorkerContainmentStatus> = OnceLock::new();
 
 #[derive(Debug)]
 struct WinHandle {
@@ -136,10 +140,20 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
 }
 
 pub(super) fn containment_status() -> WorkerContainmentStatus {
-    WorkerContainmentStatus::Unavailable {
-        backend: BACKEND,
-        assurance: WorkerContainmentAssurance::Enforced,
-        reason: "Windows LPAC runtime containment probe has not passed".to_string(),
+    STATUS.get_or_init(probe_containment).clone()
+}
+
+fn probe_containment() -> WorkerContainmentStatus {
+    match feasibility::production_runtime_preflight() {
+        Ok(()) => WorkerContainmentStatus::Available {
+            backend: BACKEND,
+            assurance: WorkerContainmentAssurance::Enforced,
+        },
+        Err(_) => WorkerContainmentStatus::Unavailable {
+            backend: BACKEND,
+            assurance: WorkerContainmentAssurance::Enforced,
+            reason: PREFLIGHT_FAILURE_REASON.to_string(),
+        },
     }
 }
 
@@ -148,13 +162,35 @@ pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
         WorkerContainmentStatus::Unavailable {
             backend, reason, ..
         } => Err(WorkerLaunchError::Unavailable { backend, reason }),
-        WorkerContainmentStatus::Available { .. } => {
-            feasibility::launch_production(feasibility::ProductionLaunchHooks::production())
-                .map_err(|error| WorkerLaunchError::Io {
-                    backend: BACKEND,
-                    source: io::Error::other(error.0),
-                })
-        }
+        WorkerContainmentStatus::Available {
+            backend: BACKEND,
+            assurance: WorkerContainmentAssurance::Enforced,
+        } => feasibility::launch_production(feasibility::ProductionLaunchHooks::production())
+            .map_err(|error| WorkerLaunchError::Io {
+                backend: BACKEND,
+                source: io::Error::other(error.0),
+            }),
+        WorkerContainmentStatus::Available { backend, .. } => Err(WorkerLaunchError::Unavailable {
+            backend,
+            reason: "Windows worker containment preflight selected the wrong backend".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn containment_status_for_benchmark(
+    executable: &std::path::Path,
+) -> WorkerContainmentStatus {
+    match feasibility::installed_worker_runtime_preflight(executable) {
+        Ok(()) => WorkerContainmentStatus::Available {
+            backend: BACKEND,
+            assurance: WorkerContainmentAssurance::Enforced,
+        },
+        Err(_) => WorkerContainmentStatus::Unavailable {
+            backend: BACKEND,
+            assurance: WorkerContainmentAssurance::Enforced,
+            reason: PREFLIGHT_FAILURE_REASON.to_string(),
+        },
     }
 }
 
@@ -162,18 +198,13 @@ pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
 pub(super) fn launch_executable_for_benchmark(
     executable: &std::path::Path,
 ) -> Result<WorkerProcess, WorkerLaunchError> {
-    match containment_status() {
-        WorkerContainmentStatus::Unavailable {
-            backend, reason, ..
-        } => Err(WorkerLaunchError::Unavailable { backend, reason }),
-        WorkerContainmentStatus::Available { .. } => feasibility::launch_production(
-            feasibility::ProductionLaunchHooks::installed_worker(executable.to_path_buf()),
-        )
-        .map_err(|error| WorkerLaunchError::Io {
-            backend: BACKEND,
-            source: io::Error::other(error.0),
-        }),
-    }
+    feasibility::launch_production(feasibility::ProductionLaunchHooks::installed_worker(
+        executable.to_path_buf(),
+    ))
+    .map_err(|error| WorkerLaunchError::Io {
+        backend: BACKEND,
+        source: io::Error::other(error.0),
+    })
 }
 
 #[derive(Debug)]
@@ -238,17 +269,19 @@ impl WorkerChild {
         }
     }
 
-    #[cfg(test)]
     fn runtime_controls_match(&self) -> Result<(), feasibility::GateError> {
-        let WorkerChildInner::Contained { process, job, .. } = &self.inner else {
-            return Err(feasibility::GateError(
+        match &self.inner {
+            WorkerChildInner::Contained { process, job, .. } => {
+                let job = job.as_ref().ok_or_else(|| {
+                    feasibility::GateError("Windows containment Job was already closed".to_string())
+                })?;
+                feasibility::verify_runtime_controls(process, job)
+            }
+            #[cfg(test)]
+            WorkerChildInner::Unconfined(_) => Err(feasibility::GateError(
                 "Windows containment probe received an uncontained child".to_string(),
-            ));
-        };
-        let job = job.as_ref().ok_or_else(|| {
-            feasibility::GateError("Windows containment Job was already closed".to_string())
-        })?;
-        feasibility::verify_runtime_controls(process, job)
+            )),
+        }
     }
 
     #[cfg(test)]
@@ -374,7 +407,7 @@ mod feasibility {
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus};
     use std::ptr::{null, null_mut};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
         ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, GENERIC_ALL,
@@ -423,12 +456,12 @@ mod feasibility {
     use windows_sys::Win32::System::Memory::{
         GetProcessHeap, HEAP_ZERO_MEMORY, HeapAlloc, HeapFree,
     };
-    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
     use windows_sys::Win32::System::SystemServices::JOB_OBJECT_UILIMIT_ALL;
     use windows_sys::Win32::System::SystemServices::{
-        PROCESS_MITIGATION_ASLR_POLICY, PROCESS_MITIGATION_DYNAMIC_CODE_POLICY,
-        PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY, PROCESS_MITIGATION_IMAGE_LOAD_POLICY,
-        PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY,
+        PROCESS_MITIGATION_ASLR_POLICY, PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
+        PROCESS_MITIGATION_DYNAMIC_CODE_POLICY, PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY,
+        PROCESS_MITIGATION_IMAGE_LOAD_POLICY, PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY,
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
@@ -439,9 +472,9 @@ mod feasibility {
         PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
         PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ProcessASLRPolicy,
-        ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy, ProcessImageLoadPolicy,
-        ProcessSystemCallDisablePolicy, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-        UpdateProcThreadAttribute, WaitForSingleObject,
+        ProcessChildProcessPolicy, ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy,
+        ProcessImageLoadPolicy, ProcessSystemCallDisablePolicy, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
     };
     use windows_sys::Win32::System::WindowsProgramming::{
         DRIVE_FIXED, PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
@@ -481,6 +514,8 @@ mod feasibility {
     const PROBE_TCP_PORT_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_TCP_PORT";
     const PROBE_UDP_PORT_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_UDP_PORT";
     const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
+    const PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+    const PRODUCTION_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
@@ -1612,6 +1647,7 @@ mod feasibility {
 
     pub(super) struct ProductionLaunchHooks {
         fail_at: Option<ProductionFailurePoint>,
+        deadline: Option<Instant>,
         child: ProductionChild,
         #[cfg(test)]
         containment: Option<ContainmentProbeConfiguration>,
@@ -1745,6 +1781,7 @@ mod feasibility {
         pub(super) const fn production() -> Self {
             Self {
                 fail_at: None,
+                deadline: None,
                 child: ProductionChild::Worker,
                 #[cfg(test)]
                 containment: None,
@@ -1757,6 +1794,7 @@ mod feasibility {
         pub(super) const fn fail_at(point: ProductionFailurePoint) -> Self {
             Self {
                 fail_at: Some(point),
+                deadline: None,
                 child: ProductionChild::FailureTest,
                 containment: None,
                 executable_override: None,
@@ -1770,6 +1808,7 @@ mod feasibility {
         ) -> Self {
             Self {
                 fail_at: None,
+                deadline: None,
                 child: ProductionChild::ContainmentTest,
                 containment: Some(configuration),
                 executable_override: Some(executable),
@@ -1780,6 +1819,7 @@ mod feasibility {
         pub(super) fn protocol_test(executable: PathBuf) -> Self {
             Self {
                 fail_at: None,
+                deadline: None,
                 child: ProductionChild::ProtocolTest,
                 containment: None,
                 executable_override: Some(executable),
@@ -1790,6 +1830,7 @@ mod feasibility {
         pub(super) fn installed_worker(executable: PathBuf) -> Self {
             Self {
                 fail_at: None,
+                deadline: None,
                 child: ProductionChild::Worker,
                 containment: None,
                 executable_override: Some(executable),
@@ -1803,6 +1844,24 @@ mod feasibility {
                 )));
             }
             Ok(())
+        }
+
+        fn with_deadline(mut self, deadline: Instant) -> Self {
+            self.deadline = Some(deadline);
+            self
+        }
+
+        fn require_before_deadline(&self) -> Result<(), GateError> {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                Err(GateError(
+                    "Windows production launch exceeded its caller deadline".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -2449,70 +2508,13 @@ mod feasibility {
             .map_err(|error| GateError(format!("resolve current executable: {error}")))
     }
 
-    pub(super) fn production_preflight() -> Result<(), GateError> {
-        let hooks = ProductionLaunchHooks::production();
-        hooks.checkpoint(ProductionFailurePoint::CreateProfile)?;
-        let profile = AppContainerProfile::production_zero_capability()?;
-        hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
-        let executable = production_executable(&hooks)?;
-        let policy = SidPolicy::current()?;
-        let (_executable, _location, image_lock) =
-            prepare_executable_acl(&executable, profile.sid, &policy)?;
-        let inheritance_guard = crate::process_creation::creation_guard()?;
-        let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
-        let job = production_job(&hooks)?;
+    pub(super) fn production_runtime_preflight() -> Result<(), GateError> {
+        run_runtime_preflight(RuntimePreflightTarget::CurrentExecutable)
+    }
 
-        let security_capabilities = SECURITY_CAPABILITIES {
-            AppContainerSid: profile.sid,
-            Capabilities: null_mut(),
-            CapabilityCount: 0,
-            Reserved: 0,
-        };
-        let inherited_handles = pipes.child_handles();
-        let job_handles = [job.raw()];
-        let all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-        let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
-        let mitigation_policy = MITIGATION_POLICY;
-        hooks.checkpoint(ProductionFailurePoint::AllocateAttributeList)?;
-        let mut attributes = AttributeList::new(6)?;
-        hooks.checkpoint(ProductionFailurePoint::SecurityCapabilitiesAttribute)?;
-        attributes.update(
-            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-            &security_capabilities,
-        )?;
-        hooks.checkpoint(ProductionFailurePoint::LpacOptOutAttribute)?;
-        attributes.update(
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-            &all_packages_policy,
-        )?;
-        hooks.checkpoint(ProductionFailurePoint::JobListAttribute)?;
-        attributes.update_slice(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handles)?;
-        hooks.checkpoint(ProductionFailurePoint::ChildProcessPolicyAttribute)?;
-        attributes.update(
-            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
-            &child_process_policy,
-        )?;
-        hooks.checkpoint(ProductionFailurePoint::MitigationPolicyAttribute)?;
-        attributes.update(PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation_policy)?;
-        hooks.checkpoint(ProductionFailurePoint::HandleListAttribute)?;
-        attributes.update_slice(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited_handles)?;
-
-        let mut parent_is_in_job = 0;
-        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle, null Job asks whether it is
-        // in any Job, and the initialized BOOL remains writable for the call. A nested parent is
-        // not rejected categorically: CreateProcessW must prove JOB_LIST compatibility at launch.
-        if unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut parent_is_in_job) } == 0 {
-            return Err(last_error("query parent Job membership"));
-        }
-        let _ = parent_is_in_job;
-        pipes.clear_child_inheritance()?;
-        drop(inheritance_guard);
-        drop(attributes);
-        drop(job);
-        drop(pipes);
-        drop(image_lock);
-        drop(profile);
-        Ok(())
+    #[cfg(test)]
+    pub(super) fn installed_worker_runtime_preflight(executable: &Path) -> Result<(), GateError> {
+        run_runtime_preflight(RuntimePreflightTarget::Installed(executable.to_path_buf()))
     }
 
     pub(super) fn launch_production(
@@ -2526,6 +2528,7 @@ mod feasibility {
         let (executable, _location, image_lock) =
             prepare_executable_acl(&executable, profile.sid, &policy)?;
         let inheritance_guard = crate::process_creation::creation_guard()?;
+        hooks.require_before_deadline()?;
         let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
         #[cfg(test)]
         let mut probe_canary_inheritance = ProbeCanaryInheritance::new(hooks.containment.as_mut())?;
@@ -2583,6 +2586,7 @@ mod feasibility {
         let mut process_information = PROCESS_INFORMATION::default();
 
         hooks.checkpoint(ProductionFailurePoint::CreateProcess)?;
+        hooks.require_before_deadline()?;
         // SAFETY: all UTF-16 buffers are NUL-terminated and remain live; command_line is mutable
         // as required. STARTUPINFOEX and all six attribute values remain initialized until after
         // CreateProcessW. TRUE is required for HANDLE_LIST, whose exact three inheritable pipe
@@ -2691,6 +2695,278 @@ mod feasibility {
             #[cfg(test)]
             force_tree_termination_error: false,
         })
+    }
+
+    enum RuntimePreflightTarget {
+        CurrentExecutable,
+        #[cfg(test)]
+        Installed(PathBuf),
+    }
+
+    fn run_runtime_preflight(target: RuntimePreflightTarget) -> Result<(), GateError> {
+        let deadline = Instant::now() + PRODUCTION_PREFLIGHT_TIMEOUT;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("mini-agent-windows-preflight".to_string())
+            .spawn(move || {
+                let hooks = match target {
+                    RuntimePreflightTarget::CurrentExecutable => {
+                        ProductionLaunchHooks::production()
+                    }
+                    #[cfg(test)]
+                    RuntimePreflightTarget::Installed(executable) => {
+                        ProductionLaunchHooks::installed_worker(executable)
+                    }
+                }
+                .with_deadline(deadline);
+                // The helper retains sole ownership of any late worker result. Even if the
+                // the caller's wait deadline wins during ACL work, creation-lock wait, or a
+                // synchronous CreateProcessW call, a worker produced later is terminated and
+                // reaped below before this helper exits. CreateProcessW itself is not cancellable.
+                let _ = sender.send(run_runtime_preflight_owned(hooks, deadline));
+            })
+            .map_err(|error| GateError(format!("start Windows preflight helper: {error}")))?;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        receiver.recv_timeout(remaining).map_err(|_| {
+            GateError(
+                "Windows production runtime preflight exceeded its caller wait deadline"
+                    .to_string(),
+            )
+        })?
+    }
+
+    fn run_runtime_preflight_owned(
+        hooks: ProductionLaunchHooks,
+        deadline: Instant,
+    ) -> Result<(), GateError> {
+        let mut process = launch_production(hooks)?;
+        let result = (|| {
+            if Instant::now() >= deadline {
+                return Err(GateError(
+                    "Windows production worker launch completed after its caller deadline"
+                        .to_string(),
+                ));
+            }
+            process.process.runtime_controls_match()?;
+            run_authenticated_round_trip(&mut process, |process| {
+                read_worker_frame_exact_bounded(process, deadline)
+            })?;
+            let status = wait_for_protocol_worker_exit_until(&mut process, deadline)?;
+            if !status.success() {
+                return Err(GateError(
+                    "Windows production protocol worker exited unsuccessfully".to_string(),
+                ));
+            }
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = process.terminate_and_reap(PRODUCTION_PREFLIGHT_REAP_TIMEOUT);
+        }
+        result
+    }
+
+    fn run_authenticated_round_trip(
+        process: &mut WorkerProcess,
+        mut read_worker_frame: impl FnMut(
+            &mut WorkerProcess,
+        ) -> Result<
+            crate::extras::js::protocol::WorkerWireFrame,
+            GateError,
+        >,
+    ) -> Result<(), GateError> {
+        use crate::extras::js::protocol::{
+            BuildIdentity, ContainmentAttestation, ContainmentProbe, InvocationId, ParentFrame,
+            ParentHello, ParentProtocol, RunStep, StepOutcome, WireFrame, WorkerFrame, write_frame,
+        };
+
+        let build = BuildIdentity::current();
+        let mut protocol = ParentProtocol::new(build.clone());
+        let hello = WireFrame::connection(build.clone(), 0, ParentFrame::Hello(ParentHello {}));
+        protocol
+            .on_send(&hello)
+            .map_err(|error| GateError(format!("validate Windows Hello: {error}")))?;
+        write_frame(&mut process.input, &hello)
+            .map_err(|error| GateError(format!("write Windows Hello: {error}")))?;
+        process
+            .input
+            .flush()
+            .map_err(|error| GateError(format!("flush Windows Hello: {error}")))?;
+        let ready = read_worker_frame(process)?;
+        protocol
+            .on_receive(&ready)
+            .map_err(|error| GateError(format!("validate Windows Ready: {error}")))?;
+        if !matches!(ready.message, WorkerFrame::Ready(_)) {
+            return Err(GateError("Windows worker did not emit Ready".to_string()));
+        }
+
+        let containment = WireFrame::connection(
+            build.clone(),
+            2,
+            ParentFrame::ContainmentProbe(ContainmentProbe {}),
+        );
+        protocol
+            .on_send(&containment)
+            .map_err(|error| GateError(format!("validate Windows containment probe: {error}")))?;
+        write_frame(&mut process.input, &containment)
+            .map_err(|error| GateError(format!("write Windows containment probe: {error}")))?;
+        process
+            .input
+            .flush()
+            .map_err(|error| GateError(format!("flush Windows containment probe: {error}")))?;
+        let attestation = read_worker_frame(process)?;
+        protocol.on_receive(&attestation).map_err(|error| {
+            GateError(format!("validate Windows containment attestation: {error}"))
+        })?;
+        if !matches!(
+            attestation.message,
+            WorkerFrame::ContainmentAttested(ContainmentAttestation::Passed)
+        ) {
+            return Err(GateError(
+                "Windows worker emitted no closed containment attestation".to_string(),
+            ));
+        }
+
+        let invocation = InvocationId::new("windows-containment-protocol")
+            .map_err(|error| GateError(format!("construct Windows invocation: {error}")))?;
+        let step = WireFrame::invocation(
+            build.clone(),
+            invocation,
+            4,
+            ParentFrame::RunStep(RunStep::new("6 * 7".to_string())),
+        );
+        protocol
+            .on_send(&step)
+            .map_err(|error| GateError(format!("validate Windows RunStep: {error}")))?;
+        write_frame(&mut process.input, &step)
+            .map_err(|error| GateError(format!("write Windows RunStep: {error}")))?;
+        process
+            .input
+            .flush()
+            .map_err(|error| GateError(format!("flush Windows RunStep: {error}")))?;
+        let result = read_worker_frame(process)?;
+        protocol
+            .on_receive(&result)
+            .map_err(|error| GateError(format!("validate Windows StepResult: {error}")))?;
+        let WorkerFrame::StepResult(result) = result.message else {
+            return Err(GateError(
+                "Windows worker returned no StepResult".to_string(),
+            ));
+        };
+        if result.outcome != StepOutcome::Value("42".to_string()) {
+            return Err(GateError(
+                "Windows worker protocol evaluation returned the wrong value".to_string(),
+            ));
+        }
+
+        let shutdown = WireFrame::connection(build, 6, ParentFrame::Shutdown);
+        protocol
+            .on_send(&shutdown)
+            .map_err(|error| GateError(format!("validate Windows Shutdown: {error}")))?;
+        write_frame(&mut process.input, &shutdown)
+            .map_err(|error| GateError(format!("write Windows Shutdown: {error}")))?;
+        process
+            .input
+            .flush()
+            .map_err(|error| GateError(format!("flush Windows Shutdown: {error}")))?;
+        Ok(())
+    }
+
+    fn pipe_bytes_available(pipe: &File) -> Result<usize, GateError> {
+        let mut available = 0u32;
+        // SAFETY: the anonymous-pipe read handle remains owned by `pipe`; null buffer arguments
+        // request only the currently buffered byte count and are not retained by PeekNamedPipe.
+        if unsafe {
+            PeekNamedPipe(
+                pipe.as_raw_handle() as HANDLE,
+                null_mut(),
+                0,
+                null_mut(),
+                &mut available,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("inspect Windows worker protocol pipe"));
+        }
+        Ok(available as usize)
+    }
+
+    fn wait_for_pipe_bytes(
+        process: &mut WorkerProcess,
+        required: usize,
+        deadline: Instant,
+    ) -> Result<(), GateError> {
+        loop {
+            if pipe_bytes_available(&process.output)? >= required {
+                return Ok(());
+            }
+            if process
+                .try_wait()
+                .map_err(|error| GateError(format!("poll Windows protocol worker: {error}")))?
+                .is_some()
+            {
+                return Err(GateError(
+                    "Windows protocol worker exited before emitting a complete frame".to_string(),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(GateError(
+                    "Windows worker protocol read timed out".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn read_worker_frame_exact_bounded(
+        process: &mut WorkerProcess,
+        deadline: Instant,
+    ) -> Result<crate::extras::js::protocol::WorkerWireFrame, GateError> {
+        wait_for_pipe_bytes(process, 4, deadline)?;
+        let mut header = [0u8; 4];
+        process
+            .output
+            .read_exact(&mut header)
+            .map_err(|error| GateError(format!("read Windows worker frame header: {error}")))?;
+        let length = u32::from_be_bytes(header) as usize;
+        if length == 0 || length > crate::extras::js::protocol::MAX_FRAME_BYTES {
+            return Err(GateError(
+                "Windows worker emitted an invalid protocol frame length".to_string(),
+            ));
+        }
+        wait_for_pipe_bytes(process, length, deadline)?;
+        let mut encoded = Vec::with_capacity(4 + length);
+        encoded.extend_from_slice(&header);
+        encoded.resize(4 + length, 0);
+        process
+            .output
+            .read_exact(&mut encoded[4..])
+            .map_err(|error| GateError(format!("read Windows worker frame payload: {error}")))?;
+        crate::extras::js::protocol::read_frame(&mut encoded.as_slice())
+            .map_err(|error| GateError(format!("decode Windows worker frame: {error}")))
+    }
+
+    fn wait_for_protocol_worker_exit_until(
+        process: &mut WorkerProcess,
+        deadline: Instant,
+    ) -> Result<ExitStatus, GateError> {
+        loop {
+            if let Some(status) = process
+                .try_wait()
+                .map_err(|error| GateError(format!("poll Windows protocol worker: {error}")))?
+            {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(GateError(
+                    "Windows protocol worker did not exit before the preflight deadline"
+                        .to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[cfg(test)]
@@ -3094,75 +3370,11 @@ mod feasibility {
 
     #[cfg(test)]
     fn run_production_protocol_round_trip(hooks: ProductionLaunchHooks) -> Result<(), GateError> {
-        use crate::extras::js::protocol::{
-            BuildIdentity, InvocationId, ParentFrame, ParentHello, ParentProtocol, RunStep,
-            StepOutcome, WireFrame, WorkerFrame, write_frame,
-        };
-
         let mut process = launch_production(hooks)?;
         process.process.runtime_controls_match()?;
-        let build = BuildIdentity::current();
-        let mut protocol = ParentProtocol::new(build.clone());
-        let hello = WireFrame::connection(build.clone(), 0, ParentFrame::Hello(ParentHello {}));
-        protocol
-            .on_send(&hello)
-            .map_err(|error| GateError(format!("validate Windows Hello: {error}")))?;
-        write_frame(&mut process.input, &hello)
-            .map_err(|error| GateError(format!("write Windows Hello: {error}")))?;
-        process
-            .input
-            .flush()
-            .map_err(|error| GateError(format!("flush Windows Hello: {error}")))?;
-        let ready = read_worker_frame_bounded(&process.output)?;
-        protocol
-            .on_receive(&ready)
-            .map_err(|error| GateError(format!("validate Windows Ready: {error}")))?;
-        if !matches!(ready.message, WorkerFrame::Ready(_)) {
-            return Err(GateError("Windows worker did not emit Ready".to_string()));
-        }
-
-        let invocation = InvocationId::new("windows-containment-protocol")
-            .map_err(|error| GateError(format!("construct Windows invocation: {error}")))?;
-        let step = WireFrame::invocation(
-            build.clone(),
-            invocation,
-            2,
-            ParentFrame::RunStep(RunStep::new("6 * 7".to_string())),
-        );
-        protocol
-            .on_send(&step)
-            .map_err(|error| GateError(format!("validate Windows RunStep: {error}")))?;
-        write_frame(&mut process.input, &step)
-            .map_err(|error| GateError(format!("write Windows RunStep: {error}")))?;
-        process
-            .input
-            .flush()
-            .map_err(|error| GateError(format!("flush Windows RunStep: {error}")))?;
-        let result = read_worker_frame_bounded(&process.output)?;
-        protocol
-            .on_receive(&result)
-            .map_err(|error| GateError(format!("validate Windows StepResult: {error}")))?;
-        let WorkerFrame::StepResult(result) = result.message else {
-            return Err(GateError(
-                "Windows worker returned no StepResult".to_string(),
-            ));
-        };
-        if result.outcome != StepOutcome::Value("42".to_string()) {
-            return Err(GateError(
-                "Windows worker protocol evaluation returned the wrong value".to_string(),
-            ));
-        }
-
-        let shutdown = WireFrame::connection(build, 4, ParentFrame::Shutdown);
-        protocol
-            .on_send(&shutdown)
-            .map_err(|error| GateError(format!("validate Windows Shutdown: {error}")))?;
-        write_frame(&mut process.input, &shutdown)
-            .map_err(|error| GateError(format!("write Windows Shutdown: {error}")))?;
-        process
-            .input
-            .flush()
-            .map_err(|error| GateError(format!("flush Windows Shutdown: {error}")))?;
+        run_authenticated_round_trip(&mut process, |process| {
+            read_worker_frame_bounded(&process.output)
+        })?;
         let status = wait_for_protocol_worker_exit(&mut process)?;
         if !status.success() {
             return Err(GateError(
@@ -3174,21 +3386,7 @@ mod feasibility {
 
     #[cfg(test)]
     fn wait_for_protocol_worker_exit(process: &mut WorkerProcess) -> Result<ExitStatus, GateError> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = process
-                .try_wait()
-                .map_err(|error| GateError(format!("poll Windows protocol worker: {error}")))?
-            {
-                return Ok(status);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(GateError(
-                    "Windows protocol worker did not exit within five seconds".to_string(),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_protocol_worker_exit_until(process, Instant::now() + Duration::from_secs(5))
     }
 
     fn launch_and_probe(
@@ -3511,6 +3709,14 @@ mod feasibility {
             && unsafe { GetLastError() } == ERROR_INVALID_HANDLE
     }
 
+    pub(super) fn attest_containment(
+        _probe: &crate::extras::js::protocol::ContainmentProbe,
+    ) -> bool {
+        child_token_is_zero_capability_lpac().unwrap_or(false)
+            && exact_protocol_std_handles()
+            && no_console_devices()
+    }
+
     fn mitigation_policy_matches_for_handle(process: HANDLE) -> bool {
         fn query<T: Default>(process: HANDLE, policy: i32) -> Option<T> {
             let mut value = T::default();
@@ -3577,6 +3783,30 @@ mod feasibility {
     fn mitigation_policy_matches() -> bool {
         // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle valid in this process.
         mitigation_policy_matches_for_handle(unsafe { GetCurrentProcess() })
+    }
+
+    fn child_process_policy_matches(process: HANDLE) -> bool {
+        let mut policy = PROCESS_MITIGATION_CHILD_PROCESS_POLICY {
+            Anonymous: windows_sys::Win32::System::SystemServices::PROCESS_MITIGATION_CHILD_PROCESS_POLICY_0 {
+                Flags: 0,
+            },
+        };
+        // SAFETY: `process` is a borrowed live process handle and `policy` is an initialized
+        // exact-size output buffer retained only for this synchronous query.
+        if unsafe {
+            GetProcessMitigationPolicy(
+                process,
+                ProcessChildProcessPolicy,
+                (&mut policy as *mut PROCESS_MITIGATION_CHILD_PROCESS_POLICY).cast(),
+                size_of::<PROCESS_MITIGATION_CHILD_PROCESS_POLICY>(),
+            )
+        } == 0
+        {
+            return false;
+        }
+        // SAFETY: this is the documented Flags member of the initialized union returned above.
+        unsafe { policy.Anonymous.Flags }
+        &0b1 == 0b1
     }
 
     pub(super) fn verify_runtime_controls(
@@ -3651,6 +3881,11 @@ mod feasibility {
         if !mitigation_policy_matches_for_handle(process.raw()) {
             return Err(GateError(
                 "effective process mitigations differ from the reviewed policy".to_string(),
+            ));
+        }
+        if !child_process_policy_matches(process.raw()) {
+            return Err(GateError(
+                "effective child-process restriction differs from the reviewed policy".to_string(),
             ));
         }
         Ok(())
@@ -3833,6 +4068,10 @@ mod feasibility {
     }
 }
 
+pub(super) fn attest_containment(probe: &crate::extras::js::protocol::ContainmentProbe) -> bool {
+    feasibility::attest_containment(probe)
+}
+
 #[cfg(test)]
 fn run_lpac_image_loading_gate() -> Result<(), feasibility::GateError> {
     feasibility::run_artifact_matrix()
@@ -3995,7 +4234,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_production_status_waits_for_runtime_containment_probe() {
+    fn windows_production_status_fails_closed_for_nonproduction_test_image() {
         match super::containment_status() {
             crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
                 backend,
@@ -4007,21 +4246,24 @@ mod tests {
                     assurance,
                     crate::sandbox::worker::WorkerContainmentAssurance::Enforced
                 );
-                assert_eq!(
-                    reason,
-                    "Windows LPAC runtime containment probe has not passed"
-                );
+                assert_eq!(reason, "Windows LPAC production runtime preflight failed");
             }
-            status => panic!("construction-only preflight reported available: {status:?}"),
+            status => {
+                panic!("libtest image unexpectedly reported production available: {status:?}")
+            }
         }
     }
 
     #[test]
-    fn windows_production_launch_returns_typed_unavailable_without_child() {
+    fn windows_production_launch_uses_cached_unavailable_without_second_child() {
+        assert!(matches!(
+            super::containment_status(),
+            crate::sandbox::worker::WorkerContainmentStatus::Unavailable { .. }
+        ));
         let _creation_guard = crate::process_creation::creation_guard()
             .expect("isolate the production-launch observation from raw launcher tests");
         super::feasibility::LAST_PRODUCTION_TEST_PID.store(0, Ordering::Release);
-        let error = super::launch().expect_err("unprobed production launcher must fail closed");
+        let error = super::launch().expect_err("cached failed preflight must fail closed");
         assert!(matches!(
             error,
             crate::sandbox::worker::WorkerLaunchError::Unavailable {
@@ -4032,7 +4274,7 @@ mod tests {
         assert_eq!(
             super::feasibility::LAST_PRODUCTION_TEST_PID.load(Ordering::Acquire),
             0,
-            "typed unavailable path reached CreateProcessW"
+            "cached unavailable launch path reached CreateProcessW a second time"
         );
     }
 

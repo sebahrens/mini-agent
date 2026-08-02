@@ -584,23 +584,41 @@ cargo test --locked --no-default-features --features js windows_lpac_can_load_cu
 
 Construction of the production LPAC policy and attribute list is not runtime evidence: it cannot
 prove that Windows accepts the combined token, Job, mitigation, handle, console, and executable
-controls or that the resulting child observes them. Production Windows worker status therefore
-remains unavailable until a sacrificial launch probes those combined controls on the running host.
-Neither the construction preflight nor the narrower image-loading rows may report availability.
-While status is unavailable, the production launcher returns the typed unavailable error without
-calling `CreateProcessW`; only the internal sacrificial-probe/test seam may call the raw production
-launcher. There is no restricted-token or unconfined fallback, and this worker boundary does not
-satisfy the separate `mini-agent-uq5c` general-command sandbox.
+controls or that the resulting child observes them. The first production status query therefore
+runs one sacrificial launch of the current executable through the exact production launcher. It
+verifies the live Job, resource, UI, mitigation, and child-process-policy controls; authenticates
+`Hello`/`Ready`; then sends one closed containment request. The child returns only `passed`, and
+only after observing its own LPAC/less-privileged token, zero capability groups, three distinct
+protocol pipes, and absent console boundary. The parent then evaluates `6 * 7` in a fresh runtime,
+requires `42`, sends `Shutdown`, and requires clean exit. The caller's five-second wait starts
+before profile/ACL preparation and the global creation-lock wait. The launcher propagates that
+absolute deadline and checks it immediately after acquiring the creation lock and again immediately
+before `CreateProcessW`, so a lock released after caller timeout cannot authorize a new launch.
+`CreateProcessW` is synchronous and not cancellable; if it was entered before the deadline but
+returns afterward, a dedicated helper retains sole ownership and terminates/reaps that late worker.
+Thus the cached-status caller is bounded and late results remain owned, without claiming a hard
+five-second bound on the sacrificial worker's complete lifetime.
+The result is cached process-wide: success enables the exact LPAC backend and every failure
+permanently leaves it unavailable with one source-free reason. The preflight calls the raw launcher
+directly rather than public launch/status or supervisor paths, and production never uses the
+executable overrides or protocol children available to tests. After a cached failure, normal launch
+attempts return the typed unavailable error without starting another child. There is no
+restricted-token or unconfined fallback, and this worker boundary does not satisfy the separate
+`mini-agent-uq5c` general-command sandbox.
 
 ### Windows production containment and install-location gate
 
 The A26 production launcher constructs a zero-capability LPAC process with the exact protocol
 handle list, child-process restriction, compatible mitigations, and creation-time Job limits. That
-construction is not availability evidence. Windows worker status remains unavailable until the
-ignored real-backend test `windows_js_worker_containment` passes in the same process image and
-under the same launcher path used by production.
+construction is not availability evidence. Windows worker status becomes available only when its
+cached sacrificial production launch succeeds on the running host. The ignored real-backend test
+`windows_js_worker_containment`, the standard-user run, and the installed binary's validated
+`--print-config` output are mandatory external delivery evidence; a test process does not mutate or
+stand in for the production process's cached status.
 
-The A27 test must prove all of the following before emitting its fixed, source-free pass frame:
+The hosted A27 test retains the ambient canary matrix that is deliberately absent from ordinary
+worker environments. It must prove all of the following before emitting its fixed, source-free
+pass frame:
 
 - the child cannot read or write a workspace sentinel or a separately rooted skill-database
   sentinel and receives none of the parent's credential environment;
@@ -651,7 +669,10 @@ The `windows-worker-containment-gate` CI job first lists tests and requires exac
 `windows_js_worker_containment` test plus at least one `worker_runtime` test, so a cfg mistake or
 filter drift cannot pass by running zero tests. It installs beneath a path containing spaces and
 Unicode, prepares the protected-location negative control, runs the ignored real probe, exercises
-the worker runtime, invokes the installed binary's `--print-config`, and archives both outputs.
+the worker runtime, and invokes the installed binary's `--print-config`. Its separate standard-user
+lane also installs the binary and requires that identity's own `--print-config` to report the same
+cached available/enforced status before it may emit pass evidence. Raw standard-user output is
+deleted rather than archived.
 That hosted-runner evidence does not replace the required standard-user run. Windows availability
 remains unverified until both `windows-latest` and a standard-user Windows installation pass; no
 restricted-token or unconfined fallback is allowed, and this gate does not satisfy the separate

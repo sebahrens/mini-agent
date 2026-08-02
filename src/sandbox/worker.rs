@@ -15,9 +15,9 @@ use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, OnceLock};
 
 pub(crate) const INTERNAL_WORKER_MARKER: &str = "MINI_AGENT_INTERNAL_JS_WORKER";
 pub(crate) const INTERNAL_WORKER_MARKER_VALUE: &str = "brokered-v1";
@@ -78,6 +78,13 @@ pub(crate) fn run_windows_containment_probe() -> io::Result<()> {
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) fn run_windows_containment_child_probe() -> io::Result<()> {
     platform::run_containment_child_probe()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn attest_windows_containment(
+    probe: &crate::extras::js::protocol::ContainmentProbe,
+) -> bool {
+    platform::attest_containment(probe)
 }
 
 #[cfg(target_os = "linux")]
@@ -201,22 +208,50 @@ impl WorkerLauncher for ProductionWorkerLauncher {
 #[derive(Debug, Clone)]
 pub(crate) struct BenchmarkWorkerLauncher {
     executable: PathBuf,
+    status: Arc<OnceLock<WorkerContainmentStatus>>,
 }
 
 #[cfg(test)]
 impl BenchmarkWorkerLauncher {
     pub(crate) fn new(executable: PathBuf) -> Self {
-        Self { executable }
+        Self {
+            executable,
+            status: Arc::new(OnceLock::new()),
+        }
     }
 }
 
 #[cfg(test)]
 impl WorkerLauncher for BenchmarkWorkerLauncher {
     fn containment_status(&self) -> WorkerContainmentStatus {
-        platform::containment_status()
+        self.status
+            .get_or_init(|| {
+                #[cfg(windows)]
+                {
+                    platform::containment_status_for_benchmark(&self.executable)
+                }
+                #[cfg(not(windows))]
+                {
+                    platform::containment_status()
+                }
+            })
+            .clone()
     }
 
     fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        match self.containment_status() {
+            WorkerContainmentStatus::Available { backend, .. }
+                if backend == WorkerBackend::for_current_platform() => {}
+            WorkerContainmentStatus::Available { backend, .. } => {
+                return Err(WorkerLaunchError::Unavailable {
+                    backend,
+                    reason: "benchmark containment preflight selected the wrong backend".into(),
+                });
+            }
+            WorkerContainmentStatus::Unavailable {
+                backend, reason, ..
+            } => return Err(WorkerLaunchError::Unavailable { backend, reason }),
+        }
         platform::launch_executable_for_benchmark(&self.executable)
     }
 }
@@ -720,14 +755,18 @@ mod tests {
             source
                 .matches("crate::process_creation::creation_guard()?")
                 .count()
-                >= 3
+                >= 2
         );
         assert!(creation_source.contains("static PROCESS_CREATION_LOCK: Mutex<()>"));
         assert!(creation_source.contains("trait StdCommandCreationExt"));
         assert!(creation_source.contains("trait TokioCommandCreationExt"));
         assert!(creation_source.contains("trait RmcpCommandCreationExt"));
-        assert!(source.contains("Windows LPAC runtime containment probe has not passed"));
-        assert!(!source.contains("PREFLIGHT.get_or_init"));
+        assert!(source.contains("static STATUS: OnceLock<WorkerContainmentStatus>"));
+        assert!(source.contains("STATUS.get_or_init(probe_containment).clone()"));
+        assert!(source.contains("production_runtime_preflight()"));
+        assert!(source.contains("Windows LPAC production runtime preflight failed"));
+        assert!(source.contains("PeekNamedPipe"));
+        assert!(source.contains("terminate_and_reap"));
         assert!(source.contains("WorkerLaunchError::Unavailable {"));
         assert!(source.contains("crate::process_creation::creation_guard()?"));
         assert!(source.contains("Capabilities: null_mut(),\n            CapabilityCount: 0"));
@@ -741,6 +780,49 @@ mod tests {
         assert!(!source.contains("PROC_THREAD_ATTRIBUTE_PARENT_PROCESS"));
         assert!(!source.contains("PROCESS_CREATION_MITIGATION_POLICY_WIN32K"));
         assert!(!source.contains("PROCESS_CREATION_MITIGATION_POLICY_PROHIBIT_DYNAMIC_CODE"));
+
+        let probe_start = source
+            .find("fn probe_containment()")
+            .expect("Windows status must use a private runtime probe");
+        let probe_end = source[probe_start..]
+            .find("\npub(super) fn launch()")
+            .map(|offset| probe_start + offset)
+            .expect("Windows runtime probe must precede the public launch path");
+        let probe = &source[probe_start..probe_end];
+        assert!(!probe.contains("containment_status()"));
+        assert!(!probe.contains("ProductionWorkerLauncher"));
+        assert!(!probe.contains("JsWorkerSupervisor"));
+
+        let runtime_start = source
+            .find("fn run_runtime_preflight(")
+            .expect("Windows preflight must exercise a live production worker");
+        let runtime_end = source[runtime_start..]
+            .find("\n    fn run_authenticated_round_trip(")
+            .map(|offset| runtime_start + offset)
+            .expect("Windows runtime preflight must delegate to the authenticated exchange");
+        let runtime = &source[runtime_start..runtime_end];
+        assert!(runtime.contains("runtime_controls_match()?"));
+        assert!(runtime.contains("read_worker_frame_exact_bounded"));
+        assert!(runtime.contains("wait_for_protocol_worker_exit_until"));
+        assert!(runtime.contains("terminate_and_reap"));
+        assert!(!runtime.contains("read_worker_frame_after_preamble"));
+        assert!(!runtime.contains("protocol_test"));
+    }
+
+    #[test]
+    fn windows_benchmark_preflights_the_configured_binary_without_production_status_pollution() {
+        let worker = include_str!("worker.rs");
+        let windows = include_str!("worker/windows.rs");
+        let benchmark = include_str!("../extras/js/tests/worker_resource_benchmark.rs");
+
+        assert!(worker.contains("status: Arc<OnceLock<WorkerContainmentStatus>>"));
+        assert!(worker.contains("platform::containment_status_for_benchmark(&self.executable)"));
+        assert!(windows.contains("installed_worker_runtime_preflight"));
+        assert!(windows.contains("ProductionLaunchHooks::installed_worker("));
+        assert!(benchmark.contains("let launcher = BenchmarkWorkerLauncher::new("));
+        assert!(benchmark.contains("match launcher.containment_status()"));
+        assert!(benchmark.contains("production_supervisor(launcher.clone())"));
+        assert!(!benchmark.contains("ProductionWorkerLauncher.containment_status()"));
     }
 
     #[test]

@@ -30,7 +30,7 @@ const TEST_WORKSPACE_CANARY: &str = "A07_WORKSPACE_CANARY_MUST_NOT_LEAK";
 
 #[cfg(windows)]
 #[tokio::test]
-async fn windows_production_supervisor_rejects_until_runtime_probe_passes() {
+async fn windows_production_supervisor_rejects_nonproduction_test_image() {
     let supervisor = JsWorkerSupervisor::with_launcher_for_test(ProductionWorkerLauncher);
     let error = supervisor
         .execute(
@@ -39,7 +39,7 @@ async fn windows_production_supervisor_rejects_until_runtime_probe_passes() {
             PermCancellation::new(),
         )
         .await
-        .expect_err("unprobed Windows containment must not reach production launch");
+        .expect_err("the libtest image must not become a production worker");
     assert_eq!(error, WorkerError::ContainmentUnavailable);
 }
 
@@ -2837,9 +2837,9 @@ fn run_scripted_supervisor_worker() -> ! {
                 output.flush().unwrap();
             }
             ParentFrame::Shutdown => std::process::exit(0),
-            ParentFrame::Hello(_) | ParentFrame::EffectResponse(EffectResponse { .. }) => {
-                std::process::exit(1)
-            }
+            ParentFrame::Hello(_)
+            | ParentFrame::ContainmentProbe(_)
+            | ParentFrame::EffectResponse(EffectResponse { .. }) => std::process::exit(1),
             #[cfg(feature = "skills")]
             ParentFrame::SkillCallResponse(_) => std::process::exit(1),
         }
