@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 
@@ -857,6 +857,79 @@ fn scoped_spawn_binding_map_is_deterministic_and_bounded() {
         ),
         Err(crate::extras::js::broker::BrokerBuildError::InvalidManifest)
     );
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn prepared_manifest_resolves_once_then_mints_distinct_singleton_grants_with_one_fresh_lease() {
+    let invocation_id = invocation("inv-prepared-manifest-reuse");
+    let identity = resolve_program_identity("printf").unwrap();
+    let resolver_calls = AtomicUsize::new(0);
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["Cargo.toml".into()],
+            },
+            CapabilityScope::Spawn {
+                programs: vec!["printf".into()],
+            },
+        ],
+    )
+    .unwrap();
+    let preparation_started = Instant::now();
+    let prepared = InvocationGrant::prepare_skill_manifest_with_resolver(manifest, |_| {
+        resolver_calls.fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(identity.clone())
+    })
+    .unwrap();
+    assert_eq!(resolver_calls.load(AtomicOrdering::Relaxed), 1);
+
+    let expires_at = Instant::now() + Duration::from_secs(10);
+    let mut grants = Vec::new();
+    for export in ["first", "second"] {
+        for capability in [HostCapability::ReadFile, HostCapability::Spawn] {
+            grants.push(
+                InvocationGrant::issue_prepared_scoped_skill(
+                    invocation_id.clone(),
+                    GrantPrincipal::Skill {
+                        artifact_id: "artifact-prepared-reuse".into(),
+                        export: export.into(),
+                        invocation_id: format!("{export}-invocation"),
+                    },
+                    capability,
+                    &prepared,
+                    expires_at,
+                )
+                .unwrap(),
+            );
+        }
+    }
+
+    assert!(expires_at > preparation_started + Duration::from_secs(9));
+    assert_eq!(resolver_calls.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(
+        grants
+            .iter()
+            .map(|grant| grant.grant_id().get())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert!(
+        grants
+            .iter()
+            .all(|grant| grant.allowed_for_test().len() == 1)
+    );
+    assert!(
+        grants
+            .iter()
+            .all(|grant| grant.expires_at_for_test() == expires_at)
+    );
+    assert!(grants.iter().all(|grant| {
+        grant.spawn_program_bindings_json_for_test()
+            == grants[0].spawn_program_bindings_json_for_test()
+    }));
 }
 
 #[test]

@@ -117,6 +117,32 @@ fn executable_preparation_slots() -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
+#[cfg(test)]
+pub(crate) struct SaturatedExecutablePreparationSlots {
+    _exclusive: tokio::sync::OwnedMutexGuard<()>,
+    _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+}
+
+#[cfg(test)]
+pub(crate) async fn saturate_executable_preparation_slots_for_test()
+-> SaturatedExecutablePreparationSlots {
+    static EXCLUSIVE: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    let exclusive = EXCLUSIVE
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await;
+    let slots = executable_preparation_slots();
+    let mut permits = Vec::with_capacity(MAX_CONCURRENT_EXECUTABLE_PREPARATIONS);
+    for _ in 0..MAX_CONCURRENT_EXECUTABLE_PREPARATIONS {
+        permits.push(slots.clone().acquire_owned().await.unwrap());
+    }
+    SaturatedExecutablePreparationSlots {
+        _exclusive: exclusive,
+        _permits: permits,
+    }
+}
+
 /// Cooperative stop state shared with one bounded executable-preparation worker.
 ///
 /// Filesystem calls such as a FUSE `read` can remain blocked in the kernel, so the async caller
@@ -234,6 +260,18 @@ pub(crate) struct SpawnExecutableIdentity {
     platform: PlatformExecutableIdentity,
     content_sha256: String,
     content_bytes: u64,
+}
+
+/// Parent-prepared authority shared by every export/capability grant for one immutable artifact.
+///
+/// Validation and executable identity resolution happen once when this value is built. Minting
+/// grants from it is pure: it clones only ordinary metadata and never reopens, rehashes, or owns
+/// executable files or snapshots.
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedSkillManifest {
+    manifest: CapabilityManifest,
+    spawn_program_identities: BTreeMap<String, SpawnExecutableIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -374,86 +412,92 @@ impl InvocationGrant {
     }
 
     #[cfg(feature = "skills")]
-    pub(crate) async fn issue_scoped_skill(
-        bound_invocation: InvocationId,
-        principal: GrantPrincipal,
+    pub(crate) async fn prepare_skill_manifest(
         manifest: CapabilityManifest,
-        expires_at: Instant,
+        deadline: Instant,
         cancellation: PermCancellation,
-    ) -> Result<Self, BrokerBuildError> {
-        let result = run_executable_preparation(expires_at, cancellation, move |control| {
-            Self::issue_scoped_skill_with_resolver_inner(
-                bound_invocation,
-                principal,
+    ) -> Result<PreparedSkillManifest, BrokerBuildError> {
+        if cancellation.is_cancelled() {
+            return Err(BrokerBuildError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(BrokerBuildError::TimedOut);
+        }
+        let spawn_programs = validate_skill_manifest_metadata(&manifest)?;
+        if spawn_programs.is_empty() {
+            return Ok(PreparedSkillManifest {
                 manifest,
-                expires_at,
-                |program| resolve_program_identity_controlled(program, &control),
-            )
+                spawn_program_identities: BTreeMap::new(),
+            });
+        }
+
+        let spawn_program_identities =
+            run_executable_preparation(deadline, cancellation, move |control| {
+                resolve_skill_spawn_programs(spawn_programs, |program| {
+                    resolve_program_identity_controlled(program, &control)
+                })
+            })
+            .await
+            .map_err(|error| match error {
+                ExecutablePreparationWaitError::Cancelled => BrokerBuildError::Cancelled,
+                ExecutablePreparationWaitError::TimedOut => BrokerBuildError::TimedOut,
+                ExecutablePreparationWaitError::WorkerFailed => {
+                    BrokerBuildError::ExecutablePreparationFailed
+                }
+            })??;
+        Ok(PreparedSkillManifest {
+            manifest,
+            spawn_program_identities,
         })
-        .await
-        .map_err(|error| match error {
-            ExecutablePreparationWaitError::Cancelled => BrokerBuildError::Cancelled,
-            ExecutablePreparationWaitError::TimedOut => BrokerBuildError::TimedOut,
-            ExecutablePreparationWaitError::WorkerFailed => {
-                BrokerBuildError::ExecutablePreparationFailed
-            }
-        })?;
-        result
     }
 
     #[cfg(feature = "skills")]
-    fn issue_scoped_skill_with_resolver_inner(
+    pub(crate) fn issue_prepared_scoped_skill(
         bound_invocation: InvocationId,
         principal: GrantPrincipal,
-        manifest: CapabilityManifest,
+        allowed: HostCapability,
+        prepared: &PreparedSkillManifest,
         expires_at: Instant,
-        resolver: impl Fn(&str) -> Result<SpawnExecutableIdentity, EffectServiceError>,
     ) -> Result<Self, BrokerBuildError> {
         if !matches!(principal, GrantPrincipal::Skill { .. }) {
             return Err(BrokerBuildError::InvalidScopedPrincipal);
         }
-        manifest
-            .validate()
-            .map_err(|_| BrokerBuildError::InvalidManifest)?;
-        let spawn_programs = manifest
-            .grants
-            .iter()
-            .filter_map(|scope| match scope {
-                CapabilityScope::Spawn { programs } => Some(programs),
-                _ => None,
-            })
-            .flatten();
-        let mut spawn_program_identities = BTreeMap::new();
-        for program in spawn_programs {
-            if spawn_program_identities.len() >= MAX_SPAWN_PROGRAM_BINDINGS {
-                return Err(BrokerBuildError::InvalidManifest);
-            }
-            let identity = resolver(program).map_err(|error| match error {
-                EffectServiceError::Cancelled => BrokerBuildError::Cancelled,
-                EffectServiceError::TimedOut => BrokerBuildError::TimedOut,
-                _ => BrokerBuildError::UnavailableManifestProgram,
-            })?;
-            if identity.canonical_path.len() > MAX_RESOLVED_EXECUTABLE_BYTES {
-                return Err(BrokerBuildError::InvalidManifest);
-            }
-            spawn_program_identities.insert(program.clone(), identity);
+        let declared = match allowed {
+            HostCapability::ReadFile => SkillHostCapability::ReadFile,
+            HostCapability::WriteFile => SkillHostCapability::WriteFile,
+            HostCapability::Fetch => SkillHostCapability::Fetch,
+            HostCapability::Spawn => SkillHostCapability::Spawn,
+            HostCapability::ProposeSkill => return Err(BrokerBuildError::InvalidManifest),
+        };
+        if !prepared.manifest.allows(declared) {
+            return Err(BrokerBuildError::InvalidManifest);
         }
-        let allowed = manifest
-            .grants
-            .iter()
-            .map(|scope| match scope.capability() {
-                SkillHostCapability::ReadFile => HostCapability::ReadFile,
-                SkillHostCapability::WriteFile => HostCapability::WriteFile,
-                SkillHostCapability::Fetch => HostCapability::Fetch,
-                SkillHostCapability::Spawn => HostCapability::Spawn,
-            })
-            .collect();
-        let mut grant = Self::issue(bound_invocation, principal, allowed, expires_at);
-        grant.manifest = Some(manifest);
-        grant.spawn_program_identities = spawn_program_identities;
+        let mut grant = Self::issue(
+            bound_invocation,
+            principal,
+            BTreeSet::from([allowed]),
+            expires_at,
+        );
+        grant.manifest = Some(prepared.manifest.clone());
+        grant.spawn_program_identities = prepared.spawn_program_identities.clone();
         Ok(grant)
     }
 
+    #[cfg(all(test, feature = "skills"))]
+    pub(crate) fn prepare_skill_manifest_with_resolver(
+        manifest: CapabilityManifest,
+        resolver: impl Fn(&str) -> Result<SpawnExecutableIdentity, EffectServiceError>,
+    ) -> Result<PreparedSkillManifest, BrokerBuildError> {
+        let spawn_programs = validate_skill_manifest_metadata(&manifest)?;
+        let spawn_program_identities = resolve_skill_spawn_programs(spawn_programs, resolver)?;
+        Ok(PreparedSkillManifest {
+            manifest,
+            spawn_program_identities,
+        })
+    }
+
+    /// Test-only convenience for single-capability broker fixtures. Production construction
+    /// always prepares once per artifact and mints through `issue_prepared_scoped_skill`.
     #[cfg(all(test, feature = "skills"))]
     pub(crate) fn issue_scoped_skill_with_resolver(
         bound_invocation: InvocationId,
@@ -462,12 +506,22 @@ impl InvocationGrant {
         expires_at: Instant,
         resolver: impl Fn(&str) -> Result<SpawnExecutableIdentity, EffectServiceError>,
     ) -> Result<Self, BrokerBuildError> {
-        Self::issue_scoped_skill_with_resolver_inner(
+        let allowed = match manifest.grants.as_slice() {
+            [scope] => match scope.capability() {
+                SkillHostCapability::ReadFile => HostCapability::ReadFile,
+                SkillHostCapability::WriteFile => HostCapability::WriteFile,
+                SkillHostCapability::Fetch => HostCapability::Fetch,
+                SkillHostCapability::Spawn => HostCapability::Spawn,
+            },
+            _ => return Err(BrokerBuildError::InvalidManifest),
+        };
+        let prepared = Self::prepare_skill_manifest_with_resolver(manifest, resolver)?;
+        Self::issue_prepared_scoped_skill(
             bound_invocation,
             principal,
-            manifest,
+            allowed,
+            &prepared,
             expires_at,
-            resolver,
         )
     }
 
@@ -479,6 +533,58 @@ impl InvocationGrant {
     pub(crate) fn grant_id(&self) -> &GrantId {
         &self.grant_id
     }
+
+    #[cfg(test)]
+    pub(crate) fn expires_at_for_test(&self) -> Instant {
+        self.expires_at
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allowed_for_test(&self) -> &BTreeSet<HostCapability> {
+        &self.allowed
+    }
+}
+
+#[cfg(feature = "skills")]
+fn validate_skill_manifest_metadata(
+    manifest: &CapabilityManifest,
+) -> Result<Vec<String>, BrokerBuildError> {
+    manifest
+        .validate()
+        .map_err(|_| BrokerBuildError::InvalidManifest)?;
+    let spawn_programs = manifest
+        .grants
+        .iter()
+        .filter_map(|scope| match scope {
+            CapabilityScope::Spawn { programs } => Some(programs.iter().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    if spawn_programs.len() > MAX_SPAWN_PROGRAM_BINDINGS {
+        return Err(BrokerBuildError::InvalidManifest);
+    }
+    Ok(spawn_programs)
+}
+
+#[cfg(feature = "skills")]
+fn resolve_skill_spawn_programs(
+    spawn_programs: Vec<String>,
+    resolver: impl Fn(&str) -> Result<SpawnExecutableIdentity, EffectServiceError>,
+) -> Result<BTreeMap<String, SpawnExecutableIdentity>, BrokerBuildError> {
+    let mut identities = BTreeMap::new();
+    for program in spawn_programs {
+        let identity = resolver(&program).map_err(|error| match error {
+            EffectServiceError::Cancelled => BrokerBuildError::Cancelled,
+            EffectServiceError::TimedOut => BrokerBuildError::TimedOut,
+            _ => BrokerBuildError::UnavailableManifestProgram,
+        })?;
+        if identity.canonical_path.len() > MAX_RESOLVED_EXECUTABLE_BYTES {
+            return Err(BrokerBuildError::InvalidManifest);
+        }
+        identities.insert(program, identity);
+    }
+    Ok(identities)
 }
 
 /// Source-free parent error classes. Only their closed wire mapping crosses the worker boundary.

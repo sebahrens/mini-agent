@@ -26,6 +26,11 @@ use super::protocol::{
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
+#[cfg(feature = "skills")]
+use super::protocol::{
+    MAX_SKILL_ARTIFACTS_PER_STEP, MAX_SKILL_CAPABILITY_GRANTS_PER_STEP,
+    MAX_SKILL_EXPORTS_PER_ARTIFACT,
+};
 use super::types::{
     MEMORY_LIMIT, READ_FILE_MAX_BYTES, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
 };
@@ -1053,6 +1058,7 @@ fn prepare_bound_exports(
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::AtomicU32;
 
+    validate_skill_authority_bounds(request)?;
     if request.artifacts.is_empty() {
         return request
             .skill_invocations
@@ -1060,8 +1066,7 @@ fn prepare_bound_exports(
             .then(HashMap::new)
             .ok_or(());
     }
-    if request.turn_id.is_empty() || request.tool_call_id.is_empty() || request.artifacts.len() > 64
-    {
+    if request.turn_id.is_empty() || request.tool_call_id.is_empty() {
         return Err(());
     }
     let mut issued = HashMap::new();
@@ -1169,6 +1174,121 @@ fn prepare_bound_exports(
         return Err(());
     }
     Ok(prepared)
+}
+
+#[cfg(feature = "skills")]
+fn validate_skill_authority_bounds(request: &RunStep) -> Result<(), ()> {
+    if request.artifacts.len() > MAX_SKILL_ARTIFACTS_PER_STEP {
+        return Err(());
+    }
+    let mut total_exports = 0_usize;
+    let mut expected_grants = 0_usize;
+    for artifact in &request.artifacts {
+        if artifact.exports.len() > MAX_SKILL_EXPORTS_PER_ARTIFACT {
+            return Err(());
+        }
+        total_exports = total_exports
+            .checked_add(artifact.exports.len())
+            .ok_or(())?;
+        expected_grants = expected_grants
+            .checked_add(
+                artifact
+                    .exports
+                    .len()
+                    .checked_mul(artifact.capability.grants.len())
+                    .ok_or(())?,
+            )
+            .ok_or(())?;
+        if expected_grants > MAX_SKILL_CAPABILITY_GRANTS_PER_STEP {
+            return Err(());
+        }
+    }
+    if request.skill_invocations.len() != total_exports {
+        return Err(());
+    }
+    let mut actual_grants = 0_usize;
+    for invocation in &request.skill_invocations {
+        actual_grants = actual_grants
+            .checked_add(invocation.grants.len())
+            .ok_or(())?;
+        if actual_grants > MAX_SKILL_CAPABILITY_GRANTS_PER_STEP {
+            return Err(());
+        }
+    }
+    (actual_grants == expected_grants).then_some(()).ok_or(())
+}
+
+#[cfg(all(test, feature = "skills"))]
+mod skill_authority_bound_tests {
+    use super::*;
+    use crate::extras::js::skills::{
+        CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
+    };
+
+    fn artifact(export_count: usize, capability: CapabilityManifest) -> SkillArtifact {
+        SkillArtifact::new(
+            "function unused() { return 0; }".into(),
+            "worker cardinality fixture".into(),
+            vec![],
+            (0..export_count)
+                .map(|index| SkillExport {
+                    name: format!("export_{index}"),
+                    signature: format!("export_{index}()"),
+                })
+                .collect(),
+            vec!["true".into()],
+            capability,
+        )
+        .unwrap()
+    }
+
+    fn step(artifacts: Vec<SkillArtifact>) -> RunStep {
+        RunStep::new("1".into()).with_skills(
+            artifacts,
+            vec![],
+            "bounded-worker-turn".into(),
+            "bounded-worker-call".into(),
+        )
+    }
+
+    #[test]
+    fn worker_rejects_artifact_export_and_total_grant_overflow_before_preparation() {
+        let pure = artifact(1, CapabilityManifest::pure());
+        assert!(
+            validate_skill_authority_bounds(&step(vec![pure; MAX_SKILL_ARTIFACTS_PER_STEP + 1]))
+                .is_err()
+        );
+
+        let too_many_exports = artifact(
+            MAX_SKILL_EXPORTS_PER_ARTIFACT + 1,
+            CapabilityManifest::pure(),
+        );
+        assert!(validate_skill_authority_bounds(&step(vec![too_many_exports])).is_err());
+
+        let four_grants = CapabilityManifest::new(
+            CapabilityTier::SideEffecting,
+            vec![
+                CapabilityScope::ReadFile {
+                    workspace_prefixes: vec!["Cargo.toml".into()],
+                },
+                CapabilityScope::WriteFile {
+                    workspace_prefixes: vec!["target".into()],
+                },
+                CapabilityScope::Fetch {
+                    origins: vec!["https://example.test".into()],
+                    methods: vec![crate::extras::js::skills::HttpMethod::Get],
+                },
+                CapabilityScope::Spawn {
+                    programs: vec!["printf".into()],
+                },
+            ],
+        )
+        .unwrap();
+        let grant_heavy = artifact(MAX_SKILL_EXPORTS_PER_ARTIFACT, four_grants);
+        let artifact_count =
+            MAX_SKILL_CAPABILITY_GRANTS_PER_STEP / (MAX_SKILL_EXPORTS_PER_ARTIFACT * 4) + 1;
+        assert!(validate_skill_authority_bounds(&step(vec![grant_heavy; artifact_count])).is_err());
+    }
 }
 
 fn execute_run_step(

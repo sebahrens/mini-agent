@@ -15,6 +15,12 @@ use uuid::Uuid;
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
+#[cfg(feature = "skills")]
+pub(crate) const MAX_SKILL_ARTIFACTS_PER_STEP: usize = 64;
+#[cfg(feature = "skills")]
+pub(crate) const MAX_SKILL_EXPORTS_PER_ARTIFACT: usize = 32;
+#[cfg(feature = "skills")]
+pub(crate) const MAX_SKILL_CAPABILITY_GRANTS_PER_STEP: usize = 1024;
 
 const MAX_ID_BYTES: usize = 128;
 
