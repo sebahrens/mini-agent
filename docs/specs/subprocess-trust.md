@@ -117,7 +117,9 @@ cyclic provenance fails closed rather than inheriting a local-type exemption. As
 function-item references and raw terminal identifiers are inventoried even when a later indirect
 call has another name. Terminal method identifiers in macro inputs and locally defined
 `macro_rules!` expansion bodies are treated as process terminals unless an exact inventory
-fingerprint classifies the site as non-process. Only
+identity classifies the site as non-process. That identity binds the source path, occurrence, and
+SHA-256 of the canonical complete macro path, delimiter, and token body; matching only the terminal
+line or macro name cannot confer an exemption. Only
 syntactically proven task/thread or local associated `spawn` calls are excluded; ambiguous and
 unrecognized terminals fail closed. Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so
