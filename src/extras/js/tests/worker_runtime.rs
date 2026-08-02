@@ -2429,7 +2429,7 @@ fn worker_supervisor_verification_internal_terminal_recycles_generation() {
 }
 
 #[tokio::test]
-async fn worker_supervisor_transport_cancellation_drops_effect_and_starts_next_generation() {
+async fn worker_supervisor_transport_cancellation_marks_started_effect_unknown_and_recovers() {
     let supervisor = scripted_supervisor(0);
     let gated = GatedEffects::new();
     let cancellation = PermCancellation::new();
@@ -2448,7 +2448,7 @@ async fn worker_supervisor_transport_cancellation_drops_effect_and_starts_next_g
     gated.wait_started().await;
     let first_generation = supervisor.active_generation_for_test().await.unwrap();
     cancellation.cancel();
-    assert_eq!(task.await.unwrap(), Err(WorkerError::Cancelled));
+    assert_eq!(task.await.unwrap(), Err(WorkerError::EffectOutcomeUnknown));
     assert!(gated.dropped.load(Ordering::Acquire));
     assert!(
         gated
