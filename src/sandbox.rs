@@ -23,6 +23,8 @@ pub struct Sandbox {
     shell_command_arg: String,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
+    #[cfg(test)]
+    complete_process_tree_for_test: bool,
 }
 
 /// Hard bounds for one captured subprocess.
@@ -73,12 +75,10 @@ pub(crate) struct CommandOutput {
 /// observes the signal, kills that child's process group, and reaps it before
 /// reporting [`CommandStatus::Cancelled`].
 #[derive(Debug, Clone)]
-#[cfg(feature = "loop")]
 pub(crate) struct CommandCancellation {
     sender: watch::Sender<bool>,
 }
 
-#[cfg(feature = "loop")]
 impl CommandCancellation {
     pub(crate) fn new() -> Self {
         let (sender, _) = watch::channel(false);
@@ -294,6 +294,8 @@ impl Sandbox {
             shell_command_arg: "-c".to_string(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            complete_process_tree_for_test: false,
         }
     }
 
@@ -382,6 +384,24 @@ impl Sandbox {
                 requested_network_policy: "backend-defined; mini-agent makes no network-isolation claim",
             },
         }
+    }
+
+    /// Whether this sandbox owns the complete descendant lifetime independently of process-group
+    /// membership. JS spawn authority is issued only when this stronger boundary is available.
+    pub(crate) fn owns_complete_process_tree(&self) -> bool {
+        #[cfg(test)]
+        if self.complete_process_tree_for_test {
+            return true;
+        }
+        cfg!(target_os = "linux")
+            && self.backend == "bwrap"
+            && self.policy() == SandboxPolicy::RequiredAndAvailable
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_complete_process_tree_for_test(mut self) -> Self {
+        self.complete_process_tree_for_test = true;
+        self
     }
 
     pub fn with_shell(self, shell: &str) -> Self {
@@ -686,6 +706,28 @@ impl Sandbox {
         limits: CommandLimits,
     ) -> std::io::Result<CommandOutput> {
         self.output_built_command_with_limits_scoped(cmd, limits, None)
+            .await
+    }
+
+    /// Cancellation-scoped variant for already-authorized commands. The returned future does
+    /// not resolve with `Cancelled` until the direct child is reaped and its process group has
+    /// been killed, so callers can finish durable reconciliation without leaking descendants.
+    #[cfg(feature = "js")]
+    pub(crate) async fn output_built_command_with_limits_cancelled(
+        &self,
+        cmd: Command,
+        limits: CommandLimits,
+        cancellation: &CommandCancellation,
+    ) -> std::io::Result<CommandOutput> {
+        if cancellation.is_cancelled() {
+            return Ok(CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: CommandStatus::Cancelled,
+            });
+        }
+        self.output_built_command_with_limits_scoped(cmd, limits, Some(cancellation.subscribe()))
             .await
     }
 
@@ -1137,6 +1179,12 @@ mod sandbox_tests {
     #[test]
     fn sandbox_disabled_policy_is_disabled() {
         assert_eq!(disabled().policy(), SandboxPolicy::Disabled);
+        assert!(!disabled().owns_complete_process_tree());
+        assert!(
+            disabled()
+                .with_complete_process_tree_for_test()
+                .owns_complete_process_tree()
+        );
     }
 
     #[test]

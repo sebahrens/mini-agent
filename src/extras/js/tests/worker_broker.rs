@@ -1478,7 +1478,7 @@ async fn worker_broker_grants_erase_authority_on_terminal_cancel_and_recycle() {
 }
 
 #[tokio::test]
-async fn worker_broker_outcome_unknown_terminates_caught_javascript_before_second_dispatch() {
+async fn worker_effect_cancellation_persists_unknown_and_stops_second_dispatch() {
     let invocation_id = invocation("inv-outcome-unknown-terminal");
     let case = OperationCase {
         name: "read_file",
@@ -1578,7 +1578,7 @@ async fn worker_broker_grants_callback_returns_only_closed_wire_errors() {
 }
 
 #[tokio::test]
-async fn worker_broker_grants_cancel_a_pending_ask_before_execution() {
+async fn worker_effect_cancellation_cancels_pending_ask_before_execution() {
     let invocation_id = invocation("inv-pending-ask");
     let case = operation_cases(&invocation_id).remove(0);
     let grant = grant(
@@ -1869,6 +1869,7 @@ enum OrderingExecutionFailure {
     None,
     BeforeEffect,
     AfterEffect,
+    PendingAfterIntent,
 }
 
 #[derive(Debug, Default)]
@@ -1942,19 +1943,68 @@ impl ParentEffectService for OrderingService {
             let durable_intents = String::from_utf8_lossy(&bytes)
                 .matches("\"state\":\"intent\"")
                 .count();
-            let mut record = record.lock().unwrap();
-            record.execute_calls += 1;
-            record.saw_durable_intent += usize::from(durable_intents > 0);
-            if matches!(failure, OrderingExecutionFailure::BeforeEffect) {
-                return Err(HostEffectError::BackendFailure);
+            {
+                let mut record = record.lock().unwrap();
+                record.execute_calls += 1;
+                record.saw_durable_intent += usize::from(durable_intents > 0);
+                if matches!(failure, OrderingExecutionFailure::BeforeEffect) {
+                    return Err(HostEffectError::BackendFailure);
+                }
+                record.effects += 1;
+                if matches!(failure, OrderingExecutionFailure::AfterEffect) {
+                    return Err(HostEffectError::OutcomeUnknown);
+                }
             }
-            record.effects += 1;
-            if matches!(failure, OrderingExecutionFailure::AfterEffect) {
-                return Err(HostEffectError::OutcomeUnknown);
+            if matches!(failure, OrderingExecutionFailure::PendingAfterIntent) {
+                return std::future::pending().await;
             }
             Ok(result)
         })
     }
+}
+
+#[tokio::test]
+async fn worker_effect_cancellation_reconciles_dropped_post_intent_future_as_unknown() {
+    let invocation_id = invocation("inv-interrupted-post-intent");
+    let case = operation_cases(&invocation_id).remove(1);
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let request = request(&case, &grant);
+    let root = AuditTempRoot::new("interrupted-post-intent");
+    let owner = root.owner();
+    let audit = EffectAudit::open(owner.clone()).unwrap();
+    let (service, record) = ordering_service(owner, OrderingExecutionFailure::PendingAfterIntent);
+    let mut broker = InvocationBroker::new(
+        invocation_id,
+        vec![grant],
+        HostCapability::all(),
+        service,
+        Arc::new(Mutex::new(audit)),
+    )
+    .unwrap();
+
+    let mut dispatch = Box::pin(broker.dispatch(request, PermCancellation::new()));
+    tokio::select! {
+        biased;
+        result = &mut dispatch => panic!("post-intent service unexpectedly completed: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    drop(dispatch);
+    assert_eq!(record.lock().unwrap().saw_durable_intent, 1);
+
+    assert!(matches!(
+        InvocationEffectHandler::reconcile_interrupted_effect(&mut broker),
+        EffectResult::Error(error) if error.code == EffectErrorCode::OutcomeUnknown
+    ));
+    let records = broker.audit_records_for_test();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].state, AuditState::Intent);
+    assert_eq!(records[1].state, AuditState::OutcomeUnknown);
+    broker.recycle();
+    assert_eq!(broker.tracked_grant_count(), 0);
 }
 
 fn ordering_service(

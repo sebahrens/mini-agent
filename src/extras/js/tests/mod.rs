@@ -60,6 +60,7 @@ mod skill_telemetry_retention;
 mod skill_verification_semantics;
 mod worker_broker;
 mod worker_containment;
+mod worker_effect_cancellation;
 mod worker_effect_services;
 mod worker_fault_matrix;
 mod worker_protocol;
@@ -91,6 +92,7 @@ fn make_test_tool_with_permissions(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) -> JsTool {
+    let sandbox = sandbox.with_complete_process_tree_for_test();
     let root =
         std::env::temp_dir().join(format!("mini-agent-js-test-audit-{}", uuid::Uuid::new_v4()));
     let paths = crate::paths::AppPaths {

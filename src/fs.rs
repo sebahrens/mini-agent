@@ -1,4 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
 
 mod private;
 
@@ -52,6 +56,140 @@ enum AtomicWriteFailure {
 enum AtomicWriteMode {
     Replace,
     CreateNew,
+}
+
+/// Cooperative stop signal for descriptor-relative atomic writes. Cancellation and the final
+/// publication-start decision share one atomic state transition: cancellation which wins prevents
+/// rename, while an already-approved syscall may finish under an ambiguous caller result.
+const ATOMIC_WRITE_ACTIVE: u8 = 0;
+const ATOMIC_WRITE_CANCELLED: u8 = 1;
+const ATOMIC_WRITE_PUBLISHING: u8 = 2;
+const ATOMIC_WRITE_FINISHED: u8 = 3;
+
+#[derive(Debug, Default)]
+struct AtomicWriteCancellationState {
+    publication: AtomicU8,
+    #[cfg(test)]
+    publication_probe: Option<AtomicWritePublicationProbe>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AtomicWriteCancellation(Arc<AtomicWriteCancellationState>);
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct AtomicWritePublicationProbe {
+    reached: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+    point: AtomicWriteProbePoint,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AtomicWriteProbePoint {
+    BeforeDecision,
+    AfterDecision,
+}
+
+#[cfg(test)]
+impl AtomicWritePublicationProbe {
+    pub(crate) fn wait_until_reached(&self) {
+        self.reached.wait();
+    }
+
+    pub(crate) fn resume(&self) {
+        self.resume.wait();
+    }
+}
+
+impl AtomicWriteCancellation {
+    pub(crate) fn cancel(&self) {
+        let _ = self.0.publication.compare_exchange(
+            ATOMIC_WRITE_ACTIVE,
+            ATOMIC_WRITE_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn check(&self) -> std::io::Result<()> {
+        if self.0.publication.load(Ordering::Acquire) == ATOMIC_WRITE_CANCELLED {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "atomic write cancelled before publication",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn publish<T>(&self, operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+        #[cfg(test)]
+        if let Some(probe) = &self.0.publication_probe
+            && probe.point == AtomicWriteProbePoint::BeforeDecision
+        {
+            probe.reached.wait();
+            probe.resume.wait();
+        }
+        self.0
+            .publication
+            .compare_exchange(
+                ATOMIC_WRITE_ACTIVE,
+                ATOMIC_WRITE_PUBLISHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "atomic write cancelled before publication",
+                )
+            })?;
+        #[cfg(test)]
+        if let Some(probe) = &self.0.publication_probe
+            && probe.point == AtomicWriteProbePoint::AfterDecision
+        {
+            probe.reached.wait();
+            probe.resume.wait();
+        }
+        // CAS is the publication-start decision. Cancellation never waits for OS I/O: if it wins,
+        // this operation cannot begin; if publication wins, the already-approved syscall may
+        // finish and the caller truthfully reports OutcomeUnknown.
+        let result = operation();
+        self.0
+            .publication
+            .store(ATOMIC_WRITE_FINISHED, Ordering::Release);
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_publication_probe_for_test() -> (Self, AtomicWritePublicationProbe) {
+        let probe = AtomicWritePublicationProbe {
+            reached: Arc::new(std::sync::Barrier::new(2)),
+            resume: Arc::new(std::sync::Barrier::new(2)),
+            point: AtomicWriteProbePoint::BeforeDecision,
+        };
+        let cancellation = Self(Arc::new(AtomicWriteCancellationState {
+            publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+            publication_probe: Some(probe.clone()),
+        }));
+        (cancellation, probe)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_blocking_publication_probe_for_test() -> (Self, AtomicWritePublicationProbe)
+    {
+        let probe = AtomicWritePublicationProbe {
+            reached: Arc::new(std::sync::Barrier::new(2)),
+            resume: Arc::new(std::sync::Barrier::new(2)),
+            point: AtomicWriteProbePoint::AfterDecision,
+        };
+        let cancellation = Self(Arc::new(AtomicWriteCancellationState {
+            publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+            publication_probe: Some(probe.clone()),
+        }));
+        (cancellation, probe)
+    }
 }
 
 #[cfg(unix)]
@@ -141,7 +279,13 @@ pub(crate) async fn atomic_write_resolved(
     path: impl AsRef<Path>,
     contents: impl AsRef<[u8]>,
 ) -> std::io::Result<()> {
-    atomic_write_resolved_inner(path.as_ref(), contents.as_ref(), None).await
+    atomic_write_resolved_inner(
+        path.as_ref(),
+        contents.as_ref(),
+        None,
+        AtomicWriteCancellation::default(),
+    )
+    .await
 }
 
 /// Variant used when a permission-gated caller captured the approved parent
@@ -152,13 +296,35 @@ pub(crate) async fn atomic_write_resolved_checked(
     contents: impl AsRef<[u8]>,
     approved_parent: std::fs::Metadata,
 ) -> std::io::Result<()> {
-    atomic_write_resolved_inner(path.as_ref(), contents.as_ref(), Some(approved_parent)).await
+    atomic_write_resolved_inner(
+        path.as_ref(),
+        contents.as_ref(),
+        Some(approved_parent),
+        AtomicWriteCancellation::default(),
+    )
+    .await
+}
+
+pub(crate) async fn atomic_write_resolved_checked_cancellable(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+    approved_parent: std::fs::Metadata,
+    cancellation: AtomicWriteCancellation,
+) -> std::io::Result<()> {
+    atomic_write_resolved_inner(
+        path.as_ref(),
+        contents.as_ref(),
+        Some(approved_parent),
+        cancellation,
+    )
+    .await
 }
 
 async fn atomic_write_resolved_inner(
     path: &Path,
     contents: &[u8],
     approved_parent: Option<std::fs::Metadata>,
+    cancellation: AtomicWriteCancellation,
 ) -> std::io::Result<()> {
     tracing::debug!(
         "atomic_write: {} ({} bytes)",
@@ -179,6 +345,7 @@ async fn atomic_write_resolved_inner(
             approved_parent.as_ref(),
             AtomicWriteMode::Replace,
             AtomicWriteFailure::None,
+            &cancellation,
         )
     })
     .await
@@ -192,6 +359,21 @@ pub(crate) async fn atomic_create_resolved_checked(
     path: impl AsRef<Path>,
     contents: impl AsRef<[u8]>,
     approved_parent: std::fs::Metadata,
+) -> std::io::Result<()> {
+    atomic_create_resolved_checked_cancellable(
+        path,
+        contents,
+        approved_parent,
+        AtomicWriteCancellation::default(),
+    )
+    .await
+}
+
+pub(crate) async fn atomic_create_resolved_checked_cancellable(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+    approved_parent: std::fs::Metadata,
+    cancellation: AtomicWriteCancellation,
 ) -> std::io::Result<()> {
     let path = path.as_ref().to_path_buf();
     let contents = contents.as_ref().to_vec();
@@ -208,6 +390,7 @@ pub(crate) async fn atomic_create_resolved_checked(
             Some(&approved_parent),
             AtomicWriteMode::CreateNew,
             AtomicWriteFailure::None,
+            &cancellation,
         )
     })
     .await
@@ -227,6 +410,7 @@ pub(crate) fn atomic_write_sync(path: &Path, contents: &[u8]) -> std::io::Result
         None,
         AtomicWriteMode::Replace,
         AtomicWriteFailure::None,
+        &AtomicWriteCancellation::default(),
     )
 }
 
@@ -243,6 +427,7 @@ pub(crate) fn atomic_create_sync(path: &Path, contents: &[u8]) -> std::io::Resul
         None,
         AtomicWriteMode::CreateNew,
         AtomicWriteFailure::None,
+        &AtomicWriteCancellation::default(),
     )
 }
 
@@ -259,6 +444,7 @@ pub(crate) fn atomic_write_within_sync(
         None,
         AtomicWriteMode::Replace,
         AtomicWriteFailure::None,
+        &AtomicWriteCancellation::default(),
     )
 }
 
@@ -280,6 +466,7 @@ pub(crate) fn atomic_write_with_failure_sync(
         } else {
             AtomicWriteFailure::Write
         },
+        &AtomicWriteCancellation::default(),
     )
 }
 
@@ -353,7 +540,9 @@ fn atomic_write_within_sync_impl(
     approved_parent: Option<&std::fs::Metadata>,
     mode: AtomicWriteMode,
     failure: AtomicWriteFailure,
+    cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
+    cancellation.check()?;
     let approved_root = absolute_lexical(approved_root)?;
     let path = absolute_lexical(path)?;
     let (relative_parent, leaf) = relative_target(&approved_root, &path)?;
@@ -377,6 +566,7 @@ fn atomic_write_within_sync_impl(
         approved_parent,
         mode,
         failure,
+        cancellation,
     )
 }
 
@@ -413,6 +603,7 @@ fn atomic_write_platform(
     approved_parent: Option<&std::fs::Metadata>,
     mode: AtomicWriteMode,
     failure: AtomicWriteFailure,
+    cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
     use std::ffi::{CString, OsStr};
     use std::fs::File;
@@ -621,6 +812,7 @@ fn atomic_write_platform(
         }
     }
 
+    cancellation.check()?;
     let directory = open_parent(canonical_root, relative_parent, approved_root)?;
     let directory_metadata = directory.metadata()?;
     if let Some(approved) = approved_parent {
@@ -673,6 +865,12 @@ fn atomic_write_platform(
         temp.flush()
     })();
     if let Err(error) = write_result {
+        drop(temp);
+        unlink_owned_temp(&directory, &temp_name, &temp_identity);
+        return Err(error);
+    }
+
+    if let Err(error) = cancellation.check() {
         drop(temp);
         unlink_owned_temp(&directory, &temp_name, &temp_identity);
         return Err(error);
@@ -749,7 +947,15 @@ fn atomic_write_platform(
             return Err(error);
         }
     };
-    let rename_result = rename_entry(&directory, &temp_name, &leaf, mode);
+    let rename_result =
+        match cancellation.publish(|| Ok(rename_entry(&directory, &temp_name, &leaf, mode))) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(temp);
+                unlink_owned_temp(&directory, &temp_name, &temp_identity);
+                return Err(error);
+            }
+        };
     if rename_result < 0 {
         let error = std::io::Error::last_os_error();
         #[cfg(unix)]
@@ -776,6 +982,7 @@ fn atomic_write_platform(
     approved_parent: Option<&std::fs::Metadata>,
     mode: AtomicWriteMode,
     failure: AtomicWriteFailure,
+    cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -788,6 +995,7 @@ fn atomic_write_platform(
         }
     }
 
+    cancellation.check()?;
     let parent = canonical_root.join(relative_parent);
     ensure_same_file(
         canonical_root,
@@ -842,6 +1050,11 @@ fn atomic_write_platform(
         remove_if_owned(&temp, &temp_identity);
         return Err(error);
     }
+    if let Err(error) = cancellation.check() {
+        drop(file);
+        remove_if_owned(&temp, &temp_identity);
+        return Err(error);
+    }
     drop(file);
 
     let current_parent = match std::fs::symlink_metadata(&parent) {
@@ -878,7 +1091,7 @@ fn atomic_write_platform(
         remove_if_owned(&temp, &temp_identity);
         return Err(std::io::Error::other("injected atomic-rename failure"));
     }
-    if let Err(error) = std::fs::rename(&temp, &target) {
+    if let Err(error) = cancellation.publish(|| std::fs::rename(&temp, &target)) {
         remove_if_owned(&temp, &temp_identity);
         return Err(error);
     }

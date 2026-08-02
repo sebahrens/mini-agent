@@ -920,6 +920,10 @@ pub(crate) struct InvocationBroker<S> {
     state: InvocationState,
     service: S,
     audit: SharedEffectAudit,
+    /// Durable intent currently handed to the effect service. This parent-only marker survives
+    /// dropping an uncooperative service future so cancellation can append a truthful unknown
+    /// completion before authority is erased.
+    in_flight_effect: Option<String>,
     #[cfg(feature = "skills")]
     skill_calls: Option<SkillCallAuthority>,
     #[cfg(feature = "skills")]
@@ -950,6 +954,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             state: InvocationState::Active,
             service,
             audit,
+            in_flight_effect: None,
             #[cfg(feature = "skills")]
             skill_calls: None,
             #[cfg(feature = "skills")]
@@ -1230,6 +1235,8 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             return Err(HostEffectError::AuditFailure);
         }
 
+        self.in_flight_effect = Some(effect_id.clone());
+
         let execution_result = self
             .service
             .execute(&authorized, &request.operation, cancellation)
@@ -1255,6 +1262,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             self.erase_authority(InvocationState::Terminal);
             return Err(HostEffectError::AuditFailure);
         }
+        self.in_flight_effect = None;
         if matches!(execution_result, Err(HostEffectError::InvocationCancelled)) {
             self.cancel_invocation();
         }
@@ -1335,7 +1343,33 @@ impl<S: ParentEffectService> InvocationBroker<S> {
     fn erase_authority(&mut self, state: InvocationState) {
         self.grants.clear();
         self.retired_grants.clear();
+        self.in_flight_effect = None;
         self.state = state;
+    }
+
+    fn reconcile_interrupted_effect(&mut self) -> EffectResult {
+        let Some(effect_id) = self.in_flight_effect.take() else {
+            return HostEffectError::InvocationCancelled.into_wire_result();
+        };
+        let completion = self
+            .audit
+            .lock()
+            .map_err(|_| HostEffectError::AuditFailure)
+            .and_then(|mut audit| {
+                audit
+                    .append_completion(EffectCompletion {
+                        effect_id,
+                        result_code: AuditResultCode::OutcomeUnknown,
+                    })
+                    .map_err(HostEffectError::from)
+            });
+        match completion {
+            Ok(_) => HostEffectError::OutcomeUnknown.into_wire_result(),
+            Err(error) => {
+                self.erase_authority(InvocationState::Terminal);
+                error.into_wire_result()
+            }
+        }
     }
 }
 
@@ -1699,6 +1733,10 @@ impl<S: ParentEffectService> InvocationEffectHandler for InvocationBroker<S> {
                 Err(error) => error.into_wire_result(),
             }
         })
+    }
+
+    fn reconcile_interrupted_effect(&mut self) -> EffectResult {
+        InvocationBroker::reconcile_interrupted_effect(self)
     }
 
     #[cfg(feature = "skills")]
