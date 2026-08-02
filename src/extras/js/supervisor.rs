@@ -7,15 +7,15 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::protocol::{
-    BuildIdentity, EffectRequest, EffectResponse, EffectResult, FrameError, InvocationId,
-    ParentFrame, ParentHello, ParentProtocol, ParentWireFrame, RunStep, StepResult,
-    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerWireFrame, read_frame,
-    write_frame,
+    BuildIdentity, DiagnosticClass, EffectErrorCode, EffectRequest, EffectResponse, EffectResult,
+    FrameError, InvocationId, JsErrorCode, ParentFrame, ParentHello, ParentProtocol,
+    ParentWireFrame, RunStep, StepOutcome, StepResult, VerificationResult, VerifyArtifact,
+    WireFrame, WorkerFrame, WorkerWireFrame, read_frame, write_frame,
 };
 #[cfg(feature = "skills")]
 use super::protocol::{SkillCallRequest, SkillCallResponse};
@@ -74,6 +74,8 @@ pub(crate) enum WorkerError {
     Cancelled,
     #[error("JavaScript worker invocation exceeded its deadline")]
     TimedOut,
+    #[error("JavaScript effect completed with an unknown outcome")]
+    EffectOutcomeUnknown,
     #[error("JavaScript worker returned a stale process generation")]
     StaleGeneration,
     #[error("JavaScript worker supervisor identity space is exhausted")]
@@ -96,6 +98,8 @@ struct SupervisorInner {
     accepts_test_preamble: bool,
     watchdog: Duration,
     reuse_policy: WorkerReusePolicy,
+    #[cfg(test)]
+    idle_retirement: tokio::sync::Notify,
 }
 
 struct SupervisorState {
@@ -113,6 +117,12 @@ struct WorkerConnection {
     stderr_drain: BoundedStderrDrain,
     created_at: Instant,
     completed_invocations: u64,
+    retirement: Option<Arc<RetirementTicket>>,
+}
+
+struct RetirementTicket {
+    cancelled: Mutex<bool>,
+    wake: Condvar,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,6 +149,47 @@ impl WorkerReusePolicy {
 impl Default for WorkerReusePolicy {
     fn default() -> Self {
         Self::new(MAX_PROCESS_AGE, MAX_PROCESS_INVOCATIONS)
+    }
+}
+
+impl RetirementTicket {
+    fn new() -> Self {
+        Self {
+            cancelled: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.wake.notify_all();
+    }
+
+    fn wait_until(&self, deadline: Instant) -> bool {
+        let mut cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if *cancelled {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            let (next, timeout) = self
+                .wake
+                .wait_timeout(cancelled, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cancelled = next;
+            if timeout.timed_out() && !*cancelled {
+                return true;
+            }
+        }
     }
 }
 
@@ -178,6 +229,9 @@ impl BoundedStderrDrain {
 
 impl Drop for WorkerConnection {
     fn drop(&mut self) {
+        if let Some(retirement) = &self.retirement {
+            retirement.cancel();
+        }
         let _ = self.process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
         self.stderr_drain.join_bounded(STDERR_JOIN_TIMEOUT);
     }
@@ -229,6 +283,8 @@ impl JsWorkerSupervisor {
             accepts_test_preamble,
             watchdog,
             reuse_policy,
+            #[cfg(test)]
+            idle_retirement: tokio::sync::Notify::new(),
         }))
     }
 
@@ -252,6 +308,11 @@ impl JsWorkerSupervisor {
         reuse_policy: WorkerReusePolicy,
     ) -> Self {
         Self::new_with_policy(Arc::new(launcher), true, watchdog, reuse_policy)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_idle_retirement_for_test(&self) {
+        self.0.idle_retirement.notified().await;
     }
 
     pub(crate) async fn execute(
@@ -378,20 +439,14 @@ impl JsWorkerSupervisor {
             &mut connection,
             invocation,
             request,
-            authority.handler(),
+            &mut authority,
             &cancellation,
             deadline,
         )
         .await;
-        let reusable_terminal = matches!(
-            &result,
-            Ok(InvocationTerminal::Step(StepResult {
-                outcome: super::protocol::StepOutcome::Value(_)
-                    | super::protocol::StepOutcome::Void
-                    | super::protocol::StepOutcome::Error(_),
-                ..
-            })) | Ok(InvocationTerminal::Verification(_))
-        );
+        let reusable_terminal = result
+            .as_ref()
+            .is_ok_and(|terminal| terminal_is_reusable(terminal));
         if reusable_terminal {
             authority.finish();
             connection.completed_invocations = connection.completed_invocations.saturating_add(1);
@@ -399,7 +454,7 @@ impl JsWorkerSupervisor {
             authority.recycle();
         }
         if reusable_terminal && self.0.reuse_policy.permits(&connection, Instant::now()) {
-            state.idle = Some(connection);
+            store_idle_with_retirement(&self.0, &mut state, connection);
         }
         active.armed = false;
         self.0.active_generation.store(0, Ordering::Release);
@@ -520,6 +575,9 @@ impl<'a, H: InvocationEffectHandler> InvocationAuthority<'a, H> {
     }
 
     fn finish(&mut self) {
+        if self.terminal {
+            return;
+        }
         if let Some(handler) = self.handler.as_deref_mut() {
             handler.finish_invocation();
         }
@@ -527,6 +585,9 @@ impl<'a, H: InvocationEffectHandler> InvocationAuthority<'a, H> {
     }
 
     fn recycle(&mut self) {
+        if self.terminal {
+            return;
+        }
         if let Some(handler) = self.handler.as_deref_mut() {
             handler.recycle_invocation();
         }
@@ -573,6 +634,95 @@ enum InvocationTerminal {
     Verification(VerificationResult),
 }
 
+fn terminal_is_reusable(terminal: &InvocationTerminal) -> bool {
+    match terminal {
+        InvocationTerminal::Step(result) => step_outcome_is_reusable(&result.outcome),
+        InvocationTerminal::Verification(result) => verification_result_is_reusable(result),
+    }
+}
+
+fn step_outcome_is_reusable(outcome: &StepOutcome) -> bool {
+    matches!(
+        outcome,
+        StepOutcome::Value(_)
+            | StepOutcome::Void
+            | StepOutcome::Error(
+                JsErrorCode::Syntax | JsErrorCode::Exception | JsErrorCode::InvalidResult
+            )
+    )
+}
+
+fn verification_result_is_reusable(result: &VerificationResult) -> bool {
+    result.cases.iter().all(|case| {
+        !case.diagnostic.as_ref().is_some_and(|diagnostic| {
+            matches!(
+                diagnostic.class,
+                DiagnosticClass::ResourceLimit | DiagnosticClass::Internal
+            )
+        })
+    })
+}
+
+fn store_idle_with_retirement(
+    inner: &Arc<SupervisorInner>,
+    state: &mut SupervisorState,
+    mut connection: WorkerConnection,
+) {
+    if connection.retirement.is_some() {
+        state.idle = Some(connection);
+        return;
+    }
+    let generation = connection.generation;
+    let retire_at = connection
+        .created_at
+        .checked_add(inner.reuse_policy.max_age)
+        .unwrap_or(connection.created_at);
+    let ticket = Arc::new(RetirementTicket::new());
+    let waiting_ticket = ticket.clone();
+    let weak = Arc::downgrade(inner);
+    connection.retirement = Some(ticket);
+    let retirement = std::thread::Builder::new()
+        .name(format!("mini-agent-js-idle-retire-{generation}"))
+        .spawn(move || retire_idle_generation(weak, generation, retire_at, waiting_ticket));
+    if retirement.is_ok() {
+        state.idle = Some(connection);
+    }
+}
+
+fn retire_idle_generation(
+    weak: Weak<SupervisorInner>,
+    generation: u64,
+    retire_at: Instant,
+    ticket: Arc<RetirementTicket>,
+) {
+    if !ticket.wait_until(retire_at) {
+        return;
+    }
+    let Some(inner) = weak.upgrade() else {
+        return;
+    };
+    let retired = {
+        let mut state = inner.transport.blocking_lock();
+        if state
+            .idle
+            .as_ref()
+            .is_some_and(|connection| connection.generation == generation)
+        {
+            state.idle.take()
+        } else {
+            None
+        }
+    };
+    let did_retire = retired.is_some();
+    drop(retired);
+    #[cfg(test)]
+    if did_retire {
+        inner.idle_retirement.notify_one();
+    }
+    #[cfg(not(test))]
+    let _ = did_retire;
+}
+
 struct RejectEffects;
 
 impl InvocationEffectHandler for RejectEffects {
@@ -609,6 +759,7 @@ async fn launch_connection(
         stderr_drain,
         created_at: Instant::now(),
         completed_invocations: 0,
+        retirement: None,
     };
     let hello = WireFrame::connection(build, 0, ParentFrame::Hello(ParentHello {}));
     connection
@@ -745,7 +896,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
     connection: &mut WorkerConnection,
     invocation: InvocationId,
     request: InvocationRequest,
-    effects: &mut Option<&mut H>,
+    authority: &mut InvocationAuthority<'_, H>,
     cancellation: &PermCancellation,
     deadline: Instant,
 ) -> Result<InvocationTerminal, WorkerError> {
@@ -775,7 +926,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
         connection.sequence = advance(connection.sequence)?;
         match frame.message {
             WorkerFrame::EffectRequest(request) => {
-                let Some(handler) = effects.as_deref_mut() else {
+                let Some(handler) = authority.handler().as_deref_mut() else {
                     return Err(WorkerError::UnexpectedVerificationEffect);
                 };
                 let effect_cancellation = PermCancellation::new();
@@ -800,6 +951,16 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     }
                 };
                 cancel_on_drop.armed = false;
+                drop(effect);
+                let outcome_unknown = matches!(
+                    &result,
+                    EffectResult::Error(super::protocol::EffectError {
+                        code: EffectErrorCode::OutcomeUnknown,
+                    })
+                );
+                if outcome_unknown {
+                    authority.recycle();
+                }
                 let response = WireFrame::invocation(
                     connection.build.clone(),
                     invocation.clone(),
@@ -813,12 +974,19 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     .protocol
                     .on_send(&response)
                     .map_err(|_| WorkerError::Protocol)?;
+                if outcome_unknown {
+                    // The durable effect outcome remains unknown even if the poisoned worker can
+                    // no longer receive its terminal response. Best-effort delivery closes the
+                    // worker state machine; the parent always returns the truthful effect error.
+                    let _ = write_parent(connection, response, cancellation, deadline).await;
+                    return Err(WorkerError::EffectOutcomeUnknown);
+                }
                 write_parent(connection, response, cancellation, deadline).await?;
                 connection.sequence = advance(connection.sequence)?;
             }
             #[cfg(feature = "skills")]
             WorkerFrame::SkillCallRequest(request) => {
-                let Some(handler) = effects.as_deref_mut() else {
+                let Some(handler) = authority.handler().as_deref_mut() else {
                     return Err(WorkerError::UnexpectedVerificationEffect);
                 };
                 if cancellation.is_cancelled() {

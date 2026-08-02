@@ -1011,11 +1011,16 @@ impl ParentProtocol {
             ) => {
                 validate_invocation(frame, invocation)?;
                 validate_effect(*effect, response.effect_ordinal)?;
-                Some(ParentState::AwaitWorker {
-                    invocation: invocation.clone(),
-                    next_effect: effect + 1,
-                    next_skill_call: *next_skill_call,
-                })
+                if effect_response_is_terminal(response) {
+                    self.active_kind = None;
+                    Some(ParentState::Closed)
+                } else {
+                    Some(ParentState::AwaitWorker {
+                        invocation: invocation.clone(),
+                        next_effect: effect + 1,
+                        next_skill_call: *next_skill_call,
+                    })
+                }
             }
             #[cfg(feature = "skills")]
             (
@@ -1220,11 +1225,16 @@ impl WorkerProtocol {
             ) => {
                 validate_invocation(frame, invocation)?;
                 validate_effect(*effect, response.effect_ordinal)?;
-                Some(WorkerState::Running {
-                    invocation: invocation.clone(),
-                    next_effect: effect + 1,
-                    next_skill_call: *next_skill_call,
-                })
+                if effect_response_is_terminal(response) {
+                    self.active_kind = None;
+                    Some(WorkerState::Closed)
+                } else {
+                    Some(WorkerState::Running {
+                        invocation: invocation.clone(),
+                        next_effect: effect + 1,
+                        next_skill_call: *next_skill_call,
+                    })
+                }
             }
             #[cfg(feature = "skills")]
             (
@@ -1393,6 +1403,15 @@ fn validate_header<M>(
         return Err(ProtocolError::SequenceExhausted);
     }
     Ok(())
+}
+
+fn effect_response_is_terminal(response: &EffectResponse) -> bool {
+    matches!(
+        &response.result,
+        EffectResult::Error(EffectError {
+            code: EffectErrorCode::OutcomeUnknown,
+        })
+    )
 }
 
 fn require_connection<M>(frame: &WireFrame<M>) -> Result<(), ProtocolError> {
