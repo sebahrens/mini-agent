@@ -15,6 +15,7 @@ use super::{
     CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, IdentityError, SkillArtifact,
     SkillExport,
 };
+use crate::extras::js::types::{EffectServiceError, PermCancellation};
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_DESCRIPTION_BYTES: usize = 1024;
@@ -575,6 +576,133 @@ impl ProposalHost {
     }
 }
 
+/// Parent-side proposal canonicalization and durable queue service. QuickJS
+/// object parsing is intentionally kept outside this API.
+#[derive(Clone)]
+pub(crate) struct ProposalEffectService {
+    host: ProposalHost,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProposalEffectResult {
+    pub(crate) skill_id: String,
+    pub(crate) proposal_id: String,
+    pub(crate) status: &'static str,
+    pub(crate) report_id: Option<String>,
+}
+
+pub(crate) struct PreparedProposalEffect {
+    artifact: SkillArtifact,
+    predecessor_id: Option<String>,
+}
+
+impl ProposalEffectService {
+    pub(crate) fn new(host: ProposalHost) -> Self {
+        Self { host }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        proposal: JsProposal,
+    ) -> Result<ProposalEffectResult, ProposalError> {
+        self.reserve_attempt()?;
+        self.execute_reserved(proposal)
+    }
+
+    /// Cancellation-aware parent API. Cancellation before dispatch is exact;
+    /// once the bounded queue command is handed off, cancellation returns the
+    /// truthful unknown-outcome class while the blocking waiter drains on the
+    /// blocking pool.
+    pub(crate) async fn execute_cancellable(
+        &self,
+        proposal: JsProposal,
+        cancellation: PermCancellation,
+    ) -> Result<ProposalEffectResult, EffectServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(EffectServiceError::Cancelled);
+        }
+        self.reserve_attempt().map_err(proposal_service_error)?;
+        let prepared = self
+            .authorize_reserved(proposal)
+            .map_err(proposal_service_error)?;
+        if cancellation.is_cancelled() {
+            return Err(EffectServiceError::Cancelled);
+        }
+        let service = self.clone();
+        let execution = tokio::task::spawn_blocking(move || service.execute_prepared(prepared));
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(EffectServiceError::OutcomeUnknown),
+            result = execution => result
+                .map_err(|_| EffectServiceError::BackendFailure)?
+                .map_err(proposal_service_error),
+        }
+    }
+
+    pub(crate) fn reserve_attempt(&self) -> Result<(), ProposalError> {
+        self.host.budget.consume()
+    }
+
+    pub(crate) fn execute_reserved(
+        &self,
+        proposal: JsProposal,
+    ) -> Result<ProposalEffectResult, ProposalError> {
+        let prepared = self.authorize_reserved(proposal)?;
+        self.execute_prepared(prepared)
+    }
+
+    pub(crate) fn authorize_reserved(
+        &self,
+        proposal: JsProposal,
+    ) -> Result<PreparedProposalEffect, ProposalError> {
+        let predecessor_id = proposal.predecessor_id.clone();
+        let artifact = proposal.validate_and_canonicalize()?;
+        Ok(PreparedProposalEffect {
+            artifact,
+            predecessor_id,
+        })
+    }
+
+    pub(crate) fn execute_prepared(
+        &self,
+        prepared: PreparedProposalEffect,
+    ) -> Result<ProposalEffectResult, ProposalError> {
+        let result = self
+            .host
+            .sender
+            .enqueue(prepared.artifact, prepared.predecessor_id)?;
+        let status = match result.status {
+            super::store::EnqueueStatus::Pending => "pending",
+            super::store::EnqueueStatus::Verified => "verified",
+            super::store::EnqueueStatus::Rejected => "rejected",
+            super::store::EnqueueStatus::AwaitingApproval => "awaiting_approval",
+            super::store::EnqueueStatus::Approved => "approved",
+        };
+        Ok(ProposalEffectResult {
+            skill_id: result.skill_id,
+            proposal_id: result.proposal_id,
+            status,
+            report_id: result.report_id,
+        })
+    }
+}
+
+fn proposal_service_error(error: ProposalError) -> EffectServiceError {
+    match error {
+        ProposalError::InvalidField { .. }
+        | ProposalError::UnknownField { .. }
+        | ProposalError::InvalidCapability(_)
+        | ProposalError::Identity(_) => EffectServiceError::InvalidTarget,
+        ProposalError::PayloadTooLarge => EffectServiceError::BodyLimit,
+        ProposalError::BudgetExhausted => EffectServiceError::PermissionDenied,
+        ProposalError::QueueTimeout => EffectServiceError::TimedOut,
+        ProposalError::QueueFull
+        | ProposalError::QueueClosed
+        | ProposalError::StoreUnavailable
+        | ProposalError::WorkerUnavailable => EffectServiceError::BackendFailure,
+    }
+}
+
 impl ProposalSender {
     pub(crate) fn enqueue(
         &self,
@@ -603,6 +731,19 @@ impl ProposalSender {
 
 pub(crate) struct ProposalReceiver {
     receiver: mpsc::Receiver<ProposalCommand>,
+}
+
+#[cfg(test)]
+impl ProposalReceiver {
+    pub(crate) fn respond_next(
+        &self,
+        delay: Duration,
+        result: Result<EnqueueResult, ProposalError>,
+    ) {
+        let command = self.receiver.recv().expect("proposal command");
+        std::thread::sleep(delay);
+        let _ = command.reply.send(result);
+    }
 }
 
 pub(crate) struct ProposalWorker {

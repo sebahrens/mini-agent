@@ -60,6 +60,7 @@ mod skill_telemetry_retention;
 mod skill_verification_semantics;
 mod worker_broker;
 mod worker_containment;
+mod worker_effect_services;
 mod worker_protocol;
 mod worker_runtime;
 
