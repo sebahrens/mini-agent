@@ -7,13 +7,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::coordinator::{
     CoordinatedMutationError, CoordinatorError, IndexCoordinator, PublicationReport,
 };
-use super::store::{SkillStore, StoreError};
+#[cfg(test)]
+use super::store::{ApprovalAuthorizationRequest, approval_manifest_digest};
+use super::store::{ApprovalTransition, SkillStore, StoreError, consume_approval_authorization};
+
+const APPROVAL_AUTHORIZATION_LIFETIME_SECONDS: i64 = 300;
 
 /// Version of the canonical lifecycle evidence encoding.
 pub const EVIDENCE_SNAPSHOT_VERSION: u32 = 1;
@@ -232,11 +236,30 @@ pub struct ReplacementTransitionOutcome {
 
 #[derive(Debug, Clone)]
 pub struct HumanApproval {
-    pub approval_id: String,
-    pub actor_id: String,
-    pub authenticated: bool,
-    pub evaluation_report_id: String,
-    pub expected_row_version: i64,
+    approval_id: String,
+    actor_id: String,
+    evaluation_report_id: String,
+    expected_row_version: i64,
+}
+
+impl HumanApproval {
+    /// Test-only stand-in for an opaque approval produced by the parent authentication adapter.
+    #[cfg(test)]
+    pub(crate) fn verified(
+        approval_id: impl Into<String>,
+        actor_id: impl Into<String>,
+        evaluation_report_id: impl Into<String>,
+        expected_row_version: i64,
+    ) -> Result<Self, LifecycleError> {
+        let approval = Self {
+            approval_id: approval_id.into(),
+            actor_id: actor_id.into(),
+            evaluation_report_id: evaluation_report_id.into(),
+            expected_row_version,
+        };
+        validate_human_approval(&approval)?;
+        Ok(approval)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -355,6 +378,7 @@ impl<'a> CoordinatedLifecycle<'a> {
         idempotency_key: &str,
         skill_id: &str,
         approval: &HumanApproval,
+        authorization: &super::store::ApprovalAuthorization,
         snapshot: &EvidenceSnapshot,
         created_at: i64,
     ) -> Result<(TransitionOutcome, PublicationReport), LifecyclePublicationError> {
@@ -364,6 +388,7 @@ impl<'a> CoordinatedLifecycle<'a> {
                     idempotency_key,
                     skill_id,
                     approval,
+                    authorization,
                     snapshot,
                     created_at,
                 )?;
@@ -398,6 +423,36 @@ pub struct LifecycleService<'a> {
 }
 
 impl<'a> LifecycleService<'a> {
+    /// Test-only stand-in for the separate parent authentication interaction.
+    #[cfg(test)]
+    pub(crate) fn authorize_root_for_test(
+        &mut self,
+        skill_id: &str,
+        approval: &HumanApproval,
+        issued_at: i64,
+    ) -> Result<super::store::ApprovalAuthorization, LifecycleError> {
+        validate_human_approval(approval)?;
+        let artifact = self
+            .store
+            .get(skill_id)?
+            .ok_or_else(|| StoreError::NotFound(skill_id.to_string()))?;
+        let expires_at = issued_at
+            .checked_add(APPROVAL_AUTHORIZATION_LIFETIME_SECONDS)
+            .ok_or(LifecycleError::InvalidHumanApproval)?;
+        Ok(self
+            .store
+            .issue_approval_authorization_for_test(ApprovalAuthorizationRequest {
+                authorization_id: approval.approval_id.clone(),
+                principal: approval.actor_id.clone(),
+                artifact_id: skill_id.to_string(),
+                report_id: approval.evaluation_report_id.clone(),
+                manifest_digest: approval_manifest_digest(&artifact)?,
+                transition: ApprovalTransition::CanaryToActive,
+                issued_at,
+                expires_at,
+            })?)
+    }
+
     pub fn new(store: &'a mut SkillStore) -> Self {
         Self { store }
     }
@@ -562,6 +617,7 @@ impl<'a> LifecycleService<'a> {
 
     /// Record Phase 4's first authenticated approval after the unchanged
     /// verified artifact has entered non-retrievable root canary.
+    #[cfg(test)]
     pub(crate) fn record_root_canary_approval(
         &mut self,
         skill_id: &str,
@@ -598,10 +654,14 @@ impl<'a> LifecycleService<'a> {
         idempotency_key: &str,
         skill_id: &str,
         approval: &HumanApproval,
+        authorization: &super::store::ApprovalAuthorization,
         snapshot: &EvidenceSnapshot,
         created_at: i64,
     ) -> Result<TransitionOutcome, LifecycleError> {
         validate_human_approval(approval)?;
+        if !authorization.binds_approval(&approval.approval_id, &approval.actor_id) {
+            return Err(StoreError::Unauthorized.into());
+        }
         if idempotency_key.is_empty()
             || snapshot.artifact_id != skill_id
             || snapshot.predecessor_id.is_some()
@@ -620,8 +680,26 @@ impl<'a> LifecycleService<'a> {
             reason: "second_authenticated_root_activation".to_string(),
             snapshot: snapshot.clone(),
         };
-        let tx = self.store.connection_mut().transaction()?;
-        if let Some(replayed) = read_idempotent_transition(&tx, &request)? {
+        {
+            let tx = self
+                .store
+                .connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(replayed) = read_idempotent_root_transition(&tx, &request, approval)? {
+                tx.commit()?;
+                return Ok(replayed);
+            }
+            tx.commit()?;
+        }
+        let artifact = self
+            .store
+            .get(skill_id)?
+            .ok_or_else(|| LifecycleError::Store(StoreError::NotFound(skill_id.to_string())))?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(replayed) = read_idempotent_root_transition(&tx, &request, approval)? {
             tx.commit()?;
             return Ok(replayed);
         }
@@ -661,6 +739,14 @@ impl<'a> LifecycleService<'a> {
         {
             return Err(LifecycleError::InvalidHumanApproval);
         }
+        consume_approval_authorization(
+            &tx,
+            authorization,
+            &artifact,
+            &approval.evaluation_report_id,
+            ApprovalTransition::CanaryToActive,
+            created_at,
+        )?;
         insert_approval(
             &tx,
             skill_id,
@@ -985,8 +1071,7 @@ impl<'a> LifecycleService<'a> {
 }
 
 fn validate_human_approval(approval: &HumanApproval) -> Result<(), LifecycleError> {
-    if !approval.authenticated
-        || approval.approval_id.is_empty()
+    if approval.approval_id.is_empty()
         || approval.actor_id.is_empty()
         || approval.evaluation_report_id.is_empty()
         || approval.expected_row_version < 1
@@ -1207,6 +1292,37 @@ fn read_idempotent_transition(
         desired_generation,
         replayed: true,
     }))
+}
+
+fn read_idempotent_root_transition(
+    tx: &Transaction<'_>,
+    request: &TransitionRequest,
+    approval: &HumanApproval,
+) -> Result<Option<TransitionOutcome>, LifecycleError> {
+    let Some(outcome) = read_idempotent_transition(tx, request)? else {
+        return Ok(None);
+    };
+    let exact_approval_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM skill_lifecycle_approvals
+          WHERE approval_id = ?1
+            AND skill_id = ?2
+            AND approval_kind = 'phase5_root_activation'
+            AND actor_id = ?3
+            AND artifact_row_version = ?4
+            AND evaluation_report_id = ?5",
+        params![
+            approval.approval_id,
+            request.skill_id,
+            approval.actor_id,
+            approval.expected_row_version,
+            approval.evaluation_report_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if exact_approval_count != 1 {
+        return Err(LifecycleError::IdempotencyConflict);
+    }
+    Ok(Some(outcome))
 }
 
 fn validate_lineage(

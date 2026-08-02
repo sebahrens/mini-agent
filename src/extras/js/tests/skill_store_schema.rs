@@ -786,7 +786,7 @@ fn test_schema_v1_to_v3_migration_preserves_rows_and_rebuilds_active_only_fts()
             store
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            5
+            6
         );
         assert_eq!(
             store

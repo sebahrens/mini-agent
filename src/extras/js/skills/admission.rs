@@ -10,12 +10,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::admission_store::{AdmissionStore, AuthenticatedApproval};
+use super::admission_store::AdmissionStore;
 use super::embed::{Embedder, SkillDocument};
 use super::held_out::{HeldOutError, HeldOutEvaluationReport, evaluate};
 use super::store::{
     AdminIdentity, CanaryApprovalResult, EvaluationReportRecord, MAX_EVALUATION_ATTEMPTS,
     ProposalLease, ProposalStatus, SkillStore, StoreError,
+};
+#[cfg(test)]
+use super::store::{
+    ApprovalAuthorization, ApprovalAuthorizationRequest, ApprovalTransition,
+    approval_manifest_digest,
 };
 use super::verify::{TestResult, VerificationError};
 use super::{CapabilityManifest, SkillArtifact, SkillExport};
@@ -359,18 +364,24 @@ impl AdmissionEvaluator {
                     &current_report,
                     &current_artifact,
                 )?;
-                let approval = AuthenticatedApproval::new(
-                    decision.decision_id,
-                    decision.principal,
-                    decision.authenticated_at,
+                let expires_at = now
+                    .checked_add(MAX_AUTH_AGE_SECONDS)
+                    .ok_or(AdmissionError::UnauthenticatedApproval)?;
+                let mut admission = AdmissionStore::new(&mut self.store);
+                let authorization = admission.authorize_canary(
+                    &decision,
+                    &artifact,
+                    &report.report_id,
+                    now,
+                    expires_at,
                 )?;
-                let result = AdmissionStore::new(&mut self.store).approve_canary(
+                let result = admission.approve_canary(
                     &proposal.proposal_id,
                     &artifact.id,
                     &report.report_id,
                     artifact_version,
                     proposal.row_version,
-                    &approval,
+                    &authorization,
                     now,
                 )?;
                 if self
@@ -484,6 +495,54 @@ impl AdmissionEvaluator {
     #[cfg(test)]
     pub(crate) fn store_mut(&mut self) -> &mut SkillStore {
         &mut self.store
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn authorize_canary_for_test(
+        &mut self,
+        authorization_id: &str,
+        principal: &str,
+        artifact: &SkillArtifact,
+        report_id: &str,
+        issued_at: i64,
+        expires_at: i64,
+    ) -> Result<ApprovalAuthorization, AdmissionError> {
+        Ok(self
+            .store
+            .issue_approval_authorization_for_test(ApprovalAuthorizationRequest {
+                authorization_id: authorization_id.to_string(),
+                principal: principal.to_string(),
+                artifact_id: artifact.id.clone(),
+                report_id: report_id.to_string(),
+                manifest_digest: approval_manifest_digest(artifact)?,
+                transition: ApprovalTransition::VerifiedToCanary,
+                issued_at,
+                expires_at,
+            })?)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn consume_canary_for_test(
+        &mut self,
+        proposal_id: &str,
+        artifact_id: &str,
+        report_id: &str,
+        artifact_version: u64,
+        proposal_version: u64,
+        authorization: &ApprovalAuthorization,
+        now: i64,
+    ) -> Result<CanaryApprovalResult, AdmissionError> {
+        Ok(AdmissionStore::new(&mut self.store).approve_canary(
+            proposal_id,
+            artifact_id,
+            report_id,
+            artifact_version,
+            proposal_version,
+            authorization,
+            now,
+        )?)
     }
 }
 
@@ -816,6 +875,12 @@ pub(crate) struct AuthenticatedHumanDecision {
 }
 
 impl AuthenticatedHumanDecision {
+    /// Test-only stand-in for the parent authentication boundary.
+    ///
+    /// Production code cannot construct this capability from caller-provided strings. The
+    /// eventual UI/authentication adapter must live in this module and mint it only after its
+    /// authenticated interaction completes.
+    #[cfg(test)]
     pub(crate) fn verified(
         decision_id: impl Into<String>,
         principal: impl Into<String>,
@@ -826,6 +891,14 @@ impl AuthenticatedHumanDecision {
             principal: principal.into(),
             authenticated_at,
         }
+    }
+
+    pub(super) fn authorization_id(&self) -> &str {
+        &self.decision_id
+    }
+
+    pub(super) fn principal(&self) -> &str {
+        &self.principal
     }
 }
 
