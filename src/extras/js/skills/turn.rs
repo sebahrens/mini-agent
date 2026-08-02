@@ -37,6 +37,7 @@ struct AgentSection {
 pub struct ResolvedSkill {
     pub id: String,
     pub identity_version: u32,
+    pub abi_version: u16,
     pub description: String,
     pub tags: Vec<String>,
     pub exports: Vec<SkillExport>,
@@ -466,6 +467,7 @@ fn resolved_skill(
     ResolvedSkill {
         id: artifact.id.clone(),
         identity_version: artifact.identity_version,
+        abi_version: artifact.abi_version,
         description: artifact.description.clone(),
         tags: artifact.tags.clone(),
         exports: artifact.exports.clone(),

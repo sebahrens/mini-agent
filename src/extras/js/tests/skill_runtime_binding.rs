@@ -5,7 +5,7 @@ use rig::tool::Tool;
 use super::make_test_tool;
 use crate::extras::js::skills::turn::{ResolvedSkill, SkillTurnContext, TurnSkillBundle};
 use crate::extras::js::skills::{
-    CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
+    CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
 };
 use crate::extras::js::tool::JsArgs;
 
@@ -31,6 +31,7 @@ fn resolved(artifact: &SkillArtifact, rank: usize) -> ResolvedSkill {
     ResolvedSkill {
         id: artifact.id.clone(),
         identity_version: artifact.identity_version,
+        abi_version: artifact.abi_version,
         description: artifact.description.clone(),
         tags: artifact.tags.clone(),
         exports: artifact.exports.clone(),
@@ -93,6 +94,30 @@ async fn identity_mismatch_fails_before_skill_source_runs() {
     assert!(result.contains(&original_id));
     assert!(result.contains("identity validation"));
     assert!(!result.contains("source must not execute"));
+}
+
+#[tokio::test]
+async fn hidden_capability_abi_mismatch_fails_before_export_source_runs() {
+    let mut selected = artifact(
+        "throw new Error('ABI-mismatched source must not execute')",
+        &["untouched"],
+        CapabilityManifest::pure(),
+    );
+    selected.abi_version = 1;
+    selected.id = selected.compute_identity();
+    let artifact_id = selected.id.clone();
+    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+
+    let result = tool
+        .call(JsArgs {
+            code: "1".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.contains(&artifact_id));
+    assert!(result.contains("identity validation"));
+    assert!(!result.contains("ABI-mismatched source must not execute"));
 }
 
 #[tokio::test]
@@ -183,9 +208,13 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
         .unwrap();
     assert!(denied.contains("not a function") || denied.contains("undefined"));
 
-    let allowed_manifest =
-        CapabilityManifest::new(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])
-            .unwrap();
+    let allowed_manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn {
+            programs: vec!["printf".to_string()],
+        }],
+    )
+    .unwrap();
     let allowed = artifact(
         "function permitted() { return spawn('printf', ['allowed']).stdout; }",
         &["permitted"],
