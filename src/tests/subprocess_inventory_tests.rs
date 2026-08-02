@@ -98,11 +98,22 @@ impl SourceProvenance {
     fn resolve_path(&self, path: &[String]) -> Option<Vec<String>> {
         let mut resolved = path.to_vec();
         let mut seen = BTreeSet::new();
-        while seen.insert(resolved.clone()) {
+        let rewrite_limit = self
+            .bindings
+            .len()
+            .saturating_add(self.qualified_bindings.len())
+            .saturating_add(1);
+        for _ in 0..rewrite_limit {
+            if !seen.insert(resolved.clone()) {
+                return None;
+            }
             let Some((binding_length, binding)) = self.matching_binding(&resolved) else {
                 return Some(resolved);
             };
             let mut next = binding.clone()?;
+            if next.starts_with(&resolved[..binding_length]) {
+                return None;
+            }
             next.extend(resolved.iter().skip(binding_length).cloned());
             resolved = next;
         }
@@ -234,6 +245,57 @@ impl<'ast> Visit<'ast> for SourceProvenance {
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
         self.local_names.insert(item.ident.to_string());
         syn::visit::visit_item_trait(self, item);
+    }
+}
+
+struct ProcessValueCollector<'a> {
+    provenance: &'a SourceProvenance,
+    names: BTreeSet<String>,
+}
+
+impl<'a> ProcessValueCollector<'a> {
+    fn new(provenance: &'a SourceProvenance) -> Self {
+        Self {
+            provenance,
+            names: BTreeSet::new(),
+        }
+    }
+
+    fn command_type_path(ty: &syn::Type) -> Option<Vec<String>> {
+        match ty {
+            syn::Type::Reference(reference) => Self::command_type_path(&reference.elem),
+            syn::Type::Group(group) => Self::command_type_path(&group.elem),
+            syn::Type::Paren(paren) => Self::command_type_path(&paren.elem),
+            syn::Type::Path(path) if path.qself.is_none() => Some(
+                path.path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn is_process_command_type(&self, ty: &syn::Type) -> bool {
+        let Some(path) = Self::command_type_path(ty) else {
+            return false;
+        };
+        let Some(resolved) = self.provenance.resolve_path(&path) else {
+            return false;
+        };
+        resolved == ["std", "process", "Command"] || resolved == ["tokio", "process", "Command"]
+    }
+}
+
+impl<'ast> Visit<'ast> for ProcessValueCollector<'_> {
+    fn visit_pat_type(&mut self, typed: &'ast syn::PatType) {
+        if self.is_process_command_type(&typed.ty) {
+            if let syn::Pat::Ident(ident) = typed.pat.as_ref() {
+                self.names.insert(ident.ident.to_string());
+            }
+        }
+        syn::visit::visit_pat_type(self, typed);
     }
 }
 
@@ -456,6 +518,11 @@ fn validate_process_creation_raw_inventory(
 }
 
 fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
+    fn normalized_ident(ident: &proc_macro2::Ident) -> String {
+        let spelling = ident.to_string();
+        spelling.strip_prefix("r#").unwrap_or(&spelling).to_string()
+    }
+
     fn is_terminal(name: &str) -> bool {
         matches!(
             name,
@@ -482,7 +549,7 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
         let TokenTree::Ident(ident) = tokens.get(cursor)? else {
             return None;
         };
-        let mut reversed = vec![ident.to_string()];
+        let mut reversed = vec![normalized_ident(ident)];
         while cursor >= 3 {
             let is_colon = |token: &TokenTree| matches!(token, TokenTree::Punct(punct) if punct.as_char() == ':');
             if !is_colon(&tokens[cursor - 1]) || !is_colon(&tokens[cursor - 2]) {
@@ -491,7 +558,7 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
             let TokenTree::Ident(ident) = &tokens[cursor - 3] else {
                 break;
             };
-            reversed.push(ident.to_string());
+            reversed.push(normalized_ident(ident));
             cursor -= 3;
         }
         reversed.reverse();
@@ -527,34 +594,63 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
     fn scan(
         stream: TokenStream,
         provenance: &SourceProvenance,
+        process_values: &BTreeSet<String>,
         calls: &mut Vec<TerminalCall>,
         inside_macro: bool,
+        macro_process_context: bool,
     ) {
+        fn contains_process_value(stream: TokenStream, process_values: &BTreeSet<String>) -> bool {
+            stream.into_iter().any(|token| {
+                matches!(token, TokenTree::Ident(ident) if process_values.contains(&normalized_ident(&ident)))
+            })
+        }
+
+        fn is_macro_rules_body(tokens: &[TokenTree], index: usize) -> bool {
+            matches!(index.checked_sub(3).and_then(|i| tokens.get(i)), Some(TokenTree::Ident(ident)) if normalized_ident(ident) == "macro_rules")
+                && matches!(index.checked_sub(2).and_then(|i| tokens.get(i)), Some(TokenTree::Punct(punct)) if punct.as_char() == '!')
+                && matches!(
+                    index.checked_sub(1).and_then(|i| tokens.get(i)),
+                    Some(TokenTree::Ident(_))
+                )
+        }
+
         let tokens: Vec<_> = stream.into_iter().collect();
         for (index, token) in tokens.iter().enumerate() {
             if let TokenTree::Group(group) = token {
                 let macro_arguments = index
                     .checked_sub(1)
                     .and_then(|previous| tokens.get(previous));
-                let group_is_macro = inside_macro
-                    || matches!(macro_arguments, Some(TokenTree::Punct(punct)) if punct.as_char() == '!');
-                scan(group.stream(), provenance, calls, group_is_macro);
+                let begins_macro = matches!(macro_arguments, Some(TokenTree::Punct(punct)) if punct.as_char() == '!')
+                    || is_macro_rules_body(&tokens, index);
+                let group_is_macro = inside_macro || begins_macro;
+                let group_process_context = macro_process_context
+                    || (begins_macro && contains_process_value(group.stream(), process_values));
+                scan(
+                    group.stream(),
+                    provenance,
+                    process_values,
+                    calls,
+                    group_is_macro,
+                    group_process_context,
+                );
             }
             let TokenTree::Ident(ident) = token else {
                 continue;
             };
-            let name = ident.to_string();
-            if !is_terminal(&name) || !is_method_or_ufcs(&tokens, index) {
+            let name = normalized_ident(ident);
+            let qualified = is_method_or_ufcs(&tokens, index);
+            let macro_method_ident = inside_macro && macro_process_context && !qualified;
+            if !is_terminal(&name) || (!qualified && !macro_method_ident) {
                 continue;
             }
-            if is_proven_non_process_spawn(&tokens, index, &name, provenance) {
+            if qualified && is_proven_non_process_spawn(&tokens, index, &name, provenance) {
                 continue;
             }
             let immediate_call = matches!(
                 tokens.get(index + 1),
                 Some(TokenTree::Group(arguments)) if arguments.delimiter() == Delimiter::Parenthesis
             );
-            if !immediate_call && !is_ufcs(&tokens, index) {
+            if !macro_method_ident && !immediate_call && !is_ufcs(&tokens, index) {
                 // Rust cannot take a bound method from `value.method`; without call syntax this is
                 // a field/accessor such as `output.status`, not terminal authority.
                 continue;
@@ -576,10 +672,19 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
         syn::parse_file(source).map_err(|error| format!("Rust source did not parse: {error}"))?;
     let mut provenance = SourceProvenance::default();
     provenance.visit_file(&file);
+    let mut process_values = ProcessValueCollector::new(&provenance);
+    process_values.visit_file(&file);
     let stream = TokenStream::from_str(source)
         .map_err(|error| format!("Rust source did not tokenize: {error}"))?;
     let mut calls = Vec::new();
-    scan(stream, &provenance, &mut calls, false);
+    scan(
+        stream,
+        &provenance,
+        &process_values.names,
+        &mut calls,
+        false,
+        false,
+    );
     calls.sort_by_key(|call| call.line);
     Ok(calls)
 }
@@ -1717,6 +1822,26 @@ fn bypass(command: &mut std::process::Command) -> std::io::Result<()> {
 }
 
 #[test]
+fn process_creation_raw_inventory_rejects_locally_defined_deferred_macros() {
+    let fixture = r#"
+fn bypass(command: &mut std::process::Command) -> std::io::Result<()> {
+    let _guard = creation_guard()?;
+    macro_rules! deferred { ($command:expr) => { || std::process::Command::spawn($command) }; }
+    let _deferred = deferred!(command);
+    Ok(())
+}
+"#;
+    let expected = BTreeMap::from([(
+        "bypass|macro_rules! deferred { ($command:expr) => { || std::process::Command::spawn($command) }; }".to_string(),
+        1,
+    )]);
+    let error = validate_process_creation_raw_inventory(fixture, &expected)
+        .expect_err("a raw terminal generated by a local macro may not inherit guard dominance");
+
+    assert!(error.contains("not dominated by a retained creation guard"));
+}
+
+#[test]
 fn current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes() {
     validate_current_class_assignments().expect("current subprocess classes must be allowed");
 }
@@ -1821,6 +1946,33 @@ fn launch(command: &mut std::process::Command) {
         ["spawn", "output", "status"]
     );
     assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn process_provenance_fails_closed_for_self_prefix_namespace_collisions() {
+    let file = syn::parse_file(
+        r#"
+use smallvec::{SmallVec, smallvec};
+
+fn render(values: &SmallVec<[String; 4]>) {}
+"#,
+    )
+    .expect("fixture must parse");
+    let mut provenance = SourceProvenance::default();
+    provenance.visit_file(&file);
+
+    assert_eq!(
+        provenance.resolve_path(&["SmallVec".to_string()]),
+        None,
+        "a macro/type namespace collision must not grow an alias path without bound"
+    );
+
+    let mut process_values = ProcessValueCollector::new(&provenance);
+    process_values.visit_file(&file);
+    assert!(
+        process_values.names.is_empty(),
+        "unresolved provenance must not confer process authority"
+    );
 }
 
 #[test]
@@ -1977,6 +2129,48 @@ fn launch(command: &mut std::process::Command) {
             .map(|call| call.name.as_str())
             .collect::<Vec<_>>(),
         ["spawn", "output"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_rejects_macro_method_ident_indirection() {
+    let calls = terminal_calls(
+        r#"
+fn launch(command: &mut std::process::Command) {
+    terminal!(command, spawn);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_normalizes_raw_terminal_identifiers() {
+    let calls = terminal_calls(
+        r#"
+fn launch(command: &mut std::process::Command) {
+    let _ = std::process::Command::r#spawn(command);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn"]
     );
     assert!(calls.iter().all(|call| !call.guarded));
 }

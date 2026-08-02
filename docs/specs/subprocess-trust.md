@@ -114,14 +114,18 @@ sources, so whitespace-separated methods, qualified-angle UFCS, and renamed stan
 `Command` calls cannot evade it. Type aliases and local-module re-exports are resolved recursively;
 glob imports and out-of-line modules remain opaque, including after a named import, and ambiguous or
 cyclic provenance fails closed rather than inheriting a local-type exemption. Associated terminal
-function-item references are inventoried even when a later indirect call has another name. Only
+function-item references and raw terminal identifiers are inventoried even when a later indirect
+call has another name. Macro method-name indirection is inventoried when its invocation receives a
+typed process `Command`, and locally defined `macro_rules!` expansion bodies are always treated as
+macro-controlled. Only
 syntactically proven task/thread or local associated `spawn` calls are excluded; ambiguous and
 unrecognized terminals fail closed. Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so
 explicit stdio and reusable-builder semantics remain exact; that synchronous helper can therefore
 hold the mutex through output completion. Raw terminals in async functions, after `.await`, or in
 deferred async/closure bodies cannot claim lexical guard dominance. A raw terminal nested in macro
-arguments also cannot claim dominance because expansion may defer execution beyond the guard scope.
+arguments or a local macro expansion body also cannot claim dominance because expansion may defer
+execution beyond the guard scope.
 Target-specific Linux/macOS worker terminals and explicit `TEST-ONLY` sites are outside this Windows
 race boundary.
 `src/process_creation.rs` cannot assign a principal because it preserves the caller's class, so it

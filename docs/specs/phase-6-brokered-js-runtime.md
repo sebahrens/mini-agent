@@ -531,7 +531,10 @@ defer execution. Inheritable-handle owners also clear their bit during drop on
 every error path before the earlier-acquired lock guard is released. The checked subprocess
 inventory recursively resolves parsed imports, type aliases, and local-module re-exports alongside
 full-source tokens, treats glob imports and out-of-line modules as opaque, and inventories associated
-terminal function-item references. It rejects multiline, qualified-angle or renamed UFCS, and
+terminal function-item references after normalizing raw identifiers. Typed process-command macro
+arguments make method-name indirection terminal authority, while locally defined `macro_rules!`
+bodies remain macro-controlled and cannot inherit lexical guard dominance. It rejects multiline,
+qualified-angle or renamed UFCS, and
 ambiguous Windows-capable production terminals that bypass this boundary. A dedicated exact
 multiset inventory for the creation helper itself requires
 every raw standard-library, Tokio, and RMCP terminal to remain dominated by a retained crate guard.
