@@ -4,7 +4,6 @@
 //! construction, and a bounded request/response exchange. SQLite, verification,
 //! embeddings, held-out data, and lifecycle transitions remain on worker threads.
 
-#[cfg(test)]
 use rquickjs::{Array, Object, String as JsString};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,6 +15,7 @@ use super::{
     CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, IdentityError, SkillArtifact,
     SkillExport,
 };
+use crate::extras::js::protocol::{ProposalStatus, SkillProposalDraft, SkillProposalScope};
 use crate::extras::js::types::{EffectServiceError, PermCancellation};
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 32 * 1024;
@@ -29,6 +29,9 @@ pub(crate) const MAX_TAGS: usize = 32;
 pub(crate) const MAX_TAG_BYTES: usize = 64;
 pub(crate) const MAX_CANONICAL_INPUT_BYTES: usize = 64 * 1024;
 pub(crate) const DEFAULT_SESSION_ATTEMPTS: usize = 3;
+const MAX_CAPABILITY_GRANTS: usize = 4;
+const MAX_SCOPE_ENTRIES: usize = 32;
+const MAX_FETCH_METHODS: usize = 2;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct JsExport {
@@ -88,7 +91,6 @@ impl fmt::Debug for JsProposal {
 }
 
 impl JsProposal {
-    #[cfg(test)]
     pub(crate) fn from_object(object: &Object<'_>) -> Result<Self, ProposalError> {
         reject_unknown_keys(
             object,
@@ -126,14 +128,14 @@ impl JsProposal {
                 })?;
         reject_unknown_keys(&capability, &["tier", "grants"], "capability")?;
 
-        Ok(Self {
+        let proposal = Self {
             source: required_string(object, "source", MAX_SOURCE_BYTES)?,
             description: required_string(object, "description", MAX_DESCRIPTION_BYTES)?,
             exports,
             tests: required_string_array(object, "tests", 1, MAX_TESTS, MAX_TEST_BYTES)?,
             capability: JsCapability {
                 tier: required_string(&capability, "tier", MAX_TAG_BYTES)?,
-                grants: required_array(&capability, "grants", 0, 4)?
+                grants: required_array(&capability, "grants", 0, MAX_CAPABILITY_GRANTS)?
                     .iter::<Object<'_>>()
                     .map(|scope| {
                         let scope = scope.map_err(|_| ProposalError::InvalidField {
@@ -153,91 +155,24 @@ impl JsProposal {
                 })?
                 .map(|value| js_string(value, "predecessor_id", 64))
                 .transpose()?,
-        })
+        };
+        proposal.validate_bounded_shape()?;
+        Ok(proposal)
     }
 
     pub(crate) fn validate_and_canonicalize(self) -> Result<SkillArtifact, ProposalError> {
-        validate_text("source", &self.source, MAX_SOURCE_BYTES, true)?;
-        validate_text(
-            "description",
-            &self.description,
-            MAX_DESCRIPTION_BYTES,
-            true,
-        )?;
-        if self.exports.is_empty() || self.exports.len() > MAX_EXPORTS {
-            return Err(ProposalError::InvalidField {
-                field: "exports",
-                reason: "must contain between 1 and 32 entries",
-            });
-        }
-        if self.tests.is_empty() || self.tests.len() > MAX_TESTS {
-            return Err(ProposalError::InvalidField {
-                field: "tests",
-                reason: "must contain between 1 and 20 entries",
-            });
-        }
-        if self.tags.len() > MAX_TAGS {
-            return Err(ProposalError::InvalidField {
-                field: "tags",
-                reason: "contains too many entries",
-            });
-        }
-
-        let mut aggregate = self.source.len() + self.description.len();
+        self.validate_bounded_shape()?;
         let exports = self
             .exports
             .into_iter()
-            .map(|export| {
-                validate_export_name(&export.name)?;
-                validate_text(
-                    "exports.signature",
-                    &export.signature,
-                    MAX_SIGNATURE_BYTES,
-                    true,
-                )?;
-                aggregate = aggregate
-                    .saturating_add(export.name.len())
-                    .saturating_add(export.signature.len());
-                Ok(SkillExport {
-                    name: export.name,
-                    signature: export.signature,
-                })
+            .map(|export| SkillExport {
+                name: export.name,
+                signature: export.signature,
             })
-            .collect::<Result<Vec<_>, ProposalError>>()?;
-        for test in &self.tests {
-            validate_text("tests", test, MAX_TEST_BYTES, true)?;
-            aggregate = aggregate.saturating_add(test.len());
-        }
-        for tag in &self.tags {
-            validate_text("tags", tag, MAX_TAG_BYTES, false)?;
-            aggregate = aggregate.saturating_add(tag.len());
-        }
-        for grant in &self.capability.grants {
-            aggregate = aggregate.saturating_add(match grant {
-                JsCapabilityScope::ReadFile { workspace_prefixes }
-                | JsCapabilityScope::WriteFile { workspace_prefixes } => {
-                    workspace_prefixes.iter().map(String::len).sum()
-                }
-                JsCapabilityScope::Fetch { origins, methods } => {
-                    origins.iter().chain(methods).map(String::len).sum()
-                }
-                JsCapabilityScope::Spawn { programs } => programs.iter().map(String::len).sum(),
-            });
-        }
-        if aggregate > MAX_CANONICAL_INPUT_BYTES {
-            return Err(ProposalError::PayloadTooLarge);
-        }
-        if let Some(predecessor_id) = self.predecessor_id.as_deref() {
-            validate_id(predecessor_id)?;
-        }
+            .collect();
 
         let tier = CapabilityTier::from_token(&self.capability.tier)
             .ok_or_else(|| ProposalError::InvalidCapability("unknown or forbidden tier".into()))?;
-        if self.capability.grants.len() > 4 {
-            return Err(ProposalError::InvalidCapability(
-                "too many capability grants".into(),
-            ));
-        }
         let grants = self
             .capability
             .grants
@@ -277,48 +212,287 @@ impl JsProposal {
         )
         .map_err(ProposalError::Identity)
     }
+
+    fn validate_bounded_shape(&self) -> Result<(), ProposalError> {
+        validate_text("source", &self.source, MAX_SOURCE_BYTES, true)?;
+        validate_text(
+            "description",
+            &self.description,
+            MAX_DESCRIPTION_BYTES,
+            true,
+        )?;
+        validate_entry_count("exports", self.exports.len(), 1, MAX_EXPORTS)?;
+        validate_entry_count("tests", self.tests.len(), 1, MAX_TESTS)?;
+        validate_entry_count("tags", self.tags.len(), 0, MAX_TAGS)?;
+        validate_text(
+            "capability.tier",
+            &self.capability.tier,
+            MAX_TAG_BYTES,
+            true,
+        )?;
+        validate_entry_count(
+            "capability.grants",
+            self.capability.grants.len(),
+            0,
+            MAX_CAPABILITY_GRANTS,
+        )?;
+
+        let mut aggregate = self.source.len().saturating_add(self.description.len());
+        for export in &self.exports {
+            validate_export_name(&export.name)?;
+            validate_text(
+                "exports.signature",
+                &export.signature,
+                MAX_SIGNATURE_BYTES,
+                true,
+            )?;
+            aggregate = aggregate
+                .saturating_add(export.name.len())
+                .saturating_add(export.signature.len());
+        }
+        for test in &self.tests {
+            validate_text("tests", test, MAX_TEST_BYTES, true)?;
+            aggregate = aggregate.saturating_add(test.len());
+        }
+        for tag in &self.tags {
+            validate_text("tags", tag, MAX_TAG_BYTES, false)?;
+            aggregate = aggregate.saturating_add(tag.len());
+        }
+        for grant in &self.capability.grants {
+            validate_capability_scope(grant)?;
+            aggregate = aggregate.saturating_add(scope_payload_bytes(grant));
+        }
+        if aggregate > MAX_CANONICAL_INPUT_BYTES {
+            return Err(ProposalError::PayloadTooLarge);
+        }
+        if let Some(predecessor_id) = self.predecessor_id.as_deref() {
+            validate_id(predecessor_id)?;
+        }
+        Ok(())
+    }
 }
 
-#[cfg(test)]
+impl From<JsProposal> for SkillProposalDraft {
+    fn from(proposal: JsProposal) -> Self {
+        Self {
+            source: proposal.source,
+            description: proposal.description,
+            exports: proposal
+                .exports
+                .into_iter()
+                .map(|export| crate::extras::js::protocol::SkillProposalExport {
+                    name: export.name,
+                    signature: export.signature,
+                })
+                .collect(),
+            tests: proposal.tests,
+            capability: crate::extras::js::protocol::SkillProposalCapability {
+                tier: proposal.capability.tier,
+                grants: proposal
+                    .capability
+                    .grants
+                    .into_iter()
+                    .map(|scope| match scope {
+                        JsCapabilityScope::ReadFile { workspace_prefixes } => {
+                            SkillProposalScope::ReadFile { workspace_prefixes }
+                        }
+                        JsCapabilityScope::WriteFile { workspace_prefixes } => {
+                            SkillProposalScope::WriteFile { workspace_prefixes }
+                        }
+                        JsCapabilityScope::Fetch { origins, methods } => {
+                            SkillProposalScope::Fetch { origins, methods }
+                        }
+                        JsCapabilityScope::Spawn { programs } => {
+                            SkillProposalScope::Spawn { programs }
+                        }
+                    })
+                    .collect(),
+            },
+            tags: proposal.tags,
+            predecessor_id: proposal.predecessor_id,
+        }
+    }
+}
+
+impl TryFrom<SkillProposalDraft> for JsProposal {
+    type Error = ProposalError;
+
+    fn try_from(draft: SkillProposalDraft) -> Result<Self, Self::Error> {
+        let proposal = Self {
+            source: draft.source,
+            description: draft.description,
+            exports: draft
+                .exports
+                .into_iter()
+                .map(|export| JsExport {
+                    name: export.name,
+                    signature: export.signature,
+                })
+                .collect(),
+            tests: draft.tests,
+            capability: JsCapability {
+                tier: draft.capability.tier,
+                grants: draft
+                    .capability
+                    .grants
+                    .into_iter()
+                    .map(|scope| match scope {
+                        SkillProposalScope::ReadFile { workspace_prefixes } => {
+                            JsCapabilityScope::ReadFile { workspace_prefixes }
+                        }
+                        SkillProposalScope::WriteFile { workspace_prefixes } => {
+                            JsCapabilityScope::WriteFile { workspace_prefixes }
+                        }
+                        SkillProposalScope::Fetch { origins, methods } => {
+                            JsCapabilityScope::Fetch { origins, methods }
+                        }
+                        SkillProposalScope::Spawn { programs } => {
+                            JsCapabilityScope::Spawn { programs }
+                        }
+                    })
+                    .collect(),
+            },
+            tags: draft.tags,
+            predecessor_id: draft.predecessor_id,
+        };
+        proposal.validate_bounded_shape()?;
+        Ok(proposal)
+    }
+}
+
+fn validate_capability_scope(scope: &JsCapabilityScope) -> Result<(), ProposalError> {
+    match scope {
+        JsCapabilityScope::ReadFile { workspace_prefixes }
+        | JsCapabilityScope::WriteFile { workspace_prefixes } => validate_string_entries(
+            "workspace_prefixes",
+            workspace_prefixes,
+            1,
+            MAX_SCOPE_ENTRIES,
+            MAX_DESCRIPTION_BYTES,
+        ),
+        JsCapabilityScope::Fetch { origins, methods } => {
+            validate_string_entries(
+                "origins",
+                origins,
+                1,
+                MAX_SCOPE_ENTRIES,
+                MAX_DESCRIPTION_BYTES,
+            )?;
+            validate_string_entries("methods", methods, 1, MAX_FETCH_METHODS, MAX_TAG_BYTES)
+        }
+        JsCapabilityScope::Spawn { programs } => {
+            validate_string_entries("programs", programs, 1, MAX_SCOPE_ENTRIES, MAX_TAG_BYTES)
+        }
+    }
+}
+
+fn scope_payload_bytes(scope: &JsCapabilityScope) -> usize {
+    match scope {
+        JsCapabilityScope::ReadFile { workspace_prefixes }
+        | JsCapabilityScope::WriteFile { workspace_prefixes } => {
+            workspace_prefixes.iter().map(String::len).sum()
+        }
+        JsCapabilityScope::Fetch { origins, methods } => {
+            origins.iter().chain(methods).map(String::len).sum()
+        }
+        JsCapabilityScope::Spawn { programs } => programs.iter().map(String::len).sum(),
+    }
+}
+
+fn validate_string_entries(
+    field: &'static str,
+    values: &[String],
+    min_items: usize,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<(), ProposalError> {
+    validate_entry_count(field, values.len(), min_items, max_items)?;
+    for value in values {
+        validate_text(field, value, max_bytes, false)?;
+    }
+    Ok(())
+}
+
+fn validate_entry_count(
+    field: &'static str,
+    actual: usize,
+    min_items: usize,
+    max_items: usize,
+) -> Result<(), ProposalError> {
+    if actual < min_items || actual > max_items {
+        return Err(ProposalError::InvalidField {
+            field,
+            reason: "contains an invalid number of entries",
+        });
+    }
+    Ok(())
+}
+
 fn parse_capability_scope(object: &Object<'_>) -> Result<JsCapabilityScope, ProposalError> {
     let kind = required_string(object, "kind", MAX_TAG_BYTES)?;
     match kind.as_str() {
         "read_file" => {
             reject_unknown_keys(object, &["kind", "workspace_prefixes"], "capability grant")?;
-            Ok(JsCapabilityScope::ReadFile {
+            let scope = JsCapabilityScope::ReadFile {
                 workspace_prefixes: required_string_array(
                     object,
                     "workspace_prefixes",
                     1,
-                    32,
+                    MAX_SCOPE_ENTRIES,
                     MAX_DESCRIPTION_BYTES,
                 )?,
-            })
+            };
+            validate_capability_scope(&scope)?;
+            Ok(scope)
         }
         "write_file" => {
             reject_unknown_keys(object, &["kind", "workspace_prefixes"], "capability grant")?;
-            Ok(JsCapabilityScope::WriteFile {
+            let scope = JsCapabilityScope::WriteFile {
                 workspace_prefixes: required_string_array(
                     object,
                     "workspace_prefixes",
                     1,
-                    32,
+                    MAX_SCOPE_ENTRIES,
                     MAX_DESCRIPTION_BYTES,
                 )?,
-            })
+            };
+            validate_capability_scope(&scope)?;
+            Ok(scope)
         }
         "fetch" => {
             reject_unknown_keys(object, &["kind", "origins", "methods"], "capability grant")?;
-            Ok(JsCapabilityScope::Fetch {
-                origins: required_string_array(object, "origins", 1, 32, MAX_DESCRIPTION_BYTES)?,
-                methods: required_string_array(object, "methods", 1, 2, MAX_TAG_BYTES)?,
-            })
+            let scope = JsCapabilityScope::Fetch {
+                origins: required_string_array(
+                    object,
+                    "origins",
+                    1,
+                    MAX_SCOPE_ENTRIES,
+                    MAX_DESCRIPTION_BYTES,
+                )?,
+                methods: required_string_array(
+                    object,
+                    "methods",
+                    1,
+                    MAX_FETCH_METHODS,
+                    MAX_TAG_BYTES,
+                )?,
+            };
+            validate_capability_scope(&scope)?;
+            Ok(scope)
         }
         "spawn" => {
             reject_unknown_keys(object, &["kind", "programs"], "capability grant")?;
-            Ok(JsCapabilityScope::Spawn {
-                programs: required_string_array(object, "programs", 1, 32, MAX_TAG_BYTES)?,
-            })
+            let scope = JsCapabilityScope::Spawn {
+                programs: required_string_array(
+                    object,
+                    "programs",
+                    1,
+                    MAX_SCOPE_ENTRIES,
+                    MAX_TAG_BYTES,
+                )?,
+            };
+            validate_capability_scope(&scope)?;
+            Ok(scope)
         }
         _ => Err(ProposalError::InvalidCapability(format!(
             "unknown or forbidden capability grant {kind}"
@@ -326,7 +500,6 @@ fn parse_capability_scope(object: &Object<'_>) -> Result<JsCapabilityScope, Prop
     }
 }
 
-#[cfg(test)]
 fn required_string(
     object: &Object<'_>,
     key: &'static str,
@@ -341,7 +514,6 @@ fn required_string(
     js_string(value, key, max_bytes)
 }
 
-#[cfg(test)]
 fn js_string(
     value: JsString<'_>,
     field: &'static str,
@@ -362,7 +534,6 @@ fn js_string(
     Ok(value.as_str().to_string())
 }
 
-#[cfg(test)]
 fn required_array<'js>(
     object: &Object<'js>,
     key: &'static str,
@@ -384,7 +555,6 @@ fn required_array<'js>(
     Ok(array)
 }
 
-#[cfg(test)]
 fn required_string_array(
     object: &Object<'_>,
     key: &'static str,
@@ -405,7 +575,6 @@ fn required_string_array(
         .collect()
 }
 
-#[cfg(test)]
 fn optional_string_array(
     object: &Object<'_>,
     key: &'static str,
@@ -441,7 +610,6 @@ fn optional_string_array(
         .collect()
 }
 
-#[cfg(test)]
 fn reject_unknown_keys(
     object: &Object<'_>,
     allowed: &[&str],
@@ -596,7 +764,7 @@ pub(crate) struct ProposalEffectService {
 pub(crate) struct ProposalEffectResult {
     pub(crate) skill_id: String,
     pub(crate) proposal_id: String,
-    pub(crate) status: &'static str,
+    pub(crate) status: ProposalStatus,
     pub(crate) report_id: Option<String>,
 }
 
@@ -648,6 +816,25 @@ impl ProposalEffectService {
         }
     }
 
+    pub(crate) async fn execute_prepared_cancellable(
+        &self,
+        prepared: PreparedProposalEffect,
+        cancellation: PermCancellation,
+    ) -> Result<ProposalEffectResult, EffectServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(EffectServiceError::Cancelled);
+        }
+        let service = self.clone();
+        let execution = tokio::task::spawn_blocking(move || service.execute_prepared(prepared));
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(EffectServiceError::OutcomeUnknown),
+            result = execution => result
+                .map_err(|_| EffectServiceError::BackendFailure)?
+                .map_err(proposal_service_error),
+        }
+    }
+
     pub(crate) fn reserve_attempt(&self) -> Result<(), ProposalError> {
         self.host.budget.consume()
     }
@@ -681,11 +868,11 @@ impl ProposalEffectService {
             .sender
             .enqueue(prepared.artifact, prepared.predecessor_id)?;
         let status = match result.status {
-            super::store::EnqueueStatus::Pending => "pending",
-            super::store::EnqueueStatus::Verified => "verified",
-            super::store::EnqueueStatus::Rejected => "rejected",
-            super::store::EnqueueStatus::AwaitingApproval => "awaiting_approval",
-            super::store::EnqueueStatus::Approved => "approved",
+            super::store::EnqueueStatus::Pending => ProposalStatus::Pending,
+            super::store::EnqueueStatus::Verified => ProposalStatus::Verified,
+            super::store::EnqueueStatus::Rejected => ProposalStatus::Rejected,
+            super::store::EnqueueStatus::AwaitingApproval => ProposalStatus::AwaitingApproval,
+            super::store::EnqueueStatus::Approved => ProposalStatus::Approved,
         };
         Ok(ProposalEffectResult {
             skill_id: result.skill_id,
@@ -696,7 +883,7 @@ impl ProposalEffectService {
     }
 }
 
-fn proposal_service_error(error: ProposalError) -> EffectServiceError {
+pub(crate) fn proposal_service_error(error: ProposalError) -> EffectServiceError {
     match error {
         ProposalError::InvalidField { .. }
         | ProposalError::UnknownField { .. }
@@ -744,6 +931,16 @@ pub(crate) struct ProposalReceiver {
 
 #[cfg(test)]
 impl ProposalReceiver {
+    pub(crate) fn is_empty(&self) -> bool {
+        match self.receiver.try_recv() {
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => true,
+            Ok(command) => {
+                let _ = command.reply.send(Err(ProposalError::QueueClosed));
+                false
+            }
+        }
+    }
+
     pub(crate) fn respond_next(
         &self,
         delay: Duration,

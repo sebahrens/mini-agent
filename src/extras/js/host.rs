@@ -22,10 +22,12 @@ use crate::extras::js::broker::{
 #[cfg(target_os = "linux")]
 use crate::extras::js::broker::{ExecutableCopyError, copy_and_hash_executable_controlled};
 use crate::extras::js::protocol::{EffectOperation, EffectResult};
-#[cfg(all(feature = "skills", test))]
+#[cfg(feature = "skills")]
 use crate::extras::js::skills::proposal::{
-    JsProposal, ProposalEffectService, ProposalError, ProposalHost,
+    JsProposal, PreparedProposalEffect, ProposalEffectService, proposal_service_error,
 };
+#[cfg(all(feature = "skills", test))]
+use crate::extras::js::skills::proposal::{ProposalError, ProposalHost};
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::PermCancellation;
 use crate::extras::js::types::{
@@ -2886,6 +2888,8 @@ enum PreparedParentEffect {
         control: Arc<FetchCallControl>,
         deadline: Instant,
     },
+    #[cfg(feature = "skills")]
+    Proposal(PreparedProposalEffect),
 }
 
 fn workspace_relative_path(base: &Path, target: &Path) -> Result<Option<String>, HostEffectError> {
@@ -2922,7 +2926,12 @@ pub(crate) struct ParentHostEffectService {
     spawn: SpawnEffectService,
     #[cfg(feature = "sandbox")]
     fetch: Option<FetchEffectService>,
-    prepared: Option<PreparedParentEffect>,
+    #[cfg(feature = "skills")]
+    proposal: Option<ProposalEffectService>,
+    /// Target preparation produced by synchronous validation. This is kept separate from the
+    /// authorization result so proposal canonicalization and target normalization can coexist.
+    validated: Option<PreparedParentEffect>,
+    authorized: Option<PreparedParentEffect>,
 }
 
 impl ParentHostEffectService {
@@ -2932,7 +2941,10 @@ impl ParentHostEffectService {
             spawn,
             #[cfg(feature = "sandbox")]
             fetch: None,
-            prepared: None,
+            #[cfg(feature = "skills")]
+            proposal: None,
+            validated: None,
+            authorized: None,
         }
     }
 
@@ -2941,11 +2953,18 @@ impl ParentHostEffectService {
         self.fetch = Some(fetch);
         self
     }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_proposal(mut self, proposal: ProposalEffectService) -> Self {
+        self.proposal = Some(proposal);
+        self
+    }
 }
 
 impl ParentEffectService for ParentHostEffectService {
     fn discard_prepared(&mut self) {
-        self.prepared = None;
+        self.validated = None;
+        self.authorized = None;
     }
 
     fn validate_target(
@@ -2953,7 +2972,8 @@ impl ParentEffectService for ParentHostEffectService {
         _authorized: &AuthorizedEffect,
         operation: &EffectOperation,
     ) -> Result<(), HostEffectError> {
-        self.prepared = None;
+        self.validated = None;
+        self.authorized = None;
         match operation {
             EffectOperation::ReadFile { path } if path.is_empty() || path.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
@@ -2974,14 +2994,26 @@ impl ParentEffectService for ParentHostEffectService {
             EffectOperation::Fetch { url, .. } if url.is_empty() || url.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
             }
-            EffectOperation::ProposeSkill { draft }
-                if draft.source.is_empty()
-                    || draft.description.is_empty()
-                    || draft.exports.is_empty()
-                    || draft.tests.is_empty() =>
-            {
-                Err(HostEffectError::InvalidTarget)
+            #[cfg(feature = "skills")]
+            EffectOperation::ProposeSkill { draft } => {
+                let proposal = self
+                    .proposal
+                    .as_ref()
+                    .ok_or(HostEffectError::BackendFailure)?;
+                proposal
+                    .reserve_attempt()
+                    .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
+                self.validated = Some(PreparedParentEffect::Proposal(
+                    proposal
+                        .authorize_reserved(JsProposal::try_from(draft.clone()).map_err(
+                            |error| HostEffectError::from(proposal_service_error(error)),
+                        )?)
+                        .map_err(|error| HostEffectError::from(proposal_service_error(error)))?,
+                ));
+                Ok(())
             }
+            #[cfg(not(feature = "skills"))]
+            EffectOperation::ProposeSkill { .. } => Err(HostEffectError::BackendFailure),
             _ => Ok(()),
         }
     }
@@ -3005,9 +3037,11 @@ impl ParentEffectService for ParentHostEffectService {
             {
                 Err(HostEffectError::BackendFailure)
             }
-            // A12's direct proposal service accepts the complete v2 proposal.
-            // The provisional worker draft omits identity-bearing fields, so
-            // the broker must fail closed instead of inventing them.
+            #[cfg(feature = "skills")]
+            EffectOperation::ProposeSkill { .. } if self.proposal.is_none() => {
+                Err(HostEffectError::BackendFailure)
+            }
+            #[cfg(not(feature = "skills"))]
             EffectOperation::ProposeSkill { .. } => Err(HostEffectError::BackendFailure),
             _ => Ok(()),
         }
@@ -3020,7 +3054,10 @@ impl ParentEffectService for ParentHostEffectService {
         cancellation: PermCancellation,
     ) -> ParentEffectFuture<'a, Result<NormalizedTarget, HostEffectError>> {
         Box::pin(async move {
-            self.prepared = None;
+            self.authorized = None;
+            if !matches!(operation, EffectOperation::ProposeSkill { .. }) {
+                self.validated = None;
+            }
             match operation {
                 EffectOperation::ReadFile { path } => {
                     let target = tokio::select! {
@@ -3034,7 +3071,7 @@ impl ParentEffectService for ParentHostEffectService {
                     };
                     let workspace_relative =
                         workspace_relative_path(&self.file.allow_config.base, &target.path)?;
-                    self.prepared = Some(PreparedParentEffect::Read(PreparedReadEffect(target)));
+                    self.validated = Some(PreparedParentEffect::Read(PreparedReadEffect(target)));
                     Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
                 EffectOperation::WriteFile { path, content } => {
@@ -3049,7 +3086,7 @@ impl ParentEffectService for ParentHostEffectService {
                     };
                     let workspace_relative =
                         workspace_relative_path(&self.file.allow_config.base, &target.path)?;
-                    self.prepared = Some(PreparedParentEffect::Write {
+                    self.validated = Some(PreparedParentEffect::Write {
                         target: PreparedWriteEffect(target),
                         content: content.clone(),
                     });
@@ -3077,7 +3114,7 @@ impl ParentEffectService for ParentHostEffectService {
                     .await
                     .map_err(HostEffectError::from)?;
                     let resolved = prepared.executable.clone();
-                    self.prepared = Some(PreparedParentEffect::Spawn(prepared));
+                    self.validated = Some(PreparedParentEffect::Spawn(prepared));
                     Ok(NormalizedTarget::Spawn {
                         program: program.nfc().collect(),
                         resolved_executable: resolved,
@@ -3103,7 +3140,7 @@ impl ParentEffectService for ParentHostEffectService {
                     let request = FetchRequest::try_new(method_name, &headers, body.clone())
                         .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
                     let control = Arc::new(FetchCallControl::new());
-                    self.prepared = Some(PreparedParentEffect::FetchPending {
+                    self.validated = Some(PreparedParentEffect::FetchPending {
                         url: url.clone(),
                         request,
                         control,
@@ -3120,7 +3157,16 @@ impl ParentEffectService for ParentHostEffectService {
                 }
                 #[cfg(not(feature = "sandbox"))]
                 EffectOperation::Fetch { .. } => Err(HostEffectError::BackendFailure),
-                EffectOperation::ProposeSkill { .. } => Ok(NormalizedTarget::ProposeSkill),
+                #[cfg(feature = "skills")]
+                EffectOperation::ProposeSkill { .. }
+                    if matches!(
+                        self.validated.as_ref(),
+                        Some(PreparedParentEffect::Proposal(_))
+                    ) =>
+                {
+                    Ok(NormalizedTarget::ProposeSkill)
+                }
+                EffectOperation::ProposeSkill { .. } => Err(HostEffectError::BackendFailure),
             }
         })
     }
@@ -3133,7 +3179,7 @@ impl ParentEffectService for ParentHostEffectService {
     ) -> ParentEffectFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
         Box::pin(async move {
             let prepared = self
-                .prepared
+                .validated
                 .take()
                 .ok_or(HostEffectError::BackendFailure)?;
             let (prepared, audit_target) = match prepared {
@@ -3250,8 +3296,13 @@ impl ParentEffectService for ParentHostEffectService {
                 }
                 #[cfg(feature = "sandbox")]
                 PreparedParentEffect::Fetch(_) => return Err(HostEffectError::BackendFailure),
+                #[cfg(feature = "skills")]
+                PreparedParentEffect::Proposal(prepared) => (
+                    PreparedParentEffect::Proposal(prepared),
+                    AuthorizedTarget::ProposeSkill,
+                ),
             };
-            self.prepared = Some(prepared);
+            self.authorized = Some(prepared);
             Ok(audit_target)
         })
     }
@@ -3264,7 +3315,7 @@ impl ParentEffectService for ParentHostEffectService {
     ) -> ParentEffectFuture<'a, Result<EffectResult, HostEffectError>> {
         Box::pin(async move {
             let prepared = self
-                .prepared
+                .authorized
                 .take()
                 .ok_or(HostEffectError::BackendFailure)?;
             match prepared {
@@ -3317,6 +3368,23 @@ impl ParentEffectService for ParentHostEffectService {
                 }
                 #[cfg(feature = "sandbox")]
                 PreparedParentEffect::FetchPending { .. } => Err(HostEffectError::BackendFailure),
+                #[cfg(feature = "skills")]
+                PreparedParentEffect::Proposal(prepared) => {
+                    let proposal = self
+                        .proposal
+                        .as_ref()
+                        .ok_or(HostEffectError::BackendFailure)?;
+                    let result = proposal
+                        .execute_prepared_cancellable(prepared, cancellation)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    Ok(EffectResult::ProposalAccepted {
+                        skill_id: result.skill_id,
+                        proposal_id: result.proposal_id,
+                        status: result.status,
+                        report_id: result.report_id,
+                    })
+                }
             }
         })
     }

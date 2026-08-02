@@ -778,13 +778,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             None => return Err(HostEffectError::UnknownGrant),
         };
 
-        if grant.bound_invocation != self.invocation_id
-            || matches!(
-                &grant.principal,
-                GrantPrincipal::Skill { invocation_id, .. }
-                    if invocation_id != self.invocation_id.as_str()
-            )
-        {
+        if grant.bound_invocation != self.invocation_id {
             return Err(HostEffectError::WrongInvocation);
         }
 

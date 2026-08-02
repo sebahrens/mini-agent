@@ -285,7 +285,7 @@ fn all_active_invocations_share_one_effect_ordinal_budget() {
 #[tokio::test]
 async fn selected_skill_exports_are_installed_before_agent_code() {
     let selected = artifact(
-        "function increment(value) { return value + 1; }",
+        "function increment(_cap, value) { return value + 1; }",
         &["increment"],
         CapabilityManifest::pure(),
     );
@@ -299,6 +299,60 @@ async fn selected_skill_exports_are_installed_before_agent_code() {
         .unwrap();
 
     assert_eq!(result, "42");
+}
+
+#[tokio::test]
+async fn production_runner_emits_parent_bound_invocation_evidence() {
+    use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
+
+    let selected = artifact(
+        "function observed() { return 42; }",
+        &["observed"],
+        CapabilityManifest::pure(),
+    );
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let tool = make_test_tool()
+        .with_skill_turn_context(context(vec![resolved(&selected, 0)]))
+        .with_telemetry(TelemetryDispatcher::from_sender_for_test(tx));
+
+    assert_eq!(
+        tool.call(JsArgs {
+            code: "observed()".to_string(),
+        })
+        .await
+        .unwrap(),
+        "42"
+    );
+
+    let batch = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("parent-bound telemetry batch");
+    let kinds: Vec<_> = batch.events().iter().map(|event| event.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SkillEventKind::Selected,
+            SkillEventKind::Injected,
+            SkillEventKind::Invoked,
+            SkillEventKind::Returned,
+        ]
+    );
+    assert!(batch.events().iter().all(|event| {
+        event.skill_id == selected.id
+            && event.turn_id == "binding-turn"
+            && event.query_fingerprint.as_deref() == Some("binding-test")
+            && event.index_generation == 7
+            && event.production
+            && event.evidence_complete
+    }));
+    assert_eq!(
+        batch
+            .events()
+            .iter()
+            .find(|event| event.kind == SkillEventKind::Invoked)
+            .and_then(|event| event.argument_shape.as_deref()),
+        Some(r#"{"argc":0,"types":[]}"#)
+    );
 }
 
 #[tokio::test]
@@ -427,14 +481,14 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
     assert_eq!(denied, "JS error: exception");
 
     let allowed_manifest = CapabilityManifest::new(
-        CapabilityTier::SideEffecting,
-        vec![CapabilityScope::Spawn {
-            programs: vec!["printf".to_string()],
+        CapabilityTier::ReadOnly,
+        vec![CapabilityScope::ReadFile {
+            workspace_prefixes: vec!["Cargo.toml".to_string()],
         }],
     )
     .unwrap();
     let allowed = artifact(
-        "function permitted() { return spawn('printf', ['allowed']).stdout; }",
+        "function permitted(cap) { return cap.read_file('Cargo.toml').includes('[package]') ? 'allowed' : 'missing'; }",
         &["permitted"],
         allowed_manifest,
     );
@@ -446,7 +500,7 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
         })
         .await
         .unwrap();
-    assert_eq!(result, "JS error: exception");
+    assert_eq!(result, "allowed");
 
     let ordinary_agent = make_test_tool()
         .call(JsArgs {

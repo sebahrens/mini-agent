@@ -5,7 +5,6 @@
 //! terminal frame is written. The only global installed here is a bounded `console`; authority
 //! globals and module loaders are deliberately absent.
 
-use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -31,7 +30,9 @@ use super::types::{
     MEMORY_LIMIT, READ_FILE_MAX_BYTES, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
 };
 #[cfg(feature = "skills")]
-use crate::extras::js::skills::capability::InvocationCapabilityRuntime;
+use crate::extras::js::skills::capability::{InvocationAuthorization, InvocationCapabilityRuntime};
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::telemetry::{SkillEvent, SkillEventKind, stable_invocation_id};
 use crate::sandbox::worker::{
     INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, finalize_internal_worker,
     is_internal_worker_marker_present, standard_streams_are_protocol_pipes,
@@ -59,6 +60,139 @@ const FETCH_REQUEST_HEADER_MAX_BYTES: usize = 16 * 1024;
 const FETCH_REQUEST_BODY_MAX_BYTES: usize = 256 * 1024;
 
 type ModelEffectDispatcher = Rc<dyn Fn(EffectOperation) -> EffectResult>;
+type WorkerEffectDispatcher = Arc<
+    dyn Fn(super::protocol::GrantId, AdvisoryAttribution, EffectOperation) -> EffectResult
+        + Send
+        + Sync,
+>;
+
+#[cfg(feature = "skills")]
+#[derive(Clone)]
+struct WorkerEventMetadata {
+    skill_id: String,
+    export_name: String,
+    turn_id: String,
+    tool_call_id: String,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Default)]
+struct WorkerEventState {
+    events: Vec<SkillEvent>,
+    pending: std::collections::HashMap<String, (WorkerEventMetadata, Instant)>,
+}
+
+#[cfg(feature = "skills")]
+impl WorkerEventState {
+    fn injected(&mut self, skill_id: String, turn_id: String, tool_call_id: String) {
+        self.events.push(worker_event(
+            skill_id,
+            turn_id,
+            tool_call_id,
+            None,
+            None,
+            SkillEventKind::Injected,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    fn start(&mut self, id: String, metadata: WorkerEventMetadata, shape: String) {
+        self.pending
+            .insert(id.clone(), (metadata.clone(), Instant::now()));
+        self.events.push(worker_event(
+            metadata.skill_id,
+            metadata.turn_id,
+            metadata.tool_call_id,
+            Some(id),
+            Some(metadata.export_name),
+            SkillEventKind::Invoked,
+            None,
+            None,
+            Some(shape),
+        ));
+    }
+
+    fn terminal(&mut self, id: &str, success: bool) {
+        let Some((metadata, started)) = self.pending.remove(id) else {
+            return;
+        };
+        self.events.push(worker_event(
+            metadata.skill_id,
+            metadata.turn_id,
+            metadata.tool_call_id,
+            Some(id.to_string()),
+            Some(metadata.export_name),
+            if success {
+                SkillEventKind::Returned
+            } else {
+                SkillEventKind::Threw
+            },
+            Some(if success { "fulfilled" } else { "exception" }.into()),
+            Some(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64),
+            None,
+        ));
+    }
+
+    fn finalize_pending(&mut self, outcome: &StepOutcome) {
+        let pending = self.pending.keys().cloned().collect::<Vec<_>>();
+        for id in pending {
+            let Some((metadata, started)) = self.pending.remove(&id) else {
+                continue;
+            };
+            let (kind, code) = match outcome {
+                StepOutcome::Timeout => (SkillEventKind::TimedOut, "step_timeout"),
+                StepOutcome::OutOfMemory => (SkillEventKind::Oom, "step_oom"),
+                _ => (SkillEventKind::Threw, "step_failed"),
+            };
+            self.events.push(worker_event(
+                metadata.skill_id,
+                metadata.turn_id,
+                metadata.tool_call_id,
+                Some(id),
+                Some(metadata.export_name),
+                kind,
+                Some(code.into()),
+                Some(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64),
+                None,
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
+fn worker_event(
+    skill_id: String,
+    turn_id: String,
+    tool_call_id: String,
+    invocation_id: Option<String>,
+    export_name: Option<String>,
+    kind: SkillEventKind,
+    outcome: Option<String>,
+    latency_us: Option<u64>,
+    argument_shape: Option<String>,
+) -> SkillEvent {
+    SkillEvent {
+        invocation_id,
+        skill_id,
+        turn_id,
+        tool_call_id: Some(tool_call_id),
+        kind,
+        export_name,
+        outcome,
+        latency_us,
+        retrieval_score: None,
+        retrieval_rank: None,
+        query_fingerprint: None,
+        index_generation: 0,
+        evidence_complete: false,
+        production: false,
+        argument_shape,
+        created_at: 0,
+    }
+}
 
 struct WorkerSpawnResult {
     stdout: String,
@@ -178,6 +312,38 @@ fn install_model_effect_globals(
         #[cfg(feature = "sandbox")]
         ctx.globals().set("fetch", fetch)?;
         Ok(())
+    })
+}
+
+#[cfg(feature = "skills")]
+fn install_proposal_global(
+    context: &Context,
+    effects: ModelEffectDispatcher,
+) -> rquickjs::Result<()> {
+    context.with(|ctx| {
+        let propose_skill = Function::new(ctx.clone(), move |draft: Object<'_>| {
+            let proposal = super::skills::proposal::JsProposal::from_object(&draft)
+                .map_err(|_| effect_error("propose_skill", EffectErrorCode::InvalidTarget))?;
+            match effects(EffectOperation::ProposeSkill {
+                draft: proposal.into(),
+            }) {
+                EffectResult::ProposalAccepted {
+                    skill_id,
+                    proposal_id,
+                    status,
+                    report_id,
+                } => serde_json::to_string(&serde_json::json!({
+                    "id": skill_id,
+                    "proposal_id": proposal_id,
+                    "status": status.as_str(),
+                    "report_id": report_id,
+                }))
+                .map_err(|_| effect_error("propose_skill", EffectErrorCode::BackendFailure)),
+                EffectResult::Error(error) => Err(effect_error("propose_skill", error.code)),
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+        ctx.globals().set("propose_skill", propose_skill)
     })
 }
 
@@ -693,7 +859,7 @@ fn run_marked_worker() -> i32 {
     }
 }
 
-fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
+fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
     mut input: R,
     mut output: W,
 ) -> Result<(), ()> {
@@ -714,7 +880,7 @@ fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
     protocol.on_send(&ready).map_err(|_| ())?;
     write_terminal(&mut output, &ready)?;
 
-    let transport = Rc::new(RefCell::new(WorkerTransport {
+    let transport = Arc::new(Mutex::new(WorkerTransport {
         input,
         output,
         protocol,
@@ -722,7 +888,7 @@ fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
 
     loop {
         let request: ParentWireFrame = {
-            let mut transport = transport.borrow_mut();
+            let mut transport = transport.lock().map_err(|_| ())?;
             let request = read_frame(&mut transport.input).map_err(|_| ())?;
             transport.protocol.on_receive(&request).map_err(|_| ())?;
             request
@@ -755,7 +921,7 @@ fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
             sequence,
             message,
         };
-        let mut transport = transport.borrow_mut();
+        let mut transport = transport.lock().map_err(|_| ())?;
         transport.protocol.on_send(&response).map_err(|_| ())?;
         write_terminal(&mut transport.output, &response)?;
     }
@@ -766,56 +932,61 @@ fn write_terminal(output: &mut impl Write, frame: &WorkerWireFrame) -> Result<()
     output.flush().map_err(|_| ())
 }
 
-fn execute_brokered_run_step<R: std::io::Read + 'static, W: Write + 'static>(
+fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
     request: RunStep,
     limits: ExecutionLimits,
-    transport: Rc<RefCell<WorkerTransport<R, W>>>,
+    transport: Arc<Mutex<WorkerTransport<R, W>>>,
     build: BuildIdentity,
     invocation_id: super::protocol::InvocationId,
     sequence: u64,
 ) -> Result<(StepResult, u64), ()> {
-    let grant_id = request.model_grant_id.clone();
-    let ordinal = Rc::new(Cell::new(0_u32));
-    let sequence = Rc::new(Cell::new(sequence));
-    let protocol_failed = Rc::new(Cell::new(false));
-    let dispatcher = grant_id.map(|grant_id| {
+    let model_grant_id = request.model_grant_id.clone();
+    let ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sequence = Arc::new(Mutex::new(sequence));
+    let protocol_failed = Arc::new(AtomicBool::new(false));
+    let wire_dispatcher: WorkerEffectDispatcher = {
         let ordinal = ordinal.clone();
         let sequence = sequence.clone();
         let protocol_failed = protocol_failed.clone();
         let transport = transport.clone();
-        Rc::new(move |operation: EffectOperation| {
-            if protocol_failed.get() {
+        Arc::new(move |grant_id, advisory, operation| {
+            if protocol_failed.load(Ordering::Acquire) {
                 return backend_failure();
             }
-            let effect_ordinal = ordinal.get();
-            let Some(next_ordinal) = effect_ordinal.checked_add(1) else {
-                protocol_failed.set(true);
+            let effect_ordinal = ordinal.fetch_add(1, Ordering::AcqRel);
+            if effect_ordinal >= super::protocol::MAX_EFFECTS_PER_STEP {
+                protocol_failed.store(true, Ordering::Release);
                 return backend_failure();
-            };
-            ordinal.set(next_ordinal);
+            }
             let request = EffectRequest {
                 effect_ordinal,
-                grant_id: grant_id.clone(),
-                advisory: AdvisoryAttribution::default(),
+                grant_id,
+                advisory,
                 operation,
             };
-            match transport
-                .borrow_mut()
-                .round_trip(request, &build, &invocation_id, &sequence)
-            {
+            let result = transport.lock().map_err(|_| ()).and_then(|mut transport| {
+                transport.round_trip(request, &build, &invocation_id, &sequence)
+            });
+            match result {
                 Ok(result) => result,
                 Err(()) => {
-                    protocol_failed.set(true);
+                    protocol_failed.store(true, Ordering::Release);
                     backend_failure()
                 }
             }
+        })
+    };
+    let model_dispatcher = model_grant_id.map(|grant_id| {
+        let dispatcher = wire_dispatcher.clone();
+        Rc::new(move |operation| {
+            dispatcher(grant_id.clone(), AdvisoryAttribution::default(), operation)
         }) as ModelEffectDispatcher
     });
-    let terminal = execute_run_step(request, limits, dispatcher);
-    if protocol_failed.get() {
+    let terminal = execute_run_step(request, limits, model_dispatcher, wire_dispatcher);
+    if protocol_failed.load(Ordering::Acquire) {
         Err(())
     } else {
-        Ok((terminal, sequence.get()))
+        Ok((terminal, *sequence.lock().map_err(|_| ())?))
     }
 }
 
@@ -831,20 +1002,26 @@ impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
         request: EffectRequest,
         build: &BuildIdentity,
         invocation_id: &super::protocol::InvocationId,
-        sequence: &Cell<u64>,
+        sequence: &Mutex<u64>,
     ) -> Result<EffectResult, ()> {
         let frame = WireFrame::invocation(
             build.clone(),
             invocation_id.clone(),
-            sequence.get(),
+            *sequence.lock().map_err(|_| ())?,
             WorkerFrame::EffectRequest(request.clone()),
         );
         self.protocol.on_send(&frame).map_err(|_| ())?;
         write_terminal(&mut self.output, &frame)?;
-        sequence.set(sequence.get().checked_add(1).ok_or(())?);
+        {
+            let mut sequence = sequence.lock().map_err(|_| ())?;
+            *sequence = sequence.checked_add(1).ok_or(())?;
+        }
         let response: ParentWireFrame = read_frame(&mut self.input).map_err(|_| ())?;
         self.protocol.on_receive(&response).map_err(|_| ())?;
-        sequence.set(sequence.get().checked_add(1).ok_or(())?);
+        {
+            let mut sequence = sequence.lock().map_err(|_| ())?;
+            *sequence = sequence.checked_add(1).ok_or(())?;
+        }
         match response.message {
             ParentFrame::EffectResponse(EffectResponse {
                 effect_ordinal,
@@ -861,14 +1038,187 @@ fn backend_failure() -> EffectResult {
     })
 }
 
+#[cfg(feature = "skills")]
+fn prepare_bound_exports(
+    request: &RunStep,
+    capabilities: &InvocationCapabilityRuntime,
+    events: Arc<Mutex<WorkerEventState>>,
+) -> Result<
+    std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, super::realm::BoundExportInvocation>,
+    >,
+    (),
+> {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::AtomicU32;
+
+    if request.artifacts.is_empty() {
+        return request
+            .skill_invocations
+            .is_empty()
+            .then(HashMap::new)
+            .ok_or(());
+    }
+    if request.turn_id.is_empty() || request.tool_call_id.is_empty() || request.artifacts.len() > 64
+    {
+        return Err(());
+    }
+    let mut issued = HashMap::new();
+    for invocation in &request.skill_invocations {
+        if issued
+            .insert(
+                (
+                    invocation.artifact_id.clone(),
+                    invocation.export_name.clone(),
+                ),
+                invocation,
+            )
+            .is_some()
+        {
+            return Err(());
+        }
+    }
+
+    let mut prepared = HashMap::new();
+    let mut seen_artifacts = HashSet::new();
+    for artifact in &request.artifacts {
+        if !seen_artifacts.insert(artifact.id.clone()) {
+            return Err(());
+        }
+        let mut exports = HashMap::new();
+        for export in &artifact.exports {
+            let invocation = issued
+                .remove(&(artifact.id.clone(), export.name.clone()))
+                .ok_or(())?;
+            let expected_invocation = stable_invocation_id(
+                &request.turn_id,
+                &request.tool_call_id,
+                &artifact.id,
+                &export.name,
+                0,
+            );
+            if invocation.invocation_id.as_str() != expected_invocation {
+                return Err(());
+            }
+            let authorization = InvocationAuthorization::new(
+                invocation.invocation_id.clone(),
+                artifact.id.clone(),
+                export.name.clone(),
+                artifact.capability.clone(),
+                invocation
+                    .grants
+                    .iter()
+                    .map(|grant| (grant.capability, grant.grant_id.clone())),
+            )
+            .map_err(|_| ())?;
+            let handle = capabilities.prepare(authorization).map_err(|_| ())?;
+            let metadata = WorkerEventMetadata {
+                skill_id: artifact.id.clone(),
+                export_name: export.name.clone(),
+                turn_id: request.turn_id.clone(),
+                tool_call_id: request.tool_call_id.clone(),
+            };
+            let ordinal = Arc::new(AtomicU32::new(0));
+            let start_events = events.clone();
+            let start_metadata = metadata.clone();
+            let start_ordinal = ordinal.clone();
+            let on_start = Arc::new(move |shape: String| {
+                let ordinal = start_ordinal.fetch_add(1, Ordering::AcqRel);
+                let id = stable_invocation_id(
+                    &start_metadata.turn_id,
+                    &start_metadata.tool_call_id,
+                    &start_metadata.skill_id,
+                    &start_metadata.export_name,
+                    ordinal,
+                );
+                let shape = if shape.len()
+                    <= crate::extras::js::skills::telemetry::MAX_ARGUMENT_SHAPE_BYTES
+                {
+                    shape
+                } else {
+                    r#"{"truncated":true}"#.to_string()
+                };
+                start_events.lock().map_err(|_| ())?.start(
+                    id.clone(),
+                    start_metadata.clone(),
+                    shape,
+                );
+                Ok(id)
+            });
+            let terminal_events = events.clone();
+            let on_terminal = Arc::new(move |invocation_id: String, success: bool| {
+                terminal_events
+                    .lock()
+                    .map_err(|_| ())?
+                    .terminal(&invocation_id, success);
+                Ok(())
+            });
+            exports.insert(
+                export.name.clone(),
+                super::realm::BoundExportInvocation {
+                    handle,
+                    on_start,
+                    on_terminal,
+                },
+            );
+        }
+        prepared.insert(artifact.id.clone(), exports);
+    }
+    if !issued.is_empty() {
+        return Err(());
+    }
+    Ok(prepared)
+}
+
 fn execute_run_step(
     request: RunStep,
     limits: ExecutionLimits,
     effects: Option<ModelEffectDispatcher>,
+    _wire_effects: WorkerEffectDispatcher,
 ) -> StepResult {
-    #[cfg(feature = "skills")]
-    let has_selected_skills = !request.artifacts.is_empty();
     let console = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(feature = "skills")]
+    let event_state = Arc::new(Mutex::new(WorkerEventState::default()));
+    #[cfg(feature = "skills")]
+    let capability_runtime = {
+        let effects = _wire_effects.clone();
+        InvocationCapabilityRuntime::new(move |effect| {
+            Ok(effects(
+                effect.request.grant_id,
+                effect.request.advisory,
+                effect.request.operation,
+            ))
+        })
+    };
+    #[cfg(feature = "skills")]
+    let _capability_lifecycle = WorkerCapabilityLifecycle::new(capability_runtime.clone());
+    #[cfg(feature = "skills")]
+    let bindings = match prepare_bound_exports(&request, &capability_runtime, event_state.clone()) {
+        Ok(bindings) => bindings,
+        Err(()) => {
+            return StepResult {
+                outcome: StepOutcome::Error(JsErrorCode::Internal),
+                console: Vec::new(),
+                diagnostic: Some(Diagnostic {
+                    class: DiagnosticClass::Internal,
+                    stage: DiagnosticStage::Initialization,
+                    script_role: ScriptRole::SkillSource,
+                    line: None,
+                    column: None,
+                }),
+                skill_events: Vec::new(),
+                evidence_complete: false,
+            };
+        }
+    };
+    #[cfg(feature = "skills")]
+    let proposal_effects = request.proposal_grant_id.clone().map(|grant_id| {
+        let effects = _wire_effects;
+        Rc::new(move |operation| {
+            effects(grant_id.clone(), AdvisoryAttribution::default(), operation)
+        }) as ModelEffectDispatcher
+    });
     let execution = execute_fresh_step(
         &request.code,
         ScriptRole::Model,
@@ -876,30 +1226,57 @@ fn execute_run_step(
         console.clone(),
         effects,
         #[cfg(feature = "skills")]
+        proposal_effects,
+        #[cfg(feature = "skills")]
         &request.artifacts,
+        #[cfg(feature = "skills")]
+        &bindings,
+        #[cfg(feature = "skills")]
+        &capability_runtime,
+        #[cfg(feature = "skills")]
+        event_state.clone(),
+        #[cfg(feature = "skills")]
+        &request.turn_id,
+        #[cfg(feature = "skills")]
+        &request.tool_call_id,
     );
     let console = console
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    #[cfg(feature = "skills")]
+    {
+        let outcome = match &execution {
+            Ok(outcome) => outcome,
+            Err(failure) => &failure.outcome,
+        };
+        if let Ok(mut state) = event_state.lock() {
+            state.finalize_pending(outcome);
+        }
+    }
+    #[cfg(feature = "skills")]
+    let skill_events = event_state
+        .lock()
+        .map(|state| state.events.clone())
+        .unwrap_or_default();
     match execution {
         Ok(outcome) => StepResult {
             outcome,
             console,
             diagnostic: None,
             #[cfg(feature = "skills")]
-            skill_events: Vec::new(),
+            skill_events,
             #[cfg(feature = "skills")]
-            evidence_complete: !has_selected_skills,
+            evidence_complete: true,
         },
         Err(failure) => StepResult {
             outcome: failure.outcome,
             console,
             diagnostic: Some(failure.diagnostic),
             #[cfg(feature = "skills")]
-            skill_events: Vec::new(),
+            skill_events,
             #[cfg(feature = "skills")]
-            evidence_complete: !has_selected_skills,
+            evidence_complete: true,
         },
     }
 }
@@ -910,7 +1287,16 @@ fn execute_fresh_step(
     limits: ExecutionLimits,
     console: Arc<Mutex<Vec<ConsoleRecord>>>,
     effects: Option<ModelEffectDispatcher>,
+    #[cfg(feature = "skills")] proposal_effects: Option<ModelEffectDispatcher>,
     #[cfg(feature = "skills")] artifacts: &[super::skills::SkillArtifact],
+    #[cfg(feature = "skills")] bindings: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, super::realm::BoundExportInvocation>,
+    >,
+    #[cfg(feature = "skills")] capability_runtime: &InvocationCapabilityRuntime,
+    #[cfg(feature = "skills")] event_state: Arc<Mutex<WorkerEventState>>,
+    #[cfg(feature = "skills")] turn_id: &str,
+    #[cfg(feature = "skills")] tool_call_id: &str,
 ) -> Result<StepOutcome, ClosedFailure> {
     let runtime = Runtime::new().map_err(|error| initialization_failure(error, role))?;
     runtime.set_memory_limit(MEMORY_LIMIT);
@@ -939,6 +1325,19 @@ fn execute_fresh_step(
     })?;
     if let Some(effects) = effects {
         install_model_effect_globals(&context, effects).map_err(|error| {
+            classify_error(
+                &context,
+                error,
+                deadline,
+                &interrupted,
+                DiagnosticStage::Initialization,
+                role,
+            )
+        })?;
+    }
+    #[cfg(feature = "skills")]
+    if let Some(proposal_effects) = proposal_effects {
+        install_proposal_global(&context, proposal_effects).map_err(|error| {
             classify_error(
                 &context,
                 error,
@@ -980,14 +1379,45 @@ fn execute_fresh_step(
             )
         })?;
     #[cfg(feature = "skills")]
+    let mut loaded_artifacts = Vec::with_capacity(artifacts.len());
+    #[cfg(feature = "skills")]
     for artifact in artifacts {
-        super::realm::load_artifact(&runtime, &context, artifact).map_err(|_| {
+        let artifact_bindings = bindings.get(&artifact.id).cloned().ok_or_else(|| {
             ClosedFailure::error(
                 JsErrorCode::Internal,
                 DiagnosticStage::Initialization,
                 ScriptRole::SkillSource,
             )
         })?;
+        let loaded = super::realm::load_artifact_with_bound_exports(
+            &runtime,
+            &context,
+            artifact,
+            capability_runtime.clone(),
+            artifact_bindings,
+        )
+        .map_err(|_| {
+            ClosedFailure::error(
+                JsErrorCode::Internal,
+                DiagnosticStage::Initialization,
+                ScriptRole::SkillSource,
+            )
+        })?;
+        loaded_artifacts.push(loaded);
+        event_state
+            .lock()
+            .map_err(|_| {
+                ClosedFailure::error(
+                    JsErrorCode::Internal,
+                    DiagnosticStage::Initialization,
+                    ScriptRole::SkillSource,
+                )
+            })?
+            .injected(
+                artifact.id.clone(),
+                turn_id.to_string(),
+                tool_call_id.to_string(),
+            );
     }
     let value = evaluate(&context, source, &runtime, deadline, &interrupted, role)?;
     let mut remaining_jobs = limits.max_pending_jobs;
