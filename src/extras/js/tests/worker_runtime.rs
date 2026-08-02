@@ -938,6 +938,7 @@ struct RecoveryLauncher {
     first_startup: TestSupervisorStartup,
     launches: Arc<AtomicUsize>,
     live_processes: Arc<AtomicUsize>,
+    last_process_id: Arc<AtomicUsize>,
 }
 
 impl RecoveryLauncher {
@@ -946,6 +947,7 @@ impl RecoveryLauncher {
             first_startup,
             launches: Arc::new(AtomicUsize::new(0)),
             live_processes: Arc::new(AtomicUsize::new(0)),
+            last_process_id: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -963,6 +965,11 @@ impl RecoveryLauncher {
             )
         });
     }
+
+    fn last_process_id(&self) -> u32 {
+        u32::try_from(self.last_process_id.load(Ordering::Acquire))
+            .expect("recorded worker PID should fit u32")
+    }
 }
 
 impl WorkerLauncher for RecoveryLauncher {
@@ -978,7 +985,91 @@ impl WorkerLauncher for RecoveryLauncher {
         };
         let mut process =
             TestWorkerLauncher::scripted_internal_worker_with_startup(0, startup).launch()?;
+        self.last_process_id
+            .store(process.id() as usize, Ordering::Release);
         process.observe_reap_for_test(self.live_processes.clone());
+        Ok(process)
+    }
+}
+
+#[derive(Clone)]
+struct DelayedLaunchLauncher {
+    launches: Arc<AtomicUsize>,
+    completed_launches: Arc<AtomicUsize>,
+    live_processes: Arc<AtomicUsize>,
+    first_delay: Duration,
+}
+
+impl DelayedLaunchLauncher {
+    fn new(first_delay: Duration) -> Self {
+        Self {
+            launches: Arc::new(AtomicUsize::new(0)),
+            completed_launches: Arc::new(AtomicUsize::new(0)),
+            live_processes: Arc::new(AtomicUsize::new(0)),
+            first_delay,
+        }
+    }
+
+    async fn wait_for_launches(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.launches.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("synchronous launcher was not entered");
+    }
+
+    async fn wait_for_completed_launches(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.completed_launches.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("delayed launch did not return");
+    }
+
+    async fn wait_for_live_processes(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.live_processes.load(Ordering::Acquire) != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late worker process was not reaped");
+    }
+}
+
+impl WorkerLauncher for DelayedLaunchLauncher {
+    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
+        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
+    }
+
+    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        if self.launches.fetch_add(1, Ordering::AcqRel) == 0 {
+            std::thread::sleep(self.first_delay);
+        }
+        let mut process = TestWorkerLauncher::scripted_internal_worker(0).launch()?;
+        process.observe_reap_for_test(self.live_processes.clone());
+        self.completed_launches.fetch_add(1, Ordering::Release);
+        Ok(process)
+    }
+}
+
+struct TreeTerminationFailureLauncher {
+    live_processes: Arc<AtomicUsize>,
+}
+
+impl WorkerLauncher for TreeTerminationFailureLauncher {
+    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
+        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
+    }
+
+    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        let mut process = TestWorkerLauncher::scripted_internal_worker(0).launch()?;
+        process.observe_reap_for_test(self.live_processes.clone());
+        process.force_tree_termination_error_for_test();
         Ok(process)
     }
 }
@@ -1027,6 +1118,111 @@ async fn assert_fault_then_recovery(
     launcher.wait_for_live_processes(1).await;
     supervisor.shutdown_for_test().await.unwrap();
     launcher.wait_for_live_processes(0).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_watchdog_bounds_synchronous_launch_and_reaps_late_process() {
+    let launcher = DelayedLaunchLauncher::new(Duration::from_millis(500));
+    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        launcher.clone(),
+        Duration::from_millis(50),
+    ));
+
+    let started = Instant::now();
+    let result = supervisor
+        .execute(
+            RunStep {
+                code: "success".into(),
+            },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await;
+    assert_eq!(result, Err(WorkerError::TimedOut));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "synchronous launcher escaped the whole-call watchdog"
+    );
+
+    launcher.wait_for_completed_launches(1).await;
+    launcher.wait_for_live_processes(0).await;
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_cancellation_bounds_synchronous_launch_and_reaps_late_process() {
+    let launcher = DelayedLaunchLauncher::new(Duration::from_millis(500));
+    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        launcher.clone(),
+        Duration::from_secs(2),
+    ));
+    let cancellation = PermCancellation::new();
+    let request_cancellation = cancellation.clone();
+    let request_supervisor = supervisor.clone();
+    let request = tokio::spawn(async move {
+        request_supervisor
+            .execute(
+                RunStep {
+                    code: "success".into(),
+                },
+                RecordingEffects::default(),
+                request_cancellation,
+            )
+            .await
+    });
+    launcher.wait_for_launches(1).await;
+
+    let started = Instant::now();
+    cancellation.cancel();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(250), request)
+            .await
+            .expect("cancellation did not interrupt synchronous startup")
+            .unwrap(),
+        Err(WorkerError::Cancelled)
+    );
+    assert!(started.elapsed() < Duration::from_millis(250));
+
+    launcher.wait_for_completed_launches(1).await;
+    launcher.wait_for_live_processes(0).await;
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_shutdown_propagates_tree_failure_after_root_exit() {
+    let live_processes = Arc::new(AtomicUsize::new(0));
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        TreeTerminationFailureLauncher {
+            live_processes: live_processes.clone(),
+        },
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+
+    assert_eq!(
+        supervisor.shutdown_for_test().await,
+        Err(WorkerError::Transport)
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while live_processes.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("root process was not reaped after tree-termination failure");
 }
 
 #[tokio::test]
@@ -1099,7 +1295,7 @@ async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler()
 }
 
 #[tokio::test]
-async fn worker_supervisor_recovery_watchdog_caller_drop_and_stale_old_process() {
+async fn worker_supervisor_recovery_watchdog_and_caller_drop() {
     let (supervisor, launcher) =
         recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_millis(100));
     assert_eq!(
@@ -1141,16 +1337,72 @@ async fn worker_supervisor_recovery_watchdog_caller_drop_and_stale_old_process()
         StepOutcome::Value("success".into())
     );
 
-    let stale = supervisor
-        .execute(
+    launcher.wait_for_live_processes(1).await;
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+}
+
+#[cfg(unix)]
+fn stale_descendant_witness_path(root_pid: u32) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    let temporary_directory = std::path::Path::new("/private/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let temporary_directory = std::path::Path::new("/tmp");
+    temporary_directory.join(format!("mini-agent-a10-descendant-{root_pid}"))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal zero performs an existence/permission check and does not mutate the target.
+    (unsafe { libc::kill(pid, 0) == 0 })
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+async fn wait_for_process_exit(pid: u32) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while process_exists(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stale protocol-pipe descendant survived bounded tree teardown");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_supervisor_reaps_root_exited_descendant_holding_protocol_pipe() {
+    let (supervisor, launcher) =
+        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(2));
+    let stale = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.execute(
             RunStep {
                 code: "stale-response".into(),
             },
             RecordingEffects::default(),
             PermCancellation::new(),
-        )
-        .await;
+        ),
+    )
+    .await
+    .expect("root-exited descendant kept recovery blocked");
     assert_eq!(stale, Err(WorkerError::Transport));
+
+    let root_pid = launcher.last_process_id();
+    let witness = stale_descendant_witness_path(root_pid);
+    let descendant_pid: u32 = std::fs::read_to_string(&witness)
+        .expect("descendant did not publish its PID before the root exited")
+        .parse()
+        .expect("descendant PID witness was invalid");
+    assert_ne!(descendant_pid, root_pid);
+    launcher.wait_for_live_processes(0).await;
+    wait_for_process_exit(descendant_pid).await;
+    let _ = std::fs::remove_file(&witness);
+
     assert_eq!(
         execute_success(&supervisor).await.outcome,
         StepOutcome::Value("success".into())
@@ -1159,10 +1411,8 @@ async fn worker_supervisor_recovery_watchdog_caller_drop_and_stale_old_process()
     assert_eq!(
         execute_success(&supervisor).await.outcome,
         StepOutcome::Value("success".into()),
-        "an old-process response poisoned the recovered connection"
+        "a stale descendant poisoned the recovered connection"
     );
-
-    launcher.wait_for_live_processes(1).await;
     supervisor.shutdown_for_test().await.unwrap();
     launcher.wait_for_live_processes(0).await;
 }
@@ -1502,20 +1752,19 @@ fn run_scripted_supervisor_worker() -> ! {
                         {
                             use std::process::{Command, Stdio};
 
-                            let executable = std::env::current_exe().unwrap();
-                            Command::new(executable)
+                            let witness = stale_descendant_witness_path(std::process::id());
+                            let _ = std::fs::remove_file(&witness);
+                            let descendant = Command::new("/bin/sleep")
                                 .env_clear()
-                                .env("MINI_AGENT_TEST_STALE_WRITER", "1")
-                                .args([
-                                    "--exact",
-                                    "extras::js::tests::worker_runtime::worker_bootstrap_test_child",
-                                    "--nocapture",
-                                ])
+                                .arg("30")
                                 .stdin(Stdio::null())
                                 .stdout(Stdio::inherit())
                                 .stderr(Stdio::null())
                                 .spawn()
                                 .unwrap();
+                            let pending_witness = witness.with_extension("pending");
+                            std::fs::write(&pending_witness, descendant.id().to_string()).unwrap();
+                            std::fs::rename(pending_witness, witness).unwrap();
                         }
                         std::process::exit(74);
                     }
@@ -1619,13 +1868,6 @@ fn run_scripted_supervisor_worker() -> ! {
 
 #[test]
 fn worker_bootstrap_test_child() {
-    if std::env::var_os("MINI_AGENT_TEST_STALE_WRITER").is_some() {
-        std::thread::sleep(Duration::from_millis(200));
-        let mut output = std::io::stdout().lock();
-        let _ = output.write_all(&[0, 0, 0, 1, b'{']);
-        let _ = output.flush();
-        return;
-    }
     if crate::sandbox::worker::is_internal_worker_marker_present() {
         for key in [
             "PATH",

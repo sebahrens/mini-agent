@@ -235,7 +235,7 @@ impl JsWorkerSupervisor {
             None => {
                 let generation = allocate_counter(&mut state.next_generation)?;
                 launch_connection(
-                    self.0.launcher.as_ref(),
+                    self.0.launcher.clone(),
                     generation,
                     self.0.accepts_test_preamble,
                     &cancellation,
@@ -294,11 +294,16 @@ impl JsWorkerSupervisor {
             .map_err(|_| WorkerError::Protocol)?;
         write_parent(&connection, frame, &cancellation, deadline).await?;
         loop {
-            if let Some(status) = connection
+            if connection
                 .process
                 .try_wait()
                 .map_err(|_| WorkerError::Transport)?
+                .is_some()
             {
+                let status = connection
+                    .process
+                    .terminate_and_reap(PROCESS_REAP_TIMEOUT)
+                    .map_err(|_| WorkerError::Transport)?;
                 return if status.success() {
                     Ok(())
                 } else {
@@ -403,13 +408,13 @@ impl InvocationEffectHandler for RejectEffects {
 }
 
 async fn launch_connection(
-    launcher: &dyn WorkerLauncher,
+    launcher: Arc<dyn WorkerLauncher>,
     generation: u64,
     accepts_test_preamble: bool,
     cancellation: &PermCancellation,
     deadline: Instant,
 ) -> Result<WorkerConnection, WorkerError> {
-    let process = launcher.launch().map_err(map_launch_error)?;
+    let process = launch_process(launcher, cancellation, deadline).await?;
     let stderr_drain = start_stderr_drain(&process)?;
     let build = BuildIdentity::current();
     let mut connection = WorkerConnection {
@@ -443,6 +448,72 @@ async fn launch_connection(
     }
     connection.sequence = 2;
     Ok(connection)
+}
+
+async fn launch_process(
+    launcher: Arc<dyn WorkerLauncher>,
+    cancellation: &PermCancellation,
+    deadline: Instant,
+) -> Result<WorkerProcess, WorkerError> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("mini-agent-js-worker-launch".into())
+        .spawn(move || {
+            let delivered = LaunchDelivery::new(launcher.launch());
+            if let Err(mut rejected) = sender.send(delivered) {
+                // Cancellation, caller-future drop, or the whole-call watchdog may win while the
+                // synchronous platform launcher is still running. A process returned afterward
+                // has no supervisor owner, so retire its complete tree on this detached thread.
+                rejected.retire_now();
+            }
+        })
+        .map_err(|_| WorkerError::Launch)?;
+
+    let mut delivered = await_controlled(receiver, cancellation, deadline)
+        .await?
+        .map_err(|_| WorkerError::Launch)?;
+    delivered
+        .take()
+        .expect("launch delivery is consumed exactly once")
+        .map_err(map_launch_error)
+}
+
+struct LaunchDelivery {
+    result: Option<Result<WorkerProcess, WorkerLaunchError>>,
+}
+
+impl LaunchDelivery {
+    fn new(result: Result<WorkerProcess, WorkerLaunchError>) -> Self {
+        Self {
+            result: Some(result),
+        }
+    }
+
+    fn take(&mut self) -> Option<Result<WorkerProcess, WorkerLaunchError>> {
+        self.result.take()
+    }
+
+    fn retire_now(&mut self) {
+        if let Some(Ok(mut process)) = self.result.take() {
+            let _ = process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
+        }
+    }
+}
+
+impl Drop for LaunchDelivery {
+    fn drop(&mut self) {
+        let Some(Ok(mut process)) = self.result.take() else {
+            return;
+        };
+        // If a ready channel value loses a cancellation/deadline race, dropping the receiver must
+        // not run the bounded process teardown on the async executor. The cleanup thread owns the
+        // only remaining process handle and performs the same full-tree retirement.
+        let _ = std::thread::Builder::new()
+            .name("mini-agent-js-late-launch-reap".into())
+            .spawn(move || {
+                let _ = process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
+            });
+    }
 }
 
 async fn run_invocation<H: InvocationEffectHandler>(

@@ -2674,6 +2674,7 @@ dependencies = [
  "http",
  "ignore",
  "include_dir",
+ "libc",
  "lsp-types",
  "matrixmultiply",
  "ort",

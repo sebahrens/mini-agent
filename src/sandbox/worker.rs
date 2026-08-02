@@ -150,6 +150,8 @@ pub(crate) struct WorkerProcess {
     pub(crate) backend: WorkerBackend,
     #[cfg(test)]
     reap_observer: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    force_tree_termination_error: bool,
 }
 
 impl WorkerProcess {
@@ -158,7 +160,12 @@ impl WorkerProcess {
     }
 
     pub(crate) fn terminate_tree(&mut self) -> io::Result<()> {
-        self.process.terminate_tree()
+        let result = self.process.terminate_tree();
+        #[cfg(test)]
+        if self.force_tree_termination_error {
+            return Err(io::Error::other("forced tree-termination failure"));
+        }
+        result
     }
 
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -177,18 +184,24 @@ impl WorkerProcess {
 
     /// Terminates the complete containment tree and waits a bounded time for its root to reap.
     pub(crate) fn terminate_and_reap(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let deadline = Instant::now() + timeout;
         let root_status = self.try_wait()?;
         // Teardown must target the containment tree even if the root has already exited: an old
         // descendant may still own a protocol-pipe clone and otherwise outlive its generation.
-        let termination_error = self.terminate_tree().err();
+        let mut termination_error = self.terminate_tree().err();
         if let Some(status) = root_status {
-            return Ok(status);
+            return match termination_error.take() {
+                Some(error) => Err(error),
+                None => Ok(status),
+            };
         }
 
-        let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.try_wait()? {
-                return Ok(status);
+                return match termination_error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(status),
+                };
             }
             if Instant::now() >= deadline {
                 return Err(termination_error.unwrap_or_else(|| {
@@ -213,6 +226,11 @@ impl WorkerProcess {
     }
 
     #[cfg(test)]
+    pub(crate) fn force_tree_termination_error_for_test(&mut self) {
+        self.force_tree_termination_error = true;
+    }
+
+    #[cfg(test)]
     fn notify_reaped(&mut self) {
         if let Some(observer) = self.reap_observer.take() {
             observer.fetch_sub(1, Ordering::AcqRel);
@@ -228,6 +246,25 @@ impl Drop for WorkerProcess {
         // This is the last-resort path for cancellation by caller-future drop. It is bounded so
         // synchronous destruction cannot hang an async executor indefinitely.
         let _ = self.terminate_and_reap(Duration::from_millis(500));
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn terminate_worker_process_group(pid: u32) -> io::Result<()> {
+    let process_group = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "worker PID exceeds pid_t"))?;
+    // SAFETY: kill is a synchronous syscall. A negative, nonzero PID addresses exactly the
+    // process group created for this worker; no pointer or borrowed memory crosses the call.
+    if unsafe { libc::kill(-process_group, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        // The complete group is already gone, which satisfies teardown.
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -427,6 +464,7 @@ impl WorkerLauncher for TestWorkerLauncher {
             stderr: child_stderr_file(stderr),
             backend,
             reap_observer: None,
+            force_tree_termination_error: false,
         })
     }
 }
@@ -558,6 +596,23 @@ mod tests {
             .terminate_tree()
             .expect("test child should terminate");
         let _ = process.wait().expect("test child should be reaped");
+    }
+
+    #[test]
+    fn worker_root_exit_does_not_mask_tree_termination_failure() {
+        let mut process = TestWorkerLauncher::current_test_process()
+            .launch()
+            .expect("test launcher should start the current test executable");
+        process
+            .terminate_tree()
+            .expect("test worker group should terminate");
+        process.wait().expect("test worker root should reap");
+        process.force_tree_termination_error_for_test();
+
+        let error = process
+            .terminate_and_reap(Duration::from_millis(50))
+            .expect_err("a cached root status must not hide tree-termination failure");
+        assert_eq!(error.to_string(), "forced tree-termination failure");
     }
 
     #[test]
