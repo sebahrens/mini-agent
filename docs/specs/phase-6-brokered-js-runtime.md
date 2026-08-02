@@ -526,12 +526,14 @@ standard-library output helper is the one synchronous exception: because
 `Command` does not expose its stdio configuration for a faithful spawn-only reimplementation, it
 holds the lock while `Command::output` completes, preserving explicit stdio and builder reuse. No
 guard crosses an async suspension, and async/await/closure-deferred terminals cannot claim lexical
-guard dominance. Inheritable-handle owners also clear their bit during drop on
+guard dominance; macro-contained raw terminals are likewise non-dominant because expansion can
+defer execution. Inheritable-handle owners also clear their bit during drop on
 every error path before the earlier-acquired lock guard is released. The checked subprocess
 inventory recursively resolves parsed imports, type aliases, and local-module re-exports alongside
-full-source tokens and rejects
-multiline, qualified-angle or renamed UFCS, and ambiguous Windows-capable production terminals that
-bypass this boundary. A dedicated exact multiset inventory for the creation helper itself requires
+full-source tokens, treats glob imports and out-of-line modules as opaque, and inventories associated
+terminal function-item references. It rejects multiline, qualified-angle or renamed UFCS, and
+ambiguous Windows-capable production terminals that bypass this boundary. A dedicated exact
+multiset inventory for the creation helper itself requires
 every raw standard-library, Tokio, and RMCP terminal to remain dominated by a retained crate guard.
 Any future raw or third-party Windows launcher is inside the same boundary and must reuse it.
 

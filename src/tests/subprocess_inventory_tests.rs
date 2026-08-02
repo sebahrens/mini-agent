@@ -74,6 +74,12 @@ impl SourceProvenance {
         }
     }
 
+    fn path_is_opaque(&self, path: &[String]) -> bool {
+        self.opaque_modules
+            .iter()
+            .any(|module| path.starts_with(module))
+    }
+
     fn matching_binding(&self, path: &[String]) -> Option<(usize, &Option<Vec<String>>)> {
         (1..=path.len())
             .rev()
@@ -105,22 +111,18 @@ impl SourceProvenance {
 
     fn is_proven_local_path(&self, path: &[String]) -> bool {
         if self.matching_binding(path).is_some() {
-            return self
-                .resolve_path(path)
-                .and_then(|target| target.first().cloned())
-                .is_some_and(|root| {
-                    self.local_names.contains(&root)
-                        || matches!(root.as_str(), "crate" | "self" | "super")
-                });
+            return self.resolve_path(path).is_some_and(|target| {
+                !self.path_is_opaque(&target)
+                    && target.first().is_some_and(|root| {
+                        self.local_names.contains(root)
+                            || matches!(root.as_str(), "crate" | "self" | "super")
+                    })
+            });
         }
         let Some(first) = path.first() else {
             return false;
         };
-        if self
-            .opaque_modules
-            .iter()
-            .any(|module| path.starts_with(module))
-        {
+        if self.path_is_opaque(path) {
             return false;
         }
         if let Some(binding) = self.bindings.get(first) {
@@ -187,6 +189,9 @@ impl<'ast> Visit<'ast> for SourceProvenance {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         self.local_names.insert(item.ident.to_string());
         self.module_path.push(item.ident.to_string());
+        if item.content.is_none() {
+            self.record_opaque_module();
+        }
         syn::visit::visit_item_mod(self, item);
         self.module_path.pop();
     }
@@ -237,6 +242,7 @@ struct TerminalCall {
     line: usize,
     name: String,
     guarded: bool,
+    macro_contained: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -408,7 +414,8 @@ fn process_creation_raw_terminal_audit(source: &str) -> Result<Vec<RawTerminalAu
         audits.push(RawTerminalAudit {
             function: owner.map_or("<no function>".to_string(), |scope| scope.name.clone()),
             fingerprint,
-            guard_dominates: owner.is_some_and(|scope| scope.guard_dominates),
+            guard_dominates: !call.macro_contained
+                && owner.is_some_and(|scope| scope.guard_dominates),
         });
     }
     audits.sort();
@@ -461,6 +468,11 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
         if punct(index.checked_sub(1).and_then(|i| tokens.get(i)), '.') {
             return true;
         }
+        is_ufcs(tokens, index)
+    }
+
+    fn is_ufcs(tokens: &[TokenTree], index: usize) -> bool {
+        let punct = |token: Option<&TokenTree>, expected| matches!(token, Some(TokenTree::Punct(punct)) if punct.as_char() == expected);
         punct(index.checked_sub(1).and_then(|i| tokens.get(i)), ':')
             && punct(index.checked_sub(2).and_then(|i| tokens.get(i)), ':')
     }
@@ -512,11 +524,21 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
                 && resolved.get(1).is_none_or(|segment| segment != "process"))
     }
 
-    fn scan(stream: TokenStream, provenance: &SourceProvenance, calls: &mut Vec<TerminalCall>) {
+    fn scan(
+        stream: TokenStream,
+        provenance: &SourceProvenance,
+        calls: &mut Vec<TerminalCall>,
+        inside_macro: bool,
+    ) {
         let tokens: Vec<_> = stream.into_iter().collect();
         for (index, token) in tokens.iter().enumerate() {
             if let TokenTree::Group(group) = token {
-                scan(group.stream(), provenance, calls);
+                let macro_arguments = index
+                    .checked_sub(1)
+                    .and_then(|previous| tokens.get(previous));
+                let group_is_macro = inside_macro
+                    || matches!(macro_arguments, Some(TokenTree::Punct(punct)) if punct.as_char() == '!');
+                scan(group.stream(), provenance, calls, group_is_macro);
             }
             let TokenTree::Ident(ident) = token else {
                 continue;
@@ -525,19 +547,27 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
             if !is_terminal(&name) || !is_method_or_ufcs(&tokens, index) {
                 continue;
             }
-            let Some(TokenTree::Group(arguments)) = tokens.get(index + 1) else {
-                continue;
-            };
-            if arguments.delimiter() != Delimiter::Parenthesis {
+            if is_proven_non_process_spawn(&tokens, index, &name, provenance) {
                 continue;
             }
-            if is_proven_non_process_spawn(&tokens, index, &name, provenance) {
+            let immediate_call = matches!(
+                tokens.get(index + 1),
+                Some(TokenTree::Group(arguments)) if arguments.delimiter() == Delimiter::Parenthesis
+            );
+            if !immediate_call && !is_ufcs(&tokens, index) {
+                // Rust cannot take a bound method from `value.method`; without call syntax this is
+                // a field/accessor such as `output.status`, not terminal authority.
+                continue;
+            }
+            if !immediate_call && name.ends_with("_guarded") {
+                // Taking a guarded helper as a function item preserves the helper's own lock.
                 continue;
             }
             calls.push(TerminalCall {
                 line: ident.span().start().line,
                 guarded: name.ends_with("_guarded"),
                 name,
+                macro_contained: inside_macro,
             });
         }
     }
@@ -549,7 +579,7 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
     let stream = TokenStream::from_str(source)
         .map_err(|error| format!("Rust source did not tokenize: {error}"))?;
     let mut calls = Vec::new();
-    scan(stream, &provenance, &mut calls);
+    scan(stream, &provenance, &mut calls, false);
     calls.sort_by_key(|call| call.line);
     Ok(calls)
 }
@@ -779,6 +809,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "let mut child = tokio::process::Command::new(cfg.command.as_str())",
         1,
         "TC-LSP-SERVICE",
+    ),
+    (
+        "src/extras/lsp/mod.rs",
+        "let spawned = LspClient::spawn(name, cfg, &self.inner.root, self.inner.diags.clone(), {",
+        1,
+        "NON-PROCESS",
     ),
     (
         "src/extras/lsp/client.rs",
@@ -1110,6 +1146,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "TEST-ONLY",
     ),
+    (
+        "src/extras/lsp/mod.rs",
+        "let spawned = LspClient::spawn(name, cfg, &self.inner.root, self.inner.diags.clone(), {",
+        1,
+        "NON-PROCESS",
+    ),
     ("src/sandbox.rs", ".status();", 2, "TC-LIFECYCLE-HELPER"),
     (
         "src/sandbox.rs",
@@ -1412,10 +1454,13 @@ fn creation_boundary_violations(
 
     for (line_index, line) in contents.lines().enumerate() {
         let line = line.trim();
-        if !is_inventory_line(line) {
+        let normalized = normalized_inventory_line(line);
+        let explicitly_inventoried = expected
+            .keys()
+            .any(|(path, source, _)| path == relative && source == &normalized);
+        if !is_inventory_line(line) && !explicitly_inventoried {
             continue;
         }
-        let normalized = normalized_inventory_line(line);
         let fingerprint = (relative.to_string(), normalized);
         let occurrence = seen.entry(fingerprint.clone()).or_default();
         *occurrence += 1;
@@ -1453,6 +1498,7 @@ fn creation_boundary_violations(
 fn production_subprocess_sites_have_a_trust_classification() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source_root = root.join("src");
+    let expected = checked_inventory();
     let mut seen = BTreeMap::<(String, String), usize>::new();
     let mut observed = BTreeSet::<(String, String, usize)>::new();
 
@@ -1469,19 +1515,20 @@ fn production_subprocess_sites_have_a_trust_classification() {
             continue;
         }
         let contents = std::fs::read_to_string(&source).expect("Rust source must be UTF-8");
-        for line in contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| is_inventory_line(line))
-        {
-            let fingerprint = (relative.clone(), normalized_inventory_line(line));
+        for line in contents.lines().map(str::trim) {
+            let normalized = normalized_inventory_line(line);
+            let explicitly_inventoried = expected
+                .keys()
+                .any(|(path, source, _)| path == &relative && source == &normalized);
+            if !is_inventory_line(line) && !explicitly_inventoried {
+                continue;
+            }
+            let fingerprint = (relative.clone(), normalized);
             let occurrence = seen.entry(fingerprint.clone()).or_default();
             *occurrence += 1;
             observed.insert((fingerprint.0, fingerprint.1, *occurrence));
         }
     }
-
-    let expected = checked_inventory();
 
     let unclassified: Vec<_> = observed
         .iter()
@@ -1648,6 +1695,25 @@ fn bypass(command: &mut std::process::Command) {
             "unexpected validation error: {error}"
         );
     }
+}
+
+#[test]
+fn process_creation_raw_inventory_rejects_macro_deferred_terminals() {
+    let fixture = r#"
+fn bypass(command: &mut std::process::Command) -> std::io::Result<()> {
+    let _guard = creation_guard()?;
+    defer!(std::process::Command::spawn(command));
+    Ok(())
+}
+"#;
+    let expected = BTreeMap::from([(
+        "bypass|defer!(std::process::Command::spawn(command));".to_string(),
+        1,
+    )]);
+    let error = validate_process_creation_raw_inventory(fixture, &expected)
+        .expect_err("a raw terminal hidden in a macro may not inherit lexical guard dominance");
+
+    assert!(error.contains("not dominated by a retained creation guard"));
 }
 
 #[test]
@@ -1859,6 +1925,58 @@ fn launch(command: &mut std::process::Command) {
             .map(|call| call.name.as_str())
             .collect::<Vec<_>>(),
         ["spawn", "spawn", "spawn", "spawn", "spawn", "spawn"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_fails_closed_after_opaque_module_imports() {
+    let calls = terminal_calls(
+        r#"
+mod globbed {
+    pub use std::process::*;
+}
+mod external;
+
+use globbed::Command;
+
+fn launch(command: &mut std::process::Command) {
+    let _ = Command::spawn(command);
+    let _ = external::Command::spawn(command);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn", "spawn"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_rejects_process_function_item_indirection() {
+    let calls = terminal_calls(
+        r#"
+fn launch(command: &mut std::process::Command) {
+    let terminal = std::process::Command::spawn;
+    let _ = terminal(command);
+    invoke!(std::process::Command::output, command);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn", "output"]
     );
     assert!(calls.iter().all(|call| !call.guarded));
 }
