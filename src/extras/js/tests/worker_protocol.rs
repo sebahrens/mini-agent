@@ -83,6 +83,30 @@ fn effect_response(sequence: u64, ordinal: u32) -> ParentWireFrame {
     )
 }
 
+#[cfg(feature = "skills")]
+fn skill_call_request(sequence: u64, request_ordinal: u32, call_ordinal: u32) -> WorkerWireFrame {
+    invoked(
+        sequence,
+        WorkerFrame::SkillCallRequest(SkillCallRequest {
+            request_ordinal,
+            artifact_id: "a".repeat(64),
+            export_name: "increment".into(),
+            call_ordinal,
+        }),
+    )
+}
+
+#[cfg(feature = "skills")]
+fn skill_call_response(sequence: u64, request_ordinal: u32) -> ParentWireFrame {
+    invoked(
+        sequence,
+        ParentFrame::SkillCallResponse(SkillCallResponse {
+            request_ordinal,
+            authorization: None,
+        }),
+    )
+}
+
 fn step_result(sequence: u64) -> WorkerWireFrame {
     invoked(
         sequence,
@@ -327,6 +351,48 @@ fn worker_protocol_run_step_complete_transition_table() {
     worker.on_receive(&shutdown).unwrap();
     assert_eq!(parent.state(), &ParentState::Closed);
     assert_eq!(worker.state(), &WorkerState::Closed);
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn worker_protocol_serializes_reusable_skill_calls_without_consuming_effect_ordinals() {
+    let mut parent = ParentProtocol::new(build());
+    let mut worker = WorkerProtocol::new(build());
+    parent.on_send(&hello()).unwrap();
+    worker.on_receive(&hello()).unwrap();
+    worker.on_send(&ready()).unwrap();
+    parent.on_receive(&ready()).unwrap();
+    parent.on_send(&run(2)).unwrap();
+    worker.on_receive(&run(2)).unwrap();
+
+    worker.on_send(&skill_call_request(3, 0, 0)).unwrap();
+    parent.on_receive(&skill_call_request(3, 0, 0)).unwrap();
+    parent.on_send(&skill_call_response(4, 0)).unwrap();
+    worker.on_receive(&skill_call_response(4, 0)).unwrap();
+    worker.on_send(&effect_request(5, 0)).unwrap();
+    parent.on_receive(&effect_request(5, 0)).unwrap();
+    parent.on_send(&effect_response(6, 0)).unwrap();
+    worker.on_receive(&effect_response(6, 0)).unwrap();
+    worker.on_send(&skill_call_request(7, 1, 1)).unwrap();
+    parent.on_receive(&skill_call_request(7, 1, 1)).unwrap();
+    parent.on_send(&skill_call_response(8, 1)).unwrap();
+    worker.on_receive(&skill_call_response(8, 1)).unwrap();
+    worker.on_send(&step_result(9)).unwrap();
+    parent.on_receive(&step_result(9)).unwrap();
+    assert_eq!(parent.state(), &ParentState::Idle);
+    assert_eq!(worker.state(), &WorkerState::Idle);
+
+    let mut parent = ParentProtocol::new(build());
+    parent.on_send(&hello()).unwrap();
+    parent.on_receive(&ready()).unwrap();
+    parent.on_send(&run(2)).unwrap();
+    assert!(matches!(
+        parent.on_receive(&skill_call_request(3, 1, 0)),
+        Err(ProtocolError::SkillCallOrdinal {
+            expected: 0,
+            actual: 1
+        })
+    ));
 }
 
 #[test]

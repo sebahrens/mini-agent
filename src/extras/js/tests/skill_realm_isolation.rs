@@ -27,7 +27,7 @@ enum CloneError {
 }
 
 #[test]
-fn production_bound_export_is_unreflectable_and_second_call_mints_no_observation() {
+fn production_bound_export_is_unreflectable_and_reusable_with_fresh_one_shot_handles() {
     let runtime = Runtime::new().unwrap();
     runtime.set_memory_limit(MEMORY_LIMIT);
     runtime.set_max_stack_size(STACK_LIMIT);
@@ -47,19 +47,8 @@ fn production_bound_export_is_unreflectable_and_second_call_mints_no_observation
     let capabilities = InvocationCapabilityRuntime::new(|_| {
         panic!("pure bound export must not dispatch an effect")
     });
-    let invocation_id = InvocationId::new("a".repeat(64)).unwrap();
-    let handle = capabilities
-        .prepare(
-            InvocationAuthorization::new(
-                invocation_id.clone(),
-                skill.id.clone(),
-                "once".into(),
-                CapabilityManifest::pure(),
-                [],
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    let call_capabilities = capabilities.clone();
+    let call_skill_id = skill.id.clone();
     let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let start_observations = starts.clone();
     let terminals = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -72,10 +61,25 @@ fn production_bound_export_is_unreflectable_and_second_call_mints_no_observation
         std::collections::HashMap::from([(
             "once".into(),
             BoundExportInvocation {
-                handle,
-                on_start: Arc::new(move |shape| {
-                    start_observations.lock().unwrap().push(shape);
-                    Ok("a".repeat(64))
+                authorize: Arc::new(move |ordinal| {
+                    let invocation_id = InvocationId::new(format!("call-{ordinal}")).unwrap();
+                    let handle = call_capabilities
+                        .prepare(
+                            InvocationAuthorization::new(
+                                invocation_id,
+                                call_skill_id.clone(),
+                                "once".into(),
+                                CapabilityManifest::pure(),
+                                [],
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    Ok((handle, format!("call-{ordinal}")))
+                }),
+                on_start: Arc::new(move |id, shape| {
+                    start_observations.lock().unwrap().push((id, shape));
+                    Ok(())
                 }),
                 on_terminal: Arc::new(move |id, success| {
                     terminal_observations.lock().unwrap().push((id, success));
@@ -92,18 +96,18 @@ fn production_bound_export_is_unreflectable_and_second_call_mints_no_observation
                 privateKeys: Reflect.ownKeys(globalThis).filter(key =>
                     typeof key === "string" && key.includes("mini-agent")),
                 first: once(41),
-                second: (() => { try { once(1); return "bad"; } catch (_) { return "denied"; } })()
+                second: once(1)
             })"#,
         )
     });
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&result.unwrap()).unwrap(),
-        serde_json::json!({"privateKeys": [], "first": 42, "second": "denied"})
+        serde_json::json!({"privateKeys": [], "first": 42, "second": 2})
     );
-    assert_eq!(starts.lock().unwrap().len(), 1);
+    assert_eq!(starts.lock().unwrap().len(), 2);
     assert_eq!(
         terminals.lock().unwrap().as_slice(),
-        &[("a".repeat(64), true)]
+        &[("call-0".into(), true), ("call-1".into(), true)]
     );
     drop(loaded);
     drop(model);

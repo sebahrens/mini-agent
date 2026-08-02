@@ -305,6 +305,55 @@ async fn selected_skill_exports_are_installed_before_agent_code() {
 }
 
 #[tokio::test]
+async fn selected_skill_export_is_reusable_with_distinct_parent_issued_call_authority() {
+    use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
+
+    let selected = artifact(
+        "function read_manifest(cap) { return cap.read_file('Cargo.toml').includes('[package]') ? 'allowed' : 'missing'; }",
+        &["read_manifest"],
+        CapabilityManifest::new(
+            CapabilityTier::ReadOnly,
+            vec![CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["Cargo.toml".to_string()],
+            }],
+        )
+        .unwrap(),
+    );
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let tool = make_test_tool()
+        .with_skill_turn_context(context(vec![resolved(&selected, 0)]))
+        .with_telemetry(TelemetryDispatcher::from_sender_for_test(tx));
+
+    assert_eq!(
+        tool.call(JsArgs {
+            code: "JSON.stringify([read_manifest(), read_manifest()])".to_string(),
+        })
+        .await
+        .unwrap(),
+        r#"["allowed","allowed"]"#
+    );
+
+    let batch = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("two-call telemetry batch");
+    let invoked: Vec<_> = batch
+        .events()
+        .iter()
+        .filter(|event| event.kind == SkillEventKind::Invoked)
+        .collect();
+    assert_eq!(invoked.len(), 2);
+    assert_ne!(invoked[0].invocation_id, invoked[1].invocation_id);
+    assert_eq!(
+        batch
+            .events()
+            .iter()
+            .filter(|event| event.kind == SkillEventKind::Returned)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn production_runner_emits_parent_bound_invocation_evidence() {
     use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
 
