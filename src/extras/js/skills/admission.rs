@@ -184,6 +184,13 @@ impl AdmissionEvaluator {
                     "embedded verification failed",
                 ));
             }
+            Err(HeldOutError::Infrastructure(error)) => {
+                return Err(classify_verification(
+                    &error,
+                    "evaluation_infrastructure_unavailable",
+                    "verification infrastructure unavailable",
+                ));
+            }
             Err(HeldOutError::CaseFailed { .. } | HeldOutError::TranscriptMismatch { .. }) => {
                 return Err(deterministic(
                     "held_out_failed",
@@ -773,6 +780,12 @@ fn classify_verification(
     fallback_code: &'static str,
     fallback_detail: &'static str,
 ) -> EvaluationFailure {
+    if let VerificationError::InfrastructureUnavailable(message) = error {
+        return EvaluationFailure::Retryable {
+            code: "evaluation_infrastructure_unavailable",
+            error: message.clone(),
+        };
+    }
     let resource_limited = match error {
         VerificationError::TestFailed { outcome, .. } => matches!(
             outcome,
@@ -932,4 +945,25 @@ pub(crate) enum AdmissionError {
     CanaryBecameRetrievable,
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn verification_scheduler_queue_outage_is_retryable_admission_infrastructure() {
+        let failure = classify_verification(
+            &VerificationError::InfrastructureUnavailable("queue full".into()),
+            "embedded_test_failed",
+            "embedded verification failed",
+        );
+        assert!(matches!(
+            failure,
+            EvaluationFailure::Retryable {
+                code: "evaluation_infrastructure_unavailable",
+                ..
+            }
+        ));
+    }
 }

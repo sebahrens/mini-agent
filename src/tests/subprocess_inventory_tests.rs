@@ -177,6 +177,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/extras/js/supervisor.rs",
+        ".spawn(move || run_verification_scheduler(supervisor, receiver, worker_queue))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/tool.rs",
         "requests.spawn(async move {",
         1,
@@ -444,6 +450,12 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/extras/js/supervisor.rs",
+        ".spawn(move || run_verification_scheduler(supervisor, receiver, worker_queue))",
+        1,
+        "NON-PROCESS",
+    ),
     ("src/agent/tools/bash.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/agent/tools/bash.rs",

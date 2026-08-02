@@ -66,6 +66,8 @@ pub enum VerificationError {
     RuntimeCreationFailed(String),
     #[error("failed to create JS context: {0}")]
     ContextCreationFailed(String),
+    #[error("verification infrastructure is temporarily unavailable: {0}")]
+    InfrastructureUnavailable(String),
     #[error("skill source failed to evaluate: {0}")]
     SourceEvaluationFailed(String),
     #[error("declared export '{export}' not found in source")]
@@ -267,6 +269,9 @@ fn verify_in_worker(request: VerifyArtifact) -> Result<VerificationResult, Verif
 }
 
 fn worker_error(error: WorkerError) -> VerificationError {
+    if error.is_retryable_admission_infrastructure() {
+        return VerificationError::InfrastructureUnavailable("worker queue unavailable".into());
+    }
     match error {
         WorkerError::TimedOut => VerificationError::SourceEvaluationFailed("timeout".to_string()),
         WorkerError::UnexpectedVerificationEffect => {

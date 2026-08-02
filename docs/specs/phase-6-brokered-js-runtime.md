@@ -118,6 +118,13 @@ shutdown sends the closed `Shutdown` frame, waits within the same bound, and sti
 cleanup. The next independent request always receives a new generation, so delayed output from
 an old process cannot enter its protocol stream.
 
+Background skill verification enters one bounded FIFO queue owned by that same supervisor; it
+never starts a verifier process or worker pool. Interactive `RunStep` callers have priority while
+waiting or active. A whole `VerifyArtifact` already dispatched to the worker remains atomic, but
+the dispatcher admits waiting interactive calls before dequeuing the next verification. A request
+cancelled before dequeue never reaches the worker. Queue overflow or closure fails closed as a
+retryable admission-infrastructure failure and cannot produce an admission success.
+
 All full-agent rebuilds in the parent obtain this same lazy, authority-free supervisor. A rebuild
 snapshots its own permission bridge, file/fetch policy, selected skill artifacts, invocation IDs,
 grants, cancellation, and broker for each `JsTool::call`; none of those values is stored in the

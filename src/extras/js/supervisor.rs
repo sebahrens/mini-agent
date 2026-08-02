@@ -7,7 +7,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+const VERIFICATION_QUEUE_CAPACITY: usize = 16;
 
 pub(crate) type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectResult> + Send + 'a>>;
 
@@ -70,6 +71,19 @@ pub(crate) enum WorkerError {
     BlockingVerifyInAsyncRuntime,
     #[error("JavaScript verification attempted an external effect")]
     UnexpectedVerificationEffect,
+    #[error("JavaScript verification queue is at capacity")]
+    VerificationQueueFull,
+    #[error("JavaScript verification queue is unavailable")]
+    VerificationQueueClosed,
+}
+
+impl WorkerError {
+    pub(crate) fn is_retryable_admission_infrastructure(self) -> bool {
+        matches!(
+            self,
+            Self::VerificationQueueFull | Self::VerificationQueueClosed
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -83,6 +97,8 @@ struct SupervisorInner {
     active_generation: AtomicU64,
     accepts_test_preamble: bool,
     watchdog: Duration,
+    priority: Arc<InvocationPriority>,
+    verification_scheduler: OnceLock<Result<VerificationScheduler, WorkerError>>,
 }
 
 struct SupervisorState {
@@ -104,6 +120,38 @@ struct BoundedStderrDrain {
     observed: Arc<AtomicUsize>,
     truncated: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct InvocationPriority {
+    state: Mutex<InvocationPriorityState>,
+    changed: Condvar,
+    observed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct InvocationPriorityState {
+    interactive_waiters: usize,
+    interactive_active: usize,
+    verification_running: bool,
+}
+
+struct VerificationScheduler {
+    sender: Mutex<Option<mpsc::SyncSender<VerificationJob>>>,
+    queue: Arc<VerificationQueueObservation>,
+}
+
+#[derive(Default)]
+struct VerificationQueueObservation {
+    depth: Mutex<usize>,
+    changed: tokio::sync::Notify,
+}
+
+struct VerificationJob {
+    request: VerifyArtifact,
+    cancellation: PermCancellation,
+    deadline: Instant,
+    reply: mpsc::SyncSender<Result<VerificationResult, WorkerError>>,
 }
 // END AUTHORITY-FREE SUPERVISOR STATE
 
@@ -172,6 +220,8 @@ impl JsWorkerSupervisor {
             active_generation: AtomicU64::new(0),
             accepts_test_preamble,
             watchdog,
+            priority: Arc::new(InvocationPriority::default()),
+            verification_scheduler: OnceLock::new(),
         }))
     }
 
@@ -220,7 +270,7 @@ impl JsWorkerSupervisor {
         invocation: Option<InvocationId>,
     ) -> Result<StepResult, WorkerError> {
         match self
-            .invoke(
+            .invoke_interactive(
                 InvocationRequest::Run(request),
                 Some(effects),
                 cancellation,
@@ -237,30 +287,34 @@ impl JsWorkerSupervisor {
         &self,
         request: VerifyArtifact,
     ) -> Result<VerificationResult, WorkerError> {
+        self.verify_blocking_cancellable(request, PermCancellation::new())
+    }
+
+    pub(crate) fn verify_blocking_cancellable(
+        &self,
+        request: VerifyArtifact,
+        cancellation: PermCancellation,
+    ) -> Result<VerificationResult, WorkerError> {
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(WorkerError::BlockingVerifyInAsyncRuntime);
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|_| WorkerError::Transport)?;
-        runtime.block_on(async {
-            match self
-                .invoke::<RejectEffects>(
-                    InvocationRequest::Verify(request),
-                    None,
-                    PermCancellation::new(),
-                    None,
-                )
-                .await?
-            {
-                InvocationTerminal::Verification(result) => Ok(result),
-                InvocationTerminal::Step(_) => Err(WorkerError::Protocol),
-            }
-        })
+        if cancellation.is_cancelled() {
+            return Err(WorkerError::Cancelled);
+        }
+        let deadline = Instant::now() + self.0.watchdog;
+        self.verification_scheduler()?
+            .submit(request, cancellation, deadline)
     }
 
-    async fn invoke<H: InvocationEffectHandler>(
+    fn verification_scheduler(&self) -> Result<&VerificationScheduler, WorkerError> {
+        self.0
+            .verification_scheduler
+            .get_or_init(|| VerificationScheduler::start(Arc::downgrade(&self.0)))
+            .as_ref()
+            .map_err(|error| *error)
+    }
+
+    async fn invoke_interactive<H: InvocationEffectHandler>(
         &self,
         request: InvocationRequest,
         mut effects: Option<&mut H>,
@@ -270,7 +324,52 @@ impl JsWorkerSupervisor {
         // The single deadline starts before lease acquisition and therefore bounds queueing,
         // startup, protocol I/O, JavaScript execution, and parent-brokered effect handling.
         let deadline = Instant::now() + self.0.watchdog;
+        let waiter = self.0.priority.register_interactive();
         let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
+        let _active_interactive = waiter.activate();
+        self.invoke_with_state(
+            &mut state,
+            request,
+            &mut effects,
+            cancellation,
+            invocation,
+            deadline,
+        )
+        .await
+    }
+
+    async fn invoke_scheduled_verification(
+        &self,
+        request: VerifyArtifact,
+        cancellation: PermCancellation,
+        deadline: Instant,
+    ) -> Result<VerificationResult, WorkerError> {
+        let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
+        match self
+            .invoke_with_state::<RejectEffects>(
+                &mut state,
+                InvocationRequest::Verify(request),
+                &mut None,
+                cancellation,
+                None,
+                deadline,
+            )
+            .await?
+        {
+            InvocationTerminal::Verification(result) => Ok(result),
+            InvocationTerminal::Step(_) => Err(WorkerError::Protocol),
+        }
+    }
+
+    async fn invoke_with_state<H: InvocationEffectHandler>(
+        &self,
+        state: &mut SupervisorState,
+        request: InvocationRequest,
+        effects: &mut Option<&mut H>,
+        cancellation: PermCancellation,
+        invocation: Option<InvocationId>,
+        deadline: Instant,
+    ) -> Result<InvocationTerminal, WorkerError> {
         let mut connection = match state.idle.take() {
             Some(connection) => connection,
             None => {
@@ -307,7 +406,7 @@ impl JsWorkerSupervisor {
             &mut connection,
             invocation,
             request,
-            &mut effects,
+            effects,
             &cancellation,
             deadline,
         )
@@ -409,6 +508,336 @@ impl JsWorkerSupervisor {
             truncated: drain.truncated.load(Ordering::Acquire),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn verification_queue_capacity_for_test(&self) -> usize {
+        VERIFICATION_QUEUE_CAPACITY
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verification_queue_depth_for_test(&self) -> usize {
+        self.verification_scheduler()
+            .map_or(0, VerificationScheduler::queue_depth)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_verification_queue_depth_for_test(&self, expected: usize) {
+        let scheduler = self
+            .verification_scheduler()
+            .expect("verification scheduler must start for tests");
+        scheduler.wait_for_queue_depth(expected).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_interactive_waiters_for_test(&self, expected: usize) {
+        self.0.priority.wait_for_interactive_waiters(expected).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_verification_queue_for_test(&self) {
+        if let Ok(scheduler) = self.verification_scheduler() {
+            scheduler.close();
+        }
+    }
+}
+
+impl InvocationPriority {
+    fn register_interactive(self: &Arc<Self>) -> InteractiveWaiter {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.interactive_waiters = state.interactive_waiters.saturating_add(1);
+        drop(state);
+        self.changed.notify_all();
+        self.observed.notify_waiters();
+        InteractiveWaiter {
+            priority: Arc::clone(self),
+            waiting: true,
+        }
+    }
+
+    fn begin_verification(
+        self: &Arc<Self>,
+        cancellation: &PermCancellation,
+        deadline: Instant,
+    ) -> Result<VerificationLease, WorkerError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.verification_running
+            || state.interactive_waiters != 0
+            || state.interactive_active != 0
+        {
+            if cancellation.is_cancelled() {
+                return Err(WorkerError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(WorkerError::TimedOut);
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+        }
+        if cancellation.is_cancelled() {
+            return Err(WorkerError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(WorkerError::TimedOut);
+        }
+        state.verification_running = true;
+        Ok(VerificationLease {
+            priority: Arc::clone(self),
+        })
+    }
+
+    #[cfg(test)]
+    async fn wait_for_interactive_waiters(&self, expected: usize) {
+        loop {
+            let changed = self.observed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let observed = self
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .interactive_waiters;
+            if observed == expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct InteractiveWaiter {
+    priority: Arc<InvocationPriority>,
+    waiting: bool,
+}
+
+impl InteractiveWaiter {
+    fn activate(mut self) -> ActiveInteractive {
+        let mut state = self
+            .priority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.interactive_waiters = state.interactive_waiters.saturating_sub(1);
+        state.interactive_active = state.interactive_active.saturating_add(1);
+        self.waiting = false;
+        drop(state);
+        self.priority.changed.notify_all();
+        self.priority.observed.notify_waiters();
+        ActiveInteractive {
+            priority: Arc::clone(&self.priority),
+        }
+    }
+}
+
+impl Drop for InteractiveWaiter {
+    fn drop(&mut self) {
+        if !self.waiting {
+            return;
+        }
+        let mut state = self
+            .priority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.interactive_waiters = state.interactive_waiters.saturating_sub(1);
+        drop(state);
+        self.priority.changed.notify_all();
+        self.priority.observed.notify_waiters();
+    }
+}
+
+struct ActiveInteractive {
+    priority: Arc<InvocationPriority>,
+}
+
+impl Drop for ActiveInteractive {
+    fn drop(&mut self) {
+        let mut state = self
+            .priority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.interactive_active = state.interactive_active.saturating_sub(1);
+        drop(state);
+        self.priority.changed.notify_all();
+        self.priority.observed.notify_waiters();
+    }
+}
+
+struct VerificationLease {
+    priority: Arc<InvocationPriority>,
+}
+
+impl Drop for VerificationLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .priority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.verification_running = false;
+        drop(state);
+        self.priority.changed.notify_all();
+        self.priority.observed.notify_waiters();
+    }
+}
+
+impl VerificationScheduler {
+    fn start(supervisor: Weak<SupervisorInner>) -> Result<Self, WorkerError> {
+        let (sender, receiver) = mpsc::sync_channel(VERIFICATION_QUEUE_CAPACITY);
+        let queue = Arc::new(VerificationQueueObservation::default());
+        let worker_queue = Arc::clone(&queue);
+        std::thread::Builder::new()
+            .name("mini-agent-js-verification".into())
+            .spawn(move || run_verification_scheduler(supervisor, receiver, worker_queue))
+            .map_err(|_| WorkerError::VerificationQueueClosed)?;
+        Ok(Self {
+            sender: Mutex::new(Some(sender)),
+            queue,
+        })
+    }
+
+    fn submit(
+        &self,
+        request: VerifyArtifact,
+        cancellation: PermCancellation,
+        deadline: Instant,
+    ) -> Result<VerificationResult, WorkerError> {
+        if cancellation.is_cancelled() {
+            return Err(WorkerError::Cancelled);
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        let job = VerificationJob {
+            request,
+            cancellation,
+            deadline,
+            reply,
+        };
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or(WorkerError::VerificationQueueClosed)?;
+        let mut depth = self
+            .queue
+            .depth
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *depth >= VERIFICATION_QUEUE_CAPACITY {
+            return Err(WorkerError::VerificationQueueFull);
+        }
+        match sender.try_send(job) {
+            Ok(()) => {
+                *depth = depth.saturating_add(1);
+                drop(depth);
+                self.queue.changed.notify_waiters();
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                return Err(WorkerError::VerificationQueueFull);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(WorkerError::VerificationQueueClosed);
+            }
+        }
+        response
+            .recv()
+            .unwrap_or(Err(WorkerError::VerificationQueueClosed))
+    }
+
+    #[cfg(test)]
+    fn queue_depth(&self) -> usize {
+        *self
+            .queue
+            .depth
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[cfg(test)]
+    async fn wait_for_queue_depth(&self, expected: usize) {
+        loop {
+            let changed = self.queue.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.queue_depth() == expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn close(&self) {
+        self.sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+}
+
+fn run_verification_scheduler(
+    supervisor: Weak<SupervisorInner>,
+    receiver: mpsc::Receiver<VerificationJob>,
+    queue: Arc<VerificationQueueObservation>,
+) {
+    while let Ok(job) = receiver.recv() {
+        if job.cancellation.is_cancelled() {
+            verification_dequeued(&queue);
+            let _ = job.reply.send(Err(WorkerError::Cancelled));
+            continue;
+        }
+        let Some(inner) = supervisor.upgrade() else {
+            verification_dequeued(&queue);
+            let _ = job.reply.send(Err(WorkerError::VerificationQueueClosed));
+            break;
+        };
+        let _verification_lease = match inner
+            .priority
+            .begin_verification(&job.cancellation, job.deadline)
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                verification_dequeued(&queue);
+                let _ = job.reply.send(Err(error));
+                continue;
+            }
+        };
+        verification_dequeued(&queue);
+        if job.cancellation.is_cancelled() {
+            let _ = job.reply.send(Err(WorkerError::Cancelled));
+            continue;
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let _ = job.reply.send(Err(WorkerError::Transport));
+                continue;
+            }
+        };
+        let result = runtime.block_on(JsWorkerSupervisor(inner).invoke_scheduled_verification(
+            job.request,
+            job.cancellation,
+            job.deadline,
+        ));
+        let _ = job.reply.send(result);
+    }
+}
+
+fn verification_dequeued(queue: &VerificationQueueObservation) {
+    let mut depth = queue
+        .depth
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *depth = depth.saturating_sub(1);
+    drop(depth);
+    queue.changed.notify_waiters();
 }
 
 struct ActiveGeneration<'a> {
