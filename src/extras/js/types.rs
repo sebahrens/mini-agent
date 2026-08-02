@@ -111,6 +111,7 @@ impl SkillExecutionBundle {
                     artifact: crate::extras::js::skills::SkillArtifact {
                         id: resolved.id.clone(),
                         identity_version: resolved.identity_version,
+                        abi_version: resolved.abi_version,
                         source: resolved.source.clone(),
                         description: resolved.description.clone(),
                         tags: resolved.tags.clone(),
