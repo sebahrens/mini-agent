@@ -3,7 +3,10 @@ use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+};
 use std::time::{Duration, Instant};
 
 use crate::extras::js::audit::{
@@ -11,18 +14,46 @@ use crate::extras::js::audit::{
     AuditResultCode, AuditState, EffectAudit, EffectCompletion, EffectIntent, SanitizedTarget,
 };
 use crate::extras::js::broker::{
-    AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, GrantPrincipal,
-    HostCapability, HostEffectError, InvocationBroker, InvocationGrant, ParentEffectService,
+    AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, ExecutableCopyError,
+    ExecutablePreparationWaitError, GrantPrincipal, HostCapability, HostEffectError,
+    InvocationBroker, InvocationGrant, MAX_SPAWN_EXECUTABLE_BYTES, NormalizedTarget,
+    ParentEffectService, copy_and_hash_executable, copy_and_hash_executable_controlled,
+    resolve_program_identity, run_executable_preparation,
 };
+#[cfg(feature = "skills")]
+use crate::extras::js::broker::{SkillCallAuthority, SkillExportAuthoritySpec};
+#[cfg(feature = "skills")]
+use crate::extras::js::protocol::SkillCallRequest;
 use crate::extras::js::protocol::{
     AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpHeader, HttpMethod, InvocationId,
-    SkillProposalDraft,
+    RunStep, SkillProposalDraft, StepOutcome,
 };
-use crate::extras::js::supervisor::InvocationEffectHandler;
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::{
+    CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod as SkillHttpMethod,
+};
+use crate::extras::js::supervisor::{InvocationEffectHandler, JsWorkerSupervisor, WorkerError};
 use crate::extras::js::types::PermCancellation;
 use crate::paths::{AppPaths, EffectAuditPathOwner};
+use crate::sandbox::worker::TestWorkerLauncher;
 
 type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+struct NoEffects;
+
+impl InvocationEffectHandler for NoEffects {
+    fn handle_effect(
+        &mut self,
+        _request: EffectRequest,
+        _cancellation: PermCancellation,
+    ) -> crate::extras::js::supervisor::EffectFuture<'_> {
+        Box::pin(async {
+            EffectResult::Error(crate::extras::js::protocol::EffectError {
+                code: EffectErrorCode::Denied,
+            })
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ServiceFailures {
@@ -34,6 +65,7 @@ struct ServiceFailures {
 
 #[derive(Clone, Debug, Default)]
 struct ServiceRecord {
+    discards: usize,
     authorizations: usize,
     execute_calls: usize,
     executions: usize,
@@ -42,12 +74,17 @@ struct ServiceRecord {
 
 struct RecordingService {
     failures: ServiceFailures,
+    normalized_target: Option<Result<NormalizedTarget, HostEffectError>>,
     pending_permission: bool,
     permission_delay_until: Option<Instant>,
     record: Arc<Mutex<ServiceRecord>>,
 }
 
 impl ParentEffectService for RecordingService {
+    fn discard_prepared(&mut self) {
+        self.record.lock().unwrap().discards += 1;
+    }
+
     fn validate_target(
         &mut self,
         _authorized: &AuthorizedEffect,
@@ -62,6 +99,19 @@ impl ParentEffectService for RecordingService {
         _operation: &EffectOperation,
     ) -> Result<(), HostEffectError> {
         self.failures.backend.map_or(Ok(()), Err)
+    }
+
+    fn normalize_target<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<NormalizedTarget, HostEffectError>> {
+        let target = self
+            .normalized_target
+            .clone()
+            .unwrap_or_else(|| normalized_target(operation));
+        Box::pin(async move { target })
     }
 
     fn authorize<'a>(
@@ -105,6 +155,33 @@ impl ParentEffectService for RecordingService {
             record.authorized.push(authorized);
             Ok(result)
         })
+    }
+}
+
+fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, HostEffectError> {
+    match operation {
+        EffectOperation::ReadFile { path } => Ok(NormalizedTarget::ReadFile {
+            workspace_relative: Some(path.clone()),
+        }),
+        EffectOperation::WriteFile { path, .. } => Ok(NormalizedTarget::WriteFile {
+            workspace_relative: Some(path.clone()),
+        }),
+        EffectOperation::Fetch { url, method, .. } => {
+            let url = reqwest::Url::parse(url).map_err(|_| HostEffectError::InvalidTarget)?;
+            Ok(NormalizedTarget::Fetch {
+                origin: url.origin().ascii_serialization(),
+                method: match method {
+                    HttpMethod::Get => "GET",
+                    HttpMethod::Post => "POST",
+                }
+                .into(),
+            })
+        }
+        EffectOperation::Spawn { program, .. } => Ok(NormalizedTarget::Spawn {
+            program: program.clone(),
+            resolved_executable: resolve_program_identity(program)?,
+        }),
+        EffectOperation::ProposeSkill { .. } => Ok(NormalizedTarget::ProposeSkill),
     }
 }
 
@@ -203,8 +280,17 @@ fn operation_cases(invocation_id: &InvocationId) -> Vec<OperationCase> {
                 draft: SkillProposalDraft {
                     source: "function run() { return true; }".into(),
                     description: "test proposal".into(),
-                    exports: vec!["run".into()],
+                    exports: vec![crate::extras::js::protocol::SkillProposalExport {
+                        name: "run".into(),
+                        signature: "run(): boolean".into(),
+                    }],
                     tests: vec!["run() === true".into()],
+                    capability: crate::extras::js::protocol::SkillProposalCapability {
+                        tier: "pure".into(),
+                        grants: Vec::new(),
+                    },
+                    tags: Vec::new(),
+                    predecessor_id: None,
                 },
             },
             capability: HostCapability::ProposeSkill,
@@ -239,7 +325,12 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
             stdout_truncated: false,
             stderr_truncated: false,
         },
-        EffectOperation::ProposeSkill { .. } => EffectResult::ProposalAccepted,
+        EffectOperation::ProposeSkill { .. } => EffectResult::ProposalAccepted {
+            skill_id: "a".repeat(64),
+            proposal_id: "proposal-test".into(),
+            status: crate::extras::js::protocol::ProposalStatus::Pending,
+            report_id: None,
+        },
     }
 }
 
@@ -248,12 +339,63 @@ fn grant(
     invocation_id: &InvocationId,
     expires_at: Instant,
 ) -> InvocationGrant {
+    #[cfg(feature = "skills")]
+    if case.capability != HostCapability::ProposeSkill
+        && matches!(case.principal, GrantPrincipal::Skill { .. })
+    {
+        return scoped_skill_grant(case, invocation_id, manifest_for(case, true), expires_at);
+    }
     InvocationGrant::issue(
         invocation_id.clone(),
         case.principal.clone(),
         BTreeSet::from([case.capability]),
         expires_at,
     )
+}
+
+#[cfg(feature = "skills")]
+fn scoped_skill_grant(
+    case: &OperationCase,
+    invocation_id: &InvocationId,
+    manifest: CapabilityManifest,
+    expires_at: Instant,
+) -> InvocationGrant {
+    InvocationGrant::issue_scoped_skill_with_resolver(
+        invocation_id.clone(),
+        case.principal.clone(),
+        manifest,
+        expires_at,
+        resolve_program_identity,
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "skills")]
+fn manifest_for(case: &OperationCase, allow_target: bool) -> CapabilityManifest {
+    let grant = match case.capability {
+        HostCapability::ReadFile => CapabilityScope::ReadFile {
+            workspace_prefixes: vec![if allow_target { "docs" } else { "docs-private" }.into()],
+        },
+        HostCapability::WriteFile => CapabilityScope::WriteFile {
+            workspace_prefixes: vec![if allow_target { "tmp" } else { "tmp-private" }.into()],
+        },
+        HostCapability::Fetch => CapabilityScope::Fetch {
+            origins: vec![
+                if allow_target {
+                    "https://example.test"
+                } else {
+                    "https://other.test"
+                }
+                .into(),
+            ],
+            methods: vec![SkillHttpMethod::Get],
+        },
+        HostCapability::Spawn => CapabilityScope::Spawn {
+            programs: vec![if allow_target { "printf" } else { "echo" }.into()],
+        },
+        HostCapability::ProposeSkill => unreachable!("skill manifests cannot propose skills"),
+    };
+    CapabilityManifest::new(CapabilityTier::SideEffecting, vec![grant]).unwrap()
 }
 
 fn request(case: &OperationCase, grant: &InvocationGrant) -> EffectRequest {
@@ -275,9 +417,24 @@ fn broker(
     Arc<Mutex<ServiceRecord>>,
     AuditTempRoot,
 ) {
+    broker_with_normalized_target(invocation_id, grants, session_allowed, failures, None)
+}
+
+fn broker_with_normalized_target(
+    invocation_id: InvocationId,
+    grants: Vec<InvocationGrant>,
+    session_allowed: BTreeSet<HostCapability>,
+    failures: ServiceFailures,
+    normalized_target: Option<Result<NormalizedTarget, HostEffectError>>,
+) -> (
+    InvocationBroker<RecordingService>,
+    Arc<Mutex<ServiceRecord>>,
+    AuditTempRoot,
+) {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures,
+        normalized_target,
         pending_permission: false,
         permission_delay_until: None,
         record: Arc::clone(&record),
@@ -325,6 +482,726 @@ async fn assert_denied_before_execute(
         "{} reached the effect service",
         case.name
     );
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_capability_intersection_enforces_manifest_before_session_permission_audit_and_effect()
+ {
+    let invocation_id = invocation("inv-scoped-cross-product");
+    for case in operation_cases(&invocation_id)
+        .into_iter()
+        .filter(|case| case.capability != HostCapability::ProposeSkill)
+    {
+        let allowed = scoped_skill_grant(
+            &case,
+            &invocation_id,
+            manifest_for(&case, true),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (mut allowed_broker, allowed_record, _audit_root) = broker(
+            invocation_id.clone(),
+            vec![allowed.clone()],
+            BTreeSet::from([case.capability]),
+            ServiceFailures::default(),
+        );
+        assert_eq!(
+            allowed_broker
+                .dispatch(request(&case, &allowed), PermCancellation::new())
+                .await,
+            Ok(success_for(&case.operation)),
+            "{} did not pass the full intersection",
+            case.name
+        );
+        assert_eq!(allowed_record.lock().unwrap().authorizations, 1);
+        assert_eq!(allowed_record.lock().unwrap().executions, 1);
+        assert_eq!(allowed_broker.audit_records_for_test().len(), 2);
+
+        let manifest_denied = scoped_skill_grant(
+            &case,
+            &invocation_id,
+            manifest_for(&case, false),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (mut denied_broker, denied_record, _audit_root) = broker(
+            invocation_id.clone(),
+            vec![manifest_denied.clone()],
+            BTreeSet::from([case.capability]),
+            ServiceFailures::default(),
+        );
+        assert_eq!(
+            denied_broker
+                .dispatch(request(&case, &manifest_denied), PermCancellation::new())
+                .await,
+            Err(HostEffectError::ManifestDenied),
+            "{} did not identify the manifest layer",
+            case.name
+        );
+        assert_eq!(denied_record.lock().unwrap().authorizations, 0);
+        assert_eq!(denied_record.lock().unwrap().executions, 0);
+        assert!(denied_broker.audit_records_for_test().is_empty());
+
+        let session_denied = scoped_skill_grant(
+            &case,
+            &invocation_id,
+            manifest_for(&case, true),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let (mut denied_broker, denied_record, _audit_root) = broker(
+            invocation_id.clone(),
+            vec![session_denied.clone()],
+            BTreeSet::new(),
+            ServiceFailures::default(),
+        );
+        assert_eq!(
+            denied_broker
+                .dispatch(request(&case, &session_denied), PermCancellation::new())
+                .await,
+            Err(HostEffectError::SessionDenied),
+            "{} did not identify the session layer",
+            case.name
+        );
+        assert_eq!(denied_record.lock().unwrap().authorizations, 0);
+        assert_eq!(denied_record.lock().unwrap().executions, 0);
+        assert!(denied_broker.audit_records_for_test().is_empty());
+    }
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_capability_intersection_keeps_model_authored_grants_session_only() {
+    let invocation_id = invocation("inv-model-session-only");
+    let case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::ProposeSkill)
+        .unwrap();
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(10),
+    );
+    let (mut broker, record, _audit_root) = broker(
+        invocation_id,
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::ProposeSkill]),
+        ServiceFailures {
+            backend: Some(HostEffectError::BackendFailure),
+            ..ServiceFailures::default()
+        },
+    );
+    assert_eq!(
+        broker
+            .dispatch(request(&case, &grant), PermCancellation::new())
+            .await,
+        Err(HostEffectError::BackendFailure)
+    );
+    assert_eq!(record.lock().unwrap().authorizations, 0);
+    assert!(broker.audit_records_for_test().is_empty());
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_capability_intersection_normalizes_fetch_method_and_spawn_identity() {
+    let invocation_id = invocation("inv-scoped-normalized-targets");
+    let mut fetch_case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::Fetch)
+        .unwrap();
+    fetch_case.operation = EffectOperation::Fetch {
+        url: "https://example.test:443/api".into(),
+        method: HttpMethod::Get,
+        headers: vec![],
+        body: None,
+    };
+    let grant = scoped_skill_grant(
+        &fetch_case,
+        &invocation_id,
+        manifest_for(&fetch_case, true),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let (mut default_port_broker, record, _audit_root) = broker(
+        invocation_id.clone(),
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::Fetch]),
+        ServiceFailures::default(),
+    );
+    assert!(
+        default_port_broker
+            .dispatch(request(&fetch_case, &grant), PermCancellation::new())
+            .await
+            .is_ok()
+    );
+    assert_eq!(record.lock().unwrap().executions, 1);
+
+    fetch_case.operation = EffectOperation::Fetch {
+        url: "https://example.test/api".into(),
+        method: HttpMethod::Post,
+        headers: vec![],
+        body: Some("body".into()),
+    };
+    let grant = scoped_skill_grant(
+        &fetch_case,
+        &invocation_id,
+        CapabilityManifest::new(
+            CapabilityTier::SideEffecting,
+            vec![CapabilityScope::Fetch {
+                origins: vec!["https://example.test".into()],
+                methods: vec![SkillHttpMethod::Get],
+            }],
+        )
+        .unwrap(),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let (mut method_broker, record, _audit_root) = broker(
+        invocation_id.clone(),
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::Fetch]),
+        ServiceFailures::default(),
+    );
+    assert_eq!(
+        method_broker
+            .dispatch(request(&fetch_case, &grant), PermCancellation::new())
+            .await,
+        Err(HostEffectError::ManifestDenied)
+    );
+    assert_eq!(record.lock().unwrap().authorizations, 0);
+    assert!(method_broker.audit_records_for_test().is_empty());
+
+    let spawn_case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::Spawn)
+        .unwrap();
+    let grant = scoped_skill_grant(
+        &spawn_case,
+        &invocation_id,
+        manifest_for(&spawn_case, true),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let (mut identity_broker, record, _audit_root) = broker_with_normalized_target(
+        invocation_id,
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::Spawn]),
+        ServiceFailures::default(),
+        Some(Ok(NormalizedTarget::Spawn {
+            program: "printf".into(),
+            resolved_executable: resolve_program_identity("true").unwrap(),
+        })),
+    );
+    assert_eq!(
+        identity_broker
+            .dispatch(request(&spawn_case, &grant), PermCancellation::new())
+            .await,
+        Err(HostEffectError::ManifestDenied)
+    );
+    assert_eq!(record.lock().unwrap().authorizations, 0);
+    assert!(identity_broker.audit_records_for_test().is_empty());
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_spawn_keeps_each_program_bound_to_its_own_executable_identity() {
+    let invocation_id = invocation("inv-scoped-spawn-name-binding");
+    let principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-spawn-binding".into(),
+        export: "run".into(),
+        invocation_id: invocation_id.to_string(),
+    };
+    let advisory = AdvisoryAttribution {
+        artifact_id: Some("artifact-spawn-binding".into()),
+        export: Some("run".into()),
+    };
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn {
+            programs: vec!["bar".into(), "foo".into()],
+        }],
+    )
+    .unwrap();
+    let foo_identity = resolve_program_identity("printf").unwrap();
+    let bar_identity = resolve_program_identity("true").unwrap();
+    let grant = InvocationGrant::issue_scoped_skill_with_resolver(
+        invocation_id.clone(),
+        principal,
+        manifest,
+        Instant::now() + Duration::from_secs(10),
+        |program| match program {
+            "foo" => Ok(foo_identity.clone()),
+            "bar" => Ok(bar_identity.clone()),
+            _ => unreachable!(),
+        },
+    )
+    .unwrap();
+    let operation = EffectOperation::Spawn {
+        program: "foo".into(),
+        arguments: vec![],
+    };
+    let request = EffectRequest {
+        effect_ordinal: 1,
+        grant_id: grant.grant_id().clone(),
+        advisory,
+        operation,
+    };
+    let (mut broker, record, _audit_root) = broker_with_normalized_target(
+        invocation_id,
+        vec![grant],
+        BTreeSet::from([HostCapability::Spawn]),
+        ServiceFailures::default(),
+        Some(Ok(NormalizedTarget::Spawn {
+            program: "foo".into(),
+            resolved_executable: bar_identity,
+        })),
+    );
+
+    assert_eq!(
+        broker.dispatch(request, PermCancellation::new()).await,
+        Err(HostEffectError::ManifestDenied)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.authorizations, 0);
+    assert_eq!(record.execute_calls, 0);
+    assert_eq!(record.discards, 1);
+    assert!(broker.audit_records_for_test().is_empty());
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_spawn_content_mismatch_denies_before_permission_audit_and_effect() {
+    let invocation_id = invocation("inv-scoped-spawn-content-binding");
+    let principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-spawn-content-binding".into(),
+        export: "run".into(),
+        invocation_id: invocation_id.to_string(),
+    };
+    let advisory = AdvisoryAttribution {
+        artifact_id: Some("artifact-spawn-content-binding".into()),
+        export: Some("run".into()),
+    };
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn {
+            programs: vec!["printf".into()],
+        }],
+    )
+    .unwrap();
+    let approved_identity = resolve_program_identity("printf").unwrap();
+    let changed_identity = approved_identity
+        .clone()
+        .with_content_sha256_for_test("00".repeat(32));
+    let grant = InvocationGrant::issue_scoped_skill_with_resolver(
+        invocation_id.clone(),
+        principal,
+        manifest,
+        Instant::now() + Duration::from_secs(10),
+        |_| Ok(approved_identity.clone()),
+    )
+    .unwrap();
+    let request = EffectRequest {
+        effect_ordinal: 1,
+        grant_id: grant.grant_id().clone(),
+        advisory,
+        operation: EffectOperation::Spawn {
+            program: "printf".into(),
+            arguments: vec![],
+        },
+    };
+    let (mut broker, record, _audit_root) = broker_with_normalized_target(
+        invocation_id,
+        vec![grant],
+        BTreeSet::from([HostCapability::Spawn]),
+        ServiceFailures::default(),
+        Some(Ok(NormalizedTarget::Spawn {
+            program: "printf".into(),
+            resolved_executable: changed_identity,
+        })),
+    );
+
+    assert_eq!(
+        broker.dispatch(request, PermCancellation::new()).await,
+        Err(HostEffectError::ManifestDenied)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.authorizations, 0);
+    assert_eq!(record.execute_calls, 0);
+    assert_eq!(record.discards, 1);
+    assert!(broker.audit_records_for_test().is_empty());
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn scoped_spawn_binding_map_is_deterministic_and_bounded() {
+    let invocation_id = invocation("inv-scoped-spawn-map-bounds");
+    let principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-spawn-map".into(),
+        export: "run".into(),
+        invocation_id: invocation_id.to_string(),
+    };
+    let identity = resolve_program_identity("printf").unwrap();
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn {
+            programs: vec!["bar".into(), "foo".into()],
+        }],
+    )
+    .unwrap();
+    let grant = InvocationGrant::issue_scoped_skill_with_resolver(
+        invocation_id.clone(),
+        principal.clone(),
+        manifest,
+        Instant::now() + Duration::from_secs(10),
+        |_| Ok(identity.clone()),
+    )
+    .unwrap();
+    let encoded = grant.spawn_program_bindings_json_for_test();
+    let decoded: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.keys().cloned().collect::<Vec<_>>(), ["bar", "foo"]);
+    for binding in decoded.values() {
+        let digest = binding["content_sha256"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(binding["content_bytes"].as_u64().is_some());
+    }
+
+    let programs = (0..257).map(|index| format!("p{index:03}")).collect();
+    let oversized = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn { programs }],
+    )
+    .unwrap();
+    assert_eq!(
+        InvocationGrant::issue_scoped_skill_with_resolver(
+            invocation_id,
+            principal,
+            oversized,
+            Instant::now() + Duration::from_secs(10),
+            |_| Ok(identity.clone()),
+        ),
+        Err(crate::extras::js::broker::BrokerBuildError::InvalidManifest)
+    );
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn prepared_manifest_resolves_once_then_mints_distinct_singleton_grants_with_one_fresh_lease() {
+    let invocation_id = invocation("inv-prepared-manifest-reuse");
+    let identity = resolve_program_identity("printf").unwrap();
+    let resolver_calls = AtomicUsize::new(0);
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["Cargo.toml".into()],
+            },
+            CapabilityScope::Spawn {
+                programs: vec!["printf".into()],
+            },
+        ],
+    )
+    .unwrap();
+    let preparation_started = Instant::now();
+    let prepared = InvocationGrant::prepare_skill_manifest_with_resolver(manifest, |_| {
+        resolver_calls.fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(identity.clone())
+    })
+    .unwrap();
+    assert_eq!(resolver_calls.load(AtomicOrdering::Relaxed), 1);
+
+    let expires_at = Instant::now() + Duration::from_secs(10);
+    let mut grants = Vec::new();
+    for export in ["first", "second"] {
+        for capability in [HostCapability::ReadFile, HostCapability::Spawn] {
+            grants.push(
+                InvocationGrant::issue_prepared_scoped_skill(
+                    invocation_id.clone(),
+                    GrantPrincipal::Skill {
+                        artifact_id: "artifact-prepared-reuse".into(),
+                        export: export.into(),
+                        invocation_id: format!("{export}-invocation"),
+                    },
+                    capability,
+                    &prepared,
+                    expires_at,
+                )
+                .unwrap(),
+            );
+        }
+    }
+
+    assert!(expires_at > preparation_started + Duration::from_secs(9));
+    assert_eq!(resolver_calls.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(
+        grants
+            .iter()
+            .map(|grant| grant.grant_id().get())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert!(
+        grants
+            .iter()
+            .all(|grant| grant.allowed_for_test().len() == 1)
+    );
+    assert!(
+        grants
+            .iter()
+            .all(|grant| grant.expires_at_for_test() == expires_at)
+    );
+    assert!(grants.iter().all(|grant| {
+        grant.spawn_program_bindings_json_for_test()
+            == grants[0].spawn_program_bindings_json_for_test()
+    }));
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn reusable_export_mints_fresh_exact_authority_and_denies_replay_revocation_and_expiry() {
+    let outer = invocation("reusable-export-outer");
+    let artifact_id = "a".repeat(64);
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::ReadOnly,
+        vec![CapabilityScope::ReadFile {
+            workspace_prefixes: vec!["Cargo.toml".into()],
+        }],
+    )
+    .unwrap();
+    let prepared = InvocationGrant::prepare_skill_manifest_with_resolver(manifest, |_| {
+        unreachable!("read-only manifest does not resolve executables")
+    })
+    .unwrap();
+    let authority = SkillCallAuthority::new(
+        "reusable-turn".into(),
+        "reusable-tool-call".into(),
+        Instant::now() + Duration::from_secs(10),
+        vec![SkillExportAuthoritySpec {
+            artifact_id: artifact_id.clone(),
+            export_name: "read".into(),
+            prepared_manifest: prepared.clone(),
+        }],
+    )
+    .unwrap();
+    let (active_broker, _record, _audit) = broker(
+        outer,
+        vec![],
+        BTreeSet::from([HostCapability::ReadFile]),
+        ServiceFailures::default(),
+    );
+    let mut active_broker = active_broker.with_skill_call_authority(authority);
+    let request = |request_ordinal, call_ordinal| SkillCallRequest {
+        request_ordinal,
+        artifact_id: artifact_id.clone(),
+        export_name: "read".into(),
+        call_ordinal,
+    };
+
+    let first = active_broker
+        .authorize_skill_call(request(0, 0))
+        .authorization
+        .unwrap();
+    let second = active_broker
+        .authorize_skill_call(request(1, 1))
+        .authorization
+        .unwrap();
+    assert_ne!(first.invocation_id, second.invocation_id);
+    assert_ne!(first.grants[0].grant_id, second.grants[0].grant_id);
+    assert!(
+        active_broker
+            .authorize_skill_call(request(2, 0))
+            .authorization
+            .is_none()
+    );
+    assert!(active_broker.revoke_skill_export(&artifact_id, "read"));
+    assert!(
+        active_broker
+            .authorize_skill_call(request(3, 2))
+            .authorization
+            .is_none()
+    );
+
+    let expired = SkillCallAuthority::new(
+        "expired-turn".into(),
+        "expired-tool-call".into(),
+        Instant::now() - Duration::from_millis(1),
+        vec![SkillExportAuthoritySpec {
+            artifact_id: artifact_id.clone(),
+            export_name: "read".into(),
+            prepared_manifest: prepared,
+        }],
+    )
+    .unwrap();
+    let (expired_broker, _record, _audit) = broker(
+        invocation("expired-export-outer"),
+        vec![],
+        BTreeSet::from([HostCapability::ReadFile]),
+        ServiceFailures::default(),
+    );
+    assert!(
+        expired_broker
+            .with_skill_call_authority(expired)
+            .authorize_skill_call(request(0, 0))
+            .authorization
+            .is_none()
+    );
+}
+
+#[test]
+fn executable_snapshot_copy_is_bounded_and_reports_destination_failure() {
+    let mut oversized = std::io::repeat(0).take(MAX_SPAWN_EXECUTABLE_BYTES + 1);
+    assert_eq!(
+        copy_and_hash_executable(&mut oversized, &mut std::io::sink()),
+        Err(ExecutableCopyError::TooLarge)
+    );
+
+    struct FailingWriter;
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected snapshot write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    assert_eq!(
+        copy_and_hash_executable(&mut b"approved executable".as_slice(), &mut FailingWriter),
+        Err(ExecutableCopyError::Write)
+    );
+}
+
+struct ControllablyBlockingExecutableSource {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    started: Arc<tokio::sync::Semaphore>,
+    announced: bool,
+}
+
+impl Read for ControllablyBlockingExecutableSource {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        if !self.announced {
+            self.announced = true;
+            self.started.add_permits(1);
+        }
+        let (released, wake) = &*self.gate;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = wake.wait(released).unwrap();
+        }
+        Ok(0)
+    }
+}
+
+struct TrackedSnapshotResource {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Write for TrackedSnapshotResource {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for TrackedSnapshotResource {
+    fn drop(&mut self) {
+        self.dropped.store(true, AtomicOrdering::Release);
+    }
+}
+
+async fn assert_blocked_executable_preparation_returns_promptly(cancel: bool) {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let cancellation = PermCancellation::new();
+    let deadline = Instant::now()
+        + if cancel {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(75)
+        };
+    let task_gate = gate.clone();
+    let task_started = started.clone();
+    let task_dropped = dropped.clone();
+    let task_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        run_executable_preparation(deadline, task_cancellation, move |control| {
+            let mut source = ControllablyBlockingExecutableSource {
+                gate: task_gate,
+                started: task_started,
+                announced: false,
+            };
+            let mut snapshot = TrackedSnapshotResource {
+                dropped: task_dropped,
+            };
+            copy_and_hash_executable_controlled(&mut source, &mut snapshot, &control)
+        })
+        .await
+    });
+
+    started.acquire().await.unwrap().forget();
+    let return_started = Instant::now();
+    if cancel {
+        cancellation.cancel();
+    }
+    let result = tokio::time::timeout(Duration::from_millis(300), task)
+        .await
+        .expect("blocked executable preparation did not return promptly")
+        .unwrap();
+    assert_eq!(
+        result,
+        Err(if cancel {
+            ExecutablePreparationWaitError::Cancelled
+        } else {
+            ExecutablePreparationWaitError::TimedOut
+        })
+    );
+    assert!(
+        return_started.elapsed() < Duration::from_millis(300),
+        "cancellation/deadline waited for a blocked source"
+    );
+    assert!(
+        !dropped.load(AtomicOrdering::Acquire),
+        "the source should still control when its worker unwinds"
+    );
+
+    let (released, wake) = &*gate;
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !dropped.load(AtomicOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late snapshot resource was not closed after the source unwound");
+}
+
+#[tokio::test]
+async fn executable_preparation_cancellation_returns_before_blocked_source_and_closes_snapshot() {
+    assert_blocked_executable_preparation_returns_promptly(true).await;
+}
+
+#[tokio::test]
+async fn executable_preparation_deadline_returns_before_blocked_source_and_closes_snapshot() {
+    assert_blocked_executable_preparation_returns_promptly(false).await;
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_identity_changes_when_bytes_are_overwritten_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = AuditTempRoot::new("executable-content-binding");
+    let executable = directory.0.join("content-bound-command");
+    std::fs::write(&executable, "#!/bin/sh\nprintf original").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let original = resolve_program_identity(executable.to_string_lossy().as_ref()).unwrap();
+
+    std::fs::write(&executable, "#!/bin/sh\nprintf replaced").unwrap();
+    let replaced = resolve_program_identity(executable.to_string_lossy().as_ref()).unwrap();
+    assert_ne!(original, replaced, "identity must bind executable content");
 }
 
 #[tokio::test]
@@ -601,6 +1478,77 @@ async fn worker_broker_grants_erase_authority_on_terminal_cancel_and_recycle() {
 }
 
 #[tokio::test]
+async fn worker_broker_outcome_unknown_terminates_caught_javascript_before_second_dispatch() {
+    let invocation_id = invocation("inv-outcome-unknown-terminal");
+    let case = OperationCase {
+        name: "read_file",
+        operation: EffectOperation::ReadFile {
+            path: "docs/first.txt".into(),
+        },
+        capability: HostCapability::ReadFile,
+        principal: GrantPrincipal::ModelAuthored {
+            tool_call_id: "tool-call-outcome-unknown".into(),
+        },
+        advisory: AdvisoryAttribution::default(),
+    };
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let grant_id = grant.grant_id().clone();
+    let (broker, record, audit_root) = broker(
+        invocation_id.clone(),
+        vec![grant],
+        BTreeSet::from([HostCapability::ReadFile]),
+        ServiceFailures {
+            execution: Some(HostEffectError::OutcomeUnknown),
+            ..ServiceFailures::default()
+        },
+    );
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        TestWorkerLauncher::internal_worker_process_with_limits(500, 10_000),
+        Duration::from_secs(2),
+    );
+    let request = RunStep::new(
+        r#"
+        try { read_file("docs/first.txt"); } catch (_) {}
+        try { read_file("docs/second.txt"); } catch (_) {}
+        "caught"
+        "#
+        .into(),
+    )
+    .with_model_grant(grant_id);
+
+    assert_eq!(
+        supervisor
+            .execute_bound(invocation_id, request, broker, PermCancellation::new())
+            .await,
+        Err(WorkerError::EffectOutcomeUnknown)
+    );
+    let record = record.lock().unwrap().clone();
+    assert_eq!(record.execute_calls, 1);
+    assert_eq!(record.executions, 0);
+    let recovered = EffectAudit::open(audit_root.owner()).unwrap();
+    assert_eq!(recovered.records().len(), 2);
+    assert_eq!(recovered.records()[0].state, AuditState::Intent);
+    assert_eq!(recovered.records()[1].state, AuditState::OutcomeUnknown);
+    assert_eq!(supervisor.generation_for_test().await, None);
+
+    let next = supervisor
+        .execute(
+            RunStep::new("42".into()),
+            NoEffects,
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.outcome, StepOutcome::Value("42".into()));
+    assert_eq!(supervisor.generation_for_test().await, Some(2));
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
+#[tokio::test]
 async fn worker_broker_grants_callback_returns_only_closed_wire_errors() {
     let invocation_id = invocation("inv-callback");
     let case = operation_cases(&invocation_id).remove(0);
@@ -642,6 +1590,7 @@ async fn worker_broker_grants_cancel_a_pending_ask_before_execution() {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures: ServiceFailures::default(),
+        normalized_target: None,
         pending_permission: true,
         permission_delay_until: None,
         record: Arc::clone(&record),
@@ -668,7 +1617,9 @@ async fn worker_broker_grants_cancel_a_pending_ask_before_execution() {
         Err(HostEffectError::InvocationCancelled)
     );
     assert_eq!(broker.tracked_grant_count(), 0);
-    assert_eq!(record.lock().unwrap().executions, 0);
+    let record = record.lock().unwrap();
+    assert_eq!(record.executions, 0);
+    assert_eq!(record.discards, 1, "cancelled Ask retained prepared state");
 }
 
 #[tokio::test]
@@ -713,6 +1664,7 @@ async fn worker_broker_grants_expiring_during_ask_never_execute() {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures: ServiceFailures::default(),
+        normalized_target: None,
         pending_permission: false,
         permission_delay_until: Some(expires_at),
         record: Arc::clone(&record),
@@ -751,6 +1703,7 @@ async fn worker_broker_grants_expiring_while_waiting_for_audit_never_execute() {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures: ServiceFailures::default(),
+        normalized_target: None,
         pending_permission: false,
         permission_delay_until: None,
         record: Arc::clone(&record),
@@ -851,6 +1804,7 @@ async fn js_effect_audit_ordering_requires_durable_intent_before_read_file() {
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
     let service = RecordingService {
         failures: ServiceFailures::default(),
+        normalized_target: None,
         pending_permission: false,
         permission_delay_until: None,
         record,
@@ -950,6 +1904,16 @@ impl ParentEffectService for OrderingService {
     ) -> Result<(), HostEffectError> {
         self.record.lock().unwrap().backend_checks += 1;
         Ok(())
+    }
+
+    fn normalize_target<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<NormalizedTarget, HostEffectError>> {
+        let target = normalized_target(operation);
+        Box::pin(async move { target })
     }
 
     fn authorize<'a>(

@@ -4,6 +4,35 @@ use uuid::Uuid;
 
 use crate::extras::js::protocol::*;
 
+#[cfg(feature = "skills")]
+fn verification_artifact(
+    source: String,
+    tests: Vec<String>,
+) -> crate::extras::js::skills::SkillArtifact {
+    crate::extras::js::skills::SkillArtifact::new(
+        source,
+        "worker protocol fixture".into(),
+        vec![],
+        vec![crate::extras::js::skills::SkillExport {
+            name: "answer".into(),
+            signature: "answer()".into(),
+        }],
+        tests,
+        crate::extras::js::skills::CapabilityManifest::pure(),
+    )
+    .unwrap()
+}
+
+#[cfg(not(feature = "skills"))]
+fn verification_artifact(source: String, tests: Vec<String>) -> ArtifactInput {
+    ArtifactInput {
+        artifact_id: "advisory-id".into(),
+        source,
+        exports: vec!["answer".into()],
+        tests,
+    }
+}
+
 fn build() -> BuildIdentity {
     BuildIdentity::new("test-build-1").unwrap()
 }
@@ -39,15 +68,15 @@ fn verify(sequence: u64) -> ParentWireFrame {
     invoked(
         sequence,
         ParentFrame::VerifyArtifact(VerifyArtifact {
-            artifact: ArtifactInput {
-                artifact_id: "advisory-id".into(),
-                source: "exports.answer = () => 42".into(),
-                exports: vec!["answer".into()],
-                tests: vec!["answer() === 42".into()],
-            },
+            artifact: verification_artifact(
+                "function answer() { return 42; }".into(),
+                vec!["answer() === 42".into()],
+            ),
             cases: vec![VerificationCase {
                 case_id: "embedded-0".into(),
                 script: "answer() === 42".into(),
+                #[cfg(feature = "skills")]
+                kind: VerificationCaseKind::Embedded,
             }],
         }),
     )
@@ -83,6 +112,42 @@ fn effect_response(sequence: u64, ordinal: u32) -> ParentWireFrame {
     )
 }
 
+fn outcome_unknown_response(sequence: u64, ordinal: u32) -> ParentWireFrame {
+    invoked(
+        sequence,
+        ParentFrame::EffectResponse(EffectResponse {
+            effect_ordinal: ordinal,
+            result: EffectResult::Error(crate::extras::js::protocol::EffectError {
+                code: crate::extras::js::protocol::EffectErrorCode::OutcomeUnknown,
+            }),
+        }),
+    )
+}
+
+#[cfg(feature = "skills")]
+fn skill_call_request(sequence: u64, request_ordinal: u32, call_ordinal: u32) -> WorkerWireFrame {
+    invoked(
+        sequence,
+        WorkerFrame::SkillCallRequest(SkillCallRequest {
+            request_ordinal,
+            artifact_id: "a".repeat(64),
+            export_name: "increment".into(),
+            call_ordinal,
+        }),
+    )
+}
+
+#[cfg(feature = "skills")]
+fn skill_call_response(sequence: u64, request_ordinal: u32) -> ParentWireFrame {
+    invoked(
+        sequence,
+        ParentFrame::SkillCallResponse(SkillCallResponse {
+            request_ordinal,
+            authorization: None,
+        }),
+    )
+}
+
 fn step_result(sequence: u64) -> WorkerWireFrame {
     invoked(
         sequence,
@@ -107,6 +172,8 @@ fn verification_result(sequence: u64) -> WorkerWireFrame {
                 case_id: "embedded-0".into(),
                 passed: true,
                 diagnostic: None,
+                #[cfg(feature = "skills")]
+                transcript: Default::default(),
             }],
             loader_version: 1,
         }),
@@ -248,17 +315,47 @@ fn worker_protocol_bounds_outbound_and_nested_payloads() {
     let nested = invoked(
         2,
         ParentFrame::VerifyArtifact(VerifyArtifact {
-            artifact: ArtifactInput {
-                artifact_id: "id".into(),
-                source: String::new(),
-                exports: vec![],
-                tests: vec!["x".repeat(MAX_FRAME_BYTES)],
-            },
+            artifact: verification_artifact(
+                "function answer() { return 42; }".into(),
+                vec!["x".repeat(MAX_FRAME_BYTES)],
+            ),
             cases: vec![],
         }),
     );
     assert!(matches!(
         write_frame(&mut Vec::new(), &nested),
+        Err(FrameError::FrameTooLarge { .. })
+    ));
+
+    let proposal = invoked(
+        3,
+        WorkerFrame::EffectRequest(EffectRequest {
+            effect_ordinal: 0,
+            grant_id: grant(),
+            advisory: AdvisoryAttribution::default(),
+            operation: EffectOperation::ProposeSkill {
+                draft: SkillProposalDraft {
+                    source: "function run() { return true; }".into(),
+                    description: "bounded proposal".into(),
+                    exports: vec![SkillProposalExport {
+                        name: "run".into(),
+                        signature: "run(): boolean".into(),
+                    }],
+                    tests: vec!["run() === true".into()],
+                    capability: SkillProposalCapability {
+                        tier: "read_only".into(),
+                        grants: vec![SkillProposalScope::ReadFile {
+                            workspace_prefixes: vec!["x".repeat(MAX_FRAME_BYTES)],
+                        }],
+                    },
+                    tags: vec![],
+                    predecessor_id: None,
+                },
+            },
+        }),
+    );
+    assert!(matches!(
+        write_frame(&mut Vec::new(), &proposal),
         Err(FrameError::FrameTooLarge { .. })
     ));
 }
@@ -295,6 +392,72 @@ fn worker_protocol_run_step_complete_transition_table() {
     worker.on_receive(&shutdown).unwrap();
     assert_eq!(parent.state(), &ParentState::Closed);
     assert_eq!(worker.state(), &WorkerState::Closed);
+}
+
+#[test]
+fn worker_protocol_outcome_unknown_response_is_invocation_terminal() {
+    let mut parent = ParentProtocol::new(build());
+    let mut worker = WorkerProtocol::new(build());
+
+    parent.on_send(&hello()).unwrap();
+    worker.on_receive(&hello()).unwrap();
+    worker.on_send(&ready()).unwrap();
+    parent.on_receive(&ready()).unwrap();
+    parent.on_send(&run(2)).unwrap();
+    worker.on_receive(&run(2)).unwrap();
+    worker.on_send(&effect_request(3, 0)).unwrap();
+    parent.on_receive(&effect_request(3, 0)).unwrap();
+    parent.on_send(&outcome_unknown_response(4, 0)).unwrap();
+    worker.on_receive(&outcome_unknown_response(4, 0)).unwrap();
+
+    assert_eq!(parent.state(), &ParentState::Closed);
+    assert_eq!(worker.state(), &WorkerState::Closed);
+    assert!(matches!(
+        worker.on_send(&effect_request(5, 1)),
+        Err(ProtocolError::InvalidTransition { .. })
+    ));
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn worker_protocol_serializes_reusable_skill_calls_without_consuming_effect_ordinals() {
+    let mut parent = ParentProtocol::new(build());
+    let mut worker = WorkerProtocol::new(build());
+    parent.on_send(&hello()).unwrap();
+    worker.on_receive(&hello()).unwrap();
+    worker.on_send(&ready()).unwrap();
+    parent.on_receive(&ready()).unwrap();
+    parent.on_send(&run(2)).unwrap();
+    worker.on_receive(&run(2)).unwrap();
+
+    worker.on_send(&skill_call_request(3, 0, 0)).unwrap();
+    parent.on_receive(&skill_call_request(3, 0, 0)).unwrap();
+    parent.on_send(&skill_call_response(4, 0)).unwrap();
+    worker.on_receive(&skill_call_response(4, 0)).unwrap();
+    worker.on_send(&effect_request(5, 0)).unwrap();
+    parent.on_receive(&effect_request(5, 0)).unwrap();
+    parent.on_send(&effect_response(6, 0)).unwrap();
+    worker.on_receive(&effect_response(6, 0)).unwrap();
+    worker.on_send(&skill_call_request(7, 1, 1)).unwrap();
+    parent.on_receive(&skill_call_request(7, 1, 1)).unwrap();
+    parent.on_send(&skill_call_response(8, 1)).unwrap();
+    worker.on_receive(&skill_call_response(8, 1)).unwrap();
+    worker.on_send(&step_result(9)).unwrap();
+    parent.on_receive(&step_result(9)).unwrap();
+    assert_eq!(parent.state(), &ParentState::Idle);
+    assert_eq!(worker.state(), &WorkerState::Idle);
+
+    let mut parent = ParentProtocol::new(build());
+    parent.on_send(&hello()).unwrap();
+    parent.on_receive(&ready()).unwrap();
+    parent.on_send(&run(2)).unwrap();
+    assert!(matches!(
+        parent.on_receive(&skill_call_request(3, 1, 0)),
+        Err(ProtocolError::SkillCallOrdinal {
+            expected: 0,
+            actual: 1
+        })
+    ));
 }
 
 #[test]

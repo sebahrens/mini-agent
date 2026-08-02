@@ -322,6 +322,7 @@ pub(crate) enum TestSupervisorStartup {
     Healthy,
     ExitBeforeReady,
     MalformedReady,
+    BuildMismatch,
 }
 
 #[cfg(test)]
@@ -488,6 +489,7 @@ impl WorkerLauncher for TestWorkerLauncher {
                             TestSupervisorStartup::Healthy => "healthy",
                             TestSupervisorStartup::ExitBeforeReady => "exit-before-ready",
                             TestSupervisorStartup::MalformedReady => "malformed-ready",
+                            TestSupervisorStartup::BuildMismatch => "build-mismatch",
                         },
                     );
                 }

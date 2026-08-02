@@ -71,10 +71,17 @@ package, VM service, or privileged system service.
 
 The process may remain warm between requests, but QuickJS state never does. `RunStep` creates one
 fresh bounded `Runtime` for the agent step. `VerifyArtifact` creates one fresh bounded `Runtime`
-for the entire verification request so source initialization and all tests share only the state
-defined by the verification contract. The runtime and every `Context`, function, promise, and
-value derived from it are dropped before the terminal result is sent. Runtime reuse after success,
-timeout, cancellation, OOM, or any other outcome is forbidden.
+for the entire verification request; each verification case creates a fresh `Context` and reloads
+source, so no source state, fake state, transcript, or pending job crosses a case boundary. The
+runtime and every `Context`, function, promise, and value derived from it are dropped before the
+terminal result is sent. Runtime reuse after success, timeout, cancellation, OOM, or any other
+outcome is forbidden.
+
+Verification fake transcripts have one aggregate call/serialized-byte reservation budget for the
+whole request even though their contents remain isolated per case. Each fake effect reserves its
+worst-case JSON wire size before cloning record values. A limit breach produces a bounded typed
+verification result and terminates remaining cases, so a complete terminal frame always remains
+below the protocol frame limit.
 
 Every runtime preserves the Phase 1 resource limits: a 30-second total request deadline, 64 MiB
 QuickJS heap, and 512 KiB QuickJS stack. The one total deadline supersedes Phase 1's independent
@@ -110,6 +117,13 @@ teardown. Tree-termination failure remains an error even when the root has alrea
 shutdown sends the closed `Shutdown` frame, waits within the same bound, and still performs tree
 cleanup. The next independent request always receives a new generation, so delayed output from
 an old process cannot enter its protocol stream.
+
+Background skill verification enters one bounded FIFO queue owned by that same supervisor; it
+never starts a verifier process or worker pool. Interactive `RunStep` callers have priority while
+waiting or active. A whole `VerifyArtifact` already dispatched to the worker remains atomic, but
+the dispatcher admits waiting interactive calls before dequeuing the next verification. A request
+cancelled before dequeue never reaches the worker. Queue overflow or closure fails closed as a
+retryable admission-infrastructure failure and cannot produce an admission success.
 
 All full-agent rebuilds in the parent obtain this same lazy, authority-free supervisor. A rebuild
 snapshots its own permission bridge, file/fetch policy, selected skill artifacts, invocation IDs,
@@ -176,14 +190,19 @@ File services preserve stable path identity across authorization and I/O; fetch 
 origin and public-address checks plus an outer deadline; spawn passes structured argv to the
 general command sandbox. Spawn permission identity is versioned canonical JSON containing the
 program and argument array, so argument boundaries are never collapsed into a shell-like string.
-The provisional broker `SkillProposalDraft` omits identity-v2 capability and signature fields, so
-that broker operation fails closed until the full typed proposal protocol lands; the direct parent
-proposal service never infers omitted scopes or identity fields.
+The broker `SkillProposalDraft` carries the complete bounded identity-v2 proposal shape: source,
+description, export names and signatures, tests, structured capability tier/scopes, tags, and an
+optional predecessor identity. The parent converts that closed wire value into the existing
+proposal validator, canonicalizes the complete artifact, writes the durable proposal audit intent,
+and only then enqueues it. It never infers omitted scopes, signatures, tags, or identity fields.
 
-Model-authored step code retains bounded file, fetch, and spawn effect globals. The
-`propose_skill` global is intentionally unavailable and is not advertised until A18 supplies its
-full typed identity-v2 protocol; the parent-owned proposal and admission workers remain outside
-the worker authority boundary. Telemetry treats every structured worker field as an untrusted
+Model-authored step code retains bounded file, fetch, and spawn effect globals. When the parent
+provides a proposal service, it also issues a separate exact `ModelAuthored` proposal grant and the
+worker installs the bounded `propose_skill` global. Without that service the global is absent and
+unadvertised. The call sends only the full typed identity-v2 draft to the parent; validation,
+durable intent/completion audit, queueing, admission, and attempt-budget ownership remain outside
+the worker authority boundary. A proposal is never added to the current turn bundle, so its source
+cannot execute in the proposing step. Telemetry treats every structured worker field as an untrusted
 execution claim. The parent requires an exact match to the selected artifact/export and the
 parent-derived turn, tool-call, deterministic invocation, and step outcome before rebuilding a
 canonical event with its own retrieval metadata, index generation, production flag, timestamp,
@@ -197,8 +216,10 @@ the first export argument. It contains only the methods declared by the stored a
 method closure embeds a parent-created grant ID and becomes unusable when the export promise
 settles, the invocation is cancelled, or its runtime ends. A skill cannot inspect or manufacture a
 grant ID, and retaining an object or method cannot transfer useful authority to a later invocation.
-The A15 cutover loads and executes pure artifacts only; an effectful stored export therefore fails
-closed until A18 wires the exact prepared invocation handle into that hidden capability object.
+Only a parent-issued `ModelAuthored` grant may authorize `ProposeSkill`; the broker rejects every
+stored-skill principal before target validation, audit, or enqueue. Direct, indirect, constructor,
+prototype, initialization, export-body, and promise-continuation lookups in a stored realm therefore
+have no writer binding and cannot create proposal traffic.
 
 `src/extras/js/skills/capability.rs` owns the worker-local binding from an explicit invocation ID
 and exact manifest to one opaque grant per declared method. `src/extras/js/realm.rs` constructs a
@@ -210,13 +231,17 @@ only the named invocation, while the worker runtime lifecycle clears every prepa
 token on timeout, unwind, or recycle. Event attribution follows the request's explicit invocation
 and captured grant; there is no ambient active-invocation map or map-order fallback.
 
-Parent preparation also yields an opaque one-shot handle. The worker must bind that exact handle
-immediately around the intended wrapper `Function::call`; wrapper statement one consumes it before
-argument encoding or other model-controlled work. An unbound call denies, and there is no FIFO,
-metadata lookup, or ambient fallback from which an extra same-export call could borrow a later
-invocation's authority. Ordinary JavaScript calls made through `ctx.eval` are therefore
-unauthorized until A18 routes the selected export call through this Rust seam; A18/A21 production
-call wiring must use it, with no ambient fallback. Async results never expose a private-realm
+Parent preparation retains only a reusable artifact/export binding inside the parent broker; it
+does not yield reusable bearer authority. On each wrapper entry, the Rust-owned worker dispatcher
+requests the next exact artifact/export call ordinal. The parent validates that ordinal against its
+selected-export table, derives the invocation ID, and mints new scoped grants. The worker prepares
+one opaque handle from that response and binds it immediately around the intended wrapper
+`Function::call`; wrapper statement one consumes it before argument encoding or other
+model-controlled work. Replaying that handle or requesting a stale, expired, revoked, unknown, or
+out-of-order call denies before stored source executes. There is no FIFO, pool, metadata lookup, or
+ambient fallback from which one export can borrow another export's authority. Pure and effectful
+exports use the same dispatcher seam; only methods present in the authoritative manifest are
+installed on the hidden capability object. Async results never expose a private-realm
 promise to the model realm. A Rust-owned settlement registry
 carries only the bounded encoded result string (or a closed rejection) into a promise created from
 the model realm's captured intrinsic, so its prototype and continuation ownership remain
@@ -259,7 +284,10 @@ Production execution, embedded tests, inherited regression tests, mutation tests
 tests use one worker-owned artifact loader and the same private-realm, pure-initialization,
 declared-export, hidden-capability-object, JSON-clone, and pending-job contract. No verifier may
 construct a QuickJS runtime in the parent or use a source wrapper that production does not use.
-One complete `VerifyArtifact` request owns one fresh runtime.
+One complete `VerifyArtifact` request owns one fresh runtime. Within it, every embedded, mutation,
+inherited, and held-out case reloads the artifact through that production loader in a fresh context
+with fresh grants, fake state, transcript, and job drain. Mutation substitutes only the selected
+post-validation export bridge; it does not introduce a second source wrapper or loader.
 
 Verification supplies deterministic fake capability objects through the same capability
 registration path used by production. Fakes are limited to the artifact's declared structured
@@ -525,11 +553,23 @@ private Windows creation lock and release it immediately after synchronous spawn
 standard-library output helper is the one synchronous exception: because
 `Command` does not expose its stdio configuration for a faithful spawn-only reimplementation, it
 holds the lock while `Command::output` completes, preserving explicit stdio and builder reuse. No
-guard crosses an async suspension. Inheritable-handle owners also clear their bit during drop on
+guard crosses an async suspension, and async/await/closure-deferred terminals cannot claim lexical
+guard dominance; macro-contained raw terminals are likewise non-dominant because expansion can
+defer execution. Inheritable-handle owners also clear their bit during drop on
 every error path before the earlier-acquired lock guard is released. The checked subprocess
-inventory combines parsed import/local-type provenance with full-source tokens and rejects
-multiline, qualified-angle or renamed UFCS, and ambiguous Windows-capable production terminals that
-bypass this boundary. A dedicated exact multiset inventory for the creation helper itself requires
+inventory recursively resolves parsed imports, type aliases, and local-module re-exports alongside
+full-source tokens, treats glob imports and out-of-line modules as opaque, and inventories associated
+terminal function-item references after normalizing raw identifiers. Terminal method identifiers in
+macro inputs and locally defined `macro_rules!` bodies fail closed unless an exact inventory
+identity proves the site non-process. The identity binds source path and occurrence to SHA-256 of the
+unambiguously framed full macro-context chain. Each invocation structurally encodes exact path tokens
+(including root qualification and raw identifier spelling), punctuation character and spacing,
+token-tree kind, nested delimiter, and literal spelling without reconstructing a path or stringifying
+the token stream. A matching terminal line, inner invocation, or macro name alone grants nothing;
+macro-controlled terminals cannot inherit lexical guard dominance. It rejects
+multiline, qualified-angle or renamed UFCS, and
+ambiguous Windows-capable production terminals that bypass this boundary. A dedicated exact
+multiset inventory for the creation helper itself requires
 every raw standard-library, Tokio, and RMCP terminal to remain dominated by a retained crate guard.
 Any future raw or third-party Windows launcher is inside the same boundary and must reuse it.
 
@@ -562,6 +602,27 @@ is a protocol fault. Optional corrective metadata is limited to a source-free lo
 `stage` and `script_role` enums plus validated one-based numeric line/column values within the
 submitted script. It contains no filename, function name, property/key name, target, ordinal,
 effect result, or other source-derived string.
+
+Worker reuse is a parent-owned, deterministic decision. A successful value or void result and the
+explicitly allowlisted `syntax`, `exception`, and `invalid_result` JavaScript errors may leave the
+contained process warm, but the worker still creates a fresh QuickJS `Runtime` for the next
+request. Stack/job resource errors, internal errors, JavaScript timeout/OOM terminals, and
+verification results containing a `resource_limit` or `internal` diagnostic poison the process
+even though their terminal frames are well formed. A watchdog timeout, cancellation, malformed or
+invalid-state frame, build/version mismatch, stale generation, unexpected verification effect,
+transport failure, process exit/signal/panic, or shutdown fault also kills and reaps the complete
+containment tree and erases all invocation grants before another request can launch. Warm
+processes are retired after 256 completed requests or 15 minutes, whichever comes first. The age
+deadline is enforced by an independent idle-retirement timer, so the parent reaps an expired idle
+worker even when no later request arrives. Clean shutdown retires the idle process and a later
+request starts a fresh generation.
+
+An unavailable audit prevents broker construction and therefore sends no request to a worker. An
+effect whose durable completion is `outcome_unknown` immediately erases invocation authority,
+closes that invocation in both protocol state machines, and forces process recycle without retry.
+JavaScript cannot catch that error and dispatch another effect: a caught second call fails locally
+inside the closing worker and never reaches the parent broker. A29 owns the effect-specific
+cancellation and reconciliation details.
 
 If QuickJS cannot be classified without trusting exception-controlled text, the worker returns the
 generic `javascript_exception` or `promise_rejection` code. Arbitrary exception `name`, message,

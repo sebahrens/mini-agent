@@ -47,7 +47,7 @@ fn store() -> (std::path::PathBuf, SkillStore, SkillArtifact) {
     let paths = AppPaths::resolve(&env).unwrap();
     let mut store = SkillStore::open_at(&paths).unwrap();
     let artifact = SkillArtifact::new(
-        "function run(x) { return x; }".into(),
+        "function run(_cap, x) { return x; }".into(),
         "Event fixture".into(),
         vec![],
         vec![SkillExport {

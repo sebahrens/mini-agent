@@ -209,8 +209,6 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(feature = "archmd")]
         let architecture = with_config(|cfg| cfg.architecture.clone())
             .map_err(|err| ToolError::Msg(err.to_string()))?;
-        #[cfg(not(feature = "archmd"))]
-        let architecture: Option<String> = None;
 
         let authorization =
             SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone());
@@ -218,6 +216,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let client = client.clone();
             let model_name = model_name.clone();
             let event_tx = subagent_event_tx.clone();
+            #[cfg(feature = "archmd")]
             let architecture = architecture.clone();
             let config = config.clone();
             let authorization = authorization.clone();
@@ -238,6 +237,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     max_turns,
                     &config,
                     authorization,
+                    #[cfg(feature = "archmd")]
                     architecture,
                 )
                 .await;
@@ -251,7 +251,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     ),
                 )
                 .await;
-                let run = match result {
+                let mut run = match result {
                     Ok(run) => run,
                     Err(_) => {
                         let output = Err("timeout: subagent exceeded 300s".to_string());

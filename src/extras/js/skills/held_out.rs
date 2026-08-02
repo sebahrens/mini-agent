@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 
 use super::fakes::{FAKES_VERSION, FakeTranscript};
 use super::store::{AdminIdentity, HeldOutSuiteRecord, SkillStore, StoreError};
-use super::verify::{VERIFIER_VERSION, VerificationError, verify_held_out_case, verify_skill};
+use super::verify::{
+    VERIFIER_VERSION, VerificationError, verify_held_out_case, verify_inherited_cases, verify_skill,
+};
 use super::{CapabilityTier, SkillArtifact};
 
 const SUITE_FORMAT_VERSION: u32 = 1;
@@ -303,9 +305,7 @@ pub(crate) fn evaluate(
         predecessor
             .verify_identity()
             .map_err(|error| HeldOutError::Identity(error.to_string()))?;
-        let mut inherited = artifact.clone();
-        inherited.tests = predecessor.tests.clone();
-        verify_skill(&inherited).map_err(HeldOutError::Inherited)?;
+        verify_inherited_cases(artifact, &predecessor.tests).map_err(HeldOutError::Inherited)?;
     }
 
     let mut suites = select_suites(store, artifact)?;
@@ -337,9 +337,14 @@ pub(crate) fn evaluate(
         for (case_index, case) in suite.cases.iter().enumerate() {
             let transcript =
                 verify_held_out_case(artifact, &case.expression, &case.expected, &case.fake_files)
-                    .map_err(|_| HeldOutError::CaseFailed {
-                        suite_id: suite.id.clone(),
-                        case_index,
+                    .map_err(|error| match error {
+                        VerificationError::InfrastructureUnavailable(_) => {
+                            HeldOutError::Infrastructure(error)
+                        }
+                        _ => HeldOutError::CaseFailed {
+                            suite_id: suite.id.clone(),
+                            case_index,
+                        },
                     })?;
             if !transcript_matches(&case.transcript, &transcript) {
                 return Err(HeldOutError::TranscriptMismatch {
@@ -421,6 +426,8 @@ pub(crate) enum HeldOutError {
     Embedded(VerificationError),
     #[error("inherited_regression_failed")]
     Inherited(VerificationError),
+    #[error("verification infrastructure unavailable")]
+    Infrastructure(VerificationError),
     #[error("held_out_failed for suite {suite_id} case {case_index}")]
     CaseFailed { suite_id: String, case_index: usize },
     #[error("held_out_failed transcript for suite {suite_id} case {case_index}")]

@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn test_multiple_tests_in_order() {
         let s = skill(
-            "function add(a, b) { return a + b; }",
+            "function add(_cap, a, b) { return a + b; }",
             vec!["add(1, 1) === 2", "add(2, 3) === 5", "add(0, 0) === 0"],
             vec![("add", "(a, b): number")],
             CapabilityTier::Pure,
@@ -280,10 +280,10 @@ mod tests {
     }
 
     #[test]
-    fn test_state_preserved_across_tests() {
+    fn verification_cases_receive_fresh_skill_state() {
         let s = skill(
             "let counter = 0; function increment() { counter++; return counter; }",
-            vec!["increment() === 1", "increment() === 2"],
+            vec!["increment() === 1", "increment() === 1"],
             vec![("increment", "(): boolean")],
             CapabilityTier::Pure,
             vec![],
@@ -292,6 +292,51 @@ mod tests {
         assert_eq!(report.test_results.len(), 2);
         assert_eq!(report.test_results[0], TestResult::Passed);
         assert_eq!(report.test_results[1], TestResult::Passed);
+    }
+
+    #[test]
+    fn verifier_rejects_source_that_only_a_generated_function_wrapper_accepts() {
+        let s = skill(
+            "return; function test() { return true; }",
+            vec!["test()"],
+            vec![("test", "(): boolean")],
+            CapabilityTier::Pure,
+            vec![],
+        );
+
+        assert!(matches!(
+            verify_skill(&s),
+            Err(VerificationError::SourceEvaluationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_top_level_effects_before_capability_construction() {
+        let s = skill(
+            "write_file('tmp/a', 'x'); function test(_cap) { return true; }",
+            vec!["test()"],
+            vec![("test", "(): boolean")],
+            CapabilityTier::SideEffecting,
+            vec![HostCapability::WriteFile],
+        );
+
+        assert!(matches!(
+            verify_skill(&s),
+            Err(VerificationError::SourceEvaluationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn verifier_exposes_declared_effects_only_on_the_hidden_capability_object() {
+        let s = skill(
+            "const ambient = typeof read_file; function inspect(cap) { return ambient === 'undefined' && typeof cap.read_file === 'function'; }",
+            vec!["inspect()"],
+            vec![("inspect", "(): boolean")],
+            CapabilityTier::ReadOnly,
+            vec![HostCapability::ReadFile],
+        );
+
+        assert!(verify_skill(&s).is_ok());
     }
 
     #[test]
@@ -366,7 +411,7 @@ mod tests {
         assert_eq!(report.identity_version, s.identity_version);
         assert_eq!(report.capability, s.capability);
         assert!(report.verifier_version > 0);
-        assert!(report.fakes_version > 0);
+        assert_eq!(report.fakes_version, 2);
         assert!(report.memory_limit > 0);
         assert!(report.stack_limit > 0);
     }
@@ -412,7 +457,7 @@ mod tests {
     fn test_export_with_complex_logic() {
         let s = skill(
             r#"
-            function isPrime(n) {
+            function isPrime(_cap, n) {
                 if (n < 2) return false;
                 for (let i = 2; i * i <= n; i++) {
                     if (n % i === 0) return false;
@@ -609,7 +654,7 @@ mod required_behaviour_probes {
     fn probe_tier1_receives_declared_read_file_fake() {
         // A Tier 1 skill declaring ReadFile must be able to call the fake.
         let skill = artifact(
-            "function readIt() { return typeof read_file; }",
+            "function readIt(cap) { return typeof cap.read_file; }",
             vec!["readIt() === 'function'"],
             vec![("readIt", "readIt(path: string): string")],
             CapabilityTier::ReadOnly,
@@ -627,7 +672,7 @@ mod required_behaviour_probes {
         // This is only meaningful if some tier DOES get globals; otherwise the
         // Tier 0 assertion is vacuous.
         let tier0 = artifact(
-            "function f() { return typeof read_file; }",
+            "function f(cap) { return typeof cap.read_file; }",
             vec!["f() === 'undefined'"],
             vec![("f", "f(): boolean")],
             CapabilityTier::Pure,
@@ -636,7 +681,7 @@ mod required_behaviour_probes {
         assert!(verify_skill(&tier0).is_ok(), "Tier 0 must see no read_file");
 
         let tier1 = artifact(
-            "function f() { return typeof read_file; }",
+            "function f(cap) { return typeof cap.read_file; }",
             vec!["f() === 'function'"],
             vec![("f", "f(): boolean")],
             CapabilityTier::ReadOnly,
@@ -652,7 +697,7 @@ mod required_behaviour_probes {
     fn probe_undeclared_host_is_unavailable_to_tier2() {
         // Declares Spawn only; fetch must not appear.
         let skill = artifact(
-            "function f() { return typeof spawn === 'function' && typeof fetch === 'undefined'; }",
+            "function f(cap) { return typeof cap.spawn === 'function' && typeof cap.fetch === 'undefined'; }",
             vec!["f()"],
             vec![("f", "f(): boolean")],
             CapabilityTier::SideEffecting,
@@ -670,7 +715,8 @@ mod required_behaviour_probes {
 mod fake_integrity_probes {
     use crate::extras::js::skills::verify::verify_skill;
     use crate::extras::js::skills::{
-        CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
+        CapabilityManifest, CapabilityScope, CapabilityTier, HostCapability, SkillArtifact,
+        SkillExport,
     };
 
     fn artifact(source: &str, tests: Vec<&str>, hosts: Vec<HostCapability>) -> SkillArtifact {
@@ -683,7 +729,28 @@ mod fake_integrity_probes {
                 signature: "f(): boolean".to_string(),
             }],
             tests.into_iter().map(str::to_string).collect(),
-            test_manifest(CapabilityTier::SideEffecting, hosts).expect("manifest"),
+            CapabilityManifest::new(
+                CapabilityTier::SideEffecting,
+                hosts
+                    .into_iter()
+                    .map(|host| match host {
+                        HostCapability::ReadFile => CapabilityScope::ReadFile {
+                            workspace_prefixes: vec!["virtual".into()],
+                        },
+                        HostCapability::WriteFile => CapabilityScope::WriteFile {
+                            workspace_prefixes: vec!["virtual".into()],
+                        },
+                        HostCapability::Spawn => CapabilityScope::Spawn {
+                            programs: vec!["printf".into()],
+                        },
+                        HostCapability::Fetch => CapabilityScope::Fetch {
+                            origins: vec!["https://example.com".into()],
+                            methods: vec![crate::extras::js::skills::HttpMethod::Get],
+                        },
+                    })
+                    .collect(),
+            )
+            .expect("manifest"),
         )
         .expect("artifact")
     }
@@ -692,7 +759,7 @@ mod fake_integrity_probes {
     fn probe_fake_write_then_read_round_trips_through_virtual_state() {
         // A real record/replay fake keeps virtual state; a hardcoded JS stub does not.
         let skill = artifact(
-            "function f() { write_file('/v/a.txt', 'hello'); return read_file('/v/a.txt') === 'hello'; }",
+            "function f(cap) { cap.write_file('virtual/a.txt', 'hello'); return cap.read_file('virtual/a.txt') === 'hello'; }",
             vec!["f() === true"],
             vec![HostCapability::ReadFile, HostCapability::WriteFile],
         );
@@ -706,7 +773,7 @@ mod fake_integrity_probes {
     #[test]
     fn probe_fake_calls_are_recorded_in_the_transcript() {
         let skill = artifact(
-            "function f() { write_file('/v/b.txt', 'x'); return true; }",
+            "function f(cap) { cap.write_file('virtual/b.txt', 'x'); return true; }",
             vec!["f() === true"],
             vec![HostCapability::WriteFile],
         );
@@ -725,10 +792,8 @@ mod fake_integrity_probes {
         // assignment and verification fails — the tampering attempt cannot yield a
         // passing verification.
         let skill = artifact(
-            "function f() { return true; }",
-            vec![
-                "globalThis.write_file = function() { return 'pwned'; }; write_file('/v/c', 'x') !== 'pwned'",
-            ],
+            "function f(cap) { cap.write_file = function() { return 'pwned'; }; return cap.write_file('virtual/c', 'x') !== 'pwned'; }",
+            vec!["f()"],
             vec![HostCapability::WriteFile],
         );
         let result = verify_skill(&skill);
@@ -739,7 +804,7 @@ mod fake_integrity_probes {
 
         // And the genuine fake still works for a skill that does not tamper.
         let honest = artifact(
-            "function f() { write_file('/v/d', 'x'); return true; }",
+            "function f(cap) { cap.write_file('virtual/d', 'x'); return true; }",
             vec!["f() === true"],
             vec![HostCapability::WriteFile],
         );

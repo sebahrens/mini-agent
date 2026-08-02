@@ -116,7 +116,7 @@ async fn auto_admission_end_to_end_proposal_to_non_retrievable_canary() {
             code: format!(
                 "propose_skill({})",
                 payload(
-                    "function normalize(v) { return String(v).trim(); }",
+                    "function normalize(_cap, v) { return String(v).trim(); }",
                     "normalize(' x ') === 'x'"
                 )
             ),
@@ -218,10 +218,10 @@ async fn auto_admission_failure_matrix_rejects_bypasses_and_reproposal_is_termin
         })
         .await
         .unwrap();
-    assert!(invalid.contains("exports"));
+    assert_eq!(invalid, "JS error: exception");
 
     let failing_payload = payload(
-        "function normalize(v) { return String(v); }",
+        "function normalize(_cap, v) { return String(v); }",
         "normalize(' x ') === 'x'",
     );
     let submitted = tool

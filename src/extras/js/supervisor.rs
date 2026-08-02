@@ -7,16 +7,18 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::protocol::{
-    BuildIdentity, EffectRequest, EffectResponse, EffectResult, FrameError, InvocationId,
-    ParentFrame, ParentHello, ParentProtocol, ParentWireFrame, RunStep, StepResult,
-    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerWireFrame, read_frame,
-    write_frame,
+    BuildIdentity, DiagnosticClass, EffectErrorCode, EffectRequest, EffectResponse, EffectResult,
+    FrameError, InvocationId, JsErrorCode, ParentFrame, ParentHello, ParentProtocol,
+    ParentWireFrame, RunStep, StepOutcome, StepResult, VerificationResult, VerifyArtifact,
+    WireFrame, WorkerFrame, WorkerWireFrame, read_frame, write_frame,
 };
+#[cfg(feature = "skills")]
+use super::protocol::{SkillCallRequest, SkillCallResponse};
 use super::types::{PermCancellation, STEP_TIMEOUT};
 #[cfg(not(test))]
 use crate::sandbox::worker::ProductionWorkerLauncher;
@@ -26,6 +28,9 @@ const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+const VERIFICATION_QUEUE_CAPACITY: usize = 16;
+const MAX_PROCESS_AGE: Duration = Duration::from_secs(15 * 60);
+const MAX_PROCESS_INVOCATIONS: u64 = 256;
 
 pub(crate) type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectResult> + Send + 'a>>;
 
@@ -36,6 +41,22 @@ pub(crate) trait InvocationEffectHandler: Send {
         request: EffectRequest,
         cancellation: PermCancellation,
     ) -> EffectFuture<'_>;
+
+    #[cfg(feature = "skills")]
+    fn handle_skill_call(&mut self, request: SkillCallRequest) -> SkillCallResponse {
+        SkillCallResponse {
+            request_ordinal: request.request_ordinal,
+            authorization: None,
+        }
+    }
+
+    /// Erase invocation authority after a terminal result that leaves the worker reusable.
+    fn finish_invocation(&mut self) {}
+
+    /// Erase invocation authority after any worker/process/protocol fault or poisoned runtime.
+    fn recycle_invocation(&mut self) {
+        self.finish_invocation();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -48,10 +69,14 @@ pub(crate) enum WorkerError {
     Transport,
     #[error("JavaScript worker violated its protocol")]
     Protocol,
+    #[error("JavaScript worker build identity differs from the parent")]
+    BuildMismatch,
     #[error("JavaScript worker invocation was cancelled")]
     Cancelled,
     #[error("JavaScript worker invocation exceeded its deadline")]
     TimedOut,
+    #[error("JavaScript effect completed with an unknown outcome")]
+    EffectOutcomeUnknown,
     #[error("JavaScript worker returned a stale process generation")]
     StaleGeneration,
     #[error("JavaScript worker supervisor identity space is exhausted")]
@@ -60,6 +85,19 @@ pub(crate) enum WorkerError {
     BlockingVerifyInAsyncRuntime,
     #[error("JavaScript verification attempted an external effect")]
     UnexpectedVerificationEffect,
+    #[error("JavaScript verification queue is at capacity")]
+    VerificationQueueFull,
+    #[error("JavaScript verification queue is unavailable")]
+    VerificationQueueClosed,
+}
+
+impl WorkerError {
+    pub(crate) fn is_retryable_admission_infrastructure(self) -> bool {
+        matches!(
+            self,
+            Self::VerificationQueueFull | Self::VerificationQueueClosed
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -73,6 +111,11 @@ struct SupervisorInner {
     active_generation: AtomicU64,
     accepts_test_preamble: bool,
     watchdog: Duration,
+    priority: Arc<InvocationPriority>,
+    verification_scheduler: OnceLock<Result<VerificationScheduler, WorkerError>>,
+    reuse_policy: WorkerReusePolicy,
+    #[cfg(test)]
+    idle_retirement: tokio::sync::Notify,
 }
 
 struct SupervisorState {
@@ -88,6 +131,82 @@ struct WorkerConnection {
     process: WorkerProcess,
     protocol: ParentProtocol,
     stderr_drain: BoundedStderrDrain,
+    created_at: Instant,
+    completed_invocations: u64,
+    retirement: Option<Arc<RetirementTicket>>,
+}
+
+struct RetirementTicket {
+    cancelled: Mutex<bool>,
+    wake: Condvar,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WorkerReusePolicy {
+    max_age: Duration,
+    max_invocations: u64,
+}
+
+impl WorkerReusePolicy {
+    pub(crate) const fn new(max_age: Duration, max_invocations: u64) -> Self {
+        Self {
+            max_age,
+            max_invocations,
+        }
+    }
+
+    fn permits(&self, connection: &WorkerConnection, now: Instant) -> bool {
+        self.max_invocations > 0
+            && connection.completed_invocations < self.max_invocations
+            && now.saturating_duration_since(connection.created_at) < self.max_age
+    }
+}
+
+impl Default for WorkerReusePolicy {
+    fn default() -> Self {
+        Self::new(MAX_PROCESS_AGE, MAX_PROCESS_INVOCATIONS)
+    }
+}
+
+impl RetirementTicket {
+    fn new() -> Self {
+        Self {
+            cancelled: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.wake.notify_all();
+    }
+
+    fn wait_until(&self, deadline: Instant) -> bool {
+        let mut cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if *cancelled {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            let (next, timeout) = self
+                .wake
+                .wait_timeout(cancelled, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cancelled = next;
+            if timeout.timed_out() && !*cancelled {
+                return true;
+            }
+        }
+    }
 }
 
 struct BoundedStderrDrain {
@@ -95,7 +214,117 @@ struct BoundedStderrDrain {
     truncated: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
+
+#[derive(Default)]
+struct InvocationPriority {
+    state: Mutex<InvocationPriorityState>,
+    changed: Condvar,
+    observed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct InvocationPriorityState {
+    interactive_waiters: usize,
+    interactive_active: usize,
+    verification_running: bool,
+}
+
+struct VerificationScheduler {
+    sender: Mutex<Option<mpsc::SyncSender<VerificationJob>>>,
+    queue: Arc<VerificationQueueObservation>,
+}
+
+#[derive(Default)]
+struct VerificationQueueObservation {
+    depth: Mutex<usize>,
+    changed: tokio::sync::Notify,
+}
+
+struct VerificationJob {
+    request: VerifyArtifact,
+    cancellation: PermCancellation,
+    deadline: Instant,
+    reply: VerificationReplySender,
+}
+
+#[derive(Default)]
+struct VerificationReply {
+    result: Mutex<Option<Result<VerificationResult, WorkerError>>>,
+    changed: Condvar,
+}
+
+struct VerificationReplySender {
+    reply: Arc<VerificationReply>,
+    armed: bool,
+}
 // END AUTHORITY-FREE SUPERVISOR STATE
+
+impl VerificationReply {
+    fn complete(&self, result: Result<VerificationResult, WorkerError>) {
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot.is_none() {
+            *slot = Some(result);
+        }
+        drop(slot);
+        self.changed.notify_all();
+    }
+
+    fn wait(
+        self: &Arc<Self>,
+        cancellation: &PermCancellation,
+    ) -> Result<VerificationResult, WorkerError> {
+        let weak_reply = Arc::downgrade(self);
+        let _cancel_wake = cancellation.register_blocking_wake(Arc::new(move || {
+            let Some(reply) = weak_reply.upgrade() else {
+                return;
+            };
+            let _result = reply
+                .result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            reply.changed.notify_all();
+        }));
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(result) = slot.take() {
+                return result;
+            }
+            if cancellation.is_cancelled() {
+                return Err(WorkerError::Cancelled);
+            }
+            slot = self
+                .changed
+                .wait(slot)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+impl VerificationReplySender {
+    fn new(reply: Arc<VerificationReply>) -> Self {
+        Self { reply, armed: true }
+    }
+
+    fn send(mut self, result: Result<VerificationResult, WorkerError>) {
+        self.reply.complete(result);
+        self.armed = false;
+    }
+}
+
+impl Drop for VerificationReplySender {
+    fn drop(&mut self) {
+        if self.armed {
+            self.reply
+                .complete(Err(WorkerError::VerificationQueueClosed));
+        }
+    }
+}
 
 impl Drop for BoundedStderrDrain {
     fn drop(&mut self) {
@@ -126,6 +355,9 @@ impl BoundedStderrDrain {
 
 impl Drop for WorkerConnection {
     fn drop(&mut self) {
+        if let Some(retirement) = &self.retirement {
+            retirement.cancel();
+        }
         let _ = self.process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
         self.stderr_drain.join_bounded(STDERR_JOIN_TIMEOUT);
     }
@@ -151,6 +383,20 @@ impl JsWorkerSupervisor {
         accepts_test_preamble: bool,
         watchdog: Duration,
     ) -> Self {
+        Self::new_with_policy(
+            launcher,
+            accepts_test_preamble,
+            watchdog,
+            WorkerReusePolicy::default(),
+        )
+    }
+
+    fn new_with_policy(
+        launcher: Arc<dyn WorkerLauncher>,
+        accepts_test_preamble: bool,
+        watchdog: Duration,
+        reuse_policy: WorkerReusePolicy,
+    ) -> Self {
         Self(Arc::new(SupervisorInner {
             transport: tokio::sync::Mutex::new(SupervisorState {
                 idle: None,
@@ -162,6 +408,11 @@ impl JsWorkerSupervisor {
             active_generation: AtomicU64::new(0),
             accepts_test_preamble,
             watchdog,
+            priority: Arc::new(InvocationPriority::default()),
+            verification_scheduler: OnceLock::new(),
+            reuse_policy,
+            #[cfg(test)]
+            idle_retirement: tokio::sync::Notify::new(),
         }))
     }
 
@@ -176,6 +427,20 @@ impl JsWorkerSupervisor {
         watchdog: Duration,
     ) -> Self {
         Self::new(Arc::new(launcher), true, watchdog)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_launcher_and_policy_for_test(
+        launcher: impl WorkerLauncher + 'static,
+        watchdog: Duration,
+        reuse_policy: WorkerReusePolicy,
+    ) -> Self {
+        Self::new_with_policy(Arc::new(launcher), true, watchdog, reuse_policy)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_idle_retirement_for_test(&self) {
+        self.0.idle_retirement.notified().await;
     }
 
     pub(crate) async fn execute(
@@ -210,7 +475,7 @@ impl JsWorkerSupervisor {
         invocation: Option<InvocationId>,
     ) -> Result<StepResult, WorkerError> {
         match self
-            .invoke(
+            .invoke_interactive(
                 InvocationRequest::Run(request),
                 Some(effects),
                 cancellation,
@@ -227,30 +492,34 @@ impl JsWorkerSupervisor {
         &self,
         request: VerifyArtifact,
     ) -> Result<VerificationResult, WorkerError> {
+        self.verify_blocking_cancellable(request, PermCancellation::new())
+    }
+
+    pub(crate) fn verify_blocking_cancellable(
+        &self,
+        request: VerifyArtifact,
+        cancellation: PermCancellation,
+    ) -> Result<VerificationResult, WorkerError> {
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(WorkerError::BlockingVerifyInAsyncRuntime);
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|_| WorkerError::Transport)?;
-        runtime.block_on(async {
-            match self
-                .invoke::<RejectEffects>(
-                    InvocationRequest::Verify(request),
-                    None,
-                    PermCancellation::new(),
-                    None,
-                )
-                .await?
-            {
-                InvocationTerminal::Verification(result) => Ok(result),
-                InvocationTerminal::Step(_) => Err(WorkerError::Protocol),
-            }
-        })
+        if cancellation.is_cancelled() {
+            return Err(WorkerError::Cancelled);
+        }
+        let deadline = Instant::now() + self.0.watchdog;
+        self.verification_scheduler()?
+            .submit(request, cancellation, deadline)
     }
 
-    async fn invoke<H: InvocationEffectHandler>(
+    fn verification_scheduler(&self) -> Result<&VerificationScheduler, WorkerError> {
+        self.0
+            .verification_scheduler
+            .get_or_init(|| VerificationScheduler::start(Arc::downgrade(&self.0)))
+            .as_ref()
+            .map_err(|error| *error)
+    }
+
+    async fn invoke_interactive<H: InvocationEffectHandler>(
         &self,
         request: InvocationRequest,
         mut effects: Option<&mut H>,
@@ -260,8 +529,58 @@ impl JsWorkerSupervisor {
         // The single deadline starts before lease acquisition and therefore bounds queueing,
         // startup, protocol I/O, JavaScript execution, and parent-brokered effect handling.
         let deadline = Instant::now() + self.0.watchdog;
+        let waiter = self.0.priority.register_interactive();
         let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
-        let mut connection = match state.idle.take() {
+        let _active_interactive = waiter.activate();
+        self.invoke_with_state(
+            &mut state,
+            request,
+            &mut effects,
+            cancellation,
+            invocation,
+            deadline,
+        )
+        .await
+    }
+
+    async fn invoke_scheduled_verification(
+        &self,
+        request: VerifyArtifact,
+        cancellation: PermCancellation,
+        deadline: Instant,
+    ) -> Result<VerificationResult, WorkerError> {
+        let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
+        match self
+            .invoke_with_state::<RejectEffects>(
+                &mut state,
+                InvocationRequest::Verify(request),
+                &mut None,
+                cancellation,
+                None,
+                deadline,
+            )
+            .await?
+        {
+            InvocationTerminal::Verification(result) => Ok(result),
+            InvocationTerminal::Step(_) => Err(WorkerError::Protocol),
+        }
+    }
+
+    async fn invoke_with_state<H: InvocationEffectHandler>(
+        &self,
+        state: &mut SupervisorState,
+        request: InvocationRequest,
+        effects: &mut Option<&mut H>,
+        cancellation: PermCancellation,
+        invocation: Option<InvocationId>,
+        deadline: Instant,
+    ) -> Result<InvocationTerminal, WorkerError> {
+        let mut authority = InvocationAuthority::new(effects.take());
+        let mut connection = match state
+            .idle
+            .take()
+            .filter(|connection| self.0.reuse_policy.permits(connection, Instant::now()))
+        {
             Some(connection) => connection,
             None => {
                 let generation = allocate_counter(&mut state.next_generation)?;
@@ -297,13 +616,22 @@ impl JsWorkerSupervisor {
             &mut connection,
             invocation,
             request,
-            &mut effects,
+            &mut authority,
             &cancellation,
             deadline,
         )
         .await;
-        if result.is_ok() {
-            state.idle = Some(connection);
+        let reusable_terminal = result
+            .as_ref()
+            .is_ok_and(|terminal| terminal_is_reusable(terminal));
+        if reusable_terminal {
+            authority.finish();
+            connection.completed_invocations = connection.completed_invocations.saturating_add(1);
+        } else {
+            authority.recycle();
+        }
+        if reusable_terminal && self.0.reuse_policy.permits(&connection, Instant::now()) {
+            store_idle_with_retirement(&self.0, state, connection);
         }
         active.armed = false;
         self.0.active_generation.store(0, Ordering::Release);
@@ -399,11 +727,396 @@ impl JsWorkerSupervisor {
             truncated: drain.truncated.load(Ordering::Acquire),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn verification_queue_capacity_for_test(&self) -> usize {
+        VERIFICATION_QUEUE_CAPACITY
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verification_queue_depth_for_test(&self) -> usize {
+        self.verification_scheduler()
+            .map_or(0, VerificationScheduler::queue_depth)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_verification_queue_depth_for_test(&self, expected: usize) {
+        let scheduler = self
+            .verification_scheduler()
+            .expect("verification scheduler must start for tests");
+        scheduler.wait_for_queue_depth(expected).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_interactive_waiters_for_test(&self, expected: usize) {
+        self.0.priority.wait_for_interactive_waiters(expected).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_verification_queue_for_test(&self) {
+        if let Ok(scheduler) = self.verification_scheduler() {
+            scheduler.close();
+        }
+    }
+}
+
+impl InvocationPriority {
+    fn register_interactive(self: &Arc<Self>) -> InteractiveWaiter {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.interactive_waiters = state.interactive_waiters.saturating_add(1);
+        drop(state);
+        self.changed.notify_all();
+        self.observed.notify_waiters();
+        InteractiveWaiter {
+            priority: Arc::clone(self),
+            waiting: true,
+        }
+    }
+
+    fn begin_verification(
+        self: &Arc<Self>,
+        cancellation: &PermCancellation,
+        deadline: Instant,
+    ) -> Result<VerificationLease, WorkerError> {
+        let weak_priority = Arc::downgrade(self);
+        let _cancel_wake = cancellation.register_blocking_wake(Arc::new(move || {
+            let Some(priority) = weak_priority.upgrade() else {
+                return;
+            };
+            let _state = priority
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            priority.changed.notify_all();
+        }));
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.verification_running
+            || state.interactive_waiters != 0
+            || state.interactive_active != 0
+        {
+            if cancellation.is_cancelled() {
+                return Err(WorkerError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(WorkerError::TimedOut);
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+        }
+        if cancellation.is_cancelled() {
+            return Err(WorkerError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(WorkerError::TimedOut);
+        }
+        state.verification_running = true;
+        Ok(VerificationLease {
+            priority: Arc::clone(self),
+        })
+    }
+
+    #[cfg(test)]
+    async fn wait_for_interactive_waiters(&self, expected: usize) {
+        loop {
+            let changed = self.observed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let observed = self
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .interactive_waiters;
+            if observed == expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct InteractiveWaiter {
+    priority: Arc<InvocationPriority>,
+    waiting: bool,
+}
+
+impl InteractiveWaiter {
+    fn activate(mut self) -> ActiveInteractive {
+        let mut state = self
+            .priority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.interactive_waiters = state.interactive_waiters.saturating_sub(1);
+        state.interactive_active = state.interactive_active.saturating_add(1);
+        self.waiting = false;
+        drop(state);
+        self.priority.changed.notify_all();
+        self.priority.observed.notify_waiters();
+        ActiveInteractive {
+            priority: Arc::clone(&self.priority),
+        }
+    }
+}
+
+impl Drop for InteractiveWaiter {
+    fn drop(&mut self) {
+        if !self.waiting {
+            return;
+        }
+        let mut state = self
+            .priority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.interactive_waiters = state.interactive_waiters.saturating_sub(1);
+        drop(state);
+        self.priority.changed.notify_all();
+        self.priority.observed.notify_waiters();
+    }
+}
+
+struct ActiveInteractive {
+    priority: Arc<InvocationPriority>,
+}
+
+impl Drop for ActiveInteractive {
+    fn drop(&mut self) {
+        let mut state = self
+            .priority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.interactive_active = state.interactive_active.saturating_sub(1);
+        drop(state);
+        self.priority.changed.notify_all();
+        self.priority.observed.notify_waiters();
+    }
+}
+
+struct VerificationLease {
+    priority: Arc<InvocationPriority>,
+}
+
+impl Drop for VerificationLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .priority
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.verification_running = false;
+        drop(state);
+        self.priority.changed.notify_all();
+        self.priority.observed.notify_waiters();
+    }
+}
+
+impl VerificationScheduler {
+    fn start(supervisor: Weak<SupervisorInner>) -> Result<Self, WorkerError> {
+        let (sender, receiver) = mpsc::sync_channel(VERIFICATION_QUEUE_CAPACITY);
+        let queue = Arc::new(VerificationQueueObservation::default());
+        let worker_queue = Arc::clone(&queue);
+        std::thread::Builder::new()
+            .name("mini-agent-js-verification".into())
+            .spawn(move || run_verification_scheduler(supervisor, receiver, worker_queue))
+            .map_err(|_| WorkerError::VerificationQueueClosed)?;
+        Ok(Self {
+            sender: Mutex::new(Some(sender)),
+            queue,
+        })
+    }
+
+    fn submit(
+        &self,
+        request: VerifyArtifact,
+        cancellation: PermCancellation,
+        deadline: Instant,
+    ) -> Result<VerificationResult, WorkerError> {
+        if cancellation.is_cancelled() {
+            return Err(WorkerError::Cancelled);
+        }
+        let reply = Arc::new(VerificationReply::default());
+        let job = VerificationJob {
+            request,
+            cancellation: cancellation.clone(),
+            deadline,
+            reply: VerificationReplySender::new(Arc::clone(&reply)),
+        };
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or(WorkerError::VerificationQueueClosed)?;
+        let mut depth = self
+            .queue
+            .depth
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *depth >= VERIFICATION_QUEUE_CAPACITY {
+            return Err(WorkerError::VerificationQueueFull);
+        }
+        match sender.try_send(job) {
+            Ok(()) => {
+                *depth = depth.saturating_add(1);
+                drop(depth);
+                self.queue.changed.notify_waiters();
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                return Err(WorkerError::VerificationQueueFull);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(WorkerError::VerificationQueueClosed);
+            }
+        }
+        reply.wait(&cancellation)
+    }
+
+    #[cfg(test)]
+    fn queue_depth(&self) -> usize {
+        *self
+            .queue
+            .depth
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[cfg(test)]
+    async fn wait_for_queue_depth(&self, expected: usize) {
+        loop {
+            let changed = self.queue.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.queue_depth() == expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn close(&self) {
+        self.sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+}
+
+fn run_verification_scheduler(
+    supervisor: Weak<SupervisorInner>,
+    receiver: mpsc::Receiver<VerificationJob>,
+    queue: Arc<VerificationQueueObservation>,
+) {
+    while let Ok(job) = receiver.recv() {
+        if job.cancellation.is_cancelled() {
+            verification_dequeued(&queue);
+            job.reply.send(Err(WorkerError::Cancelled));
+            continue;
+        }
+        let Some(inner) = supervisor.upgrade() else {
+            verification_dequeued(&queue);
+            job.reply.send(Err(WorkerError::VerificationQueueClosed));
+            break;
+        };
+        let _verification_lease = match inner
+            .priority
+            .begin_verification(&job.cancellation, job.deadline)
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                verification_dequeued(&queue);
+                job.reply.send(Err(error));
+                continue;
+            }
+        };
+        verification_dequeued(&queue);
+        if job.cancellation.is_cancelled() {
+            job.reply.send(Err(WorkerError::Cancelled));
+            continue;
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                job.reply.send(Err(WorkerError::Transport));
+                continue;
+            }
+        };
+        let result = runtime.block_on(JsWorkerSupervisor(inner).invoke_scheduled_verification(
+            job.request,
+            job.cancellation,
+            job.deadline,
+        ));
+        job.reply.send(result);
+    }
+}
+
+fn verification_dequeued(queue: &VerificationQueueObservation) {
+    let mut depth = queue
+        .depth
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *depth = depth.saturating_sub(1);
+    drop(depth);
+    queue.changed.notify_waiters();
 }
 
 struct ActiveGeneration<'a> {
     value: &'a AtomicU64,
     armed: bool,
+}
+
+struct InvocationAuthority<'a, H: InvocationEffectHandler> {
+    handler: Option<&'a mut H>,
+    terminal: bool,
+}
+
+impl<'a, H: InvocationEffectHandler> InvocationAuthority<'a, H> {
+    fn new(handler: Option<&'a mut H>) -> Self {
+        Self {
+            handler,
+            terminal: false,
+        }
+    }
+
+    fn handler(&mut self) -> &mut Option<&'a mut H> {
+        &mut self.handler
+    }
+
+    fn finish(&mut self) {
+        if self.terminal {
+            return;
+        }
+        if let Some(handler) = self.handler.as_deref_mut() {
+            handler.finish_invocation();
+        }
+        self.terminal = true;
+    }
+
+    fn recycle(&mut self) {
+        if self.terminal {
+            return;
+        }
+        if let Some(handler) = self.handler.as_deref_mut() {
+            handler.recycle_invocation();
+        }
+        self.terminal = true;
+    }
+}
+
+impl<H: InvocationEffectHandler> Drop for InvocationAuthority<'_, H> {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.recycle();
+        }
+    }
 }
 
 impl Drop for ActiveGeneration<'_> {
@@ -435,6 +1148,95 @@ enum InvocationRequest {
 enum InvocationTerminal {
     Step(StepResult),
     Verification(VerificationResult),
+}
+
+fn terminal_is_reusable(terminal: &InvocationTerminal) -> bool {
+    match terminal {
+        InvocationTerminal::Step(result) => step_outcome_is_reusable(&result.outcome),
+        InvocationTerminal::Verification(result) => verification_result_is_reusable(result),
+    }
+}
+
+fn step_outcome_is_reusable(outcome: &StepOutcome) -> bool {
+    matches!(
+        outcome,
+        StepOutcome::Value(_)
+            | StepOutcome::Void
+            | StepOutcome::Error(
+                JsErrorCode::Syntax | JsErrorCode::Exception | JsErrorCode::InvalidResult
+            )
+    )
+}
+
+fn verification_result_is_reusable(result: &VerificationResult) -> bool {
+    result.cases.iter().all(|case| {
+        !case.diagnostic.as_ref().is_some_and(|diagnostic| {
+            matches!(
+                diagnostic.class,
+                DiagnosticClass::ResourceLimit | DiagnosticClass::Internal
+            )
+        })
+    })
+}
+
+fn store_idle_with_retirement(
+    inner: &Arc<SupervisorInner>,
+    state: &mut SupervisorState,
+    mut connection: WorkerConnection,
+) {
+    if connection.retirement.is_some() {
+        state.idle = Some(connection);
+        return;
+    }
+    let generation = connection.generation;
+    let retire_at = connection
+        .created_at
+        .checked_add(inner.reuse_policy.max_age)
+        .unwrap_or(connection.created_at);
+    let ticket = Arc::new(RetirementTicket::new());
+    let waiting_ticket = ticket.clone();
+    let weak = Arc::downgrade(inner);
+    connection.retirement = Some(ticket);
+    let retirement = std::thread::Builder::new()
+        .name(format!("mini-agent-js-idle-retire-{generation}"))
+        .spawn(move || retire_idle_generation(weak, generation, retire_at, waiting_ticket));
+    if retirement.is_ok() {
+        state.idle = Some(connection);
+    }
+}
+
+fn retire_idle_generation(
+    weak: Weak<SupervisorInner>,
+    generation: u64,
+    retire_at: Instant,
+    ticket: Arc<RetirementTicket>,
+) {
+    if !ticket.wait_until(retire_at) {
+        return;
+    }
+    let Some(inner) = weak.upgrade() else {
+        return;
+    };
+    let retired = {
+        let mut state = inner.transport.blocking_lock();
+        if state
+            .idle
+            .as_ref()
+            .is_some_and(|connection| connection.generation == generation)
+        {
+            state.idle.take()
+        } else {
+            None
+        }
+    };
+    let did_retire = retired.is_some();
+    drop(retired);
+    #[cfg(test)]
+    if did_retire {
+        inner.idle_retirement.notify_one();
+    }
+    #[cfg(not(test))]
+    let _ = did_retire;
 }
 
 struct RejectEffects;
@@ -471,6 +1273,9 @@ async fn launch_connection(
         process,
         protocol: ParentProtocol::new(build.clone()),
         stderr_drain,
+        created_at: Instant::now(),
+        completed_invocations: 0,
+        retirement: None,
     };
     let hello = WireFrame::connection(build, 0, ParentFrame::Hello(ParentHello {}));
     connection
@@ -489,7 +1294,7 @@ async fn launch_connection(
     connection
         .protocol
         .on_receive(&ready)
-        .map_err(|_| WorkerError::Protocol)?;
+        .map_err(map_protocol_error)?;
     if !matches!(ready.message, WorkerFrame::Ready(_)) {
         return Err(WorkerError::Protocol);
     }
@@ -607,7 +1412,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
     connection: &mut WorkerConnection,
     invocation: InvocationId,
     request: InvocationRequest,
-    effects: &mut Option<&mut H>,
+    authority: &mut InvocationAuthority<'_, H>,
     cancellation: &PermCancellation,
     deadline: Instant,
 ) -> Result<InvocationTerminal, WorkerError> {
@@ -633,11 +1438,11 @@ async fn run_invocation<H: InvocationEffectHandler>(
         connection
             .protocol
             .on_receive(&frame)
-            .map_err(|_| WorkerError::Protocol)?;
+            .map_err(map_protocol_error)?;
         connection.sequence = advance(connection.sequence)?;
         match frame.message {
             WorkerFrame::EffectRequest(request) => {
-                let Some(handler) = effects.as_deref_mut() else {
+                let Some(handler) = authority.handler().as_deref_mut() else {
                     return Err(WorkerError::UnexpectedVerificationEffect);
                 };
                 let effect_cancellation = PermCancellation::new();
@@ -662,6 +1467,16 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     }
                 };
                 cancel_on_drop.armed = false;
+                drop(effect);
+                let outcome_unknown = matches!(
+                    &result,
+                    EffectResult::Error(super::protocol::EffectError {
+                        code: EffectErrorCode::OutcomeUnknown,
+                    })
+                );
+                if outcome_unknown {
+                    authority.recycle();
+                }
                 let response = WireFrame::invocation(
                     connection.build.clone(),
                     invocation.clone(),
@@ -675,6 +1490,37 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     .protocol
                     .on_send(&response)
                     .map_err(|_| WorkerError::Protocol)?;
+                if outcome_unknown {
+                    // The durable effect outcome remains unknown even if the poisoned worker can
+                    // no longer receive its terminal response. Best-effort delivery closes the
+                    // worker state machine; the parent always returns the truthful effect error.
+                    let _ = write_parent(connection, response, cancellation, deadline).await;
+                    return Err(WorkerError::EffectOutcomeUnknown);
+                }
+                write_parent(connection, response, cancellation, deadline).await?;
+                connection.sequence = advance(connection.sequence)?;
+            }
+            #[cfg(feature = "skills")]
+            WorkerFrame::SkillCallRequest(request) => {
+                let Some(handler) = authority.handler().as_deref_mut() else {
+                    return Err(WorkerError::UnexpectedVerificationEffect);
+                };
+                if cancellation.is_cancelled() {
+                    return Err(WorkerError::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(WorkerError::TimedOut);
+                }
+                let response = WireFrame::invocation(
+                    connection.build.clone(),
+                    invocation.clone(),
+                    connection.sequence,
+                    ParentFrame::SkillCallResponse(handler.handle_skill_call(request)),
+                );
+                connection
+                    .protocol
+                    .on_send(&response)
+                    .map_err(|_| WorkerError::Protocol)?;
                 write_parent(connection, response, cancellation, deadline).await?;
                 connection.sequence = advance(connection.sequence)?;
             }
@@ -682,7 +1528,15 @@ async fn run_invocation<H: InvocationEffectHandler>(
             WorkerFrame::VerificationResult(result) => {
                 return Ok(InvocationTerminal::Verification(result));
             }
-            WorkerFrame::ProtocolFault(_) => return Err(WorkerError::Protocol),
+            WorkerFrame::ProtocolFault(fault) => {
+                return Err(
+                    if fault.code == super::protocol::ProtocolFaultCode::BuildMismatch {
+                        WorkerError::BuildMismatch
+                    } else {
+                        WorkerError::Protocol
+                    },
+                );
+            }
             WorkerFrame::Ready(_) => return Err(WorkerError::Protocol),
         }
     }
@@ -709,7 +1563,7 @@ async fn write_parent(
         .await?
         .map_err(|_| WorkerError::Transport)?;
     validate_generation(connection.generation, tagged.generation)?;
-    tagged.result.map_err(|_| WorkerError::Transport)
+    tagged.result.map_err(map_frame_error)
 }
 
 async fn read_worker(
@@ -752,7 +1606,7 @@ async fn read_worker(
     {
         return Err(WorkerError::Transport);
     }
-    tagged.result.map_err(|_| WorkerError::Transport)
+    tagged.result.map_err(map_frame_error)
 }
 
 struct TaggedIo<T> {
@@ -857,6 +1711,26 @@ fn map_launch_error(error: WorkerLaunchError) -> WorkerError {
     match error {
         WorkerLaunchError::Unavailable { .. } => WorkerError::ContainmentUnavailable,
         WorkerLaunchError::Io { .. } | WorkerLaunchError::MissingPipe { .. } => WorkerError::Launch,
+    }
+}
+
+fn map_protocol_error(error: super::protocol::ProtocolError) -> WorkerError {
+    match error {
+        super::protocol::ProtocolError::BuildMismatch { .. }
+        | super::protocol::ProtocolError::VersionMismatch { .. } => WorkerError::BuildMismatch,
+        _ => WorkerError::Protocol,
+    }
+}
+
+fn map_frame_error(error: FrameError) -> WorkerError {
+    match error {
+        FrameError::Io(_)
+        | FrameError::TruncatedHeader { .. }
+        | FrameError::TruncatedBody { .. } => WorkerError::Transport,
+        FrameError::ZeroLength
+        | FrameError::FrameTooLarge { .. }
+        | FrameError::InvalidJson
+        | FrameError::Serialization => WorkerError::Protocol,
     }
 }
 

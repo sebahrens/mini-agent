@@ -5,7 +5,6 @@
 //! terminal frame is written. The only global installed here is a bounded `console`; authority
 //! globals and module loaders are deliberately absent.
 
-use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -27,11 +26,18 @@ use super::protocol::{
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
+#[cfg(feature = "skills")]
+use super::protocol::{
+    MAX_SKILL_ARTIFACTS_PER_STEP, MAX_SKILL_CALLS_PER_STEP, MAX_SKILL_CAPABILITY_GRANTS_PER_STEP,
+    MAX_SKILL_EXPORTS_PER_ARTIFACT, SkillCallRequest, SkillCallResponse, SkillInvocationGrant,
+};
 use super::types::{
     MEMORY_LIMIT, READ_FILE_MAX_BYTES, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
 };
 #[cfg(feature = "skills")]
-use crate::extras::js::skills::capability::InvocationCapabilityRuntime;
+use crate::extras::js::skills::capability::{InvocationAuthorization, InvocationCapabilityRuntime};
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::telemetry::{SkillEvent, SkillEventKind, stable_invocation_id};
 use crate::sandbox::worker::{
     INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, finalize_internal_worker,
     is_internal_worker_marker_present, standard_streams_are_protocol_pipes,
@@ -59,6 +65,142 @@ const FETCH_REQUEST_HEADER_MAX_BYTES: usize = 16 * 1024;
 const FETCH_REQUEST_BODY_MAX_BYTES: usize = 256 * 1024;
 
 type ModelEffectDispatcher = Rc<dyn Fn(EffectOperation) -> EffectResult>;
+type WorkerEffectDispatcher = Arc<
+    dyn Fn(super::protocol::GrantId, AdvisoryAttribution, EffectOperation) -> EffectResult
+        + Send
+        + Sync,
+>;
+#[cfg(feature = "skills")]
+type WorkerSkillCallAuthorizer =
+    Arc<dyn Fn(String, String, u32) -> Result<SkillInvocationGrant, ()> + Send + Sync>;
+
+#[cfg(feature = "skills")]
+#[derive(Clone)]
+struct WorkerEventMetadata {
+    skill_id: String,
+    export_name: String,
+    turn_id: String,
+    tool_call_id: String,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Default)]
+struct WorkerEventState {
+    events: Vec<SkillEvent>,
+    pending: std::collections::HashMap<String, (WorkerEventMetadata, Instant)>,
+}
+
+#[cfg(feature = "skills")]
+impl WorkerEventState {
+    fn injected(&mut self, skill_id: String, turn_id: String, tool_call_id: String) {
+        self.events.push(worker_event(
+            skill_id,
+            turn_id,
+            tool_call_id,
+            None,
+            None,
+            SkillEventKind::Injected,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    fn start(&mut self, id: String, metadata: WorkerEventMetadata, shape: String) {
+        self.pending
+            .insert(id.clone(), (metadata.clone(), Instant::now()));
+        self.events.push(worker_event(
+            metadata.skill_id,
+            metadata.turn_id,
+            metadata.tool_call_id,
+            Some(id),
+            Some(metadata.export_name),
+            SkillEventKind::Invoked,
+            None,
+            None,
+            Some(shape),
+        ));
+    }
+
+    fn terminal(&mut self, id: &str, success: bool) {
+        let Some((metadata, started)) = self.pending.remove(id) else {
+            return;
+        };
+        self.events.push(worker_event(
+            metadata.skill_id,
+            metadata.turn_id,
+            metadata.tool_call_id,
+            Some(id.to_string()),
+            Some(metadata.export_name),
+            if success {
+                SkillEventKind::Returned
+            } else {
+                SkillEventKind::Threw
+            },
+            Some(if success { "fulfilled" } else { "exception" }.into()),
+            Some(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64),
+            None,
+        ));
+    }
+
+    fn finalize_pending(&mut self, outcome: &StepOutcome) {
+        let pending = self.pending.keys().cloned().collect::<Vec<_>>();
+        for id in pending {
+            let Some((metadata, started)) = self.pending.remove(&id) else {
+                continue;
+            };
+            let (kind, code) = match outcome {
+                StepOutcome::Timeout => (SkillEventKind::TimedOut, "step_timeout"),
+                StepOutcome::OutOfMemory => (SkillEventKind::Oom, "step_oom"),
+                _ => (SkillEventKind::Threw, "step_failed"),
+            };
+            self.events.push(worker_event(
+                metadata.skill_id,
+                metadata.turn_id,
+                metadata.tool_call_id,
+                Some(id),
+                Some(metadata.export_name),
+                kind,
+                Some(code.into()),
+                Some(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64),
+                None,
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
+fn worker_event(
+    skill_id: String,
+    turn_id: String,
+    tool_call_id: String,
+    invocation_id: Option<String>,
+    export_name: Option<String>,
+    kind: SkillEventKind,
+    outcome: Option<String>,
+    latency_us: Option<u64>,
+    argument_shape: Option<String>,
+) -> SkillEvent {
+    SkillEvent {
+        invocation_id,
+        skill_id,
+        turn_id,
+        tool_call_id: Some(tool_call_id),
+        kind,
+        export_name,
+        outcome,
+        latency_us,
+        retrieval_score: None,
+        retrieval_rank: None,
+        query_fingerprint: None,
+        index_generation: 0,
+        evidence_complete: false,
+        production: false,
+        argument_shape,
+        created_at: 0,
+    }
+}
 
 struct WorkerSpawnResult {
     stdout: String,
@@ -178,6 +320,38 @@ fn install_model_effect_globals(
         #[cfg(feature = "sandbox")]
         ctx.globals().set("fetch", fetch)?;
         Ok(())
+    })
+}
+
+#[cfg(feature = "skills")]
+fn install_proposal_global(
+    context: &Context,
+    effects: ModelEffectDispatcher,
+) -> rquickjs::Result<()> {
+    context.with(|ctx| {
+        let propose_skill = Function::new(ctx.clone(), move |draft: Object<'_>| {
+            let proposal = super::skills::proposal::JsProposal::from_object(&draft)
+                .map_err(|_| effect_error("propose_skill", EffectErrorCode::InvalidTarget))?;
+            match effects(EffectOperation::ProposeSkill {
+                draft: proposal.into(),
+            }) {
+                EffectResult::ProposalAccepted {
+                    skill_id,
+                    proposal_id,
+                    status,
+                    report_id,
+                } => serde_json::to_string(&serde_json::json!({
+                    "id": skill_id,
+                    "proposal_id": proposal_id,
+                    "status": status.as_str(),
+                    "report_id": report_id,
+                }))
+                .map_err(|_| effect_error("propose_skill", EffectErrorCode::BackendFailure)),
+                EffectResult::Error(error) => Err(effect_error("propose_skill", error.code)),
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+        ctx.globals().set("propose_skill", propose_skill)
     })
 }
 
@@ -693,7 +867,7 @@ fn run_marked_worker() -> i32 {
     }
 }
 
-fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
+fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
     mut input: R,
     mut output: W,
 ) -> Result<(), ()> {
@@ -714,7 +888,7 @@ fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
     protocol.on_send(&ready).map_err(|_| ())?;
     write_terminal(&mut output, &ready)?;
 
-    let transport = Rc::new(RefCell::new(WorkerTransport {
+    let transport = Arc::new(Mutex::new(WorkerTransport {
         input,
         output,
         protocol,
@@ -722,7 +896,7 @@ fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
 
     loop {
         let request: ParentWireFrame = {
-            let mut transport = transport.borrow_mut();
+            let mut transport = transport.lock().map_err(|_| ())?;
             let request = read_frame(&mut transport.input).map_err(|_| ())?;
             transport.protocol.on_receive(&request).map_err(|_| ())?;
             request
@@ -747,6 +921,8 @@ fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
             }
             ParentFrame::Shutdown => return Ok(()),
             ParentFrame::Hello(_) | ParentFrame::EffectResponse(_) => return Err(()),
+            #[cfg(feature = "skills")]
+            ParentFrame::SkillCallResponse(_) => return Err(()),
         };
         let response = WireFrame {
             protocol_version: super::protocol::PROTOCOL_VERSION,
@@ -755,7 +931,7 @@ fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
             sequence,
             message,
         };
-        let mut transport = transport.borrow_mut();
+        let mut transport = transport.lock().map_err(|_| ())?;
         transport.protocol.on_send(&response).map_err(|_| ())?;
         write_terminal(&mut transport.output, &response)?;
     }
@@ -766,56 +942,117 @@ fn write_terminal(output: &mut impl Write, frame: &WorkerWireFrame) -> Result<()
     output.flush().map_err(|_| ())
 }
 
-fn execute_brokered_run_step<R: std::io::Read + 'static, W: Write + 'static>(
+fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
     request: RunStep,
     limits: ExecutionLimits,
-    transport: Rc<RefCell<WorkerTransport<R, W>>>,
+    transport: Arc<Mutex<WorkerTransport<R, W>>>,
     build: BuildIdentity,
     invocation_id: super::protocol::InvocationId,
     sequence: u64,
 ) -> Result<(StepResult, u64), ()> {
-    let grant_id = request.model_grant_id.clone();
-    let ordinal = Rc::new(Cell::new(0_u32));
-    let sequence = Rc::new(Cell::new(sequence));
-    let protocol_failed = Rc::new(Cell::new(false));
-    let dispatcher = grant_id.map(|grant_id| {
+    let model_grant_id = request.model_grant_id.clone();
+    let ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    #[cfg(feature = "skills")]
+    let skill_request_ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sequence = Arc::new(Mutex::new(sequence));
+    let protocol_failed = Arc::new(AtomicBool::new(false));
+    let wire_dispatcher: WorkerEffectDispatcher = {
+        let effect_build = build.clone();
+        let effect_invocation_id = invocation_id.clone();
         let ordinal = ordinal.clone();
         let sequence = sequence.clone();
         let protocol_failed = protocol_failed.clone();
         let transport = transport.clone();
-        Rc::new(move |operation: EffectOperation| {
-            if protocol_failed.get() {
+        Arc::new(move |grant_id, advisory, operation| {
+            if protocol_failed.load(Ordering::Acquire) {
                 return backend_failure();
             }
-            let effect_ordinal = ordinal.get();
-            let Some(next_ordinal) = effect_ordinal.checked_add(1) else {
-                protocol_failed.set(true);
+            let effect_ordinal = ordinal.fetch_add(1, Ordering::AcqRel);
+            if effect_ordinal >= super::protocol::MAX_EFFECTS_PER_STEP {
+                protocol_failed.store(true, Ordering::Release);
                 return backend_failure();
-            };
-            ordinal.set(next_ordinal);
+            }
             let request = EffectRequest {
                 effect_ordinal,
-                grant_id: grant_id.clone(),
-                advisory: AdvisoryAttribution::default(),
+                grant_id,
+                advisory,
                 operation,
             };
-            match transport
-                .borrow_mut()
-                .round_trip(request, &build, &invocation_id, &sequence)
-            {
-                Ok(result) => result,
+            let result = transport.lock().map_err(|_| ()).and_then(|mut transport| {
+                transport.round_trip(request, &effect_build, &effect_invocation_id, &sequence)
+            });
+            match result {
+                Ok(result) => {
+                    if matches!(
+                        &result,
+                        EffectResult::Error(super::protocol::EffectError {
+                            code: EffectErrorCode::OutcomeUnknown,
+                        })
+                    ) {
+                        protocol_failed.store(true, Ordering::Release);
+                    }
+                    result
+                }
                 Err(()) => {
-                    protocol_failed.set(true);
+                    protocol_failed.store(true, Ordering::Release);
                     backend_failure()
                 }
             }
+        })
+    };
+    let model_dispatcher = model_grant_id.map(|grant_id| {
+        let dispatcher = wire_dispatcher.clone();
+        Rc::new(move |operation| {
+            dispatcher(grant_id.clone(), AdvisoryAttribution::default(), operation)
         }) as ModelEffectDispatcher
     });
-    let terminal = execute_run_step(request, limits, dispatcher);
-    if protocol_failed.get() {
+    #[cfg(feature = "skills")]
+    let skill_call_authorizer = {
+        let skill_request_ordinal = skill_request_ordinal.clone();
+        let sequence = sequence.clone();
+        let protocol_failed = protocol_failed.clone();
+        let transport = transport.clone();
+        let build = build.clone();
+        let invocation_id = invocation_id.clone();
+        Arc::new(
+            move |artifact_id: String, export_name: String, call_ordinal: u32| {
+                if protocol_failed.load(Ordering::Acquire) {
+                    return Err(());
+                }
+                let request_ordinal = skill_request_ordinal.fetch_add(1, Ordering::AcqRel);
+                if request_ordinal >= MAX_SKILL_CALLS_PER_STEP {
+                    protocol_failed.store(true, Ordering::Release);
+                    return Err(());
+                }
+                let request = SkillCallRequest {
+                    request_ordinal,
+                    artifact_id,
+                    export_name,
+                    call_ordinal,
+                };
+                let result = transport.lock().map_err(|_| ()).and_then(|mut transport| {
+                    transport.skill_call_round_trip(request, &build, &invocation_id, &sequence)
+                });
+                if result.is_err() {
+                    protocol_failed.store(true, Ordering::Release);
+                }
+                result
+            },
+        )
+            as Arc<dyn Fn(String, String, u32) -> Result<SkillInvocationGrant, ()> + Send + Sync>
+    };
+    let terminal = execute_run_step(
+        request,
+        limits,
+        model_dispatcher,
+        wire_dispatcher,
+        #[cfg(feature = "skills")]
+        skill_call_authorizer,
+    );
+    if protocol_failed.load(Ordering::Acquire) {
         Err(())
     } else {
-        Ok((terminal, sequence.get()))
+        Ok((terminal, *sequence.lock().map_err(|_| ())?))
     }
 }
 
@@ -831,25 +1068,66 @@ impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
         request: EffectRequest,
         build: &BuildIdentity,
         invocation_id: &super::protocol::InvocationId,
-        sequence: &Cell<u64>,
+        sequence: &Mutex<u64>,
     ) -> Result<EffectResult, ()> {
         let frame = WireFrame::invocation(
             build.clone(),
             invocation_id.clone(),
-            sequence.get(),
+            *sequence.lock().map_err(|_| ())?,
             WorkerFrame::EffectRequest(request.clone()),
         );
         self.protocol.on_send(&frame).map_err(|_| ())?;
         write_terminal(&mut self.output, &frame)?;
-        sequence.set(sequence.get().checked_add(1).ok_or(())?);
+        {
+            let mut sequence = sequence.lock().map_err(|_| ())?;
+            *sequence = sequence.checked_add(1).ok_or(())?;
+        }
         let response: ParentWireFrame = read_frame(&mut self.input).map_err(|_| ())?;
         self.protocol.on_receive(&response).map_err(|_| ())?;
-        sequence.set(sequence.get().checked_add(1).ok_or(())?);
+        {
+            let mut sequence = sequence.lock().map_err(|_| ())?;
+            *sequence = sequence.checked_add(1).ok_or(())?;
+        }
         match response.message {
             ParentFrame::EffectResponse(EffectResponse {
                 effect_ordinal,
                 result,
             }) if effect_ordinal == request.effect_ordinal => Ok(result),
+            _ => Err(()),
+        }
+    }
+
+    #[cfg(feature = "skills")]
+    fn skill_call_round_trip(
+        &mut self,
+        request: SkillCallRequest,
+        build: &BuildIdentity,
+        invocation_id: &super::protocol::InvocationId,
+        sequence: &Mutex<u64>,
+    ) -> Result<SkillInvocationGrant, ()> {
+        let frame = WireFrame::invocation(
+            build.clone(),
+            invocation_id.clone(),
+            *sequence.lock().map_err(|_| ())?,
+            WorkerFrame::SkillCallRequest(request.clone()),
+        );
+        self.protocol.on_send(&frame).map_err(|_| ())?;
+        write_terminal(&mut self.output, &frame)?;
+        {
+            let mut sequence = sequence.lock().map_err(|_| ())?;
+            *sequence = sequence.checked_add(1).ok_or(())?;
+        }
+        let response: ParentWireFrame = read_frame(&mut self.input).map_err(|_| ())?;
+        self.protocol.on_receive(&response).map_err(|_| ())?;
+        {
+            let mut sequence = sequence.lock().map_err(|_| ())?;
+            *sequence = sequence.checked_add(1).ok_or(())?;
+        }
+        match response.message {
+            ParentFrame::SkillCallResponse(SkillCallResponse {
+                request_ordinal,
+                authorization: Some(authorization),
+            }) if request_ordinal == request.request_ordinal => Ok(authorization),
             _ => Err(()),
         }
     }
@@ -861,14 +1139,274 @@ fn backend_failure() -> EffectResult {
     })
 }
 
+#[cfg(feature = "skills")]
+fn prepare_bound_exports(
+    request: &RunStep,
+    capabilities: &InvocationCapabilityRuntime,
+    events: Arc<Mutex<WorkerEventState>>,
+    authorize_call: WorkerSkillCallAuthorizer,
+) -> Result<
+    std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, super::realm::BoundExportInvocation>,
+    >,
+    (),
+> {
+    use std::collections::{HashMap, HashSet};
+
+    validate_skill_authority_bounds(request)?;
+    if request.artifacts.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if request.turn_id.is_empty() || request.tool_call_id.is_empty() {
+        return Err(());
+    }
+    let mut prepared = HashMap::new();
+    let mut seen_artifacts = HashSet::new();
+    for artifact in &request.artifacts {
+        if !seen_artifacts.insert(artifact.id.clone()) {
+            return Err(());
+        }
+        let mut exports = HashMap::new();
+        for export in &artifact.exports {
+            let metadata = WorkerEventMetadata {
+                skill_id: artifact.id.clone(),
+                export_name: export.name.clone(),
+                turn_id: request.turn_id.clone(),
+                tool_call_id: request.tool_call_id.clone(),
+            };
+            let call_authorizer = authorize_call.clone();
+            let call_capabilities = capabilities.clone();
+            let call_manifest = artifact.capability.clone();
+            let call_artifact_id = artifact.id.clone();
+            let call_export_name = export.name.clone();
+            let call_turn_id = request.turn_id.clone();
+            let call_tool_call_id = request.tool_call_id.clone();
+            let authorize = Arc::new(move |call_ordinal: u32| {
+                let issued = call_authorizer(
+                    call_artifact_id.clone(),
+                    call_export_name.clone(),
+                    call_ordinal,
+                )?;
+                let expected_invocation = stable_invocation_id(
+                    &call_turn_id,
+                    &call_tool_call_id,
+                    &call_artifact_id,
+                    &call_export_name,
+                    call_ordinal,
+                );
+                if issued.artifact_id != call_artifact_id
+                    || issued.export_name != call_export_name
+                    || issued.invocation_id.as_str() != expected_invocation
+                {
+                    return Err(());
+                }
+                let authorization = InvocationAuthorization::new(
+                    issued.invocation_id,
+                    call_artifact_id.clone(),
+                    call_export_name.clone(),
+                    call_manifest.clone(),
+                    issued
+                        .grants
+                        .into_iter()
+                        .map(|grant| (grant.capability, grant.grant_id)),
+                )
+                .map_err(|_| ())?;
+                let invocation_id = expected_invocation;
+                let handle = call_capabilities.prepare(authorization).map_err(|_| ())?;
+                Ok((handle, invocation_id))
+            });
+            let start_events = events.clone();
+            let start_metadata = metadata.clone();
+            let on_start = Arc::new(move |id: String, shape: String| {
+                let shape = if shape.len()
+                    <= crate::extras::js::skills::telemetry::MAX_ARGUMENT_SHAPE_BYTES
+                {
+                    shape
+                } else {
+                    r#"{"truncated":true}"#.to_string()
+                };
+                start_events.lock().map_err(|_| ())?.start(
+                    id.clone(),
+                    start_metadata.clone(),
+                    shape,
+                );
+                Ok(())
+            });
+            let terminal_events = events.clone();
+            let on_terminal = Arc::new(move |invocation_id: String, success: bool| {
+                terminal_events
+                    .lock()
+                    .map_err(|_| ())?
+                    .terminal(&invocation_id, success);
+                Ok(())
+            });
+            exports.insert(
+                export.name.clone(),
+                super::realm::BoundExportInvocation {
+                    authorize,
+                    on_start,
+                    on_terminal,
+                },
+            );
+        }
+        prepared.insert(artifact.id.clone(), exports);
+    }
+    Ok(prepared)
+}
+
+#[cfg(feature = "skills")]
+fn validate_skill_authority_bounds(request: &RunStep) -> Result<(), ()> {
+    if request.artifacts.len() > MAX_SKILL_ARTIFACTS_PER_STEP {
+        return Err(());
+    }
+    let mut expected_grants = 0_usize;
+    for artifact in &request.artifacts {
+        if artifact.exports.len() > MAX_SKILL_EXPORTS_PER_ARTIFACT {
+            return Err(());
+        }
+        expected_grants = expected_grants
+            .checked_add(
+                artifact
+                    .exports
+                    .len()
+                    .checked_mul(artifact.capability.grants.len())
+                    .ok_or(())?,
+            )
+            .ok_or(())?;
+        if expected_grants > MAX_SKILL_CAPABILITY_GRANTS_PER_STEP {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "skills"))]
+mod skill_authority_bound_tests {
+    use super::*;
+    use crate::extras::js::skills::{
+        CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
+    };
+
+    fn artifact(export_count: usize, capability: CapabilityManifest) -> SkillArtifact {
+        SkillArtifact::new(
+            "function unused() { return 0; }".into(),
+            "worker cardinality fixture".into(),
+            vec![],
+            (0..export_count)
+                .map(|index| SkillExport {
+                    name: format!("export_{index}"),
+                    signature: format!("export_{index}()"),
+                })
+                .collect(),
+            vec!["true".into()],
+            capability,
+        )
+        .unwrap()
+    }
+
+    fn step(artifacts: Vec<SkillArtifact>) -> RunStep {
+        RunStep::new("1".into()).with_skills(
+            artifacts,
+            "bounded-worker-turn".into(),
+            "bounded-worker-call".into(),
+        )
+    }
+
+    #[test]
+    fn worker_rejects_artifact_export_and_total_grant_overflow_before_preparation() {
+        let pure = artifact(1, CapabilityManifest::pure());
+        assert!(
+            validate_skill_authority_bounds(&step(vec![pure; MAX_SKILL_ARTIFACTS_PER_STEP + 1]))
+                .is_err()
+        );
+
+        let too_many_exports = artifact(
+            MAX_SKILL_EXPORTS_PER_ARTIFACT + 1,
+            CapabilityManifest::pure(),
+        );
+        assert!(validate_skill_authority_bounds(&step(vec![too_many_exports])).is_err());
+
+        let four_grants = CapabilityManifest::new(
+            CapabilityTier::SideEffecting,
+            vec![
+                CapabilityScope::ReadFile {
+                    workspace_prefixes: vec!["Cargo.toml".into()],
+                },
+                CapabilityScope::WriteFile {
+                    workspace_prefixes: vec!["target".into()],
+                },
+                CapabilityScope::Fetch {
+                    origins: vec!["https://example.test".into()],
+                    methods: vec![crate::extras::js::skills::HttpMethod::Get],
+                },
+                CapabilityScope::Spawn {
+                    programs: vec!["printf".into()],
+                },
+            ],
+        )
+        .unwrap();
+        let grant_heavy = artifact(MAX_SKILL_EXPORTS_PER_ARTIFACT, four_grants);
+        let artifact_count =
+            MAX_SKILL_CAPABILITY_GRANTS_PER_STEP / (MAX_SKILL_EXPORTS_PER_ARTIFACT * 4) + 1;
+        assert!(validate_skill_authority_bounds(&step(vec![grant_heavy; artifact_count])).is_err());
+    }
+}
+
 fn execute_run_step(
     request: RunStep,
     limits: ExecutionLimits,
     effects: Option<ModelEffectDispatcher>,
+    _wire_effects: WorkerEffectDispatcher,
+    #[cfg(feature = "skills")] authorize_skill_call: WorkerSkillCallAuthorizer,
 ) -> StepResult {
-    #[cfg(feature = "skills")]
-    let has_selected_skills = !request.artifacts.is_empty();
     let console = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(feature = "skills")]
+    let event_state = Arc::new(Mutex::new(WorkerEventState::default()));
+    #[cfg(feature = "skills")]
+    let capability_runtime = {
+        let effects = _wire_effects.clone();
+        InvocationCapabilityRuntime::new(move |effect| {
+            Ok(effects(
+                effect.request.grant_id,
+                effect.request.advisory,
+                effect.request.operation,
+            ))
+        })
+    };
+    #[cfg(feature = "skills")]
+    let _capability_lifecycle = WorkerCapabilityLifecycle::new(capability_runtime.clone());
+    #[cfg(feature = "skills")]
+    let bindings = match prepare_bound_exports(
+        &request,
+        &capability_runtime,
+        event_state.clone(),
+        authorize_skill_call,
+    ) {
+        Ok(bindings) => bindings,
+        Err(()) => {
+            return StepResult {
+                outcome: StepOutcome::Error(JsErrorCode::Internal),
+                console: Vec::new(),
+                diagnostic: Some(Diagnostic {
+                    class: DiagnosticClass::Internal,
+                    stage: DiagnosticStage::Initialization,
+                    script_role: ScriptRole::SkillSource,
+                    line: None,
+                    column: None,
+                }),
+                skill_events: Vec::new(),
+                evidence_complete: false,
+            };
+        }
+    };
+    #[cfg(feature = "skills")]
+    let proposal_effects = request.proposal_grant_id.clone().map(|grant_id| {
+        let effects = _wire_effects;
+        Rc::new(move |operation| {
+            effects(grant_id.clone(), AdvisoryAttribution::default(), operation)
+        }) as ModelEffectDispatcher
+    });
     let execution = execute_fresh_step(
         &request.code,
         ScriptRole::Model,
@@ -876,30 +1414,57 @@ fn execute_run_step(
         console.clone(),
         effects,
         #[cfg(feature = "skills")]
+        proposal_effects,
+        #[cfg(feature = "skills")]
         &request.artifacts,
+        #[cfg(feature = "skills")]
+        &bindings,
+        #[cfg(feature = "skills")]
+        &capability_runtime,
+        #[cfg(feature = "skills")]
+        event_state.clone(),
+        #[cfg(feature = "skills")]
+        &request.turn_id,
+        #[cfg(feature = "skills")]
+        &request.tool_call_id,
     );
     let console = console
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    #[cfg(feature = "skills")]
+    {
+        let outcome = match &execution {
+            Ok(outcome) => outcome,
+            Err(failure) => &failure.outcome,
+        };
+        if let Ok(mut state) = event_state.lock() {
+            state.finalize_pending(outcome);
+        }
+    }
+    #[cfg(feature = "skills")]
+    let skill_events = event_state
+        .lock()
+        .map(|state| state.events.clone())
+        .unwrap_or_default();
     match execution {
         Ok(outcome) => StepResult {
             outcome,
             console,
             diagnostic: None,
             #[cfg(feature = "skills")]
-            skill_events: Vec::new(),
+            skill_events,
             #[cfg(feature = "skills")]
-            evidence_complete: !has_selected_skills,
+            evidence_complete: true,
         },
         Err(failure) => StepResult {
             outcome: failure.outcome,
             console,
             diagnostic: Some(failure.diagnostic),
             #[cfg(feature = "skills")]
-            skill_events: Vec::new(),
+            skill_events,
             #[cfg(feature = "skills")]
-            evidence_complete: !has_selected_skills,
+            evidence_complete: true,
         },
     }
 }
@@ -910,7 +1475,16 @@ fn execute_fresh_step(
     limits: ExecutionLimits,
     console: Arc<Mutex<Vec<ConsoleRecord>>>,
     effects: Option<ModelEffectDispatcher>,
+    #[cfg(feature = "skills")] proposal_effects: Option<ModelEffectDispatcher>,
     #[cfg(feature = "skills")] artifacts: &[super::skills::SkillArtifact],
+    #[cfg(feature = "skills")] bindings: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, super::realm::BoundExportInvocation>,
+    >,
+    #[cfg(feature = "skills")] capability_runtime: &InvocationCapabilityRuntime,
+    #[cfg(feature = "skills")] event_state: Arc<Mutex<WorkerEventState>>,
+    #[cfg(feature = "skills")] turn_id: &str,
+    #[cfg(feature = "skills")] tool_call_id: &str,
 ) -> Result<StepOutcome, ClosedFailure> {
     let runtime = Runtime::new().map_err(|error| initialization_failure(error, role))?;
     runtime.set_memory_limit(MEMORY_LIMIT);
@@ -939,6 +1513,19 @@ fn execute_fresh_step(
     })?;
     if let Some(effects) = effects {
         install_model_effect_globals(&context, effects).map_err(|error| {
+            classify_error(
+                &context,
+                error,
+                deadline,
+                &interrupted,
+                DiagnosticStage::Initialization,
+                role,
+            )
+        })?;
+    }
+    #[cfg(feature = "skills")]
+    if let Some(proposal_effects) = proposal_effects {
+        install_proposal_global(&context, proposal_effects).map_err(|error| {
             classify_error(
                 &context,
                 error,
@@ -980,14 +1567,45 @@ fn execute_fresh_step(
             )
         })?;
     #[cfg(feature = "skills")]
+    let mut loaded_artifacts = Vec::with_capacity(artifacts.len());
+    #[cfg(feature = "skills")]
     for artifact in artifacts {
-        super::realm::load_artifact(&runtime, &context, artifact).map_err(|_| {
+        let artifact_bindings = bindings.get(&artifact.id).cloned().ok_or_else(|| {
             ClosedFailure::error(
                 JsErrorCode::Internal,
                 DiagnosticStage::Initialization,
                 ScriptRole::SkillSource,
             )
         })?;
+        let loaded = super::realm::load_artifact_with_bound_exports(
+            &runtime,
+            &context,
+            artifact,
+            capability_runtime.clone(),
+            artifact_bindings,
+        )
+        .map_err(|_| {
+            ClosedFailure::error(
+                JsErrorCode::Internal,
+                DiagnosticStage::Initialization,
+                ScriptRole::SkillSource,
+            )
+        })?;
+        loaded_artifacts.push(loaded);
+        event_state
+            .lock()
+            .map_err(|_| {
+                ClosedFailure::error(
+                    JsErrorCode::Internal,
+                    DiagnosticStage::Initialization,
+                    ScriptRole::SkillSource,
+                )
+            })?
+            .injected(
+                artifact.id.clone(),
+                turn_id.to_string(),
+                tool_call_id.to_string(),
+            );
     }
     let value = evaluate(&context, source, &runtime, deadline, &interrupted, role)?;
     let mut remaining_jobs = limits.max_pending_jobs;
@@ -1390,6 +2008,592 @@ fn runtime_is_near_heap_limit(runtime: &Runtime) -> bool {
     usage.malloc_size >= (MEMORY_LIMIT.saturating_sub(1024 * 1024)) as i64
 }
 
+#[cfg(feature = "skills")]
+fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> VerificationResult {
+    if request.cases.is_empty()
+        || request.cases.len() > MAX_VERIFICATION_CASES
+        || request.cases.iter().any(|case| {
+            case.case_id.is_empty()
+                || case.case_id.len() > MAX_VERIFICATION_CASE_ID_BYTES
+                || case.script.len() > MAX_RESULT_BYTES
+        })
+    {
+        return VerificationResult {
+            passed: false,
+            cases: Vec::new(),
+            loader_version: VERIFICATION_LOADER_VERSION,
+        };
+    }
+    let runtime = match Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(_) => return failed_skill_verification(&request, DiagnosticClass::Internal),
+    };
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let deadline = Instant::now() + limits.timeout;
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupt_flag = interrupted.clone();
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        let expired = Instant::now() >= deadline;
+        if expired {
+            interrupt_flag.store(true, Ordering::Relaxed);
+        }
+        expired
+    })));
+
+    let mut results = Vec::with_capacity(request.cases.len());
+    let transcript_budget = super::skills::fakes::VerificationTranscriptBudget::new();
+    let mut transcript_calls_remaining = super::skills::fakes::VERIFICATION_TRANSCRIPT_MAX_CALLS;
+    let mut terminal = None;
+    for (case_index, case) in request.cases.iter().enumerate() {
+        if let Some(diagnostic) = terminal.clone() {
+            results.push(failed_case(case.case_id.clone(), diagnostic));
+            continue;
+        }
+        if runtime.is_job_pending() {
+            let diagnostic = diagnostic(
+                DiagnosticClass::Contract,
+                DiagnosticStage::JobDrain,
+                verification_case_role(&case.kind),
+            );
+            terminal = Some(diagnostic.clone());
+            results.push(failed_case(case.case_id.clone(), diagnostic));
+            continue;
+        }
+        let mut result = execute_isolated_skill_verification_case(
+            &runtime,
+            &request.artifact,
+            case,
+            case_index,
+            deadline,
+            &interrupted,
+            limits.max_pending_jobs,
+            transcript_budget.clone(),
+        );
+        if transcript_budget.exceeded() {
+            let limit_diagnostic = diagnostic(
+                DiagnosticClass::Contract,
+                DiagnosticStage::Verification,
+                verification_case_role(&case.kind),
+            );
+            result = failed_case(case.case_id.clone(), limit_diagnostic.clone());
+            terminal = Some(limit_diagnostic);
+        }
+        if result.transcript.call_count() > transcript_calls_remaining {
+            if result.passed {
+                result = failed_case(
+                    case.case_id.clone(),
+                    diagnostic(
+                        DiagnosticClass::Contract,
+                        DiagnosticStage::Verification,
+                        verification_case_role(&case.kind),
+                    ),
+                );
+            }
+            result
+                .transcript
+                .limit_call_count(&mut transcript_calls_remaining);
+        } else {
+            transcript_calls_remaining -= result.transcript.call_count();
+        }
+        if result.diagnostic.as_ref().is_some_and(|diagnostic| {
+            diagnostic.class == DiagnosticClass::ResourceLimit
+                || diagnostic.stage == DiagnosticStage::JobDrain
+        }) {
+            terminal = result.diagnostic.clone();
+        }
+        results.push(result);
+    }
+    VerificationResult {
+        passed: results.iter().all(|case| case.passed),
+        cases: results,
+        loader_version: VERIFICATION_LOADER_VERSION,
+    }
+}
+
+#[cfg(feature = "skills")]
+fn verification_case_role(kind: &super::protocol::VerificationCaseKind) -> ScriptRole {
+    use super::protocol::VerificationCaseKind;
+    match kind {
+        VerificationCaseKind::Embedded => ScriptRole::EmbeddedTest,
+        VerificationCaseKind::Mutation { .. } => ScriptRole::MutationTest,
+        VerificationCaseKind::Inherited => ScriptRole::InheritedTest,
+        VerificationCaseKind::HeldOut { .. } => ScriptRole::HeldOutTest,
+    }
+}
+
+#[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
+fn execute_isolated_skill_verification_case(
+    runtime: &Runtime,
+    artifact: &super::skills::SkillArtifact,
+    case: &super::protocol::VerificationCase,
+    case_index: usize,
+    deadline: Instant,
+    interrupted: &AtomicBool,
+    max_pending_jobs: usize,
+    transcript_budget: super::skills::fakes::VerificationTranscriptBudget,
+) -> VerificationCaseResult {
+    use super::protocol::VerificationCaseKind;
+    use super::skills::fakes::{FakeHostGlobals, FakeTranscript};
+
+    let role = verification_case_role(&case.kind);
+    let fakes =
+        FakeHostGlobals::with_transcript_budget(artifact.capability.clone(), transcript_budget);
+    if let VerificationCaseKind::HeldOut { fake_files, .. } = &case.kind {
+        if fake_files.len() > 32
+            || fake_files.iter().any(|(path, contents)| {
+                path.is_empty() || path.len() > 4 * 1024 || contents.len() > 64 * 1024
+            })
+            || fake_files
+                .iter()
+                .any(|(path, contents)| fakes.seed_file(path, contents).is_err())
+        {
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    DiagnosticClass::Contract,
+                    DiagnosticStage::Initialization,
+                    role,
+                )),
+                transcript: FakeTranscript::default(),
+            };
+        }
+    }
+    let dispatch_fakes = fakes.clone();
+    let manifest = artifact.capability.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |effect| {
+        execute_verification_fake(&manifest, &dispatch_fakes, effect.request.operation)
+    });
+    let bindings = match prepare_verification_bindings(artifact, &capabilities, case_index) {
+        Ok(bindings) => bindings,
+        Err(()) => {
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    DiagnosticClass::Internal,
+                    DiagnosticStage::Initialization,
+                    role,
+                )),
+                transcript: fakes.transcript().bounded_for_wire(),
+            };
+        }
+    };
+    let context = match Context::full(runtime) {
+        Ok(context) => context,
+        Err(_) => {
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    DiagnosticClass::Internal,
+                    DiagnosticStage::Initialization,
+                    role,
+                )),
+                transcript: fakes.transcript().bounded_for_wire(),
+            };
+        }
+    };
+    let mutated_export = match &case.kind {
+        VerificationCaseKind::Mutation { export_name } => Some(export_name.as_str()),
+        _ => None,
+    };
+    let loaded = match super::realm::load_artifact_with_bound_exports_for_verification(
+        runtime,
+        &context,
+        artifact,
+        capabilities.clone(),
+        bindings,
+        mutated_export,
+    ) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let class = match error {
+                super::realm::RealmError::Identity
+                | super::realm::RealmError::InvalidExport
+                | super::realm::RealmError::DuplicateExport
+                | super::realm::RealmError::ExportCollision
+                | super::realm::RealmError::MissingExport
+                | super::realm::RealmError::PendingInitializationJobs => DiagnosticClass::Contract,
+                super::realm::RealmError::Initialization
+                | super::realm::RealmError::WrapperInstallation => DiagnosticClass::Exception,
+            };
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    class,
+                    DiagnosticStage::Initialization,
+                    ScriptRole::SkillSource,
+                )),
+                transcript: fakes.transcript().bounded_for_wire(),
+            };
+        }
+    };
+    let mut remaining_jobs = max_pending_jobs;
+    let mut result = match &case.kind {
+        VerificationCaseKind::Embedded | VerificationCaseKind::Inherited => {
+            execute_verification_case(
+                runtime,
+                &context,
+                case.case_id.clone(),
+                &case.script,
+                role,
+                deadline,
+                interrupted,
+                &mut remaining_jobs,
+            )
+            .0
+        }
+        VerificationCaseKind::HeldOut { expected, .. } => execute_held_out_verification_case(
+            runtime,
+            &context,
+            case,
+            expected,
+            deadline,
+            interrupted,
+            &mut remaining_jobs,
+        ),
+        VerificationCaseKind::Mutation { .. } => execute_mutation_verification_case(
+            runtime,
+            &context,
+            artifact,
+            &case.case_id,
+            deadline,
+            interrupted,
+            &mut remaining_jobs,
+        ),
+    };
+    drop(loaded);
+    drop(context);
+    if runtime.is_job_pending() && result.passed {
+        result = failed_case(
+            case.case_id.clone(),
+            diagnostic(DiagnosticClass::Contract, DiagnosticStage::JobDrain, role),
+        );
+    }
+    let transcript = fakes.transcript();
+    if transcript.exceeds_wire_call_limit() && result.passed {
+        result = failed_case(
+            case.case_id.clone(),
+            diagnostic(
+                DiagnosticClass::Contract,
+                DiagnosticStage::Verification,
+                role,
+            ),
+        );
+    }
+    result.transcript = transcript.bounded_for_wire();
+    result
+}
+
+#[cfg(feature = "skills")]
+fn prepare_verification_bindings(
+    artifact: &super::skills::SkillArtifact,
+    capabilities: &InvocationCapabilityRuntime,
+    case_index: usize,
+) -> Result<std::collections::HashMap<String, super::realm::BoundExportInvocation>, ()> {
+    use std::collections::HashMap;
+
+    let mut bindings = HashMap::with_capacity(artifact.exports.len());
+    for (export_index, export) in artifact.exports.iter().enumerate() {
+        let capabilities = capabilities.clone();
+        let artifact_id = artifact.id.clone();
+        let export_name = export.name.clone();
+        let manifest = artifact.capability.clone();
+        let authorize = Arc::new(move |call_ordinal: u32| {
+            let invocation = format!("verify-{case_index}-{export_index}-{call_ordinal}");
+            let invocation_id =
+                super::protocol::InvocationId::new(invocation.clone()).map_err(|_| ())?;
+            let authorization = InvocationAuthorization::new(
+                invocation_id,
+                artifact_id.clone(),
+                export_name.clone(),
+                manifest.clone(),
+                manifest.grants.iter().map(|scope| {
+                    (
+                        scope.capability(),
+                        super::protocol::GrantId::new(uuid::Uuid::new_v4())
+                            .expect("random verification grant is non-nil"),
+                    )
+                }),
+            )
+            .map_err(|_| ())?;
+            let handle = capabilities.prepare(authorization).map_err(|_| ())?;
+            Ok((handle, invocation))
+        });
+        bindings.insert(
+            export.name.clone(),
+            super::realm::BoundExportInvocation {
+                authorize,
+                on_start: Arc::new(|_, _| Ok(())),
+                on_terminal: Arc::new(|_, _| Ok(())),
+            },
+        );
+    }
+    Ok(bindings)
+}
+
+#[cfg(feature = "skills")]
+fn execute_verification_fake(
+    manifest: &super::skills::CapabilityManifest,
+    fakes: &super::skills::fakes::FakeHostGlobals,
+    operation: EffectOperation,
+) -> Result<EffectResult, super::skills::capability::CapabilityError> {
+    use super::skills::capability::CapabilityError;
+    if !verification_scope_allows(manifest, &operation) {
+        return Err(CapabilityError::DispatchDenied);
+    }
+    match operation {
+        EffectOperation::ReadFile { path } => fakes
+            .read_file(&path)
+            .map(|content| EffectResult::ReadFile { content })
+            .map_err(|_| CapabilityError::DispatchDenied),
+        EffectOperation::WriteFile { path, content } => fakes
+            .write_file(&path, &content)
+            .map(|()| EffectResult::WriteFile)
+            .map_err(|_| CapabilityError::DispatchDenied),
+        EffectOperation::Spawn { program, arguments } => fakes
+            .spawn(&program, &arguments)
+            .map(|_| EffectResult::Spawn {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+            .map_err(|_| CapabilityError::DispatchDenied),
+        EffectOperation::Fetch { url, method, .. } => {
+            let method = match method {
+                super::protocol::HttpMethod::Get => "GET",
+                super::protocol::HttpMethod::Post => "POST",
+            };
+            fakes
+                .fetch(&url, method)
+                .map(|body| EffectResult::Fetch {
+                    status: 200,
+                    headers: Vec::new(),
+                    body,
+                    truncated: false,
+                })
+                .map_err(|_| CapabilityError::DispatchDenied)
+        }
+        EffectOperation::ProposeSkill { .. } => Err(CapabilityError::DispatchDenied),
+    }
+}
+
+#[cfg(feature = "skills")]
+fn verification_scope_allows(
+    manifest: &super::skills::CapabilityManifest,
+    operation: &EffectOperation,
+) -> bool {
+    use super::skills::{CapabilityScope, HostCapability, HttpMethod as SkillHttpMethod};
+    match operation {
+        EffectOperation::ReadFile { path } => manifest
+            .scope(HostCapability::ReadFile)
+            .and_then(|scope| match scope {
+                CapabilityScope::ReadFile { workspace_prefixes } => Some(workspace_prefixes),
+                _ => None,
+            })
+            .is_some_and(|prefixes| {
+                prefixes
+                    .iter()
+                    .any(|prefix| virtual_path_in_scope(prefix, path))
+            }),
+        EffectOperation::WriteFile { path, .. } => manifest
+            .scope(HostCapability::WriteFile)
+            .and_then(|scope| match scope {
+                CapabilityScope::WriteFile { workspace_prefixes } => Some(workspace_prefixes),
+                _ => None,
+            })
+            .is_some_and(|prefixes| {
+                prefixes
+                    .iter()
+                    .any(|prefix| virtual_path_in_scope(prefix, path))
+            }),
+        EffectOperation::Spawn { program, .. } => manifest
+            .scope(HostCapability::Spawn)
+            .and_then(|scope| match scope {
+                CapabilityScope::Spawn { programs } => Some(programs),
+                _ => None,
+            })
+            .is_some_and(|programs| programs.contains(program)),
+        EffectOperation::Fetch { url, method, .. } => {
+            let Ok(url) = reqwest::Url::parse(url) else {
+                return false;
+            };
+            let origin = url.origin().ascii_serialization();
+            manifest
+                .scope(HostCapability::Fetch)
+                .and_then(|scope| match scope {
+                    CapabilityScope::Fetch { origins, methods } => Some((origins, methods)),
+                    _ => None,
+                })
+                .is_some_and(|(origins, methods)| {
+                    origins.contains(&origin)
+                        && methods.iter().any(|allowed| {
+                            matches!(
+                                (allowed, method),
+                                (SkillHttpMethod::Get, super::protocol::HttpMethod::Get)
+                                    | (SkillHttpMethod::Post, super::protocol::HttpMethod::Post)
+                            )
+                        })
+                })
+        }
+        EffectOperation::ProposeSkill { .. } => false,
+    }
+}
+
+#[cfg(feature = "skills")]
+fn virtual_path_in_scope(prefix: &str, path: &str) -> bool {
+    !path.starts_with('/')
+        && !path.split('/').any(|component| component == "..")
+        && (path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+#[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
+fn execute_held_out_verification_case(
+    runtime: &Runtime,
+    context: &Context,
+    case: &super::protocol::VerificationCase,
+    expected: &super::protocol::VerificationExpectedValue,
+    deadline: Instant,
+    interrupted: &AtomicBool,
+    remaining_jobs: &mut usize,
+) -> VerificationCaseResult {
+    let role = ScriptRole::HeldOutTest;
+    let outcome =
+        evaluate(context, &case.script, runtime, deadline, interrupted, role).and_then(|value| {
+            drain_jobs(runtime, deadline, interrupted, remaining_jobs, role)?;
+            context.with(|ctx| {
+                let value = value.restore(&ctx).map_err(|error| {
+                    classify_ctx_error(
+                        &ctx,
+                        error,
+                        deadline,
+                        interrupted,
+                        DiagnosticStage::Verification,
+                        role,
+                    )
+                })?;
+                verification_expected_matches(expected, &value)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        ClosedFailure::error(
+                            JsErrorCode::InvalidResult,
+                            DiagnosticStage::Verification,
+                            role,
+                        )
+                    })
+            })
+        });
+    match outcome {
+        Ok(()) => VerificationCaseResult {
+            case_id: case.case_id.clone(),
+            passed: true,
+            diagnostic: None,
+            transcript: Default::default(),
+        },
+        Err(failure) => failed_case(case.case_id.clone(), failure.diagnostic),
+    }
+}
+
+#[cfg(feature = "skills")]
+fn verification_expected_matches(
+    expected: &super::protocol::VerificationExpectedValue,
+    actual: &Value<'_>,
+) -> bool {
+    use super::protocol::VerificationExpectedValue;
+    match expected {
+        VerificationExpectedValue::Boolean(expected) => actual.as_bool() == Some(*expected),
+        VerificationExpectedValue::String(expected) => actual
+            .as_string()
+            .and_then(|value| value.to_string().ok())
+            .is_some_and(|actual| actual == *expected),
+        VerificationExpectedValue::Integer(expected) => actual
+            .as_int()
+            .is_some_and(|actual| i64::from(actual) == *expected),
+        VerificationExpectedValue::Float(expected) => actual
+            .as_float()
+            .or_else(|| actual.as_int().map(f64::from))
+            .is_some_and(|actual| actual == *expected),
+        VerificationExpectedValue::Null => actual.is_null(),
+    }
+}
+
+#[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
+fn execute_mutation_verification_case(
+    runtime: &Runtime,
+    context: &Context,
+    artifact: &super::skills::SkillArtifact,
+    case_id: &str,
+    deadline: Instant,
+    interrupted: &AtomicBool,
+    remaining_jobs: &mut usize,
+) -> VerificationCaseResult {
+    for test in &artifact.tests {
+        let (result, terminal) = execute_verification_case(
+            runtime,
+            context,
+            case_id.to_string(),
+            test,
+            ScriptRole::MutationTest,
+            deadline,
+            interrupted,
+            remaining_jobs,
+        );
+        if !result.passed {
+            if terminal {
+                return result;
+            }
+            return VerificationCaseResult {
+                case_id: case_id.to_string(),
+                passed: true,
+                diagnostic: None,
+                transcript: Default::default(),
+            };
+        }
+    }
+    failed_case(
+        case_id.to_string(),
+        diagnostic(
+            DiagnosticClass::Contract,
+            DiagnosticStage::Verification,
+            ScriptRole::MutationTest,
+        ),
+    )
+}
+
+#[cfg(feature = "skills")]
+fn failed_skill_verification(
+    request: &VerifyArtifact,
+    class: DiagnosticClass,
+) -> VerificationResult {
+    let diagnostic = diagnostic(
+        class,
+        DiagnosticStage::Initialization,
+        ScriptRole::SkillSource,
+    );
+    VerificationResult {
+        passed: false,
+        cases: request
+            .cases
+            .iter()
+            .map(|case| failed_case(case.case_id.clone(), diagnostic.clone()))
+            .collect(),
+        loader_version: VERIFICATION_LOADER_VERSION,
+    }
+}
+
+#[cfg(not(feature = "skills"))]
 fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> VerificationResult {
     let case_count = request
         .artifact
@@ -1510,6 +2714,7 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
     }
 }
 
+#[cfg(not(feature = "skills"))]
 fn ensure_source_settled(
     runtime: &Runtime,
     context: &Context,
@@ -1645,6 +2850,8 @@ fn execute_verification_case(
                 case_id,
                 passed: true,
                 diagnostic: None,
+                #[cfg(feature = "skills")]
+                transcript: Default::default(),
             },
             false,
         ),
@@ -1665,9 +2872,12 @@ fn failed_case(case_id: String, diagnostic: Diagnostic) -> VerificationCaseResul
         case_id,
         passed: false,
         diagnostic: Some(diagnostic),
+        #[cfg(feature = "skills")]
+        transcript: Default::default(),
     }
 }
 
+#[cfg(not(feature = "skills"))]
 fn failed_verification(request: &VerifyArtifact, class: DiagnosticClass) -> VerificationResult {
     failed_verification_with(
         request,
@@ -1679,6 +2889,7 @@ fn failed_verification(request: &VerifyArtifact, class: DiagnosticClass) -> Veri
     )
 }
 
+#[cfg(not(feature = "skills"))]
 fn failed_verification_with(
     request: &VerifyArtifact,
     diagnostic: Diagnostic,

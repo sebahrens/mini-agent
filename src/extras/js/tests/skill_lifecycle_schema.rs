@@ -80,7 +80,7 @@ fn phase5_schema_is_restartable_and_complete() {
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            5
+            6
         );
         for table in [
             "skill_events",
@@ -96,6 +96,7 @@ fn phase5_schema_is_restartable_and_complete() {
             "skill_generations",
             "skill_tombstones",
             "skill_decision_jobs",
+            "skill_approval_authorizations",
         ] {
             let exists: i64 = store
                 .conn()

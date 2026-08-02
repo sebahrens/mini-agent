@@ -1,3 +1,6 @@
+use crate::extras::js::skills::lifecycle::{
+    EvidenceSnapshot, HumanApproval, LifecycleService, LifecycleStatus,
+};
 use crate::extras::js::skills::store::{
     AdminIdentity, EnqueueStatus, EvaluationReportRecord, HeldOutSuiteRecord, ProposalStatus,
     SkillStore, StoreError,
@@ -6,6 +9,7 @@ use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -39,7 +43,7 @@ fn paths() -> (PathBuf, AppPaths) {
 
 fn artifact(source_suffix: &str) -> SkillArtifact {
     SkillArtifact::new(
-        format!("function normalize(v) {{ return String(v).trim(); }}{source_suffix}"),
+        format!("function normalize(_cap, v) {{ return String(v).trim(); }}{source_suffix}"),
         "Normalize a value.".to_string(),
         vec!["normalize".to_string()],
         vec![SkillExport {
@@ -122,15 +126,322 @@ fn seed_v2(paths: &AppPaths, generations: &str) {
 fn skill_admission_schema_migrates_and_reopens() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("fresh store");
-    assert_eq!(store.schema_version().expect("version"), 5);
+    assert_eq!(store.schema_version().expect("version"), 6);
     drop(store);
     assert_eq!(
         SkillStore::open_at(&paths)
             .expect("reopen")
             .schema_version()
             .expect("version"),
+        6
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_admission_schema_v6_backfills_v5_awaiting_approval_report_binding() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = artifact("/* v5-awaiting */");
+    let proposal = store
+        .enqueue_proposal(&artifact, None, 10)
+        .expect("enqueue");
+    let lease = store.claim_due_proposal("worker", 20, 5).unwrap().unwrap();
+    let evaluation = report(&lease.proposal_id, &lease.skill_id, lease.attempt);
+    store
+        .complete_evaluation(
+            &proposal.proposal_id,
+            "worker",
+            lease.row_version,
+            &evaluation,
+            22,
+        )
+        .expect("complete evaluation");
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions SET evaluation_report_id = NULL WHERE id = ?1",
+            [&artifact.id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute_batch(
+            "DROP TABLE skill_approval_authorizations;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(store);
+
+    let mut migrated = SkillStore::open_at(&paths).expect("migrate v5 awaiting approval");
+    let bound: Option<String> = migrated
+        .conn_mut()
+        .query_row(
+            "SELECT evaluation_report_id FROM skill_revisions WHERE id = ?1",
+            [&artifact.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bound.as_deref(), Some(evaluation.report_id.as_str()));
+    assert_eq!(migrated.schema_version().unwrap(), 6);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_admission_schema_v6_backfills_v5_root_canary_and_can_activate() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = artifact("/* v5-root-canary */");
+    let proposal = store
+        .enqueue_proposal(&artifact, None, 10)
+        .expect("enqueue");
+    let lease = store.claim_due_proposal("worker", 20, 5).unwrap().unwrap();
+    let evaluation = report(&lease.proposal_id, &lease.skill_id, lease.attempt);
+    store
+        .complete_evaluation(
+            &proposal.proposal_id,
+            "worker",
+            lease.row_version,
+            &evaluation,
+            22,
+        )
+        .expect("complete evaluation");
+    let proposal_version = store
+        .get_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap()
+        .row_version;
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO skill_approvals (
+                approval_id, proposal_id, skill_id, report_id, approver_id,
+                authenticated_at, approved_at, artifact_version,
+                proposal_version, generation
+             ) VALUES ('v5-first-approval', ?1, ?2, ?3, 'owner', 23, 23, 1, ?4, 1)",
+            rusqlite::params![
+                proposal.proposal_id,
+                artifact.id,
+                evaluation.report_id,
+                i64::try_from(proposal_version).unwrap(),
+            ],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_proposals SET status = 'approved', row_version = row_version + 1
+              WHERE proposal_id = ?1",
+            [&proposal.proposal_id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+                SET status = 'canary', row_version = 2, evaluation_report_id = NULL,
+                    lineage_root_id = id
+              WHERE id = ?1",
+            [&artifact.id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_generations SET desired_generation = 1 WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute_batch(
+            "DELETE FROM skill_lifecycle_approvals;
+             DROP TABLE skill_approval_authorizations;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(store);
+
+    let mut migrated = SkillStore::open_at(&paths).expect("migrate v5 root canary");
+    let backfilled: (Option<String>, i64) = migrated
+        .conn_mut()
+        .query_row(
+            "SELECT r.evaluation_report_id,
+                    (SELECT COUNT(*) FROM skill_lifecycle_approvals l
+                      WHERE l.skill_id = r.id AND l.approval_kind = 'phase4_canary')
+               FROM skill_revisions r WHERE r.id = ?1",
+            [&artifact.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(backfilled.0.as_deref(), Some(evaluation.report_id.as_str()));
+    assert_eq!(backfilled.1, 1);
+
+    let mut lifecycle = LifecycleService::new(&mut migrated);
+    lifecycle.register_policy("v6-migration", "{}", 24).unwrap();
+    let second =
+        HumanApproval::verified("v6-second-approval", "owner", evaluation.report_id, 2).unwrap();
+    let authorization = lifecycle
+        .authorize_root_for_test(&artifact.id, &second, 24)
+        .unwrap();
+    let snapshot = EvidenceSnapshot::new(
+        artifact.id.clone(),
+        None,
+        "v6-migration",
+        vec![],
+        BTreeMap::new(),
+        2,
+        None,
+        1,
+    )
+    .unwrap();
+    let active = lifecycle
+        .activate_root(
+            "v6-migrated-root",
+            &artifact.id,
+            &second,
+            &authorization,
+            &snapshot,
+            25,
+        )
+        .unwrap();
+    assert_eq!(active.status, LifecycleStatus::Active);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_admission_schema_v6_rejects_v5_root_canary_without_first_approval() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = artifact("/* v5-unapproved-root-canary */");
+    store.insert_verified(&artifact).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+                SET status = 'canary', lineage_root_id = id,
+                    evaluation_report_id = ?2
+              WHERE id = ?1",
+            rusqlite::params![artifact.id, "a".repeat(64)],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute_batch(
+            "DROP TABLE skill_approval_authorizations;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(store);
+
+    assert!(matches!(
+        SkillStore::open_at(&paths),
+        Err(StoreError::CorruptRow(message))
+            if message.contains("could not be backfilled exactly")
+    ));
+    let database = paths.local_data_dir.join("skills/skills.db");
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
         5
     );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name = 'skill_approval_authorizations'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_admission_schema_v6_rejects_v5_root_canary_with_unapproved_proposal() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = artifact("/* v5-root-canary-unapproved-proposal */");
+    let proposal = store
+        .enqueue_proposal(&artifact, None, 10)
+        .expect("enqueue");
+    let lease = store.claim_due_proposal("worker", 20, 5).unwrap().unwrap();
+    let evaluation = report(&lease.proposal_id, &lease.skill_id, lease.attempt);
+    store
+        .complete_evaluation(
+            &proposal.proposal_id,
+            "worker",
+            lease.row_version,
+            &evaluation,
+            22,
+        )
+        .expect("complete evaluation");
+    let proposal_version = store
+        .get_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap()
+        .row_version;
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO skill_approvals (
+                approval_id, proposal_id, skill_id, report_id, approver_id,
+                authenticated_at, approved_at, artifact_version,
+                proposal_version, generation
+             ) VALUES ('v5-orphaned-approval', ?1, ?2, ?3, 'owner', 23, 23, 1, ?4, 1)",
+            rusqlite::params![
+                proposal.proposal_id,
+                artifact.id,
+                evaluation.report_id,
+                i64::try_from(proposal_version).unwrap(),
+            ],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+                SET status = 'canary', row_version = 2,
+                    evaluation_report_id = ?2, lineage_root_id = id
+              WHERE id = ?1",
+            rusqlite::params![artifact.id, evaluation.report_id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute_batch(
+            "DELETE FROM skill_lifecycle_approvals;
+             DROP TABLE skill_approval_authorizations;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(store);
+
+    assert!(matches!(
+        SkillStore::open_at(&paths),
+        Err(StoreError::CorruptRow(message))
+            if message.contains("could not be backfilled exactly")
+    ));
+    let database = paths.local_data_dir.join("skills/skills.db");
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    let lifecycle_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM skill_lifecycle_approvals WHERE skill_id = ?1",
+            [&artifact.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_rows, 0);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -155,7 +466,7 @@ fn skill_admission_schema_upgrades_phase3_v2_without_losing_generation_shape() {
     );
 
     let store = SkillStore::open_at(&paths).expect("upgrade Phase 3 v2");
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     let state = store.generation_state().expect("generation state");
     assert_eq!(state.desired_generation, 7);
     assert_eq!(state.applied_generation, 6);
@@ -180,7 +491,7 @@ fn skill_admission_schema_upgrades_legacy_phase4_v2_collision() {
     );
 
     let store = SkillStore::open_at(&paths).expect("upgrade legacy Phase 4 v2");
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     let state = store
         .generation_state()
         .expect("normalized generation state");
@@ -229,7 +540,7 @@ fn skill_admission_schema_quarantines_all_identity_v1_tiers_without_inference() 
     drop(connection);
 
     let mut store = SkillStore::open_at(&paths).expect("migrate identity v1");
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     assert!(store.list_retrievable().unwrap().is_empty());
 
     let rows = store

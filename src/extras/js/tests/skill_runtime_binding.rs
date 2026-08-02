@@ -3,12 +3,16 @@ use std::sync::Arc;
 use rig::tool::Tool;
 
 use super::make_test_tool;
-use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId, MAX_EFFECTS_PER_STEP};
+use crate::extras::js::broker::saturate_executable_preparation_slots_for_test;
+use crate::extras::js::protocol::{
+    EffectResult, GrantId, InvocationId, MAX_EFFECTS_PER_STEP, MAX_SKILL_EXPORTS_PER_ARTIFACT,
+};
 use crate::extras::js::skills::HostCapability;
 use crate::extras::js::skills::capability::{
     CapabilityError, InvocationAuthorization, InvocationCapabilityRuntime,
 };
 use crate::extras::js::skills::turn::{ResolvedSkill, SkillTurnContext, TurnSkillBundle};
+use crate::extras::js::skills::verify::verify_skill;
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
 };
@@ -58,6 +62,92 @@ fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
         index_generation: 7,
         skills,
     }))
+}
+
+fn differential_artifact(source: &str, test: &str) -> SkillArtifact {
+    SkillArtifact::new(
+        source.to_string(),
+        "production/verifier loader differential".to_string(),
+        vec!["differential".to_string()],
+        vec![SkillExport {
+            name: "probe".to_string(),
+            signature: "probe()".to_string(),
+        }],
+        vec![test.to_string()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn production_and_verifier_make_identical_loader_decisions_for_differential_artifacts() {
+    let cases = [
+        (
+            "valid",
+            "function probe(_cap) { return true; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "raw-vs-wrapper",
+            "return; function probe(_cap) { return true; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "top-level-effect",
+            "read_file('fixtures/a'); function probe(_cap) { return true; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "ambient-global",
+            "const ambient = typeof read_file; function probe(cap) { return ambient === 'undefined' && typeof cap.read_file === 'undefined'; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "undeclared-export",
+            "function other(_cap) { return true; }",
+            "true",
+            "probe()",
+        ),
+        (
+            "async-export",
+            "async function probe(_cap) { return true; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "constructor-escape",
+            "function probe(_cap) { let escaped = false; try { escaped = !!({}).constructor.constructor('return this')().modelSentinel; } catch (_) {} return !escaped && typeof Function === 'undefined'; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "stack-behavior",
+            "function probe(_cap, depth) { return depth === 0 ? true : probe(_cap, depth - 1); }",
+            "probe(100000)",
+            "probe(100000)",
+        ),
+    ];
+
+    for (name, source, test, production_expression) in cases {
+        let artifact = differential_artifact(source, test);
+        let verifier_accepted = verify_skill(&artifact).is_ok();
+        let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&artifact, 0)]));
+        let production = tool
+            .call(JsArgs {
+                code: production_expression.to_string(),
+            })
+            .await
+            .unwrap();
+        let production_accepted = !production.starts_with("JS error:");
+        assert_eq!(
+            verifier_accepted, production_accepted,
+            "loader decision diverged for {name}: production={production:?}"
+        );
+    }
 }
 
 #[test]
@@ -285,7 +375,7 @@ fn all_active_invocations_share_one_effect_ordinal_budget() {
 #[tokio::test]
 async fn selected_skill_exports_are_installed_before_agent_code() {
     let selected = artifact(
-        "function increment(value) { return value + 1; }",
+        "function increment(_cap, value) { return value + 1; }",
         &["increment"],
         CapabilityManifest::pure(),
     );
@@ -299,6 +389,109 @@ async fn selected_skill_exports_are_installed_before_agent_code() {
         .unwrap();
 
     assert_eq!(result, "42");
+}
+
+#[tokio::test]
+async fn selected_skill_export_is_reusable_with_distinct_parent_issued_call_authority() {
+    use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
+
+    let selected = artifact(
+        "function read_manifest(cap) { return cap.read_file('Cargo.toml').includes('[package]') ? 'allowed' : 'missing'; }",
+        &["read_manifest"],
+        CapabilityManifest::new(
+            CapabilityTier::ReadOnly,
+            vec![CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["Cargo.toml".to_string()],
+            }],
+        )
+        .unwrap(),
+    );
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let tool = make_test_tool()
+        .with_skill_turn_context(context(vec![resolved(&selected, 0)]))
+        .with_telemetry(TelemetryDispatcher::from_sender_for_test(tx));
+
+    assert_eq!(
+        tool.call(JsArgs {
+            code: "JSON.stringify([read_manifest(), read_manifest()])".to_string(),
+        })
+        .await
+        .unwrap(),
+        r#"["allowed","allowed"]"#
+    );
+
+    let batch = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("two-call telemetry batch");
+    let invoked: Vec<_> = batch
+        .events()
+        .iter()
+        .filter(|event| event.kind == SkillEventKind::Invoked)
+        .collect();
+    assert_eq!(invoked.len(), 2);
+    assert_ne!(invoked[0].invocation_id, invoked[1].invocation_id);
+    assert_eq!(
+        batch
+            .events()
+            .iter()
+            .filter(|event| event.kind == SkillEventKind::Returned)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn production_runner_emits_parent_bound_invocation_evidence() {
+    use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
+
+    let selected = artifact(
+        "function observed() { return 42; }",
+        &["observed"],
+        CapabilityManifest::pure(),
+    );
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let tool = make_test_tool()
+        .with_skill_turn_context(context(vec![resolved(&selected, 0)]))
+        .with_telemetry(TelemetryDispatcher::from_sender_for_test(tx));
+
+    assert_eq!(
+        tool.call(JsArgs {
+            code: "observed()".to_string(),
+        })
+        .await
+        .unwrap(),
+        "42"
+    );
+
+    let batch = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("parent-bound telemetry batch");
+    let kinds: Vec<_> = batch.events().iter().map(|event| event.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SkillEventKind::Selected,
+            SkillEventKind::Injected,
+            SkillEventKind::Invoked,
+            SkillEventKind::Returned,
+        ]
+    );
+    assert!(batch.events().iter().all(|event| {
+        event.skill_id == selected.id
+            && event.turn_id == "binding-turn"
+            && event.query_fingerprint.as_deref() == Some("binding-test")
+            && event.index_generation == 7
+            && event.production
+            && event.evidence_complete
+    }));
+    assert_eq!(
+        batch
+            .events()
+            .iter()
+            .find(|event| event.kind == SkillEventKind::Invoked)
+            .and_then(|event| event.argument_shape.as_deref()),
+        Some(r#"{"argc":0,"types":[]}"#)
+    );
 }
 
 #[tokio::test]
@@ -427,14 +620,14 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
     assert_eq!(denied, "JS error: exception");
 
     let allowed_manifest = CapabilityManifest::new(
-        CapabilityTier::SideEffecting,
-        vec![CapabilityScope::Spawn {
-            programs: vec!["printf".to_string()],
+        CapabilityTier::ReadOnly,
+        vec![CapabilityScope::ReadFile {
+            workspace_prefixes: vec!["Cargo.toml".to_string()],
         }],
     )
     .unwrap();
     let allowed = artifact(
-        "function permitted() { return spawn('printf', ['allowed']).stdout; }",
+        "function permitted(cap) { return cap.read_file('Cargo.toml').includes('[package]') ? 'allowed' : 'missing'; }",
         &["permitted"],
         allowed_manifest,
     );
@@ -446,7 +639,7 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
         })
         .await
         .unwrap();
-    assert_eq!(result, "JS error: exception");
+    assert_eq!(result, "allowed");
 
     let ordinary_agent = make_test_tool()
         .call(JsArgs {
@@ -455,6 +648,115 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
         .await
         .unwrap();
     assert_eq!(ordinary_agent, "function");
+}
+
+#[tokio::test]
+async fn production_skill_binding_accepts_distinct_multi_capability_authority_without_effects() {
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["Cargo.toml".to_string()],
+            },
+            CapabilityScope::WriteFile {
+                workspace_prefixes: vec!["target".to_string()],
+            },
+        ],
+    )
+    .unwrap();
+    let selected = artifact(
+        "function no_effect(cap) { return typeof cap.read_file === 'function' && typeof cap.write_file === 'function' ? 'bounded' : 'missing'; }",
+        &["no_effect"],
+        manifest,
+    );
+    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+
+    let result = tool
+        .call(JsArgs {
+            code: "no_effect()".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result, "bounded");
+}
+
+#[tokio::test]
+async fn pure_and_read_only_skill_preparation_bypasses_saturated_executable_slots() {
+    let permits = saturate_executable_preparation_slots_for_test().await;
+    let pure = artifact(
+        "function pure_value() { return 20; }",
+        &["pure_value"],
+        CapabilityManifest::pure(),
+    );
+    let read_only = artifact(
+        "function read_only_value(cap) { return typeof cap.read_file === 'function' ? 22 : 0; }",
+        &["read_only_value"],
+        CapabilityManifest::new(
+            CapabilityTier::ReadOnly,
+            vec![CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["Cargo.toml".to_string()],
+            }],
+        )
+        .unwrap(),
+    );
+    let tool = make_test_tool()
+        .with_skill_turn_context(context(vec![resolved(&pure, 0), resolved(&read_only, 1)]));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tool.call(JsArgs {
+            code: "pure_value() + read_only_value()".to_string(),
+        }),
+    )
+    .await;
+    drop(permits);
+
+    assert_eq!(
+        result
+            .expect("non-spawn manifests must not wait for executable slots")
+            .unwrap(),
+        "42"
+    );
+}
+
+#[tokio::test]
+async fn oversized_bundle_is_rejected_before_executable_preparation() {
+    let permits = saturate_executable_preparation_slots_for_test().await;
+    let names = (0..MAX_SKILL_EXPORTS_PER_ARTIFACT)
+        .map(|index| format!("export_{index}"))
+        .collect::<Vec<_>>();
+    let exports = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let oversized = artifact(
+        "function unused() { return 0; }",
+        &exports,
+        CapabilityManifest::new(
+            CapabilityTier::SideEffecting,
+            vec![CapabilityScope::Spawn {
+                programs: vec!["printf".to_string()],
+            }],
+        )
+        .unwrap(),
+    );
+    let oversized_bundle = (0..33)
+        .map(|rank| resolved(&oversized, rank))
+        .collect::<Vec<_>>();
+    let tool = make_test_tool().with_skill_turn_context(context(oversized_bundle));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        tool.call(JsArgs {
+            code: "1".to_string(),
+        }),
+    )
+    .await;
+    drop(permits);
+
+    assert!(
+        result
+            .expect("bundle bounds must be checked before executable preparation")
+            .is_err()
+    );
 }
 
 #[tokio::test]
