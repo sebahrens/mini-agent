@@ -174,6 +174,42 @@ pub struct AppPaths {
     pub project_dir: Option<PathBuf>,
 }
 
+/// Typed owner for the private, machine-local JavaScript effect audit.
+///
+/// Callers receive only fixed child paths below the resolved state root; effect metadata can never
+/// influence an audit filename or redirect the writer into the workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectAuditPathOwner {
+    state_root: PathBuf,
+    directory: PathBuf,
+}
+
+impl EffectAuditPathOwner {
+    pub fn state_root(&self) -> PathBuf {
+        self.state_root.clone()
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn lock_file(&self) -> PathBuf {
+        self.directory.join("writer.lock")
+    }
+
+    pub fn target_key_file(&self) -> PathBuf {
+        self.directory.join("target-hmac-v1.key")
+    }
+
+    pub fn initialization_marker(&self) -> PathBuf {
+        self.state_root.join("js-effect-audit-v1.initialized")
+    }
+
+    pub(crate) fn segment_file(&self, index: u64) -> PathBuf {
+        self.directory.join(format!("segment-{index:020}.audit"))
+    }
+}
+
 impl AppPaths {
     pub fn from_process(workspace_root: Option<PathBuf>) -> Result<Self, AppPathError> {
         if let Some(paths) = PROCESS_PATHS.get() {
@@ -430,6 +466,13 @@ impl AppPaths {
 
     pub fn migration_markers_dir(&self) -> PathBuf {
         self.state_dir.join("migrations").join("v1")
+    }
+
+    pub fn effect_audit(&self) -> EffectAuditPathOwner {
+        EffectAuditPathOwner {
+            state_root: self.state_dir.clone(),
+            directory: self.state_dir.join("audit").join("js-effects"),
+        }
     }
 }
 
@@ -1838,6 +1881,12 @@ mod tests {
         assert!(paths.logs_dir().starts_with(&paths.state_dir));
         assert!(paths.chat_history_file().starts_with(&paths.state_dir));
         assert!(paths.hook_trust_file().starts_with(&paths.state_dir));
+        assert!(
+            paths
+                .effect_audit()
+                .directory()
+                .starts_with(&paths.state_dir)
+        );
         assert!(
             paths
                 .project_config_trust_file()

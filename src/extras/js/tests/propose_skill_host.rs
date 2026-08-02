@@ -1,10 +1,12 @@
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::skills::proposal::{
-    AttemptBudget, JsCapability, JsExport, JsProposal, ProposalError, ProposalQueue,
+    AttemptBudget, JsCapability, JsCapabilityScope, JsExport, JsProposal, ProposalEffectService,
+    ProposalError, ProposalHost, ProposalQueue,
 };
-use crate::extras::js::skills::store::SkillStore;
+use crate::extras::js::skills::store::{EnqueueResult, EnqueueStatus, SkillStore};
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::extras::js::tool::{JsArgs, JsTool};
+use crate::extras::js::types::{EffectServiceError, PermCancellation};
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use crate::sandbox::Sandbox;
 use rig::tool::Tool;
@@ -23,11 +25,65 @@ fn proposal(source_suffix: &str) -> JsProposal {
         tests: vec!["trim(' x ') === 'x'".to_string()],
         capability: JsCapability {
             tier: "pure".to_string(),
-            allowed_hosts: vec![],
+            grants: vec![],
         },
         tags: vec![" Text ".to_string()],
         predecessor_id: None,
     }
+}
+
+#[tokio::test]
+async fn propose_skill_host_cancellation_is_bounded_and_next_call_succeeds() {
+    let (sender, receiver) = ProposalQueue::bounded(2, Duration::from_secs(1));
+    let service = ProposalEffectService::new(ProposalHost::new(sender, AttemptBudget::new(3)));
+
+    let before_dispatch = PermCancellation::new();
+    before_dispatch.cancel();
+    assert_eq!(
+        service
+            .execute_cancellable(proposal("-before"), before_dispatch)
+            .await,
+        Err(EffectServiceError::Cancelled)
+    );
+
+    let responder = std::thread::spawn(move || {
+        receiver.respond_next(
+            Duration::from_millis(50),
+            Ok(EnqueueResult {
+                proposal_id: "cancelled-proposal".to_string(),
+                skill_id: "cancelled-skill".to_string(),
+                status: EnqueueStatus::Pending,
+                report_id: None,
+            }),
+        );
+        receiver.respond_next(
+            Duration::ZERO,
+            Ok(EnqueueResult {
+                proposal_id: "next-proposal".to_string(),
+                skill_id: "next-skill".to_string(),
+                status: EnqueueStatus::Pending,
+                report_id: None,
+            }),
+        );
+    });
+    let cancellation = PermCancellation::new();
+    let cancel_later = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel_later.cancel();
+    });
+    assert_eq!(
+        service
+            .execute_cancellable(proposal("-during"), cancellation)
+            .await,
+        Err(EffectServiceError::OutcomeUnknown)
+    );
+    let next = service
+        .execute_cancellable(proposal("-next"), PermCancellation::new())
+        .await
+        .expect("subsequent proposal succeeds");
+    assert_eq!(next.proposal_id, "next-proposal");
+    responder.join().unwrap();
 }
 
 fn paths() -> (PathBuf, AppPaths) {
@@ -87,7 +143,9 @@ fn propose_skill_validation_rejects_bounds_and_capability_escalation() {
     ));
 
     let mut undeclared_tier = proposal("");
-    undeclared_tier.capability.allowed_hosts = vec!["read_file".to_string()];
+    undeclared_tier.capability.grants = vec![JsCapabilityScope::ReadFile {
+        workspace_prefixes: vec!["src".to_string()],
+    }];
     assert!(matches!(
         undeclared_tier.validate_and_canonicalize(),
         Err(ProposalError::InvalidCapability(_))
@@ -180,7 +238,7 @@ fn js_payload() -> String {
         "description": "Trim a value.",
         "exports": [{"name": "trim", "signature": "trim(value: unknown): string"}],
         "tests": ["trim(' x ') === 'x'"],
-        "capability": {"tier": "pure", "allowed_hosts": []},
+        "capability": {"tier": "pure", "grants": []},
         "tags": ["text"]
     })
     .to_string()
