@@ -35,6 +35,8 @@ pub(crate) struct AdmissionEvaluator {
     store: SkillStore,
     embedder: Embedder,
     worker_id: String,
+    #[cfg(test)]
+    verification_failure: Option<VerificationError>,
 }
 
 impl AdmissionEvaluator {
@@ -51,6 +53,8 @@ impl AdmissionEvaluator {
             store,
             embedder,
             worker_id,
+            #[cfg(test)]
+            verification_failure: None,
         })
     }
 
@@ -121,6 +125,18 @@ impl AdmissionEvaluator {
                 )?;
                 Err(AdmissionError::Retryable(error))
             }
+            Err(EvaluationFailure::Infrastructure { error }) => {
+                let exponent = lease.attempt.saturating_sub(1).min(8);
+                let delay = (1i64 << exponent).min(MAX_RETRY_BACKOFF_SECONDS);
+                self.store.retry_infrastructure_proposal(
+                    &lease.proposal_id,
+                    &self.worker_id,
+                    lease.row_version,
+                    now.saturating_add(delay),
+                    now,
+                )?;
+                Err(AdmissionError::Retryable(error))
+            }
         }
     }
 
@@ -161,6 +177,15 @@ impl AdmissionEvaluator {
             ));
         }
 
+        #[cfg(test)]
+        if let Some(error) = self.verification_failure.take() {
+            return Err(classify_verification(
+                &error,
+                "embedded_test_failed",
+                "embedded verification failed",
+            ));
+        }
+
         let held_out = match evaluate(&self.store, &artifact, predecessor.as_ref()) {
             Ok(report) => report,
             Err(HeldOutError::SuiteRequired) => return Err(EvaluationFailure::SuiteRequired),
@@ -182,6 +207,13 @@ impl AdmissionEvaluator {
                     &error,
                     "embedded_test_failed",
                     "embedded verification failed",
+                ));
+            }
+            Err(HeldOutError::Infrastructure(error)) => {
+                return Err(classify_verification(
+                    &error,
+                    "evaluation_infrastructure_unavailable",
+                    "verification infrastructure unavailable",
                 ));
             }
             Err(HeldOutError::CaseFailed { .. } | HeldOutError::TranscriptMismatch { .. }) => {
@@ -493,6 +525,11 @@ impl AdmissionEvaluator {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_verification_for_test(&mut self, error: VerificationError) {
+        self.verification_failure = Some(error);
+    }
+
+    #[cfg(test)]
     pub(crate) fn store_mut(&mut self) -> &mut SkillStore {
         &mut self.store
     }
@@ -773,6 +810,11 @@ fn classify_verification(
     fallback_code: &'static str,
     fallback_detail: &'static str,
 ) -> EvaluationFailure {
+    if let VerificationError::InfrastructureUnavailable(message) = error {
+        return EvaluationFailure::Infrastructure {
+            error: message.clone(),
+        };
+    }
     let resource_limited = match error {
         VerificationError::TestFailed { outcome, .. } => matches!(
             outcome,
@@ -811,6 +853,9 @@ enum EvaluationFailure {
     SuiteRequired,
     Retryable {
         code: &'static str,
+        error: String,
+    },
+    Infrastructure {
         error: String,
     },
 }
@@ -932,4 +977,19 @@ pub(crate) enum AdmissionError {
     CanaryBecameRetrievable,
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn verification_scheduler_queue_outage_is_retryable_admission_infrastructure() {
+        let failure = classify_verification(
+            &VerificationError::InfrastructureUnavailable("queue full".into()),
+            "embedded_test_failed",
+            "embedded verification failed",
+        );
+        assert!(matches!(failure, EvaluationFailure::Infrastructure { .. }));
+    }
 }

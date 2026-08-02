@@ -1166,6 +1166,37 @@ impl SkillStore {
         Ok(())
     }
 
+    /// Requeue work that never reached artifact evaluation without consuming its retry budget.
+    pub(crate) fn retry_infrastructure_proposal(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        row_version: u64,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let changed = self.db.execute(
+            "UPDATE skill_proposals
+             SET status = 'pending', attempt_count = CASE
+                     WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
+                 next_attempt_at = ?1, lease_owner = NULL, lease_expires_at = NULL,
+                 row_version = row_version + 1, updated_at = ?2
+             WHERE proposal_id = ?3 AND status = 'evaluating'
+               AND lease_owner = ?4 AND row_version = ?5",
+            params![
+                next_attempt_at,
+                now,
+                proposal_id,
+                worker,
+                sql_version(row_version)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseLost(proposal_id.to_string()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn complete_evaluation(
         &mut self,
         proposal_id: &str,
