@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use super::store::{SkillStore, StoreError};
-use super::{SkillArtifact, SkillExport};
+use super::{IDENTITY_VERSION, SKILL_ABI_VERSION, SkillArtifact, SkillExport};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SkillIndex {
@@ -19,6 +19,10 @@ impl SkillIndex {
         let active = store
             .list_retrievable()?
             .into_iter()
+            .filter(|artifact| {
+                artifact.identity_version == IDENTITY_VERSION
+                    && artifact.abi_version == SKILL_ABI_VERSION
+            })
             .map(|artifact| (artifact.id.clone(), artifact))
             .collect();
         Ok(Self { active })
