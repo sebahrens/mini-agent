@@ -129,18 +129,30 @@ impl SkillRuntime {
         paths: &AppPaths,
         embedding_config: Option<&crate::config::EmbeddingConfig>,
     ) -> Result<Self, super::embed::EmbeddingError> {
+        Self::open_with_learned_js(paths, embedding_config, true)
+    }
+
+    pub(crate) fn open_with_learned_js(
+        paths: &AppPaths,
+        embedding_config: Option<&crate::config::EmbeddingConfig>,
+        learned_js_enabled: bool,
+    ) -> Result<Self, super::embed::EmbeddingError> {
         let embedder = Arc::new(Embedder::from_config(embedding_config)?);
         let mut diagnostics = Vec::new();
-        let learned = match shared_coordinator(paths, Arc::clone(&embedder)) {
-            Ok((coordinator, created)) => {
-                if !created {
-                    Some(coordinator)
-                } else {
-                    match coordinator.active_count() {
-                        Ok(count) if count >= BACKGROUND_REBUILD_ROWS => {
-                            tracing::info!(count, "building learned-skill index in the background");
-                            let worker = Arc::clone(&coordinator);
-                            match std::thread::Builder::new()
+        let learned = if learned_js_enabled {
+            match shared_coordinator(paths, Arc::clone(&embedder)) {
+                Ok((coordinator, created)) => {
+                    if !created {
+                        Some(coordinator)
+                    } else {
+                        match coordinator.active_count() {
+                            Ok(count) if count >= BACKGROUND_REBUILD_ROWS => {
+                                tracing::info!(
+                                    count,
+                                    "building learned-skill index in the background"
+                                );
+                                let worker = Arc::clone(&coordinator);
+                                match std::thread::Builder::new()
                         .name("skill-index-rebuild".to_string())
                         .spawn(move || {
                             if let Err(error) = worker.rebuild_and_publish() {
@@ -154,26 +166,32 @@ impl SkillRuntime {
                             None
                         }
                     }
-                        }
-                        Ok(_) => {
-                            if let Err(error) = coordinator.rebuild_and_publish() {
-                                diagnostics.push(format!("learned_js_index_unavailable:{error}"));
-                                None
-                            } else {
-                                Some(coordinator)
                             }
-                        }
-                        Err(error) => {
-                            diagnostics.push(format!("learned_js_index_count_unavailable:{error}"));
-                            None
+                            Ok(_) => {
+                                if let Err(error) = coordinator.rebuild_and_publish() {
+                                    diagnostics
+                                        .push(format!("learned_js_index_unavailable:{error}"));
+                                    None
+                                } else {
+                                    Some(coordinator)
+                                }
+                            }
+                            Err(error) => {
+                                diagnostics
+                                    .push(format!("learned_js_index_count_unavailable:{error}"));
+                                None
+                            }
                         }
                     }
                 }
+                Err(error) => {
+                    diagnostics.push(format!("learned_js_store_unavailable:{error}"));
+                    None
+                }
             }
-            Err(error) => {
-                diagnostics.push(format!("learned_js_store_unavailable:{error}"));
-                None
-            }
+        } else {
+            diagnostics.push("learned_js_worker_containment_unavailable".to_string());
+            None
         };
         let mut catalog = AgentSkillCatalog::new(paths);
         let agent_skills = match catalog.refresh(&embedder) {

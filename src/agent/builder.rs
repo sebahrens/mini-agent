@@ -174,12 +174,47 @@ fn register_js_tool(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     cfg: &Config,
+    containment_status: crate::sandbox::worker::WorkerContainmentStatus,
+    #[cfg(feature = "skills")] skill_turn_context: Option<
+        Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+    >,
+) {
+    register_js_tool_with_status(
+        tools,
+        sandbox,
+        permission,
+        ask_tx,
+        cfg,
+        containment_status,
+        #[cfg(feature = "skills")]
+        skill_turn_context,
+    );
+}
+
+#[cfg(feature = "js")]
+#[allow(clippy::too_many_arguments)]
+fn register_js_tool_with_status(
+    tools: &mut Vec<Box<dyn rig::tool::ToolDyn>>,
+    sandbox: Sandbox,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    cfg: &Config,
+    containment_status: crate::sandbox::worker::WorkerContainmentStatus,
     #[cfg(feature = "skills")] skill_turn_context: Option<
         Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     >,
 ) {
     use crate::extras::js::host::AllowConfig;
     use crate::extras::js::tool::JsTool;
+    use crate::sandbox::worker::WorkerContainmentStatus;
+
+    if let WorkerContainmentStatus::Unavailable {
+        backend, reason, ..
+    } = containment_status
+    {
+        tracing::warn!(backend = %backend, reason = %reason, "JavaScript tool unavailable");
+        return;
+    }
 
     let startup_base = std::env::current_dir().unwrap_or_default();
     let allow_config = AllowConfig::from_settings(
@@ -292,6 +327,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // pin Claude to the Anthropic direct route so `cache_control` is honored).
     // `None` for providers that need no extra routing.
     additional_params: Option<serde_json::Value>,
+    #[cfg(feature = "js")]
+    js_worker_containment_status: crate::sandbox::worker::WorkerContainmentStatus,
     #[cfg(feature = "skills")] skill_turn_context: Option<
         Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     >,
@@ -454,6 +491,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             permission.clone(),
             ask_tx.clone(),
             cfg,
+            js_worker_containment_status,
             #[cfg(feature = "skills")]
             skill_turn_context,
         );
@@ -471,9 +509,12 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 mod js_tests {
     use std::collections::HashMap;
 
-    use super::{build_agent_inner, build_btw_agent_inner, register_js_tool};
+    use super::{build_agent_inner, build_btw_agent_inner, register_js_tool_with_status};
     use crate::context::ContextFiles;
-    use crate::sandbox::Sandbox;
+    use crate::sandbox::{
+        Sandbox,
+        worker::{WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus},
+    };
 
     fn empty_context() -> ContextFiles {
         ContextFiles {
@@ -504,12 +545,16 @@ mod js_tests {
     #[tokio::test]
     async fn registers_and_executes_js_tool() {
         let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
-        register_js_tool(
+        register_js_tool_with_status(
             &mut tools,
             Sandbox::new(false, "bwrap"),
             None,
             None,
             &crate::config::Config::default(),
+            WorkerContainmentStatus::Available {
+                backend: WorkerBackend::for_current_platform(),
+                assurance: WorkerContainmentAssurance::Enforced,
+            },
             #[cfg(feature = "skills")]
             None,
         );
@@ -525,6 +570,50 @@ mod js_tests {
         assert_eq!(result, "2");
     }
 
+    #[test]
+    fn unavailable_worker_containment_registers_no_js_tool_even_without_general_sandbox() {
+        let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+        register_js_tool_with_status(
+            &mut tools,
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            &crate::config::Config::default(),
+            WorkerContainmentStatus::Unavailable {
+                backend: WorkerBackend::for_current_platform(),
+                assurance: WorkerContainmentAssurance::Enforced,
+                reason: "backend probe failed".into(),
+            },
+            #[cfg(feature = "skills")]
+            None,
+        );
+
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn available_worker_is_independent_of_unavailable_general_sandbox() {
+        let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+        register_js_tool_with_status(
+            &mut tools,
+            Sandbox::new(true, "missing-general-backend"),
+            None,
+            None,
+            &crate::config::Config::default(),
+            WorkerContainmentStatus::Available {
+                backend: WorkerBackend::for_current_platform(),
+                assurance: WorkerContainmentAssurance::Enforced,
+            },
+            #[cfg(feature = "skills")]
+            None,
+        );
+
+        assert_eq!(
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            vec!["js"]
+        );
+    }
+
     #[tokio::test]
     async fn full_main_agent_rebuild_and_provider_retry_reuse_worker_without_policy_leakage() {
         use crate::extras::js::supervisor::JsWorkerSupervisor;
@@ -535,6 +624,7 @@ mod js_tests {
             js_write_unrestricted: Some(true),
             ..crate::config::Config::default()
         };
+        let containment_status = crate::sandbox::worker::containment_status();
         let first_agent = build_agent_inner(
             fake_model("provider-a"),
             &cli,
@@ -546,6 +636,7 @@ mod js_tests {
             false,
             None,
             None,
+            containment_status.clone(),
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "mcp")]
@@ -557,6 +648,13 @@ mod js_tests {
             .get_tool_defs(None)
             .await
             .expect("first provider tool definitions");
+        if matches!(
+            containment_status,
+            WorkerContainmentStatus::Unavailable { .. }
+        ) {
+            assert!(!first_tools.iter().any(|tool| tool.name == "js"));
+            return;
+        }
         assert!(first_tools.iter().any(|tool| tool.name == "js"));
 
         let supervisor = JsWorkerSupervisor::shared();
@@ -619,6 +717,7 @@ mod js_tests {
             false,
             None,
             None,
+            crate::sandbox::worker::containment_status(),
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "mcp")]

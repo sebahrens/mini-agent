@@ -11,6 +11,140 @@ const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
 const INSTALLED_BUILD_LABEL: &str = "installed binary provenance";
 
+fn javascript_worker_compiled_entry() -> (&'static str, String) {
+    ("compiled", cfg!(feature = "js").to_string())
+}
+
+#[cfg(feature = "js")]
+fn javascript_worker_entries_for_status(
+    status: crate::sandbox::worker::WorkerContainmentStatus,
+) -> Vec<(&'static str, String)> {
+    use crate::sandbox::worker::{
+        WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus,
+    };
+
+    let (backend, assurance, availability, reason, available) = match status {
+        WorkerContainmentStatus::Available { backend, assurance } => {
+            (backend, assurance, "available", None, true)
+        }
+        WorkerContainmentStatus::Unavailable {
+            backend,
+            assurance,
+            reason,
+        } => (backend, assurance, "unavailable", Some(reason), false),
+    };
+    let assurance = match (assurance, available) {
+        (WorkerContainmentAssurance::Enforced, true) => "enforced",
+        (WorkerContainmentAssurance::DeprecatedBestEffort, true) => "deprecated weaker best-effort",
+        (WorkerContainmentAssurance::Enforced, false) => "enforced backend class; inactive",
+        (WorkerContainmentAssurance::DeprecatedBestEffort, false) => {
+            "deprecated weaker best-effort backend class; inactive"
+        }
+    };
+    let mut entries = vec![
+        javascript_worker_compiled_entry(),
+        ("backend", backend.to_string()),
+        ("status", availability.to_string()),
+        ("assurance", assurance.to_string()),
+    ];
+    if let Some(reason) = reason {
+        entries.insert(3, ("reason", reason));
+    }
+    if available {
+        let (process_limit, memory_limit, cpu_limit) = match backend {
+            WorkerBackend::Bubblewrap => (
+                "process creation denied",
+                "at most 256 MiB",
+                "at most 35 seconds",
+            ),
+            WorkerBackend::WindowsLpac => ("1 worker process", "256 MiB", "35 seconds"),
+            WorkerBackend::Seatbelt => (
+                "process creation denied",
+                "not independently capped",
+                "not independently capped",
+            ),
+        };
+        let spawn = if backend == WorkerBackend::WindowsLpac {
+            "disabled on Windows"
+        } else {
+            "parent capability broker only"
+        };
+        entries.extend([
+            (
+                "worker launch",
+                "enabled with validated containment".to_string(),
+            ),
+            (
+                "filesystem authority",
+                "none ambient; parent broker only".to_string(),
+            ),
+            (
+                "network authority",
+                "none ambient; parent broker only".to_string(),
+            ),
+            ("process creation", "denied in worker".to_string()),
+            ("native process limit", process_limit.to_string()),
+            ("native memory limit", memory_limit.to_string()),
+            ("native CPU limit", cpu_limit.to_string()),
+            ("parent-brokered spawn", spawn.to_string()),
+        ]);
+    } else {
+        entries.extend([
+            (
+                "worker launch",
+                "disabled; no worker process starts".to_string(),
+            ),
+            (
+                "filesystem authority",
+                "not granted; no worker process".to_string(),
+            ),
+            (
+                "network authority",
+                "not granted; no worker process".to_string(),
+            ),
+            (
+                "process creation",
+                "not applicable; no worker process".to_string(),
+            ),
+            (
+                "native process limit",
+                "not active; no worker process".to_string(),
+            ),
+            (
+                "native memory limit",
+                "not active; no worker process".to_string(),
+            ),
+            (
+                "native CPU limit",
+                "not active; no worker process".to_string(),
+            ),
+            (
+                "parent-brokered spawn",
+                "unavailable; no JS worker".to_string(),
+            ),
+        ]);
+    }
+    entries.push((
+        "protocol version",
+        crate::extras::js::protocol::PROTOCOL_VERSION.to_string(),
+    ));
+    entries
+}
+
+fn javascript_worker_entries() -> Vec<(&'static str, String)> {
+    #[cfg(feature = "js")]
+    {
+        javascript_worker_entries_for_status(crate::sandbox::worker::containment_status())
+    }
+    #[cfg(not(feature = "js"))]
+    {
+        vec![
+            javascript_worker_compiled_entry(),
+            ("status", "not compiled".to_string()),
+        ]
+    }
+}
+
 fn installed_build_entry() -> (&'static str, String) {
     let assertion_mode = if cfg!(debug_assertions) {
         "debug assertions enabled"
@@ -288,6 +422,12 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         ],
     );
 
+    append_section(
+        &mut output,
+        "JavaScript worker",
+        &javascript_worker_entries(),
+    );
+
     #[cfg(feature = "advisor")]
     {
         let advisor_enabled = cli.resolve_advisor_enabled(cfg);
@@ -327,7 +467,7 @@ mod tests {
 
     use super::{
         CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        installed_build_entry, write_output,
+        installed_build_entry, javascript_worker_compiled_entry, write_output,
     };
 
     struct BrokenPipeWriter;
@@ -406,6 +546,99 @@ mod tests {
                 "chat history path policy",
                 "reject symlinked path components".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn config_reports_whether_javascript_was_compiled() {
+        assert_eq!(
+            javascript_worker_compiled_entry(),
+            ("compiled", cfg!(feature = "js").to_string())
+        );
+    }
+
+    #[cfg(not(feature = "js"))]
+    #[test]
+    fn config_reports_complete_not_compiled_javascript_worker_section() {
+        assert_eq!(
+            super::javascript_worker_entries(),
+            vec![
+                ("compiled", "false".to_string()),
+                ("status", "not compiled".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn config_reports_fail_closed_worker_authority_and_windows_spawn_fence() {
+        use crate::sandbox::worker::{
+            WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus,
+        };
+
+        let entries =
+            super::javascript_worker_entries_for_status(WorkerContainmentStatus::Available {
+                backend: WorkerBackend::WindowsLpac,
+                assurance: WorkerContainmentAssurance::Enforced,
+            })
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(entries["compiled"], "true");
+        assert_eq!(entries["backend"], "windows-lpac");
+        assert_eq!(entries["status"], "available");
+        assert_eq!(
+            entries["filesystem authority"],
+            "none ambient; parent broker only"
+        );
+        assert_eq!(
+            entries["network authority"],
+            "none ambient; parent broker only"
+        );
+        assert_eq!(entries["process creation"], "denied in worker");
+        assert_eq!(entries["native process limit"], "1 worker process");
+        assert_eq!(entries["native memory limit"], "256 MiB");
+        assert_eq!(entries["native CPU limit"], "35 seconds");
+        assert_eq!(entries["parent-brokered spawn"], "disabled on Windows");
+        assert_eq!(
+            entries["protocol version"],
+            crate::extras::js::protocol::PROTOCOL_VERSION.to_string()
+        );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn config_reports_unavailable_reason_and_weaker_macos_assurance() {
+        use crate::sandbox::worker::{
+            WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus,
+        };
+
+        let entries =
+            super::javascript_worker_entries_for_status(WorkerContainmentStatus::Unavailable {
+                backend: WorkerBackend::Seatbelt,
+                assurance: WorkerContainmentAssurance::DeprecatedBestEffort,
+                reason: "unsupported macOS version".into(),
+            })
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(entries["status"], "unavailable");
+        assert_eq!(entries["reason"], "unsupported macOS version");
+        assert_eq!(
+            entries["assurance"],
+            "deprecated weaker best-effort backend class; inactive"
+        );
+        assert_eq!(
+            entries["worker launch"],
+            "disabled; no worker process starts"
+        );
+        assert_eq!(
+            entries["filesystem authority"],
+            "not granted; no worker process"
+        );
+        assert_eq!(
+            entries["native memory limit"],
+            "not active; no worker process"
         );
     }
 }

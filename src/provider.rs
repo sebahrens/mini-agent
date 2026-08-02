@@ -1136,6 +1136,8 @@ async fn build_openai_agent(
     reasoning_enabled: bool,
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
+    #[cfg(feature = "js")]
+    js_worker_containment_status: crate::sandbox::worker::WorkerContainmentStatus,
     #[cfg(feature = "skills")] skill_turn_context: Option<
         std::sync::Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     >,
@@ -1154,6 +1156,8 @@ async fn build_openai_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "js")]
+                js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
                 skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
@@ -1173,6 +1177,8 @@ async fn build_openai_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "js")]
+                js_worker_containment_status,
                 #[cfg(feature = "skills")]
                 skill_turn_context,
                 #[cfg(feature = "mcp")]
@@ -1183,7 +1189,6 @@ async fn build_openai_agent(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn build_agent(
     model: AnyModel,
     cli: &Cli,
@@ -1197,13 +1202,23 @@ pub async fn build_agent(
     extra_body: Option<serde_json::Value>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
+    #[cfg(feature = "js")]
+    let js_worker_containment_status = crate::sandbox::worker::containment_status();
     #[cfg(feature = "skills")]
     let skills = {
         let paths = crate::paths::process_paths();
         let embedding = cfg.embedding.clone();
+        let learned_js_enabled = matches!(
+            &js_worker_containment_status,
+            crate::sandbox::worker::WorkerContainmentStatus::Available { .. }
+        );
         match paths {
             Ok(paths) => match tokio::task::spawn_blocking(move || {
-                crate::extras::js::skills::turn::SkillRuntime::open(&paths, embedding.as_ref())
+                crate::extras::js::skills::turn::SkillRuntime::open_with_learned_js(
+                    &paths,
+                    embedding.as_ref(),
+                    learned_js_enabled,
+                )
             })
             .await
             {
@@ -1239,6 +1254,8 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 merge_extra_body(routing, extra_body),
+                #[cfg(feature = "js")]
+                js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
                 skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
@@ -1258,6 +1275,8 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "js")]
+                js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
                 skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
@@ -1277,6 +1296,8 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "js")]
+                js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
                 skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
@@ -1296,6 +1317,8 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "js")]
+                js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
                 skill_turn_context.clone(),
                 #[cfg(feature = "mcp")]
@@ -1315,6 +1338,8 @@ pub async fn build_agent(
                 reasoning_enabled,
                 temperature,
                 extra_body,
+                #[cfg(feature = "js")]
+                js_worker_containment_status,
                 #[cfg(feature = "skills")]
                 skill_turn_context,
                 #[cfg(feature = "mcp")]

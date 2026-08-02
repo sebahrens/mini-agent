@@ -164,6 +164,55 @@ async fn prompt_discovery_reuses_one_query_embedding_for_both_typed_indexes() {
 }
 
 #[tokio::test]
+async fn unavailable_js_worker_disables_learned_js_but_preserves_agent_skills() {
+    let temp = TempPaths::new();
+    let learned = learned_skill();
+    SkillStore::open_at(&temp.paths)
+        .and_then(|mut store| store.insert_verified(&learned))
+        .unwrap();
+
+    let agent_source = temp.root.join("instruction-only-skill");
+    fs::create_dir_all(&agent_source).unwrap();
+    fs::write(
+        agent_source.join("SKILL.md"),
+        b"---\nname: instruction-only-skill\ndescription: Explains careful text handling.\n---\n\n# Instruction-only guidance\nHandle text carefully.\n",
+    )
+    .unwrap();
+    let imported = import_agent_skill(&agent_source, &temp.paths).unwrap();
+
+    let runtime = SkillRuntime::open_with_learned_js(&temp.paths, None, false)
+        .unwrap()
+        .with_test_policies(
+            RetrievalPolicy {
+                dense_score_floor: -1.0,
+                ..RetrievalPolicy::default()
+            },
+            AgentSkillSearchPolicy {
+                score_floor: -1.0,
+                ..AgentSkillSearchPolicy::default()
+            },
+        );
+    let discovery = runtime.prepare_turn(&retrieval_document(&learned)).await;
+
+    assert!(discovery.learned_js.skills.is_empty());
+    assert_eq!(
+        discovery.selected_agent_digests,
+        vec![imported.identity.digest]
+    );
+    assert!(
+        discovery
+            .trusted_context
+            .contains("# Instruction-only guidance")
+    );
+    assert!(
+        discovery
+            .diagnostics
+            .iter()
+            .any(|entry| entry == "learned_js_worker_containment_unavailable")
+    );
+}
+
+#[tokio::test]
 async fn prepared_prompt_places_trusted_manifest_before_the_user_prompt() {
     let temp = TempPaths::new();
     let learned = learned_skill();
