@@ -1,3 +1,4 @@
+pub(crate) mod audit;
 pub(crate) mod broker;
 pub mod engine;
 pub mod host;

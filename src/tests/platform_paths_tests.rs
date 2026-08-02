@@ -416,10 +416,40 @@ fn persistent_artifact_ownership_acceptance_covers_every_typed_owner() {
         (paths.hook_trust_file(), "hook trust"),
         (paths.archmd_state_dir(), "architecture state"),
         (paths.migration_markers_dir(), "migration markers"),
+        (
+            paths.effect_audit().directory().to_path_buf(),
+            "JavaScript effect audit",
+        ),
     ] {
         assert_owned_by(path, &paths.state_dir, artifact);
     }
     assert_owned_by(paths.mcp_oauth_dir(), &paths.credentials_dir, "MCP OAuth");
+}
+
+#[test]
+fn platform_paths_acceptance_effect_audit_has_one_fixed_state_owner() {
+    let root = TempRoot::new("effect-audit-owner");
+    let paths = acceptance_paths(root.path());
+    let owner = paths.effect_audit();
+
+    assert_eq!(owner.state_root(), paths.state_dir);
+    assert_eq!(
+        owner.directory(),
+        paths.state_dir.join("audit").join("js-effects")
+    );
+    assert_eq!(owner.lock_file(), owner.directory().join("writer.lock"));
+    assert_eq!(
+        owner.target_key_file(),
+        owner.directory().join("target-hmac-v1.key")
+    );
+    assert_eq!(
+        owner.initialization_marker(),
+        paths.state_dir.join("js-effect-audit-v1.initialized")
+    );
+    assert!(
+        !owner.directory().starts_with(paths.project_dir.unwrap()),
+        "security audit must never be workspace-owned"
+    );
 }
 
 #[test]
