@@ -22,24 +22,25 @@ impl<'a> AdmissionStore<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn authorize_canary(
         &mut self,
-        authorization_id: String,
-        principal: String,
+        decision: &super::admission::AuthenticatedHumanDecision,
         artifact: &SkillArtifact,
         report_id: &str,
         issued_at: i64,
         expires_at: i64,
     ) -> Result<ApprovalAuthorization, StoreError> {
-        self.store
-            .issue_approval_authorization(ApprovalAuthorizationRequest {
-                authorization_id,
-                principal,
+        self.store.issue_canary_approval_authorization(
+            decision,
+            ApprovalAuthorizationRequest {
+                authorization_id: decision.authorization_id().to_string(),
+                principal: decision.principal().to_string(),
                 artifact_id: artifact.id.clone(),
                 report_id: report_id.to_string(),
                 manifest_digest: approval_manifest_digest(artifact)?,
                 transition: ApprovalTransition::VerifiedToCanary,
                 issued_at,
                 expires_at,
-            })
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

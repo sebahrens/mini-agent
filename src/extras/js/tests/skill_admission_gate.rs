@@ -14,6 +14,7 @@ use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -477,8 +478,16 @@ fn skill_admission_gate_retry_budget_ends_in_stable_rejection() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-fn authorization_fixture() -> (PathBuf, AdmissionEvaluator, SkillArtifact, String, u64, u64) {
-    let (root, _paths, mut evaluator, artifact) = evaluator(true);
+fn authorization_fixture() -> (
+    PathBuf,
+    AppPaths,
+    AdmissionEvaluator,
+    SkillArtifact,
+    String,
+    u64,
+    u64,
+) {
+    let (root, paths, mut evaluator, artifact) = evaluator(true);
     let report = evaluator.evaluate_next(20).unwrap().unwrap();
     let proposal = evaluator
         .store()
@@ -492,6 +501,7 @@ fn authorization_fixture() -> (PathBuf, AdmissionEvaluator, SkillArtifact, Strin
         .unwrap();
     (
         root,
+        paths,
         evaluator,
         artifact,
         report.report_id,
@@ -502,7 +512,7 @@ fn authorization_fixture() -> (PathBuf, AdmissionEvaluator, SkillArtifact, Strin
 
 #[test]
 fn authenticated_approval_authorization_rejects_untrusted_shape_and_expiry() {
-    let (root, mut evaluator, artifact, report_id, _, _) = authorization_fixture();
+    let (root, _paths, mut evaluator, artifact, report_id, _, _) = authorization_fixture();
     assert!(matches!(
         evaluator.authorize_canary_for_test("bad-principal", "", &artifact, &report_id, 21, 22),
         Err(AdmissionError::Store(
@@ -564,7 +574,7 @@ fn authenticated_approval_authorization_rejects_untrusted_shape_and_expiry() {
 
 #[test]
 fn authenticated_approval_authorization_rejects_tampered_exact_binding() {
-    let (root, mut evaluator, artifact, report_id, artifact_version, proposal_version) =
+    let (root, _paths, mut evaluator, artifact, report_id, artifact_version, proposal_version) =
         authorization_fixture();
     let authorization = evaluator
         .authorize_canary_for_test("exact-binding", "reviewer", &artifact, &report_id, 21, 30)
@@ -659,7 +669,7 @@ fn authenticated_approval_authorization_rejects_tampered_exact_binding() {
 
 #[test]
 fn authenticated_approval_authorization_stale_and_failed_transaction_preserve_token() {
-    let (root, mut evaluator, artifact, report_id, artifact_version, proposal_version) =
+    let (root, _paths, mut evaluator, artifact, report_id, artifact_version, proposal_version) =
         authorization_fixture();
     let authorization = evaluator
         .authorize_canary_for_test("rollback-token", "reviewer", &artifact, &report_id, 21, 30)
@@ -735,8 +745,74 @@ fn authenticated_approval_authorization_stale_and_failed_transaction_preserve_to
 }
 
 #[test]
+fn authenticated_approval_authorization_two_connections_consume_exactly_once() {
+    let (root, paths, mut evaluator, artifact, report_id, artifact_version, proposal_version) =
+        authorization_fixture();
+    let authorization = evaluator
+        .authorize_canary_for_test(
+            "concurrent-one-use",
+            "reviewer",
+            &artifact,
+            &report_id,
+            21,
+            30,
+        )
+        .unwrap();
+    drop(evaluator);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut joins = Vec::new();
+    for worker in ["concurrent-a", "concurrent-b"] {
+        let paths = paths.clone();
+        let artifact_id = artifact.id.clone();
+        let report_id = report_id.clone();
+        let authorization = authorization.clone();
+        let barrier = Arc::clone(&barrier);
+        joins.push(std::thread::spawn(move || {
+            let store = SkillStore::open_at(&paths).unwrap();
+            let mut evaluator =
+                AdmissionEvaluator::new(store, Embedder::new().unwrap(), worker).unwrap();
+            barrier.wait();
+            evaluator.consume_canary_for_test(
+                &artifact_id,
+                &artifact_id,
+                &report_id,
+                artifact_version,
+                proposal_version,
+                &authorization,
+                22,
+            )
+        }));
+    }
+    let outcomes = joins
+        .into_iter()
+        .map(|join| join.join().expect("consumer thread"))
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+        1
+    );
+
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    let (consumed, approvals): (i64, i64) = store
+        .conn_mut()
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM skill_approval_authorizations
+                  WHERE authorization_id = 'concurrent-one-use' AND consumed_at IS NOT NULL),
+                (SELECT COUNT(*) FROM skill_approvals WHERE skill_id = ?1)",
+            [&artifact.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((consumed, approvals), (1, 1));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn authenticated_approval_authorization_cannot_cross_transition_or_replay() {
-    let (root, mut evaluator, artifact, report_id, artifact_version, proposal_version) =
+    let (root, _paths, mut evaluator, artifact, report_id, artifact_version, proposal_version) =
         authorization_fixture();
     let authorization = evaluator
         .authorize_canary_for_test("one-use", "reviewer", &artifact, &report_id, 21, 30)
@@ -779,9 +855,18 @@ fn authenticated_approval_authorization_cannot_cross_transition_or_replay() {
         1,
     )
     .unwrap();
-    let reused = HumanApproval::verified("one-use", "reviewer", report_id, row_version).unwrap();
+    let reused =
+        HumanApproval::verified("distinct-root-review", "reviewer", report_id, row_version)
+            .unwrap();
     assert!(matches!(
-        lifecycle.activate_root("cross-transition", &artifact.id, &reused, &snapshot, 23),
+        lifecycle.activate_root(
+            "cross-transition",
+            &artifact.id,
+            &reused,
+            &authorization,
+            &snapshot,
+            23,
+        ),
         Err(LifecycleError::Store(
             crate::extras::js::skills::store::StoreError::Unauthorized
         ))

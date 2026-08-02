@@ -13,10 +13,9 @@ use serde::{Deserialize, Serialize};
 use super::coordinator::{
     CoordinatedMutationError, CoordinatorError, IndexCoordinator, PublicationReport,
 };
-use super::store::{
-    ApprovalAuthorizationRequest, ApprovalTransition, SkillStore, StoreError,
-    approval_manifest_digest, consume_approval_authorization,
-};
+#[cfg(test)]
+use super::store::{ApprovalAuthorizationRequest, approval_manifest_digest};
+use super::store::{ApprovalTransition, SkillStore, StoreError, consume_approval_authorization};
 
 const APPROVAL_AUTHORIZATION_LIFETIME_SECONDS: i64 = 300;
 
@@ -244,6 +243,8 @@ pub struct HumanApproval {
 }
 
 impl HumanApproval {
+    /// Test-only stand-in for an opaque approval produced by the parent authentication adapter.
+    #[cfg(test)]
     pub(crate) fn verified(
         approval_id: impl Into<String>,
         actor_id: impl Into<String>,
@@ -377,6 +378,7 @@ impl<'a> CoordinatedLifecycle<'a> {
         idempotency_key: &str,
         skill_id: &str,
         approval: &HumanApproval,
+        authorization: &super::store::ApprovalAuthorization,
         snapshot: &EvidenceSnapshot,
         created_at: i64,
     ) -> Result<(TransitionOutcome, PublicationReport), LifecyclePublicationError> {
@@ -386,6 +388,7 @@ impl<'a> CoordinatedLifecycle<'a> {
                     idempotency_key,
                     skill_id,
                     approval,
+                    authorization,
                     snapshot,
                     created_at,
                 )?;
@@ -420,6 +423,36 @@ pub struct LifecycleService<'a> {
 }
 
 impl<'a> LifecycleService<'a> {
+    /// Test-only stand-in for the separate parent authentication interaction.
+    #[cfg(test)]
+    pub(crate) fn authorize_root_for_test(
+        &mut self,
+        skill_id: &str,
+        approval: &HumanApproval,
+        issued_at: i64,
+    ) -> Result<super::store::ApprovalAuthorization, LifecycleError> {
+        validate_human_approval(approval)?;
+        let artifact = self
+            .store
+            .get(skill_id)?
+            .ok_or_else(|| StoreError::NotFound(skill_id.to_string()))?;
+        let expires_at = issued_at
+            .checked_add(APPROVAL_AUTHORIZATION_LIFETIME_SECONDS)
+            .ok_or(LifecycleError::InvalidHumanApproval)?;
+        Ok(self
+            .store
+            .issue_approval_authorization_for_test(ApprovalAuthorizationRequest {
+                authorization_id: approval.approval_id.clone(),
+                principal: approval.actor_id.clone(),
+                artifact_id: skill_id.to_string(),
+                report_id: approval.evaluation_report_id.clone(),
+                manifest_digest: approval_manifest_digest(&artifact)?,
+                transition: ApprovalTransition::CanaryToActive,
+                issued_at,
+                expires_at,
+            })?)
+    }
+
     pub fn new(store: &'a mut SkillStore) -> Self {
         Self { store }
     }
@@ -621,6 +654,7 @@ impl<'a> LifecycleService<'a> {
         idempotency_key: &str,
         skill_id: &str,
         approval: &HumanApproval,
+        authorization: &super::store::ApprovalAuthorization,
         snapshot: &EvidenceSnapshot,
         created_at: i64,
     ) -> Result<TransitionOutcome, LifecycleError> {
@@ -658,21 +692,6 @@ impl<'a> LifecycleService<'a> {
             .store
             .get(skill_id)?
             .ok_or_else(|| LifecycleError::Store(StoreError::NotFound(skill_id.to_string())))?;
-        let expires_at = created_at
-            .checked_add(APPROVAL_AUTHORIZATION_LIFETIME_SECONDS)
-            .ok_or(LifecycleError::InvalidHumanApproval)?;
-        let authorization =
-            self.store
-                .issue_approval_authorization(ApprovalAuthorizationRequest {
-                    authorization_id: approval.approval_id.clone(),
-                    principal: approval.actor_id.clone(),
-                    artifact_id: skill_id.to_string(),
-                    report_id: approval.evaluation_report_id.clone(),
-                    manifest_digest: approval_manifest_digest(&artifact)?,
-                    transition: ApprovalTransition::CanaryToActive,
-                    issued_at: created_at,
-                    expires_at,
-                })?;
         let tx = self
             .store
             .connection_mut()
@@ -719,7 +738,7 @@ impl<'a> LifecycleService<'a> {
         }
         consume_approval_authorization(
             &tx,
-            &authorization,
+            authorization,
             &artifact,
             &approval.evaluation_report_id,
             ApprovalTransition::CanaryToActive,

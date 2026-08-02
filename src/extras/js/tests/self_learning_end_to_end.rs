@@ -76,6 +76,11 @@ fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
     lifecycle
         .record_root_canary_approval(&root_artifact.id, &first_approval, 1)
         .unwrap();
+    let second_approval =
+        HumanApproval::verified("phase5-root-activation", "owner", "root-report", 1).unwrap();
+    let root_authorization = lifecycle
+        .authorize_root_for_test(&root_artifact.id, &second_approval, 1)
+        .unwrap();
     drop(store);
 
     let embedder = Arc::new(Embedder::new().unwrap());
@@ -97,13 +102,12 @@ fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
         generation as i64,
     )
     .unwrap();
-    let second_approval =
-        HumanApproval::verified("phase5-root-activation", "owner", "root-report", 1).unwrap();
     CoordinatedLifecycle::new(&coordinator)
         .activate_root(
             "activate-root",
             &root_artifact.id,
             &second_approval,
+            &root_authorization,
             &activation_snapshot,
             2,
         )

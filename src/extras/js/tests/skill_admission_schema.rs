@@ -1,3 +1,6 @@
+use crate::extras::js::skills::lifecycle::{
+    EvidenceSnapshot, HumanApproval, LifecycleService, LifecycleStatus,
+};
 use crate::extras::js::skills::store::{
     AdminIdentity, EnqueueStatus, EvaluationReportRecord, HeldOutSuiteRecord, ProposalStatus,
     SkillStore, StoreError,
@@ -6,6 +9,7 @@ use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -131,6 +135,177 @@ fn skill_admission_schema_migrates_and_reopens() {
             .expect("version"),
         6
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_admission_schema_v6_backfills_v5_awaiting_approval_report_binding() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = artifact("/* v5-awaiting */");
+    let proposal = store
+        .enqueue_proposal(&artifact, None, 10)
+        .expect("enqueue");
+    let lease = store.claim_due_proposal("worker", 20, 5).unwrap().unwrap();
+    let evaluation = report(&lease.proposal_id, &lease.skill_id, lease.attempt);
+    store
+        .complete_evaluation(
+            &proposal.proposal_id,
+            "worker",
+            lease.row_version,
+            &evaluation,
+            22,
+        )
+        .expect("complete evaluation");
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions SET evaluation_report_id = NULL WHERE id = ?1",
+            [&artifact.id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute_batch(
+            "DROP TABLE skill_approval_authorizations;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(store);
+
+    let mut migrated = SkillStore::open_at(&paths).expect("migrate v5 awaiting approval");
+    let bound: Option<String> = migrated
+        .conn_mut()
+        .query_row(
+            "SELECT evaluation_report_id FROM skill_revisions WHERE id = ?1",
+            [&artifact.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bound.as_deref(), Some(evaluation.report_id.as_str()));
+    assert_eq!(migrated.schema_version().unwrap(), 6);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_admission_schema_v6_backfills_v5_root_canary_and_can_activate() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = artifact("/* v5-root-canary */");
+    let proposal = store
+        .enqueue_proposal(&artifact, None, 10)
+        .expect("enqueue");
+    let lease = store.claim_due_proposal("worker", 20, 5).unwrap().unwrap();
+    let evaluation = report(&lease.proposal_id, &lease.skill_id, lease.attempt);
+    store
+        .complete_evaluation(
+            &proposal.proposal_id,
+            "worker",
+            lease.row_version,
+            &evaluation,
+            22,
+        )
+        .expect("complete evaluation");
+    let proposal_version = store
+        .get_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap()
+        .row_version;
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO skill_approvals (
+                approval_id, proposal_id, skill_id, report_id, approver_id,
+                authenticated_at, approved_at, artifact_version,
+                proposal_version, generation
+             ) VALUES ('v5-first-approval', ?1, ?2, ?3, 'owner', 23, 23, 1, ?4, 1)",
+            rusqlite::params![
+                proposal.proposal_id,
+                artifact.id,
+                evaluation.report_id,
+                i64::try_from(proposal_version).unwrap(),
+            ],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_proposals SET status = 'approved', row_version = row_version + 1
+              WHERE proposal_id = ?1",
+            [&proposal.proposal_id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+                SET status = 'canary', row_version = 2, evaluation_report_id = NULL,
+                    lineage_root_id = id
+              WHERE id = ?1",
+            [&artifact.id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_generations SET desired_generation = 1 WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute_batch(
+            "DELETE FROM skill_lifecycle_approvals;
+             DROP TABLE skill_approval_authorizations;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(store);
+
+    let mut migrated = SkillStore::open_at(&paths).expect("migrate v5 root canary");
+    let backfilled: (Option<String>, i64) = migrated
+        .conn_mut()
+        .query_row(
+            "SELECT r.evaluation_report_id,
+                    (SELECT COUNT(*) FROM skill_lifecycle_approvals l
+                      WHERE l.skill_id = r.id AND l.approval_kind = 'phase4_canary')
+               FROM skill_revisions r WHERE r.id = ?1",
+            [&artifact.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(backfilled.0.as_deref(), Some(evaluation.report_id.as_str()));
+    assert_eq!(backfilled.1, 1);
+
+    let mut lifecycle = LifecycleService::new(&mut migrated);
+    lifecycle.register_policy("v6-migration", "{}", 24).unwrap();
+    let second =
+        HumanApproval::verified("v6-second-approval", "owner", evaluation.report_id, 2).unwrap();
+    let authorization = lifecycle
+        .authorize_root_for_test(&artifact.id, &second, 24)
+        .unwrap();
+    let snapshot = EvidenceSnapshot::new(
+        artifact.id.clone(),
+        None,
+        "v6-migration",
+        vec![],
+        BTreeMap::new(),
+        2,
+        None,
+        1,
+    )
+    .unwrap();
+    let active = lifecycle
+        .activate_root(
+            "v6-migrated-root",
+            &artifact.id,
+            &second,
+            &authorization,
+            &snapshot,
+            25,
+        )
+        .unwrap();
+    assert_eq!(active.status, LifecycleStatus::Active);
     let _ = std::fs::remove_dir_all(root);
 }
 

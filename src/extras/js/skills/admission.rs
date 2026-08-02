@@ -13,11 +13,14 @@ use std::time::Duration;
 use super::admission_store::AdmissionStore;
 use super::embed::{Embedder, SkillDocument};
 use super::held_out::{HeldOutError, HeldOutEvaluationReport, evaluate};
-#[cfg(test)]
-use super::store::ApprovalAuthorization;
 use super::store::{
     AdminIdentity, CanaryApprovalResult, EvaluationReportRecord, MAX_EVALUATION_ATTEMPTS,
     ProposalLease, ProposalStatus, SkillStore, StoreError,
+};
+#[cfg(test)]
+use super::store::{
+    ApprovalAuthorization, ApprovalAuthorizationRequest, ApprovalTransition,
+    approval_manifest_digest,
 };
 use super::verify::{TestResult, VerificationError};
 use super::{CapabilityManifest, SkillArtifact, SkillExport};
@@ -366,8 +369,7 @@ impl AdmissionEvaluator {
                     .ok_or(AdmissionError::UnauthenticatedApproval)?;
                 let mut admission = AdmissionStore::new(&mut self.store);
                 let authorization = admission.authorize_canary(
-                    decision.decision_id,
-                    decision.principal,
+                    &decision,
                     &artifact,
                     &report.report_id,
                     now,
@@ -506,14 +508,18 @@ impl AdmissionEvaluator {
         issued_at: i64,
         expires_at: i64,
     ) -> Result<ApprovalAuthorization, AdmissionError> {
-        Ok(AdmissionStore::new(&mut self.store).authorize_canary(
-            authorization_id.to_string(),
-            principal.to_string(),
-            artifact,
-            report_id,
-            issued_at,
-            expires_at,
-        )?)
+        Ok(self
+            .store
+            .issue_approval_authorization_for_test(ApprovalAuthorizationRequest {
+                authorization_id: authorization_id.to_string(),
+                principal: principal.to_string(),
+                artifact_id: artifact.id.clone(),
+                report_id: report_id.to_string(),
+                manifest_digest: approval_manifest_digest(artifact)?,
+                transition: ApprovalTransition::VerifiedToCanary,
+                issued_at,
+                expires_at,
+            })?)
     }
 
     #[cfg(test)]
@@ -869,6 +875,12 @@ pub(crate) struct AuthenticatedHumanDecision {
 }
 
 impl AuthenticatedHumanDecision {
+    /// Test-only stand-in for the parent authentication boundary.
+    ///
+    /// Production code cannot construct this capability from caller-provided strings. The
+    /// eventual UI/authentication adapter must live in this module and mint it only after its
+    /// authenticated interaction completes.
+    #[cfg(test)]
     pub(crate) fn verified(
         decision_id: impl Into<String>,
         principal: impl Into<String>,
@@ -879,6 +891,14 @@ impl AuthenticatedHumanDecision {
             principal: principal.into(),
             authenticated_at,
         }
+    }
+
+    pub(super) fn authorization_id(&self) -> &str {
+        &self.decision_id
+    }
+
+    pub(super) fn principal(&self) -> &str {
+        &self.principal
     }
 }
 

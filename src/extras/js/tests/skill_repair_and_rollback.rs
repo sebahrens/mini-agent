@@ -251,13 +251,30 @@ fn skill_root_activation_requires_two_authenticated_human_actions() {
         Err(LifecycleError::InvalidHumanApproval)
     ));
     let second = HumanApproval::verified("approval-phase5", "owner", "report-1", 1).unwrap();
+    let authorization = service
+        .authorize_root_for_test(&predecessor.id, &second, 2)
+        .unwrap();
     let activated = service
-        .activate_root("root-activation", &predecessor.id, &second, &snapshot, 3)
+        .activate_root(
+            "root-activation",
+            &predecessor.id,
+            &second,
+            &authorization,
+            &snapshot,
+            3,
+        )
         .unwrap();
     assert_eq!(activated.status, LifecycleStatus::Active);
     assert!(
         service
-            .activate_root("root-activation", &predecessor.id, &second, &snapshot, 4)
+            .activate_root(
+                "root-activation",
+                &predecessor.id,
+                &second,
+                &authorization,
+                &snapshot,
+                4,
+            )
             .unwrap()
             .replayed
     );

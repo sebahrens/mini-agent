@@ -1450,7 +1450,7 @@ impl SkillStore {
 
     /// Persist one exact parent-owned authorization before attempting its transition.
     /// A later transition failure therefore leaves a fresh token available for an exact retry.
-    pub(super) fn issue_approval_authorization(
+    fn issue_approval_authorization(
         &mut self,
         request: ApprovalAuthorizationRequest,
     ) -> Result<ApprovalAuthorization, StoreError> {
@@ -1594,6 +1594,29 @@ impl SkillStore {
             issued_at: request.issued_at,
             expires_at: request.expires_at,
         })
+    }
+
+    /// Mint canary authority only from the opaque result of the parent review interaction.
+    pub(super) fn issue_canary_approval_authorization(
+        &mut self,
+        decision: &super::admission::AuthenticatedHumanDecision,
+        request: ApprovalAuthorizationRequest,
+    ) -> Result<ApprovalAuthorization, StoreError> {
+        if request.transition != ApprovalTransition::VerifiedToCanary
+            || request.authorization_id != decision.authorization_id()
+            || request.principal != decision.principal()
+        {
+            return Err(StoreError::Unauthorized);
+        }
+        self.issue_approval_authorization(request)
+    }
+
+    #[cfg(test)]
+    pub(super) fn issue_approval_authorization_for_test(
+        &mut self,
+        request: ApprovalAuthorizationRequest,
+    ) -> Result<ApprovalAuthorization, StoreError> {
+        self.issue_approval_authorization(request)
     }
 
     pub(super) fn approve_canary_transaction(
@@ -2783,8 +2806,64 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
     // lifecycle evidence. A token is consumed only inside the transition transaction.
     if current_version < 6 {
         db.execute_batch("BEGIN IMMEDIATE;")?;
-        let migration = db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS skill_approval_authorizations (
+        let migration = (|| -> Result<(), StoreError> {
+            let invalid_legacy_approval: i64 = db.query_row(
+                "SELECT COUNT(*)
+                   FROM skill_proposals p
+                   LEFT JOIN evaluation_reports e ON e.report_id = p.report_id
+                  WHERE p.status IN ('awaiting_approval', 'approved')
+                    AND (e.report_id IS NULL
+                         OR e.proposal_id <> p.proposal_id
+                         OR e.skill_id <> p.skill_id
+                         OR e.outcome <> 'passed'
+                         OR length(e.report_id) <> 64
+                         OR e.report_id GLOB '*[^0-9a-f]*')",
+                [],
+                |row| row.get(0),
+            )?;
+            if invalid_legacy_approval != 0 {
+                return Err(StoreError::CorruptRow(
+                    "v5 approval/report binding is ambiguous or invalid".to_string(),
+                ));
+            }
+
+            db.execute_batch(
+                "UPDATE skill_revisions
+                    SET evaluation_report_id = (
+                        SELECT p.report_id
+                          FROM skill_proposals p
+                          JOIN evaluation_reports e ON e.report_id = p.report_id
+                         WHERE p.skill_id = skill_revisions.id
+                           AND p.status IN ('awaiting_approval', 'approved')
+                           AND e.proposal_id = p.proposal_id
+                           AND e.skill_id = p.skill_id
+                           AND e.outcome = 'passed'
+                    )
+                  WHERE evaluation_report_id IS NULL
+                    AND 1 = (
+                        SELECT COUNT(*)
+                          FROM skill_proposals p
+                          JOIN evaluation_reports e ON e.report_id = p.report_id
+                         WHERE p.skill_id = skill_revisions.id
+                           AND p.status IN ('awaiting_approval', 'approved')
+                           AND e.proposal_id = p.proposal_id
+                           AND e.skill_id = p.skill_id
+                           AND e.outcome = 'passed'
+                    );
+
+                 INSERT OR IGNORE INTO skill_lifecycle_approvals (
+                     approval_id, skill_id, approval_kind, actor_id,
+                     artifact_row_version, evaluation_report_id, created_at
+                 )
+                 SELECT a.approval_id, a.skill_id, 'phase4_canary', a.approver_id,
+                        a.artifact_version + 1, a.report_id, a.approved_at
+                   FROM skill_approvals a
+                   JOIN skill_revisions r ON r.id = a.skill_id
+                  WHERE r.status IN ('canary', 'active')
+                    AND r.supersedes_id IS NULL
+                    AND r.evaluation_report_id = a.report_id;
+
+                 CREATE TABLE IF NOT EXISTS skill_approval_authorizations (
                 authorization_id TEXT PRIMARY KEY,
                 principal        TEXT NOT NULL,
                 artifact_id      TEXT NOT NULL,
@@ -2808,9 +2887,41 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
             CREATE INDEX IF NOT EXISTS skill_approval_authorizations_binding_idx
                 ON skill_approval_authorizations(
                     artifact_id, report_id, transition, consumed_at, expires_at
-                );
-            PRAGMA user_version = 6;",
-        );
+                );",
+            )?;
+
+            let stranded: i64 = db.query_row(
+                "SELECT COUNT(*)
+                  FROM skill_proposals p
+                   JOIN skill_revisions r ON r.id = p.skill_id
+                  WHERE p.status IN ('awaiting_approval', 'approved')
+                    AND r.evaluation_report_id IS NOT p.report_id",
+                [],
+                |row| row.get(0),
+            )?;
+            let stranded_root_canary: i64 = db.query_row(
+                "SELECT COUNT(*)
+                   FROM skill_approvals a
+                   JOIN skill_revisions r ON r.id = a.skill_id
+                   LEFT JOIN skill_lifecycle_approvals l
+                     ON l.skill_id = a.skill_id AND l.approval_kind = 'phase4_canary'
+                  WHERE r.status = 'canary' AND r.supersedes_id IS NULL
+                    AND (l.approval_id IS NULL
+                         OR l.approval_id IS NOT a.approval_id
+                         OR l.actor_id IS NOT a.approver_id
+                         OR l.artifact_row_version IS NOT a.artifact_version + 1
+                         OR l.evaluation_report_id IS NOT a.report_id)",
+                [],
+                |row| row.get(0),
+            )?;
+            if stranded != 0 || stranded_root_canary != 0 {
+                return Err(StoreError::CorruptRow(
+                    "v5 approval lifecycle state could not be backfilled exactly".to_string(),
+                ));
+            }
+            db.pragma_update(None, "user_version", 6)?;
+            Ok(())
+        })();
         match migration {
             Ok(()) => db.execute_batch("COMMIT;")?,
             Err(error) => {
