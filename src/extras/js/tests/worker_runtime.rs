@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,9 @@ use crate::extras::js::supervisor::{
     EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
 };
 use crate::extras::js::types::PermCancellation;
-use crate::sandbox::worker::{TestWorkerLauncher, WorkerLauncher};
+use crate::sandbox::worker::{
+    TestSupervisorStartup, TestWorkerLauncher, WorkerLaunchError, WorkerLauncher, WorkerProcess,
+};
 
 const TEST_CREDENTIAL_CANARY: &str = "A07_CREDENTIAL_CANARY_MUST_NOT_LEAK";
 const TEST_CONFIG_CANARY: &str = "A07_CONFIG_CANARY_MUST_NOT_LEAK";
@@ -931,6 +933,261 @@ fn scripted_supervisor(stderr_bytes: usize) -> Arc<JsWorkerSupervisor> {
     ))
 }
 
+#[derive(Clone)]
+struct RecoveryLauncher {
+    first_startup: TestSupervisorStartup,
+    launches: Arc<AtomicUsize>,
+    live_processes: Arc<AtomicUsize>,
+}
+
+impl RecoveryLauncher {
+    fn new(first_startup: TestSupervisorStartup) -> Self {
+        Self {
+            first_startup,
+            launches: Arc::new(AtomicUsize::new(0)),
+            live_processes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    async fn wait_for_live_processes(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.live_processes.load(Ordering::Acquire) != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "expected {expected} live worker processes, observed {}",
+                self.live_processes.load(Ordering::Acquire)
+            )
+        });
+    }
+}
+
+impl WorkerLauncher for RecoveryLauncher {
+    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
+        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
+    }
+
+    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        let startup = if self.launches.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.first_startup
+        } else {
+            TestSupervisorStartup::Healthy
+        };
+        let mut process =
+            TestWorkerLauncher::scripted_internal_worker_with_startup(0, startup).launch()?;
+        process.observe_reap_for_test(self.live_processes.clone());
+        Ok(process)
+    }
+}
+
+fn recovery_supervisor(
+    first_startup: TestSupervisorStartup,
+    watchdog: Duration,
+) -> (Arc<JsWorkerSupervisor>, RecoveryLauncher) {
+    let launcher = RecoveryLauncher::new(first_startup);
+    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        launcher.clone(),
+        watchdog,
+    ));
+    (supervisor, launcher)
+}
+
+async fn execute_success(supervisor: &JsWorkerSupervisor) -> StepResult {
+    supervisor
+        .execute(
+            RunStep {
+                code: "success".into(),
+            },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .expect("worker supervisor must recover on the next invocation")
+}
+
+async fn assert_fault_then_recovery(
+    first_startup: TestSupervisorStartup,
+    code: &str,
+    expected_error: WorkerError,
+) {
+    let (supervisor, launcher) = recovery_supervisor(first_startup, Duration::from_secs(2));
+    let error = supervisor
+        .execute(
+            RunStep { code: code.into() },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await;
+    assert_eq!(error, Err(expected_error));
+    let recovered = execute_success(&supervisor).await;
+    assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
+    launcher.wait_for_live_processes(1).await;
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_recovery_startup_exit_malformed_ready_and_pure_crash() {
+    assert_fault_then_recovery(
+        TestSupervisorStartup::ExitBeforeReady,
+        "success",
+        WorkerError::Transport,
+    )
+    .await;
+    assert_fault_then_recovery(
+        TestSupervisorStartup::MalformedReady,
+        "success",
+        WorkerError::Transport,
+    )
+    .await;
+    assert_fault_then_recovery(
+        TestSupervisorStartup::Healthy,
+        "crash",
+        WorkerError::Transport,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler() {
+    let (supervisor, launcher) =
+        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(2));
+    let gated = GatedEffects::new();
+    let task_supervisor = supervisor.clone();
+    let task_effects = gated.clone();
+    let task = tokio::spawn(async move {
+        task_supervisor
+            .execute(
+                RunStep {
+                    code: "crash-pending-effect".into(),
+                },
+                task_effects,
+                PermCancellation::new(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), gated.wait_started())
+        .await
+        .expect("fake effect did not become pending");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker crash waited for the whole-call watchdog")
+            .unwrap(),
+        Err(WorkerError::Transport)
+    );
+    assert!(gated.dropped.load(Ordering::Acquire));
+    assert!(
+        gated
+            .cancellation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_cancelled()
+    );
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    launcher.wait_for_live_processes(1).await;
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_recovery_watchdog_caller_drop_and_stale_old_process() {
+    let (supervisor, launcher) =
+        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_millis(100));
+    assert_eq!(
+        supervisor
+            .execute(
+                RunStep {
+                    code: "deadline".into(),
+                },
+                RecordingEffects::default(),
+                PermCancellation::new(),
+            )
+            .await,
+        Err(WorkerError::TimedOut)
+    );
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+
+    let gated = GatedEffects::new();
+    let task_supervisor = supervisor.clone();
+    let task_effects = gated.clone();
+    let dropped = tokio::spawn(async move {
+        task_supervisor
+            .execute(
+                RunStep {
+                    code: "effect-pending".into(),
+                },
+                task_effects,
+                PermCancellation::new(),
+            )
+            .await
+    });
+    gated.wait_started().await;
+    dropped.abort();
+    assert!(dropped.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+
+    let stale = supervisor
+        .execute(
+            RunStep {
+                code: "stale-response".into(),
+            },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await;
+    assert_eq!(stale, Err(WorkerError::Transport));
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into()),
+        "an old-process response poisoned the recovered connection"
+    );
+
+    launcher.wait_for_live_processes(1).await;
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_recovery_clean_shutdown_reaps_and_restarts() {
+    let (supervisor, launcher) =
+        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(2));
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    let generation = supervisor.generation_for_test().await.unwrap();
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    assert!(supervisor.generation_for_test().await.unwrap() > generation);
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+}
+
 fn held_out_verification() -> VerifyArtifact {
     VerifyArtifact {
         artifact: ArtifactInput {
@@ -1192,6 +1449,11 @@ fn worker_supervisor_transport_rejects_verify_blocking_inside_tokio_and_keeps_st
 }
 
 fn run_scripted_supervisor_worker() -> ! {
+    let startup =
+        std::env::var("MINI_AGENT_TEST_SUPERVISOR_STARTUP").unwrap_or_else(|_| "healthy".into());
+    if startup == "exit-before-ready" {
+        std::process::exit(71);
+    }
     let stderr_bytes = std::env::var("MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -1216,6 +1478,11 @@ fn run_scripted_supervisor_worker() -> ! {
     let mut output = stdout.lock();
     let hello: ParentWireFrame = read_frame(&mut input).unwrap();
     protocol.on_receive(&hello).unwrap();
+    if startup == "malformed-ready" {
+        output.write_all(&[0, 0, 0, 1, b'{']).unwrap();
+        output.flush().unwrap();
+        std::process::exit(72);
+    }
     let ready = WireFrame::connection(build.clone(), 1, WorkerFrame::Ready(WorkerReady {}));
     protocol.on_send(&ready).unwrap();
     write_frame(&mut output, &ready).unwrap();
@@ -1224,13 +1491,40 @@ fn run_scripted_supervisor_worker() -> ! {
     loop {
         let request: ParentWireFrame = read_frame(&mut input).unwrap();
         protocol.on_receive(&request).unwrap();
-        let invocation = request.invocation_id.clone().unwrap();
         match request.message {
             ParentFrame::RunStep(step) => {
+                let invocation = request.invocation_id.clone().unwrap();
+                match step.code.as_str() {
+                    "crash" => std::process::exit(73),
+                    "deadline" => std::thread::park_timeout(Duration::from_secs(30)),
+                    "stale-response" => {
+                        #[cfg(unix)]
+                        {
+                            use std::process::{Command, Stdio};
+
+                            let executable = std::env::current_exe().unwrap();
+                            Command::new(executable)
+                                .env_clear()
+                                .env("MINI_AGENT_TEST_STALE_WRITER", "1")
+                                .args([
+                                    "--exact",
+                                    "extras::js::tests::worker_runtime::worker_bootstrap_test_child",
+                                    "--nocapture",
+                                ])
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::inherit())
+                                .stderr(Stdio::null())
+                                .spawn()
+                                .unwrap();
+                        }
+                        std::process::exit(74);
+                    }
+                    _ => {}
+                }
                 let mut sequence = request.sequence + 1;
                 let effect_count = match step.code.as_str() {
                     "two-effects" => 2,
-                    "effect-pending" => 1,
+                    "effect-pending" | "crash-pending-effect" => 1,
                     _ => 0,
                 };
                 for ordinal in 0..effect_count {
@@ -1250,6 +1544,10 @@ fn run_scripted_supervisor_worker() -> ! {
                     protocol.on_send(&effect).unwrap();
                     write_frame(&mut output, &effect).unwrap();
                     output.flush().unwrap();
+                    if step.code == "crash-pending-effect" {
+                        std::thread::sleep(Duration::from_millis(30));
+                        std::process::exit(75);
+                    }
                     let response: ParentWireFrame = read_frame(&mut input).unwrap();
                     assert!(matches!(response.message, ParentFrame::EffectResponse(_)));
                     protocol.on_receive(&response).unwrap();
@@ -1275,6 +1573,7 @@ fn run_scripted_supervisor_worker() -> ! {
                 output.flush().unwrap();
             }
             ParentFrame::VerifyArtifact(verification) => {
+                let invocation = request.invocation_id.clone().unwrap();
                 let mut cases = verification
                     .artifact
                     .tests
@@ -1320,6 +1619,13 @@ fn run_scripted_supervisor_worker() -> ! {
 
 #[test]
 fn worker_bootstrap_test_child() {
+    if std::env::var_os("MINI_AGENT_TEST_STALE_WRITER").is_some() {
+        std::thread::sleep(Duration::from_millis(200));
+        let mut output = std::io::stdout().lock();
+        let _ = output.write_all(&[0, 0, 0, 1, b'{']);
+        let _ = output.flush();
+        return;
+    }
     if crate::sandbox::worker::is_internal_worker_marker_present() {
         for key in [
             "PATH",

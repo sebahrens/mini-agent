@@ -96,8 +96,15 @@ arguments, file or response contents, environment values, or secrets.
 verification requests. The shared state retains only process, protocol, generation, and bounded
 stderr-drain data; per-invocation effect authority remains method-local. Dropping or cancelling an
 in-flight lease invalidates that worker connection, so the next independent request launches a
-new generation. Watchdog, exhaustive fault recovery, and bounded group reaping remain separate
-Phase 6 delivery units; this module boundary does not mark Phase 6 as delivered.
+new generation. One 30-second watchdog starts before lease acquisition and covers startup, IPC,
+execution, and pending parent effects. A worker exit is observed while reads and effects are
+pending, and any startup fault, malformed frame, crash, cancellation, deadline, or caller-future
+drop destroys the connection instead of attempting resynchronization. Cleanup closes/kills the
+backend-owned containment tree and reaps its root within a fixed bound; the platform
+`WorkerProcess` abstraction supplies Unix process-group or Windows Job teardown. A graceful
+shutdown sends the closed `Shutdown` frame, waits within the same bound, and still performs tree
+cleanup. The next independent request always receives a new generation, so delayed output from
+an old process cannot enter its protocol stream.
 
 ## Wire protocol
 

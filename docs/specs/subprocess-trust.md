@@ -132,7 +132,7 @@ The audit currently resolves as follows:
 | `TC-INTERNAL-VERIFICATION` | Fixed embedded-policy Bash constructor/status in `src/extras/loop/mod.rs`. |
 | `TC-LIFECYCLE-HELPER` | Production process-group `kill` constructors/status terminals in `src/sandbox.rs`. |
 | `TEST-ONLY` | Inline Bash-tool and loop-validation process-existence helpers, plus the unconfined protocol-pipe worker fixture in `src/sandbox/worker.rs`. |
-| `NON-PROCESS` | Lexical exclusions in ACP, export/HTTP, JS runtime/skill thread tasks, fake verification, source comments, and assertions that legacy loop callers contain no raw Tokio process constructor. |
+| `NON-PROCESS` | Lexical exclusions in ACP, export/HTTP, JS runtime/supervisor/skill thread tasks, fake verification, source comments, and assertions that legacy loop callers contain no raw Tokio process constructor. |
 
 ## Review and change rules
 

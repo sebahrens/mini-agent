@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::protocol::{
     BuildIdentity, EffectRequest, EffectResponse, EffectResult, FrameError, InvocationId,
@@ -23,6 +23,9 @@ use crate::sandbox::worker::{
 };
 
 const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub(crate) type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectResult> + Send + 'a>>;
 
@@ -68,6 +71,7 @@ struct SupervisorInner {
     launcher: Arc<dyn WorkerLauncher>,
     active_generation: AtomicU64,
     accepts_test_preamble: bool,
+    watchdog: Duration,
 }
 
 struct SupervisorState {
@@ -94,9 +98,35 @@ struct BoundedStderrDrain {
 
 impl Drop for BoundedStderrDrain {
     fn drop(&mut self) {
-        // A10 owns bounded join/reap. Detaching here never blocks Drop; WorkerProcess Drop closes
-        // the peer by terminating the child, so the reader exits without retaining payload bytes.
+        // A standalone drain still never makes Drop unbounded. WorkerConnection performs the
+        // ordered process teardown and bounded join before its fields are destroyed.
         let _ = self.thread.take();
+    }
+}
+
+impl BoundedStderrDrain {
+    fn join_bounded(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+impl Drop for WorkerConnection {
+    fn drop(&mut self) {
+        let _ = self.process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
+        self.stderr_drain.join_bounded(STDERR_JOIN_TIMEOUT);
     }
 }
 
@@ -104,11 +134,21 @@ impl JsWorkerSupervisor {
     pub(crate) fn shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<JsWorkerSupervisor>> = OnceLock::new();
         SHARED
-            .get_or_init(|| Arc::new(Self::new(Arc::new(ProductionWorkerLauncher), false)))
+            .get_or_init(|| {
+                Arc::new(Self::new(
+                    Arc::new(ProductionWorkerLauncher),
+                    false,
+                    STEP_TIMEOUT,
+                ))
+            })
             .clone()
     }
 
-    fn new(launcher: Arc<dyn WorkerLauncher>, accepts_test_preamble: bool) -> Self {
+    fn new(
+        launcher: Arc<dyn WorkerLauncher>,
+        accepts_test_preamble: bool,
+        watchdog: Duration,
+    ) -> Self {
         Self(Arc::new(SupervisorInner {
             transport: tokio::sync::Mutex::new(SupervisorState {
                 idle: None,
@@ -118,12 +158,21 @@ impl JsWorkerSupervisor {
             launcher,
             active_generation: AtomicU64::new(0),
             accepts_test_preamble,
+            watchdog,
         }))
     }
 
     #[cfg(test)]
     pub(crate) fn with_launcher_for_test(launcher: impl WorkerLauncher + 'static) -> Self {
-        Self::new(Arc::new(launcher), true)
+        Self::new(Arc::new(launcher), true, STEP_TIMEOUT)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_launcher_and_watchdog_for_test(
+        launcher: impl WorkerLauncher + 'static,
+        watchdog: Duration,
+    ) -> Self {
+        Self::new(Arc::new(launcher), true, watchdog)
     }
 
     pub(crate) async fn execute(
@@ -177,7 +226,9 @@ impl JsWorkerSupervisor {
         mut effects: Option<&mut H>,
         cancellation: PermCancellation,
     ) -> Result<InvocationTerminal, WorkerError> {
-        let deadline = Instant::now() + STEP_TIMEOUT;
+        // The single deadline starts before lease acquisition and therefore bounds queueing,
+        // startup, protocol I/O, JavaScript execution, and parent-brokered effect handling.
+        let deadline = Instant::now() + self.0.watchdog;
         let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
         let mut connection = match state.idle.take() {
             Some(connection) => connection,
@@ -222,6 +273,50 @@ impl JsWorkerSupervisor {
         active.armed = false;
         self.0.active_generation.store(0, Ordering::Release);
         result
+    }
+
+    /// Gracefully retires the current idle generation, with forced tree cleanup on any fault.
+    pub(crate) async fn shutdown(&self) -> Result<(), WorkerError> {
+        let cancellation = PermCancellation::new();
+        let deadline = Instant::now() + self.0.watchdog;
+        let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
+        let Some(mut connection) = state.idle.take() else {
+            return Ok(());
+        };
+        let frame = WireFrame::connection(
+            connection.build.clone(),
+            connection.sequence,
+            ParentFrame::Shutdown,
+        );
+        connection
+            .protocol
+            .on_send(&frame)
+            .map_err(|_| WorkerError::Protocol)?;
+        write_parent(&connection, frame, &cancellation, deadline).await?;
+        loop {
+            if let Some(status) = connection
+                .process
+                .try_wait()
+                .map_err(|_| WorkerError::Transport)?
+            {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(WorkerError::Transport)
+                };
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    return Err(WorkerError::TimedOut);
+                }
+                _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn shutdown_for_test(&self) -> Result<(), WorkerError> {
+        self.shutdown().await
     }
 
     #[cfg(test)]
@@ -332,7 +427,13 @@ async fn launch_connection(
         .map_err(|_| WorkerError::Protocol)?;
     write_parent(&connection, hello, cancellation, deadline).await?;
     connection.sequence = 1;
-    let ready = read_worker(&connection, accepts_test_preamble, cancellation, deadline).await?;
+    let ready = read_worker(
+        &mut connection,
+        accepts_test_preamble,
+        cancellation,
+        deadline,
+    )
+    .await?;
     connection
         .protocol
         .on_receive(&ready)
@@ -386,12 +487,22 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     cancellation: effect_cancellation.clone(),
                     armed: true,
                 };
-                let result = await_controlled(
-                    handler.handle_effect(request.clone(), effect_cancellation),
-                    cancellation,
-                    deadline,
-                )
-                .await?;
+                let mut effect = handler.handle_effect(request.clone(), effect_cancellation);
+                let result = loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return Err(WorkerError::Cancelled),
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                            return Err(WorkerError::TimedOut);
+                        }
+                        result = &mut effect => break result,
+                        _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
+                            if connection.process.try_wait().map_err(|_| WorkerError::Transport)?.is_some() {
+                                return Err(WorkerError::Transport);
+                            }
+                        }
+                    }
+                };
                 cancel_on_drop.armed = false;
                 let response = WireFrame::invocation(
                     connection.build.clone(),
@@ -444,7 +555,7 @@ async fn write_parent(
 }
 
 async fn read_worker(
-    connection: &WorkerConnection,
+    connection: &mut WorkerConnection,
     accepts_test_preamble: bool,
     cancellation: &PermCancellation,
     deadline: Instant,
@@ -455,14 +566,34 @@ async fn read_worker(
         .output
         .try_clone()
         .map_err(|_| WorkerError::Transport)?;
-    let task = tokio::task::spawn_blocking(move || {
+    let mut task = tokio::task::spawn_blocking(move || {
         let result = read_worker_frame(&mut output, accepts_test_preamble);
         TaggedIo { generation, result }
     });
-    let tagged = await_controlled(task, cancellation, deadline)
-        .await?
-        .map_err(|_| WorkerError::Transport)?;
+    let tagged = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(WorkerError::Cancelled),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(WorkerError::TimedOut);
+            }
+            tagged = &mut task => break tagged.map_err(|_| WorkerError::Transport)?,
+            _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
+                if connection.process.try_wait().map_err(|_| WorkerError::Transport)?.is_some() {
+                    return Err(WorkerError::Transport);
+                }
+            }
+        }
+    };
     validate_generation(connection.generation, tagged.generation)?;
+    if connection
+        .process
+        .try_wait()
+        .map_err(|_| WorkerError::Transport)?
+        .is_some()
+    {
+        return Err(WorkerError::Transport);
+    }
     tagged.result.map_err(|_| WorkerError::Transport)
 }
 

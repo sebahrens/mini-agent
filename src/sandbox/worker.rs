@@ -10,6 +10,12 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::process::ExitStatus;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) const INTERNAL_WORKER_MARKER: &str = "MINI_AGENT_INTERNAL_JS_WORKER";
 pub(crate) const INTERNAL_WORKER_MARKER_VALUE: &str = "brokered-v1";
@@ -142,6 +148,8 @@ pub(crate) struct WorkerProcess {
     pub(crate) output: File,
     pub(crate) stderr: File,
     pub(crate) backend: WorkerBackend,
+    #[cfg(test)]
+    reap_observer: Option<Arc<AtomicUsize>>,
 }
 
 impl WorkerProcess {
@@ -154,23 +162,81 @@ impl WorkerProcess {
     }
 
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.process.try_wait()
+        let status = self.process.try_wait()?;
+        if status.is_some() {
+            self.notify_reaped();
+        }
+        Ok(status)
     }
 
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.process.wait()
+        let status = self.process.wait()?;
+        self.notify_reaped();
+        Ok(status)
     }
+
+    /// Terminates the complete containment tree and waits a bounded time for its root to reap.
+    pub(crate) fn terminate_and_reap(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let root_status = self.try_wait()?;
+        // Teardown must target the containment tree even if the root has already exited: an old
+        // descendant may still own a protocol-pipe clone and otherwise outlive its generation.
+        let termination_error = self.terminate_tree().err();
+        if let Some(status) = root_status {
+            return Ok(status);
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(termination_error.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "JavaScript worker did not exit before the bounded reap deadline",
+                    )
+                }));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_reap_for_test(&mut self, observer: Arc<AtomicUsize>) {
+        assert!(
+            self.reap_observer.is_none(),
+            "reap observer already installed"
+        );
+        observer.fetch_add(1, Ordering::AcqRel);
+        self.reap_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    fn notify_reaped(&mut self) {
+        if let Some(observer) = self.reap_observer.take() {
+            observer.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn notify_reaped(&mut self) {}
 }
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        if self.process.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        // Drop is a last-resort tree kill and must never block. The
-        // supervisor owns the explicit bounded reap path.
-        let _ = self.process.terminate_tree();
+        // This is the last-resort path for cancellation by caller-future drop. It is bounded so
+        // synchronous destruction cannot hang an async executor indefinitely.
+        let _ = self.terminate_and_reap(Duration::from_millis(500));
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestSupervisorStartup {
+    Healthy,
+    ExitBeforeReady,
+    MalformedReady,
 }
 
 #[cfg(test)]
@@ -182,6 +248,7 @@ enum TestWorkerTarget {
         max_pending_jobs: Option<usize>,
         supervisor_script: bool,
         stderr_bytes: usize,
+        startup: TestSupervisorStartup,
     },
 }
 
@@ -213,6 +280,7 @@ impl TestWorkerLauncher {
                 max_pending_jobs: None,
                 supervisor_script: false,
                 stderr_bytes: 0,
+                startup: TestSupervisorStartup::Healthy,
             },
         }
     }
@@ -228,6 +296,7 @@ impl TestWorkerLauncher {
                 max_pending_jobs: Some(max_pending_jobs),
                 supervisor_script: false,
                 stderr_bytes: 0,
+                startup: TestSupervisorStartup::Healthy,
             },
         }
     }
@@ -240,6 +309,22 @@ impl TestWorkerLauncher {
                 max_pending_jobs: None,
                 supervisor_script: true,
                 stderr_bytes,
+                startup: TestSupervisorStartup::Healthy,
+            },
+        }
+    }
+
+    pub(crate) const fn scripted_internal_worker_with_startup(
+        stderr_bytes: usize,
+        startup: TestSupervisorStartup,
+    ) -> Self {
+        Self {
+            target: TestWorkerTarget::InternalWorker {
+                timeout_ms: None,
+                max_pending_jobs: None,
+                supervisor_script: true,
+                stderr_bytes,
+                startup,
             },
         }
     }
@@ -282,6 +367,7 @@ impl WorkerLauncher for TestWorkerLauncher {
                 max_pending_jobs,
                 supervisor_script,
                 stderr_bytes,
+                startup,
             } => {
                 command
                     .env(INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE)
@@ -303,6 +389,14 @@ impl WorkerLauncher for TestWorkerLauncher {
                     command.env("MINI_AGENT_TEST_SUPERVISOR_SCRIPT", "1").env(
                         "MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES",
                         stderr_bytes.to_string(),
+                    );
+                    command.env(
+                        "MINI_AGENT_TEST_SUPERVISOR_STARTUP",
+                        match startup {
+                            TestSupervisorStartup::Healthy => "healthy",
+                            TestSupervisorStartup::ExitBeforeReady => "exit-before-ready",
+                            TestSupervisorStartup::MalformedReady => "malformed-ready",
+                        },
                     );
                 }
             }
@@ -332,6 +426,7 @@ impl WorkerLauncher for TestWorkerLauncher {
             output: child_stdout_file(output),
             stderr: child_stderr_file(stderr),
             backend,
+            reap_observer: None,
         })
     }
 }
