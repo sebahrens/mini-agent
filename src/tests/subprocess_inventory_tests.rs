@@ -1,5 +1,79 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalCall {
+    line: usize,
+    name: String,
+    guarded: bool,
+}
+
+fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
+    fn is_terminal(name: &str) -> bool {
+        matches!(
+            name,
+            "spawn" | "output" | "status" | "spawn_guarded" | "output_guarded" | "status_guarded"
+        )
+    }
+
+    fn is_method_or_ufcs(tokens: &[TokenTree], index: usize) -> bool {
+        let punct = |token: Option<&TokenTree>, expected| matches!(token, Some(TokenTree::Punct(punct)) if punct.as_char() == expected);
+        if punct(index.checked_sub(1).and_then(|i| tokens.get(i)), '.') {
+            return true;
+        }
+        if !punct(index.checked_sub(1).and_then(|i| tokens.get(i)), ':')
+            || !punct(index.checked_sub(2).and_then(|i| tokens.get(i)), ':')
+        {
+            return false;
+        }
+        let Some(TokenTree::Ident(owner)) = index.checked_sub(3).and_then(|i| tokens.get(i)) else {
+            return false;
+        };
+        !matches!(
+            owner.to_string().as_str(),
+            // These are reviewed task/thread or domain constructors, not OS-process terminals.
+            // Every other UFCS owner fails closed unless its exact line is inventoried NON-PROCESS.
+            "tokio" | "thread" | "LspClient" | "SanitizedTarget"
+        )
+    }
+
+    fn scan(stream: TokenStream, calls: &mut Vec<TerminalCall>) {
+        let tokens: Vec<_> = stream.into_iter().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if let TokenTree::Group(group) = token {
+                scan(group.stream(), calls);
+            }
+            let TokenTree::Ident(ident) = token else {
+                continue;
+            };
+            let name = ident.to_string();
+            if !is_terminal(&name) || !is_method_or_ufcs(&tokens, index) {
+                continue;
+            }
+            let Some(TokenTree::Group(arguments)) = tokens.get(index + 1) else {
+                continue;
+            };
+            if arguments.delimiter() != Delimiter::Parenthesis {
+                continue;
+            }
+            calls.push(TerminalCall {
+                line: ident.span().start().line,
+                guarded: name.ends_with("_guarded"),
+                name,
+            });
+        }
+    }
+
+    let stream = TokenStream::from_str(source)
+        .map_err(|error| format!("Rust source did not tokenize: {error}"))?;
+    let mut calls = Vec::new();
+    scan(stream, &mut calls);
+    calls.sort_by_key(|call| call.line);
+    Ok(calls)
+}
 
 /// `(path, trimmed source fingerprint, occurrence count, trust class)`.
 ///
@@ -849,6 +923,53 @@ fn normalized_inventory_line(line: &str) -> String {
         .replace(".status_guarded(", ".status(")
 }
 
+fn creation_boundary_violations(
+    relative: &str,
+    contents: &str,
+    expected: &BTreeMap<(String, String, usize), &'static str>,
+) -> Result<Vec<String>, String> {
+    let mut seen = BTreeMap::<(String, String), usize>::new();
+    let mut classes_by_line = BTreeMap::<usize, Vec<&'static str>>::new();
+
+    for (line_index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if !is_inventory_line(line) {
+            continue;
+        }
+        let normalized = normalized_inventory_line(line);
+        let fingerprint = (relative.to_string(), normalized);
+        let occurrence = seen.entry(fingerprint.clone()).or_default();
+        *occurrence += 1;
+        if let Some(&classification) = expected.get(&(fingerprint.0, fingerprint.1, *occurrence)) {
+            classes_by_line
+                .entry(line_index + 1)
+                .or_default()
+                .push(classification);
+        }
+    }
+
+    let mut violations = Vec::new();
+    for call in terminal_calls(contents)? {
+        if call.guarded {
+            continue;
+        }
+        match classes_by_line.get(&call.line) {
+            Some(classes) if classes.iter().all(|class| !class.starts_with("TC-")) => {}
+            Some(classes) => violations.push(format!(
+                "{relative}:{} unguarded {} terminal classified as {}",
+                call.line,
+                call.name,
+                classes.join("/")
+            )),
+            None => violations.push(format!(
+                "{relative}:{} unrecognized unguarded {} terminal",
+                call.line, call.name
+            )),
+        }
+    }
+    Ok(violations)
+}
+
 #[test]
 fn production_subprocess_sites_have_a_trust_classification() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -921,7 +1042,6 @@ fn windows_capable_production_process_terminals_use_creation_boundary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source_root = root.join("src");
     let expected = checked_inventory();
-    let mut seen = BTreeMap::<(String, String), usize>::new();
     let mut unguarded = Vec::new();
 
     for source in rust_sources(&source_root) {
@@ -941,30 +1061,10 @@ fn windows_capable_production_process_terminals_use_creation_boundary() {
             continue;
         }
         let contents = std::fs::read_to_string(&source).expect("Rust source must be UTF-8");
-        for line in contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| is_inventory_line(line))
-        {
-            let normalized = normalized_inventory_line(line);
-            let fingerprint = (relative.clone(), normalized.clone());
-            let occurrence = seen.entry(fingerprint.clone()).or_default();
-            *occurrence += 1;
-            let Some(classification) =
-                expected.get(&(fingerprint.0.clone(), fingerprint.1.clone(), *occurrence))
-            else {
-                continue;
-            };
-            let is_terminal = normalized.contains(".spawn(")
-                || normalized.contains(".output(")
-                || normalized.contains(".status(");
-            let is_guarded = line.contains(".spawn_guarded(")
-                || line.contains(".output_guarded(")
-                || line.contains(".status_guarded(");
-            if classification.starts_with("TC-") && is_terminal && !is_guarded {
-                unguarded.push((relative.clone(), line.to_string(), *classification));
-            }
-        }
+        unguarded.extend(
+            creation_boundary_violations(&relative, &contents, &expected)
+                .unwrap_or_else(|error| panic!("could not inspect {relative}: {error}")),
+        );
     }
 
     assert!(
@@ -1052,4 +1152,107 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
             "ownership validation accepted relabeling {description} as {replacement}"
         );
     }
+}
+
+#[test]
+fn token_terminal_discovery_rejects_multiline_creation_lock_bypasses() {
+    let calls = terminal_calls(
+        r#"
+fn launch(command: &mut std::process::Command) {
+    let _ = command.spawn
+        ();
+    let _ = command.output
+        ();
+    let _ = command.status
+        ();
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn", "output", "status"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_rejects_std_and_tokio_ufcs_bypasses() {
+    let calls = terminal_calls(
+        r#"
+fn launch(
+    std_command: &mut std::process::Command,
+    tokio_command: &mut tokio::process::Command,
+) {
+    let _ = std::process::Command::spawn(&mut *std_command);
+    let _ = std::process::Command::output(&mut *std_command);
+    let _ = std::process::Command::status(&mut *std_command);
+    let _ = tokio::process::Command::spawn(&mut *tokio_command);
+    let _ = ProcessCommand::spawn(&mut *std_command);
+    let _ = Cmd::output(&mut *std_command);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn", "output", "status", "spawn", "spawn", "output"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_distinguishes_guarded_calls_and_ignores_text() {
+    let calls = terminal_calls(
+        r#"
+fn launch(command: &mut std::process::Command) {
+    // command.spawn();
+    let text = ".output()";
+    let task = tokio::spawn(async {});
+    let thread = std::thread::spawn(|| {});
+    let _ = command.spawn_guarded
+        ();
+    let _ = StdCommandCreationExt::output_guarded(command);
+    let _ = command.status_guarded();
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|call| call.guarded));
+}
+
+#[test]
+fn boundary_validation_fails_closed_for_unclassified_multiline_and_ufcs_terminals() {
+    let fixture = r#"
+fn launch(
+    std_command: &mut std::process::Command,
+    tokio_command: &mut tokio::process::Command,
+) {
+    let _ = std_command.spawn
+        ();
+    let _ = std::process::Command::output(&mut *std_command);
+    let _ = tokio::process::Command::spawn(&mut *tokio_command);
+    let _ = ProcessCommand::status(&mut *std_command);
+}
+"#;
+    let violations = creation_boundary_violations("src/fixture.rs", fixture, &BTreeMap::new())
+        .expect("fixture must be inspectable");
+
+    assert_eq!(violations.len(), 4);
+    assert!(
+        violations
+            .iter()
+            .all(|violation| violation.contains("unrecognized unguarded")),
+        "every terminal missing from the inventory must fail closed: {violations:#?}"
+    );
 }

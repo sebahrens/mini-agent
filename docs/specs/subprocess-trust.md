@@ -109,9 +109,14 @@ Command::new | tokio::process | .spawn( | .output( | .status(
 Guarded process terminals normalize to their original lexical fingerprint so moving a site behind
 the crate-wide creation boundary does not change its trust class. A separate inventory assertion
 requires every Windows-capable `TC-*` terminal to use the guarded standard-library, Tokio, or RMCP
-helper. The helpers hold the Windows creation mutex only through synchronous spawn, never through
-`wait`, `wait_with_output`, or an async suspension. Target-specific Linux/macOS worker terminals and
-explicit `TEST-ONLY` sites are outside this Windows race boundary.
+helper. That assertion tokenizes complete Rust sources, so whitespace-separated method calls and
+standard-library/Tokio `Command` UFCS calls cannot evade it; any terminal the lexical trust inventory
+does not recognize fails closed. Spawn/status helpers hold the Windows creation mutex only through
+synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so
+explicit stdio and reusable-builder semantics remain exact; that synchronous helper can therefore
+hold the mutex through output completion, but no helper carries it across an async suspension.
+Target-specific Linux/macOS worker terminals and explicit `TEST-ONLY` sites are outside this Windows
+race boundary.
 The lexical trust inventory excludes `src/process_creation.rs` itself: that module cannot assign a
 principal because it preserves the caller's class, and dedicated source assertions pin its one
 mutex plus standard-library, Tokio, and RMCP helper implementations.
