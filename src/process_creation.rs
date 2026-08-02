@@ -7,7 +7,7 @@
 //! it is released.
 
 use std::io;
-use std::process::{Child, ExitStatus, Output, Stdio};
+use std::process::{Child, ExitStatus, Output};
 use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
 #[cfg(feature = "mcp")]
@@ -56,11 +56,12 @@ impl StdCommandCreationExt for std::process::Command {
     }
 
     fn output_guarded(&mut self) -> io::Result<Output> {
-        self.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = self.spawn_guarded()?;
-        child.wait_with_output()
+        // `Command` exposes no way to inspect or clone its configured stdio. Delegating to the
+        // standard-library terminal is therefore required to preserve explicit stdio and reuse of
+        // the same builder. This synchronous path holds the outer Windows lock until `output`
+        // returns; it never crosses an async suspension.
+        let _guard = creation_guard()?;
+        std::process::Command::output(self)
     }
 }
 
@@ -95,5 +96,36 @@ impl RmcpCommandCreationExt for rmcp::transport::child_process::TokioChildProces
     )> {
         let _guard = creation_guard()?;
         rmcp::transport::child_process::TokioChildProcessBuilder::spawn(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StdCommandCreationExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn guarded_output_preserves_explicit_stdio_across_builder_reuse() {
+        let mut command = Command::new(std::env::current_exe().expect("test executable exists"));
+        command
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        for _ in 0..2 {
+            let output = command
+                .output_guarded()
+                .expect("guarded output should launch the reusable command");
+            assert!(output.status.success());
+            assert!(
+                output.stdout.is_empty(),
+                "explicit stdout must not be replaced"
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "explicit stderr must not be replaced"
+            );
+        }
     }
 }

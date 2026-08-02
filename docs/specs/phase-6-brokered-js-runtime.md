@@ -520,12 +520,16 @@ Windows handle inheritance is process-global state. The LPAC launcher and every 
 standard-library, Tokio, or reviewed third-party process terminal in mini-agent use one crate-wide
 creation lock. LPAC acquires it before the first handle is made inheritable and releases it only
 after every intended child endpoint and excluded canary has had its inherit bit cleared or its
-handle closed. Ordinary command helpers acquire the same outer lock before entering Rust's private
-Windows creation lock and release it immediately after synchronous spawn; no guard crosses a wait
-or async suspension. Inheritable-handle owners also clear their bit during drop on every error path
-before the earlier-acquired lock guard is released. The checked subprocess inventory rejects a
-Windows-capable production terminal that bypasses this boundary. Any future raw or third-party
-Windows launcher is inside the same boundary and must reuse it.
+handle closed. Spawn/status command helpers acquire the same outer lock before entering Rust's
+private Windows creation lock and release it immediately after synchronous spawn. The
+standard-library output helper is the one synchronous exception: because
+`Command` does not expose its stdio configuration for a faithful spawn-only reimplementation, it
+holds the lock while `Command::output` completes, preserving explicit stdio and builder reuse. No
+guard crosses an async suspension. Inheritable-handle owners also clear their bit during drop on
+every error path before the earlier-acquired lock guard is released. The checked subprocess
+inventory tokenizes full Rust sources and rejects multiline, UFCS, and unrecognized Windows-capable
+production terminals that bypass this boundary. Any future raw or third-party Windows launcher is
+inside the same boundary and must reuse it.
 
 On a standard-user Windows checkout, prepare and run the complete gate with:
 
