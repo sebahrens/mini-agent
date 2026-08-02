@@ -248,57 +248,6 @@ impl<'ast> Visit<'ast> for SourceProvenance {
     }
 }
 
-struct ProcessValueCollector<'a> {
-    provenance: &'a SourceProvenance,
-    names: BTreeSet<String>,
-}
-
-impl<'a> ProcessValueCollector<'a> {
-    fn new(provenance: &'a SourceProvenance) -> Self {
-        Self {
-            provenance,
-            names: BTreeSet::new(),
-        }
-    }
-
-    fn command_type_path(ty: &syn::Type) -> Option<Vec<String>> {
-        match ty {
-            syn::Type::Reference(reference) => Self::command_type_path(&reference.elem),
-            syn::Type::Group(group) => Self::command_type_path(&group.elem),
-            syn::Type::Paren(paren) => Self::command_type_path(&paren.elem),
-            syn::Type::Path(path) if path.qself.is_none() => Some(
-                path.path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect(),
-            ),
-            _ => None,
-        }
-    }
-
-    fn is_process_command_type(&self, ty: &syn::Type) -> bool {
-        let Some(path) = Self::command_type_path(ty) else {
-            return false;
-        };
-        let Some(resolved) = self.provenance.resolve_path(&path) else {
-            return false;
-        };
-        resolved == ["std", "process", "Command"] || resolved == ["tokio", "process", "Command"]
-    }
-}
-
-impl<'ast> Visit<'ast> for ProcessValueCollector<'_> {
-    fn visit_pat_type(&mut self, typed: &'ast syn::PatType) {
-        if self.is_process_command_type(&typed.ty) {
-            if let syn::Pat::Ident(ident) = typed.pat.as_ref() {
-                self.names.insert(ident.ident.to_string());
-            }
-        }
-        syn::visit::visit_pat_type(self, typed);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TerminalCall {
     line: usize,
@@ -488,6 +437,14 @@ fn validate_process_creation_raw_inventory(
     source: &str,
     expected: &BTreeMap<String, usize>,
 ) -> Result<(), String> {
+    validate_process_creation_raw_inventory_with_non_process(source, expected, &BTreeSet::new())
+}
+
+fn validate_process_creation_raw_inventory_with_non_process(
+    source: &str,
+    expected: &BTreeMap<String, usize>,
+    exact_non_process: &BTreeSet<String>,
+) -> Result<(), String> {
     let audits = process_creation_raw_terminal_audit(source)?;
     let mut observed = BTreeMap::<String, usize>::new();
     for audit in &audits {
@@ -503,7 +460,10 @@ fn validate_process_creation_raw_inventory(
     }
     let unguarded: Vec<_> = audits
         .iter()
-        .filter(|audit| !audit.guard_dominates)
+        .filter(|audit| {
+            !audit.guard_dominates
+                && !exact_non_process.contains(&format!("{}|{}", audit.function, audit.fingerprint))
+        })
         .collect();
     if !unguarded.is_empty() {
         errors.push(format!(
@@ -594,17 +554,9 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
     fn scan(
         stream: TokenStream,
         provenance: &SourceProvenance,
-        process_values: &BTreeSet<String>,
         calls: &mut Vec<TerminalCall>,
         inside_macro: bool,
-        macro_process_context: bool,
     ) {
-        fn contains_process_value(stream: TokenStream, process_values: &BTreeSet<String>) -> bool {
-            stream.into_iter().any(|token| {
-                matches!(token, TokenTree::Ident(ident) if process_values.contains(&normalized_ident(&ident)))
-            })
-        }
-
         fn is_macro_rules_body(tokens: &[TokenTree], index: usize) -> bool {
             matches!(index.checked_sub(3).and_then(|i| tokens.get(i)), Some(TokenTree::Ident(ident)) if normalized_ident(ident) == "macro_rules")
                 && matches!(index.checked_sub(2).and_then(|i| tokens.get(i)), Some(TokenTree::Punct(punct)) if punct.as_char() == '!')
@@ -623,23 +575,14 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
                 let begins_macro = matches!(macro_arguments, Some(TokenTree::Punct(punct)) if punct.as_char() == '!')
                     || is_macro_rules_body(&tokens, index);
                 let group_is_macro = inside_macro || begins_macro;
-                let group_process_context = macro_process_context
-                    || (begins_macro && contains_process_value(group.stream(), process_values));
-                scan(
-                    group.stream(),
-                    provenance,
-                    process_values,
-                    calls,
-                    group_is_macro,
-                    group_process_context,
-                );
+                scan(group.stream(), provenance, calls, group_is_macro);
             }
             let TokenTree::Ident(ident) = token else {
                 continue;
             };
             let name = normalized_ident(ident);
             let qualified = is_method_or_ufcs(&tokens, index);
-            let macro_method_ident = inside_macro && macro_process_context && !qualified;
+            let macro_method_ident = inside_macro && !qualified;
             if !is_terminal(&name) || (!qualified && !macro_method_ident) {
                 continue;
             }
@@ -672,19 +615,10 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
         syn::parse_file(source).map_err(|error| format!("Rust source did not parse: {error}"))?;
     let mut provenance = SourceProvenance::default();
     provenance.visit_file(&file);
-    let mut process_values = ProcessValueCollector::new(&provenance);
-    process_values.visit_file(&file);
     let stream = TokenStream::from_str(source)
         .map_err(|error| format!("Rust source did not tokenize: {error}"))?;
     let mut calls = Vec::new();
-    scan(
-        stream,
-        &provenance,
-        &process_values.names,
-        &mut calls,
-        false,
-        false,
-    );
+    scan(stream, &provenance, &mut calls, false);
     calls.sort_by_key(|call| call.line);
     Ok(calls)
 }
@@ -1101,6 +1035,462 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/ui/slash/session.rs", ".output()", 1, "TC-INTERNAL-GIT"),
 ];
 
+/// Exact macro-token fingerprints whose terminal spelling is data rather than
+/// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
+/// macro-controlled tokens remains process authority and fails closed.
+const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/agent/runner.rs",
+        "assert!(output.contains(\"cacheStatus\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/runner.rs",
+        "assert!(output.contains(\"unknown stream item variant\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/agent/runner.rs", "output,", 1, "NON-PROCESS"),
+    ("src/agent/runner.rs", "output.len(),", 1, "NON-PROCESS"),
+    (
+        "src/agent/runner.rs",
+        "println!(\"{}\", output);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "assert!(output.stderr.is_empty());",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "assert!(output.stdout.is_empty());",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "assert_eq!(output, \"stdout\\nstderr\\nExit code: 7\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "assert_eq!(output.stderr.len(), limits.stderr_bytes);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "assert_eq!(output.stdout.len(), limits.stdout_bytes);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "output.status,",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "output.stdout.len() + output.stderr.len(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "tracing::warn!(\"tool bash stopped before completion: {:?}\", output.status);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(!output.contains(\"0 more\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(!output.contains(\"[truncated\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(!output.contains(\"swapped_marker.txt\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(\"authorized_marker.txt\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(\"truncated after 100 entries\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(\"unknown number of additional entries\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(marker));",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.starts_with(\"100 files found:\\n\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert_eq!(output, \"No files found matching the pattern.\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"0 more matches\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"[truncated after\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"swapped_binding_marker\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.contains(\"authorized_binding_marker\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.contains(\"unknown number of additional matches\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.contains(marker));",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.starts_with(\"2 results (searched 1 files):\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert_eq!(output, \"No matches found.\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/mod.rs",
+        "TextContent::new(output.to_string()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/export.rs",
+        "anyhow::bail!(\"GitHub API returned {}: {}\", status, text.trim());",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/audit.rs",
+        "let _ = write!(output, \"{byte:02x}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/extras/js/host.rs", "output.status,", 2, "NON-PROCESS"),
+    ("src/extras/js/host.rs", "status,", 1, "NON-PROCESS"),
+    ("src/extras/js/host.rs", "status: 200,", 7, "NON-PROCESS"),
+    ("src/extras/js/host.rs", "status: 204,", 1, "NON-PROCESS"),
+    ("src/extras/js/host.rs", "status: 304,", 1, "NON-PROCESS"),
+    (
+        "src/extras/js/skills/capability.rs",
+        "\"status\": status,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/store.rs",
+        "Some((ref status, ref report_id, ref reason))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/store.rs",
+        "if status == \"rejected\"",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/extras/js/skills/store.rs", "status,", 3, "NON-PROCESS"),
+    (
+        "src/extras/js/skills/telemetry.rs",
+        "if !matches!(status, LifecycleStatus::Canary | LifecycleStatus::Active) {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"  capability: {}\", skill.capability.tier);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"  rank: {}\", skill.rank);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"  route: {:?}\", route.route_kind);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"  route_fingerprint: {}\", route.route_fingerprint);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"  route_policy: {}\", route.policy_version);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"  score: {:.6}\", skill.score());",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"- id: {}\", skill.id);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"<available_js_skills>\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"BEGIN_{resource_delimiter} path={path}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"END_{delimiter}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/turn.rs",
+        "let _ = writeln!(output, \"END_{resource_delimiter}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/extras/js/skills/turn.rs", "output,", 5, "NON-PROCESS"),
+    (
+        "src/extras/js/supervisor.rs",
+        "output = future => Ok(output),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/loop/mod.rs",
+        "status.success(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Err(\"boom\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Err(\"second failed\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"completed first\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"first\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"late success\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"must be cancelled\".into()),",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"must not start\".into()),",
+        5,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"result one\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"result two\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"result zero\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"x\".repeat(2_000)),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/print.rs",
+        "writeln!(output).expect(\"writing configuration output to a String cannot fail\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/print.rs",
+        "writeln!(output, \"  {k:<width$}  {v}\")",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/print.rs",
+        "writeln!(output, \"{}:\", title).expect(\"writing configuration output to a String cannot fail\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "!output.exit_status.is_some_and(|status| status.success()),",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "String::from_utf8_lossy(&output.stderr)",
+        4,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "assert_eq!(output.status, CommandStatus::Failed);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "assert_eq!(output.stdout, b\"LINUX_SANDBOX_POLICY_PASS\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "assert_eq!(output.stdout, b\"MACOS_SEATBELT_POLICY_PASS\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "output.exit_status.is_some_and(|status| status.success()),",
+        2,
+        "NON-PROCESS",
+    ),
+    ("src/sandbox.rs", "output.status,", 2, "NON-PROCESS"),
+    ("src/sandbox.rs", "output.status", 1, "NON-PROCESS"),
+    (
+        "src/sandbox.rs",
+        "output.stdout.is_empty(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "status = child.wait() => CommandTermination::Exited(status),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "crate::extras::truncate::truncate_cjk(output, 500, \"…\")",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/renderer.rs",
+        "if matches!(child.wait(), Ok(status) if status.success()) {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/renderer.rs",
+        "if wrote && matches!(child.wait(), Ok(status) if status.success()) {",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/ui/slash/features.rs", "status,", 1, "NON-PROCESS"),
+];
+
 /// Sites whose identical terminal expression inherits different classes from
 /// the surrounding constructor, in source order.
 const MIXED_SITES: &[(&str, &str, &[&str])] = &[(
@@ -1396,17 +1786,19 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
 
 fn checked_inventory() -> BTreeMap<(String, String, usize), &'static str> {
     let mut expected = BTreeMap::new();
-    for &(path, source, count, classification) in UNIFORM_SITES {
-        for occurrence in 1..=count {
-            assert!(
-                expected
-                    .insert(
-                        (path.to_string(), source.to_string(), occurrence),
-                        classification,
-                    )
-                    .is_none(),
-                "duplicate checked inventory entry for {path} occurrence {occurrence}: {source}"
-            );
+    for sites in [UNIFORM_SITES, MACRO_IDENTIFIER_NON_PROCESS_SITES] {
+        for &(path, source, count, classification) in sites {
+            for occurrence in 1..=count {
+                assert!(
+                    expected
+                        .insert(
+                            (path.to_string(), source.to_string(), occurrence),
+                            classification,
+                        )
+                        .is_none(),
+                    "duplicate checked inventory entry for {path} occurrence {occurrence}: {source}"
+                );
+            }
         }
     }
     for &(path, source, classifications) in MIXED_SITES {
@@ -1428,17 +1820,22 @@ fn checked_inventory() -> BTreeMap<(String, String, usize), &'static str> {
 
 fn checked_exact_site_classes() -> BTreeMap<(String, String, usize), &'static str> {
     let mut exact = BTreeMap::new();
-    for &(path, source, count, classification) in EXACT_UNIFORM_SITE_CLASSES {
-        for occurrence in 1..=count {
-            assert!(
-                exact
-                    .insert(
-                        (path.to_string(), source.to_string(), occurrence),
-                        classification,
-                    )
-                    .is_none(),
-                "duplicate exact ownership rule for {path} occurrence {occurrence}: {source}"
-            );
+    for sites in [
+        EXACT_UNIFORM_SITE_CLASSES,
+        MACRO_IDENTIFIER_NON_PROCESS_SITES,
+    ] {
+        for &(path, source, count, classification) in sites {
+            for occurrence in 1..=count {
+                assert!(
+                    exact
+                        .insert(
+                            (path.to_string(), source.to_string(), occurrence),
+                            classification,
+                        )
+                        .is_none(),
+                    "duplicate exact ownership rule for {path} occurrence {occurrence}: {source}"
+                );
+            }
         }
     }
     for &(path, source, classifications) in EXACT_MIXED_SITE_CLASSES {
@@ -1724,10 +2121,37 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
             "spawn_guarded|std::process::Command::spawn(self)".to_string(),
             1,
         ),
+        (
+            "guarded_output_preserves_explicit_stdio_across_builder_reuse|assert!(output.status.success());"
+                .to_string(),
+            1,
+        ),
+        (
+            "guarded_output_preserves_explicit_stdio_across_builder_reuse|output.stderr.is_empty(),"
+                .to_string(),
+            1,
+        ),
+        (
+            "guarded_output_preserves_explicit_stdio_across_builder_reuse|output.stdout.is_empty(),"
+                .to_string(),
+            1,
+        ),
+    ]);
+    let exact_non_process = BTreeSet::from([
+        "guarded_output_preserves_explicit_stdio_across_builder_reuse|assert!(output.status.success());"
+            .to_string(),
+        "guarded_output_preserves_explicit_stdio_across_builder_reuse|output.stderr.is_empty(),"
+            .to_string(),
+        "guarded_output_preserves_explicit_stdio_across_builder_reuse|output.stdout.is_empty(),"
+            .to_string(),
     ]);
 
-    validate_process_creation_raw_inventory(&source, &expected)
-        .expect("every raw terminal must be enumerated behind the retained crate guard");
+    validate_process_creation_raw_inventory_with_non_process(
+        &source,
+        &expected,
+        &exact_non_process,
+    )
+    .expect("every raw terminal must be enumerated behind the retained crate guard");
 }
 
 #[test]
@@ -1949,7 +2373,7 @@ fn launch(command: &mut std::process::Command) {
 }
 
 #[test]
-fn process_provenance_fails_closed_for_self_prefix_namespace_collisions() {
+fn path_provenance_fails_closed_for_self_prefix_namespace_collisions() {
     let file = syn::parse_file(
         r#"
 use smallvec::{SmallVec, smallvec};
@@ -1965,13 +2389,6 @@ fn render(values: &SmallVec<[String; 4]>) {}
         provenance.resolve_path(&["SmallVec".to_string()]),
         None,
         "a macro/type namespace collision must not grow an alias path without bound"
-    );
-
-    let mut process_values = ProcessValueCollector::new(&provenance);
-    process_values.visit_file(&file);
-    assert!(
-        process_values.names.is_empty(),
-        "unresolved provenance must not confer process authority"
     );
 }
 
@@ -2139,6 +2556,73 @@ fn token_terminal_discovery_rejects_macro_method_ident_indirection() {
         r#"
 fn launch(command: &mut std::process::Command) {
     terminal!(command, spawn);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_rejects_inferred_macro_method_ident_indirection() {
+    let calls = terminal_calls(
+        r#"
+use std::process::Command;
+
+fn launch() {
+    let mut command = Command::new("program");
+    terminal!(command, spawn);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_rejects_aliased_macro_method_ident_indirection() {
+    let calls = terminal_calls(
+        r#"
+fn launch(command: &mut std::process::Command) {
+    let alias = command;
+    terminal!(alias, spawn);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_rejects_nested_macro_method_ident_indirection() {
+    let calls = terminal_calls(
+        r#"
+fn launch(command: &mut std::process::Command) {
+    terminal!((command), spawn);
 }
 "#,
     )

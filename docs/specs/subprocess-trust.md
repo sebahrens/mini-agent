@@ -115,9 +115,9 @@ sources, so whitespace-separated methods, qualified-angle UFCS, and renamed stan
 glob imports and out-of-line modules remain opaque, including after a named import, and ambiguous or
 cyclic provenance fails closed rather than inheriting a local-type exemption. Associated terminal
 function-item references and raw terminal identifiers are inventoried even when a later indirect
-call has another name. Macro method-name indirection is inventoried when its invocation receives a
-typed process `Command`, and locally defined `macro_rules!` expansion bodies are always treated as
-macro-controlled. Only
+call has another name. Terminal method identifiers in macro inputs and locally defined
+`macro_rules!` expansion bodies are treated as process terminals unless an exact inventory
+fingerprint classifies the site as non-process. Only
 syntactically proven task/thread or local associated `spawn` calls are excluded; ambiguous and
 unrecognized terminals fail closed. Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so
