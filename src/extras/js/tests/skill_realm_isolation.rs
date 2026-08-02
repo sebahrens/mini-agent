@@ -1,9 +1,16 @@
 use rquickjs::context::EvalOptions;
 use rquickjs::promise::PromiseState;
 use rquickjs::{Context, Error, Function, Persistent, Promise, Runtime, Value};
+use std::sync::Arc;
 
-use crate::extras::js::realm::{RealmError, load_artifact};
-use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId};
+use crate::extras::js::realm::{RealmError, load_artifact, load_artifact_with_capabilities};
+use crate::extras::js::skills::capability::{
+    DispatchedEffect, InvocationAuthorization, InvocationCapabilityRuntime,
+};
+use crate::extras::js::skills::{
+    CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
+};
 use crate::extras::js::types::{MEMORY_LIMIT, STACK_LIMIT};
 
 const MAX_CLONE_BYTES: usize = 1_024;
@@ -397,6 +404,300 @@ fn bounded_runtime() -> Runtime {
     runtime.set_memory_limit(MEMORY_LIMIT);
     runtime.set_max_stack_size(STACK_LIMIT);
     runtime
+}
+
+fn grant(byte: u8) -> GrantId {
+    GrantId::new(uuid::Uuid::from_bytes([byte; 16])).expect("non-nil grant")
+}
+
+fn invocation(value: &str) -> InvocationId {
+    InvocationId::new(value).expect("valid invocation id")
+}
+
+#[test]
+fn abi_v2_hides_an_exact_immutable_capability_argument_and_revokes_retained_methods() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let manifest = test_manifest(
+        CapabilityTier::SideEffecting,
+        vec![HostCapability::ReadFile, HostCapability::Spawn],
+    )
+    .unwrap();
+    let skill = SkillArtifact::new(
+        "let retained; function inspect(cap, value) { retained = cap.read_file; return {keys: Object.keys(cap), frozen: Object.isFrozen(cap), value, globals: [typeof read_file, typeof spawn, typeof propose_skill]}; } function useRetained(_cap) { try { return retained('secret'); } catch (_) { return 'denied'; } }".into(),
+        "ABI-v2 capability fixture".into(),
+        vec![],
+        vec![
+            SkillExport { name: "inspect".into(), signature: "(value)".into() },
+            SkillExport { name: "useRetained".into(), signature: "()".into() },
+        ],
+        vec!["true".into()],
+        manifest.clone(),
+    )
+    .unwrap();
+    let dispatched = Arc::new(std::sync::Mutex::new(Vec::<DispatchedEffect>::new()));
+    let captured = dispatched.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |effect| {
+        captured.lock().unwrap().push(effect);
+        Ok(EffectResult::ReadFile {
+            content: "unexpected".into(),
+        })
+    });
+    for (name, ordinal) in [("inspect", 1), ("useRetained", 2)] {
+        capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    invocation(&format!("hidden-{ordinal}")),
+                    skill.id.clone(),
+                    name.into(),
+                    manifest.clone(),
+                    [
+                        (HostCapability::ReadFile, grant(ordinal)),
+                        (HostCapability::Spawn, grant(ordinal + 8)),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities)
+        .expect("load capability-bound artifact");
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("JSON.stringify(inspect(41))").unwrap(),
+            r#"{"keys":["read_file","spawn"],"frozen":true,"value":41,"globals":["undefined","undefined","undefined"]}"#
+        );
+        assert_eq!(ctx.eval::<String, _>("useRetained()").unwrap(), "denied");
+    });
+    assert!(
+        dispatched.lock().unwrap().is_empty(),
+        "stale method emitted an effect request"
+    );
+}
+
+#[test]
+fn overlapping_promises_keep_their_explicit_invocation_and_grant_identity() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let manifest = test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile]).unwrap();
+    let skill = SkillArtifact::new(
+        "async function readLater(cap, path) { await 0; if (path === 'a') await 0; return cap.read_file(path); }".into(),
+        "overlap fixture".into(),
+        vec![],
+        vec![SkillExport { name: "readLater".into(), signature: "(path)".into() }],
+        vec!["true".into()],
+        manifest.clone(),
+    ).unwrap();
+    let dispatched = Arc::new(std::sync::Mutex::new(Vec::<DispatchedEffect>::new()));
+    let captured = dispatched.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |effect| {
+        let path = match &effect.request.operation {
+            crate::extras::js::protocol::EffectOperation::ReadFile { path } => path.clone(),
+            _ => panic!("unexpected operation"),
+        };
+        captured.lock().unwrap().push(effect);
+        Ok(EffectResult::ReadFile { content: path })
+    });
+    for (name, byte) in [("overlap-a", 3), ("overlap-b", 4)] {
+        capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    invocation(name),
+                    skill.id.clone(),
+                    "readLater".into(),
+                    manifest.clone(),
+                    [(HostCapability::ReadFile, grant(byte))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities)
+        .expect("load async artifact");
+    let promise = model.with(|ctx| {
+        let promise: Promise = ctx
+            .eval("Promise.all([readLater('a'), readLater('b')])")
+            .unwrap();
+        Persistent::save(&ctx, promise)
+    });
+    while runtime.is_job_pending() {
+        runtime.execute_pending_job().unwrap();
+    }
+    model.with(|ctx| {
+        let promise = promise.restore(&ctx).unwrap();
+        assert_eq!(promise.state(), PromiseState::Resolved);
+        ctx.globals()
+            .set("settled", promise.result::<Value>().unwrap().unwrap())
+            .unwrap();
+        assert_eq!(
+            ctx.eval::<String, _>("JSON.stringify(settled)").unwrap(),
+            r#"["a","b"]"#
+        );
+    });
+    let effects = dispatched.lock().unwrap();
+    assert_eq!(effects.len(), 2);
+    assert_eq!(effects[0].invocation_id.as_str(), "overlap-b");
+    assert_eq!(effects[0].request.grant_id, grant(4));
+    assert!(matches!(
+        &effects[0].request.operation,
+        crate::extras::js::protocol::EffectOperation::ReadFile { path } if path == "b"
+    ));
+    assert_eq!(effects[1].invocation_id.as_str(), "overlap-a");
+    assert_eq!(effects[1].request.grant_id, grant(3));
+    assert!(matches!(
+        &effects[1].request.operation,
+        crate::extras::js::protocol::EffectOperation::ReadFile { path } if path == "a"
+    ));
+}
+
+#[test]
+fn async_wrapper_returns_only_a_model_realm_promise_across_private_poisoning() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).unwrap();
+    let skill = artifact(
+        "async function modelOwned(_cap, value) { await 0; return {value}; } Promise = function PrivatePoison() { throw 0; };",
+        &["modelOwned"],
+    );
+    let capabilities = InvocationCapabilityRuntime::deny_all();
+    capabilities
+        .prepare(
+            InvocationAuthorization::new(
+                invocation("model-owned-promise"),
+                skill.id.clone(),
+                "modelOwned".into(),
+                CapabilityManifest::pure(),
+                [],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities).unwrap();
+
+    let promise = model.with(|ctx| {
+        ctx.eval::<(), _>(
+            "globalThis.ExpectedPromise = Promise; globalThis.expectedPromisePrototype = Promise.prototype; globalThis.Promise = function ModelPoison() { throw 0; };",
+        )
+        .unwrap();
+        let promise: Promise = ctx.eval("modelOwned(17)").unwrap();
+        ctx.globals().set("ownedPromise", promise.clone()).unwrap();
+        assert!(
+            ctx.eval::<bool, _>(
+                "ownedPromise instanceof ExpectedPromise && Object.getPrototypeOf(ownedPromise) === expectedPromisePrototype && !(ownedPromise instanceof Promise)",
+            )
+            .unwrap()
+        );
+        Persistent::save(&ctx, promise)
+    });
+    while runtime.is_job_pending() {
+        runtime.execute_pending_job().unwrap();
+    }
+    model.with(|ctx| {
+        let promise = promise.restore(&ctx).unwrap();
+        assert_eq!(promise.state(), PromiseState::Resolved);
+        ctx.globals()
+            .set("ownedResult", promise.result::<Value>().unwrap().unwrap())
+            .unwrap();
+        assert_eq!(
+            ctx.eval::<String, _>("JSON.stringify(ownedResult)")
+                .unwrap(),
+            r#"{"value":17}"#
+        );
+    });
+}
+
+#[test]
+fn synchronous_throw_and_promise_rejection_revoke_the_invocation() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).unwrap();
+    let skill = artifact(
+        "function failSync(_cap) { throw 1; } async function failAsync(_cap) { await Promise.resolve(); throw 2; }",
+        &["failSync", "failAsync"],
+    );
+    let capabilities = InvocationCapabilityRuntime::deny_all();
+    for export in ["failSync", "failAsync"] {
+        capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    invocation(&format!("failure-{export}")),
+                    skill.id.clone(),
+                    export.into(),
+                    CapabilityManifest::pure(),
+                    [],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone()).unwrap();
+    model.with(|ctx| {
+        assert!(
+            ctx.eval::<bool, _>("try { failSync(); false } catch (_) { true }")
+                .unwrap()
+        );
+    });
+    assert_eq!(capabilities.active_count(), 0);
+    let promise = model.with(|ctx| {
+        let promise: Promise = ctx.eval("failAsync()").unwrap();
+        Persistent::save(&ctx, promise)
+    });
+    while runtime.is_job_pending() {
+        runtime.execute_pending_job().unwrap();
+    }
+    model.with(|ctx| {
+        let promise = promise.restore(&ctx).unwrap();
+        assert_eq!(promise.state(), PromiseState::Rejected);
+        let _ = promise.result::<Value>();
+        let _ = ctx.catch();
+    });
+    assert_eq!(capabilities.active_count(), 0);
+}
+
+#[test]
+fn method_retained_across_promise_settlement_cannot_dispatch() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).unwrap();
+    let manifest = test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile]).unwrap();
+    let skill = SkillArtifact::new(
+        "let retained; async function capture(cap) { retained = cap.read_file; await Promise.resolve(); return true; } function useOld(_cap) { try { return retained('secret'); } catch (_) { return 'denied'; } }".into(),
+        "async retained capability fixture".into(), vec![],
+        vec![
+            SkillExport { name: "capture".into(), signature: "()".into() },
+            SkillExport { name: "useOld".into(), signature: "()".into() },
+        ], vec!["true".into()], manifest.clone(),
+    ).unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured = calls.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |_| {
+        captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(EffectResult::ReadFile {
+            content: "unexpected".into(),
+        })
+    });
+    for (export, byte) in [("capture", 13), ("useOld", 14)] {
+        capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    invocation(&format!("async-{export}")),
+                    skill.id.clone(),
+                    export.into(),
+                    manifest.clone(),
+                    [(HostCapability::ReadFile, grant(byte))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone()).unwrap();
+    model.with(|ctx| {
+        ctx.eval::<Promise, _>("capture()").unwrap();
+    });
+    while runtime.is_job_pending() {
+        runtime.execute_pending_job().unwrap();
+    }
+    assert_eq!(capabilities.active_count(), 0);
+    model.with(|ctx| assert_eq!(ctx.eval::<String, _>("useOld()").unwrap(), "denied"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
 #[test]

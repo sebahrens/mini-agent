@@ -4,7 +4,7 @@
 - **Specification version**: 0.1.0
 - **Delivery status**: planned
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-01
+- **Last reconciled**: 2026-08-02
 - **Entry dependency**: the indexed Phase 1–5 contracts whose behavior Phase 6 preserves
 - **Exit dependency**: every gate and acceptance requirement in this document
 
@@ -178,6 +178,24 @@ the first export argument. It contains only the methods declared by the stored a
 method closure embeds a parent-created grant ID and becomes unusable when the export promise
 settles, the invocation is cancelled, or its runtime ends. A skill cannot inspect or manufacture a
 grant ID, and retaining an object or method cannot transfer useful authority to a later invocation.
+
+`src/extras/js/skills/capability.rs` owns the worker-local binding from an explicit invocation ID
+and exact manifest to one opaque grant per declared method. `src/extras/js/realm.rs` constructs a
+null-prototype frozen object immediately before calling the stored export, inserts it at hidden
+argument zero, and keeps its token live only until synchronous return/throw or exact promise
+fulfillment/rejection. Dispatch checks the captured token before constructing an `EffectRequest`;
+a stale method therefore produces a closed denial and no protocol traffic. Cancellation removes
+only the named invocation, while the worker runtime lifecycle clears every prepared and active
+token on timeout, unwind, or recycle. Event attribution follows the request's explicit invocation
+and captured grant; there is no ambient active-invocation map or map-order fallback.
+
+Parent preparation also yields an opaque one-shot handle. Wrapper entry consumes the next handle
+in preparation order and validates its exact artifact, export, and manifest without scanning for a
+metadata match; direct nested entry activates only the explicitly supplied handle. Async results
+never expose a private-realm promise to the model realm. A Rust-owned settlement registry carries
+only the bounded encoded result string (or a closed rejection) into a promise created from the
+model realm's captured intrinsic, so its prototype and continuation ownership remain model-local
+even when private promise bindings are shadowed.
 
 File, fetch, proposal, and command operations retain their owning Phase 1–4 validation and limits.
 Parent-brokered JS `spawn` remains disabled on Windows until `mini-agent-uq5c` delivers and verifies

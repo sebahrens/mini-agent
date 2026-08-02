@@ -1,7 +1,12 @@
 //! Runtime intersection of session authority and immutable skill manifests.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+
+use crate::extras::js::protocol::{
+    AdvisoryAttribution, EffectErrorCode, EffectOperation, EffectRequest, EffectResult, GrantId,
+    HttpHeader, HttpMethod, InvocationId, MAX_EFFECTS_PER_STEP,
+};
 
 use super::{CapabilityManifest, CapabilityTier, HostCapability, IdentityError};
 
@@ -35,6 +40,468 @@ pub enum CapabilityError {
     InvalidManifest(#[from] IdentityError),
     #[error("skill capability denied")]
     Denied(CapabilityDenied),
+    #[error("invocation authorization is missing or invalid")]
+    InvalidInvocation,
+    #[error("invocation capability has been revoked")]
+    Revoked,
+    #[error("effect arguments are outside the invocation ABI")]
+    InvalidArguments,
+    #[error("effect dispatcher denied the request")]
+    DispatchDenied,
+}
+
+/// Parent-issued authority for exactly one ABI-v2 export invocation.
+#[derive(Debug, Clone)]
+pub(crate) struct InvocationAuthorization {
+    pub(crate) invocation_id: InvocationId,
+    pub(crate) attribution: SkillExecutionAttribution,
+    grants: BTreeMap<HostCapability, GrantId>,
+}
+
+impl InvocationAuthorization {
+    pub(crate) fn new(
+        invocation_id: InvocationId,
+        skill_id: String,
+        export_name: String,
+        manifest: CapabilityManifest,
+        grants: impl IntoIterator<Item = (HostCapability, GrantId)>,
+    ) -> Result<Self, CapabilityError> {
+        let attribution = SkillExecutionAttribution {
+            skill_id,
+            export_name,
+            manifest,
+        };
+        validate_attribution(&attribution)?;
+        let mut exact_grants = BTreeMap::new();
+        for (capability, grant_id) in grants {
+            if exact_grants.insert(capability, grant_id).is_some() {
+                return Err(CapabilityError::InvalidInvocation);
+            }
+        }
+        let declared = attribution
+            .manifest
+            .grants
+            .iter()
+            .map(|scope| scope.capability())
+            .collect::<Vec<_>>();
+        if exact_grants.len() != declared.len()
+            || declared
+                .iter()
+                .any(|capability| !exact_grants.contains_key(capability))
+            || exact_grants
+                .values()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != exact_grants.len()
+        {
+            return Err(CapabilityError::InvalidInvocation);
+        }
+        Ok(Self {
+            invocation_id,
+            attribution,
+            grants: exact_grants,
+        })
+    }
+}
+
+/// An effect whose authoritative invocation identity travels separately from advisory fields.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DispatchedEffect {
+    pub(crate) invocation_id: InvocationId,
+    pub(crate) request: EffectRequest,
+}
+
+/// Opaque one-shot binding between parent preparation and one wrapper entry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PreparedInvocationHandle(u64);
+
+type EffectDispatcher =
+    dyn Fn(DispatchedEffect) -> Result<EffectResult, CapabilityError> + Send + Sync + 'static;
+
+#[derive(Clone)]
+pub(crate) struct InvocationCapabilityRuntime {
+    state: Arc<Mutex<InvocationCapabilityState>>,
+    dispatcher: Arc<EffectDispatcher>,
+}
+
+#[derive(Default)]
+struct InvocationCapabilityState {
+    next_prepared_handle: u64,
+    next_token: u64,
+    prepared: VecDeque<PreparedInvocation>,
+    active: HashMap<u64, ActiveInvocation>,
+    seen_grants: HashSet<GrantId>,
+}
+
+struct PreparedInvocation {
+    handle: PreparedInvocationHandle,
+    authorization: InvocationAuthorization,
+}
+
+struct ActiveInvocation {
+    authorization: InvocationAuthorization,
+    next_effect_ordinal: u32,
+}
+
+impl std::fmt::Debug for InvocationCapabilityRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (prepared, active) = self
+            .state
+            .lock()
+            .map(|state| (state.prepared.len(), state.active.len()))
+            .unwrap_or_default();
+        formatter
+            .debug_struct("InvocationCapabilityRuntime")
+            .field("prepared", &prepared)
+            .field("active", &active)
+            .finish()
+    }
+}
+
+impl InvocationCapabilityRuntime {
+    pub(crate) fn new(
+        dispatcher: impl Fn(DispatchedEffect) -> Result<EffectResult, CapabilityError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(InvocationCapabilityState::default())),
+            dispatcher: Arc::new(dispatcher),
+        }
+    }
+
+    pub(crate) fn deny_all() -> Self {
+        Self::new(|_| Err(CapabilityError::DispatchDenied))
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        authorization: InvocationAuthorization,
+    ) -> Result<PreparedInvocationHandle, CapabilityError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CapabilityError::InvalidInvocation)?;
+        if state
+            .prepared
+            .iter()
+            .any(|candidate| candidate.authorization.invocation_id == authorization.invocation_id)
+            || state.active.values().any(|candidate| {
+                candidate.authorization.invocation_id == authorization.invocation_id
+            })
+            || authorization
+                .grants
+                .values()
+                .any(|grant_id| state.seen_grants.contains(grant_id))
+        {
+            return Err(CapabilityError::InvalidInvocation);
+        }
+        let next_prepared_handle = state
+            .next_prepared_handle
+            .checked_add(1)
+            .ok_or(CapabilityError::InvalidInvocation)?;
+        state
+            .seen_grants
+            .extend(authorization.grants.values().cloned());
+        state.next_prepared_handle = next_prepared_handle;
+        let handle = PreparedInvocationHandle(next_prepared_handle);
+        state.prepared.push_back(PreparedInvocation {
+            handle,
+            authorization,
+        });
+        Ok(handle)
+    }
+
+    /// Activate exactly the parent-prepared handle; public artifact metadata is validation only.
+    pub(crate) fn begin(
+        &self,
+        handle: PreparedInvocationHandle,
+        skill_id: &str,
+        export_name: &str,
+        manifest: &CapabilityManifest,
+    ) -> Result<u64, CapabilityError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CapabilityError::InvalidInvocation)?;
+        let position = state
+            .prepared
+            .iter()
+            .position(|candidate| candidate.handle == handle)
+            .ok_or(CapabilityError::InvalidInvocation)?;
+        Self::activate(&mut state, position, skill_id, export_name, manifest)
+    }
+
+    /// Worker wrapper entry consumes the next opaque handle in parent preparation order. A
+    /// mismatched export fails closed without scanning forward for ambient matching authority.
+    pub(crate) fn begin_next(
+        &self,
+        skill_id: &str,
+        export_name: &str,
+        manifest: &CapabilityManifest,
+    ) -> Result<u64, CapabilityError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CapabilityError::InvalidInvocation)?;
+        Self::activate(&mut state, 0, skill_id, export_name, manifest)
+    }
+
+    fn activate(
+        state: &mut InvocationCapabilityState,
+        position: usize,
+        skill_id: &str,
+        export_name: &str,
+        manifest: &CapabilityManifest,
+    ) -> Result<u64, CapabilityError> {
+        let prepared = state
+            .prepared
+            .get(position)
+            .ok_or(CapabilityError::InvalidInvocation)?;
+        if prepared.authorization.attribution.skill_id != skill_id
+            || prepared.authorization.attribution.export_name != export_name
+            || prepared.authorization.attribution.manifest != *manifest
+        {
+            return Err(CapabilityError::InvalidInvocation);
+        }
+        let authorization = state
+            .prepared
+            .remove(position)
+            .ok_or(CapabilityError::InvalidInvocation)?
+            .authorization;
+        state.next_token = state
+            .next_token
+            .checked_add(1)
+            .ok_or(CapabilityError::InvalidInvocation)?;
+        let token = state.next_token;
+        state.active.insert(
+            token,
+            ActiveInvocation {
+                authorization,
+                next_effect_ordinal: 0,
+            },
+        );
+        Ok(token)
+    }
+
+    pub(crate) fn dispatch(
+        &self,
+        token: u64,
+        operation: HostCapability,
+        encoded_arguments: &str,
+    ) -> Result<String, CapabilityError> {
+        let effect = {
+            let mut state = self.state.lock().map_err(|_| CapabilityError::Revoked)?;
+            let active = state
+                .active
+                .get_mut(&token)
+                .ok_or(CapabilityError::Revoked)?;
+            let grant_id = active
+                .authorization
+                .grants
+                .get(&operation)
+                .cloned()
+                .ok_or(CapabilityError::Revoked)?;
+            let decoded_operation = decode_operation(operation, encoded_arguments)?;
+            if active.next_effect_ordinal >= MAX_EFFECTS_PER_STEP {
+                return Err(CapabilityError::DispatchDenied);
+            }
+            let effect_ordinal = active.next_effect_ordinal;
+            active.next_effect_ordinal += 1;
+            DispatchedEffect {
+                invocation_id: active.authorization.invocation_id.clone(),
+                request: EffectRequest {
+                    effect_ordinal,
+                    grant_id,
+                    advisory: AdvisoryAttribution {
+                        artifact_id: Some(active.authorization.attribution.skill_id.clone()),
+                        export: Some(active.authorization.attribution.export_name.clone()),
+                    },
+                    operation: decoded_operation,
+                },
+            }
+        };
+        encode_effect_result((self.dispatcher)(effect)?)
+    }
+
+    pub(crate) fn finish(&self, token: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active.remove(&token);
+        }
+    }
+
+    pub(crate) fn cancel(&self, invocation_id: &InvocationId) {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .prepared
+                .retain(|candidate| &candidate.authorization.invocation_id != invocation_id);
+            state
+                .active
+                .retain(|_, candidate| &candidate.authorization.invocation_id != invocation_id);
+        }
+    }
+
+    pub(crate) fn recycle(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.prepared.clear();
+            state.active.clear();
+            state.seen_grants.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.active.len())
+            .unwrap_or_default()
+    }
+}
+
+fn decode_operation(
+    operation: HostCapability,
+    encoded_arguments: &str,
+) -> Result<EffectOperation, CapabilityError> {
+    let arguments: Vec<serde_json::Value> =
+        serde_json::from_str(encoded_arguments).map_err(|_| CapabilityError::InvalidArguments)?;
+    let string = |index: usize| {
+        arguments
+            .get(index)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(CapabilityError::InvalidArguments)
+    };
+    match operation {
+        HostCapability::ReadFile if arguments.len() == 1 => {
+            Ok(EffectOperation::ReadFile { path: string(0)? })
+        }
+        HostCapability::WriteFile if arguments.len() == 2 => Ok(EffectOperation::WriteFile {
+            path: string(0)?,
+            content: string(1)?,
+        }),
+        HostCapability::Spawn if arguments.len() == 2 => {
+            let values = arguments
+                .get(1)
+                .and_then(serde_json::Value::as_array)
+                .ok_or(CapabilityError::InvalidArguments)?;
+            let command_arguments = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or(CapabilityError::InvalidArguments)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(EffectOperation::Spawn {
+                program: string(0)?,
+                arguments: command_arguments,
+            })
+        }
+        HostCapability::Fetch if (1..=2).contains(&arguments.len()) => {
+            let mut method = HttpMethod::Get;
+            let mut headers = Vec::new();
+            let mut body = None;
+            if let Some(options) = arguments.get(1) {
+                let options = options
+                    .as_object()
+                    .ok_or(CapabilityError::InvalidArguments)?;
+                if options
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "method" | "headers" | "body"))
+                {
+                    return Err(CapabilityError::InvalidArguments);
+                }
+                if let Some(value) = options.get("method") {
+                    method = match value.as_str() {
+                        Some("GET") => HttpMethod::Get,
+                        Some("POST") => HttpMethod::Post,
+                        _ => return Err(CapabilityError::InvalidArguments),
+                    };
+                }
+                if let Some(value) = options.get("headers") {
+                    headers = value
+                        .as_object()
+                        .ok_or(CapabilityError::InvalidArguments)?
+                        .iter()
+                        .map(|(name, value)| {
+                            Ok(HttpHeader {
+                                name: name.clone(),
+                                value: value
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .ok_or(CapabilityError::InvalidArguments)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, CapabilityError>>()?;
+                }
+                if let Some(value) = options.get("body") {
+                    body = Some(
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or(CapabilityError::InvalidArguments)?,
+                    );
+                }
+            }
+            Ok(EffectOperation::Fetch {
+                url: string(0)?,
+                method,
+                headers,
+                body,
+            })
+        }
+        _ => Err(CapabilityError::InvalidArguments),
+    }
+}
+
+fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError> {
+    let value = match result {
+        EffectResult::ReadFile { content } => serde_json::Value::String(content),
+        EffectResult::WriteFile => serde_json::Value::Null,
+        EffectResult::Fetch {
+            status,
+            headers,
+            body,
+            truncated,
+        } => serde_json::json!({
+            "status": status,
+            "headers": headers.into_iter().map(|HttpHeader { name, value }| (name, value)).collect::<BTreeMap<_, _>>(),
+            "body": body,
+            "truncated": truncated,
+        }),
+        EffectResult::Spawn {
+            stdout,
+            stderr,
+            exit_code,
+            timed_out,
+            stdout_truncated,
+            stderr_truncated,
+        } => serde_json::json!({
+            "stdout": stdout,
+            "stderr": stderr,
+            "code": exit_code,
+            "timed_out": timed_out,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }),
+        EffectResult::ProposalAccepted => return Err(CapabilityError::DispatchDenied),
+        EffectResult::Error(error) => {
+            let _closed_code = match error.code {
+                EffectErrorCode::Denied
+                | EffectErrorCode::InvalidTarget
+                | EffectErrorCode::Cancelled
+                | EffectErrorCode::TimedOut
+                | EffectErrorCode::OutputLimit
+                | EffectErrorCode::BackendFailure
+                | EffectErrorCode::AuditFailure
+                | EffectErrorCode::OutcomeUnknown => error.code,
+            };
+            return Err(CapabilityError::DispatchDenied);
+        }
+    };
+    serde_json::to_string(&value).map_err(|_| CapabilityError::DispatchDenied)
 }
 
 /// Cloneable execution context shared by the JS wrappers and host globals for
@@ -42,22 +509,15 @@ pub enum CapabilityError {
 #[derive(Clone, Default)]
 pub struct CapabilityContext {
     stack: Arc<Mutex<Vec<SkillExecutionAttribution>>>,
-    active_invocations: Arc<Mutex<BTreeMap<String, SkillExecutionAttribution>>>,
     denials: Arc<Mutex<Vec<CapabilityDenied>>>,
 }
 
 impl std::fmt::Debug for CapabilityContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let depth = self.stack.lock().map(|stack| stack.len()).unwrap_or(0);
-        let active_invocations = self
-            .active_invocations
-            .lock()
-            .map(|active| active.len())
-            .unwrap_or(0);
         formatter
             .debug_struct("CapabilityContext")
             .field("depth", &depth)
-            .field("active_invocations", &active_invocations)
             .finish()
     }
 }
@@ -95,42 +555,6 @@ impl CapabilityContext {
             .ok_or(CapabilityError::InvalidAttribution)
     }
 
-    /// Keep a skill constraint active for the full synchronous or asynchronous
-    /// invocation. This closes escape hatches such as `globalThis.read_file`
-    /// and indirect `eval`, which bypass lexical host proxies.
-    pub(crate) fn begin_invocation(
-        &self,
-        invocation_id: String,
-        attribution: SkillExecutionAttribution,
-    ) -> Result<(), CapabilityError> {
-        if invocation_id.is_empty() {
-            return Err(CapabilityError::InvalidAttribution);
-        }
-        validate_attribution(&attribution)?;
-        let mut active = self
-            .active_invocations
-            .lock()
-            .map_err(|_| CapabilityError::InvalidAttribution)?;
-        match active.entry(invocation_id) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(attribution);
-            }
-            std::collections::btree_map::Entry::Occupied(_) => {
-                return Err(CapabilityError::InvalidAttribution);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn end_invocation(&self, invocation_id: &str) -> Result<(), CapabilityError> {
-        self.active_invocations
-            .lock()
-            .map_err(|_| CapabilityError::InvalidAttribution)?
-            .remove(invocation_id)
-            .map(|_| ())
-            .ok_or(CapabilityError::InvalidAttribution)
-    }
-
     /// Model-authored code outside a skill wrapper has no skill constraint and
     /// is governed solely by normal session permissions.
     pub fn authorize(
@@ -142,11 +566,7 @@ impl CapabilityContext {
             .stack
             .lock()
             .map_err(|_| CapabilityError::InvalidAttribution)?;
-        let active = self
-            .active_invocations
-            .lock()
-            .map_err(|_| CapabilityError::InvalidAttribution)?;
-        let current = stack.last().or_else(|| active.values().next_back());
+        let current = stack.last();
         let Some(current) = current else {
             return if session_allowed {
                 Ok(())
@@ -171,7 +591,6 @@ impl CapabilityContext {
         // authority from either callers or the ambient session.
         if stack
             .iter()
-            .chain(active.values())
             .all(|attribution| attribution.manifest.allows(operation))
         {
             Ok(())
@@ -179,7 +598,6 @@ impl CapabilityContext {
             let denied_attribution = stack
                 .iter()
                 .rev()
-                .chain(active.values().rev())
                 .find(|attribution| !attribution.manifest.allows(operation))
                 .unwrap_or(current);
             self.deny(CapabilityDenied {
@@ -210,23 +628,12 @@ impl CapabilityContext {
     }
 
     pub fn current(&self) -> Option<SkillExecutionAttribution> {
-        if let Some(current) = self.stack.lock().ok()?.last().cloned() {
-            return Some(current);
-        }
-        self.active_invocations
-            .lock()
-            .ok()?
-            .values()
-            .next_back()
-            .cloned()
+        self.stack.lock().ok()?.last().cloned()
     }
 
     pub fn clear(&self) {
         if let Ok(mut stack) = self.stack.lock() {
             stack.clear();
-        }
-        if let Ok(mut active) = self.active_invocations.lock() {
-            active.clear();
         }
     }
 }

@@ -3,11 +3,17 @@ use std::sync::Arc;
 use rig::tool::Tool;
 
 use super::make_test_tool;
+use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId};
+use crate::extras::js::skills::HostCapability;
+use crate::extras::js::skills::capability::{
+    CapabilityError, InvocationAuthorization, InvocationCapabilityRuntime,
+};
 use crate::extras::js::skills::turn::{ResolvedSkill, SkillTurnContext, TurnSkillBundle};
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
 };
 use crate::extras::js::tool::JsArgs;
+use crate::extras::js::worker::WorkerCapabilityLifecycle;
 
 fn artifact(source: &str, exports: &[&str], capability: CapabilityManifest) -> SkillArtifact {
     SkillArtifact::new(
@@ -52,6 +58,136 @@ fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
         index_generation: 7,
         skills,
     }))
+}
+
+#[test]
+fn cancellation_and_worker_recycle_revoke_before_effect_dispatch() {
+    let manifest = crate::extras::js::skills::test_manifest(
+        CapabilityTier::ReadOnly,
+        vec![HostCapability::ReadFile],
+    )
+    .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured = calls.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |_| {
+        captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(EffectResult::ReadFile {
+            content: "should-not-run".into(),
+        })
+    });
+    let skill_id = "a".repeat(64);
+    let grant = GrantId::new(uuid::Uuid::from_bytes([7; 16])).unwrap();
+    let first = InvocationId::new("cancelled-invocation").unwrap();
+    let cancelled_handle = capabilities
+        .prepare(
+            InvocationAuthorization::new(
+                first.clone(),
+                skill_id.clone(),
+                "run".into(),
+                manifest.clone(),
+                [(HostCapability::ReadFile, grant.clone())],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let cancelled_token = capabilities
+        .begin(cancelled_handle, &skill_id, "run", &manifest)
+        .unwrap();
+    let lifecycle = WorkerCapabilityLifecycle::new(capabilities.clone());
+    lifecycle.cancel(&first);
+    assert_eq!(capabilities.active_count(), 0);
+    assert!(matches!(
+        capabilities.dispatch(cancelled_token, HostCapability::ReadFile, r#"["secret"]"#),
+        Err(CapabilityError::Revoked)
+    ));
+
+    let recycled_handle = capabilities
+        .prepare(
+            InvocationAuthorization::new(
+                InvocationId::new("recycled-invocation").unwrap(),
+                skill_id.clone(),
+                "run".into(),
+                manifest.clone(),
+                [(
+                    HostCapability::ReadFile,
+                    GrantId::new(uuid::Uuid::from_bytes([9; 16])).unwrap(),
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let recycled_token = capabilities
+        .begin(recycled_handle, &skill_id, "run", &manifest)
+        .unwrap();
+    drop(lifecycle);
+    assert_eq!(capabilities.active_count(), 0);
+    assert!(matches!(
+        capabilities.dispatch(recycled_token, HostCapability::ReadFile, r#"["secret"]"#),
+        Err(CapabilityError::Revoked)
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[test]
+fn prepared_authority_must_contain_exactly_one_grant_per_declared_method() {
+    let manifest = crate::extras::js::skills::test_manifest(
+        CapabilityTier::SideEffecting,
+        vec![HostCapability::ReadFile, HostCapability::Spawn],
+    )
+    .unwrap();
+    assert!(matches!(
+        InvocationAuthorization::new(
+            InvocationId::new("incomplete-grants").unwrap(),
+            "b".repeat(64),
+            "run".into(),
+            manifest,
+            [(
+                HostCapability::ReadFile,
+                GrantId::new(uuid::Uuid::from_bytes([8; 16])).unwrap()
+            )],
+        ),
+        Err(CapabilityError::InvalidInvocation)
+    ));
+}
+
+#[test]
+fn wrapper_entry_never_scans_past_a_mismatched_prepared_handle() {
+    let manifest = CapabilityManifest::pure();
+    let skill_id = "e".repeat(64);
+    let capabilities = InvocationCapabilityRuntime::deny_all();
+    let prepare = |invocation: &str, export: &str| {
+        capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    InvocationId::new(invocation).unwrap(),
+                    skill_id.clone(),
+                    export.into(),
+                    manifest.clone(),
+                    [],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    };
+    let second_handle = prepare("prepared-second", "second");
+    let first_handle = prepare("prepared-first", "first");
+
+    assert!(matches!(
+        capabilities.begin_next(&skill_id, "first", &manifest),
+        Err(CapabilityError::InvalidInvocation)
+    ));
+    let second = capabilities
+        .begin_next(&skill_id, "second", &manifest)
+        .unwrap();
+    capabilities.finish(second);
+    let first = capabilities
+        .begin(first_handle, &skill_id, "first", &manifest)
+        .unwrap();
+    capabilities.finish(first);
+    assert!(matches!(
+        capabilities.begin(second_handle, &skill_id, "second", &manifest),
+        Err(CapabilityError::InvalidInvocation)
+    ));
 }
 
 #[tokio::test]
