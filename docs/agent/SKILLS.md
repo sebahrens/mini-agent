@@ -9,7 +9,9 @@ first model request of each user turn:
   `allowed-tools` and bundled scripts are inert metadata/resources and never grant permissions.
 - Learned JavaScript skills are immutable, identity-checked, verified artifacts in
   `<local-data>/skills/skills.db`. Only active revisions enter a generation snapshot. Their source
-  is never placed in the model prompt; the frozen source bundle is sent directly to the JS thread.
+  is never placed in the model prompt; the frozen source bundle is sent directly to the contained
+  JavaScript worker. Identity-v1 rows are quarantined and cannot execute; current artifacts use
+  identity v2 with ABI-bound structured target grants.
 
 One cached query embedding feeds both typed indexes. Learned-JS retrieval uses an immutable HNSW
 generation, a generation-local FTS5 snapshot, RRF fusion, score floors, semantic/lineage dedupe,
@@ -33,11 +35,18 @@ workers are configured, model code also receives bounded `propose_skill(draft)` 
 separate parent grant. Stored skill initialization and exports never receive proposal authority,
 and a newly proposed skill cannot run in the proposing step.
 
+Private realms prevent one skill from receiving another skill's source-level capability object;
+they do not contain native compromise. The parent treats the union of all live current-step grants
+as the worker's maximum brokered authority and still applies exact scope, session permission,
+target narrowing, durable audit, and deadline checks to every effect. The worker has no ambient
+workspace, network, credential, database, or persistence authority.
+
 Normal removal is optimistic, versioned retirement. Retirement and privacy purge publish an
 immediate immutable visibility mask without rebuilding the graph; purge also deletes persistent
 vectors, and a purged identity is tombstoned so it cannot be resurrected.
 Agent Skill instructions and learned capabilities never bypass the existing MCP, filesystem,
 network, process, or sandbox permission paths.
 
-See [the Phase 3 specification](../specs/phase-3-skill-library.md) and
+See [the Phase 3 specification](../specs/phase-3-skill-library.md),
+[the Phase 6 brokered-runtime specification](../specs/phase-6-brokered-js-runtime.md), and
 [the 100k benchmark](../benchmarks/skill-retrieval.md) for invariants and measured limits.

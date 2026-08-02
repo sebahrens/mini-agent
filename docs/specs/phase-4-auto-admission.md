@@ -1,10 +1,10 @@
 # Phase 4 — Agent Proposals and Human-Gated Admission
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-31
+- **Last reconciled**: 2026-08-02
 - **Entry dependencies**: Foundation, Phase 1, and Phase 3 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 4 blocker
 
@@ -20,7 +20,8 @@ Phase 6 supersedes this phase's identity-v1 flat proposal capability payload, JS
 placement, and verifier runtime ownership. Identity-v2 proposals carry complete structured scopes,
 cross worker IPC as bounded drafts, and are canonicalized/persisted only by the parent. Phase 4's
 field bounds, independent held-out evaluation, immutable reports, and human approval gates remain
-authoritative. Phase 6 is planned; the delivered checkmarks below remain Phase 4 evidence only.
+authoritative. Brokered identity-v2 proposal transport is now the current execution path; the
+delivered checkmarks below remain evidence for Phase 4's preserved admission behavior.
 
 ---
 
@@ -74,8 +75,9 @@ mutable copy of canonical source that could drift from the final artifact.
 | `src/extras/js/skills/visibility.rs` | IMPLEMENTED | Active-only index, prompt manifest, and frozen turn-bundle boundary |
 | `src/extras/js/skills/verify.rs` | EXTENDED | Pure embedded/inherited/held-out execution |
 | `src/extras/js/skills/store.rs` | EXTENDED | Proposal/report/suite/approval schema and lifecycle primitives |
-| `src/extras/js/host.rs` | EXTENDED | Bounded `propose_skill` host implementation |
-| `src/extras/js/engine.rs` | EXTENDED | Register the host only in normal `skills` execution mode; verifier modes omit it |
+| `src/extras/js/host.rs`, `skills/proposal.rs` | EXTENDED | Parent proposal effect service, bounds, durable queue handoff |
+| `src/extras/js/worker.rs` | EXTENDED | Register the model-only wire global; verifier and stored-skill modes omit it |
+| `src/extras/js/engine.rs` | TEST-ONLY | Historical proposal-global regression harness |
 
 The delivered Phase 4 implementation keeps proposal persistence on a dedicated bounded parent-side
 admission worker, not the historical QuickJS thread. Phase 6 preserves that parent-owned
@@ -143,9 +145,8 @@ existing rejection/report idempotently; only changed identity-bearing content cr
 
 ## `propose_skill()` host global
 
-The example below is the delivered identity-v1 payload. Under Phase 6, `allowed_hosts` is replaced
-by canonical structured `scopes`; omission, ambiguity, or a flat version-1 list is rejected rather
-than widened or inferred.
+The current identity-v2 payload uses canonical structured `grants`. Omission, ambiguity, an
+identity-v1 `allowed_hosts` list, or an unknown field is rejected rather than widened or inferred.
 
 ```javascript
 propose_skill({
@@ -153,7 +154,14 @@ propose_skill({
   description,
   exports,
   tests,
-  capability: { tier, allowed_hosts },
+  capability: {
+    tier,
+    grants: [
+      { kind: "read_file", workspace_prefixes: ["src/"] },
+      { kind: "fetch", origins: ["https://docs.rs"], methods: ["GET"] },
+      { kind: "spawn", programs: ["cargo"] }
+    ]
+  },
   tags?,
   predecessor_id?
 })
@@ -165,13 +173,14 @@ propose_skill({
 | `description` | string | Retrieval description, nonempty, max 1 KiB |
 | `exports` | object[] | Public names and signatures, min 1, bounded count/bytes |
 | `tests` | string[] | Expressions required to return exact boolean `true`, 1–20, max 4 KiB each |
-| `capability` | object | Tier plus exact allowed host operations; must be internally consistent and Tier 0–2 |
+| `capability` | object | Tier plus exact structured target grants; must be internally consistent and Tier 0–2 |
 | `tags` | string[] | Optional normalized retrieval tags with count/length limits |
 | `predecessor_id` | string | Optional full immutable revision ID for a replacement proposal |
 
-The delivered host canonicalized the proposal and computed the Phase 3 identity-v1 full identity.
-Under Phase 6, the parent canonicalizes the bounded wire draft and computes identity v2 including
-the ABI and complete structured scopes. Duplicate submissions of the same artifact/version are
+The historical Phase 4 host canonicalized a flat identity-v1 proposal. The current worker only
+decodes the bounded identity-v2 draft; the parent validates and canonicalizes it, writes durable
+intent, and computes identity v2 including the ABI and complete structured grants. Duplicate
+submissions of the same artifact/version are
 idempotent. A predecessor must resolve to an eligible active/canary revision. The complete
 canonical payload and per-session proposal count have fixed limits. Queue backpressure returns a
 typed retryable error rather than growing memory without bound.
@@ -182,24 +191,10 @@ revision for immutable audit lineage, but that predecessor supplies no execution
 non-inferiority, or capability-scope authority. Ordinary model-authored proposals cannot select
 this exception.
 
-```rust
-pub fn make_propose_skill(
-    proposal_tx: ProposalSender,
-    attempt_budget: Arc<AtomicUsize>,
-) -> impl Fn(JsProposal) -> rquickjs::Result<String> {
-    move |proposal: JsProposal| {
-        consume_attempt_budget(&attempt_budget)?;
-        let artifact = validate_and_canonicalize(proposal)?;
-        let result = proposal_tx.enqueue(artifact)?;
-        serde_json::to_string(&result).map_err(to_js_error)
-    }
-}
-```
-
-The host performs bounded shape and canonicalization checks only. It never evaluates untrusted
-proposal code on the current JS runtime or blocks on model embedding. Durable enqueue follows the
-same async request/response boundary as other host I/O. Evaluation happens in bounded blocking
-workers after the current tool call.
+The worker closure performs bounded JS-to-wire decoding only. It never evaluates proposed source,
+opens the store, or owns the attempt budget. The parent effect service performs bounded shape and
+canonicalization checks, appends audit intent before queue dispatch, and durably reconciles the
+completion. Evaluation happens in bounded blocking workers after the current tool call.
 
 Example response:
 

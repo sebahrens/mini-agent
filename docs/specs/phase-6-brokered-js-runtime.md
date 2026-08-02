@@ -1,8 +1,8 @@
 # Phase 6 — Brokered Cross-Platform JavaScript Runtime
 
 - **Document role**: normative phase specification
-- **Specification version**: 0.1.0
-- **Delivery status**: planned
+- **Specification version**: 1.0.0-rc.1
+- **Delivery status**: implementation complete; final cross-platform evidence pending
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-08-02
 - **Entry dependency**: the indexed Phase 1–5 contracts whose behavior Phase 6 preserves
@@ -11,7 +11,8 @@
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). This document is the authority for JavaScript worker containment,
 worker protocol, runtime ownership, brokered effects, effect audit, and production/verification
-realm parity. It is a contract for future implementation, not a claim that Phase 6 is delivered.
+realm parity. The implementation follows this contract. The final delivery claim remains pending
+until the required cross-platform CI artifacts and reviewed resource record are available.
 
 Phase 1 remains the authority for the JavaScript language surface, resource limits, stable error
 categories, and permission semantics that this phase preserves. Its exception text/stack
@@ -50,12 +51,14 @@ initialized in the worker.
 
 For an ordinary JavaScript invocation, per-artifact grants constrain the capabilities exposed by
 the JavaScript realm. They are not a defense against a native-compromised worker. Such a worker
-may try to borrow any parent-created grant handle provisioned for the current invocation, so the
-maximum brokered authority is the union of those live handles. It cannot create authority: every
+may try to borrow any parent-created grant handle provisioned for the current request, so the
+maximum brokered authority is the union of all live current-step handles rather than the scope of
+one source-level realm. It cannot create authority: every
 request is still intersected with parent session permissions and target-narrowing policy, and the
 grant is bound to the parent-created invocation. Platform containment separately removes ambient
-filesystem, network, credential, database, and parent-memory authority. Linux and Windows also
-deny process creation; macOS carries the narrower, probed claim defined under Platform containment.
+filesystem, network, credential, database, and parent-memory authority. An available Linux worker
+and an attested Windows worker also deny process creation. macOS is unavailable because its probed
+stable-image Seatbelt path cannot enforce that property.
 
 Out of scope are compromise of the parent, containment backend, operating system, or kernel, and
 availability after a host-wide resource failure. Phase 6 does not claim that JavaScript realms
@@ -250,9 +253,9 @@ limit belong to the whole fresh worker runtime request, not to individual nested
 capability tokens, and reset only when that disposable runtime is recycled.
 
 File, fetch, proposal, and command operations retain their owning Phase 1–4 validation and limits.
-Parent-brokered JS `spawn` remains disabled on Windows until `mini-agent-uq5c` delivers and verifies
-the separate general command sandbox. Worker containment never serves as containment for a
-brokered command.
+Parent-brokered JS `spawn` remains disabled on Windows until a separate general command sandbox
+owns and verifies the complete descendant lifetime. LPAC worker containment never serves as
+containment for a brokered command.
 
 ## Persistence boundary
 
@@ -368,8 +371,12 @@ original ordinal. A repeated invocation/ordinal pair is denied before execution.
 grant/session/target authorization, audit append, or audit sync failure executes no effect. A
 completion append/sync failure returns the closed audit operational error, retires the invocation,
 and leaves the already-durable intent available for conservative `outcome_unknown` recovery; it
-never retries the effect. The audit writer is shared by parent brokers behind one exclusive
-process-local lock, matching the single private on-disk writer.
+never retries the effect. All brokers in one parent share one mutex-protected writer. A private
+lock file also enforces one active production parent writer for this audit store across the
+machine: a second parent fails audit initialization and cannot advertise JS while the first holds
+the lock. The first initialization result, including lock contention or recovery failure, is held
+in a process-wide `OnceLock`; that process does not retry. A process restart creates a new
+initialization attempt and can recover after the other writer exits or the storage fault is fixed.
 
 Grant expiry remains a lease boundary while waiting for that shared writer. The broker rechecks
 expiry after acquiring the audit lock and before appending intent, so a grant that expires under
@@ -392,10 +399,13 @@ digest is separate from the audit chain hash, is domain-separated by operation a
 and supports equality correlation only; it cannot be used as authorization or reversed to recover
 the target.
 
-The audit key is created in private parent-owned storage, identified by a non-secret key version,
-and never enters the worker or diagnostics. Rotation retains old keys only for the configured audit
-retention window. A missing, unreadable, or corrupt required key makes audit recovery fail and JS
-remain unavailable rather than falling back to plaintext metadata or an unkeyed digest.
+The audit target-correlation key is one fixed version-1 key created in private parent-owned
+storage. It never enters the worker or diagnostics. Each segment open record binds that same key
+version and key digest; size-driven segment rotation writes hash-chained close/open anchors and
+does not rotate the key. Key rotation, multiple retained keys, and recovery across a key change are
+not implemented and remain explicitly out of Phase 6 scope. A missing, unreadable, corrupt, or
+unexpected required version-1 key makes audit recovery fail and JS remain unavailable rather than
+falling back to plaintext metadata or an unkeyed digest.
 
 The same metadata allow-list and target-tag rules apply to completion records, recovery messages,
 and audit errors; none may reintroduce a raw target while describing a result.
@@ -425,14 +435,15 @@ The platform-neutral launcher owns its target-selected child control object and 
 protocol/diagnostic pipes as ordinary files. Its common control surface is limited to process ID,
 tree termination, nonblocking status, and reaping; it does not require a Windows process created
 through Win32 APIs to masquerade as `std::process::Child`. The unconfined launcher is compiled only
-for tests. Until a target's real containment launcher is delivered and probed, its production
-status and every production launch attempt remain unavailable.
+for tests. Until a target's real containment launcher is implemented and its required local
+attestation succeeds, its production status and every production launch attempt remain
+unavailable.
 
 | Platform | Required worker containment |
 |----------|-----------------------------|
-| Linux | A broker-only bubblewrap profile with no workspace/cache bind; isolated namespaces and environment; validated OS resource limits; and an in-worker seccomp deny policy for process creation and execution. |
-| macOS | A broker-only Seatbelt profile, explicit descriptor closing, sanitized environment, and validated rlimits. `/usr/bin/sandbox-exec` is a deprecated, weaker, best-effort MAC backstop, so real probes must report its exact denials and process-creation behavior and the parent must always kill the whole process group. |
-| Windows | A zero-capability LPAC/AppContainer, compatible process mitigations, creation-time Job Object assignment, child-process denial, validated resource limits, and an exact inherited-handle list. |
+| Linux | Available only after a broker-only empty-root bubblewrap preflight proves isolated namespaces/environment, exact mounts, resource limits, and in-worker seccomp denial of process creation and execution. |
+| macOS | Unavailable. The real Seatbelt probe proves that the stable worker image cannot be allowed for initial execution and simultaneously denied to a native-compromised worker for re-exec. Deprecated `sandbox-exec` is not accepted as a weaker production fallback. |
+| Windows | Available only after a cached minimal production attestation observes the LPAC/token shape, protocol handles, selected Job/mitigation state, closed protocol probe, fresh runtime, and clean shutdown for the same launcher used for real work. It does not establish filesystem, credential, network, actual-child, omitted-handle, or install-root denial. The hosted full canary/install-location gate is separate reference-runner evidence. |
 
 The Linux launcher is a dedicated broker-only bubblewrap profile, not the general command
 sandbox. It starts from an empty root, mounts only the exact worker executable and the exact
@@ -461,9 +472,9 @@ reports no core dump and leaves no artifact under `RLIMIT_CORE=0` (including on 
 completed Hello/Ready handshake and valid contained `RunStep`,
 and disappearance of the exact controlled sleeper PID/start-time after process-group teardown.
 
-Containment availability and the real backend are probed before JS is advertised. Linux and
-Windows separately deny process creation/exec. macOS must probe the weaker backend's process
-behavior and report it without upgrading the claim. A backend that is absent, untrusted,
+Containment availability and the real backend are probed before JS is advertised. An available
+Linux or Windows worker denies process creation/exec. macOS reports the probed reusable-exec
+blocker without upgrading the claim. A backend that is absent, untrusted,
 misconfigured, unverifiable, or unable to apply every required restriction makes JS unavailable.
 
 ### macOS standalone-CLI containment gate
@@ -584,23 +595,57 @@ cargo test --locked --no-default-features --features js windows_lpac_can_load_cu
 
 Construction of the production LPAC policy and attribute list is not runtime evidence: it cannot
 prove that Windows accepts the combined token, Job, mitigation, handle, console, and executable
-controls or that the resulting child observes them. Production Windows worker status therefore
-remains unavailable until a sacrificial launch probes those combined controls on the running host.
-Neither the construction preflight nor the narrower image-loading rows may report availability.
-While status is unavailable, the production launcher returns the typed unavailable error without
-calling `CreateProcessW`; only the internal sacrificial-probe/test seam may call the raw production
-launcher. There is no restricted-token or unconfined fallback, and this worker boundary does not
-satisfy the separate `mini-agent-uq5c` general-command sandbox.
+controls or that the resulting child observes them. Before advertising availability, the trusted
+parent therefore performs one minimal sacrificial production attestation through the same raw
+launcher, executable image, authenticated protocol, LPAC token, exact handle list, mitigation
+attributes, and creation-time Job policy used by a real request. One process-wide `OnceLock` owns
+the first status query and caches its result permanently. The parent verifies exact Job membership,
+active-process limit one, 256 MiB per-process memory, CPU/UI/kill-on-close limits, selected
+mitigations, and the queryable child-process restriction. After authenticated `Hello`/`Ready`, it
+sends the closed connection-scoped `ContainmentProbe`; the child reports only `Passed` after
+self-checking AppContainer plus less-privileged token state, zero capability groups, three distinct
+valid pipe standard handles, and no console, window, or device authority. The parent then requires
+`6 * 7` to evaluate to `42`, performs the closed shutdown, and requires successful exit. Any
+failure or timeout becomes one fixed source-free unavailable reason. Later public launch never
+retries under a weaker token or an uncontained launcher.
+
+This bounded local attestation is the production availability decision, not evidence for
+filesystem, credential, network, actual child-spawn, omitted-handle, or install-root denial. Those
+ambient canaries belong only to the full hosted gate below and are intentionally absent from an
+ordinary worker environment. LPAC is a token boundary, not a filesystem namespace: host objects
+whose ACLs grant effective access to the stable AppContainer package identity can remain visible.
+The broader hosted canaries record denial observations on the configured reference runner; they
+do not prove that every Windows host has identical ACL visibility. While the
+attestation is unavailable, normal launch returns a typed unavailable error and starts no
+production worker. LPAC worker containment also does not satisfy the separate general-command
+sandbox required by parent-brokered JS `spawn`.
+
+The potentially blocking Windows creation call runs on one owned helper thread behind a five-second
+caller-side deadline. Cancellation and timeout do not claim to interrupt the operating-system call.
+If it returns late, the supervisor still owns and tears down the result before releasing the launch
+lease. A permanently blocked creation call cannot be forcibly stopped and remains an explicit
+availability residual; no second launch helper or worker may be created around it.
 
 ### Windows production containment and install-location gate
 
-The A26 production launcher constructs a zero-capability LPAC process with the exact protocol
-handle list, child-process restriction, compatible mitigations, and creation-time Job limits. That
-construction is not availability evidence. Windows worker status remains unavailable until the
-ignored real-backend test `windows_js_worker_containment` passes in the same process image and
-under the same launcher path used by production.
+The production launcher constructs a zero-capability LPAC process with the exact protocol handle
+list, child-process restriction, compatible mitigations, and creation-time Job limits. The cached
+minimal attestation above is necessary for runtime availability. The ignored real-backend test
+`windows_js_worker_containment` is the broader release gate and uses the same production launcher
+to record denial-canary, supported-install-location, and lifecycle observations on the hosted
+reference runner.
 
-The A27 test must prove all of the following before emitting its fixed, source-free pass frame:
+Evaluating Windows containment status during ordinary startup or `--print-config` performs
+production preflight. That preflight creates or reuses a stable AppContainer profile and, for a
+supported current executable owned by the user, may add the package SID's exact read/execute ACE
+to the installed executable. The production profile and committed ACE persist after process exit.
+There is no automatic profile deletion, ACL rollback, explicit consent prompt, or cleanup command;
+protected, other-user-owned, remote, reparse-point, and unsupported executable locations are
+rejected instead of mutated. Merely querying status can therefore mutate supported Windows host
+state even when no user JavaScript request is run.
+
+The A27 test must observe all of the following on its hosted reference runner before emitting its
+fixed, source-free pass frame:
 
 - the child cannot read or write a workspace sentinel or a separately rooted skill-database
   sentinel and receives none of the parent's credential environment;
@@ -652,10 +697,11 @@ The `windows-worker-containment-gate` CI job first lists tests and requires exac
 filter drift cannot pass by running zero tests. It installs beneath a path containing spaces and
 Unicode, prepares the protected-location negative control, runs the ignored real probe, exercises
 the worker runtime, invokes the installed binary's `--print-config`, and archives both outputs.
-That hosted-runner evidence does not replace the required standard-user run. Windows availability
-remains unverified until both `windows-latest` and a standard-user Windows installation pass; no
-restricted-token or unconfined fallback is allowed, and this gate does not satisfy the separate
-`mini-agent-uq5c` general-command sandbox.
+The hosted workflow must run the complete gate both as the runner identity and under a newly
+created standard-user credential from a private path containing spaces and Unicode. The final CI
+result and artifact are still pending and must be inserted here before Phase 6 is marked delivered.
+No restricted-token or unconfined fallback is allowed, and this gate does not satisfy the separate
+general-command sandbox.
 
 ## Failure semantics
 
@@ -751,8 +797,9 @@ invocation. Callers must not replay that proposal automatically.
 
 ## Acceptance matrix
 
-The matrix defines required evidence. It deliberately records no completed status; Phase 6 remains
-planned until the index exit rule is satisfied.
+The matrix defines required evidence. Implementation is complete, but the final delivery status
+remains pending until the index exit rule is satisfied. The platform and resource rows below are
+intentional last-mile placeholders; replace them only with reviewed CI artifacts, never estimates.
 
 | Contract area | Required acceptance evidence |
 |---------------|------------------------------|
@@ -762,7 +809,8 @@ planned until the index exit rule is satisfied.
 | Capability broker | Permission/policy/grant intersection tests cover every typed effect, expiry, scope, Windows spawn denial, and malicious attribution. |
 | Persistence boundary | Tests prove no worker database/path authority, pure initialization, no writer in stored realms, identity-v1 quarantine, and parent-only canonical persistence. |
 | Verification parity | The QuickJS realm gate passes; production and all verifier modes use one loader/ABI path with only declared deterministic fake capabilities and the same sanitized typed diagnostic contract. |
-| Effect audit | Recovery and failure-injection tests prove durable intent before every real effect, bounded completion, hash-chain integrity, HMAC target correlation/redaction, key rotation/failure, retention, and no replay. |
-| Platform containment | Real Linux/macOS/Windows probes prove the broker-only capability matrix; the LPAC install-location gate passes wherever Windows JS is enabled. |
+| Effect audit | Recovery and failure-injection tests prove durable intent before every real effect, bounded completion, hash-chain integrity, fixed version-1 HMAC target correlation/redaction, version-1 key failure, segment rotation/anchors, bounded retention, machine-wide single-writer exclusion, process-restart retry semantics, and no replay. Key rotation remains out of scope. |
+| Platform containment | **PENDING FINAL CI EVIDENCE.** Linux must publish its real empty-root bwrap probe; macOS must publish truthful status-only unavailability for the reusable-exec blocker; Windows must publish the cached-attestation and hosted reference-runner full-canary/supported-install-location observations before those results are recorded. |
+| Resource baseline | **PENDING EXTERNAL RUNS.** The schema and methodology are delivered in [`../benchmarks/js-worker.md`](../benchmarks/js-worker.md); [`../benchmarks/results/js-worker-baseline.json`](../benchmarks/results/js-worker-baseline.json) remains an explicit empty observation record until the reviewed aggregate is checked in. Target misses are recorded, not blocking, unless a miss is reproduced on a matched quiet host and explicitly promoted to a blocking acceptance issue. |
 | Failure semantics | Crash, OOM, timeout, cancellation, audit failure, backend absence, parent death, ambiguous-effect, and secret-in-thrown-value tests all fail closed with only stable class/code and source-free location metadata. |
-| Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded, indexes this planned spec, and marks no Phase 6 feature delivered. |
+| Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded and records implementation-complete/evidence-pending status consistently. Final delivery wording is inserted only after the two pending rows above close. |

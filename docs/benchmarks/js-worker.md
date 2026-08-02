@@ -10,10 +10,11 @@ CI records Linux, macOS, and Windows. An empty `platform_evidence` array and
 `evidence_state: pending_external_runs` are explicit missing evidence, not zeroes or estimated
 results. A platform whose production containment is unavailable emits a status-only
 `containment_unavailable` record with closed backend, assurance, and reason code. It contains no
-latency, memory, or count fields and does not satisfy a resource target. In the current design,
-macOS is unavailable due the reusable-exec Seatbelt blocker and Windows remains unavailable until
-its runtime containment gate can authorize production launch; only Linux can currently produce a
-measured baseline.
+latency, memory, or count fields and does not satisfy a resource target. macOS is unavailable due
+the reusable-exec Seatbelt blocker. Windows may emit measurements only after its cached minimal
+LPAC/Job production attestation authorizes the worker. The final Linux/macOS/Windows aggregate is
+still pending external CI runs; this document does not predict which measured records those runs
+will produce.
 
 ## Reference method
 
@@ -42,8 +43,8 @@ authenticated `Ready`, identifies exactly one worker by the configured installed
 device/inode,
 samples that exact worker rather than the bwrap namespace-init helper, and reports helper counts
 separately. Idle private memory is exact-worker-only and deliberately excludes bwrap helper
-overhead. Ambiguous, changing, or multi-worker trees fail closed. On a future available Windows
-backend, the harness uses the directly owned `CreateProcessW` application PID and queries the
+overhead. Ambiguous, changing, or multi-worker trees fail closed. On an attested Windows backend,
+the harness uses the directly owned `CreateProcessW` application PID and queries the
 owned creation-time Job's active-process count; the Job handle is authority, not a helper process.
 It reports zero idle QuickJS
 runtimes as a protocol/lifecycle proof rather than a cross-process measurement: authenticated
@@ -70,6 +71,12 @@ even when a p95 target is missed. Schema errors, wrong results, ambiguous/multip
 inability to measure memory on an available backend remain hard failures. Containment
 unavailability produces a valid status-only artifact instead of running measurements.
 
+Initial external runs are observation collection, not target exit gates. A single performance-goal
+miss is recorded in `target_results` and does not block Phase 6. It becomes blocking only after the
+miss is reproduced on a matched, otherwise quiet host using the comparison method below and a
+review explicitly promotes that repeatable miss to a blocking acceptance issue. Until then the
+checked-in aggregate reports what was observed without converting a target boolean into a verdict.
+
 To create the repeatability record required in the three-platform aggregate, run once to a
 `-reference.json` output, then run the same command again with:
 
@@ -86,10 +93,10 @@ retains the reference machine and containment identity, records the previous/cur
 each derived relative delta against the
 documented 15% repeatability envelope, and an aggregate `all_within_documented_variance` flag.
 That flag is evidence, not a test verdict. Single-platform reference artifacts may omit comparison;
-an aggregate rejects every measured record that omits it. Repeat
-an out-of-envelope run on the same quiet host before investigating; optimize a repeatable target
-miss before changing a target. Any target amendment requires a reviewed rationale and checked-in
-evidence.
+an aggregate rejects every measured record that omits it. Repeat an out-of-envelope run or target
+miss on the same quiet host before investigating. A repeatable miss remains recorded evidence
+unless review explicitly makes it blocking; optimize a promoted blocking miss before changing a
+target. Any target amendment requires a reviewed rationale and checked-in evidence.
 
 After downloading the three artifacts, aggregate and validate them deterministically with:
 
@@ -129,8 +136,9 @@ After each platform containment probe, install the debug binary and run the comm
 first to a reference path,
 then to the final path with `MINI_AGENT_JS_WORKER_BENCH_COMPARE` naming the reference. Upload
 `js-worker-${RUNNER_OS}.json` as an artifact named `js-worker-resource-${RUNNER_OS}`. Do not add a
-condition on any `target_results` or comparison field. Unavailable platforms still upload their
-status-only evidence. The final evidence job should download all three artifacts and use
+condition on any `target_results` or comparison field unless review has promoted a repeatable miss
+to a blocking acceptance issue. Unavailable platforms still upload their status-only evidence. The
+final evidence job should download all three artifacts and use
 `js_worker_resource_aggregate` to require, sort, and schema-validate one record per OS before
 accepting the generated manifest. The separate
 `worker_resource_baseline_manifest_is_honest_and_schema_valid` test protects only the checked-in
