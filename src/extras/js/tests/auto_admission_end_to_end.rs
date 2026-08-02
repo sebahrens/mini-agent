@@ -52,7 +52,7 @@ fn payload(source: &str, test: &str) -> String {
         "description": "Normalize a value.",
         "exports": [{"name": "normalize", "signature": "normalize(value: unknown): string"}],
         "tests": [test],
-        "capability": {"tier": "pure", "allowed_hosts": []},
+        "capability": {"tier": "pure", "grants": []},
         "tags": ["normalize"]
     })
     .to_string()

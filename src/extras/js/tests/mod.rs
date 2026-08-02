@@ -3,6 +3,8 @@ mod agent_skill_catalog;
 #[cfg(feature = "skills")]
 mod auto_admission_end_to_end;
 #[cfg(feature = "skills")]
+mod capability_manifest_v2;
+#[cfg(feature = "skills")]
 mod evidence_policy_scheduler;
 #[cfg(feature = "skills")]
 mod evidence_promotion_policy;
@@ -35,6 +37,8 @@ mod skill_lifecycle_schema;
 #[cfg(feature = "skills")]
 mod skill_quarantine_policy;
 #[cfg(feature = "skills")]
+mod skill_realm_isolation;
+#[cfg(feature = "skills")]
 mod skill_repair_and_rollback;
 #[cfg(feature = "skills")]
 mod skill_repair_records;
@@ -54,6 +58,8 @@ mod skill_targeted_feedback;
 mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
+mod worker_protocol;
+mod worker_runtime;
 
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::tool::JsTool;
@@ -527,6 +533,55 @@ async fn js_outcome_mapping() {
     assert_eq!(
         run("typeof globalThis.leaked", normal_timeout, 10_000),
         JsOutcome::Value("undefined".to_string())
+    );
+
+    owner.shutdown();
+}
+
+#[tokio::test]
+async fn runtime_has_no_require_or_dynamic_module_loader() {
+    use std::time::Duration;
+
+    use crate::extras::js::engine::run_step_for_test;
+    use crate::extras::js::tool::PermissionBridgeOwner;
+
+    let sandbox = Sandbox::new(false, "bwrap");
+    let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+    let bridge = owner.bridge();
+    let runtime = tokio::runtime::Handle::current();
+    let allow_config = AllowConfig::unrestricted(&std::env::current_dir().unwrap());
+    let run = |code: &str| {
+        run_step_for_test(
+            code,
+            &sandbox,
+            &bridge,
+            &PermCancellation::new(),
+            &runtime,
+            &allow_config,
+            Duration::from_secs(2),
+            10_000,
+        )
+    };
+
+    assert_eq!(
+        run("typeof require"),
+        JsOutcome::Value("undefined".to_string())
+    );
+    for dynamic_import in [
+        "import('file:///tmp/mini-agent-no-loader.js')",
+        "import('file:///tmp/mini-agent-native-loader.so')",
+    ] {
+        assert!(
+            matches!(run(dynamic_import), JsOutcome::Error(_)),
+            "dynamic import unexpectedly resolved without a configured loader"
+        );
+    }
+    assert!(
+        matches!(
+            run("import value from 'file:///tmp/mini-agent-no-loader.js'; value"),
+            JsOutcome::Error(_)
+        ),
+        "an import declaration entered the script-only evaluation path"
     );
 
     owner.shutdown();
