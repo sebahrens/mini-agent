@@ -10,7 +10,9 @@ use crate::extras::js::skills::lifecycle::{
     EvidenceSnapshot, HumanApproval, LifecycleError, LifecycleService,
 };
 use crate::extras::js::skills::store::{AdminIdentity, ProposalStatus, SkillStore};
+use crate::extras::js::skills::verify::worker_error;
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+use crate::extras::js::supervisor::WorkerError;
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -95,6 +97,35 @@ fn evaluator(with_suite: bool) -> (PathBuf, AppPaths, AdmissionEvaluator, SkillA
     let evaluator =
         AdmissionEvaluator::new(store, Embedder::new().unwrap(), "worker-1").expect("evaluator");
     (root, paths, evaluator, artifact)
+}
+
+#[test]
+fn verification_scheduler_cancellation_retries_without_rejecting_candidate() {
+    let (root, _paths, mut evaluator, artifact) = evaluator(true);
+    evaluator.fail_next_verification_for_test(worker_error(WorkerError::Cancelled));
+
+    let error = evaluator
+        .evaluate_next(20)
+        .expect_err("scheduler cancellation must remain retryable");
+    assert!(matches!(error, AdmissionError::Retryable(_)));
+
+    let proposal = evaluator
+        .store()
+        .get_proposal(&artifact.id)
+        .unwrap()
+        .expect("proposal remains queued");
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+    assert_eq!(proposal.attempt_count, 1);
+    assert_eq!(proposal.next_attempt_at, Some(21));
+    assert_eq!(proposal.lease_owner, None);
+    assert_eq!(proposal.lease_expires_at, None);
+    assert_eq!(proposal.report_id, None);
+    assert_eq!(proposal.reason_code, None);
+    assert_eq!(
+        evaluator.store().revision_status(&artifact.id).unwrap(),
+        Some("pending".to_string())
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 struct Approver {

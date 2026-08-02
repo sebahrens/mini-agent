@@ -35,6 +35,8 @@ pub(crate) struct AdmissionEvaluator {
     store: SkillStore,
     embedder: Embedder,
     worker_id: String,
+    #[cfg(test)]
+    verification_failure: Option<VerificationError>,
 }
 
 impl AdmissionEvaluator {
@@ -51,6 +53,8 @@ impl AdmissionEvaluator {
             store,
             embedder,
             worker_id,
+            #[cfg(test)]
+            verification_failure: None,
         })
     }
 
@@ -158,6 +162,15 @@ impl AdmissionEvaluator {
             return Err(deterministic(
                 "duplicate_skill",
                 "active skill has the same normalized contract",
+            ));
+        }
+
+        #[cfg(test)]
+        if let Some(error) = self.verification_failure.take() {
+            return Err(classify_verification(
+                &error,
+                "embedded_test_failed",
+                "embedded verification failed",
             ));
         }
 
@@ -497,6 +510,11 @@ impl AdmissionEvaluator {
     #[cfg(test)]
     pub(crate) fn store(&self) -> &SkillStore {
         &self.store
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_verification_for_test(&mut self, error: VerificationError) {
+        self.verification_failure = Some(error);
     }
 
     #[cfg(test)]

@@ -2076,12 +2076,56 @@ async fn verification_scheduler_cancels_before_dequeue_without_recycling_worker(
         .wait_for_verification_queue_depth_for_test(1)
         .await;
     cancellation.cancel();
-    launcher.release_first_launch();
 
-    assert!(first.join().unwrap().unwrap().passed);
     assert_eq!(queued.join().unwrap(), Err(WorkerError::Cancelled));
+    launcher.release_first_launch();
+    assert!(first.join().unwrap().unwrap().passed);
     assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
     assert_eq!(supervisor.generation_for_test().await, Some(1));
+}
+
+#[tokio::test]
+async fn verification_scheduler_cancellation_wakes_priority_wait_while_interactive_stays_active() {
+    let supervisor = scripted_supervisor(0);
+    let gated = GatedEffects::new();
+    let interactive_supervisor = supervisor.clone();
+    let interactive_effects = gated.clone();
+    let interactive = tokio::spawn(async move {
+        interactive_supervisor
+            .execute(
+                RunStep::new("effect-pending".into()),
+                interactive_effects,
+                PermCancellation::new(),
+            )
+            .await
+    });
+    gated.wait_started().await;
+
+    let cancellation = PermCancellation::new();
+    let queued_cancellation = cancellation.clone();
+    let queued_supervisor = supervisor.clone();
+    let queued = std::thread::spawn(move || {
+        queued_supervisor.verify_blocking_cancellable(held_out_verification(), queued_cancellation)
+    });
+    supervisor
+        .wait_for_verification_queue_depth_for_test(1)
+        .await;
+
+    cancellation.cancel();
+    assert_eq!(queued.join().unwrap(), Err(WorkerError::Cancelled));
+    supervisor
+        .wait_for_verification_queue_depth_for_test(0)
+        .await;
+    assert!(
+        !interactive.is_finished(),
+        "cancellation must wake the scheduler without releasing interactive priority"
+    );
+
+    gated.release();
+    assert_eq!(
+        interactive.await.unwrap().unwrap().outcome,
+        StepOutcome::Value("success".into())
+    );
 }
 
 #[tokio::test]

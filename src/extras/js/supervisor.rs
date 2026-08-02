@@ -151,9 +151,87 @@ struct VerificationJob {
     request: VerifyArtifact,
     cancellation: PermCancellation,
     deadline: Instant,
-    reply: mpsc::SyncSender<Result<VerificationResult, WorkerError>>,
+    reply: VerificationReplySender,
+}
+
+#[derive(Default)]
+struct VerificationReply {
+    result: Mutex<Option<Result<VerificationResult, WorkerError>>>,
+    changed: Condvar,
+}
+
+struct VerificationReplySender {
+    reply: Arc<VerificationReply>,
+    armed: bool,
 }
 // END AUTHORITY-FREE SUPERVISOR STATE
+
+impl VerificationReply {
+    fn complete(&self, result: Result<VerificationResult, WorkerError>) {
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot.is_none() {
+            *slot = Some(result);
+        }
+        drop(slot);
+        self.changed.notify_all();
+    }
+
+    fn wait(
+        self: &Arc<Self>,
+        cancellation: &PermCancellation,
+    ) -> Result<VerificationResult, WorkerError> {
+        let weak_reply = Arc::downgrade(self);
+        let _cancel_wake = cancellation.register_blocking_wake(Arc::new(move || {
+            let Some(reply) = weak_reply.upgrade() else {
+                return;
+            };
+            let _result = reply
+                .result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            reply.changed.notify_all();
+        }));
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(result) = slot.take() {
+                return result;
+            }
+            if cancellation.is_cancelled() {
+                return Err(WorkerError::Cancelled);
+            }
+            slot = self
+                .changed
+                .wait(slot)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+impl VerificationReplySender {
+    fn new(reply: Arc<VerificationReply>) -> Self {
+        Self { reply, armed: true }
+    }
+
+    fn send(mut self, result: Result<VerificationResult, WorkerError>) {
+        self.reply.complete(result);
+        self.armed = false;
+    }
+}
+
+impl Drop for VerificationReplySender {
+    fn drop(&mut self) {
+        if self.armed {
+            self.reply
+                .complete(Err(WorkerError::VerificationQueueClosed));
+        }
+    }
+}
 
 impl Drop for BoundedStderrDrain {
     fn drop(&mut self) {
@@ -559,6 +637,17 @@ impl InvocationPriority {
         cancellation: &PermCancellation,
         deadline: Instant,
     ) -> Result<VerificationLease, WorkerError> {
+        let weak_priority = Arc::downgrade(self);
+        let _cancel_wake = cancellation.register_blocking_wake(Arc::new(move || {
+            let Some(priority) = weak_priority.upgrade() else {
+                return;
+            };
+            let _state = priority
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            priority.changed.notify_all();
+        }));
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         while state.verification_running
             || state.interactive_waiters != 0
@@ -709,12 +798,12 @@ impl VerificationScheduler {
         if cancellation.is_cancelled() {
             return Err(WorkerError::Cancelled);
         }
-        let (reply, response) = mpsc::sync_channel(1);
+        let reply = Arc::new(VerificationReply::default());
         let job = VerificationJob {
             request,
-            cancellation,
+            cancellation: cancellation.clone(),
             deadline,
-            reply,
+            reply: VerificationReplySender::new(Arc::clone(&reply)),
         };
         let sender = self
             .sender
@@ -743,9 +832,7 @@ impl VerificationScheduler {
                 return Err(WorkerError::VerificationQueueClosed);
             }
         }
-        response
-            .recv()
-            .unwrap_or(Err(WorkerError::VerificationQueueClosed))
+        reply.wait(&cancellation)
     }
 
     #[cfg(test)]
@@ -787,12 +874,12 @@ fn run_verification_scheduler(
     while let Ok(job) = receiver.recv() {
         if job.cancellation.is_cancelled() {
             verification_dequeued(&queue);
-            let _ = job.reply.send(Err(WorkerError::Cancelled));
+            job.reply.send(Err(WorkerError::Cancelled));
             continue;
         }
         let Some(inner) = supervisor.upgrade() else {
             verification_dequeued(&queue);
-            let _ = job.reply.send(Err(WorkerError::VerificationQueueClosed));
+            job.reply.send(Err(WorkerError::VerificationQueueClosed));
             break;
         };
         let _verification_lease = match inner
@@ -802,13 +889,13 @@ fn run_verification_scheduler(
             Ok(lease) => lease,
             Err(error) => {
                 verification_dequeued(&queue);
-                let _ = job.reply.send(Err(error));
+                job.reply.send(Err(error));
                 continue;
             }
         };
         verification_dequeued(&queue);
         if job.cancellation.is_cancelled() {
-            let _ = job.reply.send(Err(WorkerError::Cancelled));
+            job.reply.send(Err(WorkerError::Cancelled));
             continue;
         }
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -817,7 +904,7 @@ fn run_verification_scheduler(
         {
             Ok(runtime) => runtime,
             Err(_) => {
-                let _ = job.reply.send(Err(WorkerError::Transport));
+                job.reply.send(Err(WorkerError::Transport));
                 continue;
             }
         };
@@ -826,7 +913,7 @@ fn run_verification_scheduler(
             job.cancellation,
             job.deadline,
         ));
-        let _ = job.reply.send(result);
+        job.reply.send(result);
     }
 }
 

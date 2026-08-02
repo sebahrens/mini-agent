@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -288,6 +289,13 @@ pub struct PermCancellation {
 struct PermCancellationState {
     cancelled: AtomicBool,
     notify: tokio::sync::Notify,
+    next_blocking_wake: AtomicU64,
+    blocking_wakes: Mutex<BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>>,
+}
+
+pub(crate) struct PermCancellationWake {
+    state: Arc<PermCancellationState>,
+    id: Option<u64>,
 }
 
 impl Default for PermCancellation {
@@ -306,6 +314,17 @@ impl PermCancellation {
     pub fn cancel(&self) {
         if !self.state.cancelled.swap(true, Ordering::AcqRel) {
             self.state.notify.notify_waiters();
+            let wakes = self
+                .state
+                .blocking_wakes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for wake in wakes {
+                wake();
+            }
         }
     }
 
@@ -323,6 +342,48 @@ impl PermCancellation {
             }
             notified.await;
         }
+    }
+
+    pub(crate) fn register_blocking_wake(
+        &self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> PermCancellationWake {
+        let id = self
+            .state
+            .next_blocking_wake
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let mut wakes = self
+            .state
+            .blocking_wakes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_cancelled() || id == 0 || wakes.contains_key(&id) {
+            drop(wakes);
+            wake();
+            return PermCancellationWake {
+                state: Arc::clone(&self.state),
+                id: None,
+            };
+        }
+        wakes.insert(id, wake);
+        PermCancellationWake {
+            state: Arc::clone(&self.state),
+            id: Some(id),
+        }
+    }
+}
+
+impl Drop for PermCancellationWake {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        self.state
+            .blocking_wakes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
     }
 }
 
