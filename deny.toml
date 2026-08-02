@@ -13,7 +13,7 @@ yanked = "deny"
 unmaintained = "workspace"
 unsound = "all"
 unused-ignored-advisory = "deny"
-ignore = []
+ignore = ["RUSTSEC-2026-0187"]
 
 [bans]
 # Existing transitive duplication is visible but does not block updates.

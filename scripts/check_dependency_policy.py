@@ -169,7 +169,7 @@ def validate_policy(root: Path, *, today: dt.date | None = None) -> None:
 
     audit_advisories = audit.get("advisories", {})
     require(
-        audit_advisories.get("severity-threshold") == "medium",
+        audit_advisories.get("severity_threshold") == "medium",
         "cargo-audit severity threshold must be medium",
     )
     require(
@@ -287,7 +287,7 @@ def dependency_is_denied(
         fallback = sources.get(f"unknown-{source_kind}")
         return case["id"] not in allowed and fallback == "deny"
     if kind == "advisory":
-        threshold = audit.get("advisories", {}).get("severity-threshold")
+        threshold = audit.get("advisories", {}).get("severity_threshold")
         ignored = set(audit.get("advisories", {}).get("ignore", []))
         return (
             case["id"] not in ignored

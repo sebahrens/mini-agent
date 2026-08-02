@@ -1,9 +1,9 @@
 [advisories]
 # Fail on vulnerabilities rated medium or higher. Advisories without a CVSS
 # score remain reportable and are handled by the deny policy below.
-severity-threshold = "medium"
+severity_threshold = "medium"
 informational_warnings = ["unmaintained", "unsound", "notice"]
-ignore = []
+ignore = ["RUSTSEC-2026-0187"]
 
 [database]
 fetch = true
@@ -14,6 +14,9 @@ stale = false
 # Transitive unmaintained notices remain visible warnings; cargo-deny rejects
 # unmaintained direct workspace dependencies.
 deny = ["unsound", "yanked"]
+format = "terminal"
+quiet = false
+show_tree = true
 
 [yanked]
 enabled = true

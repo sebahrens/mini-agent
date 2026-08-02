@@ -2,7 +2,14 @@
 # into .cargo/audit.toml or deny.toml. CI rejects missing, orphaned, malformed,
 # overlong, and expired entries.
 version = 1
-exceptions = []
+[[exceptions]]
+kind = "advisory"
+id = "RUSTSEC-2026-0187"
+crate = "lopdf@0.41.0"
+owner = "@sebahrens"
+rationale = "rig-core's opt-in PDF feature still requires lopdf 0.41; upgrade rig-core as soon as it accepts lopdf >=0.42, and do not enable PDF ingestion for untrusted documents in the interim."
+created = "2026-08-02"
+expires = "2026-08-30"
 
 # Example only:
 #
