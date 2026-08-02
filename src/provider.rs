@@ -1189,6 +1189,9 @@ async fn build_openai_agent(
     }
 }
 
+// Builder inputs mirror independently resolved CLI/config authorities. Keeping
+// them explicit avoids hiding security-relevant state in a broad bag of options.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_agent(
     model: AnyModel,
     cli: &Cli,

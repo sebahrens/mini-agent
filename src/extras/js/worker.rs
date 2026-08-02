@@ -1485,6 +1485,9 @@ fn execute_run_step(
     }
 }
 
+// These arguments are the complete per-request security context and keeping them
+// explicit makes fresh-runtime construction and capability binding auditable.
+#[allow(clippy::too_many_arguments)]
 fn execute_fresh_step(
     source: &str,
     role: ScriptRole,
@@ -1779,6 +1782,9 @@ fn drain_jobs(
     }
 }
 
+// Settlement receives the already-captured runtime guards as separate values so
+// no reusable QuickJS state can be hidden in a context object.
+#[allow(clippy::too_many_arguments)]
 fn settle_and_convert(
     runtime: &Runtime,
     context: &Context,
@@ -2156,26 +2162,25 @@ fn execute_isolated_skill_verification_case(
     let role = verification_case_role(&case.kind);
     let fakes =
         FakeHostGlobals::with_transcript_budget(artifact.capability.clone(), transcript_budget);
-    if let VerificationCaseKind::HeldOut { fake_files, .. } = &case.kind {
-        if fake_files.len() > 32
+    if let VerificationCaseKind::HeldOut { fake_files, .. } = &case.kind
+        && (fake_files.len() > 32
             || fake_files.iter().any(|(path, contents)| {
                 path.is_empty() || path.len() > 4 * 1024 || contents.len() > 64 * 1024
             })
             || fake_files
                 .iter()
-                .any(|(path, contents)| fakes.seed_file(path, contents).is_err())
-        {
-            return VerificationCaseResult {
-                case_id: case.case_id.clone(),
-                passed: false,
-                diagnostic: Some(diagnostic(
-                    DiagnosticClass::Contract,
-                    DiagnosticStage::Initialization,
-                    role,
-                )),
-                transcript: FakeTranscript::default(),
-            };
-        }
+                .any(|(path, contents)| fakes.seed_file(path, contents).is_err()))
+    {
+        return VerificationCaseResult {
+            case_id: case.case_id.clone(),
+            passed: false,
+            diagnostic: Some(diagnostic(
+                DiagnosticClass::Contract,
+                DiagnosticStage::Initialization,
+                role,
+            )),
+            transcript: FakeTranscript::default(),
+        };
     }
     let dispatch_fakes = fakes.clone();
     let manifest = artifact.capability.clone();

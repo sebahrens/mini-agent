@@ -372,6 +372,9 @@ where
     wrapper.call_arg(args)
 }
 
+// QuickJS values are confined to this request-local worker thread. `Arc` is used
+// to share ownership with capability callbacks, not to cross thread boundaries.
+#[allow(clippy::arc_with_non_send_sync)]
 fn load_artifact_internal(
     runtime: &Runtime,
     model_context: &Context,
@@ -571,6 +574,9 @@ fn reject_model_collisions(
     })
 }
 
+type InstalledWrapper = (String, Persistent<Function<'static>>);
+type DispatcherResourceOwner = Arc<Mutex<Option<DispatcherResources>>>;
+
 fn build_model_wrappers(
     model_context: &Context,
     artifact: &SkillArtifact,
@@ -578,13 +584,7 @@ fn build_model_wrappers(
     capabilities: Option<Arc<InvocationCapabilityRuntime>>,
     settlements: Option<Arc<ModelSettlementRegistry>>,
     bound_exports: Option<Arc<HashMap<String, BoundExportInvocation>>>,
-) -> Result<
-    (
-        Vec<(String, Persistent<Function<'static>>)>,
-        Vec<Arc<Mutex<Option<DispatcherResources>>>>,
-    ),
-    RealmError,
-> {
+) -> Result<(Vec<InstalledWrapper>, Vec<DispatcherResourceOwner>), RealmError> {
     model_context
         .with(|ctx| {
             // These closures are captured before model source runs, so model prototype/global
@@ -691,6 +691,9 @@ fn build_model_wrappers(
         .map_err(|_| RealmError::WrapperInstallation)
 }
 
+// The dispatcher and its persistent QuickJS values never leave the fresh realm's
+// worker thread; shared ownership only ties callback and teardown lifetimes.
+#[allow(clippy::arc_with_non_send_sync)]
 fn build_bound_dispatcher<'js>(
     ctx: &Ctx<'js>,
     wrapper: Function<'js>,

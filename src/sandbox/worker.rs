@@ -37,7 +37,7 @@ pub(crate) fn standard_streams_are_protocol_pipes() -> bool {
 pub(crate) fn finalize_internal_worker() -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return platform::finalize_worker();
+        platform::finalize_worker()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -114,15 +114,15 @@ impl WorkerBackend {
     pub(crate) const fn for_current_platform() -> Self {
         #[cfg(target_os = "linux")]
         {
-            return Self::Bubblewrap;
+            Self::Bubblewrap
         }
         #[cfg(target_os = "macos")]
         {
-            return Self::Seatbelt;
+            Self::Seatbelt
         }
         #[cfg(target_os = "windows")]
         {
-            return Self::WindowsLpac;
+            Self::WindowsLpac
         }
     }
 }

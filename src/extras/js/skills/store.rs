@@ -1554,6 +1554,7 @@ impl SkillStore {
             ],
         )?;
         if changed != 1 {
+            #[allow(clippy::type_complexity)]
             let existing: Option<(
                 String,
                 String,
@@ -3009,7 +3010,7 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
             Ok(()) => db.execute_batch("COMMIT;")?,
             Err(error) => {
                 let _ = db.execute_batch("ROLLBACK;");
-                return Err(error.into());
+                return Err(error);
             }
         }
     }

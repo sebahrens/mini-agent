@@ -29,8 +29,10 @@ use crate::extras::js::skills::proposal::{
 use crate::extras::js::skills::proposal::{ProposalError, ProposalHost};
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::PermCancellation;
+#[cfg(any(feature = "sandbox", test))]
+use crate::extras::js::types::STEP_TIMEOUT;
 use crate::extras::js::types::{
-    EffectServiceError, READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
+    EffectServiceError, READ_FILE_MAX_BYTES, SpawnResult, WRITE_FILE_MAX_BYTES,
     canonical_spawn_permission_subject, spawn_policy_input,
 };
 #[cfg(any(target_os = "linux", not(unix)))]
@@ -2684,13 +2686,15 @@ impl PreparedSpawnEffect {
         }
         #[cfg(unix)]
         {
+            #[cfg(target_os = "linux")]
             let file = match &self.target {
                 PreparedSpawnTarget::OpenedPath(file) => file,
-                #[cfg(target_os = "linux")]
                 PreparedSpawnTarget::SealedSnapshot(_) => {
                     return Err(EffectServiceError::TargetChanged);
                 }
             };
+            #[cfg(not(target_os = "linux"))]
+            let PreparedSpawnTarget::OpenedPath(file) = &self.target;
             let opened = file
                 .metadata()
                 .map_err(|_| EffectServiceError::TargetChanged)?;

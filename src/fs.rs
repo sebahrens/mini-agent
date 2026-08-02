@@ -191,7 +191,7 @@ pub(crate) fn checked_path_metadata(path: &Path) -> std::io::Result<CheckedMetad
         // SAFETY: `open` returned a new owned descriptor.
         let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
         let metadata = file.metadata()?;
-        return checked_owned_file(file, metadata);
+        checked_owned_file(file, metadata)
     }
     #[cfg(windows)]
     {
@@ -204,7 +204,7 @@ pub(crate) fn checked_path_metadata(path: &Path) -> std::io::Result<CheckedMetad
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)?;
         let metadata = file.metadata()?;
-        return checked_owned_file(file, metadata);
+        checked_owned_file(file, metadata)
     }
     #[cfg(not(any(unix, windows)))]
     {

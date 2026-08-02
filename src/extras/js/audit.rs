@@ -315,6 +315,9 @@ pub(crate) enum AuditError {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+// The effect body is serialized immediately and preserving the direct value keeps
+// the authenticated on-disk representation and replay code straightforward.
+#[allow(clippy::large_enum_variant)]
 enum StoredKind {
     Open {
         segment_index: u64,
@@ -1267,12 +1270,13 @@ fn prepare_owner_directory(
 }
 
 fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Result<File> {
-    if create && !create_new && std::fs::symlink_metadata(path).is_err() {
-        if let Err(error) = crate::fs::private_atomic_create_sync(path, b"")
-            && error.kind() != std::io::ErrorKind::AlreadyExists
-        {
-            return Err(error);
-        }
+    if create
+        && !create_new
+        && std::fs::symlink_metadata(path).is_err()
+        && let Err(error) = crate::fs::private_atomic_create_sync(path, b"")
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(error);
     }
     if create_new {
         crate::fs::private_atomic_create_sync(path, b"")?;

@@ -358,10 +358,10 @@ impl BoundedStderrDrain {
         {
             std::thread::sleep(Duration::from_millis(5));
         }
-        if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
+        if self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(thread) = self.thread.take()
+        {
+            let _ = thread.join();
         }
     }
 }
@@ -643,9 +643,7 @@ impl JsWorkerSupervisor {
             deadline,
         )
         .await;
-        let reusable_terminal = result
-            .as_ref()
-            .is_ok_and(|terminal| terminal_is_reusable(terminal));
+        let reusable_terminal = result.as_ref().is_ok_and(terminal_is_reusable);
         if reusable_terminal {
             authority.finish();
             connection.completed_invocations = connection.completed_invocations.saturating_add(1);

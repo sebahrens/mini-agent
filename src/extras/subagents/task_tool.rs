@@ -251,6 +251,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     ),
                 )
                 .await;
+                #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
                 let mut run = match result {
                     Ok(run) => run,
                     Err(_) => {
