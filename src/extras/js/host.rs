@@ -1,5 +1,7 @@
 #[cfg(test)]
 use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,6 +30,8 @@ use crate::extras::js::broker::{
     AuthorizedEffect, AuthorizedTarget, GrantPrincipal, HostEffectError, NormalizedTarget,
     ParentEffectFuture, ParentEffectService, SpawnExecutableIdentity, resolve_program_identity,
 };
+#[cfg(target_os = "linux")]
+use crate::extras::js::broker::{ExecutableCopyError, copy_and_hash_executable};
 use crate::extras::js::protocol::{EffectOperation, EffectResult};
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::proposal::{
@@ -2462,15 +2466,56 @@ pub(crate) struct SpawnEffectService {
 struct PreparedSpawnEffect {
     executable: SpawnExecutableIdentity,
     arguments: Vec<String>,
+    target: PreparedSpawnTarget,
+}
+
+enum PreparedSpawnTarget {
     #[cfg(unix)]
-    executable_file: std::fs::File,
+    OpenedPath(std::fs::File),
+    #[cfg(target_os = "linux")]
+    SealedSnapshot(std::fs::File),
+    #[cfg(not(unix))]
+    Path,
 }
 
 impl PreparedSpawnEffect {
-    fn capture(program: &str, arguments: Vec<String>) -> Result<Self, EffectServiceError> {
+    fn capture(
+        program: &str,
+        arguments: Vec<String>,
+        immutable_snapshot: bool,
+    ) -> Result<Self, EffectServiceError> {
         let executable = resolve_program_identity(program)?;
+        if immutable_snapshot {
+            #[cfg(target_os = "linux")]
+            {
+                let mut source = std::fs::File::open(executable.canonical_path())
+                    .map_err(|_| EffectServiceError::InvalidTarget)?;
+                let opened = source
+                    .metadata()
+                    .map_err(|_| EffectServiceError::InvalidTarget)?;
+                let current = std::fs::symlink_metadata(executable.canonical_path())
+                    .map_err(|_| EffectServiceError::InvalidTarget)?;
+                if !opened.is_file()
+                    || !executable.matches_metadata(&opened)
+                    || !executable.matches_metadata(&current)
+                {
+                    return Err(EffectServiceError::TargetChanged);
+                }
+                let (snapshot, content) = create_sealed_executable_snapshot(&mut source)?;
+                let executable = executable.with_content(content);
+                return Ok(Self {
+                    executable,
+                    arguments,
+                    target: PreparedSpawnTarget::SealedSnapshot(snapshot),
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(EffectServiceError::BackendFailure);
+            }
+        }
         #[cfg(unix)]
-        let executable_file = {
+        let target = {
             let file = std::fs::File::open(executable.canonical_path())
                 .map_err(|_| EffectServiceError::InvalidTarget)?;
             let opened = file
@@ -2484,17 +2529,22 @@ impl PreparedSpawnEffect {
             {
                 return Err(EffectServiceError::TargetChanged);
             }
-            file
+            PreparedSpawnTarget::OpenedPath(file)
         };
+        #[cfg(not(unix))]
+        let target = PreparedSpawnTarget::Path;
         Ok(Self {
             executable,
             arguments,
-            #[cfg(unix)]
-            executable_file,
+            target,
         })
     }
 
     fn revalidate(&self) -> Result<(), EffectServiceError> {
+        #[cfg(target_os = "linux")]
+        if let PreparedSpawnTarget::SealedSnapshot(snapshot) = &self.target {
+            return verify_executable_snapshot_seals(snapshot);
+        }
         let current = std::fs::symlink_metadata(self.executable.canonical_path())
             .map_err(|_| EffectServiceError::TargetChanged)?;
         if !self.executable.matches_metadata(&current) {
@@ -2502,8 +2552,14 @@ impl PreparedSpawnEffect {
         }
         #[cfg(unix)]
         {
-            let opened = self
-                .executable_file
+            let file = match &self.target {
+                PreparedSpawnTarget::OpenedPath(file) => file,
+                #[cfg(target_os = "linux")]
+                PreparedSpawnTarget::SealedSnapshot(_) => {
+                    return Err(EffectServiceError::TargetChanged);
+                }
+            };
+            let opened = file
                 .metadata()
                 .map_err(|_| EffectServiceError::TargetChanged)?;
             if !self.executable.matches_metadata(&opened) {
@@ -2516,23 +2572,75 @@ impl PreparedSpawnEffect {
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn inherit_executable_fd(command: &mut SandboxCommand, executable_file: &std::fs::File) {
+fn create_sealed_executable_snapshot(
+    source: &mut std::fs::File,
+) -> Result<(std::fs::File, crate::extras::js::broker::ExecutableContent), EffectServiceError> {
+    use std::os::fd::FromRawFd;
+
+    // SAFETY: `memfd_create` receives a static NUL-terminated name. On success this function
+    // immediately assumes ownership of the returned descriptor through `File`.
+    let raw_fd = unsafe {
+        libc::memfd_create(
+            c"mini-agent-spawn".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(EffectServiceError::BackendFailure);
+    }
+    // SAFETY: `raw_fd` is a newly-created owned descriptor and is transferred exactly once.
+    let mut snapshot = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    let content = copy_and_hash_executable(source, &mut snapshot).map_err(|error| match error {
+        ExecutableCopyError::Read => EffectServiceError::TargetChanged,
+        ExecutableCopyError::Write => EffectServiceError::BackendFailure,
+        ExecutableCopyError::TooLarge => EffectServiceError::InvalidTarget,
+    })?;
+    snapshot
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| EffectServiceError::BackendFailure)?;
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: `fcntl` operates on the owned memfd and uses the documented sealing commands.
+    if unsafe { libc::fcntl(raw_fd, libc::F_ADD_SEALS, required) } < 0 {
+        return Err(EffectServiceError::BackendFailure);
+    }
+    verify_executable_snapshot_seals(&snapshot)?;
+    Ok((snapshot, content))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn verify_executable_snapshot_seals(snapshot: &std::fs::File) -> Result<(), EffectServiceError> {
+    use std::os::fd::AsRawFd;
+
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: `fcntl(F_GET_SEALS)` only queries the owned descriptor.
+    let seals = unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || seals & required != required {
+        return Err(EffectServiceError::TargetChanged);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn provide_snapshot_fd(command: &mut SandboxCommand, snapshot: &std::fs::File) {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
-    const CHILD_EXECUTABLE_FD: libc::c_int = 3;
-    let source_fd = executable_file.as_raw_fd();
+    const BWRAP_SNAPSHOT_FD: libc::c_int = 3;
+    let source_fd = snapshot.as_raw_fd();
     // SAFETY: this callback uses only async-signal-safe fcntl/dup2 operations between fork and
-    // exec. `PreparedSpawnEffect` owns the source file until the command has been spawned.
+    // exec. `PreparedSpawnEffect` owns the sealed memfd until bwrap has been spawned. fd 3 is an
+    // input to bwrap's `--ro-bind-data`, not an inherited descriptor for the final process.
     unsafe {
         command.as_std_mut().pre_exec(move || {
-            if source_fd == CHILD_EXECUTABLE_FD {
+            if source_fd == BWRAP_SNAPSHOT_FD {
                 let flags = libc::fcntl(source_fd, libc::F_GETFD);
                 if flags < 0 || libc::fcntl(source_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
                 {
                     return Err(std::io::Error::last_os_error());
                 }
-            } else if libc::dup2(source_fd, CHILD_EXECUTABLE_FD) < 0 {
+            } else if libc::dup2(source_fd, BWRAP_SNAPSHOT_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -2586,7 +2694,11 @@ impl SpawnEffectService {
             .check_structured_async("bash", &subject, policy_input)
             .await
             .map_err(permission_service_error)?;
-        PreparedSpawnEffect::capture(program, arguments.to_vec())
+        PreparedSpawnEffect::capture(
+            program,
+            arguments.to_vec(),
+            self.sandbox.supports_immutable_executable_snapshot(),
+        )
     }
 
     async fn execute_prepared(
@@ -2599,18 +2711,27 @@ impl SpawnEffectService {
         let command: SandboxCommand = return Err(EffectServiceError::BackendFailure);
 
         #[cfg(target_os = "linux")]
-        let command = {
-            const CHILD_EXECUTABLE_PATH: &str = "/proc/self/fd/3";
-
-            let mut command = self
-                .sandbox
-                .wrap_command_preserving_executable_fd(&format!(
-                    "exec {CHILD_EXECUTABLE_PATH} \"$@\""
-                ))
-                .map_err(|_| EffectServiceError::BackendFailure)?;
-            inherit_executable_fd(&mut command, &prepared.executable_file);
-            command.arg("approved-executable").args(&prepared.arguments);
-            command
+        let command = match &prepared.target {
+            PreparedSpawnTarget::SealedSnapshot(snapshot) => {
+                let mut command = self
+                    .sandbox
+                    .wrap_command_with_executable_snapshot(&prepared.arguments)
+                    .map_err(|_| EffectServiceError::BackendFailure)?;
+                provide_snapshot_fd(&mut command, snapshot);
+                command
+            }
+            PreparedSpawnTarget::OpenedPath(_) => {
+                // This compatibility path is model-authored/direct only. Learned skills require
+                // the sealed-snapshot branch and fail before permission/audit without it.
+                let mut command = self
+                    .sandbox
+                    .wrap_command(r#"exec "$0" "$@""#)
+                    .map_err(|_| EffectServiceError::BackendFailure)?;
+                command
+                    .arg(prepared.executable.canonical_path())
+                    .args(&prepared.arguments);
+                command
+            }
         };
         #[cfg(all(unix, not(target_os = "linux")))]
         let command = {
@@ -2746,6 +2867,10 @@ impl ParentHostEffectService {
 }
 
 impl ParentEffectService for ParentHostEffectService {
+    fn discard_prepared(&mut self) {
+        self.prepared = None;
+    }
+
     fn validate_target(
         &mut self,
         _authorized: &AuthorizedEffect,
@@ -2799,7 +2924,7 @@ impl ParentEffectService for ParentHostEffectService {
             EffectOperation::Spawn { .. }
                 if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable
                     || (matches!(authorized.principal(), GrantPrincipal::Skill { .. })
-                        && !self.spawn.sandbox.supports_identity_preserving_spawn()) =>
+                        && !self.spawn.sandbox.supports_immutable_executable_snapshot()) =>
             {
                 Err(HostEffectError::BackendFailure)
             }
@@ -2813,7 +2938,7 @@ impl ParentEffectService for ParentHostEffectService {
 
     fn normalize_target<'a>(
         &'a mut self,
-        _authorized: &'a AuthorizedEffect,
+        authorized: &'a AuthorizedEffect,
         operation: &'a EffectOperation,
         cancellation: PermCancellation,
     ) -> ParentEffectFuture<'a, Result<NormalizedTarget, HostEffectError>> {
@@ -2860,8 +2985,19 @@ impl ParentEffectService for ParentHostEffectService {
                     {
                         return Err(HostEffectError::InvalidTarget);
                     }
-                    let prepared = PreparedSpawnEffect::capture(program, arguments.clone())
-                        .map_err(HostEffectError::from)?;
+                    let learned_skill =
+                        matches!(authorized.principal(), GrantPrincipal::Skill { .. });
+                    let snapshot_available =
+                        self.spawn.sandbox.supports_immutable_executable_snapshot();
+                    if learned_skill && !snapshot_available {
+                        return Err(HostEffectError::BackendFailure);
+                    }
+                    let prepared = PreparedSpawnEffect::capture(
+                        program,
+                        arguments.clone(),
+                        snapshot_available,
+                    )
+                    .map_err(HostEffectError::from)?;
                     let resolved = prepared.executable.clone();
                     self.prepared = Some(PreparedParentEffect::Spawn(prepared));
                     Ok(NormalizedTarget::Spawn {
@@ -2998,8 +3134,9 @@ impl ParentEffectService for ParentHostEffectService {
                         .await
                         .map_err(permission_service_error)
                         .map_err(HostEffectError::from)?;
-                    // The permission decision may have been blocked on Ask. Rebind it to the
-                    // exact inode captured during normalization before durable audit.
+                    // The permission decision may have been blocked on Ask. Revalidate the
+                    // sealed immutable version (or model-only compatibility identity) captured
+                    // during normalization before durable audit.
                     target.revalidate().map_err(HostEffectError::from)?;
                     let resolved_executable = target.executable.canonical_path().to_string();
                     (
@@ -4111,27 +4248,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn linux_spawn_dispatches_the_opened_executable_identity_not_a_replacement_path() {
+    #[ignore = "requires a real Linux bubblewrap backend"]
+    async fn linux_spawn_executes_sealed_script_snapshot_after_in_place_overwrite() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = TempDir::new();
         let executable = directory.path().join("approved-command");
-        let replacement = directory.path().join("replacement-command");
         std::fs::write(&executable, "#!/bin/sh\nprintf approved").unwrap();
-        std::fs::write(&replacement, "#!/bin/sh\nprintf replacement").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
         let prepared =
-            PreparedSpawnEffect::capture(executable.to_string_lossy().as_ref(), Vec::new())
+            PreparedSpawnEffect::capture(executable.to_string_lossy().as_ref(), Vec::new(), true)
                 .unwrap();
-        let sandbox = Sandbox::new(false, "bwrap");
+        let PreparedSpawnTarget::SealedSnapshot(snapshot) = &prepared.target else {
+            panic!("Linux immutable capture must produce a sealed snapshot");
+        };
+        verify_executable_snapshot_seals(snapshot).unwrap();
+        let sandbox = Sandbox::new(true, "bwrap").with_shell("/definitely/not-a-shell");
         let mut command = sandbox
-            .wrap_command_preserving_executable_fd("exec /proc/self/fd/3 \"$@\"")
+            .wrap_command_with_executable_snapshot(&prepared.arguments)
             .unwrap();
-        inherit_executable_fd(&mut command, &prepared.executable_file);
-        command.arg("approved-executable");
+        provide_snapshot_fd(&mut command, snapshot);
 
-        std::fs::rename(&replacement, &executable).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nprintf replacement").unwrap();
         let output = sandbox
             .output_built_command_with_limits(
                 command,
@@ -4146,6 +4284,205 @@ mod tests {
             .unwrap();
         assert_eq!(output.status, CommandStatus::Completed);
         assert_eq!(output.stdout, b"approved");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend"]
+    async fn linux_spawn_executes_sealed_elf_snapshot_without_a_shell() {
+        let prepared = PreparedSpawnEffect::capture(
+            "sh",
+            vec![
+                "-c".to_string(),
+                "test ! -e /proc/self/fd/3 || exit 70; /bin/sh -c 'test ! -e /proc/self/fd/3' || exit 71; printf elf-snapshot".to_string(),
+            ],
+            true,
+        )
+        .unwrap();
+        let PreparedSpawnTarget::SealedSnapshot(snapshot) = &prepared.target else {
+            panic!("Linux immutable capture must produce a sealed snapshot");
+        };
+        let sandbox = Sandbox::new(true, "bwrap").with_shell("/definitely/not-a-shell");
+        let mut command = sandbox
+            .wrap_command_with_executable_snapshot(&prepared.arguments)
+            .unwrap();
+        provide_snapshot_fd(&mut command, snapshot);
+        let output = sandbox
+            .output_built_command_with_limits(
+                command,
+                CommandLimits {
+                    timeout: Duration::from_secs(1),
+                    stdout_bytes: 1024,
+                    stderr_bytes: 1024,
+                    combined_bytes: 2048,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Completed);
+        assert_eq!(output.stdout, b"elf-snapshot");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend"]
+    async fn linux_spawn_in_place_overwrite_during_ask_executes_original_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new();
+        let executable = directory.path().join("approved-command");
+        std::fs::write(&executable, "#!/bin/sh\nprintf original-snapshot").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let permission =
+            host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(directory.path()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(true, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let invocation = InvocationId::new("spawn-ask-in-place-overwrite").unwrap();
+        let grant = InvocationGrant::issue(
+            invocation.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: "spawn-snapshot-overwrite".into(),
+            },
+            BTreeSet::from([HostCapability::Spawn]),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let request = EffectRequest {
+            effect_ordinal: 0,
+            grant_id: grant.grant_id().clone(),
+            advisory: AdvisoryAttribution::default(),
+            operation: EffectOperation::Spawn {
+                program: executable.to_string_lossy().into_owned(),
+                arguments: vec![],
+            },
+        };
+        let audit_root = directory.path().join("audit-spawn-snapshot-overwrite");
+        let audit = EffectAudit::open(
+            AppPaths {
+                config_dir: audit_root.join("config"),
+                data_dir: audit_root.join("data"),
+                local_data_dir: audit_root.join("local"),
+                state_dir: audit_root.join("state"),
+                cache_dir: audit_root.join("cache"),
+                credentials_dir: audit_root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap();
+        let mut broker = InvocationBroker::new(
+            invocation,
+            vec![grant],
+            BTreeSet::from([HostCapability::Spawn]),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        let dispatch = tokio::spawn(async move {
+            let result = broker.dispatch(request, PermCancellation::new()).await;
+            (result, broker)
+        });
+        let prompt = ask_rx.recv().await.expect("spawn should block at Ask");
+        std::fs::write(&executable, "#!/bin/sh\nprintf replacement-bytes").unwrap();
+        prompt.reply.send(UserDecision::AllowOnce).unwrap();
+        let (result, broker) = dispatch.await.unwrap();
+        assert!(matches!(
+            result,
+            Ok(EffectResult::Spawn { stdout, exit_code: 0, .. })
+                if stdout == "original-snapshot"
+        ));
+        assert_eq!(broker.audit_records_for_test().len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_oversized_snapshot_failure_closes_the_memfd() {
+        let directory = TempDir::new();
+        let executable = directory.path().join("oversized-command");
+        let file = std::fs::File::create(&executable).unwrap();
+        file.set_len(crate::extras::js::broker::MAX_SPAWN_EXECUTABLE_BYTES + 1)
+            .unwrap();
+        drop(file);
+        let mut source = std::fs::File::open(&executable).unwrap();
+        let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        assert!(matches!(
+            create_sealed_executable_snapshot(&mut source),
+            Err(EffectServiceError::InvalidTarget)
+        ));
+        let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        assert_eq!(after, before, "failed snapshot capture leaked a descriptor");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_bwrap_construction_failure_closes_snapshot_without_spawning() {
+        let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let prepared = PreparedSpawnEffect::capture("printf", Vec::new(), true).unwrap();
+        let captured = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        assert_eq!(captured, before + 1, "capture should own exactly one memfd");
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let service = SpawnEffectService::new(
+            Sandbox::new(true, "__unavailable_snapshot_backend__"),
+            owner.bridge(),
+            Duration::from_secs(1),
+        );
+        assert!(matches!(
+            service.execute_prepared(prepared, owner.bridge()).await,
+            Err(EffectServiceError::BackendFailure)
+        ));
+        let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        assert_eq!(after, before, "failed bwrap construction leaked a memfd");
+    }
+
+    #[cfg(all(feature = "skills", target_os = "linux"))]
+    #[tokio::test]
+    async fn learned_skill_spawn_fails_closed_on_linux_without_snapshot_backend() {
+        let directory = TempDir::new();
+        let permission =
+            host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(directory.path()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let (mut broker, request) = scoped_host_broker(
+            &directory,
+            "linux-disabled-spawn",
+            service,
+            CapabilityScope::Spawn {
+                programs: vec!["printf".to_string()],
+            },
+            EffectOperation::Spawn {
+                program: "printf".to_string(),
+                arguments: vec!["denied".to_string()],
+            },
+        );
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::BackendFailure)
+        );
+        assert!(ask_rx.try_recv().is_err());
+        assert!(broker.audit_records_for_test().is_empty());
     }
 
     #[cfg(target_os = "macos")]

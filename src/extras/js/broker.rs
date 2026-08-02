@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -99,13 +100,17 @@ pub(crate) struct InvocationGrant {
 #[cfg(feature = "skills")]
 const MAX_SPAWN_PROGRAM_BINDINGS: usize = 256;
 const MAX_RESOLVED_EXECUTABLE_BYTES: usize = 4096;
+pub(crate) const MAX_SPAWN_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Stable parent-owned identity for one resolved executable. The canonical path is the
-/// permission/audit label; the platform identity prevents a path replacement from borrowing it.
+/// permission/audit label; platform identity rejects path replacement and the bounded content
+/// digest rejects in-place mutation that preserves device/inode identity.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub(crate) struct SpawnExecutableIdentity {
     canonical_path: String,
     platform: PlatformExecutableIdentity,
+    content_sha256: String,
+    content_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -129,6 +134,66 @@ impl SpawnExecutableIdentity {
     pub(crate) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
         platform_executable_identity(metadata).is_some_and(|identity| identity == self.platform)
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_content(self, content: ExecutableContent) -> Self {
+        Self {
+            content_sha256: content.sha256,
+            content_bytes: content.bytes,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_content_sha256_for_test(mut self, content_sha256: String) -> Self {
+        self.content_sha256 = content_sha256;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutableContent {
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutableCopyError {
+    Read,
+    Write,
+    TooLarge,
+}
+
+/// Copies and hashes one executable version without ever accepting an unbounded input.
+pub(crate) fn copy_and_hash_executable(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+) -> Result<ExecutableContent, ExecutableCopyError> {
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| ExecutableCopyError::Read)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or(ExecutableCopyError::TooLarge)?;
+        if total > MAX_SPAWN_EXECUTABLE_BYTES {
+            return Err(ExecutableCopyError::TooLarge);
+        }
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|_| ExecutableCopyError::Write)?;
+        digest.update(&buffer[..read]);
+    }
+    Ok(ExecutableContent {
+        sha256: format!("{:x}", digest.finalize()),
+        bytes: total,
+    })
 }
 
 impl InvocationGrant {
@@ -420,6 +485,9 @@ impl AuthorizedEffect {
 
 /// Abstract parent effect seam. A12 supplies the real host implementations.
 pub(crate) trait ParentEffectService: Send {
+    /// Releases any normalized-but-not-executed resource after a later policy layer denies it.
+    fn discard_prepared(&mut self) {}
+
     fn validate_target(
         &mut self,
         authorized: &AuthorizedEffect,
@@ -584,13 +652,25 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         if normalization_result == Err(HostEffectError::InvocationCancelled) {
             self.cancel_invocation();
         }
-        let normalized_target = normalization_result?;
-        enforce_manifest_scope(&grant, capability, &normalized_target)?;
+        let normalized_target = match normalization_result {
+            Ok(target) => target,
+            Err(error) => {
+                self.service.discard_prepared();
+                return Err(error);
+            }
+        };
+        if let Err(error) = enforce_manifest_scope(&grant, capability, &normalized_target) {
+            self.service.discard_prepared();
+            return Err(error);
+        }
         if !self.session_allowed.contains(&capability) {
+            self.service.discard_prepared();
             return Err(HostEffectError::SessionDenied);
         }
-        self.service
-            .ensure_backend(&authorized, &request.operation)?;
+        if let Err(error) = self.service.ensure_backend(&authorized, &request.operation) {
+            self.service.discard_prepared();
+            return Err(error);
+        }
 
         let authorization_result = {
             let authorization =
@@ -606,13 +686,23 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         if authorization_result == Err(HostEffectError::InvocationCancelled) {
             self.cancel_invocation();
         }
-        let audit_target = authorization_result?;
+        let audit_target = match authorization_result {
+            Ok(target) => target,
+            Err(error) => {
+                self.service.discard_prepared();
+                return Err(error);
+            }
+        };
 
         if cancellation.is_cancelled() {
             self.cancel_invocation();
+            self.service.discard_prepared();
             return Err(HostEffectError::InvocationCancelled);
         }
-        self.ensure_grant_unexpired(&request.grant_id, grant.expires_at)?;
+        if let Err(error) = self.ensure_grant_unexpired(&request.grant_id, grant.expires_at) {
+            self.service.discard_prepared();
+            return Err(error);
+        }
 
         let effect_id = effect_id(&self.invocation_id, request.effect_ordinal);
         let (artifact_id, export) = match &authorized.principal {
@@ -627,6 +717,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             Ok(timestamp_ms) => timestamp_ms,
             Err(error) => {
                 self.erase_authority(InvocationState::Terminal);
+                self.service.discard_prepared();
                 return Err(error);
             }
         };
@@ -659,9 +750,11 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         if let Err(error) = intent_result {
             if error == HostEffectError::ExpiredGrant {
                 let _ = self.ensure_grant_unexpired(&request.grant_id, grant.expires_at);
+                self.service.discard_prepared();
                 return Err(error);
             }
             self.erase_authority(InvocationState::Terminal);
+            self.service.discard_prepared();
             return Err(HostEffectError::AuditFailure);
         }
 
@@ -892,13 +985,25 @@ pub(crate) fn resolve_program_identity(
         if canonical_path.len() > MAX_RESOLVED_EXECUTABLE_BYTES {
             return Err(EffectServiceError::InvalidTarget);
         }
-        let metadata =
+        let mut file =
+            std::fs::File::open(&canonical).map_err(|_| EffectServiceError::InvalidTarget)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| EffectServiceError::InvalidTarget)?;
+        let current =
             std::fs::symlink_metadata(&canonical).map_err(|_| EffectServiceError::InvalidTarget)?;
         let platform =
             platform_executable_identity(&metadata).ok_or(EffectServiceError::InvalidTarget)?;
+        if platform_executable_identity(&current) != Some(platform.clone()) {
+            return Err(EffectServiceError::TargetChanged);
+        }
+        let content = copy_and_hash_executable(&mut file, &mut std::io::sink())
+            .map_err(|_| EffectServiceError::InvalidTarget)?;
         return Ok(SpawnExecutableIdentity {
             canonical_path,
             platform,
+            content_sha256: content.sha256,
+            content_bytes: content.bytes,
         });
     }
     Err(EffectServiceError::InvalidTarget)

@@ -11,9 +11,10 @@ use crate::extras::js::audit::{
     AuditResultCode, AuditState, EffectAudit, EffectCompletion, EffectIntent, SanitizedTarget,
 };
 use crate::extras::js::broker::{
-    AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, GrantPrincipal,
-    HostCapability, HostEffectError, InvocationBroker, InvocationGrant, NormalizedTarget,
-    ParentEffectService, resolve_program_identity,
+    AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, ExecutableCopyError,
+    GrantPrincipal, HostCapability, HostEffectError, InvocationBroker, InvocationGrant,
+    MAX_SPAWN_EXECUTABLE_BYTES, NormalizedTarget, ParentEffectService, copy_and_hash_executable,
+    resolve_program_identity,
 };
 use crate::extras::js::protocol::{
     AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpHeader, HttpMethod, InvocationId,
@@ -39,6 +40,7 @@ struct ServiceFailures {
 
 #[derive(Clone, Debug, Default)]
 struct ServiceRecord {
+    discards: usize,
     authorizations: usize,
     execute_calls: usize,
     executions: usize,
@@ -54,6 +56,10 @@ struct RecordingService {
 }
 
 impl ParentEffectService for RecordingService {
+    fn discard_prepared(&mut self) {
+        self.record.lock().unwrap().discards += 1;
+    }
+
     fn validate_target(
         &mut self,
         _authorized: &AuthorizedEffect,
@@ -713,6 +719,70 @@ async fn scoped_spawn_keeps_each_program_bound_to_its_own_executable_identity() 
     let record = record.lock().unwrap();
     assert_eq!(record.authorizations, 0);
     assert_eq!(record.execute_calls, 0);
+    assert_eq!(record.discards, 1);
+    assert!(broker.audit_records_for_test().is_empty());
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_spawn_content_mismatch_denies_before_permission_audit_and_effect() {
+    let invocation_id = invocation("inv-scoped-spawn-content-binding");
+    let principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-spawn-content-binding".into(),
+        export: "run".into(),
+        invocation_id: invocation_id.to_string(),
+    };
+    let advisory = AdvisoryAttribution {
+        artifact_id: Some("artifact-spawn-content-binding".into()),
+        export: Some("run".into()),
+    };
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn {
+            programs: vec!["printf".into()],
+        }],
+    )
+    .unwrap();
+    let approved_identity = resolve_program_identity("printf").unwrap();
+    let changed_identity = approved_identity
+        .clone()
+        .with_content_sha256_for_test("00".repeat(32));
+    let grant = InvocationGrant::issue_scoped_skill_with_resolver(
+        invocation_id.clone(),
+        principal,
+        manifest,
+        Instant::now() + Duration::from_secs(10),
+        |_| Ok(approved_identity.clone()),
+    )
+    .unwrap();
+    let request = EffectRequest {
+        effect_ordinal: 1,
+        grant_id: grant.grant_id().clone(),
+        advisory,
+        operation: EffectOperation::Spawn {
+            program: "printf".into(),
+            arguments: vec![],
+        },
+    };
+    let (mut broker, record, _audit_root) = broker_with_normalized_target(
+        invocation_id,
+        vec![grant],
+        BTreeSet::from([HostCapability::Spawn]),
+        ServiceFailures::default(),
+        Some(Ok(NormalizedTarget::Spawn {
+            program: "printf".into(),
+            resolved_executable: changed_identity,
+        })),
+    );
+
+    assert_eq!(
+        broker.dispatch(request, PermCancellation::new()).await,
+        Err(HostEffectError::ManifestDenied)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.authorizations, 0);
+    assert_eq!(record.execute_calls, 0);
+    assert_eq!(record.discards, 1);
     assert!(broker.audit_records_for_test().is_empty());
 }
 
@@ -745,6 +815,12 @@ fn scoped_spawn_binding_map_is_deterministic_and_bounded() {
     let decoded: std::collections::BTreeMap<String, serde_json::Value> =
         serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded.keys().cloned().collect::<Vec<_>>(), ["bar", "foo"]);
+    for binding in decoded.values() {
+        let digest = binding["content_sha256"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(binding["content_bytes"].as_u64().is_some());
+    }
 
     let programs = (0..257).map(|index| format!("p{index:03}")).collect();
     let oversized = CapabilityManifest::new(
@@ -762,6 +838,47 @@ fn scoped_spawn_binding_map_is_deterministic_and_bounded() {
         ),
         Err(crate::extras::js::broker::BrokerBuildError::InvalidManifest)
     );
+}
+
+#[test]
+fn executable_snapshot_copy_is_bounded_and_reports_destination_failure() {
+    let mut oversized = std::io::repeat(0).take(MAX_SPAWN_EXECUTABLE_BYTES + 1);
+    assert_eq!(
+        copy_and_hash_executable(&mut oversized, &mut std::io::sink()),
+        Err(ExecutableCopyError::TooLarge)
+    );
+
+    struct FailingWriter;
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected snapshot write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    assert_eq!(
+        copy_and_hash_executable(&mut b"approved executable".as_slice(), &mut FailingWriter),
+        Err(ExecutableCopyError::Write)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_identity_changes_when_bytes_are_overwritten_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = AuditTempRoot::new("executable-content-binding");
+    let executable = directory.0.join("content-bound-command");
+    std::fs::write(&executable, "#!/bin/sh\nprintf original").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let original = resolve_program_identity(executable.to_string_lossy().as_ref()).unwrap();
+
+    std::fs::write(&executable, "#!/bin/sh\nprintf replaced").unwrap();
+    let replaced = resolve_program_identity(executable.to_string_lossy().as_ref()).unwrap();
+    assert_ne!(original, replaced, "identity must bind executable content");
 }
 
 #[tokio::test]
@@ -1106,7 +1223,9 @@ async fn worker_broker_grants_cancel_a_pending_ask_before_execution() {
         Err(HostEffectError::InvocationCancelled)
     );
     assert_eq!(broker.tracked_grant_count(), 0);
-    assert_eq!(record.lock().unwrap().executions, 0);
+    let record = record.lock().unwrap();
+    assert_eq!(record.executions, 0);
+    assert_eq!(record.discards, 1, "cancelled Ask retained prepared state");
 }
 
 #[tokio::test]

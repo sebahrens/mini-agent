@@ -155,6 +155,8 @@ const BWRAP_REQUESTED_NETWORK_POLICY: &str =
     "deny (unshare-net; backend absence/setup failure denies launch)";
 const SEATBELT_REQUESTED_NETWORK_POLICY: &str =
     "deny (Seatbelt network*; backend absence/setup failure denies launch)";
+#[cfg(feature = "js")]
+const SNAPSHOT_EXECUTABLE_PATH: &str = "/run/mini-agent/spawn-executable";
 
 fn zerobox_exists() -> bool {
     *ZEROBOX_AVAILABLE.get_or_init(|| which_cmd("zerobox"))
@@ -400,27 +402,41 @@ impl Sandbox {
     }
 
     pub fn wrap_command(&self, command: &str) -> Result<Command, String> {
-        self.wrap_command_with_preserved_fds(command, 0)
+        self.wrap_command_inner(command)
     }
 
     #[cfg(feature = "js")]
-    pub(crate) fn wrap_command_preserving_executable_fd(
+    pub(crate) fn wrap_command_with_executable_snapshot(
         &self,
-        command: &str,
+        arguments: &[String],
     ) -> Result<Command, String> {
-        if !self.supports_identity_preserving_spawn() {
-            return Err("sandbox backend cannot preserve an executable identity".to_string());
+        if !self.supports_immutable_executable_snapshot() {
+            return Err("sandbox backend cannot bind an immutable executable snapshot".to_string());
         }
-        self.wrap_command_with_preserved_fds(command, 1)
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
+        let cwd = canonical_non_root(&cwd, "working directory")?;
+        let paths = crate::paths::process_paths()
+            .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
+        std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
+            format!(
+                "sandbox: failed to create application cache {}: {error}",
+                paths.cache_dir.display()
+            )
+        })?;
+        let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+        let bwrap = bwrap_path().ok_or_else(|| {
+            "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
+                .to_string()
+        })?;
+        Ok(self.build_bwrap_snapshot_command(bwrap, &cwd, &cache_dir, arguments))
     }
 
     #[cfg(feature = "js")]
-    pub(crate) fn supports_identity_preserving_spawn(&self) -> bool {
+    pub(crate) fn supports_immutable_executable_snapshot(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            matches!(self.policy(), SandboxPolicy::Disabled)
-                || (matches!(self.policy(), SandboxPolicy::RequiredAndAvailable)
-                    && self.backend == "bwrap")
+            matches!(self.policy(), SandboxPolicy::RequiredAndAvailable) && self.backend == "bwrap"
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -428,11 +444,7 @@ impl Sandbox {
         }
     }
 
-    fn wrap_command_with_preserved_fds(
-        &self,
-        command: &str,
-        preserved_fds: usize,
-    ) -> Result<Command, String> {
+    fn wrap_command_inner(&self, command: &str) -> Result<Command, String> {
         match self.policy() {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
@@ -487,13 +499,7 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
-        Ok(self.build_bwrap_command_with_preserved_fds(
-            bwrap,
-            command,
-            &cwd,
-            &cache_dir,
-            preserved_fds,
-        ))
+        Ok(self.build_bwrap_command(bwrap, command, &cwd, &cache_dir))
     }
 
     fn build_seatbelt_command(
@@ -541,30 +547,53 @@ impl Sandbox {
         cwd: &Path,
         cache_dir: &Path,
     ) -> Command {
-        self.build_bwrap_command_with_preserved_fds(bwrap, command, cwd, cache_dir, 0)
+        let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir);
+        append_bwrap_isolation(&mut cmd, cwd);
+        cmd.args([
+            "--die-with-parent",
+            "--",
+            &self.shell,
+            &self.shell_command_arg,
+            command,
+        ]);
+        configure_child_lifetime(&mut cmd);
+        cmd
     }
 
-    fn build_bwrap_command_with_preserved_fds(
+    #[cfg(feature = "js")]
+    fn build_bwrap_snapshot_command(
         &self,
         bwrap: &Path,
-        command: &str,
         cwd: &Path,
         cache_dir: &Path,
-        preserved_fds: usize,
+        arguments: &[String],
     ) -> Command {
+        let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir);
+        cmd.args(["--dir", "/run", "--dir", "/run/mini-agent"]);
+        // fd 3 is consumed by bubblewrap while constructing this read-only executable file.
+        // It is deliberately not listed under `--preserve-fds`, so neither the target nor any
+        // descendant can inherit the snapshot descriptor.
+        cmd.args([
+            "--perms",
+            "0500",
+            "--ro-bind-data",
+            "3",
+            SNAPSHOT_EXECUTABLE_PATH,
+        ]);
+        append_bwrap_isolation(&mut cmd, cwd);
+        cmd.args(["--die-with-parent", "--", SNAPSHOT_EXECUTABLE_PATH]);
+        cmd.args(arguments);
+        configure_child_lifetime(&mut cmd);
+        cmd
+    }
+
+    fn build_bwrap_base_command(&self, bwrap: &Path, cwd: &Path, cache_dir: &Path) -> Command {
         let mut cmd = Command::new(bwrap);
-        if preserved_fds > 0 {
-            cmd.arg("--preserve-fds").arg(preserved_fds.to_string());
-        }
         cmd.arg("--clearenv");
-        for (k, v) in essential_env() {
-            cmd.arg("--setenv").arg(k).arg(v);
+        for (key, value) in essential_env() {
+            cmd.arg("--setenv").arg(key).arg(value);
         }
         cmd.args(["--setenv", "TMPDIR", "/tmp"]);
-
-        // Start from bubblewrap's empty root and add only executable/runtime
-        // assets. Never read-bind the host root: doing so would expose home
-        // directories, credentials, and other unrelated host state.
         for path in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix"] {
             cmd.args(["--ro-bind-try", path, path]);
         }
@@ -575,26 +604,6 @@ impl Sandbox {
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
         cmd.arg("--bind").arg(cwd).arg(cwd);
         cmd.arg("--bind").arg(cache_dir).arg(cache_dir);
-        cmd.args([
-            "--unshare-user",
-            "--unshare-ipc",
-            "--unshare-pid",
-            "--unshare-net",
-            "--unshare-uts",
-            "--unshare-cgroup",
-            "--remount-ro",
-            "/",
-            "--chdir",
-        ]);
-        cmd.arg(cwd);
-        cmd.args([
-            "--die-with-parent",
-            "--",
-            &self.shell,
-            &self.shell_command_arg,
-            command,
-        ]);
-        configure_child_lifetime(&mut cmd);
         cmd
     }
 
@@ -1066,6 +1075,21 @@ fn essential_env() -> Vec<(&'static str, String)> {
         }
     }
     vars
+}
+
+fn append_bwrap_isolation(command: &mut Command, cwd: &Path) {
+    command.args([
+        "--unshare-user",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--remount-ro",
+        "/",
+        "--chdir",
+    ]);
+    command.arg(cwd);
 }
 
 fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {

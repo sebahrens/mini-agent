@@ -157,6 +157,11 @@ jobs:
       - name: Test JS spawn parity through the shared sandbox
         run: cargo test --locked --features js,sandbox
 
+      - name: Test immutable learned-skill executable snapshots
+        run: |
+          cargo test --locked --no-default-features --features js,sandbox,skills learned_skill_spawn_fails_closed_on_linux_without_snapshot_backend
+          cargo test --locked --no-default-features --features js,sandbox,skills linux_spawn_ -- --ignored --nocapture
+
   macos-worker-containment-gate:
     if: github.event_name != 'schedule'
     strategy:
