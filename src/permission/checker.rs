@@ -383,7 +383,18 @@ impl PermissionChecker {
     }
 
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
-        self.check_inner(tool, input, false)
+        self.check_inner(tool, input, input, false)
+    }
+
+    /// Evaluate policy against a compatibility rendering while keeping a
+    /// separate, reversible identity for session approval and doom-loop state.
+    pub(crate) fn check_with_identity(
+        &mut self,
+        tool: &str,
+        policy_input: &str,
+        identity: &str,
+    ) -> CheckResult {
+        self.check_inner(tool, policy_input, identity, false)
     }
 
     #[cfg(feature = "mcp")]
@@ -395,17 +406,27 @@ impl PermissionChecker {
     ) -> CheckResult {
         let read_only_exempt =
             trusted_identity.is_some_and(|identity| identity.exempts_read_only_tool(mcp_tool_name));
-        self.check_inner("mcp_tool", input, read_only_exempt)
+        self.check_inner("mcp_tool", input, input, read_only_exempt)
     }
 
-    fn check_inner(&mut self, tool: &str, input: &str, mcp_read_only_exempt: bool) -> CheckResult {
-        tracing::debug!("perm check: tool={}, input_len={}", tool, input.len());
+    fn check_inner(
+        &mut self,
+        tool: &str,
+        policy_input: &str,
+        identity: &str,
+        mcp_read_only_exempt: bool,
+    ) -> CheckResult {
+        tracing::debug!(
+            "perm check: tool={}, input_len={}",
+            tool,
+            policy_input.len()
+        );
         if tool == "todo_write" {
             return CheckResult::Allowed;
         }
         // Deny rules are the security baseline — evaluate before the session
         // allowlist and allow_all_mcp_calls so neither can bypass a deny.
-        if self.matches_deny_rule(tool, &[input]) {
+        if self.matches_deny_rule(tool, &[policy_input, identity]) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         #[cfg(feature = "hooks")]
@@ -415,7 +436,7 @@ impl PermissionChecker {
         if self.allow_all_mcp_calls && tool == "mcp_tool" {
             return CheckResult::Allowed;
         }
-        if self.is_session_allowed(tool, input) {
+        if self.is_session_allowed(tool, identity) {
             return CheckResult::Allowed;
         }
         if tool == "mcp_tool"
@@ -434,9 +455,9 @@ impl PermissionChecker {
                     // Model B: allow only the exact, complete script. Ask and
                     // deny rules remain pattern-based so broad safeguards keep
                     // working, but globs/regexes cannot widen Bash execution.
-                    pattern.original == input
+                    pattern.original == policy_input
                 } else {
-                    pattern.matches(input)
+                    pattern.matches(policy_input)
                 };
                 if matches {
                     matched.push(*action);
@@ -445,7 +466,7 @@ impl PermissionChecker {
         }
 
         let action = self.resolve_check_action(tool, &matched);
-        self.doom_loop_check(tool, input, action)
+        self.doom_loop_check(tool, identity, action)
     }
 
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {

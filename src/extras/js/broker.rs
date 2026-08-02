@@ -16,6 +16,7 @@ use super::protocol::{
 };
 pub(crate) use super::protocol::{EffectOperation, EffectResult};
 use super::supervisor::{EffectFuture, InvocationEffectHandler};
+use super::types::EffectServiceError;
 use super::types::PermCancellation;
 
 pub(crate) type ParentEffectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -128,8 +129,14 @@ pub(crate) enum HostEffectError {
     PermissionDenied,
     #[error("permission prompt timed out")]
     AskTimedOut,
+    #[error("effect execution timed out")]
+    EffectTimedOut,
+    #[error("effect output exceeded its limit")]
+    OutputLimit,
     #[error("effect backend is unavailable")]
     BackendFailure,
+    #[error("effect outcome is unknown after dispatch")]
+    OutcomeUnknown,
 }
 
 impl HostEffectError {
@@ -137,8 +144,10 @@ impl HostEffectError {
         match self {
             Self::InvalidTarget | Self::TargetDenied => EffectErrorCode::InvalidTarget,
             Self::InvocationCancelled => EffectErrorCode::Cancelled,
-            Self::AskTimedOut => EffectErrorCode::TimedOut,
+            Self::AskTimedOut | Self::EffectTimedOut => EffectErrorCode::TimedOut,
+            Self::OutputLimit => EffectErrorCode::OutputLimit,
             Self::BackendFailure => EffectErrorCode::BackendFailure,
+            Self::OutcomeUnknown => EffectErrorCode::OutcomeUnknown,
             Self::UnknownGrant
             | Self::ReplayedGrant
             | Self::ExpiredGrant
@@ -156,6 +165,30 @@ impl HostEffectError {
         EffectResult::Error(EffectError {
             code: self.wire_code(),
         })
+    }
+}
+
+impl From<EffectServiceError> for HostEffectError {
+    fn from(error: EffectServiceError) -> Self {
+        match error {
+            EffectServiceError::InvalidTarget
+            | EffectServiceError::FinalSymlink
+            | EffectServiceError::TargetChanged
+            | EffectServiceError::InvalidBody => Self::InvalidTarget,
+            EffectServiceError::TargetDenied
+            | EffectServiceError::FileNoConfiguredRoots
+            | EffectServiceError::FileInvalidConfiguration
+            | EffectServiceError::FileOutsideConfiguredRoots => Self::TargetDenied,
+            EffectServiceError::PermissionDenied | EffectServiceError::DoomLoopDenied => {
+                Self::PermissionDenied
+            }
+            EffectServiceError::PermissionTimedOut => Self::AskTimedOut,
+            EffectServiceError::Cancelled => Self::InvocationCancelled,
+            EffectServiceError::TimedOut => Self::EffectTimedOut,
+            EffectServiceError::OutputLimit | EffectServiceError::BodyLimit => Self::OutputLimit,
+            EffectServiceError::BackendFailure => Self::BackendFailure,
+            EffectServiceError::OutcomeUnknown => Self::OutcomeUnknown,
+        }
     }
 }
 

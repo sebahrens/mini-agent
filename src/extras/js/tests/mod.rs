@@ -61,6 +61,7 @@ mod skill_verification_semantics;
 mod worker_broker;
 #[cfg(target_os = "macos")]
 mod worker_containment;
+mod worker_effect_services;
 mod worker_protocol;
 mod worker_runtime;
 

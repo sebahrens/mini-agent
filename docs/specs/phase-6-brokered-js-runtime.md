@@ -148,9 +148,16 @@ of artifact identity, capability tier, scope, permission, or prior approval neve
 supervisor callback. It issues opaque grant IDs, derives the effective principal only from its
 table, intersects grant and session capabilities, validates invocation, expiry, attribution,
 target, permission, and backend readiness, and erases all grant state on terminal, cancellation,
-or worker recycle transitions. The module exposes only an abstract authorized-effect seam: the
-real file, fetch, spawn, and proposal services and their detailed narrowing remain owned by the
-host-effect integration task.
+or worker recycle transitions. The authorized-effect seam is backed by parent-side file, fetch,
+spawn, and proposal services whose callable contracts contain no QuickJS types. Worker closures
+only decode JavaScript values, call those services, and encode their closed results or errors.
+File services preserve stable path identity across authorization and I/O; fetch preserves exact
+origin and public-address checks plus an outer deadline; spawn passes structured argv to the
+general command sandbox. Spawn permission identity is versioned canonical JSON containing the
+program and argument array, so argument boundaries are never collapsed into a shell-like string.
+The provisional broker `SkillProposalDraft` omits identity-v2 capability and signature fields, so
+that broker operation fails closed until the full typed proposal protocol lands; the direct parent
+proposal service never infers omitted scopes or identity fields.
 
 Model-authored step code retains bounded effect globals and a bounded `propose_skill` writer host.
 Durable proposal enqueue is parent-owned. Stored learned-skill realms receive no effect or writer
@@ -440,6 +447,11 @@ is recorded as completed or ambiguous and returned without automatic retry. Phas
 neither exactly-once external effects nor rollback of an approved effect; it promises durable
 pre-effect intent, bounded completion evidence, no automatic replay, and fresh state on the next
 independent call.
+
+Proposal cancellation is exact before queue dispatch and returns `cancelled`. After a proposal has
+entered the bounded queue, cancellation returns `outcome_unknown` while a detached blocking waiter
+drains the response; callers must not replay that proposal automatically. A29 owns durable
+reconciliation of this ambiguous outcome.
 
 ## Acceptance matrix
 

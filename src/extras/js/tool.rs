@@ -34,10 +34,11 @@ use crate::sandbox::Sandbox;
 
 const PERMISSION_WAIT_POLL: Duration = Duration::from_millis(10);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PermissionCheckKind {
     Input,
     Path,
+    StructuredInput { policy_input: String },
 }
 
 enum PermissionReply {
@@ -94,7 +95,6 @@ impl PermissionBridge {
         bridge
     }
 
-    #[cfg(feature = "sandbox")]
     pub(crate) fn for_host_call(&self, cancellation: PermCancellation) -> Self {
         let mut bridge = self.clone();
         bridge.host_call_cancellation = Some(cancellation);
@@ -117,6 +117,7 @@ impl PermissionBridge {
         self.check_sync(PermissionCheckKind::Input, tool, key)
     }
 
+    #[allow(dead_code)] // Retained for compatibility with synchronous host tests.
     pub(crate) fn check_path(&self, tool: &str, key: &str) -> Result<(), PermissionBridgeError> {
         self.check_sync(PermissionCheckKind::Path, tool, key)
     }
@@ -172,6 +173,39 @@ impl PermissionBridge {
         tool: &str,
         key: &str,
     ) -> Result<(), PermissionBridgeError> {
+        self.check_async_kind(PermissionCheckKind::Input, tool, key)
+            .await
+    }
+
+    pub(crate) async fn check_path_async(
+        &self,
+        tool: &str,
+        key: &str,
+    ) -> Result<(), PermissionBridgeError> {
+        self.check_async_kind(PermissionCheckKind::Path, tool, key)
+            .await
+    }
+
+    pub(crate) async fn check_structured_async(
+        &self,
+        tool: &str,
+        identity: &str,
+        policy_input: String,
+    ) -> Result<(), PermissionBridgeError> {
+        self.check_async_kind(
+            PermissionCheckKind::StructuredInput { policy_input },
+            tool,
+            identity,
+        )
+        .await
+    }
+
+    async fn check_async_kind(
+        &self,
+        kind: PermissionCheckKind,
+        tool: &str,
+        key: &str,
+    ) -> Result<(), PermissionBridgeError> {
         self.ensure_active()?;
         let cancellation = PermCancellation::new();
         let request = PermRequest::new(tool, key, self.timeout, cancellation.clone())
@@ -184,7 +218,7 @@ impl PermissionBridge {
         self.tx
             .send(PermissionEnvelope {
                 request,
-                kind: PermissionCheckKind::Input,
+                kind,
                 reply: PermissionReply::Async(reply_tx),
             })
             .map_err(|_| self.closed_request_error())?;
@@ -464,6 +498,9 @@ async fn resolve_permission(
         match kind {
             PermissionCheckKind::Input => checker.check(request.tool(), request.key()),
             PermissionCheckKind::Path => checker.check_path(request.tool(), request.key()),
+            PermissionCheckKind::StructuredInput { policy_input } => {
+                checker.check_with_identity(request.tool(), &policy_input, request.key())
+            }
         }
     };
 
