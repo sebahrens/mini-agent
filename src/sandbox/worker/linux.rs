@@ -1513,8 +1513,7 @@ impl WorkerChild {
     }
 
     pub(super) fn terminate_tree(&mut self) -> io::Result<()> {
-        super::super::kill_process_group(self.child.id());
-        self.child.kill()
+        super::terminate_worker_process_group(self.child.id())
     }
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
