@@ -189,13 +189,19 @@ only the named invocation, while the worker runtime lifecycle clears every prepa
 token on timeout, unwind, or recycle. Event attribution follows the request's explicit invocation
 and captured grant; there is no ambient active-invocation map or map-order fallback.
 
-Parent preparation also yields an opaque one-shot handle. Wrapper entry consumes the next handle
-in preparation order and validates its exact artifact, export, and manifest without scanning for a
-metadata match; direct nested entry activates only the explicitly supplied handle. Async results
-never expose a private-realm promise to the model realm. A Rust-owned settlement registry carries
-only the bounded encoded result string (or a closed rejection) into a promise created from the
-model realm's captured intrinsic, so its prototype and continuation ownership remain model-local
-even when private promise bindings are shadowed.
+Parent preparation also yields an opaque one-shot handle. The worker must bind that exact handle
+immediately around the intended wrapper `Function::call`; wrapper statement one consumes it before
+argument encoding or other model-controlled work. An unbound call denies, and there is no FIFO,
+metadata lookup, or ambient fallback from which an extra same-export call could borrow a later
+invocation's authority. Ordinary JavaScript calls made through `ctx.eval` are therefore
+unauthorized until A18 routes the selected export call through this Rust seam; A18/A21 production
+call wiring must use it, with no ambient fallback. Async results never expose a private-realm
+promise to the model realm. A Rust-owned settlement registry
+carries only the bounded encoded result string (or a closed rejection) into a promise created from
+the model realm's captured intrinsic, so its prototype and continuation ownership remain
+model-local even when private promise bindings are shadowed. Effect ordinals and the 256-effect
+limit belong to the whole fresh worker runtime request, not to individual nested or overlapping
+capability tokens, and reset only when that disposable runtime is recycled.
 
 File, fetch, proposal, and command operations retain their owning Phase 1–4 validation and limits.
 Parent-brokered JS `spawn` remains disabled on Windows until `mini-agent-uq5c` delivers and verifies

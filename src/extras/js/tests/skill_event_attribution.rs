@@ -274,17 +274,17 @@ fn nested_same_and_different_exports_keep_exact_handles_and_outer_authority() {
             (
                 "nested-inner",
                 GrantId::new(uuid::Uuid::from_bytes([22; 16])).unwrap(),
-                0
+                1
             ),
             (
                 "nested-same-export",
                 GrantId::new(uuid::Uuid::from_bytes([23; 16])).unwrap(),
-                0
+                2
             ),
             (
                 "nested-outer",
                 GrantId::new(uuid::Uuid::from_bytes([21; 16])).unwrap(),
-                1
+                3
             ),
         ]
     );

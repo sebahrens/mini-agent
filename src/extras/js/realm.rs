@@ -6,13 +6,14 @@
 //! JSON strings. Invocation capability construction is deliberately owned by Phase 6 A17.
 
 use rquickjs::context::EvalOptions;
+use rquickjs::function::IntoArgs;
 use rquickjs::object::Property;
-use rquickjs::{Context, Ctx, Function, Object, Persistent, Runtime, Value};
+use rquickjs::{Context, Ctx, FromJs, Function, Object, Persistent, Runtime, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-use super::skills::capability::InvocationCapabilityRuntime;
+use super::skills::capability::{InvocationCapabilityRuntime, PreparedInvocationHandle};
 use super::skills::{
     HostCapability, SKILL_REALM_HARDENING_JS, SkillArtifact, private_skill_source,
 };
@@ -38,23 +39,26 @@ const PURE_MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
 
 const MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
 ((freeze, parse, PromiseCtor) =>
- (invoke, encode, prepareSettlement, abandonSettlement) => freeze(function (...values) {
-    let resolveEncoded;
-    let rejectEncoded;
-    const publicPromise = new PromiseCtor((resolve, reject) => {
-        resolveEncoded = encoded => {
-            try { resolve(parse(encoded)); } catch (_) { reject(0); }
-        };
-        rejectEncoded = () => reject(0);
-    });
-    const settlementId = prepareSettlement(resolveEncoded, rejectEncoded);
+ (invoke, encode, claim, revoke, prepareSettlement, abandonSettlement) => freeze(function (...values) {
+    const token = claim();
+    let settlementId;
     try {
-        const encoded = invoke(encode(values), settlementId);
+        let resolveEncoded;
+        let rejectEncoded;
+        const publicPromise = new PromiseCtor((resolve, reject) => {
+            resolveEncoded = encoded => {
+                try { resolve(parse(encoded)); } catch (_) { reject(0); }
+            };
+            rejectEncoded = () => reject(0);
+        });
+        settlementId = prepareSettlement(resolveEncoded, rejectEncoded);
+        const encoded = invoke(token, encode(values), settlementId);
         if (encoded === undefined) return publicPromise;
         abandonSettlement(settlementId);
         return parse(encoded);
     } catch (_) {
-        abandonSettlement(settlementId);
+        if (settlementId !== undefined) abandonSettlement(settlementId);
+        revoke(token);
         throw 0;
     }
 }))(Object.freeze, JSON.parse, Promise)
@@ -62,12 +66,10 @@ const MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
 
 const CAPABILITY_BRIDGE_FACTORY_SOURCE: &str = r#"
 ((parse, apply, freeze, create, defineProperty, promiseResolve, promiseThen, PromiseCtor) =>
- (original, encode, begin, dispatch, finish) =>
- (settleSuccess, settleFailure, exportName, methods) =>
- (encodedArguments, settlementId) => {
-    let token;
+ (original, encode, dispatch, finish) =>
+ (settleSuccess, settleFailure, methods) =>
+ (token, encodedArguments, settlementId) => {
     try {
-        token = begin(exportName);
         const capability = create(null);
         for (const method of methods) {
             const invokeEffect = freeze(function (...effectArguments) {
@@ -101,7 +103,7 @@ const CAPABILITY_BRIDGE_FACTORY_SOURCE: &str = r#"
         }
         try { return encode(result); } finally { finish(token); }
     } catch (_) {
-        if (token !== undefined) finish(token);
+        finish(token);
         throw 0;
     }
 })(JSON.parse, Reflect.apply, Object.freeze, Object.create, Object.defineProperty,
@@ -229,6 +231,28 @@ pub(crate) fn load_artifact_with_capabilities(
     )
 }
 
+/// Call an installed model wrapper under one exact, opaque invocation binding.
+///
+/// The guard is installed immediately around `Function::call`. Wrapper statement one claims the
+/// handle before argument encoding can execute model-controlled proxy traps or re-enter a wrapper.
+pub(crate) fn call_export_with_capability<'js, A, R>(
+    ctx: &Ctx<'js>,
+    export_name: &str,
+    capabilities: &InvocationCapabilityRuntime,
+    handle: PreparedInvocationHandle,
+    arguments: A,
+) -> rquickjs::Result<R>
+where
+    A: IntoArgs<'js>,
+    R: FromJs<'js>,
+{
+    let wrapper: Function = ctx.globals().get(export_name)?;
+    let _binding = capabilities
+        .bind(handle)
+        .map_err(|_| rquickjs::Error::Unknown)?;
+    wrapper.call(arguments)
+}
+
 fn load_artifact_internal(
     runtime: &Runtime,
     model_context: &Context,
@@ -306,14 +330,6 @@ fn load_artifact_internal(
                         let settlements = settlements
                             .as_ref()
                             .expect("capability loader has settlement registry");
-                        let begin_capabilities = capabilities.clone();
-                        let artifact_id = artifact.id.clone();
-                        let manifest = artifact.capability.clone();
-                        let begin = Function::new(ctx.clone(), move |export_name: String| {
-                            begin_capabilities
-                                .begin_next(&artifact_id, &export_name, &manifest)
-                                .map_err(|_| rquickjs::Error::Unknown)
-                        })?;
                         let dispatch_capabilities = capabilities.clone();
                         let dispatch = Function::new(
                             ctx.clone(),
@@ -353,16 +369,10 @@ fn load_artifact_internal(
                         let capability_factory: Function = bridge_factory.call((
                             original,
                             private_encoder.clone(),
-                            begin,
                             dispatch,
                             finish,
                         ))?;
-                        capability_factory.call((
-                            settle_success,
-                            settle_failure,
-                            export.name.clone(),
-                            methods,
-                        ))?
+                        capability_factory.call((settle_success, settle_failure, methods))?
                     } else {
                         bridge_factory.call((original, private_encoder.clone()))?
                     };
@@ -376,7 +386,8 @@ fn load_artifact_internal(
         return Err(RealmError::PendingInitializationJobs);
     }
 
-    let wrappers = build_model_wrappers(model_context, artifact, bridges, settlements)?;
+    let wrappers =
+        build_model_wrappers(model_context, artifact, bridges, capabilities, settlements)?;
     if runtime.is_job_pending() {
         return Err(RealmError::PendingInitializationJobs);
     }
@@ -432,6 +443,7 @@ fn build_model_wrappers(
     model_context: &Context,
     artifact: &SkillArtifact,
     bridges: Vec<Persistent<Function<'static>>>,
+    capabilities: Option<Arc<InvocationCapabilityRuntime>>,
     settlements: Option<Arc<ModelSettlementRegistry>>,
 ) -> Result<Vec<(String, Persistent<Function<'static>>)>, RealmError> {
     model_context
@@ -474,9 +486,27 @@ fn build_model_wrappers(
                     let invoke = bridge.restore(&ctx)?;
                     let wrapper: Function = if let Some((prepare, abandon)) = &settlement_functions
                     {
+                        let capabilities = capabilities
+                            .as_ref()
+                            .expect("settlement wrappers have invocation capabilities");
+                        let claim_capabilities = capabilities.clone();
+                        let artifact_id = artifact.id.clone();
+                        let export_name = export.name.clone();
+                        let manifest = artifact.capability.clone();
+                        let claim = Function::new(ctx.clone(), move || {
+                            claim_capabilities
+                                .claim_bound(&artifact_id, &export_name, &manifest)
+                                .map_err(|_| rquickjs::Error::Unknown)
+                        })?;
+                        let revoke_capabilities = capabilities.clone();
+                        let revoke = Function::new(ctx.clone(), move |token: u64| {
+                            revoke_capabilities.finish(token);
+                        })?;
                         wrapper_factory.call((
                             invoke,
                             model_encoder.clone().restore(&ctx)?,
+                            claim,
+                            revoke,
                             prepare.clone(),
                             abandon.clone(),
                         ))?

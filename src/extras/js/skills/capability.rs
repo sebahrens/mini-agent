@@ -128,8 +128,10 @@ pub(crate) struct InvocationCapabilityRuntime {
 struct InvocationCapabilityState {
     next_prepared_handle: u64,
     next_token: u64,
+    next_effect_ordinal: u32,
     prepared: VecDeque<PreparedInvocation>,
     active: HashMap<u64, ActiveInvocation>,
+    bound_handle: Option<PreparedInvocationHandle>,
     seen_grants: HashSet<GrantId>,
 }
 
@@ -140,7 +142,22 @@ struct PreparedInvocation {
 
 struct ActiveInvocation {
     authorization: InvocationAuthorization,
-    next_effect_ordinal: u32,
+}
+
+/// Exact, one-shot binding held only across the direct wrapper function call.
+pub(crate) struct InvocationBindingGuard {
+    runtime: InvocationCapabilityRuntime,
+    handle: PreparedInvocationHandle,
+}
+
+impl Drop for InvocationBindingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.runtime.state.lock()
+            && state.bound_handle == Some(self.handle)
+        {
+            state.bound_handle = None;
+        }
+    }
 }
 
 impl std::fmt::Debug for InvocationCapabilityRuntime {
@@ -233,9 +250,33 @@ impl InvocationCapabilityRuntime {
         Self::activate(&mut state, position, skill_id, export_name, manifest)
     }
 
-    /// Worker wrapper entry consumes the next opaque handle in parent preparation order. A
-    /// mismatched export fails closed without scanning forward for ambient matching authority.
-    pub(crate) fn begin_next(
+    /// Bind one exact prepared handle for the immediately following direct wrapper call.
+    pub(crate) fn bind(
+        &self,
+        handle: PreparedInvocationHandle,
+    ) -> Result<InvocationBindingGuard, CapabilityError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CapabilityError::InvalidInvocation)?;
+        if state.bound_handle.is_some()
+            || !state
+                .prepared
+                .iter()
+                .any(|candidate| candidate.handle == handle)
+        {
+            return Err(CapabilityError::InvalidInvocation);
+        }
+        state.bound_handle = Some(handle);
+        Ok(InvocationBindingGuard {
+            runtime: self.clone(),
+            handle,
+        })
+    }
+
+    /// Wrapper entry consumes only the explicitly bound opaque handle. Artifact metadata is
+    /// validation, never an authority selector.
+    pub(crate) fn claim_bound(
         &self,
         skill_id: &str,
         export_name: &str,
@@ -245,7 +286,16 @@ impl InvocationCapabilityRuntime {
             .state
             .lock()
             .map_err(|_| CapabilityError::InvalidInvocation)?;
-        Self::activate(&mut state, 0, skill_id, export_name, manifest)
+        let handle = state
+            .bound_handle
+            .take()
+            .ok_or(CapabilityError::InvalidInvocation)?;
+        let position = state
+            .prepared
+            .iter()
+            .position(|candidate| candidate.handle == handle)
+            .ok_or(CapabilityError::InvalidInvocation)?;
+        Self::activate(&mut state, position, skill_id, export_name, manifest)
     }
 
     fn activate(
@@ -275,13 +325,9 @@ impl InvocationCapabilityRuntime {
             .checked_add(1)
             .ok_or(CapabilityError::InvalidInvocation)?;
         let token = state.next_token;
-        state.active.insert(
-            token,
-            ActiveInvocation {
-                authorization,
-                next_effect_ordinal: 0,
-            },
-        );
+        state
+            .active
+            .insert(token, ActiveInvocation { authorization });
         Ok(token)
     }
 
@@ -293,30 +339,34 @@ impl InvocationCapabilityRuntime {
     ) -> Result<String, CapabilityError> {
         let effect = {
             let mut state = self.state.lock().map_err(|_| CapabilityError::Revoked)?;
-            let active = state
-                .active
-                .get_mut(&token)
-                .ok_or(CapabilityError::Revoked)?;
-            let grant_id = active
-                .authorization
-                .grants
-                .get(&operation)
-                .cloned()
-                .ok_or(CapabilityError::Revoked)?;
+            let (grant_id, invocation_id, artifact_id, export) = {
+                let active = state.active.get(&token).ok_or(CapabilityError::Revoked)?;
+                (
+                    active
+                        .authorization
+                        .grants
+                        .get(&operation)
+                        .cloned()
+                        .ok_or(CapabilityError::Revoked)?,
+                    active.authorization.invocation_id.clone(),
+                    active.authorization.attribution.skill_id.clone(),
+                    active.authorization.attribution.export_name.clone(),
+                )
+            };
             let decoded_operation = decode_operation(operation, encoded_arguments)?;
-            if active.next_effect_ordinal >= MAX_EFFECTS_PER_STEP {
+            if state.next_effect_ordinal >= MAX_EFFECTS_PER_STEP {
                 return Err(CapabilityError::DispatchDenied);
             }
-            let effect_ordinal = active.next_effect_ordinal;
-            active.next_effect_ordinal += 1;
+            let effect_ordinal = state.next_effect_ordinal;
+            state.next_effect_ordinal += 1;
             DispatchedEffect {
-                invocation_id: active.authorization.invocation_id.clone(),
+                invocation_id,
                 request: EffectRequest {
                     effect_ordinal,
                     grant_id,
                     advisory: AdvisoryAttribution {
-                        artifact_id: Some(active.authorization.attribution.skill_id.clone()),
-                        export: Some(active.authorization.attribution.export_name.clone()),
+                        artifact_id: Some(artifact_id),
+                        export: Some(export),
                     },
                     operation: decoded_operation,
                 },
@@ -333,6 +383,14 @@ impl InvocationCapabilityRuntime {
 
     pub(crate) fn cancel(&self, invocation_id: &InvocationId) {
         if let Ok(mut state) = self.state.lock() {
+            if state.bound_handle.is_some_and(|handle| {
+                state.prepared.iter().any(|candidate| {
+                    candidate.handle == handle
+                        && &candidate.authorization.invocation_id == invocation_id
+                })
+            }) {
+                state.bound_handle = None;
+            }
             state
                 .prepared
                 .retain(|candidate| &candidate.authorization.invocation_id != invocation_id);
@@ -346,6 +404,8 @@ impl InvocationCapabilityRuntime {
         if let Ok(mut state) = self.state.lock() {
             state.prepared.clear();
             state.active.clear();
+            state.bound_handle = None;
+            state.next_effect_ordinal = 0;
             state.seen_grants.clear();
         }
     }

@@ -4,7 +4,9 @@ use rquickjs::{Context, Error, Function, Persistent, Promise, Runtime, Value};
 use std::sync::Arc;
 
 use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId};
-use crate::extras::js::realm::{RealmError, load_artifact, load_artifact_with_capabilities};
+use crate::extras::js::realm::{
+    RealmError, call_export_with_capability, load_artifact, load_artifact_with_capabilities,
+};
 use crate::extras::js::skills::capability::{
     DispatchedEffect, InvocationAuthorization, InvocationCapabilityRuntime,
 };
@@ -443,32 +445,54 @@ fn abi_v2_hides_an_exact_immutable_capability_argument_and_revokes_retained_meth
             content: "unexpected".into(),
         })
     });
+    let mut handles = Vec::new();
     for (name, ordinal) in [("inspect", 1), ("useRetained", 2)] {
-        capabilities
-            .prepare(
-                InvocationAuthorization::new(
-                    invocation(&format!("hidden-{ordinal}")),
-                    skill.id.clone(),
-                    name.into(),
-                    manifest.clone(),
-                    [
-                        (HostCapability::ReadFile, grant(ordinal)),
-                        (HostCapability::Spawn, grant(ordinal + 8)),
-                    ],
+        handles.push(
+            capabilities
+                .prepare(
+                    InvocationAuthorization::new(
+                        invocation(&format!("hidden-{ordinal}")),
+                        skill.id.clone(),
+                        name.into(),
+                        manifest.clone(),
+                        [
+                            (HostCapability::ReadFile, grant(ordinal)),
+                            (HostCapability::Spawn, grant(ordinal + 8)),
+                        ],
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
-            )
-            .unwrap();
+        );
     }
 
-    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities)
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone())
         .expect("load capability-bound artifact");
     model.with(|ctx| {
+        let inspected: Value = call_export_with_capability(
+            &ctx,
+            "inspect",
+            &capabilities,
+            handles[0],
+            (41,),
+        )
+        .unwrap();
+        ctx.globals().set("inspected", inspected).unwrap();
         assert_eq!(
-            ctx.eval::<String, _>("JSON.stringify(inspect(41))").unwrap(),
+            ctx.eval::<String, _>("JSON.stringify(inspected)").unwrap(),
             r#"{"keys":["read_file","spawn"],"frozen":true,"value":41,"globals":["undefined","undefined","undefined"]}"#
         );
-        assert_eq!(ctx.eval::<String, _>("useRetained()").unwrap(), "denied");
+        assert_eq!(
+            call_export_with_capability::<_, String>(
+                &ctx,
+                "useRetained",
+                &capabilities,
+                handles[1],
+                (),
+            )
+            .unwrap(),
+            "denied"
+        );
     });
     assert!(
         dispatched.lock().unwrap().is_empty(),
@@ -499,25 +523,36 @@ fn overlapping_promises_keep_their_explicit_invocation_and_grant_identity() {
         captured.lock().unwrap().push(effect);
         Ok(EffectResult::ReadFile { content: path })
     });
+    let mut handles = Vec::new();
     for (name, byte) in [("overlap-a", 3), ("overlap-b", 4)] {
-        capabilities
-            .prepare(
-                InvocationAuthorization::new(
-                    invocation(name),
-                    skill.id.clone(),
-                    "readLater".into(),
-                    manifest.clone(),
-                    [(HostCapability::ReadFile, grant(byte))],
+        handles.push(
+            capabilities
+                .prepare(
+                    InvocationAuthorization::new(
+                        invocation(name),
+                        skill.id.clone(),
+                        "readLater".into(),
+                        manifest.clone(),
+                        [(HostCapability::ReadFile, grant(byte))],
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
-            )
-            .unwrap();
+        );
     }
-    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities)
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone())
         .expect("load async artifact");
     let promise = model.with(|ctx| {
+        let first: Promise =
+            call_export_with_capability(&ctx, "readLater", &capabilities, handles[0], ("a",))
+                .unwrap();
+        let second: Promise =
+            call_export_with_capability(&ctx, "readLater", &capabilities, handles[1], ("b",))
+                .unwrap();
+        ctx.globals().set("firstPromise", first).unwrap();
+        ctx.globals().set("secondPromise", second).unwrap();
         let promise: Promise = ctx
-            .eval("Promise.all([readLater('a'), readLater('b')])")
+            .eval("Promise.all([firstPromise, secondPromise])")
             .unwrap();
         Persistent::save(&ctx, promise)
     });
@@ -539,16 +574,84 @@ fn overlapping_promises_keep_their_explicit_invocation_and_grant_identity() {
     assert_eq!(effects.len(), 2);
     assert_eq!(effects[0].invocation_id.as_str(), "overlap-b");
     assert_eq!(effects[0].request.grant_id, grant(4));
+    assert_eq!(effects[0].request.effect_ordinal, 0);
     assert!(matches!(
         &effects[0].request.operation,
         crate::extras::js::protocol::EffectOperation::ReadFile { path } if path == "b"
     ));
     assert_eq!(effects[1].invocation_id.as_str(), "overlap-a");
     assert_eq!(effects[1].request.grant_id, grant(3));
+    assert_eq!(effects[1].request.effect_ordinal, 1);
     assert!(matches!(
         &effects[1].request.operation,
         crate::extras::js::protocol::EffectOperation::ReadFile { path } if path == "a"
     ));
+}
+
+#[test]
+fn unbound_same_export_call_cannot_steal_a_later_invocation_handle() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).unwrap();
+    let manifest = test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile]).unwrap();
+    let skill = SkillArtifact::new(
+        "function readExact(cap, path) { return cap.read_file(path); }".into(),
+        "one-shot handle theft fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "readExact".into(),
+            signature: "(path)".into(),
+        }],
+        vec!["true".into()],
+        manifest.clone(),
+    )
+    .unwrap();
+    let effects = Arc::new(std::sync::Mutex::new(Vec::<DispatchedEffect>::new()));
+    let captured = effects.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |effect| {
+        captured.lock().unwrap().push(effect);
+        Ok(EffectResult::ReadFile {
+            content: "authorized".into(),
+        })
+    });
+    let handle = capabilities
+        .prepare(
+            InvocationAuthorization::new(
+                invocation("intended-later-call"),
+                skill.id.clone(),
+                "readExact".into(),
+                manifest,
+                [(HostCapability::ReadFile, grant(31))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone()).unwrap();
+
+    model.with(|ctx| {
+        assert!(
+            ctx.eval::<bool, _>("try { readExact('attacker'); false } catch (_) { true }",)
+                .unwrap()
+        );
+    });
+    assert!(effects.lock().unwrap().is_empty());
+
+    model.with(|ctx| {
+        assert_eq!(
+            call_export_with_capability::<_, String>(
+                &ctx,
+                "readExact",
+                &capabilities,
+                handle,
+                ("intended",),
+            )
+            .unwrap(),
+            "authorized"
+        );
+    });
+    let effects = effects.lock().unwrap();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].invocation_id.as_str(), "intended-later-call");
+    assert_eq!(effects[0].request.grant_id, grant(31));
 }
 
 #[test]
@@ -560,7 +663,7 @@ fn async_wrapper_returns_only_a_model_realm_promise_across_private_poisoning() {
         &["modelOwned"],
     );
     let capabilities = InvocationCapabilityRuntime::deny_all();
-    capabilities
+    let handle = capabilities
         .prepare(
             InvocationAuthorization::new(
                 invocation("model-owned-promise"),
@@ -572,14 +675,21 @@ fn async_wrapper_returns_only_a_model_realm_promise_across_private_poisoning() {
             .unwrap(),
         )
         .unwrap();
-    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities).unwrap();
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone()).unwrap();
 
     let promise = model.with(|ctx| {
         ctx.eval::<(), _>(
             "globalThis.ExpectedPromise = Promise; globalThis.expectedPromisePrototype = Promise.prototype; globalThis.Promise = function ModelPoison() { throw 0; };",
         )
         .unwrap();
-        let promise: Promise = ctx.eval("modelOwned(17)").unwrap();
+        let promise: Promise = call_export_with_capability(
+            &ctx,
+            "modelOwned",
+            &capabilities,
+            handle,
+            (17,),
+        )
+        .unwrap();
         ctx.globals().set("ownedPromise", promise.clone()).unwrap();
         assert!(
             ctx.eval::<bool, _>(
@@ -615,30 +725,41 @@ fn synchronous_throw_and_promise_rejection_revoke_the_invocation() {
         &["failSync", "failAsync"],
     );
     let capabilities = InvocationCapabilityRuntime::deny_all();
+    let mut handles = Vec::new();
     for export in ["failSync", "failAsync"] {
-        capabilities
-            .prepare(
-                InvocationAuthorization::new(
-                    invocation(&format!("failure-{export}")),
-                    skill.id.clone(),
-                    export.into(),
-                    CapabilityManifest::pure(),
-                    [],
+        handles.push(
+            capabilities
+                .prepare(
+                    InvocationAuthorization::new(
+                        invocation(&format!("failure-{export}")),
+                        skill.id.clone(),
+                        export.into(),
+                        CapabilityManifest::pure(),
+                        [],
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
-            )
-            .unwrap();
+        );
     }
     load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone()).unwrap();
     model.with(|ctx| {
         assert!(
-            ctx.eval::<bool, _>("try { failSync(); false } catch (_) { true }")
-                .unwrap()
+            call_export_with_capability::<_, Value>(
+                &ctx,
+                "failSync",
+                &capabilities,
+                handles[0],
+                (),
+            )
+            .is_err()
         );
+        let _ = ctx.catch();
     });
     assert_eq!(capabilities.active_count(), 0);
     let promise = model.with(|ctx| {
-        let promise: Promise = ctx.eval("failAsync()").unwrap();
+        let promise: Promise =
+            call_export_with_capability(&ctx, "failAsync", &capabilities, handles[1], ()).unwrap();
         Persistent::save(&ctx, promise)
     });
     while runtime.is_job_pending() {
@@ -674,29 +795,45 @@ fn method_retained_across_promise_settlement_cannot_dispatch() {
             content: "unexpected".into(),
         })
     });
+    let mut handles = Vec::new();
     for (export, byte) in [("capture", 13), ("useOld", 14)] {
-        capabilities
-            .prepare(
-                InvocationAuthorization::new(
-                    invocation(&format!("async-{export}")),
-                    skill.id.clone(),
-                    export.into(),
-                    manifest.clone(),
-                    [(HostCapability::ReadFile, grant(byte))],
+        handles.push(
+            capabilities
+                .prepare(
+                    InvocationAuthorization::new(
+                        invocation(&format!("async-{export}")),
+                        skill.id.clone(),
+                        export.into(),
+                        manifest.clone(),
+                        [(HostCapability::ReadFile, grant(byte))],
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
-            )
-            .unwrap();
+        );
     }
     load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone()).unwrap();
     model.with(|ctx| {
-        ctx.eval::<Promise, _>("capture()").unwrap();
+        call_export_with_capability::<_, Promise>(&ctx, "capture", &capabilities, handles[0], ())
+            .unwrap();
     });
     while runtime.is_job_pending() {
         runtime.execute_pending_job().unwrap();
     }
     assert_eq!(capabilities.active_count(), 0);
-    model.with(|ctx| assert_eq!(ctx.eval::<String, _>("useOld()").unwrap(), "denied"));
+    model.with(|ctx| {
+        assert_eq!(
+            call_export_with_capability::<_, String>(
+                &ctx,
+                "useOld",
+                &capabilities,
+                handles[1],
+                (),
+            )
+            .unwrap(),
+            "denied"
+        )
+    });
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 

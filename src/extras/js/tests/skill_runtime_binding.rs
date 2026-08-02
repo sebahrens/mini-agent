@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rig::tool::Tool;
 
 use super::make_test_tool;
-use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId};
+use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId, MAX_EFFECTS_PER_STEP};
 use crate::extras::js::skills::HostCapability;
 use crate::extras::js::skills::capability::{
     CapabilityError, InvocationAuthorization, InvocationCapabilityRuntime,
@@ -151,7 +151,7 @@ fn prepared_authority_must_contain_exactly_one_grant_per_declared_method() {
 }
 
 #[test]
-fn wrapper_entry_never_scans_past_a_mismatched_prepared_handle() {
+fn wrapper_entry_claims_only_the_exact_bound_prepared_handle() {
     let manifest = CapabilityManifest::pure();
     let skill_id = "e".repeat(64);
     let capabilities = InvocationCapabilityRuntime::deny_all();
@@ -172,22 +172,114 @@ fn wrapper_entry_never_scans_past_a_mismatched_prepared_handle() {
     let second_handle = prepare("prepared-second", "second");
     let first_handle = prepare("prepared-first", "first");
 
-    assert!(matches!(
-        capabilities.begin_next(&skill_id, "first", &manifest),
-        Err(CapabilityError::InvalidInvocation)
-    ));
+    {
+        let _binding = capabilities.bind(second_handle).unwrap();
+        assert!(matches!(
+            capabilities.claim_bound(&skill_id, "first", &manifest),
+            Err(CapabilityError::InvalidInvocation)
+        ));
+    }
+    let _binding = capabilities.bind(second_handle).unwrap();
     let second = capabilities
-        .begin_next(&skill_id, "second", &manifest)
+        .claim_bound(&skill_id, "second", &manifest)
         .unwrap();
     capabilities.finish(second);
     let first = capabilities
         .begin(first_handle, &skill_id, "first", &manifest)
         .unwrap();
     capabilities.finish(first);
+    assert!(capabilities.bind(second_handle).is_err());
+}
+
+#[test]
+fn all_active_invocations_share_one_effect_ordinal_budget() {
+    let manifest = crate::extras::js::skills::test_manifest(
+        CapabilityTier::ReadOnly,
+        vec![HostCapability::ReadFile],
+    )
+    .unwrap();
+    let skill_id = "f".repeat(64);
+    let effects = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = effects.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |effect| {
+        captured.lock().unwrap().push(effect);
+        Ok(EffectResult::ReadFile {
+            content: "ok".into(),
+        })
+    });
+    let prepare = |name: &str, byte: u8| {
+        capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    InvocationId::new(name).unwrap(),
+                    skill_id.clone(),
+                    "run".into(),
+                    manifest.clone(),
+                    [(
+                        HostCapability::ReadFile,
+                        GrantId::new(uuid::Uuid::from_bytes([byte; 16])).unwrap(),
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    };
+    let first_handle = prepare("aggregate-first", 41);
+    let second_handle = prepare("aggregate-second", 42);
+    let first = capabilities
+        .begin(first_handle, &skill_id, "run", &manifest)
+        .unwrap();
+    let second = capabilities
+        .begin(second_handle, &skill_id, "run", &manifest)
+        .unwrap();
+
+    for ordinal in 0..MAX_EFFECTS_PER_STEP {
+        let token = if ordinal % 2 == 0 { first } else { second };
+        capabilities
+            .dispatch(token, HostCapability::ReadFile, r#"["allowed"]"#)
+            .unwrap();
+    }
     assert!(matches!(
-        capabilities.begin(second_handle, &skill_id, "second", &manifest),
-        Err(CapabilityError::InvalidInvocation)
+        capabilities.dispatch(first, HostCapability::ReadFile, r#"["over-limit"]"#),
+        Err(CapabilityError::DispatchDenied)
     ));
+    {
+        let effects = effects.lock().unwrap();
+        assert_eq!(effects.len(), MAX_EFFECTS_PER_STEP as usize);
+        assert_eq!(effects.first().unwrap().request.effect_ordinal, 0);
+        assert_eq!(
+            effects.last().unwrap().request.effect_ordinal,
+            MAX_EFFECTS_PER_STEP - 1
+        );
+        assert!(
+            effects
+                .windows(2)
+                .all(|pair| pair[1].request.effect_ordinal == pair[0].request.effect_ordinal + 1)
+        );
+    }
+
+    capabilities.recycle();
+    let after_recycle_handle = prepare("aggregate-after-recycle", 43);
+    let after_recycle = capabilities
+        .begin(after_recycle_handle, &skill_id, "run", &manifest)
+        .unwrap();
+    capabilities
+        .dispatch(
+            after_recycle,
+            HostCapability::ReadFile,
+            r#"["allowed-after-recycle"]"#,
+        )
+        .unwrap();
+    assert_eq!(
+        effects
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .request
+            .effect_ordinal,
+        0
+    );
 }
 
 #[tokio::test]
