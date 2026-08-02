@@ -1279,7 +1279,7 @@ fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Resu
     } else if path.exists() {
         drop(crate::fs::open_private_file(path)?);
     }
-    let before = std::fs::symlink_metadata(path)?;
+    let before = crate::fs::checked_path_metadata(path)?;
     if before.file_type().is_symlink() || !before.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1299,8 +1299,8 @@ fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Resu
         options.custom_flags(NOFOLLOW);
     }
     let file = options.open(path)?;
-    let opened = file.metadata()?;
-    let after = std::fs::symlink_metadata(path)?;
+    let opened = crate::fs::checked_file_metadata(&file)?;
+    let after = crate::fs::checked_path_metadata(path)?;
     crate::fs::ensure_same_file(path, &before, &opened)?;
     crate::fs::ensure_same_file(path, &opened, &after)?;
     #[cfg(unix)]

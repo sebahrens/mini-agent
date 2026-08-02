@@ -311,7 +311,7 @@ fn unambiguous_legacy_candidate(
     let portable_expected = crate::paths::validate_portable_component(&expected_name).is_ok();
     let expected_collision = crate::paths::collision_key(&expected_name).ok();
     let sanitized = legacy_sanitized_stem(server_name);
-    let directory_before = match std::fs::symlink_metadata(directory) {
+    let directory_before = match crate::fs::checked_path_metadata(directory) {
         Ok(metadata) if !metadata_is_link_or_reparse(&metadata) && metadata.is_dir() => metadata,
         Ok(_) => {
             return Err(std::io::Error::new(
@@ -346,7 +346,7 @@ fn unambiguous_legacy_candidate(
             }
         }
     }
-    let directory_after = std::fs::symlink_metadata(directory)?;
+    let directory_after = crate::fs::checked_path_metadata(directory)?;
     if metadata_is_link_or_reparse(&directory_after) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -402,8 +402,8 @@ fn secure_remove_file(path: &Path) -> std::io::Result<bool> {
         ));
     }
     let file = open_private_existing(path)?;
-    let opened = file.metadata()?;
-    let current = std::fs::symlink_metadata(path)?;
+    let opened = crate::fs::checked_file_metadata(&file)?;
+    let current = crate::fs::checked_path_metadata(path)?;
     crate::fs::ensure_same_file(path, &opened, &current)?;
     std::fs::remove_file(path)?;
     Ok(true)
@@ -447,7 +447,7 @@ fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder.create(path)?;
-    let before = std::fs::symlink_metadata(path)?;
+    let before = crate::fs::checked_path_metadata(path)?;
     if before.file_type().is_symlink() || !before.is_dir() || before.uid() != current_uid() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -455,8 +455,8 @@ fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
         ));
     }
     let directory = std::fs::File::open(path)?;
-    let opened = directory.metadata()?;
-    let after = std::fs::symlink_metadata(path)?;
+    let opened = crate::fs::checked_file_metadata(&directory)?;
+    let after = crate::fs::checked_path_metadata(path)?;
     crate::fs::ensure_same_file(path, &before, &opened)?;
     crate::fs::ensure_same_file(path, &opened, &after)?;
     directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
@@ -467,7 +467,7 @@ fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
 fn open_private_existing(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let before = std::fs::symlink_metadata(path)?;
+    let before = crate::fs::checked_path_metadata(path)?;
     if before.file_type().is_symlink() || !before.is_file() || before.uid() != current_uid() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -478,8 +478,8 @@ fn open_private_existing(path: &Path) -> std::io::Result<std::fs::File> {
         .read(true)
         .custom_flags(OPEN_NOFOLLOW)
         .open(path)?;
-    let opened = file.metadata()?;
-    let after = std::fs::symlink_metadata(path)?;
+    let opened = crate::fs::checked_file_metadata(&file)?;
+    let after = crate::fs::checked_path_metadata(path)?;
     crate::fs::ensure_same_file(path, &before, &opened)?;
     crate::fs::ensure_same_file(path, &opened, &after)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -1140,7 +1140,7 @@ mod windows_private {
 
     pub(super) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         repair_path(path, false)?;
-        let before = std::fs::symlink_metadata(path)?;
+        let before = crate::fs::checked_path_metadata(path)?;
         if before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !before.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -1151,8 +1151,8 @@ mod windows_private {
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        let opened = file.metadata()?;
-        let after = std::fs::symlink_metadata(path)?;
+        let opened = crate::fs::checked_file_metadata(&file)?;
+        let after = crate::fs::checked_path_metadata(path)?;
         crate::fs::ensure_same_file(path, &before, &opened)?;
         crate::fs::ensure_same_file(path, &opened, &after)?;
         Ok(file)
@@ -1204,7 +1204,7 @@ mod windows_private {
         let mut temp_identity = None;
         let write_result = (|| {
             let mut file = create_private_file(&temp, CREATE_NEW)?;
-            temp_identity = Some(file.metadata()?);
+            temp_identity = Some(crate::fs::checked_file_metadata(&file)?);
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
@@ -1237,9 +1237,10 @@ mod windows_private {
             repair_path(path, false)
         })();
         if write_result.is_err() {
-            if let (Some(identity), Ok(current)) =
-                (temp_identity.as_ref(), std::fs::symlink_metadata(&temp))
-                && crate::fs::ensure_same_file(&temp, identity, &current).is_ok()
+            if let (Some(identity), Ok(current)) = (
+                temp_identity.as_ref(),
+                crate::fs::checked_path_metadata(&temp),
+            ) && crate::fs::ensure_same_file(&temp, identity, &current).is_ok()
             {
                 let _ = std::fs::remove_file(&temp);
             }

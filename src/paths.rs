@@ -1134,7 +1134,7 @@ fn content_identity(path: &Path) -> io::Result<String> {
 }
 
 fn open_regular_no_follow(path: &Path) -> io::Result<std::fs::File> {
-    let before = std::fs::symlink_metadata(path)?;
+    let before = crate::fs::checked_path_metadata(path)?;
     if portable::is_link_or_reparse(&before) || !before.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1142,8 +1142,8 @@ fn open_regular_no_follow(path: &Path) -> io::Result<std::fs::File> {
         ));
     }
     let file = std::fs::File::open(path)?;
-    let opened = file.metadata()?;
-    let after = std::fs::symlink_metadata(path)?;
+    let opened = crate::fs::checked_file_metadata(&file)?;
+    let after = crate::fs::checked_path_metadata(path)?;
     crate::fs::ensure_same_file(path, &before, &opened)?;
     crate::fs::ensure_same_file(path, &opened, &after)?;
     Ok(file)

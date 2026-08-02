@@ -1784,7 +1784,7 @@ async fn timeout_host_call<T>(
 
 struct ResolvedReadTarget {
     path: PathBuf,
-    identity: std::fs::Metadata,
+    identity: crate::fs::CheckedMetadata,
 }
 
 #[derive(Clone, Copy)]
@@ -1795,7 +1795,7 @@ enum WriteMode {
 
 struct ResolvedWriteTarget {
     path: PathBuf,
-    parent_identity: std::fs::Metadata,
+    parent_identity: crate::fs::CheckedMetadata,
     mode: WriteMode,
 }
 
@@ -1867,7 +1867,9 @@ async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, Effect
     let file = crate::fs::open_stable_file(&target.path)
         .await
         .map_err(file_path_error)?;
-    let opened = file.metadata().await.map_err(file_path_error)?;
+    let opened = crate::fs::checked_tokio_file_metadata(&file)
+        .await
+        .map_err(file_path_error)?;
     crate::fs::ensure_same_file(&target.path, &target.identity, &opened)
         .map_err(file_path_error)?;
     if !opened.is_file() {
@@ -2665,10 +2667,20 @@ impl PreparedSpawnEffect {
         if let PreparedSpawnTarget::SealedSnapshot(snapshot) = &self.target {
             return verify_executable_snapshot_seals(snapshot);
         }
+        #[cfg(unix)]
         let current = std::fs::symlink_metadata(self.executable.canonical_path())
             .map_err(|_| EffectServiceError::TargetChanged)?;
+        #[cfg(unix)]
         if !self.executable.matches_metadata(&current) {
             return Err(EffectServiceError::TargetChanged);
+        }
+        #[cfg(windows)]
+        {
+            let current = std::fs::File::open(self.executable.canonical_path())
+                .map_err(|_| EffectServiceError::TargetChanged)?;
+            if !self.executable.matches_file(&current) {
+                return Err(EffectServiceError::TargetChanged);
+            }
         }
         #[cfg(unix)]
         {

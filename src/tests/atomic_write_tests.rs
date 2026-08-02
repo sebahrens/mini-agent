@@ -79,6 +79,7 @@ async fn atomic_write_security_creates_new_file_with_restrictive_permissions() {
     assert_eq!(mode, 0o600);
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn overwrites_existing_file() {
     let dir = TempDir::new("overwrite");
@@ -86,6 +87,21 @@ async fn overwrites_existing_file() {
     std::fs::write(&f, b"old contents").unwrap();
     atomic_write(&f, b"new contents").await.unwrap();
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "new contents");
+    assert_eq!(temp_residue(dir.path()), 0);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_atomic_replace_fails_closed_and_preserves_existing_file() {
+    let dir = TempDir::new("windows_replace_unsupported");
+    let target = dir.join("target.txt");
+    std::fs::write(&target, b"prior contents").unwrap();
+
+    let error = atomic_write(&target, b"must-not-publish")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(std::fs::read(&target).unwrap(), b"prior contents");
     assert_eq!(temp_residue(dir.path()), 0);
 }
 
@@ -294,7 +310,7 @@ async fn atomic_write_security_concurrent_writers_publish_only_complete_values()
 async fn atomic_write_cancellation_serializes_with_final_publication() {
     let dir = TempDir::new("cancel_publication_gate");
     let target = dir.join("target.txt");
-    let parent = std::fs::metadata(dir.path()).unwrap();
+    let parent = crate::fs::checked_path_metadata(dir.path()).unwrap();
     let (cancellation, probe) = AtomicWriteCancellation::with_publication_probe_for_test();
     let writer_cancellation = cancellation.clone();
     let writer_target = target.clone();
@@ -324,11 +340,100 @@ async fn atomic_write_cancellation_serializes_with_final_publication() {
     assert_eq!(temp_residue(dir.path()), 0);
 }
 
+#[test]
+fn windows_atomic_temp_creation_is_relative_to_verified_directory_handle() {
+    let source = include_str!("../fs.rs");
+    assert!(source.contains("NtCreateFile"));
+    assert!(source.contains("RootDirectory: directory.as_raw_handle().cast()"));
+    assert!(source.contains("FILE_TRAVERSE | FILE_READ_ATTRIBUTES"));
+    assert!(source.contains("ensure_same_file(path, expected, &opened)"));
+    assert!(source.contains("FILE_CREATE"));
+    assert!(!source.contains("let staging_path = parent.join"));
+    assert!(!source.contains(".zswrite.{}.stage"));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_atomic_replace_fails_closed_after_parent_rename_and_leaf_swap() {
+    let container = TempDir::new("windows_replace_parent_swap");
+    let approved_path = container.join("approved");
+    let moved_approved_path = container.join("approved-held");
+    std::fs::create_dir(&approved_path).unwrap();
+    let target = approved_path.join("target.txt");
+    std::fs::write(&target, b"approved-original").unwrap();
+    std::fs::rename(&approved_path, &moved_approved_path).unwrap();
+    let moved_target = moved_approved_path.join("target.txt");
+    let attacker = moved_approved_path.join("attacker.txt");
+    let displaced = moved_approved_path.join("displaced.txt");
+    std::fs::write(&attacker, b"attacker-y").unwrap();
+    std::fs::rename(&moved_target, &displaced).unwrap();
+    std::fs::rename(&attacker, &moved_target).unwrap();
+
+    assert!(
+        atomic_write(&moved_target, b"must-not-publish")
+            .await
+            .is_err()
+    );
+    let attacker_contents = std::fs::read(&moved_target).unwrap();
+    assert_eq!(attacker_contents, b"attacker-y");
+    assert_ne!(attacker_contents, b"must-not-publish");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_atomic_creation_ignores_swapped_parent_and_retained_attacker_handle() {
+    use std::io::{Seek, Write};
+
+    let container = TempDir::new("windows_temp_parent_swap");
+    let approved_path = container.join("approved");
+    let moved_approved_path = container.join("approved-held");
+    std::fs::create_dir(&approved_path).unwrap();
+    let target = approved_path.join("target.txt");
+    let approved_parent = crate::fs::checked_path_metadata(&approved_path).unwrap();
+    let (cancellation, probe) = AtomicWriteCancellation::with_temp_creation_probe_for_test();
+    let writer_target = target.clone();
+    let writer = tokio::spawn(async move {
+        atomic_create_resolved_checked_cancellable(
+            writer_target,
+            b"approved-directory-only",
+            approved_parent,
+            cancellation,
+        )
+        .await
+    });
+
+    let reached = probe.clone();
+    tokio::task::spawn_blocking(move || reached.wait_until_reached())
+        .await
+        .unwrap();
+    std::fs::rename(&approved_path, &moved_approved_path).unwrap();
+    std::fs::create_dir(&approved_path).unwrap();
+    let attacker_target = approved_path.join("target.txt");
+    std::fs::write(&attacker_target, b"attacker-owned").unwrap();
+    let mut attacker_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&attacker_target)
+        .unwrap();
+    probe.resume();
+
+    writer.await.unwrap().unwrap();
+    attacker_handle.rewind().unwrap();
+    attacker_handle.write_all(b"corrupted-by-b").unwrap();
+    attacker_handle.flush().unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"corrupted-by-b");
+    assert_eq!(
+        std::fs::read(moved_approved_path.join("target.txt")).unwrap(),
+        b"approved-directory-only"
+    );
+}
+
 #[tokio::test]
 async fn atomic_write_cancellation_does_not_wait_for_approved_publication() {
     let dir = TempDir::new("cancel_after_publication_decision");
     let target = dir.join("target.txt");
-    let parent = std::fs::metadata(dir.path()).unwrap();
+    let parent = crate::fs::checked_path_metadata(dir.path()).unwrap();
     let (cancellation, probe) = AtomicWriteCancellation::with_blocking_publication_probe_for_test();
     let writer_cancellation = cancellation.clone();
     let writer_target = target.clone();

@@ -133,6 +133,10 @@ fn launch_executable(
         output: super::child_stdout_file(output),
         stderr: super::child_stderr_file(stderr),
         backend: BACKEND,
+        #[cfg(test)]
+        reap_observer: None,
+        #[cfg(test)]
+        force_tree_termination_error: false,
     })
 }
 
@@ -1057,9 +1061,9 @@ fn wait_worker_bounded(process: &mut WorkerProcess, timeout: Duration) -> io::Re
 
 #[cfg(test)]
 fn process_descendants(root: u32) -> Vec<(u32, u64)> {
-    let mut processes = Vec::new();
+    let mut processes: Vec<(u32, u32, u64)> = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return processes;
+        return Vec::new();
     };
     for entry in entries.flatten() {
         let Some(pid) = entry

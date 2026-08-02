@@ -44,7 +44,7 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
     builder.recursive(true).mode(0o700);
     builder.create(path)?;
 
-    let before = std::fs::symlink_metadata(path)?;
+    let before = super::checked_path_metadata(path)?;
     if before.file_type().is_symlink() || !before.is_dir() || before.uid() != current_uid() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -55,10 +55,10 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
         .read(true)
         .custom_flags(OPEN_DIRECTORY | OPEN_NOFOLLOW | OPEN_CLOEXEC)
         .open(path)?;
-    let opened = directory.metadata()?;
+    let opened = super::checked_file_metadata(&directory)?;
     super::ensure_same_file(path, &before, &opened)?;
     directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-    let after = std::fs::symlink_metadata(path)?;
+    let after = super::checked_path_metadata(path)?;
     super::ensure_same_file(path, &opened, &after)
 }
 
@@ -66,7 +66,7 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
 pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let before = std::fs::symlink_metadata(path)?;
+    let before = super::checked_path_metadata(path)?;
     if before.file_type().is_symlink() || !before.is_file() || before.uid() != current_uid() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -77,10 +77,10 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         .read(true)
         .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC)
         .open(path)?;
-    let opened = file.metadata()?;
+    let opened = super::checked_file_metadata(&file)?;
     super::ensure_same_file(path, &before, &opened)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    let after = std::fs::symlink_metadata(path)?;
+    let after = super::checked_path_metadata(path)?;
     super::ensure_same_file(path, &opened, &after)?;
     Ok(file)
 }
@@ -673,7 +673,7 @@ mod windows {
 
     pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         repair_path(path, false)?;
-        let before = std::fs::symlink_metadata(path)?;
+        let before = super::super::checked_path_metadata(path)?;
         if before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !before.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -684,8 +684,8 @@ mod windows {
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        let opened = file.metadata()?;
-        let after = std::fs::symlink_metadata(path)?;
+        let opened = super::super::checked_file_metadata(&file)?;
+        let after = super::super::checked_path_metadata(path)?;
         super::super::ensure_same_file(path, &before, &opened)?;
         super::super::ensure_same_file(path, &opened, &after)?;
         Ok(file)
@@ -732,7 +732,7 @@ mod windows {
         let mut temp_identity = None;
         let result = (|| {
             let mut file = create_private_file(&temp)?;
-            temp_identity = Some(file.metadata()?);
+            temp_identity = Some(super::super::checked_file_metadata(&file)?);
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
@@ -765,8 +765,10 @@ mod windows {
             repair_path(path, false)
         })();
         if result.is_err()
-            && let (Some(identity), Ok(current)) =
-                (temp_identity.as_ref(), std::fs::symlink_metadata(&temp))
+            && let (Some(identity), Ok(current)) = (
+                temp_identity.as_ref(),
+                super::super::checked_path_metadata(&temp),
+            )
             && super::super::ensure_same_file(&temp, identity, &current).is_ok()
         {
             let _ = std::fs::remove_file(&temp);

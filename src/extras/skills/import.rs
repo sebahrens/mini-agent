@@ -294,7 +294,7 @@ fn collect_directory_recursive(
     raw_entries: &mut usize,
     expanded_bytes: &mut u64,
 ) -> Result<(), ImportError> {
-    let before = fs::symlink_metadata(current)?;
+    let before = secure_fs::checked_path_metadata(current)?;
     if portable::is_link_or_reparse(&before) || !before.is_dir() {
         return Err(ImportError::UnsafeEntry(current.display().to_string()));
     }
@@ -341,7 +341,7 @@ fn collect_directory_recursive(
         }
     }
 
-    let after = fs::symlink_metadata(current)?;
+    let after = secure_fs::checked_path_metadata(current)?;
     secure_fs::ensure_same_file(current, &before, &after)?;
     Ok(())
 }
@@ -651,10 +651,10 @@ fn read_stable_file(
     limit: u64,
     reject_hard_links: bool,
 ) -> Result<Vec<u8>, ImportError> {
-    let before = fs::symlink_metadata(path)?;
+    let before = secure_fs::checked_path_metadata(path)?;
     if portable::is_link_or_reparse(&before)
         || !before.is_file()
-        || (reject_hard_links && has_unsafe_link_count(&before))
+        || (reject_hard_links && has_unsafe_link_count(path, None, &before))
     {
         return Err(ImportError::UnsafeEntry(path.display().to_string()));
     }
@@ -669,9 +669,9 @@ fn read_stable_file(
     }
 
     let file = open_source_file(path)?;
-    let opened = file.metadata()?;
+    let opened = secure_fs::checked_file_metadata(&file)?;
     secure_fs::ensure_same_file(path, &before, &opened)?;
-    if reject_hard_links && has_unsafe_link_count(&opened) {
+    if reject_hard_links && has_unsafe_link_count(path, Some(&file), &opened) {
         return Err(ImportError::UnsafeEntry(path.display().to_string()));
     }
     let mut bytes = Vec::with_capacity(before.len() as usize);
@@ -679,30 +679,32 @@ fn read_stable_file(
     if bytes.len() as u64 > limit || bytes.len() as u64 != before.len() {
         return Err(ImportError::VerificationFailed);
     }
-    let after = fs::symlink_metadata(path)?;
+    let after = secure_fs::checked_path_metadata(path)?;
     secure_fs::ensure_same_file(path, &opened, &after)?;
-    if reject_hard_links && has_unsafe_link_count(&after) {
+    if reject_hard_links && has_unsafe_link_count(path, None, &after) {
         return Err(ImportError::UnsafeEntry(path.display().to_string()));
     }
     Ok(bytes)
 }
 
 #[cfg(unix)]
-fn has_unsafe_link_count(metadata: &fs::Metadata) -> bool {
+fn has_unsafe_link_count(_path: &Path, _file: Option<&fs::File>, metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     metadata.nlink() != 1
 }
 
 #[cfg(windows)]
-fn has_unsafe_link_count(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    metadata.number_of_links() != Some(1)
+fn has_unsafe_link_count(path: &Path, file: Option<&fs::File>, _metadata: &fs::Metadata) -> bool {
+    match file {
+        Some(file) => crate::fs::windows_file_link_count(file),
+        None => open_source_file(path).and_then(|file| crate::fs::windows_file_link_count(&file)),
+    }
+    .map_or(true, |links| links != 1)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn has_unsafe_link_count(_metadata: &fs::Metadata) -> bool {
+fn has_unsafe_link_count(_path: &Path, _file: Option<&fs::File>, _metadata: &fs::Metadata) -> bool {
     true
 }
 

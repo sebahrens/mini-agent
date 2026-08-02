@@ -365,8 +365,8 @@ enum PlatformExecutableIdentity {
         inode: u64,
     },
     Windows {
-        volume_serial_number: u32,
-        file_index: u64,
+        volume_serial_number: u64,
+        file_id: [u8; 16],
     },
 }
 
@@ -375,8 +375,14 @@ impl SpawnExecutableIdentity {
         &self.canonical_path
     }
 
+    #[cfg(unix)]
     pub(crate) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
         platform_executable_identity(metadata).is_some_and(|identity| identity == self.platform)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn matches_file(&self, file: &std::fs::File) -> bool {
+        platform_executable_identity(file).is_some_and(|identity| identity == self.platform)
     }
 
     #[cfg(target_os = "linux")]
@@ -1511,16 +1517,35 @@ fn resolve_program_identity_inner(
         let mut file =
             std::fs::File::open(&canonical).map_err(|_| EffectServiceError::InvalidTarget)?;
         executable_identity_checkpoint(control)?;
+        #[cfg(not(windows))]
         let metadata = file
             .metadata()
             .map_err(|_| EffectServiceError::InvalidTarget)?;
-        let current =
-            std::fs::symlink_metadata(&canonical).map_err(|_| EffectServiceError::InvalidTarget)?;
+        #[cfg(unix)]
+        let platform = {
+            let current = std::fs::symlink_metadata(&canonical)
+                .map_err(|_| EffectServiceError::InvalidTarget)?;
+            let platform =
+                platform_executable_identity(&metadata).ok_or(EffectServiceError::InvalidTarget)?;
+            if platform_executable_identity(&current) != Some(platform.clone()) {
+                return Err(EffectServiceError::TargetChanged);
+            }
+            platform
+        };
+        #[cfg(windows)]
+        let platform = {
+            let platform =
+                platform_executable_identity(&file).ok_or(EffectServiceError::InvalidTarget)?;
+            let current =
+                std::fs::File::open(&canonical).map_err(|_| EffectServiceError::InvalidTarget)?;
+            if platform_executable_identity(&current) != Some(platform.clone()) {
+                return Err(EffectServiceError::TargetChanged);
+            }
+            platform
+        };
+        #[cfg(not(any(unix, windows)))]
         let platform =
             platform_executable_identity(&metadata).ok_or(EffectServiceError::InvalidTarget)?;
-        if platform_executable_identity(&current) != Some(platform.clone()) {
-            return Err(EffectServiceError::TargetChanged);
-        }
         let content = match control {
             Some(control) => {
                 copy_and_hash_executable_controlled(&mut file, &mut std::io::sink(), control)
@@ -1574,14 +1599,12 @@ fn platform_executable_identity(
 }
 
 #[cfg(windows)]
-fn platform_executable_identity(
-    metadata: &std::fs::Metadata,
-) -> Option<PlatformExecutableIdentity> {
-    use std::os::windows::fs::MetadataExt;
+fn platform_executable_identity(file: &std::fs::File) -> Option<PlatformExecutableIdentity> {
+    let identity = crate::fs::windows_file_identity(file).ok()?;
 
     Some(PlatformExecutableIdentity::Windows {
-        volume_serial_number: metadata.volume_serial_number()?,
-        file_index: metadata.file_index()?,
+        volume_serial_number: identity.volume_serial_number,
+        file_id: identity.file_id,
     })
 }
 
