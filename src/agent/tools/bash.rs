@@ -201,9 +201,9 @@ mod tests {
             .is_ok_and(|status| status.success())
     }
 
-    async fn wait_for_file(path: &Path) {
+    async fn wait_for_nonempty_file(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !path.exists() {
+        while std::fs::metadata(path).map_or(true, |metadata| metadata.len() == 0) {
             assert!(Instant::now() < deadline, "timed out waiting for pid file");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -291,7 +291,7 @@ mod tests {
                 })
                 .await
         });
-        wait_for_file(&pid_file).await;
+        wait_for_nonempty_file(&pid_file).await;
         let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
 
         handle.abort();
