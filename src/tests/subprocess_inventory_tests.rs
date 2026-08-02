@@ -147,12 +147,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/supervisor.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/extras/js/skills/telemetry.rs",
         ".spawn(move || {",
         1,
@@ -520,12 +514,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/js/skills/proposal.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/supervisor.rs",
         ".spawn(move || {",
         1,
         "NON-PROCESS",
