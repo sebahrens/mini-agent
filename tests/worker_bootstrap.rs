@@ -1,3 +1,5 @@
+#![cfg(feature = "js")]
+
 use std::io::Write;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
