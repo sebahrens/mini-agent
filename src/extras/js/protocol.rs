@@ -15,6 +15,12 @@ use uuid::Uuid;
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
+#[cfg(feature = "skills")]
+pub(crate) const MAX_SKILL_ARTIFACTS_PER_STEP: usize = 64;
+#[cfg(feature = "skills")]
+pub(crate) const MAX_SKILL_EXPORTS_PER_ARTIFACT: usize = 32;
+#[cfg(feature = "skills")]
+pub(crate) const MAX_SKILL_CAPABILITY_GRANTS_PER_STEP: usize = 1024;
 
 const MAX_ID_BYTES: usize = 128;
 
@@ -237,7 +243,11 @@ pub(crate) struct RunStep {
     pub(crate) code: String,
     pub(crate) model_grant_id: Option<GrantId>,
     #[cfg(feature = "skills")]
+    pub(crate) proposal_grant_id: Option<GrantId>,
+    #[cfg(feature = "skills")]
     pub(crate) artifacts: Vec<super::skills::SkillArtifact>,
+    #[cfg(feature = "skills")]
+    pub(crate) skill_invocations: Vec<SkillInvocationGrant>,
     #[cfg(feature = "skills")]
     pub(crate) turn_id: String,
     #[cfg(feature = "skills")]
@@ -250,12 +260,22 @@ impl RunStep {
             code,
             model_grant_id: None,
             #[cfg(feature = "skills")]
+            proposal_grant_id: None,
+            #[cfg(feature = "skills")]
             artifacts: Vec::new(),
+            #[cfg(feature = "skills")]
+            skill_invocations: Vec::new(),
             #[cfg(feature = "skills")]
             turn_id: String::new(),
             #[cfg(feature = "skills")]
             tool_call_id: String::new(),
         }
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_proposal_grant(mut self, grant_id: GrantId) -> Self {
+        self.proposal_grant_id = Some(grant_id);
+        self
     }
 
     pub(crate) fn with_model_grant(mut self, grant_id: GrantId) -> Self {
@@ -267,14 +287,35 @@ impl RunStep {
     pub(crate) fn with_skills(
         mut self,
         artifacts: Vec<super::skills::SkillArtifact>,
+        skill_invocations: Vec<SkillInvocationGrant>,
         turn_id: String,
         tool_call_id: String,
     ) -> Self {
         self.artifacts = artifacts;
+        self.skill_invocations = skill_invocations;
         self.turn_id = turn_id;
         self.tool_call_id = tool_call_id;
         self
     }
+}
+
+/// Parent-issued authority for one exact selected ABI-v2 export call.
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillInvocationGrant {
+    pub(crate) artifact_id: String,
+    pub(crate) export_name: String,
+    pub(crate) invocation_id: InvocationId,
+    pub(crate) grants: Vec<SkillCapabilityGrant>,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillCapabilityGrant {
+    pub(crate) capability: super::skills::HostCapability,
+    pub(crate) grant_id: GrantId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -363,11 +404,50 @@ pub(crate) struct HttpHeader {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Deserialization input remains capped by the enclosing [`MAX_FRAME_BYTES`]
+/// frame. The parent applies the tighter proposal and nested-scope limits via
+/// the fallible `JsProposal` conversion before writing audit intent or enqueueing;
+/// the proposal frame regression preserves that residual transport bound.
 pub(crate) struct SkillProposalDraft {
     pub(crate) source: String,
     pub(crate) description: String,
-    pub(crate) exports: Vec<String>,
+    pub(crate) exports: Vec<SkillProposalExport>,
     pub(crate) tests: Vec<String>,
+    pub(crate) capability: SkillProposalCapability,
+    pub(crate) tags: Vec<String>,
+    pub(crate) predecessor_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillProposalExport {
+    pub(crate) name: String,
+    pub(crate) signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillProposalCapability {
+    pub(crate) tier: String,
+    pub(crate) grants: Vec<SkillProposalScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum SkillProposalScope {
+    ReadFile {
+        workspace_prefixes: Vec<String>,
+    },
+    WriteFile {
+        workspace_prefixes: Vec<String>,
+    },
+    Fetch {
+        origins: Vec<String>,
+        methods: Vec<String>,
+    },
+    Spawn {
+        programs: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -403,8 +483,35 @@ pub(crate) enum EffectResult {
         stdout_truncated: bool,
         stderr_truncated: bool,
     },
-    ProposalAccepted,
+    ProposalAccepted {
+        skill_id: String,
+        proposal_id: String,
+        status: ProposalStatus,
+        report_id: Option<String>,
+    },
     Error(EffectError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProposalStatus {
+    Pending,
+    Verified,
+    Rejected,
+    AwaitingApproval,
+    Approved,
+}
+
+impl ProposalStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Verified => "verified",
+            Self::Rejected => "rejected",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Approved => "approved",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

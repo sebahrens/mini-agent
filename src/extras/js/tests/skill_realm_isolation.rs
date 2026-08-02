@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId};
 use crate::extras::js::realm::{
-    RealmError, call_export_with_capability, load_artifact, load_artifact_with_capabilities,
+    BoundExportInvocation, RealmError, call_export_with_capability, load_artifact,
+    load_artifact_with_bound_exports, load_artifact_with_capabilities,
 };
 use crate::extras::js::skills::capability::{
     DispatchedEffect, InvocationAuthorization, InvocationCapabilityRuntime,
@@ -23,6 +24,90 @@ const MAX_EXCEPTION_STACK_BYTES: usize = 32;
 enum CloneError {
     Rejected,
     TooLarge,
+}
+
+#[test]
+fn production_bound_export_is_unreflectable_and_second_call_mints_no_observation() {
+    let runtime = Runtime::new().unwrap();
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let model = Context::full(&runtime).unwrap();
+    let skill = SkillArtifact::new(
+        "function once(_cap, value) { return value + 1; }".into(),
+        "One exact production call".into(),
+        vec![],
+        vec![SkillExport {
+            name: "once".into(),
+            signature: "(number) => number".into(),
+        }],
+        vec!["once(1) === 2".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    let capabilities = InvocationCapabilityRuntime::new(|_| {
+        panic!("pure bound export must not dispatch an effect")
+    });
+    let invocation_id = InvocationId::new("a".repeat(64)).unwrap();
+    let handle = capabilities
+        .prepare(
+            InvocationAuthorization::new(
+                invocation_id.clone(),
+                skill.id.clone(),
+                "once".into(),
+                CapabilityManifest::pure(),
+                [],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let start_observations = starts.clone();
+    let terminals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let terminal_observations = terminals.clone();
+    let loaded = load_artifact_with_bound_exports(
+        &runtime,
+        &model,
+        &skill,
+        capabilities,
+        std::collections::HashMap::from([(
+            "once".into(),
+            BoundExportInvocation {
+                handle,
+                on_start: Arc::new(move |shape| {
+                    start_observations.lock().unwrap().push(shape);
+                    Ok("a".repeat(64))
+                }),
+                on_terminal: Arc::new(move |id, success| {
+                    terminal_observations.lock().unwrap().push((id, success));
+                    Ok(())
+                }),
+            },
+        )]),
+    )
+    .unwrap();
+
+    let result = model.with(|ctx| {
+        ctx.eval::<String, _>(
+            r#"JSON.stringify({
+                privateKeys: Reflect.ownKeys(globalThis).filter(key =>
+                    typeof key === "string" && key.includes("mini-agent")),
+                first: once(41),
+                second: (() => { try { once(1); return "bad"; } catch (_) { return "denied"; } })()
+            })"#,
+        )
+    });
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result.unwrap()).unwrap(),
+        serde_json::json!({"privateKeys": [], "first": 42, "second": "denied"})
+    );
+    assert_eq!(starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        terminals.lock().unwrap().as_slice(),
+        &[("a".repeat(64), true)]
+    );
+    drop(loaded);
+    drop(model);
+    drop(runtime);
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {

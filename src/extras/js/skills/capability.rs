@@ -546,7 +546,7 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
         }),
-        EffectResult::ProposalAccepted => return Err(CapabilityError::DispatchDenied),
+        EffectResult::ProposalAccepted { .. } => return Err(CapabilityError::DispatchDenied),
         EffectResult::Error(error) => {
             let _closed_code = match error.code {
                 EffectErrorCode::Denied
