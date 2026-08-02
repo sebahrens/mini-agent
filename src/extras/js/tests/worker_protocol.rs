@@ -261,6 +261,38 @@ fn worker_protocol_bounds_outbound_and_nested_payloads() {
         write_frame(&mut Vec::new(), &nested),
         Err(FrameError::FrameTooLarge { .. })
     ));
+
+    let proposal = invoked(
+        3,
+        WorkerFrame::EffectRequest(EffectRequest {
+            effect_ordinal: 0,
+            grant_id: grant(),
+            advisory: AdvisoryAttribution::default(),
+            operation: EffectOperation::ProposeSkill {
+                draft: SkillProposalDraft {
+                    source: "function run() { return true; }".into(),
+                    description: "bounded proposal".into(),
+                    exports: vec![SkillProposalExport {
+                        name: "run".into(),
+                        signature: "run(): boolean".into(),
+                    }],
+                    tests: vec!["run() === true".into()],
+                    capability: SkillProposalCapability {
+                        tier: "read_only".into(),
+                        grants: vec![SkillProposalScope::ReadFile {
+                            workspace_prefixes: vec!["x".repeat(MAX_FRAME_BYTES)],
+                        }],
+                    },
+                    tags: vec![],
+                    predecessor_id: None,
+                },
+            },
+        }),
+    );
+    assert!(matches!(
+        write_frame(&mut Vec::new(), &proposal),
+        Err(FrameError::FrameTooLarge { .. })
+    ));
 }
 
 #[test]

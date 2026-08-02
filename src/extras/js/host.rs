@@ -2649,7 +2649,9 @@ impl ParentEffectService for ParentHostEffectService {
                     .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
                 self.prepared_proposal = Some(
                     proposal
-                        .authorize_reserved(JsProposal::from(draft.clone()))
+                        .authorize_reserved(JsProposal::try_from(draft.clone()).map_err(
+                            |error| HostEffectError::from(proposal_service_error(error)),
+                        )?)
                         .map_err(|error| HostEffectError::from(proposal_service_error(error)))?,
                 );
                 Ok(())

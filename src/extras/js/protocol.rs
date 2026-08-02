@@ -323,6 +323,10 @@ pub(crate) struct HttpHeader {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Deserialization input remains capped by the enclosing [`MAX_FRAME_BYTES`]
+/// frame. The parent applies the tighter proposal and nested-scope limits via
+/// the fallible `JsProposal` conversion before writing audit intent or enqueueing;
+/// the proposal frame regression preserves that residual transport bound.
 pub(crate) struct SkillProposalDraft {
     pub(crate) source: String,
     pub(crate) description: String,

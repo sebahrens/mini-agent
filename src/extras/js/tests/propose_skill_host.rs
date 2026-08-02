@@ -6,7 +6,7 @@ use crate::extras::js::host::AllowConfig;
 use crate::extras::js::host::{FileEffectService, ParentHostEffectService, SpawnEffectService};
 use crate::extras::js::protocol::{
     AdvisoryAttribution, EffectOperation, EffectRequest, EffectResult, GrantId, InvocationId,
-    SkillProposalCapability, SkillProposalDraft, SkillProposalExport,
+    SkillProposalCapability, SkillProposalDraft, SkillProposalExport, SkillProposalScope,
 };
 use crate::extras::js::realm::{
     call_export_with_capability, load_artifact, load_artifact_with_capabilities,
@@ -325,7 +325,8 @@ async fn model_authored_proposal_uses_one_exact_grant_and_durable_audit_envelope
             draft: wire_proposal(""),
         },
     };
-    let expected_skill_id = JsProposal::from(wire_proposal(""))
+    let expected_skill_id = JsProposal::try_from(wire_proposal(""))
+        .unwrap()
         .validate_and_canonicalize()
         .unwrap()
         .id;
@@ -522,6 +523,141 @@ async fn parent_proposal_attempt_budget_precedes_canonical_validation() {
             .await
             .is_err()
     );
+    assert!(audit.lock().unwrap().records().is_empty());
+    drop(broker);
+    drop(worker);
+    let store = SkillStore::open_at(&paths).unwrap();
+    assert_eq!(store.count_proposals().unwrap(), 0);
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn wire_proposal_rejects_33_nested_scope_entries_before_audit_or_enqueue() {
+    let (root, paths) = paths();
+    let store = SkillStore::open_at(&paths).expect("store");
+    let worker = ProposalQueue::start_store_worker(store, 4, Duration::from_secs(1)).unwrap();
+    let audit = Arc::new(Mutex::new(
+        crate::extras::js::audit::EffectAudit::open(paths.effect_audit()).unwrap(),
+    ));
+    let invocation = InvocationId::new("model-proposal-nested-count").unwrap();
+    let grant = InvocationGrant::issue(
+        invocation.clone(),
+        GrantPrincipal::ModelAuthored {
+            tool_call_id: "nested-count-tool-call".to_string(),
+        },
+        BTreeSet::from([HostCapability::ProposeSkill]),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let mut draft = wire_proposal("-nested-count");
+    draft.capability = SkillProposalCapability {
+        tier: "side_effecting".to_string(),
+        grants: vec![SkillProposalScope::Spawn {
+            programs: (0..33).map(|index| format!("program{index}")).collect(),
+        }],
+    };
+    let mut broker = InvocationBroker::new(
+        invocation,
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::ProposeSkill]),
+        proposal_parent_service(ProposalHost::new(worker.sender(), AttemptBudget::new(1))),
+        audit.clone(),
+    )
+    .unwrap();
+
+    assert!(
+        broker
+            .dispatch(
+                EffectRequest {
+                    effect_ordinal: 0,
+                    grant_id: grant.grant_id().clone(),
+                    advisory: AdvisoryAttribution::default(),
+                    operation: EffectOperation::ProposeSkill { draft },
+                },
+                PermCancellation::new(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(audit.lock().unwrap().records().is_empty());
+    drop(broker);
+    drop(worker);
+    let store = SkillStore::open_at(&paths).unwrap();
+    assert_eq!(store.count_proposals().unwrap(), 0);
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn wire_proposal_rejects_oversized_nested_strings_before_audit_or_enqueue() {
+    let (root, paths) = paths();
+    let store = SkillStore::open_at(&paths).expect("store");
+    let worker = ProposalQueue::start_store_worker(store, 4, Duration::from_secs(1)).unwrap();
+    let audit = Arc::new(Mutex::new(
+        crate::extras::js::audit::EffectAudit::open(paths.effect_audit()).unwrap(),
+    ));
+    let invocation = InvocationId::new("model-proposal-nested-strings").unwrap();
+    let grant = InvocationGrant::issue(
+        invocation.clone(),
+        GrantPrincipal::ModelAuthored {
+            tool_call_id: "nested-strings-tool-call".to_string(),
+        },
+        BTreeSet::from([HostCapability::ProposeSkill]),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let grant_id = grant.grant_id().clone();
+    let mut broker = InvocationBroker::new(
+        invocation,
+        vec![grant],
+        BTreeSet::from([HostCapability::ProposeSkill]),
+        proposal_parent_service(ProposalHost::new(worker.sender(), AttemptBudget::new(3))),
+        audit.clone(),
+    )
+    .unwrap();
+    let oversized_origin = format!(
+        "https://{}.example",
+        "o".repeat(
+            crate::extras::js::skills::proposal::MAX_DESCRIPTION_BYTES + 1
+                - "https://".len()
+                - ".example".len()
+        )
+    );
+    let invalid_scopes = [
+        SkillProposalScope::ReadFile {
+            workspace_prefixes: vec![
+                "p".repeat(crate::extras::js::skills::proposal::MAX_DESCRIPTION_BYTES + 1),
+            ],
+        },
+        SkillProposalScope::Fetch {
+            origins: vec![oversized_origin],
+            methods: vec!["GET".to_string()],
+        },
+        SkillProposalScope::Spawn {
+            programs: vec!["p".repeat(crate::extras::js::skills::proposal::MAX_TAG_BYTES + 1)],
+        },
+    ];
+
+    for (effect_ordinal, scope) in invalid_scopes.into_iter().enumerate() {
+        let mut draft = wire_proposal(&format!("-nested-string-{effect_ordinal}"));
+        draft.capability = SkillProposalCapability {
+            tier: "side_effecting".to_string(),
+            grants: vec![scope],
+        };
+        assert!(
+            broker
+                .dispatch(
+                    EffectRequest {
+                        effect_ordinal: effect_ordinal as u32,
+                        grant_id: grant_id.clone(),
+                        advisory: AdvisoryAttribution::default(),
+                        operation: EffectOperation::ProposeSkill { draft },
+                    },
+                    PermCancellation::new(),
+                )
+                .await
+                .is_err()
+        );
+    }
     assert!(audit.lock().unwrap().records().is_empty());
     drop(broker);
     drop(worker);
