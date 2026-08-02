@@ -1,11 +1,20 @@
 #![allow(unsafe_code)]
 
+use std::fs::File;
 use std::io;
-use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::process::{Child, ExitStatus};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::process::ExitStatusExt;
+use std::process::ExitStatus;
+use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(test)]
+use std::process::Child;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
+use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 
 use super::{
     WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus, WorkerLaunchError,
@@ -13,8 +22,77 @@ use super::{
 };
 
 const BACKEND: WorkerBackend = WorkerBackend::WindowsLpac;
-const UNAVAILABLE_REASON: &str =
-    "the zero-capability LPAC/AppContainer creation-time Job backend has not been delivered";
+
+#[derive(Debug)]
+struct WinHandle {
+    handle: Option<OwnedHandle>,
+}
+
+impl WinHandle {
+    fn from_created(raw: HANDLE, context: &str) -> io::Result<Self> {
+        if raw.is_null() || raw == (-1isize as HANDLE) {
+            return Err(contextual_last_error(context));
+        }
+        // SAFETY: `raw` is a newly returned, non-null owned Win32 handle. This conversion
+        // transfers its single CloseHandle obligation to OwnedHandle; no other owner remains.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        #[cfg(test)]
+        LIVE_WIN_HANDLES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(Self {
+            handle: Some(handle),
+        })
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.handle
+            .as_ref()
+            .expect("owned Windows handle was already transferred")
+            .as_raw_handle()
+    }
+
+    fn clear_inherit(&self) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+        // SAFETY: the handle remains owned by `self` for the call, and
+        // SetHandleInformation neither stores nor closes it.
+        if unsafe { SetHandleInformation(self.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(contextual_last_error("clear protocol-pipe inheritance"));
+        }
+        Ok(())
+    }
+
+    fn into_file(mut self) -> File {
+        File::from(
+            self.handle
+                .take()
+                .expect("owned Windows handle was already transferred"),
+        )
+    }
+}
+
+impl Drop for WinHandle {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        LIVE_WIN_HANDLES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+static LIVE_WIN_HANDLES: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+fn contextual_last_error(context: &str) -> io::Error {
+    io::Error::other(format!("{context}: {}", io::Error::last_os_error()))
+}
+
+fn close_unowned_handle(raw: HANDLE) {
+    if !raw.is_null() && raw != (-1isize as HANDLE) {
+        // SAFETY: callers pass only a raw handle returned by a failed/malformed FFI operation
+        // before ownership was transferred. This discharges that operation's sole obligation.
+        unsafe {
+            CloseHandle(raw);
+        }
+    }
+}
 
 pub(super) fn standard_streams_are_protocol_pipes() -> bool {
     fn is_pipe(handle: RawHandle) -> bool {
@@ -31,71 +109,176 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
 }
 
 pub(super) fn containment_status() -> WorkerContainmentStatus {
-    WorkerContainmentStatus::Unavailable {
-        backend: BACKEND,
-        assurance: WorkerContainmentAssurance::Enforced,
-        reason: UNAVAILABLE_REASON.to_string(),
+    static PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
+    match PREFLIGHT.get_or_init(|| feasibility::production_preflight().map_err(|error| error.0)) {
+        Ok(()) => WorkerContainmentStatus::Available {
+            backend: BACKEND,
+            assurance: WorkerContainmentAssurance::Enforced,
+        },
+        Err(reason) => WorkerContainmentStatus::Unavailable {
+            backend: BACKEND,
+            assurance: WorkerContainmentAssurance::Enforced,
+            reason: reason.clone(),
+        },
     }
 }
 
 pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
-    Err(WorkerLaunchError::Unavailable {
-        backend: BACKEND,
-        reason: UNAVAILABLE_REASON.to_string(),
-    })
+    feasibility::launch_production(feasibility::ProductionLaunchHooks::production()).map_err(
+        |error| WorkerLaunchError::Io {
+            backend: BACKEND,
+            source: io::Error::other(error.0),
+        },
+    )
 }
 
-// This temporary std::process-backed type is reachable only from the test
-// launcher. The A03 LPAC code below is a target-gated research helper, not a
-// production launcher. A26 will replace this type with directly owned process
-// and Job handles after the real Windows gate has passed.
 #[derive(Debug)]
 pub(super) struct WorkerChild {
-    child: Child,
+    inner: WorkerChildInner,
+}
+
+#[derive(Debug)]
+enum WorkerChildInner {
+    Contained {
+        process: WinHandle,
+        job: WinHandle,
+        process_id: u32,
+        status: Option<ExitStatus>,
+    },
+    #[cfg(test)]
+    Unconfined(Child),
 }
 
 impl WorkerChild {
+    fn contained(process: WinHandle, job: WinHandle, process_id: u32) -> Self {
+        Self {
+            inner: WorkerChildInner::Contained {
+                process,
+                job,
+                process_id,
+                status: None,
+            },
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn from_unconfined_test_child(child: Child) -> Self {
-        Self { child }
+        Self {
+            inner: WorkerChildInner::Unconfined(child),
+        }
     }
 
     pub(super) fn id(&self) -> u32 {
-        self.child.id()
+        match &self.inner {
+            WorkerChildInner::Contained { process_id, .. } => *process_id,
+            #[cfg(test)]
+            WorkerChildInner::Unconfined(child) => child.id(),
+        }
     }
 
     pub(super) fn terminate_tree(&mut self) -> io::Result<()> {
-        self.child.kill()
+        match &mut self.inner {
+            WorkerChildInner::Contained { job, .. } => {
+                // SAFETY: `job` is the directly owned creation-time Job for this worker. The
+                // call terminates every member synchronously and does not retain the handle.
+                if unsafe { TerminateJobObject(job.raw(), 1) } == 0 {
+                    return Err(contextual_last_error("terminate JavaScript worker Job"));
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            WorkerChildInner::Unconfined(child) => child.kill(),
+        }
     }
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        match &mut self.inner {
+            WorkerChildInner::Contained {
+                process, status, ..
+            } => {
+                if let Some(status) = status {
+                    return Ok(Some(*status));
+                }
+                // SAFETY: the process handle remains directly owned for this nonblocking wait.
+                match unsafe { WaitForSingleObject(process.raw(), 0) } {
+                    WAIT_TIMEOUT => Ok(None),
+                    WAIT_OBJECT_0 => {
+                        let exited = process_exit_status(process)?;
+                        *status = Some(exited);
+                        Ok(Some(exited))
+                    }
+                    WAIT_FAILED => Err(contextual_last_error("poll JavaScript worker process")),
+                    other => Err(io::Error::other(format!(
+                        "unexpected JavaScript worker wait result {other}"
+                    ))),
+                }
+            }
+            #[cfg(test)]
+            WorkerChildInner::Unconfined(child) => child.try_wait(),
+        }
     }
 
     pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
+        match &mut self.inner {
+            WorkerChildInner::Contained {
+                process, status, ..
+            } => {
+                if let Some(status) = status {
+                    return Ok(*status);
+                }
+                // SAFETY: the process handle remains directly owned for this wait. Common caller
+                // paths bound it by terminating the kill-on-close Job before waiting.
+                match unsafe { WaitForSingleObject(process.raw(), INFINITE) } {
+                    WAIT_OBJECT_0 => {
+                        let exited = process_exit_status(process)?;
+                        *status = Some(exited);
+                        Ok(exited)
+                    }
+                    WAIT_FAILED => Err(contextual_last_error("wait for JavaScript worker process")),
+                    other => Err(io::Error::other(format!(
+                        "unexpected JavaScript worker wait result {other}"
+                    ))),
+                }
+            }
+            #[cfg(test)]
+            WorkerChildInner::Unconfined(child) => child.wait(),
+        }
     }
 }
 
-#[cfg(test)]
+fn process_exit_status(process: &WinHandle) -> io::Result<ExitStatus> {
+    let mut code = 0u32;
+    // SAFETY: `process` is a live directly owned process handle and `code` is one initialized,
+    // writable DWORD. GetExitCodeProcess does not retain either pointer or handle.
+    if unsafe { GetExitCodeProcess(process.raw(), &mut code) } == 0 {
+        return Err(contextual_last_error(
+            "read JavaScript worker process exit code",
+        ));
+    }
+    Ok(ExitStatus::from_raw(code))
+}
+
+#[allow(dead_code)]
 mod feasibility {
+    use super::{WinHandle, WorkerChild, close_unowned_handle};
+    use crate::sandbox::worker::{
+        INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, WorkerBackend, WorkerProcess,
+    };
     use std::ffi::{OsStr, c_void};
     use std::fmt;
     use std::fs::{File, OpenOptions};
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::mem::{size_of, size_of_val};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
     use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE,
-        GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, GetHandleInformation,
-        GetLastError, HANDLE, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation, TRUE,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, GENERIC_ALL,
+        GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, GetLastError, HANDLE,
+        LocalFree, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetEffectiveRightsFromAclW,
@@ -129,27 +312,43 @@ mod feasibility {
     };
     use windows_sys::Win32::System::JobObjects::{
         CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Memory::{
         GetProcessHeap, HEAP_ZERO_MEMORY, HeapAlloc, HeapFree,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::SystemServices::JOB_OBJECT_UILIMIT_ALL;
     use windows_sys::Win32::System::Threading::{
         CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
         GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
         OpenProcessToken, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+        PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
         STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
     };
     use windows_sys::Win32::System::WindowsProgramming::{
         DRIVE_FIXED, PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
+        PROCESS_CREATION_CHILD_PROCESS_RESTRICTED,
     };
 
     const PROFILE_NAME: &str = "mini-agent.worker-image-loading-gate.v1";
+    const PRODUCTION_PROFILE_NAME: &str = "mini-agent.worker.production.v1";
+    pub(super) const PROCESS_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+    pub(super) const PROCESS_CPU_LIMIT_100NS: i64 = 35 * 10_000_000;
+    pub(super) const MITIGATION_POLICY: u64 = (1u64 << 8) // force image relocation (mandatory ASLR)
+        | (1u64 << 12) // terminate on heap corruption
+        | (1u64 << 16) // bottom-up ASLR
+        | (1u64 << 20) // high-entropy ASLR
+        | (1u64 << 32) // disable legacy extension points
+        | (1u64 << 52) // deny remote image loads
+        | (1u64 << 56) // deny low-integrity image loads
+        | (1u64 << 60); // prefer System32 image resolution
     const CHILD_TEST_NAME: &str = "sandbox::worker::platform::tests::windows_lpac_gate_child";
     const INSTALLED_EXE_ENV: &str = "MINI_AGENT_LPAC_CARGO_INSTALL_EXE";
     const SENTINEL_ENV: &str = "MINI_AGENT_LPAC_SENTINEL";
@@ -162,7 +361,7 @@ mod feasibility {
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
     #[derive(Debug)]
-    pub(super) struct GateError(String);
+    pub(super) struct GateError(pub(super) String);
 
     impl fmt::Display for GateError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -171,6 +370,12 @@ mod feasibility {
     }
 
     impl std::error::Error for GateError {}
+
+    impl From<io::Error> for GateError {
+        fn from(error: io::Error) -> Self {
+            Self(error.to_string())
+        }
+    }
 
     fn last_error(context: &str) -> GateError {
         GateError(format!("{context}: {}", io::Error::last_os_error()))
@@ -209,54 +414,6 @@ mod feasibility {
     fn wide_string(value: &str) -> Vec<u16> {
         OsStr::new(value).encode_wide().chain(Some(0)).collect()
     }
-
-    #[derive(Debug)]
-    struct WinHandle(OwnedHandle);
-
-    impl WinHandle {
-        fn from_created(raw: HANDLE, context: &str) -> Result<Self, GateError> {
-            if raw.is_null() || raw == (-1isize as HANDLE) {
-                return Err(last_error(context));
-            }
-            // SAFETY: `raw` is a newly returned, non-null owned Win32 handle.
-            // This conversion transfers its single CloseHandle obligation to
-            // OwnedHandle; no other owner is retained.
-            Ok(Self(unsafe { OwnedHandle::from_raw_handle(raw) }))
-        }
-
-        fn raw(&self) -> HANDLE {
-            self.0.as_raw_handle()
-        }
-
-        fn clear_inherit(&self) -> Result<(), GateError> {
-            // SAFETY: the handle remains owned by `self` for the call, and
-            // SetHandleInformation neither stores nor closes it.
-            if unsafe { SetHandleInformation(self.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
-                return Err(last_error("clear pipe inheritance"));
-            }
-            Ok(())
-        }
-
-        fn into_file(self) -> File {
-            File::from(self.0)
-        }
-    }
-
-    fn close_unowned_handle(raw: HANDLE) {
-        if !raw.is_null() && raw != (-1isize as HANDLE) {
-            // SAFETY: this helper is called only for a raw handle returned by a
-            // failed/malformed FFI operation before ownership was transferred.
-            // It discharges that operation's sole CloseHandle obligation.
-            unsafe {
-                CloseHandle(raw);
-            }
-        }
-    }
-
-    // WinHandle normally delegates cleanup to OwnedHandle. Keep this direct
-    // CloseHandle assertion near the FFI definitions so source inspection also
-    // verifies which API owns all raw HANDLE values used by the gate.
-    const _: unsafe extern "system" fn(HANDLE) -> i32 = CloseHandle;
 
     #[derive(Debug)]
     struct LocalMemory(*mut c_void);
@@ -411,13 +568,40 @@ mod feasibility {
         name: Vec<u16>,
         sid: PSID,
         created: bool,
+        cleanup_created: bool,
     }
 
     impl AppContainerProfile {
         fn stable_zero_capability() -> Result<Self, GateError> {
-            let name = wide_string(PROFILE_NAME);
-            let display = wide_string("mini-agent worker image-loading gate");
-            let description = wide_string("zero-capability LPAC feasibility profile");
+            Self::stable_zero_capability_named(
+                PROFILE_NAME,
+                "mini-agent worker image-loading gate",
+                "zero-capability LPAC feasibility profile",
+                true,
+            )
+        }
+
+        fn production_zero_capability() -> Result<Self, GateError> {
+            // Production keeps this stable zero-capability profile installed. Deleting and
+            // recreating a shared profile on every launch would race concurrent mini-agent
+            // parents. The name deterministically identifies the same package SID.
+            Self::stable_zero_capability_named(
+                PRODUCTION_PROFILE_NAME,
+                "mini-agent JavaScript worker",
+                "zero-capability LPAC production worker",
+                false,
+            )
+        }
+
+        fn stable_zero_capability_named(
+            profile_name: &str,
+            display_name: &str,
+            profile_description: &str,
+            cleanup_created: bool,
+        ) -> Result<Self, GateError> {
+            let name = wide_string(profile_name);
+            let display = wide_string(display_name);
+            let description = wide_string(profile_description);
             let mut sid = null_mut();
 
             // SAFETY: all three UTF-16 strings are NUL-terminated and live
@@ -454,6 +638,7 @@ mod feasibility {
                     name,
                     sid,
                     created: true,
+                    cleanup_created,
                 });
             }
 
@@ -494,11 +679,12 @@ mod feasibility {
                 name,
                 sid,
                 created: false,
+                cleanup_created,
             })
         }
 
         fn finish(mut self) -> Result<(), GateError> {
-            if self.created {
+            if self.created && self.cleanup_created {
                 // SAFETY: this exact stable profile was created by this gate,
                 // and its NUL-terminated name remains alive for the call.
                 let result = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
@@ -516,7 +702,7 @@ mod feasibility {
 
     impl Drop for AppContainerProfile {
         fn drop(&mut self) {
-            if self.created {
+            if self.created && self.cleanup_created {
                 // SAFETY: the stable NUL-terminated name is still alive. The
                 // test removes only the profile it created; pre-existing
                 // profiles are retained.
@@ -609,7 +795,7 @@ mod feasibility {
         if sid_bytes == 0 {
             return Err(last_error("size current token SID"));
         }
-        let mut copy = OwnedSid(vec![
+        let copy = OwnedSid(vec![
             0usize;
             (sid_bytes as usize).div_ceil(size_of::<usize>())
         ]);
@@ -1199,6 +1385,63 @@ mod feasibility {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ProductionFailurePoint {
+        CreateProfile,
+        PrepareExecutableAcl,
+        CreateStdinPipe,
+        CreateStdoutPipe,
+        CreateStderrPipe,
+        CreateJob,
+        SetJobLimits,
+        SetJobUiRestrictions,
+        AllocateAttributeList,
+        SecurityCapabilitiesAttribute,
+        LpacOptOutAttribute,
+        JobListAttribute,
+        ChildProcessPolicyAttribute,
+        MitigationPolicyAttribute,
+        HandleListAttribute,
+        CreateProcess,
+        OwnProcessHandle,
+        OwnThreadHandle,
+        ClearStdinInheritance,
+        ClearStdoutInheritance,
+        ClearStderrInheritance,
+        VerifyCreationTimeJob,
+    }
+
+    pub(super) struct ProductionLaunchHooks {
+        fail_at: Option<ProductionFailurePoint>,
+        test_child: bool,
+    }
+
+    impl ProductionLaunchHooks {
+        pub(super) const fn production() -> Self {
+            Self {
+                fail_at: None,
+                test_child: false,
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) const fn fail_at(point: ProductionFailurePoint) -> Self {
+            Self {
+                fail_at: Some(point),
+                test_child: true,
+            }
+        }
+
+        fn checkpoint(&self, point: ProductionFailurePoint) -> Result<(), GateError> {
+            if self.fail_at == Some(point) {
+                return Err(GateError(format!(
+                    "injected Windows launcher failure at {point:?}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
     struct ProtocolPipes {
         parent_input: WinHandle,
         parent_output: WinHandle,
@@ -1254,6 +1497,26 @@ mod feasibility {
                 self.child_error.raw(),
             ]
         }
+
+        fn production_set(hooks: &ProductionLaunchHooks) -> Result<Self, GateError> {
+            hooks.checkpoint(ProductionFailurePoint::CreateStdinPipe)?;
+            let (child_input, parent_input) = inheritable_pipe()?;
+            parent_input.clear_inherit()?;
+            hooks.checkpoint(ProductionFailurePoint::CreateStdoutPipe)?;
+            let (parent_output, child_output) = inheritable_pipe()?;
+            parent_output.clear_inherit()?;
+            hooks.checkpoint(ProductionFailurePoint::CreateStderrPipe)?;
+            let (parent_error, child_error) = inheritable_pipe()?;
+            parent_error.clear_inherit()?;
+            Ok(Self {
+                parent_input,
+                parent_output,
+                parent_error,
+                child_input,
+                child_output,
+                child_error,
+            })
+        }
     }
 
     fn temporary_job() -> Result<WinHandle, GateError> {
@@ -1280,6 +1543,59 @@ mod feasibility {
         } == 0
         {
             return Err(last_error("configure temporary LPAC Job"));
+        }
+        Ok(job)
+    }
+
+    fn production_job(hooks: &ProductionLaunchHooks) -> Result<WinHandle, GateError> {
+        hooks.checkpoint(ProductionFailurePoint::CreateJob)?;
+        // SAFETY: null attributes/name request one private unnamed Job. Ownership transfers
+        // immediately to WinHandle, whose OwnedHandle closes it on every return path.
+        let job = WinHandle::from_created(
+            unsafe { CreateJobObjectW(null(), null()) },
+            "create JavaScript worker Job",
+        )?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | JOB_OBJECT_LIMIT_PROCESS_TIME;
+        limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        limits.BasicLimitInformation.PerProcessUserTimeLimit = PROCESS_CPU_LIMIT_100NS;
+        limits.ProcessMemoryLimit = PROCESS_MEMORY_LIMIT_BYTES;
+        // SAFETY: `limits` is fully initialized and lives for this synchronous call. The Job
+        // copies the values and retains no pointer.
+        hooks.checkpoint(ProductionFailurePoint::SetJobLimits)?;
+        if unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(last_error("configure JavaScript worker Job limits"));
+        }
+
+        let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+            UIRestrictionsClass: JOB_OBJECT_UILIMIT_ALL,
+        };
+        // SAFETY: `ui` is initialized with the complete documented restriction mask and lives
+        // through this synchronous call. No pointer is retained by the Job.
+        hooks.checkpoint(ProductionFailurePoint::SetJobUiRestrictions)?;
+        if unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectBasicUIRestrictions,
+                (&ui as *const JOBOBJECT_BASIC_UI_RESTRICTIONS).cast(),
+                size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+            )
+        } == 0
+        {
+            return Err(last_error(
+                "configure JavaScript worker Job UI restrictions",
+            ));
         }
         Ok(job)
     }
@@ -1623,6 +1939,283 @@ mod feasibility {
             .map_err(|_| GateError(format!("{label} reader panicked")))?
     }
 
+    fn production_command_line(executable: &Path, test_child: bool) -> Result<Vec<u16>, GateError> {
+        let display = executable.as_os_str().to_string_lossy();
+        if display.contains('"') {
+            return Err(GateError(
+                "Windows worker executable path contains a quote".to_string(),
+            ));
+        }
+        let arguments = if test_child {
+            " --exact sandbox::worker::platform::tests::windows_production_failure_child --nocapture --test-threads=1"
+        } else {
+            ""
+        };
+        Ok(wide_string(&format!("\"{display}\"{arguments}")))
+    }
+
+    fn production_environment_block() -> Result<Vec<u16>, GateError> {
+        let mut entries = vec![format!(
+            "{INTERNAL_WORKER_MARKER}={INTERNAL_WORKER_MARKER_VALUE}"
+        )];
+        // SystemRoot is non-secret loader configuration required by Windows system DLL
+        // resolution. No PATH, profile, credential, workspace, or application variable crosses.
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            let system_root = system_root.to_string_lossy();
+            if system_root.contains('\0') || system_root.contains('=') {
+                return Err(GateError(
+                    "SystemRoot cannot enter the worker environment".to_string(),
+                ));
+            }
+            entries.push(format!("SystemRoot={system_root}"));
+        }
+        entries.sort_by_key(|entry| entry.to_ascii_lowercase());
+        let mut block = Vec::new();
+        for entry in entries {
+            block.extend(OsStr::new(&entry).encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        Ok(block)
+    }
+
+    pub(super) fn production_preflight() -> Result<(), GateError> {
+        let hooks = ProductionLaunchHooks::production();
+        hooks.checkpoint(ProductionFailurePoint::CreateProfile)?;
+        let profile = AppContainerProfile::production_zero_capability()?;
+        hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
+        let executable = std::env::current_exe()
+            .map_err(|error| GateError(format!("resolve current executable: {error}")))?;
+        let policy = SidPolicy::current()?;
+        let (_executable, _location, image_lock) =
+            prepare_executable_acl(&executable, profile.sid, &policy)?;
+        let pipes = ProtocolPipes::production_set(&hooks)?;
+        let job = production_job(&hooks)?;
+
+        let security_capabilities = SECURITY_CAPABILITIES {
+            AppContainerSid: profile.sid,
+            Capabilities: null_mut(),
+            CapabilityCount: 0,
+            Reserved: 0,
+        };
+        let inherited_handles = pipes.child_handles();
+        let job_handles = [job.raw()];
+        let all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+        let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+        let mitigation_policy = MITIGATION_POLICY;
+        hooks.checkpoint(ProductionFailurePoint::AllocateAttributeList)?;
+        let mut attributes = AttributeList::new(6)?;
+        hooks.checkpoint(ProductionFailurePoint::SecurityCapabilitiesAttribute)?;
+        attributes.update(
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            &security_capabilities,
+        )?;
+        hooks.checkpoint(ProductionFailurePoint::LpacOptOutAttribute)?;
+        attributes.update(
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+            &all_packages_policy,
+        )?;
+        hooks.checkpoint(ProductionFailurePoint::JobListAttribute)?;
+        attributes.update_slice(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handles)?;
+        hooks.checkpoint(ProductionFailurePoint::ChildProcessPolicyAttribute)?;
+        attributes.update(
+            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+            &child_process_policy,
+        )?;
+        hooks.checkpoint(ProductionFailurePoint::MitigationPolicyAttribute)?;
+        attributes.update(PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation_policy)?;
+        hooks.checkpoint(ProductionFailurePoint::HandleListAttribute)?;
+        attributes.update_slice(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited_handles)?;
+
+        let mut parent_is_in_job = 0;
+        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle, null Job asks whether it is
+        // in any Job, and the initialized BOOL remains writable for the call. A nested parent is
+        // not rejected categorically: CreateProcessW must prove JOB_LIST compatibility at launch.
+        if unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut parent_is_in_job) } == 0 {
+            return Err(last_error("query parent Job membership"));
+        }
+        let _ = parent_is_in_job;
+        drop(attributes);
+        drop(job);
+        drop(pipes);
+        drop(image_lock);
+        drop(profile);
+        Ok(())
+    }
+
+    pub(super) fn launch_production(
+        hooks: ProductionLaunchHooks,
+    ) -> Result<WorkerProcess, GateError> {
+        hooks.checkpoint(ProductionFailurePoint::CreateProfile)?;
+        let profile = AppContainerProfile::production_zero_capability()?;
+        hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
+        let executable = std::env::current_exe()
+            .map_err(|error| GateError(format!("resolve current executable: {error}")))?;
+        let policy = SidPolicy::current()?;
+        let (executable, _location, image_lock) =
+            prepare_executable_acl(&executable, profile.sid, &policy)?;
+        let pipes = ProtocolPipes::production_set(&hooks)?;
+        let job = production_job(&hooks)?;
+
+        let security_capabilities = SECURITY_CAPABILITIES {
+            AppContainerSid: profile.sid,
+            Capabilities: null_mut(),
+            CapabilityCount: 0,
+            Reserved: 0,
+        };
+        let inherited_handles = pipes.child_handles();
+        let job_handles = [job.raw()];
+        let all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+        let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+        let mitigation_policy = MITIGATION_POLICY;
+        hooks.checkpoint(ProductionFailurePoint::AllocateAttributeList)?;
+        let mut attributes = AttributeList::new(6)?;
+        hooks.checkpoint(ProductionFailurePoint::SecurityCapabilitiesAttribute)?;
+        attributes.update(
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            &security_capabilities,
+        )?;
+        hooks.checkpoint(ProductionFailurePoint::LpacOptOutAttribute)?;
+        attributes.update(
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+            &all_packages_policy,
+        )?;
+        hooks.checkpoint(ProductionFailurePoint::JobListAttribute)?;
+        attributes.update_slice(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handles)?;
+        hooks.checkpoint(ProductionFailurePoint::ChildProcessPolicyAttribute)?;
+        attributes.update(
+            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+            &child_process_policy,
+        )?;
+        hooks.checkpoint(ProductionFailurePoint::MitigationPolicyAttribute)?;
+        attributes.update(PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation_policy)?;
+        hooks.checkpoint(ProductionFailurePoint::HandleListAttribute)?;
+        attributes.update_slice(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited_handles)?;
+
+        let executable_wide = wide_null(executable.as_os_str())?;
+        let child_directory = executable
+            .parent()
+            .ok_or_else(|| GateError("worker executable has no parent directory".to_string()))?;
+        let child_directory_wide = wide_null(child_directory.as_os_str())?;
+        let mut command_line = production_command_line(&executable, hooks.test_child)?;
+        let environment = production_environment_block()?;
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = inherited_handles[0];
+        startup.StartupInfo.hStdOutput = inherited_handles[1];
+        startup.StartupInfo.hStdError = inherited_handles[2];
+        startup.lpAttributeList = attributes.pointer;
+        let mut process_information = PROCESS_INFORMATION::default();
+
+        hooks.checkpoint(ProductionFailurePoint::CreateProcess)?;
+        // SAFETY: all UTF-16 buffers are NUL-terminated and remain live; command_line is mutable
+        // as required. STARTUPINFOEX and all six attribute values remain initialized until after
+        // CreateProcessW. TRUE is required for HANDLE_LIST, whose exact three inheritable pipe
+        // handles are the only handles admitted. JOB_LIST assigns the configured Job before the
+        // first instruction. Returned process/thread handles transfer immediately to RAII owners.
+        if unsafe {
+            CreateProcessW(
+                executable_wide.as_ptr(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                TRUE,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS,
+                environment.as_ptr().cast(),
+                child_directory_wide.as_ptr(),
+                &startup.StartupInfo,
+                &mut process_information,
+            )
+        } == 0
+        {
+            return Err(last_error("create zero-capability LPAC JavaScript worker"));
+        }
+        #[cfg(test)]
+        LAST_PRODUCTION_TEST_PID.store(
+            process_information.dwProcessId,
+            std::sync::atomic::Ordering::Release,
+        );
+
+        if let Err(error) = hooks.checkpoint(ProductionFailurePoint::OwnProcessHandle) {
+            close_unowned_handle(process_information.hProcess);
+            close_unowned_handle(process_information.hThread);
+            return Err(error);
+        }
+        let process = match WinHandle::from_created(
+            process_information.hProcess,
+            "own LPAC worker process handle",
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                close_unowned_handle(process_information.hThread);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = hooks.checkpoint(ProductionFailurePoint::OwnThreadHandle) {
+            close_unowned_handle(process_information.hThread);
+            return Err(error);
+        }
+        let thread = WinHandle::from_created(
+            process_information.hThread,
+            "own LPAC worker initial-thread handle",
+        )?;
+
+        // Only the three child endpoints were inheritable during CreateProcessW. Clear each bit
+        // immediately after creation, before any fallible membership verification or handoff.
+        hooks.checkpoint(ProductionFailurePoint::ClearStdinInheritance)?;
+        pipes.child_input.clear_inherit()?;
+        hooks.checkpoint(ProductionFailurePoint::ClearStdoutInheritance)?;
+        pipes.child_output.clear_inherit()?;
+        hooks.checkpoint(ProductionFailurePoint::ClearStderrInheritance)?;
+        pipes.child_error.clear_inherit()?;
+        drop(thread);
+
+        hooks.checkpoint(ProductionFailurePoint::VerifyCreationTimeJob)?;
+        let mut in_creation_job = 0;
+        // SAFETY: both directly owned handles are live. This verifies the exact Job supplied in
+        // JOB_LIST; a nested-Job or attribute incompatibility must already have failed creation.
+        if unsafe { IsProcessInJob(process.raw(), job.raw(), &mut in_creation_job) } == 0 {
+            return Err(last_error("verify LPAC worker creation-time Job"));
+        }
+        if in_creation_job == 0 {
+            return Err(GateError(
+                "LPAC worker escaped its requested creation-time Job".to_string(),
+            ));
+        }
+
+        let ProtocolPipes {
+            parent_input,
+            parent_output,
+            parent_error,
+            child_input,
+            child_output,
+            child_error,
+        } = pipes;
+        drop(child_input);
+        drop(child_output);
+        drop(child_error);
+        drop(attributes);
+        drop(image_lock);
+        drop(profile);
+
+        Ok(WorkerProcess {
+            process: WorkerChild::contained(process, job, process_information.dwProcessId),
+            input: parent_input.into_file(),
+            output: parent_output.into_file(),
+            stderr: parent_error.into_file(),
+            backend: WorkerBackend::WindowsLpac,
+            #[cfg(test)]
+            reap_observer: None,
+            #[cfg(test)]
+            force_tree_termination_error: false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) static LAST_PRODUCTION_TEST_PID: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+
     pub(super) fn run_artifact_matrix() -> Result<(), GateError> {
         let profile = AppContainerProfile::stable_zero_capability()?;
         let result = (|| {
@@ -1759,7 +2352,7 @@ mod feasibility {
             Ok(process) => process,
             Err(error) => {
                 close_unowned_handle(process_information.hThread);
-                return Err(error);
+                return Err(error.into());
             }
         };
         let thread =
@@ -2032,6 +2625,17 @@ fn run_lpac_image_loading_gate() -> Result<(), feasibility::GateError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_PARAMETER, FALSE, GetLastError, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessHandleCount, OpenProcess, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
+    };
+
     #[test]
     #[ignore = "requires a real Windows AppContainer backend"]
     fn windows_lpac_can_load_current_exe_with_only_protocol_handles() {
@@ -2137,6 +2741,134 @@ mod tests {
                 && contract.source_location == InstallLocation::CargoInstall
                 && contract.probe == ProbeKind::ImageLoadingOnly
         }));
+    }
+
+    #[test]
+    fn windows_production_policy_has_required_limits_and_compatible_mitigations() {
+        use super::feasibility::{
+            MITIGATION_POLICY, PROCESS_CPU_LIMIT_100NS, PROCESS_MEMORY_LIMIT_BYTES,
+        };
+
+        assert_eq!(PROCESS_MEMORY_LIMIT_BYTES, 256 * 1024 * 1024);
+        assert_eq!(PROCESS_CPU_LIMIT_100NS, 35 * 10_000_000);
+        for required in [8, 12, 16, 20, 32, 52, 56, 60] {
+            assert_ne!(MITIGATION_POLICY & (1u64 << required), 0);
+        }
+        assert_eq!(
+            MITIGATION_POLICY & (1u64 << 28),
+            0,
+            "Win32k denial requires an A27 compatibility proof"
+        );
+        assert_eq!(
+            MITIGATION_POLICY & (1u64 << 36),
+            0,
+            "dynamic-code denial requires an exact release-binary compatibility proof"
+        );
+    }
+
+    #[test]
+    fn windows_production_failure_injection_closes_raii_handles_and_reaps_children() {
+        use super::feasibility::{
+            LAST_PRODUCTION_TEST_PID, ProductionFailurePoint, ProductionLaunchHooks,
+            launch_production,
+        };
+
+        let points = [
+            ProductionFailurePoint::CreateProfile,
+            ProductionFailurePoint::PrepareExecutableAcl,
+            ProductionFailurePoint::CreateStdinPipe,
+            ProductionFailurePoint::CreateStdoutPipe,
+            ProductionFailurePoint::CreateStderrPipe,
+            ProductionFailurePoint::CreateJob,
+            ProductionFailurePoint::SetJobLimits,
+            ProductionFailurePoint::SetJobUiRestrictions,
+            ProductionFailurePoint::AllocateAttributeList,
+            ProductionFailurePoint::SecurityCapabilitiesAttribute,
+            ProductionFailurePoint::LpacOptOutAttribute,
+            ProductionFailurePoint::JobListAttribute,
+            ProductionFailurePoint::ChildProcessPolicyAttribute,
+            ProductionFailurePoint::MitigationPolicyAttribute,
+            ProductionFailurePoint::HandleListAttribute,
+            ProductionFailurePoint::CreateProcess,
+            ProductionFailurePoint::OwnProcessHandle,
+            ProductionFailurePoint::OwnThreadHandle,
+            ProductionFailurePoint::ClearStdinInheritance,
+            ProductionFailurePoint::ClearStdoutInheritance,
+            ProductionFailurePoint::ClearStderrInheritance,
+            ProductionFailurePoint::VerifyCreationTimeJob,
+        ];
+
+        for point in points {
+            let baseline = super::LIVE_WIN_HANDLES.load(Ordering::Acquire);
+            let os_handle_baseline = current_process_handle_count();
+            LAST_PRODUCTION_TEST_PID.store(0, Ordering::Release);
+            let error = launch_production(ProductionLaunchHooks::fail_at(point))
+                .expect_err("each injected launcher failure must fail closed");
+            assert!(
+                error.to_string().contains(&format!("{point:?}")),
+                "launcher failed before injected point {point:?}: {error}"
+            );
+            let pid = LAST_PRODUCTION_TEST_PID.load(Ordering::Acquire);
+            if pid != 0 {
+                assert_process_exits_after_job_cleanup(pid);
+            }
+            assert_eq!(
+                super::LIVE_WIN_HANDLES.load(Ordering::Acquire),
+                baseline,
+                "owned Win32 handle leaked at {point:?}"
+            );
+            assert_eq!(
+                current_process_handle_count(),
+                os_handle_baseline,
+                "kernel HANDLE leaked at {point:?}"
+            );
+        }
+    }
+
+    fn current_process_handle_count() -> u32 {
+        let mut count = 0;
+        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle, and `count` is an
+        // initialized writable DWORD retained only for this synchronous diagnostic call.
+        assert_ne!(
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
+            0,
+            "query current process HANDLE count"
+        );
+        count
+    }
+
+    fn assert_process_exits_after_job_cleanup(pid: u32) {
+        // SAFETY: OpenProcess receives a numeric PID reported by CreateProcessW. On success the
+        // returned SYNCHRONIZE-only handle transfers immediately into the module's RAII owner.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, FALSE, pid) };
+        if raw.is_null() {
+            // SAFETY: OpenProcess failed immediately above; GetLastError reads that thread-local
+            // failure code and has no pointer or ownership effects. Only a vanished PID proves
+            // cleanup; access denial would make the reap assertion inconclusive.
+            assert_eq!(
+                unsafe { GetLastError() },
+                ERROR_INVALID_PARAMETER,
+                "injected worker {pid} still exists but cannot be opened for synchronization"
+            );
+            return;
+        }
+        let process = super::WinHandle::from_created(raw, "open injected worker for reap check")
+            .expect("OpenProcess returned a valid owned handle");
+        // SAFETY: the SYNCHRONIZE handle is live for the bounded wait and no pointer is retained.
+        assert_eq!(
+            unsafe {
+                WaitForSingleObject(process.raw(), Duration::from_secs(5).as_millis() as u32)
+            },
+            WAIT_OBJECT_0,
+            "kill-on-close Job did not reap injected child {pid}"
+        );
+    }
+
+    #[test]
+    fn windows_production_failure_child() {
+        if std::env::var_os(super::super::INTERNAL_WORKER_MARKER).is_some() {
+            std::thread::park_timeout(Duration::from_secs(30));
+        }
     }
 
     #[test]
