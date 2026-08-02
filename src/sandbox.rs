@@ -9,6 +9,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
+#[cfg(feature = "js")]
+pub(crate) mod worker;
+
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     enabled: bool,

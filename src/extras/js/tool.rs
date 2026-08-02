@@ -69,6 +69,7 @@ pub(crate) struct PermissionBridge {
     tx: tokio_mpsc::UnboundedSender<PermissionEnvelope>,
     shutdown: PermCancellation,
     invocation_cancellation: Option<PermCancellation>,
+    host_call_cancellation: Option<PermCancellation>,
     timeout: Duration,
 }
 
@@ -82,6 +83,7 @@ impl PermissionBridge {
             tx,
             shutdown,
             invocation_cancellation: None,
+            host_call_cancellation: None,
             timeout,
         }
     }
@@ -89,6 +91,13 @@ impl PermissionBridge {
     pub(crate) fn for_invocation(&self, cancellation: PermCancellation) -> Self {
         let mut bridge = self.clone();
         bridge.invocation_cancellation = Some(cancellation);
+        bridge
+    }
+
+    #[cfg(feature = "sandbox")]
+    pub(crate) fn for_host_call(&self, cancellation: PermCancellation) -> Self {
+        let mut bridge = self.clone();
+        bridge.host_call_cancellation = Some(cancellation);
         bridge
     }
 
@@ -100,6 +109,7 @@ impl PermissionBridge {
         tokio::select! {
             _ = self.shutdown.cancelled() => {}
             _ = wait_for_cancellation(self.invocation_cancellation.clone()) => {}
+            _ = wait_for_cancellation(self.host_call_cancellation.clone()) => {}
         }
     }
 
@@ -189,6 +199,9 @@ impl PermissionBridge {
             _ = wait_for_cancellation(self.invocation_cancellation.clone()) => {
                 return Err(PermissionBridgeError::Cancelled);
             }
+            _ = wait_for_cancellation(self.host_call_cancellation.clone()) => {
+                return Err(PermissionBridgeError::Cancelled);
+            }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 return Err(PermissionBridgeError::TimedOut);
             }
@@ -229,6 +242,10 @@ impl PermissionBridge {
         self.shutdown.is_cancelled()
             || self
                 .invocation_cancellation
+                .as_ref()
+                .is_some_and(PermCancellation::is_cancelled)
+            || self
+                .host_call_cancellation
                 .as_ref()
                 .is_some_and(PermCancellation::is_cancelled)
     }

@@ -30,16 +30,32 @@ mod tests;
 use anyhow::Context;
 use clap::Parser;
 use std::io::IsTerminal;
+use std::process::ExitCode;
 
-#[cfg_attr(
-    feature = "multithread",
-    tokio::main(flavor = "multi_thread", worker_threads = 4)
-)]
-#[cfg_attr(not(feature = "multithread"), tokio::main(flavor = "current_thread"))]
-async fn main() -> anyhow::Result<()> {
-    run().await.context(
+fn main() -> anyhow::Result<ExitCode> {
+    #[cfg(feature = "js")]
+    if let Some(exit_code) = extras::js::worker::maybe_run_internal_worker() {
+        return Ok(exit_code);
+    }
+
+    let runtime = normal_runtime().context("failed to initialize the async runtime")?;
+    runtime.block_on(run()).context(
         "This error might derive from an incomplete configuration: run `mini-agent --setup` to configure your providers and models interactively, or `mini-agent --tutor` to see the getting started guide",
-    )
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    #[cfg(feature = "multithread")]
+    let mut builder = {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(4);
+        builder
+    };
+    #[cfg(not(feature = "multithread"))]
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+
+    builder.enable_all().build().map_err(Into::into)
 }
 
 async fn run() -> anyhow::Result<()> {

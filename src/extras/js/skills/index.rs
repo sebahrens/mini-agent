@@ -724,9 +724,9 @@ fn manifest_size(artifact: &SkillArtifact) -> usize {
             .sum::<usize>()
         + artifact
             .capability
-            .allowed_hosts
+            .grants
             .iter()
-            .map(|host| host.as_token().len())
+            .map(|grant| serde_json::to_vec(grant).map_or(0, |bytes| bytes.len()))
             .sum::<usize>()
         + 128
 }

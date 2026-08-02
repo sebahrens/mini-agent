@@ -1,6 +1,7 @@
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::skills::proposal::{
-    AttemptBudget, JsCapability, JsExport, JsProposal, ProposalError, ProposalQueue,
+    AttemptBudget, JsCapability, JsCapabilityScope, JsExport, JsProposal, ProposalError,
+    ProposalQueue,
 };
 use crate::extras::js::skills::store::SkillStore;
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
@@ -23,7 +24,7 @@ fn proposal(source_suffix: &str) -> JsProposal {
         tests: vec!["trim(' x ') === 'x'".to_string()],
         capability: JsCapability {
             tier: "pure".to_string(),
-            allowed_hosts: vec![],
+            grants: vec![],
         },
         tags: vec![" Text ".to_string()],
         predecessor_id: None,
@@ -87,7 +88,9 @@ fn propose_skill_validation_rejects_bounds_and_capability_escalation() {
     ));
 
     let mut undeclared_tier = proposal("");
-    undeclared_tier.capability.allowed_hosts = vec!["read_file".to_string()];
+    undeclared_tier.capability.grants = vec![JsCapabilityScope::ReadFile {
+        workspace_prefixes: vec!["src".to_string()],
+    }];
     assert!(matches!(
         undeclared_tier.validate_and_canonicalize(),
         Err(ProposalError::InvalidCapability(_))
@@ -180,7 +183,7 @@ fn js_payload() -> String {
         "description": "Trim a value.",
         "exports": [{"name": "trim", "signature": "trim(value: unknown): string"}],
         "tests": ["trim(' x ') === 'x'"],
-        "capability": {"tier": "pure", "allowed_hosts": []},
+        "capability": {"tier": "pure", "grants": []},
         "tags": ["text"]
     })
     .to_string()

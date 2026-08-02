@@ -92,6 +92,13 @@ automatically. Worker stdout is protocol-only. Console output is returned as bou
 data, while a bounded stderr pipe carries only sanitized diagnostics and never source, prompts,
 arguments, file or response contents, environment values, or secrets.
 
+`src/extras/js/supervisor.rs` owns the parent-side serialized transport lease shared by run and
+verification requests. The shared state retains only process, protocol, generation, and bounded
+stderr-drain data; per-invocation effect authority remains method-local. Dropping or cancelling an
+in-flight lease invalidates that worker connection, so the next independent request launches a
+new generation. Watchdog, exhaustive fault recovery, and bounded group reaping remain separate
+Phase 6 delivery units; this module boundary does not mark Phase 6 as delivered.
+
 ## Wire protocol
 
 IPC uses inherited anonymous pipes and a strictly alternating, half-duplex protocol. Each frame is
@@ -99,6 +106,12 @@ an 8 MiB-or-smaller JSON payload preceded by a big-endian `u32` byte length. A r
 over-limit prefix before allocating its payload buffer. Message enums are closed. Every frame
 carries the protocol version, build identity, and monotonic sequence; every invocation frame also
 carries a parent-created invocation ID.
+
+The build identity combines the package version with a deterministic SHA-256 fingerprint of the
+production compile inputs, dependency lockfile, enabled features, target/profile settings, and
+Rust compiler version. Ordinary local and packaged builds therefore reject a same-version peer
+built from different inputs without relying on Git metadata, network access, timestamps, or random
+values.
 
 After a versioned hello/ready exchange, the only invocation flow is:
 
@@ -191,6 +204,26 @@ production wire/result/log surface may preserve that arbitrary text. Failure sto
 shared-global wrapper is not an accepted fallback. Passing proves a source-level realm contract,
 not native containment.
 
+### Realm isolation
+
+The locked realm gate passes with `rquickjs`, `rquickjs-core`, and `rquickjs-sys` 0.12.1, whose
+vendored QuickJS reports version 0.15.1. Within one `Runtime`, a `Persistent<Function>` created in
+one full `Context` restores and can be invoked while an agent `Context` is active, but resolves
+`globalThis` from its defining skill context. A promise returned by that function remains pending
+until the runtime executes its queued continuation, then settles with the defining context's
+global. An exception thrown by the restored function remains available through the function's
+context with its message, function name, and source filename intact so the test can apply bounded,
+UTF-8-safe message and stack extraction.
+
+The same gate installs mock `read_file`, `write_file`, `fetch`, `spawn`, and `propose_skill`
+globals in the agent context and observes each as exactly `undefined` in the skill context. Plain
+JSON-compatible objects and arrays cross only after strict validation, bounded JSON serialization,
+and parsing in the receiving context; functions, symbols, BigInts, accessors, host objects, cycles,
+sparse arrays, unsupported nested values, and oversized encodings are rejected. These results
+establish the source-level operations required by the future loader. They do not make QuickJS
+contexts a native security boundary, and they do not authorize arbitrary exception text on any
+production result, wire, diagnostic, or log surface.
+
 ## Effect audit
 
 Before every real brokered call—including `read_file`—the parent appends and durably syncs an
@@ -244,6 +277,13 @@ anonymous protocol and bounded-diagnostic handles, and narrowly required system 
 visible. Inherited descriptors/handles are closed except for an exact allow-list. Parent teardown
 kills the entire containment/process group.
 
+The platform-neutral launcher owns its target-selected child control object and three anonymous
+protocol/diagnostic pipes as ordinary files. Its common control surface is limited to process ID,
+tree termination, nonblocking status, and reaping; it does not require a Windows process created
+through Win32 APIs to masquerade as `std::process::Child`. The unconfined launcher is compiled only
+for tests. Until a target's real containment launcher is delivered and probed, its production
+status and every production launch attempt remain unavailable.
+
 | Platform | Required worker containment |
 |----------|-----------------------------|
 | Linux | A broker-only bubblewrap profile with no workspace/cache bind; isolated namespaces and environment; validated OS resource limits; and an in-worker seccomp deny policy for process creation and execution. |
@@ -255,10 +295,99 @@ Windows separately deny process creation/exec. macOS must probe the weaker backe
 behavior and report it without upgrading the claim. A backend that is absent, untrusted,
 misconfigured, unverifiable, or unable to apply every required restriction makes JS unavailable.
 
+### macOS standalone-CLI containment gate
+
+The standalone macOS CLI currently reports `Seatbelt` with typed
+`DeprecatedBestEffort` assurance and keeps production JavaScript unavailable. This is a deliberate
+fail-closed result, not a delivered macOS containment backend. A real local probe on macOS 26
+preserves the following platform evidence:
+
+- a deny-default profile without `process-exec` prevents `/usr/bin/sandbox-exec` from executing
+  the initial worker image;
+- allowing the exact initial image is not a one-time grant and remains usable for later exec; and
+- macOS rejects applying a second, tighter Seatbelt profile after the first profile is active.
+
+macOS 15 remains an explicit CI probe target rather than a validated runtime major. The production
+allowlist must not classify it as validated until that runner has produced the same real-backend
+evidence. Both CI rows first prove that the target-gated test exists, so an unsupported target or
+an accidentally compiled-out test cannot pass as a zero-test success.
+
+Consequently the current stable-image design cannot both enter the worker through `sandbox-exec`
+and deny a native-compromised worker from executing the allowed image again. The public
+`sandbox_init` API is deprecated, accepts only named profiles, and documents re-sandboxing as an
+error; the raw profile compile/apply functions used by `sandbox-exec` are private. A one-time
+securely published image whose only pathname is removed before untrusted work is a possible future
+design, not a delivered bypass: its code-signing behavior, publication race, descriptor/path
+re-exec surface, crash cleanup, and full capability matrix remain unvalidated. Until a validated
+standalone mechanism closes this transition, the launcher has no profile, descriptor, rlimit, or
+process-group fallback: every production launch returns unavailable. The ignored real-backend test
+`macos_js_worker_containment` is a blocker regression gate; it must not be represented as proof of
+the complete workspace, skill-store, network, descriptor, resource, or descendant-denial matrix.
+
 The Windows delivery gate is mandatory: an LPAC worker must load from every supported install
 location and start with only the protocol handles. Failure for a location leaves Windows JS
 disabled there. A restricted-token worker, unsafe broad ACL change, or unconfined fallback is
 forbidden.
+
+### Windows image-loading feasibility gate
+
+The A03 research spike provides a Windows-only ignored real-backend test named
+`windows_lpac_can_load_current_exe_with_only_protocol_handles`. Its containment matrix copies the
+full-probe-capable Cargo-built libtest harness into each of the three supported destination
+classes: Cargo build, Cargo install, and a user archive under `%LOCALAPPDATA%`. Every one of those
+three rows runs the same token, capability, console, Job, handle, and workspace-denial readiness
+probe. The source location and destination location are validated independently, so the archive
+row correctly treats its harness source as Cargo build while requiring its copy to classify as a
+user archive.
+
+A real binary produced by `cargo install --locked --no-default-features --features js --path .
+--debug` supplies two additional, explicitly narrower image-loading rows: a disposable copy
+under the active Cargo home and another under the user-archive root. Those rows execute
+`--version` and prove only that `CreateProcessW` accepts the production image with the requested
+attribute list and that the image reaches its version path. They do not prove the resulting token,
+capability, console, handle, sentinel, or other child-side containment assertions and are never
+reported as doing so. `MINI_AGENT_LPAC_CARGO_INSTALL_EXE` must name that installed binary. A
+missing variable, a source outside the active Cargo home, or any omitted or failed row fails the
+whole gate.
+
+For every row the gate makes a private disposable copy within that row's real location class and
+changes only the copy. It rejects NULL DACLs; inherited-deny ambiguity; broad executable access
+for Everyone, Authenticated Users, Builtin Users, `ALL APPLICATION PACKAGES`, or `ALL RESTRICTED
+APPLICATION PACKAGES`; and write, modify, ACL, ownership, or delete authority held by any
+untrusted principal. It maps generic file rights before evaluation, rejects generic or specific
+read/execute grants to every unexpected principal, counts every package-SID allow ACE, and
+requires exactly one package allow ACE whose mapped mask is exactly non-inheriting read/execute.
+It then checks effective access and holds the executable open without share-write or share-delete
+until `CreateProcessW` returns. It never restores a stale whole DACL. Every ancestor through the
+classified trust root must be local, fixed-drive,
+non-reparse, non-NULL-DACL, and protected from other-principal mutation or deletion. UNC, remote,
+protected machine-wide, and unknown roots fail closed.
+
+The launch creates or derives one stable zero-capability AppContainer profile, opts out of `ALL
+APPLICATION PACKAGES` for LPAC, uses `DETACHED_PROCESS`, supplies an exact three-handle anonymous
+protocol/diagnostic list, and assigns an unnamed kill-on-close, single-process Job through the
+creation-time attribute list. The parent verifies membership in that exact Job. The harness child
+must verify `TokenIsAppContainer`, `TokenIsLessPrivilegedAppContainer`, zero token capabilities,
+no console window or `CONIN$`/`CONOUT$`, the three distinct standard protocol handles, rejection of
+an inheritable canary omitted from `HANDLE_LIST`, and access denial for a parent-created workspace
+sentinel before emitting its fixed readiness frame. Profile and disposable-artifact cleanup errors
+are part of the gate result rather than silently treated as success.
+
+On a standard-user Windows checkout, prepare and run the complete gate with:
+
+```powershell
+cargo install --locked --no-default-features --features js --path . --debug
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $cargoHome 'bin\mini-agent.exe'
+cargo test --locked --no-default-features --features js windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --nocapture --exact
+```
+
+This source-level gate has not been executed on Windows as part of the macOS-authored change. Its
+result remains unverified until the ignored test passes on `windows-latest` and a standard-user
+Windows installation for every location that will be advertised. Production Windows worker status
+therefore remains unavailable: this spike does not deliver the A26 launcher, does not permit a
+restricted-token or unconfined fallback, and does not satisfy the separate `mini-agent-uq5c`
+general-command sandbox.
 
 ## Failure semantics
 
