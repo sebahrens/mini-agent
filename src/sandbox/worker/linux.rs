@@ -15,7 +15,12 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+use rustix::process::{
+    DumpableBehavior, Resource, Rlimit, dumpable_behavior, getrlimit, set_dumpable_behavior,
+    setrlimit,
+};
+#[cfg(target_arch = "x86_64")]
+use seccompiler::sock_filter;
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
 
 use super::{
@@ -30,6 +35,8 @@ const CPU_LIMIT_SECONDS: u64 = 35;
 const FILE_DESCRIPTOR_LIMIT: u64 = 64;
 const FILE_SIZE_LIMIT: u64 = 1024 * 1024;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 static STATUS: OnceLock<WorkerContainmentStatus> = OnceLock::new();
 
@@ -125,11 +132,22 @@ pub(super) fn finalize_worker() -> io::Result<()> {
     set_limit(Resource::Nofile, FILE_DESCRIPTOR_LIMIT)?;
     set_limit(Resource::Core, 0)?;
     set_limit(Resource::Fsize, FILE_SIZE_LIMIT)?;
+    set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(io::Error::from)?;
+    if dumpable_behavior().map_err(io::Error::from)? != DumpableBehavior::NotDumpable {
+        return Err(io::Error::other(
+            "worker process remained dumpable after finalization",
+        ));
+    }
 
     rustix::thread::set_no_new_privs(true).map_err(io::Error::from)?;
     if !rustix::thread::no_new_privs().map_err(io::Error::from)? {
         return Err(io::Error::other("no_new_privs did not become irreversible"));
     }
+
+    #[cfg(target_arch = "x86_64")]
+    seccompiler::apply_filter_all_threads(&x32_syscall_deny_filter()).map_err(|error| {
+        io::Error::other(format!("failed to deny the x32 syscall range: {error}"))
+    })?;
 
     let arch = std::env::consts::ARCH
         .try_into()
@@ -149,6 +167,40 @@ pub(super) fn finalize_worker() -> io::Result<()> {
     .map_err(|error| io::Error::other(format!("failed to compile seccomp policy: {error}")))?;
     seccompiler::apply_filter_all_threads(&filter)
         .map_err(|error| io::Error::other(format!("failed to install seccomp policy: {error}")))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x32_syscall_deny_filter() -> BpfProgram {
+    const LOAD_SYSCALL_NUMBER: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+    const JUMP_IF_MASK_SET: u16 = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
+    const RETURN_CONSTANT: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+
+    vec![
+        sock_filter {
+            code: LOAD_SYSCALL_NUMBER,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        sock_filter {
+            code: JUMP_IF_MASK_SET,
+            jt: 0,
+            jf: 1,
+            k: X32_SYSCALL_BIT,
+        },
+        sock_filter {
+            code: RETURN_CONSTANT,
+            jt: 0,
+            jf: 0,
+            k: u32::from(SeccompAction::Errno(libc::EPERM as u32)),
+        },
+        sock_filter {
+            code: RETURN_CONSTANT,
+            jt: 0,
+            jf: 0,
+            k: u32::from(SeccompAction::Allow),
+        },
+    ]
 }
 
 fn set_limit(resource: Resource, ceiling: u64) -> io::Result<()> {
@@ -355,7 +407,7 @@ fn trusted_runtime_files() -> Result<Vec<PathBuf>, WorkerLaunchError> {
         if !is_system_runtime_path(&path) {
             continue;
         }
-        if !path.is_file() || !super::super::is_trusted_system_path(&path) {
+        if !is_trusted_runtime_file(&path) {
             return Err(WorkerLaunchError::Unavailable {
                 backend: BACKEND,
                 reason: "the loaded system runtime closure contains an untrusted path".into(),
@@ -366,7 +418,7 @@ fn trusted_runtime_files() -> Result<Vec<PathBuf>, WorkerLaunchError> {
     for interpreter in interpreter_aliases() {
         let path = PathBuf::from(interpreter);
         if path.exists() {
-            if !path.is_file() || !super::super::is_trusted_system_path(&path) {
+            if !is_trusted_runtime_file(&path) {
                 return Err(WorkerLaunchError::Unavailable {
                     backend: BACKEND,
                     reason: "the system runtime interpreter alias is untrusted".into(),
@@ -382,6 +434,23 @@ fn trusted_runtime_files() -> Result<Vec<PathBuf>, WorkerLaunchError> {
         });
     }
     Ok(files.into_iter().collect())
+}
+
+fn is_trusted_runtime_file(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for (index, ancestor) in path.ancestors().enumerate() {
+        let Ok(metadata) = ancestor.metadata() else {
+            return false;
+        };
+        if metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+            return false;
+        }
+        if index == 0 && !metadata.is_file() {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -568,12 +637,17 @@ pub(super) fn run_containment_probe() -> io::Result<()> {
         )));
     }
     run_cpu_limit_probe(&bwrap, &executable)?;
+    run_core_limit_probe(&bwrap, &executable)?;
     run_worker_lifecycle_probes(&bwrap, &executable)?;
     Ok(())
 }
 
 #[cfg(test)]
 fn run_cpu_limit_probe(bwrap: &Path, executable: &Path) -> io::Result<()> {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+
+    const CPU_LIMIT_ARMED: &str = "MINI_AGENT_LINUX_CPU_LIMIT_ARMED";
     let mut command = broker_only_command(
         bwrap,
         executable,
@@ -591,30 +665,177 @@ fn run_cpu_limit_probe(bwrap: &Path, executable: &Path) -> io::Result<()> {
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    let status = loop {
         match child.try_wait()? {
-            Some(status) if status.success() => {
-                return Err(io::Error::other(
-                    "CPU limit probe returned instead of being terminated",
-                ));
-            }
-            Some(_) => return Ok(()),
+            Some(status) => break status,
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             None => {
                 cleanup_child(&mut child);
                 return Err(io::Error::other("CPU limit probe timed out"));
             }
         }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("CPU probe stdout pipe missing"))?
+        .read_to_string(&mut stdout)?;
+    child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("CPU probe stderr pipe missing"))?
+        .read_to_string(&mut stderr)?;
+    if status.signal() != Some(libc::SIGXCPU)
+        || !stdout.contains(CPU_LIMIT_ARMED)
+        || !stderr.is_empty()
+    {
+        return Err(io::Error::other(format!(
+            "CPU limit probe had the wrong outcome: status={status}, signal={:?}, armed={}, stderr={stderr:?}",
+            status.signal(),
+            stdout.contains(CPU_LIMIT_ARMED)
+        )));
     }
+    Ok(())
 }
 
 #[cfg(test)]
 pub(super) fn run_cpu_limit_child_probe() -> io::Result<()> {
+    use std::io::Write;
+
     finalize_worker()?;
-    set_limit(Resource::Cpu, 1)?;
+    let expected = Rlimit {
+        current: Some(1),
+        maximum: Some(2),
+    };
+    setrlimit(Resource::Cpu, expected).map_err(io::Error::from)?;
+    if getrlimit(Resource::Cpu) != expected {
+        return Err(io::Error::other(
+            "CPU probe could not arm distinct soft and hard limits",
+        ));
+    }
+    raw_probe::reset_cpu_limit_signal();
+    println!("MINI_AGENT_LINUX_CPU_LIMIT_ARMED");
+    std::io::stdout().flush()?;
     let mut value = 0_u64;
     loop {
         value = std::hint::black_box(value.wrapping_add(1));
+    }
+}
+
+#[cfg(test)]
+fn run_core_limit_probe(bwrap: &Path, executable: &Path) -> io::Result<()> {
+    use std::io::Read;
+
+    let mut command = broker_only_command(
+        bwrap,
+        executable,
+        "linux-core-probe-v1",
+        &[
+            "--exact",
+            "extras::js::tests::worker_containment::linux_core_limit_probe_child",
+            "--nocapture",
+        ],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let status = wait_child_bounded(&mut child, Duration::from_secs(5), "core-limit probe")?;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("core probe stdout pipe missing"))?
+        .read_to_string(&mut stdout)?;
+    child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("core probe stderr pipe missing"))?
+        .read_to_string(&mut stderr)?;
+    if !status.success()
+        || !stdout.contains("MINI_AGENT_LINUX_CORE_LIMIT_PASS")
+        || !stderr.is_empty()
+    {
+        return Err(io::Error::other(format!(
+            "core-limit probe failed: status={status}, stdout={stdout:?}, stderr={stderr:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn run_core_limit_child_probe() -> io::Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let probe_directory = Path::new("/tmp/mini-agent-core-limit-probe");
+    std::fs::create_dir(probe_directory)?;
+    let mut child = Command::new(WORKER_PATH)
+        .env_clear()
+        .env(INTERNAL_WORKER_MARKER, "linux-core-crash-v1")
+        .args([
+            "--exact",
+            "extras::js::tests::worker_containment::linux_core_limit_probe_child",
+            "--nocapture",
+        ])
+        .current_dir(probe_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let status = wait_child_bounded(&mut child, Duration::from_secs(5), "core crash child")?;
+    if status.signal() != Some(libc::SIGABRT) || status.core_dumped() {
+        return Err(io::Error::other(format!(
+            "core crash child had the wrong outcome: status={status}, signal={:?}, core_dumped={}",
+            status.signal(),
+            status.core_dumped()
+        )));
+    }
+    let artifacts = std::fs::read_dir(probe_directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    if !artifacts.is_empty() {
+        return Err(io::Error::other(format!(
+            "RLIMIT_CORE=0 left a core artifact: {artifacts:?}"
+        )));
+    }
+    println!("MINI_AGENT_LINUX_CORE_LIMIT_PASS");
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn run_core_crash_child_probe() -> io::Result<()> {
+    finalize_worker()?;
+    assert_limit_at_most(Resource::Core, 0)?;
+    if dumpable_behavior().map_err(io::Error::from)? != DumpableBehavior::NotDumpable {
+        return Err(io::Error::other(
+            "core crash child remained dumpable after finalization",
+        ));
+    }
+    raw_probe::abort_for_core_probe()
+}
+
+#[cfg(test)]
+fn wait_child_bounded(
+    child: &mut Child,
+    timeout: Duration,
+    description: &str,
+) -> io::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            cleanup_child(child);
+            return Err(io::Error::other(format!("{description} timed out")));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -623,6 +844,7 @@ fn run_worker_lifecycle_probes(bwrap: &Path, executable: &Path) -> io::Result<()
     use std::io::Write;
 
     let mut protocol_fault = launch().map_err(|error| io::Error::other(error.to_string()))?;
+    complete_hello_ready_and_run_step(&mut protocol_fault)?;
     protocol_fault.input.write_all(&0_u32.to_be_bytes())?;
     protocol_fault.input.flush()?;
     let fault_status = wait_worker_bounded(&mut protocol_fault, Duration::from_secs(5))?;
@@ -633,8 +855,14 @@ fn run_worker_lifecycle_probes(bwrap: &Path, executable: &Path) -> io::Result<()
     }
 
     let mut terminated = launch().map_err(|error| io::Error::other(error.to_string()))?;
+    complete_hello_ready_and_run_step(&mut terminated)?;
     terminated.terminate_tree()?;
-    let _ = wait_worker_bounded(&mut terminated, Duration::from_secs(5))?;
+    let terminated_status = wait_worker_bounded(&mut terminated, Duration::from_secs(5))?;
+    if terminated_status.success() {
+        return Err(io::Error::other(
+            "explicit worker termination produced a successful exit",
+        ));
+    }
 
     let mut command = broker_only_command(
         bwrap,
@@ -653,15 +881,14 @@ fn run_worker_lifecycle_probes(bwrap: &Path, executable: &Path) -> io::Result<()
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let launch_deadline = Instant::now() + Duration::from_secs(5);
-    let descendants = loop {
+    let sleeper = loop {
         if child.try_wait()?.is_some() {
             return Err(io::Error::other(
                 "descendant cleanup probe exited before teardown",
             ));
         }
-        let descendants = process_descendants(child.id());
-        if descendants.len() >= 2 {
-            break descendants;
+        if let Some(identity) = controlled_sleeper_identity(child.id())? {
+            break identity;
         }
         if Instant::now() >= launch_deadline {
             cleanup_child(&mut child);
@@ -671,12 +898,15 @@ fn run_worker_lifecycle_probes(bwrap: &Path, executable: &Path) -> io::Result<()
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    if process_start_time(sleeper.0) != Some(sleeper.1) {
+        cleanup_child(&mut child);
+        return Err(io::Error::other(
+            "controlled sleeper identity disappeared before teardown",
+        ));
+    }
     cleanup_child(&mut child);
     let cleanup_deadline = Instant::now() + Duration::from_secs(5);
-    while descendants
-        .iter()
-        .any(|(pid, start_time)| process_start_time(*pid) == Some(*start_time))
-    {
+    while process_start_time(sleeper.0) == Some(sleeper.1) {
         if Instant::now() >= cleanup_deadline {
             return Err(io::Error::other(
                 "contained descendant survived parent teardown",
@@ -685,6 +915,102 @@ fn run_worker_lifecycle_probes(bwrap: &Path, executable: &Path) -> io::Result<()
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn complete_hello_ready_and_run_step(process: &mut WorkerProcess) -> io::Result<()> {
+    use crate::extras::js::protocol::{
+        BuildIdentity, InvocationId, ParentFrame, ParentHello, ParentProtocol, RunStep,
+        StepOutcome, WireFrame, WorkerFrame, WorkerWireFrame, write_frame,
+    };
+    use std::io::Write;
+
+    let build = BuildIdentity::current();
+    let mut protocol = ParentProtocol::new(build.clone());
+    let hello = WireFrame::connection(build, 0, ParentFrame::Hello(ParentHello {}));
+    protocol
+        .on_send(&hello)
+        .map_err(|_| io::Error::other("lifecycle probe could not send Hello"))?;
+    write_frame(&mut process.input, &hello)
+        .map_err(|_| io::Error::other("lifecycle probe could not encode Hello"))?;
+    process.input.flush()?;
+    let ready: WorkerWireFrame = read_test_worker_frame_after_preamble(&mut process.output)?;
+    protocol
+        .on_receive(&ready)
+        .map_err(|_| io::Error::other("lifecycle probe received unauthenticated Ready"))?;
+    if !matches!(ready.message, WorkerFrame::Ready(_)) {
+        return Err(io::Error::other(
+            "lifecycle probe received a non-Ready startup frame",
+        ));
+    }
+    let invocation = InvocationId::new("linux-lifecycle-ready-probe")
+        .map_err(|_| io::Error::other("lifecycle probe invocation identity was invalid"))?;
+    let run_step = WireFrame::invocation(
+        BuildIdentity::current(),
+        invocation,
+        2,
+        ParentFrame::RunStep(RunStep {
+            code: "21 * 2".into(),
+        }),
+    );
+    protocol
+        .on_send(&run_step)
+        .map_err(|_| io::Error::other("lifecycle probe could not send RunStep"))?;
+    write_frame(&mut process.input, &run_step)
+        .map_err(|_| io::Error::other("lifecycle probe could not encode RunStep"))?;
+    process.input.flush()?;
+    let result: WorkerWireFrame = read_test_worker_frame_after_preamble(&mut process.output)?;
+    protocol
+        .on_receive(&result)
+        .map_err(|_| io::Error::other("lifecycle probe received an invalid StepResult"))?;
+    match result.message {
+        WorkerFrame::StepResult(step) if step.outcome == StepOutcome::Value("42".into()) => {}
+        _ => {
+            return Err(io::Error::other(
+                "lifecycle probe did not complete its contained RunStep",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_test_worker_frame_after_preamble(
+    reader: &mut impl std::io::Read,
+) -> io::Result<crate::extras::js::protocol::WorkerWireFrame> {
+    use crate::extras::js::protocol::{MAX_FRAME_BYTES, read_frame};
+
+    let mut discarded = 0_usize;
+    let mut window = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        reader.read_exact(&mut byte)?;
+        window.push(byte[0]);
+        if window.len() < 5 {
+            continue;
+        }
+        let length = u32::from_be_bytes(
+            window[..4]
+                .try_into()
+                .map_err(|_| io::Error::other("invalid Ready prefix"))?,
+        ) as usize;
+        if length > 0 && length <= MAX_FRAME_BYTES && window[4] == b'{' {
+            let mut encoded = window[..5].to_vec();
+            let mut tail = vec![0_u8; length - 1];
+            reader.read_exact(&mut tail)?;
+            encoded.extend_from_slice(&tail);
+            if let Ok(frame) = read_frame(&mut encoded.as_slice()) {
+                return Ok(frame);
+            }
+        }
+        window.remove(0);
+        discarded += 1;
+        if discarded > 4096 {
+            return Err(io::Error::other(
+                "lifecycle probe Ready preamble exceeded its bound",
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -739,6 +1065,29 @@ fn process_descendants(root: u32) -> Vec<(u32, u64)> {
             (pid != root && owners.contains(&pid)).then_some((pid, start_time))
         })
         .collect()
+}
+
+#[cfg(test)]
+fn controlled_sleeper_identity(root: u32) -> io::Result<Option<(u32, u64)>> {
+    const SLEEPER_TEST: &str =
+        "extras::js::tests::worker_containment::linux_containment_sleeper_child";
+    let sleepers = process_descendants(root)
+        .into_iter()
+        .filter(|(pid, _)| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|command_line| {
+                command_line
+                    .split(|byte| *byte == 0)
+                    .any(|argument| argument == SLEEPER_TEST.as_bytes())
+            })
+        })
+        .collect::<Vec<_>>();
+    match sleepers.as_slice() {
+        [] => Ok(None),
+        [identity] => Ok(Some(*identity)),
+        _ => Err(io::Error::other(
+            "descendant cleanup probe created ambiguous controlled sleepers",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -870,6 +1219,9 @@ pub(super) fn run_containment_child_probe() -> io::Result<()> {
     if !rustix::thread::no_new_privs().map_err(io::Error::from)? {
         return Err(io::Error::other("worker no_new_privs probe failed"));
     }
+    if dumpable_behavior().map_err(io::Error::from)? != DumpableBehavior::NotDumpable {
+        return Err(io::Error::other("worker non-dumpability probe failed"));
+    }
     let process_status = std::fs::read_to_string("/proc/self/status")?;
     if !process_status.lines().any(|line| line == "NoNewPrivs:\t1")
         || !process_status.lines().any(|line| line == "Seccomp:\t2")
@@ -890,6 +1242,8 @@ pub(super) fn run_containment_child_probe() -> io::Result<()> {
     }
 
     raw_probe::assert_denied_syscalls()?;
+    #[cfg(target_arch = "x86_64")]
+    raw_probe::assert_x32_syscall_range_denied()?;
     for socket_result in [
         std::net::TcpListener::bind("127.0.0.1:0").map(|_| ()),
         UdpSocket::bind("127.0.0.1:0").map(|_| ()),
@@ -1014,6 +1368,37 @@ mod raw_probe {
         unsafe {
             libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
         }
+    }
+
+    pub(super) fn reset_cpu_limit_signal() {
+        // SAFETY: This sacrificial Linux test process has no application signal handlers. Restoring
+        // SIGXCPU's default action makes RLIMIT_CPU observable as one exact termination signal.
+        unsafe {
+            libc::signal(libc::SIGXCPU, libc::SIG_DFL);
+        }
+    }
+
+    pub(super) fn abort_for_core_probe() -> ! {
+        // SAFETY: This is a sacrificial Linux test process after RLIMIT_CORE=0 was read back. It
+        // deliberately terminates with SIGABRT so its contained parent can verify no core artifact.
+        unsafe { libc::abort() }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn assert_x32_syscall_range_denied() -> io::Result<()> {
+        // SAFETY: getpid takes no arguments and creates no resources. Adding the x32 ABI bit makes
+        // this a representative request from the entire range guarded by the preceding JSET rule.
+        let result =
+            unsafe { libc::syscall((libc::SYS_getpid as u32 | super::X32_SYSCALL_BIT) as i64) };
+        let errno = (result == -1)
+            .then(|| io::Error::last_os_error().raw_os_error())
+            .flatten();
+        if errno != Some(libc::EPERM) {
+            return Err(io::Error::other(format!(
+                "x32 syscall range was not denied with EPERM: {errno:?}"
+            )));
+        }
+        Ok(())
     }
 
     fn raw_denied_syscall(syscall: i64) -> Option<i32> {

@@ -31,7 +31,13 @@ fn linux_worker_launcher_source_is_broker_only_and_fail_closed() {
     assert!(!source.contains("cache_dir"));
     assert!(!source.contains("fn launch_unconfined"));
     assert!(source.contains("trusted_runtime_files"));
-    assert!(source.contains("is_trusted_system_path"));
+    assert!(source.contains("is_trusted_runtime_file"));
+    let runtime_validation = source
+        .split("fn trusted_runtime_files")
+        .nth(1)
+        .and_then(|tail| tail.split("fn interpreter_aliases").next())
+        .expect("runtime-file validation source must remain inspectable");
+    assert!(!runtime_validation.contains("is_trusted_system_path"));
     assert!(!source.contains("command.args([\"--ro-bind\", runtime, runtime])"));
 }
 
@@ -75,6 +81,9 @@ fn linux_worker_finalizer_is_before_ready_and_denies_process_creation() {
         "SYS_pivot_root",
         "SYS_chroot",
         "apply_filter_all_threads",
+        "X32_SYSCALL_BIT",
+        "BPF_JSET",
+        "assert_x32_syscall_range_denied",
         "CapEff:",
     ] {
         assert!(
@@ -92,8 +101,17 @@ fn linux_worker_launcher_owns_group_teardown_and_pipe_failures() {
     assert!(source.contains("cleanup_failed_launch"));
     assert!(source.contains("MissingPipe"));
     assert!(source.contains("run_worker_lifecycle_probes"));
+    assert!(source.contains("complete_hello_ready"));
+    assert!(source.contains("ParentFrame::RunStep"));
+    assert!(source.contains("controlled_sleeper_identity"));
     assert!(source.contains("process_descendants"));
     assert!(source.contains("contained descendant survived parent teardown"));
+    assert!(source.contains("CPU_LIMIT_ARMED"));
+    assert!(source.contains("SIGXCPU"));
+    assert!(source.contains("run_core_limit_probe"));
+    assert!(source.contains("DumpableBehavior::NotDumpable"));
+    assert!(source.contains("core_dumped()"));
+    assert!(source.contains("core artifact"));
 }
 
 #[cfg(target_os = "linux")]
@@ -146,6 +164,23 @@ fn linux_cpu_limit_probe_child() {
     }
     crate::sandbox::worker::run_linux_cpu_limit_child_probe()
         .expect("CPU limit probe must be terminated before returning");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_core_limit_probe_child() {
+    let Some(marker) = std::env::var_os(crate::sandbox::worker::INTERNAL_WORKER_MARKER) else {
+        return;
+    };
+    match marker.to_string_lossy().as_ref() {
+        "linux-core-probe-v1" => crate::sandbox::worker::run_linux_core_limit_child_probe()
+            .expect("core-limit parent probe must verify the sacrificial child"),
+        "linux-core-crash-v1" => {
+            crate::sandbox::worker::run_linux_core_crash_child_probe()
+                .expect("core-limit sacrificial child must be terminated before returning");
+        }
+        _ => {}
+    }
 }
 
 #[cfg(target_os = "linux")]

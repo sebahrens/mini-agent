@@ -290,6 +290,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TEST-ONLY",
     ),
     ("src/sandbox/worker/linux.rs", ".status()", 1, "TEST-ONLY"),
+    ("src/sandbox/worker/linux.rs", ".spawn()?;", 1, "TEST-ONLY"),
     (
         "src/sandbox/worker/linux.rs",
         "if std::process::Command::new(WORKER_PATH)",
@@ -316,8 +317,14 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/linux.rs",
+        "let mut child = Command::new(WORKER_PATH)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
         "let mut child = command.spawn()?;",
-        3,
+        4,
         "TEST-ONLY",
     ),
     (
@@ -593,6 +600,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "TEST-ONLY",
     ),
     ("src/sandbox/worker/linux.rs", ".status()", 1, "TEST-ONLY"),
+    ("src/sandbox/worker/linux.rs", ".spawn()?;", 1, "TEST-ONLY"),
     (
         "src/sandbox/worker/linux.rs",
         "if std::process::Command::new(WORKER_PATH)",
@@ -619,8 +627,14 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/linux.rs",
+        "let mut child = Command::new(WORKER_PATH)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
         "let mut child = command.spawn()?;",
-        3,
+        4,
         "TEST-ONLY",
     ),
     (

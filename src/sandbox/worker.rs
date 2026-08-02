@@ -52,6 +52,16 @@ pub(crate) fn run_linux_cpu_limit_child_probe() -> io::Result<()> {
     platform::run_cpu_limit_child_probe()
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_linux_core_limit_child_probe() -> io::Result<()> {
+    platform::run_core_limit_child_probe()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_linux_core_crash_child_probe() -> io::Result<()> {
+    platform::run_core_crash_child_probe()
+}
+
 #[cfg(target_os = "linux")]
 #[path = "worker/linux.rs"]
 mod platform;
