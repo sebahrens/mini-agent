@@ -237,6 +237,43 @@ pub(crate) async fn build_explore_agent(
     AnyAgent::without_skills(inner)
 }
 
+#[cfg(all(test, feature = "js"))]
+mod js_isolation_tests {
+    use super::{SubagentAuthorization, build_explore_agent_inner};
+
+    #[tokio::test]
+    async fn actual_explore_subagent_tool_set_omits_js() {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("subagent"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = build_explore_agent_inner(
+            model,
+            2,
+            1024 * 1024,
+            1_000,
+            1_000,
+            1_000,
+            Some(1_000),
+            &SubagentAuthorization::new(None, None),
+            None,
+            #[cfg(feature = "archmd")]
+            None,
+        );
+        let names = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("subagent tool definitions")
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "read"));
+        assert!(!names.iter().any(|name| name == "js"), "{names:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

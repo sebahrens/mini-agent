@@ -469,8 +469,37 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 
 #[cfg(all(test, feature = "js"))]
 mod js_tests {
-    use super::register_js_tool;
+    use std::collections::HashMap;
+
+    use super::{build_agent_inner, build_btw_agent_inner, register_js_tool};
+    use crate::context::ContextFiles;
     use crate::sandbox::Sandbox;
+
+    fn empty_context() -> ContextFiles {
+        ContextFiles {
+            agents: None,
+            prompts: HashMap::new(),
+            current_prompt: None,
+            current_prompt_name: None,
+            themes: HashMap::new(),
+            current_theme_name: None,
+            extra_files: Vec::new(),
+            one_shot_restore: None,
+            chain_declined: Vec::new(),
+            #[cfg(feature = "memory")]
+            memory: None,
+            #[cfg(feature = "archmd")]
+            architecture: None,
+        }
+    }
+
+    fn fake_model(label: &str) -> rig::test_utils::MockCompletionModel {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text(label.to_string()),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]])
+    }
 
     #[tokio::test]
     async fn registers_and_executes_js_tool() {
@@ -494,6 +523,148 @@ mod js_tests {
             .await
             .expect("registered JS tool call failed");
         assert_eq!(result, "2");
+    }
+
+    #[tokio::test]
+    async fn full_main_agent_rebuild_and_provider_retry_reuse_worker_without_policy_leakage() {
+        use crate::extras::js::supervisor::JsWorkerSupervisor;
+        let cli = crate::cli::Cli::default();
+        let context = empty_context();
+        let mut first_config = crate::config::Config {
+            js_read_unrestricted: Some(true),
+            js_write_unrestricted: Some(true),
+            ..crate::config::Config::default()
+        };
+        let first_agent = build_agent_inner(
+            fake_model("provider-a"),
+            &cli,
+            &first_config,
+            &context,
+            None,
+            None,
+            Sandbox::new(false, "bwrap"),
+            false,
+            None,
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+        )
+        .await;
+        let first_tools = first_agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("first provider tool definitions");
+        assert!(first_tools.iter().any(|tool| tool.name == "js"));
+
+        let supervisor = JsWorkerSupervisor::shared();
+        assert_eq!(
+            first_agent
+                .tool_server_handle
+                .call_tool("js", r#"{"code":"20 + 1"}"#)
+                .await
+                .expect("first provider JS call"),
+            "21"
+        );
+        let generation = supervisor.generation_for_test().await.unwrap();
+        let process_id = supervisor.process_id_for_test().await.unwrap();
+
+        // Provider retry reuses the same built Agent and therefore the same
+        // JsTool/supervisor lease rather than rebuilding authority.
+        assert_eq!(
+            first_agent
+                .tool_server_handle
+                .call_tool("js", r#"{"code":"20 + 2"}"#)
+                .await
+                .expect("provider retry JS call"),
+            "22"
+        );
+        assert_eq!(supervisor.generation_for_test().await, Some(generation));
+        assert_eq!(supervisor.process_id_for_test().await, Some(process_id));
+
+        let external_path = std::env::temp_dir().join(format!(
+            "mini-agent-builder-rebuild-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first_write = format!(
+            "write_file({:?}, 'first'); 'written'",
+            external_path.to_string_lossy()
+        );
+        assert_eq!(
+            first_agent
+                .tool_server_handle
+                .call_tool(
+                    "js",
+                    &serde_json::json!({ "code": first_write }).to_string()
+                )
+                .await
+                .expect("first provider unrestricted write"),
+            "written"
+        );
+        assert_eq!(std::fs::read_to_string(&external_path).unwrap(), "first");
+        std::fs::remove_file(&external_path).unwrap();
+
+        first_config.js_read_unrestricted = Some(false);
+        first_config.js_write_unrestricted = Some(false);
+        let rebuilt_agent = build_agent_inner(
+            fake_model("provider-b"),
+            &cli,
+            &first_config,
+            &context,
+            None,
+            None,
+            Sandbox::new(false, "bwrap"),
+            false,
+            None,
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+        )
+        .await;
+        let denied = format!(
+            "try {{ write_file({:?}, 'leaked'); 'allowed' }} catch (_) {{ 'denied' }}",
+            external_path.to_string_lossy()
+        );
+        assert_eq!(
+            rebuilt_agent
+                .tool_server_handle
+                .call_tool("js", &serde_json::json!({ "code": denied }).to_string())
+                .await
+                .expect("rebuilt provider policy call"),
+            "denied"
+        );
+        assert!(!external_path.exists());
+        assert_eq!(supervisor.generation_for_test().await, Some(generation));
+        assert_eq!(supervisor.process_id_for_test().await, Some(process_id));
+    }
+
+    #[tokio::test]
+    async fn btw_agent_actual_tool_set_omits_js() {
+        let agent = build_btw_agent_inner(
+            fake_model("btw"),
+            &crate::cli::Cli::default(),
+            &crate::config::Config::default(),
+            &empty_context(),
+            &None,
+            &None,
+            false,
+            None,
+            None,
+        );
+        let names = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("btw tool definitions")
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "read"));
+        assert!(!names.iter().any(|name| name == "js"), "{names:?}");
     }
 }
 

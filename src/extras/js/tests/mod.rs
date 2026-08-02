@@ -64,7 +64,9 @@ mod worker_effect_services;
 mod worker_protocol;
 mod worker_runtime;
 
+use crate::extras::js::audit::EffectAudit;
 use crate::extras::js::host::AllowConfig;
+use crate::extras::js::supervisor::JsWorkerSupervisor;
 use crate::extras::js::tool::JsTool;
 use crate::extras::js::types::{
     JsOutcome, JsRequest, JsResponse, PermCancellation, STEP_TIMEOUT, THREAD_STACK,
@@ -73,6 +75,7 @@ use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
 use crate::sandbox::Sandbox;
+use crate::sandbox::worker::TestWorkerLauncher;
 
 fn make_test_tool() -> JsTool {
     make_test_tool_with_sandbox(Sandbox::new(false, "bwrap"))
@@ -87,11 +90,27 @@ fn make_test_tool_with_permissions(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) -> JsTool {
-    JsTool::new(
+    let root =
+        std::env::temp_dir().join(format!("mini-agent-js-test-audit-{}", uuid::Uuid::new_v4()));
+    let paths = crate::paths::AppPaths {
+        config_dir: root.join("config"),
+        data_dir: root.join("data"),
+        local_data_dir: root.join("local"),
+        state_dir: root.join("state"),
+        cache_dir: root.join("cache"),
+        credentials_dir: root.join("credentials"),
+        project_dir: None,
+    };
+    let audit = EffectAudit::open(paths.effect_audit()).expect("test effect audit");
+    JsTool::new_with_runtime_for_test(
         sandbox,
         permission,
         ask_tx,
         AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        std::sync::Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            TestWorkerLauncher::internal_worker_process(),
+        )),
+        std::sync::Arc::new(std::sync::Mutex::new(audit)),
     )
 }
 
@@ -160,6 +179,22 @@ async fn test_fetch_global_matches_sandbox_feature() {
             "undefined"
         }
     );
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn proposal_global_is_unavailable_and_not_advertised_before_a18() {
+    use rig::tool::Tool;
+    let tool = make_test_tool();
+
+    assert!(!tool.description().contains("propose_skill"));
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "typeof propose_skill".to_string(),
+        })
+        .await
+        .expect("call failed");
+    assert_eq!(result, "undefined");
 }
 
 #[cfg(feature = "sandbox")]
@@ -287,10 +322,7 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         })
         .await
         .expect("read call failed");
-    assert!(
-        read_result.contains("Permission denied"),
-        "read_file bypassed permissions: {read_result}"
-    );
+    assert_eq!(read_result, "JS error: exception");
 
     let write_result = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -298,10 +330,7 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         })
         .await
         .expect("write call failed");
-    assert!(
-        write_result.contains("Permission denied"),
-        "write_file bypassed permissions: {write_result}"
-    );
+    assert_eq!(write_result, "JS error: exception");
     assert!(
         !path.exists(),
         "denied write_file created {}",
@@ -314,10 +343,7 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         })
         .await
         .expect("spawn call failed");
-    assert!(
-        spawn_result.contains("Permission denied"),
-        "spawn bypassed permissions: {spawn_result}"
-    );
+    assert_eq!(spawn_result, "JS error: exception");
     assert!(!path.exists(), "denied spawn created {}", path.display());
 }
 
@@ -337,7 +363,7 @@ async fn test_timeout() {
 }
 
 #[tokio::test]
-async fn test_exception_includes_stack_trace() {
+async fn test_exception_is_a_source_free_closed_error() {
     use rig::tool::Tool;
     let tool = make_test_tool();
 
@@ -348,16 +374,9 @@ async fn test_exception_includes_stack_trace() {
         .await
         .expect("exception call failed");
 
-    assert!(
-        result.contains("test exception"),
-        "exception message missing from output: {result}"
-    );
-    assert!(
-        result
-            .lines()
-            .any(|line| line.trim_start().starts_with("at ")),
-        "exception stack trace missing from output: {result}"
-    );
+    assert_eq!(result, "JS error: exception");
+    assert!(!result.contains("test exception"));
+    assert!(!result.contains("at "));
 }
 
 #[tokio::test]

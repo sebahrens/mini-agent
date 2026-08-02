@@ -1,5 +1,6 @@
 pub(crate) mod audit;
 pub(crate) mod broker;
+#[cfg(test)]
 pub mod engine;
 pub mod host;
 pub(crate) mod protocol;

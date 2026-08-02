@@ -111,6 +111,15 @@ shutdown sends the closed `Shutdown` frame, waits within the same bound, and sti
 cleanup. The next independent request always receives a new generation, so delayed output from
 an old process cannot enter its protocol stream.
 
+All full-agent rebuilds in the parent obtain this same lazy, authority-free supervisor. A rebuild
+snapshots its own permission bridge, file/fetch policy, selected skill artifacts, invocation IDs,
+grants, cancellation, and broker for each `JsTool::call`; none of those values is stored in the
+warm process or supervisor. Model switches and network retries therefore reuse the existing tool
+and worker generation, while dropping an agent closes only that build's permission receiver.
+Subagents and `/btw` intentionally keep their exact restricted tool sets and do not receive JS.
+Lifecycle regression tests assert stable process ID and generation across rebuilds plus denial
+under a rebuilt policy, proving that the old policy did not leak into the reused worker.
+
 ## Wire protocol
 
 IPC uses inherited anonymous pipes and a strictly alternating, half-duplex protocol. Each frame is
@@ -171,13 +180,25 @@ The provisional broker `SkillProposalDraft` omits identity-v2 capability and sig
 that broker operation fails closed until the full typed proposal protocol lands; the direct parent
 proposal service never infers omitted scopes or identity fields.
 
-Model-authored step code retains bounded effect globals and a bounded `propose_skill` writer host.
-Durable proposal enqueue is parent-owned. Stored learned-skill realms receive no effect or writer
+Model-authored step code retains bounded file, fetch, and spawn effect globals. The
+`propose_skill` global is intentionally unavailable and is not advertised until A18 supplies its
+full typed identity-v2 protocol; the parent-owned proposal and admission workers remain outside
+the worker authority boundary. Telemetry treats every structured worker field as an untrusted
+execution claim. The parent requires an exact match to the selected artifact/export and the
+parent-derived turn, tool-call, deterministic invocation, and step outcome before rebuilding a
+canonical event with its own retrieval metadata, index generation, production flag, timestamp,
+and evidence status. Worker feedback, selection, observability, and capability-policy kinds are
+rejected. Positive evidence exists only after a complete canonical batch is accepted by the
+bounded dispatcher. Invalid, incomplete, saturated, disconnected, or failed dispatch records a
+parent-owned `ObservabilityLost` signal and cannot trigger feedback or quarantine. Stored
+learned-skill realms receive no effect or writer
 globals. Learned-skill ABI v2 instead passes one hidden, immutable invocation capability object as
 the first export argument. It contains only the methods declared by the stored artifact. Each
 method closure embeds a parent-created grant ID and becomes unusable when the export promise
 settles, the invocation is cancelled, or its runtime ends. A skill cannot inspect or manufacture a
 grant ID, and retaining an object or method cannot transfer useful authority to a later invocation.
+The A15 cutover loads and executes pure artifacts only; an effectful stored export therefore fails
+closed until A18 wires the exact prepared invocation handle into that hidden capability object.
 
 `src/extras/js/skills/capability.rs` owns the worker-local binding from an explicit invocation ID
 and exact manifest to one opaque grant per declared method. `src/extras/js/realm.rs` constructs a

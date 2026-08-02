@@ -253,7 +253,8 @@ impl fmt::Display for HostCapability {
 }
 
 /// A declared export: the function name the skill publishes and its documented signature.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillExport {
     pub name: String,
     pub signature: String,
@@ -520,7 +521,8 @@ pub(crate) fn test_manifest(
 /// Construct through [`SkillArtifact::new`], which validates the manifest and computes the
 /// canonical identity. A caller-supplied `id` is never trusted; use
 /// [`SkillArtifact::verify_identity`] to check a value that came from storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillArtifact {
     pub id: String,
     pub identity_version: u32,
