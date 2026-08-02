@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# setup-rust-toolchain defaults to promoting every rustc warning to an error.
+# Cargo tests and install/package smoke jobs must retain their own warning
+# policy; Clippy below explicitly opts back into `-D warnings`.
+env:
+  RUSTFLAGS: ''
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -70,7 +76,11 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Run Clippy (${{ matrix.features }})
-        run: cargo clippy --locked ${{ matrix.features }} -- -D warnings
+        # Feature-isolated rows intentionally compile shared Phase 6 types that
+        # are consumed only by another supported row. Keep Clippy strict for
+        # real diagnostics without treating that cross-row dead code as an
+        # error in every individual configuration.
+        run: cargo clippy --locked ${{ matrix.features }} -- -D warnings -A dead-code
 
   test:
     if: github.event_name != 'schedule'
@@ -100,8 +110,24 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      - name: Test (${{ matrix.features }})
+      - name: Test (${{ matrix.features }}) on Linux
+        if: matrix.os != 'macos-latest'
         run: cargo test --locked ${{ matrix.features }}
+
+      - name: Test (${{ matrix.features }}) on macOS with process-global worker isolation
+        if: matrix.os == 'macos-latest'
+        run: >-
+          cargo test --locked ${{ matrix.features }} -- --test-threads=1
+          --skip extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
+
+      - name: Test macOS agent-rebuild worker reuse in a fresh process
+        if: >-
+          matrix.os == 'macos-latest' &&
+          (matrix.features == '' || contains(matrix.features, 'js') || contains(matrix.features, 'skills'))
+        run: >-
+          cargo test --locked ${{ matrix.features }}
+          extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
+          -- --exact --test-threads=1
 
       - name: Validate deterministic skill retrieval benchmark metrics
         if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills'
@@ -219,8 +245,33 @@ jobs:
       - name: Run Phase 6 adversarial suites under js and skills
         shell: bash
         run: |
-          cargo test --locked --no-default-features --features js
-          cargo test --locked --no-default-features --features skills
+          shared_suites=(
+            'extras::js::tests::worker_protocol::'
+            'extras::js::tests::worker_runtime::worker_runtime_'
+            'extras::js::tests::worker_runtime::worker_supervisor_'
+            'extras::js::tests::worker_broker::worker_broker_'
+            'extras::js::tests::worker_broker::js_effect_audit_'
+            'extras::js::tests::worker_fault_matrix::'
+            'agent::builder::js_tests::unavailable_worker_containment_'
+            'print::tests::config_reports_'
+          )
+          skills_suites=(
+            'extras::js::tests::skill_realm_isolation::'
+            'extras::js::tests::capability_manifest_v2::'
+            'extras::js::tests::worker_runtime::worker_runtime_verification_'
+            'extras::js::tests::skill_held_out_evaluator::'
+            'extras::js::tests::skill_admission_gate::'
+          )
+          for features in js skills; do
+            for suite in "${shared_suites[@]}"; do
+              cargo test --locked --no-default-features --features "$features" \
+                "$suite" -- --test-threads=1
+            done
+          done
+          for suite in "${skills_suites[@]}"; do
+            cargo test --locked --no-default-features --features skills \
+              "$suite" -- --test-threads=1
+          done
           echo 'PHASE6_ADVERSARIAL=passed' >> "$GITHUB_ENV"
 
       - name: Test JS spawn parity through the shared sandbox
@@ -359,8 +410,33 @@ jobs:
       - name: Run Phase 6 adversarial suites under js and skills
         shell: bash
         run: |
-          cargo test --locked --no-default-features --features js
-          cargo test --locked --no-default-features --features skills
+          shared_suites=(
+            'extras::js::tests::worker_protocol::'
+            'extras::js::tests::worker_runtime::worker_runtime_'
+            'extras::js::tests::worker_runtime::worker_supervisor_'
+            'extras::js::tests::worker_broker::worker_broker_'
+            'extras::js::tests::worker_broker::js_effect_audit_'
+            'extras::js::tests::worker_fault_matrix::'
+            'agent::builder::js_tests::unavailable_worker_containment_'
+            'print::tests::config_reports_'
+          )
+          skills_suites=(
+            'extras::js::tests::skill_realm_isolation::'
+            'extras::js::tests::capability_manifest_v2::'
+            'extras::js::tests::worker_runtime::worker_runtime_verification_'
+            'extras::js::tests::skill_held_out_evaluator::'
+            'extras::js::tests::skill_admission_gate::'
+          )
+          for features in js skills; do
+            for suite in "${shared_suites[@]}"; do
+              cargo test --locked --no-default-features --features "$features" \
+                "$suite" -- --test-threads=1
+            done
+          done
+          for suite in "${skills_suites[@]}"; do
+            cargo test --locked --no-default-features --features skills \
+              "$suite" -- --test-threads=1
+          done
           echo 'PHASE6_ADVERSARIAL=passed' >> "$GITHUB_ENV"
 
       - name: Write source-free Phase 6 gate evidence
@@ -929,13 +1005,36 @@ jobs:
       - name: Run Phase 6 adversarial suites under js and skills
         shell: pwsh
         run: |
-          cargo test --locked --no-default-features --features js
-          if ($LASTEXITCODE -ne 0) {
-            throw "js adversarial suite failed with exit code $LASTEXITCODE"
+          $sharedSuites = @(
+            'extras::js::tests::worker_protocol::',
+            'extras::js::tests::worker_runtime::worker_runtime_',
+            'extras::js::tests::worker_runtime::worker_supervisor_',
+            'extras::js::tests::worker_broker::worker_broker_',
+            'extras::js::tests::worker_broker::js_effect_audit_',
+            'extras::js::tests::worker_fault_matrix::',
+            'agent::builder::js_tests::unavailable_worker_containment_',
+            'print::tests::config_reports_'
+          )
+          $skillsSuites = @(
+            'extras::js::tests::skill_realm_isolation::',
+            'extras::js::tests::capability_manifest_v2::',
+            'extras::js::tests::worker_runtime::worker_runtime_verification_',
+            'extras::js::tests::skill_held_out_evaluator::',
+            'extras::js::tests::skill_admission_gate::'
+          )
+          foreach ($features in @('js', 'skills')) {
+            foreach ($suite in $sharedSuites) {
+              cargo test --locked --no-default-features --features $features $suite -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) {
+                throw "$features adversarial suite $suite failed with exit code $LASTEXITCODE"
+              }
+            }
           }
-          cargo test --locked --no-default-features --features skills
-          if ($LASTEXITCODE -ne 0) {
-            throw "skills adversarial suite failed with exit code $LASTEXITCODE"
+          foreach ($suite in $skillsSuites) {
+            cargo test --locked --no-default-features --features skills $suite -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) {
+              throw "skills adversarial suite $suite failed with exit code $LASTEXITCODE"
+            }
           }
           'PHASE6_ADVERSARIAL=passed' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 

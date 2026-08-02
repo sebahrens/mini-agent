@@ -23,6 +23,24 @@ def job_body(workflow: str, name: str) -> str:
 
 
 class Phase6CiWorkflowTests(unittest.TestCase):
+    SHARED_ADVERSARIAL_FILTERS = (
+        "extras::js::tests::worker_protocol::",
+        "extras::js::tests::worker_runtime::worker_runtime_",
+        "extras::js::tests::worker_runtime::worker_supervisor_",
+        "extras::js::tests::worker_broker::worker_broker_",
+        "extras::js::tests::worker_broker::js_effect_audit_",
+        "extras::js::tests::worker_fault_matrix::",
+        "agent::builder::js_tests::unavailable_worker_containment_",
+        "print::tests::config_reports_",
+    )
+    SKILLS_ADVERSARIAL_FILTERS = (
+        "extras::js::tests::skill_realm_isolation::",
+        "extras::js::tests::capability_manifest_v2::",
+        "extras::js::tests::worker_runtime::worker_runtime_verification_",
+        "extras::js::tests::skill_held_out_evaluator::",
+        "extras::js::tests::skill_admission_gate::",
+    )
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -53,14 +71,8 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 self.assertIn(runner, body)
                 self.assertIn(probe, body)
                 self.assertRegex(body, rf"(?s){probe}.+Count.+(?:-eq|-ne) 1|count.+-eq 1")
-                self.assertIn(
-                    "cargo test --locked --no-default-features --features js\n",
-                    body,
-                )
-                self.assertIn(
-                    "cargo test --locked --no-default-features --features skills\n",
-                    body,
-                )
+                self.assertRegex(body.lower(), r"shared_?suites")
+                self.assertRegex(body.lower(), r"skills_?suites")
                 self.assertEqual(
                     0,
                     body.count("continue-on-error: true"),
@@ -88,10 +100,28 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         ):
             with self.subTest(job=job):
                 body = job_body(self.workflow, job)
+                before_guard, after_guard = body.split(
+                    "must execute at least one test", 1
+                )
+                discovery = (
+                    before_guard.rsplit("- name:", 1)[1]
+                    + "must execute at least one test"
+                    + after_guard.split("- name:", 1)[0]
+                )
+                guard_calls = re.findall(
+                    r"(?m)^\s+(?:require_suite|Assert-Suite)\s+(.+)$",
+                    discovery,
+                )
+                self.assertEqual(12, len(guard_calls))
                 for category in required_categories:
-                    self.assertIn(category, body)
-                self.assertIn("-- --list", body)
-                self.assertIn("must execute at least one test", body)
+                    matching_calls = [
+                        call
+                        for call in guard_calls
+                        if re.search(rf"(?:^|[ '\"]){re.escape(category)}(?:$|[ '\"])", call)
+                    ]
+                    self.assertEqual(1, len(matching_calls), category)
+                self.assertIn("-- --list", discovery)
+                self.assertIn("must execute at least one test", discovery)
 
     def test_each_platform_uploads_only_closed_source_free_phase6_evidence(self) -> None:
         for job in (
@@ -159,6 +189,9 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             self.assertIn(forbidden, standard_user_step)
 
     def test_phase6_jobs_clear_setup_rust_warning_injection(self) -> None:
+        workflow_header = self.workflow.split("jobs:", 1)[0]
+        self.assertIn("env:\n  RUSTFLAGS: ''", workflow_header)
+
         for job in (
             "linux-sandbox-policy",
             "macos-worker-containment-gate",
@@ -172,6 +205,84 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 self.assertIn("rustflags: ''", install)
 
         self.assertNotIn("rustflags: ''", job_body(self.workflow, "clippy"))
+        self.assertIn(
+            "-- -D warnings -A dead-code",
+            job_body(self.workflow, "clippy"),
+        )
+
+    def test_phase6_adversarial_suites_use_isolated_serialized_processes(self) -> None:
+        for job in (
+            "linux-sandbox-policy",
+            "macos-worker-containment-gate",
+            "windows-worker-containment-gate",
+        ):
+            with self.subTest(job=job):
+                body = job_body(self.workflow, job)
+                adversarial = body.split(
+                    "name: Run Phase 6 adversarial suites under js and skills", 1
+                )[1].split("- name:", 1)[0]
+                inventories = {}
+                for inventory in ("shared", "skills"):
+                    match = re.search(
+                        rf"(?ms)(?:\${inventory}Suites|{inventory}_suites)\s*=\s*@?\((?P<body>.*?)^\s*\)",
+                        adversarial,
+                    )
+                    self.assertIsNotNone(match, inventory)
+                    inventories[inventory] = tuple(
+                        re.findall(r"'([^']+)'", match.group("body"))
+                    )
+                self.assertEqual(
+                    self.SHARED_ADVERSARIAL_FILTERS,
+                    inventories["shared"],
+                )
+                self.assertEqual(
+                    self.SKILLS_ADVERSARIAL_FILTERS,
+                    inventories["skills"],
+                )
+                self.assertNotRegex(
+                    adversarial,
+                    r"--features (?:js|skills) -- --test-threads=1",
+                )
+                self.assertEqual(2, adversarial.count("cargo test"))
+                self.assertEqual(2, adversarial.count("-- --test-threads=1"))
+                self.assertRegex(
+                    adversarial,
+                    r"(?s)(?:for|foreach).+shared.+(?:for|foreach).+cargo test",
+                )
+                self.assertRegex(
+                    adversarial,
+                    r"(?s)(?:for|foreach).+skills.+cargo test",
+                )
+
+    def test_macos_matrix_isolates_the_agent_rebuild_worker_reuse_test(self) -> None:
+        body = job_body(self.workflow, "test")
+        full_path = (
+            "extras::js::tool::js_permission_bridge::"
+            "js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver"
+        )
+        linux_step = body.split("name: Test (${{ matrix.features }}) on Linux", 1)[
+            1
+        ].split("- name:", 1)[0]
+        self.assertIn("matrix.os != 'macos-latest'", linux_step)
+        self.assertNotIn("--skip", linux_step)
+
+        macos_step = body.split(
+            "name: Test (${{ matrix.features }}) on macOS with process-global worker isolation",
+            1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("matrix.os == 'macos-latest'", macos_step)
+        self.assertIn("-- --test-threads=1", macos_step)
+        self.assertIn(f"--skip {full_path}", macos_step)
+
+        isolated_step = body.split(
+            "name: Test macOS agent-rebuild worker reuse in a fresh process", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("matrix.os == 'macos-latest'", isolated_step)
+        self.assertIn("matrix.features == ''", isolated_step)
+        self.assertIn("contains(matrix.features, 'js')", isolated_step)
+        self.assertIn("contains(matrix.features, 'skills')", isolated_step)
+        self.assertIn(full_path, isolated_step)
+        self.assertIn("-- --exact --test-threads=1", isolated_step)
 
     def test_windows_installed_status_requires_the_runtime_preflight_claims(self) -> None:
         body = job_body(self.workflow, "windows-worker-containment-gate")
