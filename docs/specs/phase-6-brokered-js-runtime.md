@@ -686,8 +686,30 @@ An unavailable audit prevents broker construction and therefore sends no request
 effect whose durable completion is `outcome_unknown` immediately erases invocation authority,
 closes that invocation in both protocol state machines, and forces process recycle without retry.
 JavaScript cannot catch that error and dispatch another effect: a caught second call fails locally
-inside the closing worker and never reaches the parent broker. A29 owns the effect-specific
-cancellation and reconciliation details.
+inside the closing worker and never reaches the parent broker. Caller cancellation and the shared
+absolute deadline signal the active parent effect and give it a separate bounded drain window
+before authority is erased. That drain lets the service kill and reap an owned subprocess tree,
+stop fetch work, hand off a bounded proposal waiter, and append the truthful durable completion. Protocol
+continuation is never attempted after an interrupted effect; the worker is recycled and the next
+invocation starts with fresh grants and process state.
+
+Cancellation while waiting for the serialized worker lease, target normalization, or permission
+`Ask` aborts before mutation and returns `cancelled` (or `timed_out`). Read cancellation is likewise
+exact because it is non-mutating. A write cancelled before its mutation future is polled is exact;
+after open/write dispatch, cancellation or deadline is `outcome_unknown` because atomic replacement
+does not imply transactional rollback. The blocking atomic writer is drained; cancellation and the
+final rename serialize through one publication gate, so cancellation returning proves a later
+publication cannot begin. If the writer wins that atomic start decision, cancellation remains
+bounded while the already-approved syscall may finish and the result stays `outcome_unknown`. JS
+receives `spawn` authority only when the configured process sandbox
+owns the complete descendant lifetime independently of process-group membership (currently the
+Linux bwrap PID namespace). Elsewhere spawn fails closed before intent. Within that boundary, spawn
+cancellation signals the command-specific token, kills the process group and containing namespace,
+reaps the direct child, and then records `outcome_unknown` because the program may already have
+changed external state. Fetch preserves its one outer wall-clock
+deadline across permission, DNS, connect, response headers, and body; cancellation after HTTP
+dispatch is ambiguous. These rules do not extend cancellation to MCP, LSP, or the general agent
+loop and do not promise exactly-once execution.
 
 If QuickJS cannot be classified without trusting exception-controlled text, the worker returns the
 generic `javascript_exception` or `promise_rejection` code. Arbitrary exception `name`, message,
@@ -724,8 +746,8 @@ independent call.
 
 Proposal cancellation is exact before queue dispatch and returns `cancelled`. After a proposal has
 entered the bounded queue, cancellation returns `outcome_unknown` while a detached blocking waiter
-drains the response; callers must not replay that proposal automatically. A29 owns durable
-reconciliation of this ambiguous outcome.
+drains the response; the broker durably reconciles that ambiguous outcome before recycling the
+invocation. Callers must not replay that proposal automatically.
 
 ## Acceptance matrix
 

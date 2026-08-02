@@ -49,7 +49,7 @@ fn proposal(source_suffix: &str) -> JsProposal {
 }
 
 #[tokio::test]
-async fn propose_skill_host_cancellation_is_bounded_and_next_call_succeeds() {
+async fn worker_effect_cancellation_bounds_proposal_enqueue_and_next_call_succeeds() {
     let (sender, receiver) = ProposalQueue::bounded(2, Duration::from_secs(1));
     let service = ProposalEffectService::new(ProposalHost::new(sender, AttemptBudget::new(3)));
 

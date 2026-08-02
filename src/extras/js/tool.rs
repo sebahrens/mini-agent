@@ -812,12 +812,14 @@ impl Tool for JsTool {
         let grant_expires_at = Instant::now()
             .checked_add(STEP_TIMEOUT)
             .ok_or_else(|| ToolError::Msg("JS authority deadline unavailable".into()))?;
-        let model_capabilities = std::collections::BTreeSet::from([
+        let mut model_capabilities = std::collections::BTreeSet::from([
             HostCapability::ReadFile,
             HostCapability::WriteFile,
             HostCapability::Fetch,
-            HostCapability::Spawn,
         ]);
+        if self.sandbox.owns_complete_process_tree() {
+            model_capabilities.insert(HostCapability::Spawn);
+        }
         let grant = InvocationGrant::issue(
             invocation_id.clone(),
             GrantPrincipal::ModelAuthored {

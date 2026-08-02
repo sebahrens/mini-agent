@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom};
@@ -36,7 +35,9 @@ use crate::extras::js::types::{
 };
 #[cfg(any(target_os = "linux", not(unix)))]
 use crate::sandbox::SandboxCommand;
-use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox, SandboxPolicy};
+use crate::sandbox::{
+    CommandCancellation, CommandLimits, CommandOutputLimit, CommandStatus, Sandbox, SandboxPolicy,
+};
 #[cfg(feature = "sandbox")]
 use reqwest::Url;
 #[cfg(feature = "sandbox")]
@@ -1956,20 +1957,35 @@ async fn write_approved_file(
     target: ResolvedWriteTarget,
     content: String,
 ) -> Result<(), EffectServiceError> {
+    write_approved_file_cancellable(
+        target,
+        content,
+        crate::fs::AtomicWriteCancellation::default(),
+    )
+    .await
+}
+
+async fn write_approved_file_cancellable(
+    target: ResolvedWriteTarget,
+    content: String,
+    cancellation: crate::fs::AtomicWriteCancellation,
+) -> Result<(), EffectServiceError> {
     match target.mode {
         WriteMode::Create => {
-            crate::fs::atomic_create_resolved_checked(
+            crate::fs::atomic_create_resolved_checked_cancellable(
                 target.path,
                 content.as_bytes(),
                 target.parent_identity,
+                cancellation,
             )
             .await
         }
         WriteMode::Replace => {
-            crate::fs::atomic_write_resolved_checked(
+            crate::fs::atomic_write_resolved_checked_cancellable(
                 target.path,
                 content.as_bytes(),
                 target.parent_identity,
+                cancellation,
             )
             .await
         }
@@ -2095,10 +2111,65 @@ impl FileEffectService {
         content: String,
         bridge: PermissionBridge,
     ) -> Result<(), EffectServiceError> {
-        let call = async { write_approved_file(prepared.0, content).await };
-        tokio::select! {
-            result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
-            _ = bridge.cancelled() => Err(EffectServiceError::Cancelled),
+        let write_cancellation = crate::fs::AtomicWriteCancellation::default();
+        let signal = write_cancellation.clone();
+        let call = async {
+            write_approved_file_cancellable(prepared.0, content, write_cancellation).await
+        };
+        await_mutating_effect_with_interrupt(&bridge, self.timeout, call, move || signal.cancel())
+            .await
+    }
+}
+
+/// Waits for an operation whose first poll can cross a mutation boundary.
+///
+/// Cancellation before polling is an exact abort. Once the operation is dispatched, cancellation
+/// or deadline cannot prove whether the mutation committed and must therefore reconcile as
+/// `OutcomeUnknown`; the future is dropped so no independently-owned async task is leaked.
+pub(crate) async fn await_mutating_effect<T>(
+    cancellation: &PermissionBridge,
+    duration: Duration,
+    call: impl Future<Output = Result<T, EffectServiceError>>,
+) -> Result<T, EffectServiceError> {
+    await_mutating_effect_with_interrupt(cancellation, duration, call, || {}).await
+}
+
+const MUTATION_CANCELLATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn await_mutating_effect_with_interrupt<T>(
+    cancellation: &PermissionBridge,
+    duration: Duration,
+    call: impl Future<Output = Result<T, EffectServiceError>>,
+    interrupt: impl Fn(),
+) -> Result<T, EffectServiceError> {
+    if cancellation.is_cancelled() {
+        return Err(EffectServiceError::Cancelled);
+    }
+    tokio::pin!(call);
+    enum MutationWait<T> {
+        Completed(Result<T, EffectServiceError>),
+        Interrupted,
+    }
+    let wait = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => MutationWait::Interrupted,
+        result = timeout(duration, &mut call) => {
+            match result {
+                Ok(result) => MutationWait::Completed(result),
+                Err(_) => MutationWait::Interrupted,
+            }
+        }
+    };
+    match wait {
+        MutationWait::Completed(result) => result,
+        MutationWait::Interrupted => {
+            interrupt();
+            // The actual filesystem implementation uses a blocking worker. Retain its future long
+            // enough to clean its owned temporary file. If the writer already won its atomic
+            // publication decision, the syscall may finish later under this truthful unknown
+            // outcome; cancellation which won that decision prevents publication entirely.
+            let _ = timeout(MUTATION_CANCELLATION_DRAIN_TIMEOUT, &mut call).await;
+            Err(EffectServiceError::OutcomeUnknown)
         }
     }
 }
@@ -2385,6 +2456,9 @@ async fn await_fetch_host_call(
         _ = permission_bridge.cancelled() => WaitOutcome::Cancelled,
     };
     match outcome {
+        WaitOutcome::Completed(Ok(Err(error @ (FetchError::Cancelled | FetchError::TimedOut)))) => {
+            Err(control.cancel(error))
+        }
         WaitOutcome::Completed(Ok(result)) => result,
         WaitOutcome::Completed(Err(_)) => Err(FetchError::RequestFailed(
             "fetch executor task failed".to_string(),
@@ -2834,14 +2908,32 @@ impl SpawnEffectService {
             stderr_bytes: SPAWN_STDERR_MAX_BYTES,
             combined_bytes: SPAWN_COMBINED_MAX_BYTES,
         };
+        if bridge.is_cancelled() {
+            return Err(EffectServiceError::Cancelled);
+        }
+        let process_cancellation = CommandCancellation::new();
+        let mut execution = Box::pin(self.sandbox.output_built_command_with_limits_cancelled(
+            command,
+            limits,
+            &process_cancellation,
+        ));
         let output = tokio::select! {
-            result = self.sandbox.output_built_command_with_limits(command, limits) => {
-                result.map_err(|_| EffectServiceError::BackendFailure)?
+            biased;
+            _ = bridge.cancelled() => {
+                process_cancellation.cancel();
+                // The sandbox future resolves only after killing the complete process group and
+                // reaping the direct child. Once startup began, filesystem/network effects from
+                // that tree may already have happened, so cancellation is never reported as an
+                // exact pre-effect abort.
+                execution
+                    .await
+                    .map_err(|_| EffectServiceError::OutcomeUnknown)?;
+                return Err(EffectServiceError::OutcomeUnknown);
             }
-            _ = bridge.cancelled() => return Err(EffectServiceError::Cancelled),
+            result = &mut execution => result.map_err(|_| EffectServiceError::BackendFailure)?,
         };
         match output.status {
-            CommandStatus::Cancelled => return Err(EffectServiceError::Cancelled),
+            CommandStatus::Cancelled => return Err(EffectServiceError::OutcomeUnknown),
             CommandStatus::Failed => return Err(EffectServiceError::BackendFailure),
             CommandStatus::Completed
             | CommandStatus::TimedOut
@@ -4938,7 +5030,7 @@ mod tests {
 
     #[cfg(feature = "sandbox")]
     #[tokio::test]
-    async fn js_fetch_effect_service_is_cancellable_and_recovers_after_target_error() {
+    async fn worker_effect_cancellation_bounds_fetch_and_recovers_after_target_error() {
         let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
         let sender = Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())]));
         let service = FetchEffectService {
@@ -5120,7 +5212,7 @@ mod tests {
 
     #[cfg(feature = "sandbox")]
     #[tokio::test]
-    async fn js_fetch_timeout_cancels_delayed_permission_before_dispatch_and_reaps_executor() {
+    async fn worker_effect_cancellation_bounds_fetch_permission_before_dispatch() {
         let outer_timeout = Duration::from_millis(25);
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
         let owner = PermissionBridgeOwner::new(
@@ -5180,7 +5272,7 @@ mod tests {
 
     #[cfg(feature = "sandbox")]
     #[tokio::test]
-    async fn js_fetch_host_call_cancellation_marks_dispatched_request_outcome_unknown() {
+    async fn worker_effect_cancellation_marks_dispatched_fetch_outcome_unknown() {
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let owner =
@@ -5223,6 +5315,41 @@ mod tests {
             error.contains(&FetchError::OutcomeUnknown.to_string()),
             "unexpected dispatched-fetch cancellation error: {error}"
         );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn worker_effect_cancellation_maps_inner_fetch_timeout_by_dispatch_phase() {
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+
+        let before_dispatch = Arc::new(FetchCallControl::new());
+        let before_call = tokio::spawn(async { Err(FetchError::TimedOut) });
+        assert_eq!(
+            await_fetch_host_call(
+                &owner.bridge(),
+                Duration::from_secs(1),
+                before_call,
+                before_dispatch,
+            )
+            .await,
+            Err(FetchError::TimedOut)
+        );
+
+        let after_dispatch = Arc::new(FetchCallControl::new());
+        assert!(after_dispatch.begin_dispatch());
+        after_dispatch.finish();
+        let after_call = tokio::spawn(async { Err(FetchError::TimedOut) });
+        assert_eq!(
+            await_fetch_host_call(
+                &owner.bridge(),
+                Duration::from_secs(1),
+                after_call,
+                after_dispatch,
+            )
+            .await,
+            Err(FetchError::OutcomeUnknown)
+        );
+        owner.shutdown();
     }
 
     #[cfg(feature = "sandbox")]

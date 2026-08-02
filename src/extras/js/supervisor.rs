@@ -28,6 +28,10 @@ const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// Effect services get a short, independent drain window after invocation cancellation. This is
+/// long enough for bounded process-tree teardown and durable unknown-outcome reconciliation, but
+/// never extends an abandoned caller indefinitely.
+const EFFECT_CANCELLATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const VERIFICATION_QUEUE_CAPACITY: usize = 16;
 const MAX_PROCESS_AGE: Duration = Duration::from_secs(15 * 60);
 const MAX_PROCESS_INVOCATIONS: u64 = 256;
@@ -41,6 +45,15 @@ pub(crate) trait InvocationEffectHandler: Send {
         request: EffectRequest,
         cancellation: PermCancellation,
     ) -> EffectFuture<'_>;
+
+    /// Reconcile an effect future which did not stop within the bounded cancellation drain.
+    /// Implementations backed by durable intent should append `OutcomeUnknown` here. The secure
+    /// default is ambiguous rather than implying that an uncooperative effect did not happen.
+    fn reconcile_interrupted_effect(&mut self) -> EffectResult {
+        EffectResult::Error(super::protocol::EffectError {
+            code: EffectErrorCode::OutcomeUnknown,
+        })
+    }
 
     #[cfg(feature = "skills")]
     fn handle_skill_call(&mut self, request: SkillCallRequest) -> SkillCallResponse {
@@ -1451,17 +1464,55 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     armed: true,
                 };
                 let mut effect = handler.handle_effect(request.clone(), effect_cancellation);
-                let result = loop {
+                enum EffectWait {
+                    Completed(EffectResult),
+                    Cancelled,
+                    TimedOut,
+                }
+                let wait = loop {
                     tokio::select! {
                         biased;
-                        _ = cancellation.cancelled() => return Err(WorkerError::Cancelled),
+                        _ = cancellation.cancelled() => break EffectWait::Cancelled,
                         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                            return Err(WorkerError::TimedOut);
+                            break EffectWait::TimedOut;
                         }
-                        result = &mut effect => break result,
+                        result = &mut effect => break EffectWait::Completed(result),
                         _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
                             if connection.process.try_wait().map_err(|_| WorkerError::Transport)?.is_some() {
                                 return Err(WorkerError::Transport);
+                            }
+                        }
+                    }
+                };
+                let caller_cancelled = matches!(&wait, EffectWait::Cancelled);
+                let (result, interrupted) = match wait {
+                    EffectWait::Completed(result) => (result, None),
+                    EffectWait::Cancelled | EffectWait::TimedOut => {
+                        // Do not drop an in-flight service as soon as the caller leaves. Signal it,
+                        // then let it kill/reap owned processes and append a truthful completion
+                        // (including OutcomeUnknown) before invocation authority is erased.
+                        cancel_on_drop.cancellation.cancel();
+                        let interrupted = if caller_cancelled {
+                            WorkerError::Cancelled
+                        } else {
+                            WorkerError::TimedOut
+                        };
+                        let result =
+                            tokio::time::timeout(EFFECT_CANCELLATION_DRAIN_TIMEOUT, &mut effect)
+                                .await;
+                        match result {
+                            Ok(result) => (result, Some(interrupted)),
+                            Err(_) => {
+                                drop(effect);
+                                cancel_on_drop.armed = false;
+                                let result = handler.reconcile_interrupted_effect();
+                                let outcome_unknown = interrupted_effect_requires_unknown(&result);
+                                authority.recycle();
+                                return Err(if outcome_unknown {
+                                    WorkerError::EffectOutcomeUnknown
+                                } else {
+                                    interrupted
+                                });
                             }
                         }
                     }
@@ -1474,8 +1525,21 @@ async fn run_invocation<H: InvocationEffectHandler>(
                         code: EffectErrorCode::OutcomeUnknown,
                     })
                 );
+                let interrupted_outcome_unknown = interrupted
+                    .as_ref()
+                    .is_some_and(|_| interrupted_effect_requires_unknown(&result));
                 if outcome_unknown {
                     authority.recycle();
+                }
+                if let Some(interrupted) = interrupted {
+                    // Invocation cancellation breaks protocol continuation even when the service
+                    // proves that it stopped before mutation. Unknown outcomes take precedence so
+                    // callers are never invited to replay an effect which may have happened.
+                    return Err(if interrupted_outcome_unknown {
+                        WorkerError::EffectOutcomeUnknown
+                    } else {
+                        interrupted
+                    });
                 }
                 let response = WireFrame::invocation(
                     connection.build.clone(),
@@ -1564,6 +1628,23 @@ async fn write_parent(
         .map_err(|_| WorkerError::Transport)?;
     validate_generation(connection.generation, tagged.generation)?;
     tagged.result.map_err(map_frame_error)
+}
+
+/// Cancellation can win the parent select after a mutating service has already completed but
+/// before its response is delivered to the worker. Those successful results are ambiguous to the
+/// caller even though the durable audit knows they completed. Audit failures are also ambiguous:
+/// the parent cannot safely prove whether the effect preceded the failed completion append.
+fn interrupted_effect_requires_unknown(result: &EffectResult) -> bool {
+    matches!(
+        result,
+        EffectResult::WriteFile
+            | EffectResult::Fetch { .. }
+            | EffectResult::Spawn { .. }
+            | EffectResult::ProposalAccepted { .. }
+            | EffectResult::Error(super::protocol::EffectError {
+                code: EffectErrorCode::AuditFailure | EffectErrorCode::OutcomeUnknown,
+            })
+    )
 }
 
 async fn read_worker(
