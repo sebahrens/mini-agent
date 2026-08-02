@@ -15,7 +15,10 @@ use std::io::Read;
 #[cfg(feature = "sandbox")]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(feature = "sandbox")]
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
 #[cfg(feature = "sandbox")]
 use std::time::Instant;
 
@@ -24,6 +27,8 @@ use crate::extras::js::skills::proposal::{JsProposal, ProposalError, ProposalHos
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::store::EnqueueStatus;
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
+#[cfg(feature = "sandbox")]
+use crate::extras::js::types::PermCancellation;
 use crate::extras::js::types::{
     READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
 };
@@ -626,25 +631,34 @@ fn fetch_origin(url: &Url) -> Result<FetchOrigin, FetchError> {
 
 #[cfg(feature = "sandbox")]
 trait FetchResolver: Send + Sync {
-    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError>;
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        permission_bridge: &PermissionBridge,
+    ) -> Result<Vec<SocketAddr>, FetchError>;
 }
 
 #[cfg(feature = "sandbox")]
 struct RuntimeFetchResolver {
     runtime: tokio::runtime::Handle,
-    permission_bridge: PermissionBridge,
 }
 
 #[cfg(feature = "sandbox")]
 impl FetchResolver for RuntimeFetchResolver {
-    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError> {
-        if self.permission_bridge.is_cancelled() {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        permission_bridge: &PermissionBridge,
+    ) -> Result<Vec<SocketAddr>, FetchError> {
+        if permission_bridge.is_cancelled() {
             return Err(FetchError::Cancelled);
         }
         if let Ok(address) = host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(address, port)]);
         }
-        let bridge = self.permission_bridge.clone();
+        let bridge = permission_bridge.clone();
         self.runtime.block_on(async move {
             tokio::select! {
                 result = tokio::time::timeout(
@@ -710,27 +724,146 @@ struct FetchExecutor {
 }
 
 #[cfg(feature = "sandbox")]
+const FETCH_CALL_ACTIVE: u8 = 0;
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_CANCELLED: u8 = 1;
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_DISPATCHED: u8 = 2;
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_FINISHED_BEFORE_DISPATCH: u8 = 3;
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_FINISHED_AFTER_DISPATCH: u8 = 4;
+
+#[cfg(feature = "sandbox")]
+struct FetchCallControl {
+    cancellation: PermCancellation,
+    phase: AtomicU8,
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchCallControl {
+    fn new() -> Self {
+        Self {
+            cancellation: PermCancellation::new(),
+            phase: AtomicU8::new(FETCH_CALL_ACTIVE),
+        }
+    }
+
+    fn begin_dispatch(&self) -> bool {
+        loop {
+            match self.phase.load(Ordering::Acquire) {
+                FETCH_CALL_ACTIVE => {
+                    if self
+                        .phase
+                        .compare_exchange(
+                            FETCH_CALL_ACTIVE,
+                            FETCH_CALL_DISPATCHED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                FETCH_CALL_DISPATCHED => return !self.cancellation.is_cancelled(),
+                FETCH_CALL_CANCELLED
+                | FETCH_CALL_FINISHED_BEFORE_DISPATCH
+                | FETCH_CALL_FINISHED_AFTER_DISPATCH => return false,
+                _ => unreachable!("fetch call entered an unknown phase"),
+            }
+        }
+    }
+
+    fn cancel(&self, before_dispatch: FetchError) -> FetchError {
+        self.cancellation.cancel();
+        match self.phase.compare_exchange(
+            FETCH_CALL_ACTIVE,
+            FETCH_CALL_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(FETCH_CALL_CANCELLED | FETCH_CALL_FINISHED_BEFORE_DISPATCH) => {
+                before_dispatch
+            }
+            Err(FETCH_CALL_DISPATCHED | FETCH_CALL_FINISHED_AFTER_DISPATCH) => {
+                FetchError::OutcomeUnknown
+            }
+            Err(_) => unreachable!("fetch call entered an unknown phase"),
+        }
+    }
+
+    fn finish(&self) {
+        loop {
+            let current = self.phase.load(Ordering::Acquire);
+            let finished = match current {
+                FETCH_CALL_ACTIVE => FETCH_CALL_FINISHED_BEFORE_DISPATCH,
+                FETCH_CALL_DISPATCHED => FETCH_CALL_FINISHED_AFTER_DISPATCH,
+                FETCH_CALL_CANCELLED
+                | FETCH_CALL_FINISHED_BEFORE_DISPATCH
+                | FETCH_CALL_FINISHED_AFTER_DISPATCH => return,
+                _ => unreachable!("fetch call entered an unknown phase"),
+            };
+            if self
+                .phase
+                .compare_exchange(current, finished, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sandbox")]
+struct FetchCallCompletion(Arc<FetchCallControl>);
+
+#[cfg(feature = "sandbox")]
+impl Drop for FetchCallCompletion {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+#[cfg(feature = "sandbox")]
 impl FetchExecutor {
+    #[cfg(test)]
     fn execute(&self, raw_url: &str, request: &FetchRequest) -> Result<FetchResult, FetchError> {
+        self.execute_controlled(raw_url, request, Arc::new(FetchCallControl::new()))
+    }
+
+    fn execute_controlled(
+        &self,
+        raw_url: &str,
+        request: &FetchRequest,
+        control: Arc<FetchCallControl>,
+    ) -> Result<FetchResult, FetchError> {
+        let _completion = FetchCallCompletion(control.clone());
+        let permission_bridge = self
+            .permission_bridge
+            .for_host_call(control.cancellation.clone());
         let mut current = raw_url.to_string();
         for redirect_count in 0..=FETCH_MAX_REDIRECTS {
             let url = self.policy.authorize(&current)?;
             let host = url.host_str().ok_or(FetchError::MissingHost)?;
             let port = url.port_or_known_default().ok_or(FetchError::MissingPort)?;
-            let mut addresses = self.resolver.resolve(host, port)?;
+            let mut addresses = self.resolver.resolve(host, port, &permission_bridge)?;
             addresses.sort_unstable();
             addresses.dedup();
             validate_public_destinations(&addresses)?;
 
             let permission_key = fetch_permission_key(&url, &addresses);
-            self.permission_bridge
+            permission_bridge
                 .check("js/fetch", &permission_key)
                 .map_err(|error| FetchError::Permission(error.to_string()))?;
 
             let origin = fetch_origin(&url)?;
+            if permission_bridge.is_cancelled() || !control.begin_dispatch() {
+                return Err(FetchError::Cancelled);
+            }
             match self
                 .sender
-                .send(url, request, &addresses, &self.permission_bridge)?
+                .send(url, request, &addresses, &permission_bridge)?
             {
                 FetchTransportOutcome::Complete(result) => return Ok(result),
                 FetchTransportOutcome::Redirect(redirect) => {
@@ -842,6 +975,8 @@ const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "sandbox")]
 const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "sandbox")]
+const FETCH_CANCELLATION_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(feature = "sandbox")]
 const FETCH_REQUEST_HEADER_MAX_BYTES: usize = 16 * 1024;
 #[cfg(feature = "sandbox")]
@@ -1020,6 +1155,7 @@ pub(crate) enum FetchError {
     ClientBuild(String),
     Cancelled,
     TimedOut,
+    OutcomeUnknown,
     RequestHeadersTooLarge,
     RequestBodyTooLarge,
     RequestFailed(String),
@@ -1068,6 +1204,9 @@ impl std::fmt::Display for FetchError {
             Self::ClientBuild(message) => write!(formatter, "fetch client setup failed: {message}"),
             Self::Cancelled => formatter.write_str("fetch cancelled"),
             Self::TimedOut => formatter.write_str("fetch timed out"),
+            Self::OutcomeUnknown => {
+                formatter.write_str("fetch outcome is unknown after request dispatch")
+            }
             Self::RequestHeadersTooLarge => {
                 formatter.write_str("fetch request headers exceed the configured limit")
             }
@@ -1710,24 +1849,87 @@ fn make_fetch(
     policy: FetchPolicy,
 ) -> impl for<'js> Fn(String, Opt<Object<'js>>) -> rquickjs::Result<FetchResult> {
     let resolver = Arc::new(RuntimeFetchResolver {
-        runtime,
-        permission_bridge: permission_bridge.clone(),
+        runtime: runtime.clone(),
     });
     let executor = Arc::new(FetchExecutor {
         policy,
         resolver,
         sender: Arc::new(BoundFetchSender),
-        permission_bridge,
+        permission_bridge: permission_bridge.clone(),
     });
+    make_fetch_with_timeout(permission_bridge, runtime, executor, FETCH_TOTAL_TIMEOUT)
+}
+
+#[cfg(feature = "sandbox")]
+fn make_fetch_with_timeout(
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+    executor: Arc<FetchExecutor>,
+    duration: Duration,
+) -> impl for<'js> Fn(String, Opt<Object<'js>>) -> rquickjs::Result<FetchResult> {
     move |url: String, options: Opt<Object<'_>>| {
         let request = FetchRequest::from_options(options.0.as_ref()).map_err(fetch_host_error)?;
-        executor.execute(&url, &request).map_err(fetch_host_error)
+        let executor = executor.clone();
+        let control = Arc::new(FetchCallControl::new());
+        let task_control = control.clone();
+        let fetch = runtime
+            .spawn_blocking(move || executor.execute_controlled(&url, &request, task_control));
+        block_on_fetch_host_call(&runtime, &permission_bridge, duration, fetch, control)
+            .map_err(fetch_host_error)
     }
 }
 
 #[cfg(feature = "sandbox")]
 fn fetch_host_error(error: FetchError) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("network policy", "js/fetch", error.to_string())
+}
+
+#[cfg(feature = "sandbox")]
+fn block_on_fetch_host_call(
+    runtime: &tokio::runtime::Handle,
+    permission_bridge: &PermissionBridge,
+    duration: Duration,
+    mut call: tokio::task::JoinHandle<Result<FetchResult, FetchError>>,
+    control: Arc<FetchCallControl>,
+) -> Result<FetchResult, FetchError> {
+    runtime.block_on(async {
+        enum WaitOutcome {
+            Completed(Result<Result<FetchResult, FetchError>, tokio::task::JoinError>),
+            TimedOut,
+            Cancelled,
+        }
+
+        let outcome = tokio::select! {
+            result = timeout(duration, &mut call) => match result {
+                Ok(result) => WaitOutcome::Completed(result),
+                Err(_) => WaitOutcome::TimedOut,
+            },
+            _ = permission_bridge.cancelled() => WaitOutcome::Cancelled,
+        };
+        match outcome {
+            WaitOutcome::Completed(Ok(result)) => result,
+            WaitOutcome::Completed(Err(_)) => Err(FetchError::RequestFailed(
+                "fetch executor task failed".to_string(),
+            )),
+            WaitOutcome::TimedOut | WaitOutcome::Cancelled => {
+                let before_dispatch = if matches!(outcome, WaitOutcome::TimedOut) {
+                    FetchError::TimedOut
+                } else {
+                    FetchError::Cancelled
+                };
+                let error = control.cancel(before_dispatch);
+                if timeout(FETCH_CANCELLATION_DRAIN_TIMEOUT, &mut call)
+                    .await
+                    .is_err()
+                {
+                    tokio::spawn(async move {
+                        let _ = call.await;
+                    });
+                }
+                Err(error)
+            }
+        }
+    })
 }
 
 pub(crate) fn make_spawn(
@@ -1957,6 +2159,8 @@ pub(crate) fn register_host_globals(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    #[cfg(feature = "sandbox")]
+    use std::sync::Condvar;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2382,7 +2586,12 @@ mod tests {
 
     #[cfg(feature = "sandbox")]
     impl FetchResolver for FakeFetchResolver {
-        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, FetchError> {
+        fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+            _permission_bridge: &PermissionBridge,
+        ) -> Result<Vec<SocketAddr>, FetchError> {
             self.responses
                 .lock()
                 .unwrap()
@@ -2427,6 +2636,31 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("fake sender response exhausted")
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    struct BlockingFetchSender {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    #[cfg(feature = "sandbox")]
+    impl FetchSender for BlockingFetchSender {
+        fn send(
+            &self,
+            _url: Url,
+            _request: &FetchRequest,
+            _addresses: &[SocketAddr],
+            _permission_bridge: &PermissionBridge,
+        ) -> Result<FetchTransportOutcome, FetchError> {
+            self.started.notify_one();
+            let (released, wake) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(completed_fetch())
         }
     }
 
@@ -2509,6 +2743,222 @@ mod tests {
         .await
         .expect("fake fetch task panicked");
         (result, sender)
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_host_call_bounds_dispatched_request_and_leaves_js_context_usable() {
+        let outer_timeout = Duration::from_millis(25);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let owner =
+            PermissionBridgeOwner::new(Some(fetch_permission(Action::Allow)), None, STEP_TIMEOUT);
+        let executor = Arc::new(FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: Arc::new(BlockingFetchSender {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            permission_bridge: owner.bridge(),
+        });
+        let fetch = make_fetch_with_timeout(
+            owner.bridge(),
+            tokio::runtime::Handle::current(),
+            executor,
+            outer_timeout,
+        );
+
+        let host_call = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            let runtime = rquickjs::Runtime::new().expect("create QuickJS runtime");
+            let context = Context::full(&runtime).expect("create QuickJS context");
+            context.with(|ctx| {
+                ctx.globals()
+                    .set("fetch", Func::from(fetch))
+                    .expect("install fetch host global");
+                assert!(matches!(
+                    ctx.eval::<(), _>("fetch('https://example.com/')"),
+                    Err(rquickjs::Error::Exception)
+                ));
+                let error = ctx
+                    .catch()
+                    .as_exception()
+                    .expect("fetch host error must be an exception")
+                    .message()
+                    .expect("fetch host error must have a message");
+                let recovery = ctx
+                    .eval::<i32, _>("6 * 7")
+                    .expect("subsequent JS evaluation must remain usable");
+                (error, recovery)
+            })
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("blocked sender must start");
+        let started_at = Instant::now();
+        let completed = tokio::time::timeout(Duration::from_secs(1), host_call).await;
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_one();
+
+        let (error, recovery) = completed
+            .expect("outer fetch timeout must bound the host call")
+            .expect("fetch host-call task panicked");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "outer fetch timeout exceeded the host-call bound"
+        );
+
+        assert!(
+            error.contains(&FetchError::OutcomeUnknown.to_string()),
+            "unexpected dispatched-fetch timeout error: {error}"
+        );
+        assert_eq!(recovery, 42);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_timeout_cancels_delayed_permission_before_dispatch_and_reaps_executor() {
+        let outer_timeout = Duration::from_millis(25);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(
+            Some(fetch_permission(Action::Ask)),
+            Some(ask_tx),
+            STEP_TIMEOUT,
+        );
+        let sender = Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())]));
+        let executor = Arc::new(FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: sender.clone(),
+            permission_bridge: owner.bridge(),
+        });
+        let fetch = make_fetch_with_timeout(
+            owner.bridge(),
+            tokio::runtime::Handle::current(),
+            executor.clone(),
+            outer_timeout,
+        );
+
+        let host_call = tokio::task::spawn_blocking(move || {
+            fetch("https://example.com/".to_string(), Opt(None))
+                .expect_err("permission wait must exceed the outer timeout")
+                .to_string()
+        });
+        let permission = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
+            .await
+            .expect("fetch must reach permission before its outer timeout")
+            .expect("permission channel closed");
+        let error = tokio::time::timeout(Duration::from_secs(1), host_call)
+            .await
+            .expect("outer timeout must return")
+            .expect("fetch host-call task panicked");
+        let retained_executor_after_timeout = Arc::strong_count(&executor);
+
+        let _ = permission.reply.send(UserDecision::AllowOnce);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&executor) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fetch executor did not finish after the permission resolved");
+
+        assert!(error.contains(&FetchError::TimedOut.to_string()));
+        assert_eq!(
+            retained_executor_after_timeout, 1,
+            "timed-out host call left a detached executor"
+        );
+        assert_eq!(
+            sender.call_count(),
+            0,
+            "permission approved after timeout reached the network sender"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_host_call_cancellation_marks_dispatched_request_outcome_unknown() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let owner =
+            PermissionBridgeOwner::new(Some(fetch_permission(Action::Allow)), None, STEP_TIMEOUT);
+        let executor = Arc::new(FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: Arc::new(BlockingFetchSender {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            permission_bridge: owner.bridge(),
+        });
+        let fetch = make_fetch_with_timeout(
+            owner.bridge(),
+            tokio::runtime::Handle::current(),
+            executor,
+            FETCH_TOTAL_TIMEOUT,
+        );
+        let host_call = tokio::task::spawn_blocking(move || {
+            fetch("https://example.com/".to_string(), Opt(None))
+                .expect_err("cancelled fetch executor must not complete")
+                .to_string()
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("blocked sender must start");
+        owner.shutdown();
+        let completed = tokio::time::timeout(Duration::from_secs(1), host_call).await;
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_one();
+
+        let error = completed
+            .expect("fetch cancellation must bound the host call")
+            .expect("fetch host-call task panicked");
+        assert!(
+            error.contains(&FetchError::OutcomeUnknown.to_string()),
+            "unexpected dispatched-fetch cancellation error: {error}"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_host_call_preserves_completed_fetch() {
+        let owner =
+            PermissionBridgeOwner::new(Some(fetch_permission(Action::Allow)), None, STEP_TIMEOUT);
+        let executor = Arc::new(FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())])),
+            permission_bridge: owner.bridge(),
+        });
+        let fetch = make_fetch_with_timeout(
+            owner.bridge(),
+            tokio::runtime::Handle::current(),
+            executor,
+            FETCH_TOTAL_TIMEOUT,
+        );
+
+        let result = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            fetch("https://example.com/".to_string(), Opt(None))
+        })
+        .await
+        .expect("fetch host-call task panicked")
+        .expect("completed fetch must survive the outer host-call wrapper");
+
+        assert_eq!(
+            result,
+            FetchResult {
+                status: 200,
+                text: "ok".to_string(),
+            }
+        );
     }
 
     #[cfg(feature = "sandbox")]
