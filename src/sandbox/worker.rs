@@ -630,6 +630,7 @@ mod tests {
     #[test]
     fn windows_production_launcher_source_keeps_creation_time_authority_closed() {
         let source = include_str!("worker/windows.rs");
+        let creation_source = include_str!("../process_creation.rs");
         for required in [
             "PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES",
             "PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY",
@@ -658,18 +659,21 @@ mod tests {
         assert!(source.contains("pipes.child_input.clear_inherit()?"));
         assert!(source.contains("pipes.child_output.clear_inherit()?"));
         assert!(source.contains("pipes.child_error.clear_inherit()?"));
-        assert!(source.contains("static INHERITING_PROCESS_CREATION_LOCK: Mutex<()>"));
-        assert!(source.contains("inheriting_process_creation_lock()?"));
         assert!(source.contains("drop(inheritance_guard);"));
-        assert_eq!(
+        assert!(
             source
-                .matches("inheriting_process_creation_lock()?")
-                .count(),
-            3
+                .matches("crate::process_creation::creation_guard()?")
+                .count()
+                >= 3
         );
-        assert_eq!(source.matches("drop(inheritance_guard);").count(), 3);
+        assert!(creation_source.contains("static PROCESS_CREATION_LOCK: Mutex<()>"));
+        assert!(creation_source.contains("trait StdCommandCreationExt"));
+        assert!(creation_source.contains("trait TokioCommandCreationExt"));
+        assert!(creation_source.contains("trait RmcpCommandCreationExt"));
         assert!(source.contains("Windows LPAC runtime containment probe has not passed"));
         assert!(!source.contains("PREFLIGHT.get_or_init"));
+        assert!(source.contains("WorkerLaunchError::Unavailable {"));
+        assert!(source.contains("crate::process_creation::creation_guard()?"));
         assert!(source.contains("Capabilities: null_mut(),\n            CapabilityCount: 0"));
         assert!(!source.contains("AssignProcessToJobObject"));
         assert!(!source.contains("PROC_THREAD_ATTRIBUTE_PARENT_PROCESS"));

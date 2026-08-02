@@ -11,6 +11,7 @@ use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::io::Write;
 
+use crate::process_creation::StdCommandCreationExt;
 use crate::ui::pickers::file::FilePicker;
 use crate::ui::pickers::list::ListPicker;
 use crate::ui::pickers::models::ModelsPicker;
@@ -251,7 +252,7 @@ impl InputEditor {
             .arg(format!("{} \"$1\"", editor))
             .arg("sh")
             .arg(&tmp)
-            .status();
+            .status_guarded();
 
         let _ = crossterm::ExecutableCommand::execute(
             &mut stdout,

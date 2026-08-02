@@ -12,6 +12,7 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use super::config::{McpServerConfig, TrustedMcpServer};
+use crate::process_creation::RmcpCommandCreationExt;
 
 const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
@@ -51,7 +52,7 @@ impl McpClientHandle {
                 })?;
                 let (transport, stderr) = TokioChildProcess::builder(cmd)
                     .stderr(Stdio::piped())
-                    .spawn()
+                    .spawn_guarded()
                     .map_err(|error| {
                         anyhow::anyhow!(
                             "MCP command spawn failed for '{server_name}' ({command}): {error}"

@@ -5,7 +5,6 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::sync::{Mutex, MutexGuard};
 
 #[cfg(test)]
 use std::process::Child;
@@ -22,18 +21,6 @@ use super::{
 };
 
 const BACKEND: WorkerBackend = WorkerBackend::WindowsLpac;
-
-// `bInheritHandles=TRUE` consults process-global handle flags. Every Windows launch in this
-// module that uses inheritable handles must hold this one lock from before the first inherit bit
-// is set until every such bit is cleared or its handle is closed. Future Windows launchers that
-// use inheriting process creation must reuse this lock instead of introducing a local mutex.
-static INHERITING_PROCESS_CREATION_LOCK: Mutex<()> = Mutex::new(());
-
-fn inheriting_process_creation_lock() -> io::Result<MutexGuard<'static, ()>> {
-    INHERITING_PROCESS_CREATION_LOCK
-        .lock()
-        .map_err(|_| io::Error::other("Windows inheriting-process creation lock is poisoned"))
-}
 
 #[derive(Debug)]
 struct WinHandle {
@@ -155,12 +142,18 @@ pub(super) fn containment_status() -> WorkerContainmentStatus {
 }
 
 pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
-    feasibility::launch_production(feasibility::ProductionLaunchHooks::production()).map_err(
-        |error| WorkerLaunchError::Io {
-            backend: BACKEND,
-            source: io::Error::other(error.0),
-        },
-    )
+    match containment_status() {
+        WorkerContainmentStatus::Unavailable {
+            backend, reason, ..
+        } => Err(WorkerLaunchError::Unavailable { backend, reason }),
+        WorkerContainmentStatus::Available { .. } => {
+            feasibility::launch_production(feasibility::ProductionLaunchHooks::production())
+                .map_err(|error| WorkerLaunchError::Io {
+                    backend: BACKEND,
+                    source: io::Error::other(error.0),
+                })
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -291,7 +284,8 @@ fn process_exit_status(process: &WinHandle) -> io::Result<ExitStatus> {
 
 #[allow(dead_code)]
 mod feasibility {
-    use super::{WinHandle, WorkerChild, close_unowned_handle, inheriting_process_creation_lock};
+    use super::{WinHandle, WorkerChild, close_unowned_handle};
+    use crate::process_creation::CreationGuard;
     use crate::sandbox::worker::{
         INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, WorkerBackend, WorkerProcess,
     };
@@ -304,7 +298,6 @@ mod feasibility {
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
-    use std::sync::MutexGuard;
     use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{
@@ -1474,7 +1467,7 @@ mod feasibility {
         }
     }
 
-    struct ProtocolPipes {
+    pub(super) struct ProtocolPipes {
         parent_input: WinHandle,
         parent_output: WinHandle,
         parent_error: WinHandle,
@@ -1484,7 +1477,7 @@ mod feasibility {
     }
 
     fn inheritable_pipe(
-        _inheritance_guard: &MutexGuard<'static, ()>,
+        _inheritance_guard: &CreationGuard,
     ) -> Result<(WinHandle, WinHandle), GateError> {
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -1507,8 +1500,8 @@ mod feasibility {
     }
 
     impl ProtocolPipes {
-        fn exact_anonymous_set(
-            inheritance_guard: &MutexGuard<'static, ()>,
+        pub(super) fn exact_anonymous_set(
+            inheritance_guard: &CreationGuard,
         ) -> Result<Self, GateError> {
             let (child_input, mut parent_input) = inheritable_pipe(inheritance_guard)?;
             parent_input.clear_inherit()?;
@@ -1536,7 +1529,7 @@ mod feasibility {
 
         fn production_set(
             hooks: &ProductionLaunchHooks,
-            inheritance_guard: &MutexGuard<'static, ()>,
+            inheritance_guard: &CreationGuard,
         ) -> Result<Self, GateError> {
             hooks.checkpoint(ProductionFailurePoint::CreateStdinPipe)?;
             let (child_input, mut parent_input) = inheritable_pipe(inheritance_guard)?;
@@ -1557,11 +1550,32 @@ mod feasibility {
             })
         }
 
-        fn clear_child_inheritance(&mut self) -> Result<(), GateError> {
+        pub(super) fn clear_child_inheritance(&mut self) -> Result<(), GateError> {
             self.child_input.clear_inherit()?;
             self.child_output.clear_inherit()?;
             self.child_error.clear_inherit()?;
             Ok(())
+        }
+
+        #[cfg(test)]
+        pub(super) fn into_test_handles(
+            self,
+        ) -> (
+            WinHandle,
+            WinHandle,
+            WinHandle,
+            WinHandle,
+            WinHandle,
+            WinHandle,
+        ) {
+            (
+                self.parent_input,
+                self.parent_output,
+                self.parent_error,
+                self.child_input,
+                self.child_output,
+                self.child_error,
+            )
         }
     }
 
@@ -2035,7 +2049,7 @@ mod feasibility {
         let policy = SidPolicy::current()?;
         let (_executable, _location, image_lock) =
             prepare_executable_acl(&executable, profile.sid, &policy)?;
-        let inheritance_guard = inheriting_process_creation_lock()?;
+        let inheritance_guard = crate::process_creation::creation_guard()?;
         let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
         let job = production_job(&hooks)?;
 
@@ -2103,7 +2117,7 @@ mod feasibility {
         let policy = SidPolicy::current()?;
         let (executable, _location, image_lock) =
             prepare_executable_acl(&executable, profile.sid, &policy)?;
-        let inheritance_guard = inheriting_process_creation_lock()?;
+        let inheritance_guard = crate::process_creation::creation_guard()?;
         let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
         let job = production_job(&hooks)?;
 
@@ -2329,7 +2343,7 @@ mod feasibility {
         probe: ProbeKind,
     ) -> Result<(), GateError> {
         let sentinel = Sentinel::workspace_file()?;
-        let inheritance_guard = inheriting_process_creation_lock()?;
+        let inheritance_guard = crate::process_creation::creation_guard()?;
         let mut pipes = ProtocolPipes::exact_anonymous_set(&inheritance_guard)?;
         // Both canary endpoints are deliberately inheritable but absent from
         // HANDLE_LIST. The child receives only the numeric value and must prove
@@ -2681,6 +2695,7 @@ fn run_lpac_image_loading_gate() -> Result<(), feasibility::GateError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -2845,14 +2860,34 @@ mod tests {
     }
 
     #[test]
+    fn windows_production_launch_returns_typed_unavailable_without_child() {
+        let _creation_guard = crate::process_creation::creation_guard()
+            .expect("isolate the production-launch observation from raw launcher tests");
+        super::feasibility::LAST_PRODUCTION_TEST_PID.store(0, Ordering::Release);
+        let error = super::launch().expect_err("unprobed production launcher must fail closed");
+        assert!(matches!(
+            error,
+            crate::sandbox::worker::WorkerLaunchError::Unavailable {
+                backend: crate::sandbox::worker::WorkerBackend::WindowsLpac,
+                ..
+            }
+        ));
+        assert_eq!(
+            super::feasibility::LAST_PRODUCTION_TEST_PID.load(Ordering::Acquire),
+            0,
+            "typed unavailable path reached CreateProcessW"
+        );
+    }
+
+    #[test]
     fn windows_production_inheriting_process_lock_serializes_launch_windows() {
-        let first = super::inheriting_process_creation_lock()
+        let first = crate::process_creation::creation_guard()
             .expect("first inheriting-process creation lock acquisition");
         let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let contender = std::thread::spawn(move || {
             attempting_tx.send(()).expect("announce lock attempt");
-            let _guard = super::inheriting_process_creation_lock()
+            let _guard = crate::process_creation::creation_guard()
                 .expect("contending inheriting-process creation lock acquisition");
             acquired_tx.send(()).expect("announce lock acquisition");
         });
@@ -2871,6 +2906,112 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("contender did not acquire released lock");
         contender.join().expect("lock contender panicked");
+    }
+
+    #[test]
+    fn windows_production_creation_boundary_excludes_ordinary_piped_child() {
+        use crate::process_creation::StdCommandCreationExt;
+        use std::process::Command as ProcessBuilder;
+
+        let inheritance_guard = crate::process_creation::creation_guard()
+            .expect("acquire LPAC inheritable-handle window");
+        let mut pipes = super::feasibility::ProtocolPipes::exact_anonymous_set(&inheritance_guard)
+            .expect("create LPAC protocol pipes");
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (spawned_tx, spawned_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let mut command =
+                ProcessBuilder::new(std::env::current_exe().expect("resolve libtest executable"));
+            command
+                .args([
+                    "--exact",
+                    "sandbox::worker::platform::tests::windows_production_failure_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(
+                    super::super::INTERNAL_WORKER_MARKER,
+                    super::super::INTERNAL_WORKER_MARKER_VALUE,
+                )
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            attempting_tx.send(()).expect("announce ordinary spawn");
+            spawned_tx
+                .send(StdCommandCreationExt::spawn_guarded(&mut command))
+                .expect("report ordinary spawn result");
+        });
+
+        attempting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ordinary child did not reach creation boundary");
+        assert!(
+            spawned_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "ordinary piped child spawned inside the LPAC inheritance window"
+        );
+
+        pipes
+            .clear_child_inheritance()
+            .expect("clear LPAC protocol inheritance before releasing boundary");
+        drop(inheritance_guard);
+        let mut child = spawned_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ordinary child remained blocked after LPAC window closed")
+            .expect("spawn ordinary piped child");
+        contender.join().expect("ordinary spawn contender panicked");
+        assert!(
+            child.try_wait().expect("poll ordinary child").is_none(),
+            "ordinary child exited before handle-retention proof"
+        );
+        drop(
+            crate::process_creation::creation_guard()
+                .expect("ordinary spawn retained creation lock while child was running"),
+        );
+
+        let (parent_input, parent_output, parent_error, child_input, child_output, child_error) =
+            pipes.into_test_handles();
+        drop(child_input);
+        drop(child_output);
+        drop(child_error);
+
+        let mut parent_input = parent_input.into_file();
+        assert!(
+            parent_input.write_all(b"x").is_err(),
+            "ordinary child retained the LPAC stdin read endpoint"
+        );
+        drop(parent_input);
+
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        let readers =
+            [("stdout", parent_output), ("stderr", parent_error)].map(|(label, handle)| {
+                let eof_tx = eof_tx.clone();
+                std::thread::spawn(move || {
+                    let mut handle = handle.into_file();
+                    let mut byte = [0u8; 1];
+                    eof_tx
+                        .send((label, handle.read(&mut byte)))
+                        .expect("report LPAC pipe EOF");
+                })
+            });
+        drop(eof_tx);
+        for expected in ["stdout", "stderr"] {
+            let (label, result) = match eof_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("ordinary child retained LPAC {expected} endpoint: {error}");
+                }
+            };
+            assert_eq!(result.expect("read LPAC parent endpoint"), 0, "{label}");
+        }
+        for reader in readers {
+            reader.join().expect("LPAC EOF reader panicked");
+        }
+        child
+            .kill()
+            .expect("terminate ordinary boundary-test child");
+        child.wait().expect("reap ordinary boundary-test child");
     }
 
     #[test]
@@ -2930,7 +3071,7 @@ mod tests {
                 "kernel HANDLE leaked at {point:?}"
             );
             drop(
-                super::inheriting_process_creation_lock()
+                crate::process_creation::creation_guard()
                     .expect("failed launch poisoned the shared creation lock"),
             );
         }

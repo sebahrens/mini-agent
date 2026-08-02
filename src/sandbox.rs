@@ -9,6 +9,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::process_creation::{StdCommandCreationExt, TokioCommandCreationExt};
+
 #[cfg(feature = "js")]
 pub(crate) mod worker;
 
@@ -662,7 +664,7 @@ impl Sandbox {
             return;
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = match cmd.spawn() {
+        let mut child = match cmd.spawn_guarded() {
             Ok(child) => child,
             Err(error) => {
                 let _ = response_tx.send(CommandOutput {
@@ -981,12 +983,12 @@ pub(crate) fn kill_process_group(pid: u32) {
             .args(["-TERM", "--", &group])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status_guarded();
         let _ = std::process::Command::new("kill")
             .args(["-KILL", "--", &group])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status_guarded();
     }
 }
 

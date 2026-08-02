@@ -15,10 +15,11 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/docs.rs",
-        "let status = std::process::Command::new(\"less\").arg(&doc_path).status()?;",
+        "let status = std::process::Command::new(\"less\")",
         1,
         "TC-SUPPORT-UTILITY",
     ),
+    ("src/docs.rs", ".status()?;", 1, "TC-SUPPORT-UTILITY"),
     (
         "src/extras/acp/mod.rs",
         ".spawn(move || {",
@@ -53,7 +54,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/git_worktree/mod.rs",
         ".output();",
-        4,
+        5,
         "TC-INTERNAL-GIT",
     ),
     (
@@ -77,13 +78,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/git_worktree/mod.rs",
         "let output = Command::new(\"git\")",
-        13,
-        "TC-INTERNAL-GIT",
-    ),
-    (
-        "src/extras/git_worktree/mod.rs",
-        "let output = Command::new(\"git\").args([\"status\", \"--porcelain\"]).output();",
-        1,
+        14,
         "TC-INTERNAL-GIT",
     ),
     (
@@ -405,10 +400,11 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/slash/session.rs",
-        "match std::process::Command::new(\"git\").args([\"stash\"]).output() {",
+        "match std::process::Command::new(\"git\")",
         1,
         "TC-INTERNAL-GIT",
     ),
+    ("src/ui/slash/session.rs", ".output()", 1, "TC-INTERNAL-GIT"),
 ];
 
 /// Sites whose identical terminal expression inherits different classes from
@@ -840,8 +836,17 @@ fn is_inventory_line(line: &str) -> bool {
     line.contains("Command::new")
         || line.contains("tokio::process")
         || line.contains(".spawn(")
+        || line.contains(".spawn_guarded(")
         || line.contains(".output(")
+        || line.contains(".output_guarded(")
         || line.contains(".status(")
+        || line.contains(".status_guarded(")
+}
+
+fn normalized_inventory_line(line: &str) -> String {
+    line.replace(".spawn_guarded(", ".spawn(")
+        .replace(".output_guarded(", ".output(")
+        .replace(".status_guarded(", ".status(")
 }
 
 #[test]
@@ -860,13 +865,16 @@ fn production_subprocess_sites_have_a_trust_classification() {
         if relative.starts_with("src/tests/") || relative.starts_with("src/extras/js/tests/") {
             continue;
         }
+        if relative == "src/process_creation.rs" {
+            continue;
+        }
         let contents = std::fs::read_to_string(&source).expect("Rust source must be UTF-8");
         for line in contents
             .lines()
             .map(str::trim)
             .filter(|line| is_inventory_line(line))
         {
-            let fingerprint = (relative.clone(), line.to_string());
+            let fingerprint = (relative.clone(), normalized_inventory_line(line));
             let occurrence = seen.entry(fingerprint.clone()).or_default();
             *occurrence += 1;
             observed.insert((fingerprint.0, fingerprint.1, *occurrence));
@@ -906,6 +914,63 @@ fn production_subprocess_sites_have_a_trust_classification() {
             );
         }
     }
+}
+
+#[test]
+fn windows_capable_production_process_terminals_use_creation_boundary() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source_root = root.join("src");
+    let expected = checked_inventory();
+    let mut seen = BTreeMap::<(String, String), usize>::new();
+    let mut unguarded = Vec::new();
+
+    for source in rust_sources(&source_root) {
+        let relative = source
+            .strip_prefix(root)
+            .expect("source must be below manifest root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative.starts_with("src/tests/")
+            || relative.starts_with("src/extras/js/tests/")
+            || relative == "src/process_creation.rs"
+            || matches!(
+                relative.as_str(),
+                "src/sandbox/worker/linux.rs" | "src/sandbox/worker/macos.rs"
+            )
+        {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&source).expect("Rust source must be UTF-8");
+        for line in contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| is_inventory_line(line))
+        {
+            let normalized = normalized_inventory_line(line);
+            let fingerprint = (relative.clone(), normalized.clone());
+            let occurrence = seen.entry(fingerprint.clone()).or_default();
+            *occurrence += 1;
+            let Some(classification) =
+                expected.get(&(fingerprint.0.clone(), fingerprint.1.clone(), *occurrence))
+            else {
+                continue;
+            };
+            let is_terminal = normalized.contains(".spawn(")
+                || normalized.contains(".output(")
+                || normalized.contains(".status(");
+            let is_guarded = line.contains(".spawn_guarded(")
+                || line.contains(".output_guarded(")
+                || line.contains(".status_guarded(");
+            if classification.starts_with("TC-") && is_terminal && !is_guarded {
+                unguarded.push((relative.clone(), line.to_string(), *classification));
+            }
+        }
+    }
+
+    assert!(
+        unguarded.is_empty(),
+        "Windows-capable production process terminals bypass the crate creation boundary: {unguarded:#?}"
+    );
 }
 
 #[test]

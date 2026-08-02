@@ -9,6 +9,7 @@ use crate::paths::AppPaths;
 use crate::permission::SecurityMode;
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::{PermCheck, PermissionChecker};
+use crate::process_creation::StdCommandCreationExt;
 use crate::provider::{self, AnyClient};
 use crate::sandbox::{Sandbox, SandboxPolicy};
 use crate::session::{self, MessageRole, Session};
@@ -976,7 +977,7 @@ impl Startup {
                 let output = std::process::Command::new("bash")
                     .arg("-c")
                     .arg(cmd)
-                    .output()?;
+                    .output_guarded()?;
                 let mut result = String::new();
                 if !output.stdout.is_empty() {
                     result.push_str(&String::from_utf8_lossy(&output.stdout));
