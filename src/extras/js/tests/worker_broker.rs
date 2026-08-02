@@ -22,10 +22,13 @@ struct ServiceFailures {
     target: Option<HostEffectError>,
     backend: Option<HostEffectError>,
     permission: Option<HostEffectError>,
+    execution: Option<HostEffectError>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct ServiceRecord {
+    authorizations: usize,
+    execute_calls: usize,
     executions: usize,
     authorized: Vec<AuthorizedEffect>,
 }
@@ -33,6 +36,7 @@ struct ServiceRecord {
 struct RecordingService {
     failures: ServiceFailures,
     pending_permission: bool,
+    permission_delay_until: Option<Instant>,
     record: Arc<Mutex<ServiceRecord>>,
 }
 
@@ -60,8 +64,14 @@ impl ParentEffectService for RecordingService {
         _cancellation: PermCancellation,
     ) -> ServiceFuture<'a, Result<(), HostEffectError>> {
         let result = self.failures.permission.map_or(Ok(()), Err);
+        self.record.lock().unwrap().authorizations += 1;
         if self.pending_permission {
             Box::pin(std::future::pending())
+        } else if let Some(delay_until) = self.permission_delay_until {
+            Box::pin(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(delay_until)).await;
+                result
+            })
         } else {
             Box::pin(async move { result })
         }
@@ -73,11 +83,16 @@ impl ParentEffectService for RecordingService {
         operation: &'a EffectOperation,
         _cancellation: PermCancellation,
     ) -> ServiceFuture<'a, Result<EffectResult, HostEffectError>> {
+        let failure = self.failures.execution;
         let result = success_for(operation);
         let authorized = authorized.clone();
         let record = Arc::clone(&self.record);
         Box::pin(async move {
             let mut record = record.lock().unwrap();
+            record.execute_calls += 1;
+            if let Some(error) = failure {
+                return Err(error);
+            }
             record.executions += 1;
             record.authorized.push(authorized);
             Ok(result)
@@ -232,6 +247,7 @@ fn broker(
     let service = RecordingService {
         failures,
         pending_permission: false,
+        permission_delay_until: None,
         record: Arc::clone(&record),
     };
     (
@@ -584,6 +600,7 @@ async fn worker_broker_grants_cancel_a_pending_ask_before_execution() {
     let service = RecordingService {
         failures: ServiceFailures::default(),
         pending_permission: true,
+        permission_delay_until: None,
         record: Arc::clone(&record),
     };
     let mut broker =
@@ -633,4 +650,81 @@ async fn worker_broker_grants_never_allow_a_skill_to_propose_another_skill() {
         |_| {},
     )
     .await;
+}
+
+#[tokio::test]
+async fn worker_broker_grants_expiring_during_ask_never_execute() {
+    let invocation_id = invocation("inv-expiring-ask");
+    let case = operation_cases(&invocation_id).remove(0);
+    let expires_at = Instant::now() + Duration::from_secs(1);
+    let grant = grant(&case, &invocation_id, expires_at);
+    let effect = request(&case, &grant);
+    let record = Arc::new(Mutex::new(ServiceRecord::default()));
+    let service = RecordingService {
+        failures: ServiceFailures::default(),
+        pending_permission: false,
+        permission_delay_until: Some(expires_at),
+        record: Arc::clone(&record),
+    };
+    let mut broker =
+        InvocationBroker::new(invocation_id, vec![grant], HostCapability::all(), service).unwrap();
+
+    assert_eq!(
+        broker
+            .dispatch(effect.clone(), PermCancellation::new())
+            .await,
+        Err(HostEffectError::ExpiredGrant)
+    );
+    assert_eq!(
+        broker.dispatch(effect, PermCancellation::new()).await,
+        Err(HostEffectError::ReplayedGrant)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.authorizations, 1, "the Ask preflight must run");
+    assert_eq!(record.execute_calls, 0, "an expired grant reached execute");
+    assert_eq!(record.executions, 0);
+}
+
+#[tokio::test]
+async fn worker_broker_grants_execute_cancellation_erases_authority_before_redispatch() {
+    let invocation_id = invocation("inv-execute-cancel");
+    let mut cases = operation_cases(&invocation_id);
+    let first_case = cases.remove(0);
+    let second_case = cases.remove(0);
+    let first_grant = grant(
+        &first_case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let second_grant = grant(
+        &second_case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let first_effect = request(&first_case, &first_grant);
+    let second_effect = request(&second_case, &second_grant);
+    let (mut broker, record) = broker(
+        invocation_id,
+        vec![first_grant, second_grant],
+        HostCapability::all(),
+        ServiceFailures {
+            execution: Some(HostEffectError::InvocationCancelled),
+            ..ServiceFailures::default()
+        },
+    );
+
+    assert_eq!(
+        broker.dispatch(first_effect, PermCancellation::new()).await,
+        Err(HostEffectError::InvocationCancelled)
+    );
+    assert_eq!(broker.tracked_grant_count(), 0);
+    assert_eq!(
+        broker
+            .dispatch(second_effect, PermCancellation::new())
+            .await,
+        Err(HostEffectError::InvocationCancelled)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.execute_calls, 1, "redispatch reached the service");
+    assert_eq!(record.executions, 0);
 }

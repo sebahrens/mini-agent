@@ -291,11 +291,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             return Err(HostEffectError::WrongInvocation);
         }
 
-        if Instant::now() >= grant.expires_at {
-            self.grants.remove(&request.grant_id);
-            self.retired_grants.insert(request.grant_id);
-            return Err(HostEffectError::ExpiredGrant);
-        }
+        self.ensure_grant_unexpired(&request.grant_id, grant.expires_at)?;
 
         if !attribution_matches(&grant.principal, &request.advisory) {
             return Err(HostEffectError::AttributionMismatch);
@@ -345,9 +341,16 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             self.cancel_invocation();
             return Err(HostEffectError::InvocationCancelled);
         }
-        self.service
+        self.ensure_grant_unexpired(&request.grant_id, grant.expires_at)?;
+
+        let execution_result = self
+            .service
             .execute(&authorized, &request.operation, cancellation)
-            .await
+            .await;
+        if matches!(execution_result, Err(HostEffectError::InvocationCancelled)) {
+            self.cancel_invocation();
+        }
+        execution_result
     }
 
     pub(crate) fn revoke_grant(&mut self, grant_id: &GrantId) -> bool {
@@ -382,6 +385,19 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             InvocationState::Cancelled => Err(HostEffectError::InvocationCancelled),
             InvocationState::Recycled => Err(HostEffectError::InvocationRecycled),
         }
+    }
+
+    fn ensure_grant_unexpired(
+        &mut self,
+        grant_id: &GrantId,
+        expires_at: Instant,
+    ) -> Result<(), HostEffectError> {
+        if Instant::now() < expires_at {
+            return Ok(());
+        }
+        self.grants.remove(grant_id);
+        self.retired_grants.insert(grant_id.clone());
+        Err(HostEffectError::ExpiredGrant)
     }
 
     fn erase_authority(&mut self, state: InvocationState) {
