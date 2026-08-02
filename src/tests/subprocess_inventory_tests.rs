@@ -903,6 +903,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/extras/js/host.rs",
+        "assert_eq!(output.status, CommandStatus::Completed);",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/host.rs",
+        "assert_eq!(output.stdout, b\"approved\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/host.rs",
+        "assert_eq!(output.stdout, b\"elf-snapshot\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/skills/admission.rs",
         ".spawn(move || {",
         1,
@@ -945,6 +963,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/extras/js/worker.rs",
+        "\"status\": status.as_str(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/supervisor.rs",
         ".spawn(move || {",
         3,
@@ -953,6 +977,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/js/supervisor.rs",
         ".spawn(move || run_verification_scheduler(supervisor, receiver, worker_queue))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/supervisor.rs",
+        ".spawn(move || retire_idle_generation(weak, generation, retire_at, waiting_ticket));",
         1,
         "NON-PROCESS",
     ),
@@ -1839,6 +1869,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/js/host.rs",
         &[
             (
+                "04c86182a5a99a0f160452606423562347d2b4f8bb1aad73f1651fee6fdc98bf",
+                1,
+            ),
+            (
                 "0397b840693f6b293544b512fce5572f9d450833533087168f099b3af77a5cb9",
                 1,
             ),
@@ -1849,6 +1883,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             (
                 "2f073adf370dfed835a37ffd305529ca895486178a4033f395abb56386e6cb63",
                 1,
+            ),
+            (
+                "2af98358d4d0cc429b3ce4d3d0c3e5c8b100dd2d15a699dceef636c9092c420f",
+                1,
+            ),
+            (
+                "2990b99216f07cf0bf799c8742347e406c9d3f08ec875af2101bfdf3182519c7",
+                2,
             ),
             (
                 "4b4be55dac813da63579ff80d76a858484598b955c750180378e47acac2ec2b1",
@@ -1879,6 +1921,13 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
         ],
+    ),
+    (
+        "src/extras/js/worker.rs",
+        &[(
+            "2ae1572a8e3e684cff68f2fdcdb44d0c5ee3808f1bb261e9b1818446ee024674",
+            1,
+        )],
     ),
     (
         "src/extras/js/skills/capability.rs",
@@ -2154,8 +2203,38 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/extras/js/host.rs",
+        "assert_eq!(output.status, CommandStatus::Completed);",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/host.rs",
+        "assert_eq!(output.stdout, b\"approved\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/host.rs",
+        "assert_eq!(output.stdout, b\"elf-snapshot\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/worker.rs",
+        "\"status\": status.as_str(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/supervisor.rs",
         ".spawn(move || run_verification_scheduler(supervisor, receiver, worker_queue))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/supervisor.rs",
+        ".spawn(move || retire_idle_generation(weak, generation, retire_at, waiting_ticket));",
         1,
         "NON-PROCESS",
     ),
@@ -2649,10 +2728,19 @@ fn creation_boundary_violations(
                 call.name,
                 classes.join("/")
             )),
-            None => violations.push(format!(
-                "{relative}:{} unrecognized unguarded {} terminal",
-                call.line, call.name
-            )),
+            None => {
+                if let Some(context) = &call.macro_context {
+                    violations.push(format!(
+                        "{relative}:{} unrecognized macro context {}#{} for {} terminal",
+                        call.line, context.digest, context.occurrence, call.name
+                    ));
+                } else {
+                    violations.push(format!(
+                        "{relative}:{} unrecognized unguarded {} terminal",
+                        call.line, call.name
+                    ));
+                }
+            }
         }
     }
     Ok(violations)
