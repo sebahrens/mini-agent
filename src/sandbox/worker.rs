@@ -658,6 +658,18 @@ mod tests {
         assert!(source.contains("pipes.child_input.clear_inherit()?"));
         assert!(source.contains("pipes.child_output.clear_inherit()?"));
         assert!(source.contains("pipes.child_error.clear_inherit()?"));
+        assert!(source.contains("static INHERITING_PROCESS_CREATION_LOCK: Mutex<()>"));
+        assert!(source.contains("inheriting_process_creation_lock()?"));
+        assert!(source.contains("drop(inheritance_guard);"));
+        assert_eq!(
+            source
+                .matches("inheriting_process_creation_lock()?")
+                .count(),
+            3
+        );
+        assert_eq!(source.matches("drop(inheritance_guard);").count(), 3);
+        assert!(source.contains("Windows LPAC runtime containment probe has not passed"));
+        assert!(!source.contains("PREFLIGHT.get_or_init"));
         assert!(source.contains("Capabilities: null_mut(),\n            CapabilityCount: 0"));
         assert!(!source.contains("AssignProcessToJobObject"));
         assert!(!source.contains("PROC_THREAD_ATTRIBUTE_PARENT_PROCESS"));

@@ -5,7 +5,7 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard};
 
 #[cfg(test)]
 use std::process::Child;
@@ -23,9 +23,22 @@ use super::{
 
 const BACKEND: WorkerBackend = WorkerBackend::WindowsLpac;
 
+// `bInheritHandles=TRUE` consults process-global handle flags. Every Windows launch in this
+// module that uses inheritable handles must hold this one lock from before the first inherit bit
+// is set until every such bit is cleared or its handle is closed. Future Windows launchers that
+// use inheriting process creation must reuse this lock instead of introducing a local mutex.
+static INHERITING_PROCESS_CREATION_LOCK: Mutex<()> = Mutex::new(());
+
+fn inheriting_process_creation_lock() -> io::Result<MutexGuard<'static, ()>> {
+    INHERITING_PROCESS_CREATION_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("Windows inheriting-process creation lock is poisoned"))
+}
+
 #[derive(Debug)]
 struct WinHandle {
     handle: Option<OwnedHandle>,
+    inheritable: bool,
 }
 
 impl WinHandle {
@@ -40,7 +53,14 @@ impl WinHandle {
         LIVE_WIN_HANDLES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(Self {
             handle: Some(handle),
+            inheritable: false,
         })
+    }
+
+    fn from_inheritable_created(raw: HANDLE, context: &str) -> io::Result<Self> {
+        let mut handle = Self::from_created(raw, context)?;
+        handle.inheritable = true;
+        Ok(handle)
     }
 
     fn raw(&self) -> HANDLE {
@@ -50,14 +70,19 @@ impl WinHandle {
             .as_raw_handle()
     }
 
-    fn clear_inherit(&self) -> io::Result<()> {
+    fn clear_inherit(&mut self) -> io::Result<()> {
         use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+        if !self.inheritable {
+            return Ok(());
+        }
 
         // SAFETY: the handle remains owned by `self` for the call, and
         // SetHandleInformation neither stores nor closes it.
         if unsafe { SetHandleInformation(self.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
             return Err(contextual_last_error("clear protocol-pipe inheritance"));
         }
+        self.inheritable = false;
         Ok(())
     }
 
@@ -72,6 +97,19 @@ impl WinHandle {
 
 impl Drop for WinHandle {
     fn drop(&mut self) {
+        if self.inheritable {
+            // Best-effort fail-safe for every early return and panic while the shared creation
+            // lock is still held. Closing the handle follows immediately even if clearing fails.
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+            if let Some(handle) = &self.handle {
+                // SAFETY: this owned handle remains live until the end of Drop. The call only
+                // clears a flag and neither retains nor closes the handle.
+                unsafe {
+                    SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+            self.inheritable = false;
+        }
         #[cfg(test)]
         LIVE_WIN_HANDLES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -109,17 +147,10 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
 }
 
 pub(super) fn containment_status() -> WorkerContainmentStatus {
-    static PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
-    match PREFLIGHT.get_or_init(|| feasibility::production_preflight().map_err(|error| error.0)) {
-        Ok(()) => WorkerContainmentStatus::Available {
-            backend: BACKEND,
-            assurance: WorkerContainmentAssurance::Enforced,
-        },
-        Err(reason) => WorkerContainmentStatus::Unavailable {
-            backend: BACKEND,
-            assurance: WorkerContainmentAssurance::Enforced,
-            reason: reason.clone(),
-        },
+    WorkerContainmentStatus::Unavailable {
+        backend: BACKEND,
+        assurance: WorkerContainmentAssurance::Enforced,
+        reason: "Windows LPAC runtime containment probe has not passed".to_string(),
     }
 }
 
@@ -260,7 +291,7 @@ fn process_exit_status(process: &WinHandle) -> io::Result<ExitStatus> {
 
 #[allow(dead_code)]
 mod feasibility {
-    use super::{WinHandle, WorkerChild, close_unowned_handle};
+    use super::{WinHandle, WorkerChild, close_unowned_handle, inheriting_process_creation_lock};
     use crate::sandbox::worker::{
         INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, WorkerBackend, WorkerProcess,
     };
@@ -273,6 +304,7 @@ mod feasibility {
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
+    use std::sync::MutexGuard;
     use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{
@@ -1451,7 +1483,9 @@ mod feasibility {
         child_error: WinHandle,
     }
 
-    fn inheritable_pipe() -> Result<(WinHandle, WinHandle), GateError> {
+    fn inheritable_pipe(
+        _inheritance_guard: &MutexGuard<'static, ()>,
+    ) -> Result<(WinHandle, WinHandle), GateError> {
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: null_mut(),
@@ -1467,18 +1501,20 @@ mod feasibility {
             close_unowned_handle(write);
             return Err(last_error("create anonymous protocol pipe"));
         }
-        let read = WinHandle::from_created(read, "create protocol read handle")?;
-        let write = WinHandle::from_created(write, "create protocol write handle")?;
+        let read = WinHandle::from_inheritable_created(read, "create protocol read handle")?;
+        let write = WinHandle::from_inheritable_created(write, "create protocol write handle")?;
         Ok((read, write))
     }
 
     impl ProtocolPipes {
-        fn exact_anonymous_set() -> Result<Self, GateError> {
-            let (child_input, parent_input) = inheritable_pipe()?;
+        fn exact_anonymous_set(
+            inheritance_guard: &MutexGuard<'static, ()>,
+        ) -> Result<Self, GateError> {
+            let (child_input, mut parent_input) = inheritable_pipe(inheritance_guard)?;
             parent_input.clear_inherit()?;
-            let (parent_output, child_output) = inheritable_pipe()?;
+            let (mut parent_output, child_output) = inheritable_pipe(inheritance_guard)?;
             parent_output.clear_inherit()?;
-            let (parent_error, child_error) = inheritable_pipe()?;
+            let (mut parent_error, child_error) = inheritable_pipe(inheritance_guard)?;
             parent_error.clear_inherit()?;
             Ok(Self {
                 parent_input,
@@ -1498,15 +1534,18 @@ mod feasibility {
             ]
         }
 
-        fn production_set(hooks: &ProductionLaunchHooks) -> Result<Self, GateError> {
+        fn production_set(
+            hooks: &ProductionLaunchHooks,
+            inheritance_guard: &MutexGuard<'static, ()>,
+        ) -> Result<Self, GateError> {
             hooks.checkpoint(ProductionFailurePoint::CreateStdinPipe)?;
-            let (child_input, parent_input) = inheritable_pipe()?;
+            let (child_input, mut parent_input) = inheritable_pipe(inheritance_guard)?;
             parent_input.clear_inherit()?;
             hooks.checkpoint(ProductionFailurePoint::CreateStdoutPipe)?;
-            let (parent_output, child_output) = inheritable_pipe()?;
+            let (mut parent_output, child_output) = inheritable_pipe(inheritance_guard)?;
             parent_output.clear_inherit()?;
             hooks.checkpoint(ProductionFailurePoint::CreateStderrPipe)?;
-            let (parent_error, child_error) = inheritable_pipe()?;
+            let (mut parent_error, child_error) = inheritable_pipe(inheritance_guard)?;
             parent_error.clear_inherit()?;
             Ok(Self {
                 parent_input,
@@ -1516,6 +1555,13 @@ mod feasibility {
                 child_output,
                 child_error,
             })
+        }
+
+        fn clear_child_inheritance(&mut self) -> Result<(), GateError> {
+            self.child_input.clear_inherit()?;
+            self.child_output.clear_inherit()?;
+            self.child_error.clear_inherit()?;
+            Ok(())
         }
     }
 
@@ -1989,7 +2035,8 @@ mod feasibility {
         let policy = SidPolicy::current()?;
         let (_executable, _location, image_lock) =
             prepare_executable_acl(&executable, profile.sid, &policy)?;
-        let pipes = ProtocolPipes::production_set(&hooks)?;
+        let inheritance_guard = inheriting_process_creation_lock()?;
+        let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
         let job = production_job(&hooks)?;
 
         let security_capabilities = SECURITY_CAPABILITIES {
@@ -2035,6 +2082,8 @@ mod feasibility {
             return Err(last_error("query parent Job membership"));
         }
         let _ = parent_is_in_job;
+        pipes.clear_child_inheritance()?;
+        drop(inheritance_guard);
         drop(attributes);
         drop(job);
         drop(pipes);
@@ -2054,7 +2103,8 @@ mod feasibility {
         let policy = SidPolicy::current()?;
         let (executable, _location, image_lock) =
             prepare_executable_acl(&executable, profile.sid, &policy)?;
-        let pipes = ProtocolPipes::production_set(&hooks)?;
+        let inheritance_guard = inheriting_process_creation_lock()?;
+        let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
         let job = production_job(&hooks)?;
 
         let security_capabilities = SECURITY_CAPABILITIES {
@@ -2169,6 +2219,7 @@ mod feasibility {
         pipes.child_output.clear_inherit()?;
         hooks.checkpoint(ProductionFailurePoint::ClearStderrInheritance)?;
         pipes.child_error.clear_inherit()?;
+        drop(inheritance_guard);
         drop(thread);
 
         hooks.checkpoint(ProductionFailurePoint::VerifyCreationTimeJob)?;
@@ -2278,12 +2329,13 @@ mod feasibility {
         probe: ProbeKind,
     ) -> Result<(), GateError> {
         let sentinel = Sentinel::workspace_file()?;
-        let pipes = ProtocolPipes::exact_anonymous_set()?;
+        let inheritance_guard = inheriting_process_creation_lock()?;
+        let mut pipes = ProtocolPipes::exact_anonymous_set(&inheritance_guard)?;
         // Both canary endpoints are deliberately inheritable but absent from
         // HANDLE_LIST. The child receives only the numeric value and must prove
         // it is invalid, demonstrating that the allow-list excluded ambient
         // inheritable handles rather than merely listing the intended three.
-        let (canary_read, canary_write) = inheritable_pipe()?;
+        let (mut canary_read, mut canary_write) = inheritable_pipe(&inheritance_guard)?;
         let job = temporary_job()?;
         let security_capabilities = SECURITY_CAPABILITIES {
             AppContainerSid: appcontainer_sid,
@@ -2357,6 +2409,10 @@ mod feasibility {
         };
         let thread =
             WinHandle::from_created(process_information.hThread, "own LPAC thread handle")?;
+        pipes.clear_child_inheritance()?;
+        canary_read.clear_inherit()?;
+        canary_write.clear_inherit()?;
+        drop(inheritance_guard);
         drop(thread);
         drop(attributes);
 
@@ -2767,6 +2823,57 @@ mod tests {
     }
 
     #[test]
+    fn windows_production_status_waits_for_runtime_containment_probe() {
+        match super::containment_status() {
+            crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+                backend,
+                assurance,
+                reason,
+            } => {
+                assert_eq!(backend, crate::sandbox::worker::WorkerBackend::WindowsLpac);
+                assert_eq!(
+                    assurance,
+                    crate::sandbox::worker::WorkerContainmentAssurance::Enforced
+                );
+                assert_eq!(
+                    reason,
+                    "Windows LPAC runtime containment probe has not passed"
+                );
+            }
+            status => panic!("construction-only preflight reported available: {status:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_production_inheriting_process_lock_serializes_launch_windows() {
+        let first = super::inheriting_process_creation_lock()
+            .expect("first inheriting-process creation lock acquisition");
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            attempting_tx.send(()).expect("announce lock attempt");
+            let _guard = super::inheriting_process_creation_lock()
+                .expect("contending inheriting-process creation lock acquisition");
+            acquired_tx.send(()).expect("announce lock acquisition");
+        });
+
+        attempting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender did not attempt lock acquisition");
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "two inheritable-handle windows overlapped"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender did not acquire released lock");
+        contender.join().expect("lock contender panicked");
+    }
+
+    #[test]
     fn windows_production_failure_injection_closes_raii_handles_and_reaps_children() {
         use super::feasibility::{
             LAST_PRODUCTION_TEST_PID, ProductionFailurePoint, ProductionLaunchHooks,
@@ -2821,6 +2928,10 @@ mod tests {
                 current_process_handle_count(),
                 os_handle_baseline,
                 "kernel HANDLE leaked at {point:?}"
+            );
+            drop(
+                super::inheriting_process_creation_lock()
+                    .expect("failed launch poisoned the shared creation lock"),
             );
         }
     }
