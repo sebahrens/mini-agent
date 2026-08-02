@@ -180,6 +180,8 @@ enum TestWorkerTarget {
     InternalWorker {
         timeout_ms: Option<u64>,
         max_pending_jobs: Option<usize>,
+        supervisor_script: bool,
+        stderr_bytes: usize,
     },
 }
 
@@ -209,6 +211,8 @@ impl TestWorkerLauncher {
             target: TestWorkerTarget::InternalWorker {
                 timeout_ms: None,
                 max_pending_jobs: None,
+                supervisor_script: false,
+                stderr_bytes: 0,
             },
         }
     }
@@ -222,6 +226,20 @@ impl TestWorkerLauncher {
             target: TestWorkerTarget::InternalWorker {
                 timeout_ms: Some(timeout_ms),
                 max_pending_jobs: Some(max_pending_jobs),
+                supervisor_script: false,
+                stderr_bytes: 0,
+            },
+        }
+    }
+
+    /// Launch the real protocol-pipe child with a test-only scripted worker body.
+    pub(crate) const fn scripted_internal_worker(stderr_bytes: usize) -> Self {
+        Self {
+            target: TestWorkerTarget::InternalWorker {
+                timeout_ms: None,
+                max_pending_jobs: None,
+                supervisor_script: true,
+                stderr_bytes,
             },
         }
     }
@@ -262,6 +280,8 @@ impl WorkerLauncher for TestWorkerLauncher {
             TestWorkerTarget::InternalWorker {
                 timeout_ms,
                 max_pending_jobs,
+                supervisor_script,
+                stderr_bytes,
             } => {
                 command
                     .env(INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE)
@@ -277,6 +297,12 @@ impl WorkerLauncher for TestWorkerLauncher {
                     command.env(
                         "MINI_AGENT_TEST_WORKER_MAX_PENDING_JOBS",
                         max_pending_jobs.to_string(),
+                    );
+                }
+                if supervisor_script {
+                    command.env("MINI_AGENT_TEST_SUPERVISOR_SCRIPT", "1").env(
+                        "MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES",
+                        stderr_bytes.to_string(),
                     );
                 }
             }

@@ -3,6 +3,7 @@ pub mod host;
 pub(crate) mod protocol;
 #[cfg(feature = "skills")]
 pub mod skills;
+pub(crate) mod supervisor;
 pub mod tool;
 pub mod types;
 pub(crate) mod worker;
