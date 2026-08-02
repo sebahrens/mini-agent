@@ -289,6 +289,43 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TEST-ONLY",
     ),
+    ("src/sandbox/worker/linux.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker/linux.rs",
+        "if std::process::Command::new(WORKER_PATH)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "if std::thread::Builder::new().spawn(|| {}).is_ok() {",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = command.spawn()?;",
+        3,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut command = Command::new(bwrap);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
     ("src/session/mod.rs", ".output()", 1, "TC-INTERNAL-GIT"),
     (
         "src/session/mod.rs",
@@ -374,6 +411,7 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
     "TC-LSP-SERVICE",
     "TC-MCP-STDIO",
     "TC-MODEL-ACTION",
+    "TC-BROKER-JS-WORKER",
     "TC-PROJECT-AUTOMATION",
     "TC-SUPPORT-UTILITY",
 ];
@@ -554,6 +592,43 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "TEST-ONLY",
     ),
+    ("src/sandbox/worker/linux.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker/linux.rs",
+        "if std::process::Command::new(WORKER_PATH)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "if std::thread::Builder::new().spawn(|| {}).is_ok() {",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = command.spawn()?;",
+        3,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut command = Command::new(bwrap);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
     (
         "src/ui/app.rs",
         "if std::process::Command::new(\"lazygit\")",
@@ -672,11 +747,6 @@ fn validate_class_assignments(
     }
 
     for ((path, source, occurrence), classification) in inventory {
-        if *classification == "TC-BROKER-JS-WORKER" {
-            return Err(format!(
-                "broker-only JS worker cannot classify a current site: {path} occurrence {occurrence}: {source}"
-            ));
-        }
         if !ALLOWED_CURRENT_CLASSES.contains(classification) {
             return Err(format!(
                 "class {classification} is not allowed for current launch inventory"
@@ -812,7 +882,7 @@ fn production_subprocess_sites_have_a_trust_classification() {
 }
 
 #[test]
-fn current_subprocess_inventory_rejects_broker_and_cross_family_classes() {
+fn current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes() {
     validate_current_class_assignments().expect("current subprocess classes must be allowed");
 }
 
@@ -853,6 +923,13 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
             1,
             "TC-MODEL-ACTION",
             "a lifecycle helper in the mixed sandbox family",
+        ),
+        (
+            "src/sandbox/worker/linux.rs",
+            "let Ok(mut child) = command.spawn() else {",
+            1,
+            "TC-MODEL-ACTION",
+            "the broker-only Linux preflight launch",
         ),
         (
             "src/ui/app.rs",

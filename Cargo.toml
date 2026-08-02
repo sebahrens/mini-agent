@@ -135,6 +135,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rustix = { version = "1.1", features = ["process", "thread"] }
+seccompiler = "0.5"
+
 [dev-dependencies]
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }
 
