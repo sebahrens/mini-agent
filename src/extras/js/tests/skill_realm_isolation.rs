@@ -425,6 +425,12 @@ fn production_loader_installs_only_frozen_declared_wrappers() {
             )
             .expect("inspect frozen wrapper")
         );
+        assert!(
+            ctx.eval::<bool, _>(
+                "(() => { const original = increment; const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'increment'); let deleted = true; try { deleted = delete globalThis.increment; } catch (_) { deleted = false; } let redefined = true; try { Object.defineProperty(globalThis, 'increment', {value: () => 0}); } catch (_) { redefined = false; } return descriptor.writable === false && descriptor.configurable === false && deleted === false && redefined === false && increment === original; })()",
+            )
+            .expect("inspect permanent wrapper binding")
+        );
     });
 }
 
@@ -461,6 +467,30 @@ fn loader_rejects_collisions_and_missing_exports_without_partial_publication() {
             "undefined,undefined"
         );
         assert_eq!(ctx.eval::<i32, _>("occupied").unwrap(), 7);
+    });
+}
+
+#[test]
+fn reconstructed_duplicate_exports_are_rejected_before_evaluation() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let mut duplicate = artifact(
+        "throw new Error('duplicate source must not execute')",
+        &["same"],
+    );
+    duplicate.exports.push(duplicate.exports[0].clone());
+    duplicate.id = duplicate.compute_identity();
+
+    assert!(matches!(
+        load_artifact(&runtime, &model, &duplicate),
+        Err(RealmError::DuplicateExport)
+    ));
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("typeof same")
+                .expect("inspect atomic publication"),
+            "undefined"
+        );
     });
 }
 
@@ -548,6 +578,50 @@ fn initialization_has_no_authority_and_rejects_pending_jobs() {
         load_artifact(&runtime, &model, &module_source),
         Err(RealmError::Initialization)
     ));
+
+    let top_level_return = artifact(
+        "return; function returnedFromTopLevel() { return 1; }",
+        &["returnedFromTopLevel"],
+    );
+    assert!(matches!(
+        load_artifact(&runtime, &model, &top_level_return),
+        Err(RealmError::Initialization)
+    ));
+}
+
+#[test]
+fn export_extraction_uses_data_properties_and_rejects_jobs_queued_by_getters() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let data_property = artifact(
+        "let reads = 0; Object.defineProperty(globalThis, 'readOnce', { get() { reads += 1; return function () { return reads; }; } });",
+        &["readOnce"],
+    );
+    load_artifact(&runtime, &model, &data_property).expect("load getter-backed binding");
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<i32, _>("readOnce()")
+                .expect("call loader-owned data property"),
+            1,
+            "bridge construction must read the loader namespace data property, not rerun the source getter"
+        );
+    });
+
+    let queued_getter = artifact(
+        "Object.defineProperty(globalThis, 'queuedGetter', { get() { Promise.resolve().then(() => 1); return new Proxy(function () { return 1; }, {}); } });",
+        &["queuedGetter"],
+    );
+    assert!(matches!(
+        load_artifact(&runtime, &model, &queued_getter),
+        Err(RealmError::PendingInitializationJobs)
+    ));
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("typeof queuedGetter")
+                .expect("inspect rejected getter export"),
+            "undefined"
+        );
+    });
 }
 
 #[test]
@@ -584,8 +658,16 @@ fn wrapper_boundary_rejects_executable_cyclic_accessor_and_async_values() {
     let runtime = bounded_runtime();
     let model = Context::full(&runtime).expect("create model context");
     let skill = artifact(
-        "function echo(value) { return value; } function closure() { return () => 1; } function pending() { return Promise.resolve(1); } function oversized() { return 'x'.repeat(70000); } function throwsSecret() { throw new Error('private thrown value'); }",
-        &["echo", "closure", "pending", "oversized", "throwsSecret"],
+        "function echo(value) { return value; } function closure() { return () => 1; } function pending() { return Promise.resolve(1); } function oversized() { return 'x'.repeat(70000); } function throwsSecret() { throw new Error('private thrown value'); } function trappedClone() { return new Proxy({safe: 1}, { ownKeys() { throw new Error('private clone trap secret'); } }); } const trappedApply = new Proxy(function () { return 1; }, { apply() { throw new Error('private apply trap secret'); } });",
+        &[
+            "echo",
+            "closure",
+            "pending",
+            "oversized",
+            "throwsSecret",
+            "trappedClone",
+            "trappedApply",
+        ],
     );
     load_artifact(&runtime, &model, &skill).expect("load boundary skill");
 
@@ -604,6 +686,17 @@ fn wrapper_boundary_rejects_executable_cyclic_accessor_and_async_values() {
             "number,true,0",
             "arbitrary skill exception objects must not cross into the model realm"
         );
+        for invocation in ["trappedClone()", "trappedApply()"] {
+            let expression = format!(
+                "(() => {{ try {{ {invocation}; }} catch (value) {{ return [typeof value, value === 0, String(value)].join(','); }} }})()"
+            );
+            assert_eq!(
+                ctx.eval::<String, _>(expression)
+                    .expect("inspect sanitized private Proxy trap"),
+                "number,true,0",
+                "private parse/apply/clone failures must cross only as the fixed primitive"
+            );
+        }
         assert!(
             ctx.eval::<Value, _>("(() => { const value = {}; value.self = value; return echo(value); })()")
                 .is_err()

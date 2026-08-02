@@ -97,28 +97,12 @@ pub const SKILL_REALM_HARDENING_JS: &str = r#"
 })()
 "#;
 
-pub(crate) fn private_skill_source(skill: &SkillArtifact) -> String {
-    let published = skill
-        .exports
-        .iter()
-        .map(|export| {
-            let key =
-                serde_json::to_string(&export.name).unwrap_or_else(|_| "\"invalid\"".to_string());
-            format!(
-                "{key}: (typeof {name} === 'function' ? {name} : undefined)",
-                name = export.name
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "(function(__zs_safe_global,__zs_Promise){{\n\
-         return (function(read_file,write_file,spawn,fetch,propose_skill,require,module,exports,globalThis,self,window,global,Function,Promise){{\n\
-         'use strict';\n{}\n;return ({{{published}}});\n\
-         }})(undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,__zs_safe_global,__zs_safe_global,__zs_safe_global,__zs_safe_global,undefined,__zs_Promise);\n\
-         }})(Object.freeze({{}}),Promise)",
-        skill.source,
-    )
+/// Return the immutable artifact source unchanged for evaluation as a QuickJS Script.
+///
+/// Export lookup and namespace construction are loader operations. In particular, this helper
+/// must not wrap source in a function because doing so changes Script grammar.
+pub(crate) fn private_skill_source(skill: &SkillArtifact) -> &str {
+    &skill.source
 }
 
 /// Compatibility wrapper for the Phase 3 in-process engine. The Phase 6 realm loader uses
