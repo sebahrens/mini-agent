@@ -177,7 +177,10 @@ impl Drop for WorkerProcess {
 #[derive(Debug, Clone, Copy)]
 enum TestWorkerTarget {
     LauncherProbe,
-    InternalWorker,
+    InternalWorker {
+        timeout_ms: Option<u64>,
+        max_pending_jobs: Option<usize>,
+    },
 }
 
 #[cfg(test)]
@@ -203,7 +206,23 @@ impl TestWorkerLauncher {
 
     pub(crate) const fn internal_worker_process() -> Self {
         Self {
-            target: TestWorkerTarget::InternalWorker,
+            target: TestWorkerTarget::InternalWorker {
+                timeout_ms: None,
+                max_pending_jobs: None,
+            },
+        }
+    }
+
+    /// Test-only resource limits for exercising worker reset behavior without slow tests.
+    pub(crate) const fn internal_worker_process_with_limits(
+        timeout_ms: u64,
+        max_pending_jobs: usize,
+    ) -> Self {
+        Self {
+            target: TestWorkerTarget::InternalWorker {
+                timeout_ms: Some(timeout_ms),
+                max_pending_jobs: Some(max_pending_jobs),
+            },
         }
     }
 }
@@ -240,7 +259,10 @@ impl WorkerLauncher for TestWorkerLauncher {
                     "--nocapture",
                 ]);
             }
-            TestWorkerTarget::InternalWorker => {
+            TestWorkerTarget::InternalWorker {
+                timeout_ms,
+                max_pending_jobs,
+            } => {
                 command
                     .env(INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE)
                     .args([
@@ -248,6 +270,15 @@ impl WorkerLauncher for TestWorkerLauncher {
                         "extras::js::tests::worker_runtime::worker_bootstrap_test_child",
                         "--nocapture",
                     ]);
+                if let Some(timeout_ms) = timeout_ms {
+                    command.env("MINI_AGENT_TEST_WORKER_TIMEOUT_MS", timeout_ms.to_string());
+                }
+                if let Some(max_pending_jobs) = max_pending_jobs {
+                    command.env(
+                        "MINI_AGENT_TEST_WORKER_MAX_PENDING_JOBS",
+                        max_pending_jobs.to_string(),
+                    );
+                }
             }
         }
         #[cfg(unix)]
