@@ -508,53 +508,104 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
         macro_rules_body: bool,
         parent_context: Option<&MacroContext>,
     ) -> String {
-        fn invocation_path(tokens: &[TokenTree], bang_index: usize) -> String {
-            let Some(mut cursor) = bang_index.checked_sub(1) else {
-                return "<missing>".to_string();
-            };
-            let Some(TokenTree::Ident(ident)) = tokens.get(cursor) else {
-                return "<non-ident>".to_string();
-            };
-            let mut reversed = vec![normalized_ident(ident)];
-            while cursor >= 3 {
-                let colon = |token: &TokenTree| matches!(token, TokenTree::Punct(punct) if punct.as_char() == ':');
-                if !colon(&tokens[cursor - 1]) || !colon(&tokens[cursor - 2]) {
-                    break;
-                }
-                let TokenTree::Ident(ident) = &tokens[cursor - 3] else {
-                    break;
-                };
-                reversed.push(normalized_ident(ident));
-                cursor -= 3;
-            }
-            reversed.reverse();
-            reversed.join("::")
+        fn push_frame(output: &mut Vec<u8>, tag: u8, payload: &[u8]) {
+            output.push(tag);
+            output.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            output.extend_from_slice(payload);
         }
 
-        let delimiter = match group.delimiter() {
-            Delimiter::Parenthesis => "paren",
-            Delimiter::Brace => "brace",
-            Delimiter::Bracket => "bracket",
-            Delimiter::None => "none",
-        };
-        let prefix = if macro_rules_body {
-            let name = index
-                .checked_sub(1)
-                .and_then(|i| tokens.get(i))
-                .and_then(|token| match token {
-                    TokenTree::Ident(ident) => Some(normalized_ident(ident)),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "<missing>".to_string());
-            format!("macro_rules!{name}")
+        fn encode_token(token: &TokenTree) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            match token {
+                TokenTree::Group(group) => {
+                    let mut payload = vec![match group.delimiter() {
+                        Delimiter::Parenthesis => 1,
+                        Delimiter::Brace => 2,
+                        Delimiter::Bracket => 3,
+                        Delimiter::None => 4,
+                    }];
+                    let nested: Vec<_> = group.stream().into_iter().collect();
+                    payload.extend_from_slice(&(nested.len() as u64).to_be_bytes());
+                    for token in &nested {
+                        payload.extend_from_slice(&encode_token(token));
+                    }
+                    push_frame(&mut encoded, 1, &payload);
+                }
+                TokenTree::Ident(ident) => {
+                    let exact = ident.to_string();
+                    let normalized = normalized_ident(ident);
+                    let mut payload = vec![u8::from(exact.starts_with("r#"))];
+                    push_frame(&mut payload, 1, exact.as_bytes());
+                    push_frame(&mut payload, 2, normalized.as_bytes());
+                    push_frame(&mut encoded, 2, &payload);
+                }
+                TokenTree::Punct(punct) => {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&(punct.as_char() as u32).to_be_bytes());
+                    payload.push(match punct.spacing() {
+                        proc_macro2::Spacing::Alone => 1,
+                        proc_macro2::Spacing::Joint => 2,
+                    });
+                    push_frame(&mut encoded, 3, &payload);
+                }
+                TokenTree::Literal(literal) => {
+                    push_frame(&mut encoded, 4, literal.to_string().as_bytes());
+                }
+            }
+            encoded
+        }
+
+        fn invocation_prefix_start(tokens: &[TokenTree], bang_index: usize) -> usize {
+            let Some(mut cursor) = bang_index.checked_sub(1) else {
+                return bang_index;
+            };
+            if !matches!(tokens.get(cursor), Some(TokenTree::Ident(_))) {
+                return cursor;
+            }
+            let colon = |token: &TokenTree| matches!(token, TokenTree::Punct(punct) if punct.as_char() == ':');
+            while cursor >= 3
+                && colon(&tokens[cursor - 1])
+                && colon(&tokens[cursor - 2])
+                && matches!(tokens[cursor - 3], TokenTree::Ident(_))
+            {
+                cursor -= 3;
+            }
+            if cursor >= 1
+                && matches!(&tokens[cursor - 1], TokenTree::Punct(punct) if punct.as_char() == '$')
+            {
+                cursor -= 1;
+            }
+            if cursor >= 2 && colon(&tokens[cursor - 1]) && colon(&tokens[cursor - 2]) {
+                cursor -= 2;
+            }
+            cursor
+        }
+
+        fn encode_sequence(tokens: &[TokenTree]) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&(tokens.len() as u64).to_be_bytes());
+            for token in tokens {
+                encoded.extend_from_slice(&encode_token(token));
+            }
+            encoded
+        }
+
+        let prefix_start = if macro_rules_body {
+            index.saturating_sub(3)
         } else {
-            let bang_index = index.saturating_sub(1);
-            format!("{}!", invocation_path(tokens, bang_index))
+            invocation_prefix_start(tokens, index.saturating_sub(1))
         };
-        let canonical = format!("{prefix}{delimiter}({})", group.stream());
-        let Some(parent_context) = parent_context else {
-            return format!("{:x}", Sha256::digest(canonical.as_bytes()));
-        };
+        let mut invocation = vec![u8::from(macro_rules_body)];
+        push_frame(
+            &mut invocation,
+            1,
+            &encode_sequence(&tokens[prefix_start..index]),
+        );
+        push_frame(
+            &mut invocation,
+            2,
+            &encode_token(&TokenTree::Group(group.clone())),
+        );
 
         fn hash_frame(hasher: &mut Sha256, value: &[u8]) {
             hasher.update((value.len() as u64).to_be_bytes());
@@ -562,9 +613,13 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
         }
 
         let mut hasher = Sha256::new();
-        hasher.update(b"mini-agent:macro-context-chain:v1");
-        hash_frame(&mut hasher, parent_context.digest.as_bytes());
-        hash_frame(&mut hasher, canonical.as_bytes());
+        if let Some(parent_context) = parent_context {
+            hasher.update(b"mini-agent:macro-context-chain:v1");
+            hash_frame(&mut hasher, parent_context.digest.as_bytes());
+        } else {
+            hasher.update(b"mini-agent:macro-token-tree:v1");
+        }
+        hash_frame(&mut hasher, &invocation);
         format!("{:x}", hasher.finalize())
     }
 
@@ -1593,7 +1648,9 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/ui/slash/features.rs", "status,", 1, "NON-PROCESS"),
 ];
 
-/// SHA-256 of the canonical macro path, delimiter, and complete token body.
+/// SHA-256 of the length-framed structural macro path and complete token tree.
+/// Token kinds, root qualification, raw identifier spelling, punctuation
+/// spacing, and every nested delimiter are identity-bearing.
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
@@ -1601,23 +1658,23 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/agent/runner.rs",
         &[
             (
-                "6ff3c28d14d5d84917571e5f05c45de5d7d220dc38a220a6ca1d5eb0a671c3c6",
+                "171453e5b2606177e62ffc589caee645490fd18305ae366b007a993e16b669db",
                 1,
             ),
             (
-                "7227db9bd08d4ea9bf40f6912fc1ed1fba5335091e6094ab523147919980e3a0",
+                "2e9d6fe2b541c8535dfabf335779690424c0bb5bb198ff7429dbaede8642b50f",
                 1,
             ),
             (
-                "dc83f63ab70ec0837d5f9481e0048bb1f3bd3e305541b75c396811449c20dec2",
+                "9b95c26fba2e0e1c67f90565d197425d7c3bdecbbe365dd0c071de7130a7eafb",
                 1,
             ),
             (
-                "e0e7704453a0e0b64d6def7a3eadf474c4e3d31d4fdaf826469fb63b863de145",
+                "a65ff78b30cd28567d54a354081c187246782a6f49f314a7d5ce6289ebdc97f3",
                 1,
             ),
             (
-                "e527deefc2f7d807e5fc10cdcfe09d67add441967e55ba56b0fc482fad9fc029",
+                "c7984bb9ee969797484f192f11aa877a68f90f5b456d5d2ee40a2a7e7f834fbd",
                 1,
             ),
         ],
@@ -1626,43 +1683,43 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/agent/tools/bash.rs",
         &[
             (
-                "0ccaa30485938b3de9aaf3f1d5a975abc6865706f053276f99e96167e6caf3b4",
+                "11590494b23b272022bf8aa154b2fcfb865b05cc25efb8a449623f43dbd184c8",
                 1,
             ),
             (
-                "1e5465670ad8339ad9f89476c1fbf99ba7c3fb5d7fadfcd6a39bc27a42871125",
+                "1a4d10559a457b95bab2fbea7dcd65fefebe980c444cd00e9de9a60d1ece599d",
                 1,
             ),
             (
-                "400a4b791d5f7cfad3ec39bc23ff111e0ace3959151b56782c2e7c0a1c948dfc",
+                "7340793918840ff0a06131325b389589d2873616472f19c449062b5be4bc1380",
                 1,
             ),
             (
-                "529cac7f49cba5304b809d39239f7e8af1d802c3084999ca7dfa7b1b4f04afbf",
+                "761e9d94916bbe3a5d5de4cbbb2d1ceb08208ec28b457cd8d41fbac9e1f8a6fe",
                 1,
             ),
             (
-                "609285a59b245c86a704e74642a4c97409c0ee1fab1f24f8a07254b85da2574e",
+                "ad2596fb4e92d03c6e11f4c1aa11829076d1156dd173cc7b094036343a52b445",
                 1,
             ),
             (
-                "8dcaaf6d07b83ad709a7199a7201132a0c360d593ff9a558479df3024c159ddb",
+                "add018d80d10cb6a3d585ccb97bcdbe26bd63ccec9cca4519b6075fa172c2eb8",
                 1,
             ),
             (
-                "8e52692f3756645c6c3e867310a60af884333a0f3afcd31015076ffe53568c40",
+                "bb696e69e39aa81f50ef752ce4bc1564021298890472dce79dedaf55263346f6",
                 1,
             ),
             (
-                "9977ccef98daa5097ca1b00f78e82acf13d24f3e5cbf2c5d7d70178425bc2a5a",
+                "d70f631d43aa86b91b591554981d4ba8cb2a723cd349bc1742f6a6a2e2f2fd54",
                 1,
             ),
             (
-                "9de9c88424c7265d3a8f49680c0cd1e71221cba50e8424e83b0443c602913c26",
+                "dacb7feff2f8401db6fff30373bb92be0bc1bdfa88d247cabcef3edd4d93d16c",
                 1,
             ),
             (
-                "d2fa760055d244ce2b5d20ac50011cf220f8422486ebdc30652bf0f26eaa3267",
+                "f67e03a1d8c8573ffae016bbaf134c13aa8d999566a8ed47610219e3e5507457",
                 1,
             ),
         ],
@@ -1671,39 +1728,39 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/agent/tools/find_files.rs",
         &[
             (
-                "16f89557f90f902c7ec7f039802baffa7ba301966a60d1f22556f76f1168e753",
+                "115510326f281b766408701156e3b61bd28b08fb8a83e1a83ae95034bfab337e",
                 1,
             ),
             (
-                "1aaf1f7e6b05c745716ae647a5f4aa4d353150d40dbad6b0b6f5cc780c7965aa",
+                "205b255efe38d50d4e3ffd4840977d3744af25b4be13bacd284867d626d6eea0",
                 1,
             ),
             (
-                "58f47cd2363b3368e446ba9792e51612647a0fef38b93bb3c5c7afaca7470ad9",
+                "44b3168425ceb3c6808eea846f357f1369ebc7da14a5bddef0ed7090e353dafb",
                 1,
             ),
             (
-                "679b54c98870903405ecb367bd3aff2cc97d611b12b94602a90d997fc7687164",
+                "55753c0c181d8223928b02a8bb73ee136fcf855df473a0c9e2e7662d79f4f026",
                 1,
             ),
             (
-                "85ad7d54eff77124f8e86fc91c764e6e23135fc4fd85b8bf4a839ab87fc10c5d",
+                "56e99f3288d12b12f3643fdb1a5a4e56eddec6c5ce068190a6056d9fd6e7412e",
                 1,
             ),
             (
-                "9fe0cd9972b1eaad791d9993e0cf88d4aab964d69e2d9dd245f77a7406cdb18a",
+                "645122c3dee305566d960b4846b998a32de6fdaeac386e21e3d0e19e644409d7",
+                1,
+            ),
+            (
+                "94179e11a3f89f5be978ecad4f61da60c1d2e431b78531090945f40b629d2541",
+                1,
+            ),
+            (
+                "ae8fedde9b6e8bece82821b0de38178334b0c1ca387c872260b80d2e138c6e06",
                 2,
             ),
             (
-                "b2b779d390dbfb18cee3d21a262087067dd4e350dd933368d47d6a8edc8e8fa9",
-                1,
-            ),
-            (
-                "f65a92530c141e6eee59299ded45cf929b15f52b09398fb35272fb40757371e6",
-                1,
-            ),
-            (
-                "f74b6824f1903234970cbeb3726daa8c858d4b29cd0c043c268b977972cbad7f",
+                "f25fa463789bdff96f2ac1db892cb80aa2acf858cae6fce6207f6faa70bc85b8",
                 1,
             ),
         ],
@@ -1712,35 +1769,35 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/agent/tools/grep.rs",
         &[
             (
-                "1e4161769f79aa679b9473aa8f980f4267e170e5edda47b3fa8b23ff0c7a80c7",
+                "0a94ede10a0163a59731cf2f78ca877c9139de14b8b94e4daa8d72347ddaadd0",
                 1,
             ),
             (
-                "38004f86e59697c1b5e725ed1e033615399cc3470593d9cb01e4f4a454bacf2a",
+                "0acbebee88d292c8ec6ee41a10395563fb9ffe96c71dbc580dbdc484b64dcea6",
                 1,
             ),
             (
-                "476d3ade66214347b93f4d1b283d838e1c8f9aebf9106c98b74b160537def4f3",
+                "174b3659662ea4f4bcc7d2f7de1f632e16b959c70fd2f7e186199bfe8474a639",
                 1,
             ),
             (
-                "6e32bfd3be6e7c7cc64d642f88fe48402340254cbdc361099be169f1262a75f7",
+                "21cc41b46381ab04832f9a6c9f3d598ed2fe4d747d481237f990b7158c52a58a",
                 1,
             ),
             (
-                "713d8cc85fa695b3b29459def4ab6cecc3b3cf780097c41ca33c04810343a665",
+                "371266118d5513014528466d57966ed6c1909cb33bab1a9fd302e5c6256ad82b",
                 1,
             ),
             (
-                "9fe0cd9972b1eaad791d9993e0cf88d4aab964d69e2d9dd245f77a7406cdb18a",
+                "99092c71e9e39b0963c34a3241c195133962a8db5ec43f09bb6cd66917665b9b",
+                1,
+            ),
+            (
+                "ae8fedde9b6e8bece82821b0de38178334b0c1ca387c872260b80d2e138c6e06",
                 2,
             ),
             (
-                "a300a469769f43c771776366f63090873725863cc86afcf64bb1207b72a97f3a",
-                1,
-            ),
-            (
-                "a82c556d9be4e7284c52a3eff6aee4125ad25265eca7d767de2d9272d3ee9d0a",
+                "ddc400f7816d0659ba5fe6e89b565e7e22473e6551c6c5be7a2ee53dca51c0ab",
                 1,
             ),
         ],
@@ -1748,21 +1805,21 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/acp/mod.rs",
         &[(
-            "b139bdf25cd51e4504776171ad7b9574a8dc5537f599246d967c23a049d80961",
+            "295618629907043194c80029881ca6c0c7fd6c758a98c278f3d845cdf7e45f7f",
             1,
         )],
     ),
     (
         "src/extras/export.rs",
         &[(
-            "f467ee1a288daf5012c070fe01d5c1b2eb4184803a20665bda2fd2d7dace28bd",
+            "2642f045409085bb7c6fe9d020dad6e7a3f2915275c0c3686ac43710af88e0bc",
             1,
         )],
     ),
     (
         "src/extras/js/audit.rs",
         &[(
-            "17ab185b28a4e2ccf0963a9814ad8c597591efac4aeda33e3a426ab74057a93b",
+            "01ea14b48b35ce7c8b962bcb1ba243817f0a63f230d414850118cee9fed9f6cc",
             1,
         )],
     ),
@@ -1770,43 +1827,43 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/js/host.rs",
         &[
             (
-                "0c11ba5f5dfb13c024a5c6503549b552284161bea32e4a2a6fd90cba84fabfad",
+                "0397b840693f6b293544b512fce5572f9d450833533087168f099b3af77a5cb9",
                 1,
             ),
             (
-                "125bc6c48f884518e485a05df14aba2329f380333574782c5ef254e3a73ed76d",
+                "1b71d7d643b2f7208bbb297fc64a33265b776a2b8c934c32441cc124083abcd4",
                 1,
             ),
             (
-                "1d6b4727fd361a687a362c496c373c471e9558f497ac1eccf161a99dc2636ff2",
+                "2f073adf370dfed835a37ffd305529ca895486178a4033f395abb56386e6cb63",
                 1,
             ),
             (
-                "2651f1f9dcbcbea50132c9f397a71fe8d4e0e53ad1e57aa902a7a37e677a6219",
+                "4b4be55dac813da63579ff80d76a858484598b955c750180378e47acac2ec2b1",
                 1,
             ),
             (
-                "76d813b7df3c301d824c6807c711a94268cd55ce6c9c2c1ce2ab25301cefb605",
+                "5190609317dbab79fde23dab3907dc07258c750dd05ff75ec44868499bf4bcff",
+                1,
+            ),
+            (
+                "7517f2b69b6a018823611af16ad46cf509fd34b973baa82547d55ace719d28ca",
                 2,
             ),
             (
-                "7d219cfac89a4cfd69fa84419469c6936bfcba376fe5ae6f73cf392db3d4edad",
+                "8198bc7a5a750904ebdbef0a4b5a9371aaae8034a46471b5ce5a66e448c5b4e9",
                 1,
             ),
             (
-                "8f9fe1bb1a1cf6cf053d07aee5f1c5fd1f03777b040191f06387d2d6614dfea6",
+                "891a8bf5535d2f446d9d641b9d740ab7042ca41a7408f9ab36d76624b10cb05e",
                 1,
             ),
             (
-                "d114a8dff406decaf329f3ace3cc01fb159a6eaf7a362a8de67bc6b4c07fb168",
+                "a2934036f2abb93e08faec85d7d7c126860a0fda0a8d26e879dd0f45ed38ac42",
                 1,
             ),
             (
-                "e019001c2105b07e7ade5795b3bcd57f11658295f9d16937545bf7c029f693bb",
-                1,
-            ),
-            (
-                "fd7aad175a48f9ec579a9afafcc82c7ee11c3490921f21da7b40eb33b6ae0c47",
+                "e44a0994c1278803b6647fefeb9a3c5bfeecf526b1c19fcc05d8fdb2a174d406",
                 1,
             ),
         ],
@@ -1814,7 +1871,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/js/skills/capability.rs",
         &[(
-            "f47fa5d2f6a6c605c4428c1104ee2bb7b3cadd863311fe89e0d5f6cfc6c973cc",
+            "20ff2e59a38df1c73b89cf24447c44d4ad82d7a0ebeaf8b89a8cf70929c78661",
             1,
         )],
     ),
@@ -1822,11 +1879,11 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/js/skills/store.rs",
         &[
             (
-                "d0d098d44cc9d2bf1ed33699ab1bde4ce238b4c9687ddbf2c45622c2b83e9ac0",
+                "24f6070b5204f83ee8d5fc7a6bd756f7991bbe7fca840e62752f54e090661491",
                 1,
             ),
             (
-                "f3839eff42a062f930fc3bce8a6516ad36feb746c264515b964427c0d957d3a0",
+                "37b1d55d03713d423bc79e2bdfc046830486adddb9997708182cbd6434852b94",
                 1,
             ),
         ],
@@ -1834,7 +1891,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/js/skills/telemetry.rs",
         &[(
-            "8b85d9a26a71cdcae5855b9be3fa0a80266f1f90aedea1bc774f3c00ae8f8c7b",
+            "060c076e1ddfc773151d0c424432a12ad46d0d66f893b7ef6c39b5070b3a73b5",
             1,
         )],
     ),
@@ -1842,67 +1899,67 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/js/skills/turn.rs",
         &[
             (
-                "03543ce780408ea6f211d13654c6300810d083afa3d480ebd62f424a80d464c7",
+                "09e954887c1888a296255a04fc1d10ba7806e8fc67dbd9d9b8a34d53a537dc5d",
                 1,
             ),
             (
-                "1945aecd88d664569d0863c639b256c1854f141c52a9b6fdc41f65d0b5e61412",
+                "28e6f4ffe8d995be8ac3f65f2da51fc77225808714039ef01a22669ad78e1143",
                 1,
             ),
             (
-                "2f872b4fd8428e1daf3a22589f141d9523f1e6aa119e041fdf175a69217dde2a",
+                "3fc20275d0f702215459b51e6b690a67ad684f7bd750513503d007b6fe8635ac",
                 1,
             ),
             (
-                "3f17dd102213634b0e6842ee149191c1c4b7924eb4d4d711bf68df8604bc4be3",
+                "512f23c6f08f33c0ac29a8dee50052a6e6095547c7cad697b269fe69e02bff5a",
                 1,
             ),
             (
-                "4e56fbfcc3a2035534694b3f6f351720780d5890f183bd7aeb5546af34502e5b",
+                "53b45424ea372be94559be65c6f1ac40932431c7093e9cfe824d256dc55454ec",
                 1,
             ),
             (
-                "667ba34a1dd74c035eb254b6855d2d668f9c8aa23efa205b3bc4e5809a668357",
+                "5eeb4ebba574fc8359881819f6b7d27f879be4b7a64a5993cc4b89429e7d5831",
                 1,
             ),
             (
-                "7278b77d2a9482b0e978d3476f71f2741b29b753196b1a224e25fcd01857fc3f",
+                "90ca522aa88240dba89634b772026c3cddd99b27e54673ff13874f2462c73f4d",
                 1,
             ),
             (
-                "737cb5d5157acda87d5ce8087f61006d494d111e9b1bfc1a1933f6af5cb9f513",
+                "a3ed78f809040e7856ccd224f3040f2a334937ea2702a6aef1f0584bba41d417",
                 1,
             ),
             (
-                "931ebf613b64748252207cd341f00a3edb634ced3b6119970a5876654c2fcfbb",
+                "b3292455b91810203a439b84d52e261c6838155a4d035a19eb84fbd763610159",
                 1,
             ),
             (
-                "a385de4d3efea15a8f9ed4903fb5febbff19cd9a1abd6d5beb2979bef42202dc",
+                "bc4fb0706aaa17dcb6d23c47773435403f4660ebf1230b57349ea16e489978c3",
                 1,
             ),
             (
-                "bb5c0d91a5103b20c9d888f7f743355b0c519e49edf689f0780094cc2a4616b9",
+                "bd88f4885b162d21bd6c9c9819b78cba7017fda84d546275d93eb40ee3f05037",
                 1,
             ),
             (
-                "c6def2be8d35ef4e7478b1726ee91a79638feeb55e8f25a38ced339a532fdee1",
+                "c9126084bcc36b3b03f6bcfb1a0fe17fc36b65edcb75386d9dcfefc20954df9d",
                 1,
             ),
             (
-                "d24eda52d7decd0a2b0e49ee3f43928afa5465cf29da727d8d7cb4b1523c165d",
+                "d4ee4a31960023c4dca62084241f8e7e0e63866d5367a3c02886b4c0a29bb428",
                 1,
             ),
             (
-                "eb2976f0342d80e42ab65fb8f4793518e49117141946a1501382133f432a2b42",
+                "dac84961f14ecf95f7c7977967ca0956483de20be39a59e3e535972c86df536d",
                 1,
             ),
             (
-                "fa053209a909a78ab8af355cec3c34bff7465e6fa19d1b1e9670a40f25b37cc7",
+                "e134a67930eed0c8e0c1a02bcac6efda89c87f216b2f1a438a90737d63907acb",
                 1,
             ),
             (
-                "fee53c345ad62cb8ad60ade580efa4406835f890e332b7bd9f0149a591384b07",
+                "f4faf0ed27164d65181a5963d363f1eaef80f3ed8d260e6e0aef509bfbbdbe31",
                 1,
             ),
         ],
@@ -1910,21 +1967,21 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/js/supervisor.rs",
         &[(
-            "290164c18c5020ca450782d25b7327721079ee85a0b16a94d9139acb53ece31a",
+            "e30de734188566fa21d676314e3cff927ee853afaa7e694f5f33d20ecaa58413",
             1,
         )],
     ),
     (
         "src/extras/js/tool.rs",
         &[(
-            "001aab5f18bd14a8a8f6f8bd63ec0fcfa7795714d2516531f11dc0bde14db5c8",
+            "34e3105112941e29707d7c89c27658d9e34c02bcf446c9bf49b08d275c5fbdfa",
             1,
         )],
     ),
     (
         "src/extras/loop/mod.rs",
         &[(
-            "53e1cc6b4c8058fec64aa055ba35ee966079cc044145dbae5a2e0f68b3f1f2e8",
+            "e225d1fcf2e8c60201d067ff175cbdcbbf980e3b0a3b09a34a8aa0279bfe11e7",
             1,
         )],
     ),
@@ -1932,23 +1989,23 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/subagents/task_tool.rs",
         &[
             (
-                "3ec1e10cbc5a53f21a5c370a83139973270d27190164be3caf9775f5896384f6",
+                "5b355171d273f77d7a74c57959ccae1ff1c7f4e15189cc8f15c170bf3be44c3b",
                 1,
             ),
             (
-                "69e8776d5e549d11d0e5cd4a5813fb99dc265b9523e6a46a2c171cf1bcf19c69",
+                "6884bc264c3021e29f258708b6c9047a22a2d755048dd069b549824131e86d7a",
                 1,
             ),
             (
-                "7756992ddc099546cce7cd35330b8f77343483eeb7307f2dd396a6f91b912772",
+                "7308fdc8eff948ba4a55b0e6e5bc4490cd09ba72db71d7553393f8ec71aa2da4",
                 1,
             ),
             (
-                "994cad6940046f9ffc567e8eeee577b7deb4961a807b4c67ea69304f9321a238",
+                "e43f6b1a9e960b4dbeb45d38462dcdee2075a1a7dbb5bee387bf5fc8ad238280",
                 1,
             ),
             (
-                "d4cb7f5c0d79bcc97cd340555b7e18597c8f5b72149eee4a11fa55c3c5cd83b5",
+                "ed11a97886914baeefe43d2157c89851a90e5f5bb1af6d4d0d4545046d5c8fc9",
                 1,
             ),
         ],
@@ -1957,15 +2014,15 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/print.rs",
         &[
             (
-                "7e29ef9d82008876ce58c29268a4936e42d935910f92243b01b4230f14aa405e",
+                "7754ad9d4a4920c203d43d087fc405e95102f7a4801855582533ab54e3a86b86",
                 1,
             ),
             (
-                "88f2e641e3b76065c266fa5c99b46ee938c6a42eb267ad0feab765b970f4cfc3",
+                "8a4d18f5eab2de9d10ef609d4c51cef612fd6652674c5ee503fb77a75a66cc1a",
                 1,
             ),
             (
-                "c850050f68dbbfef5c69f81fa7b9f94d25c8961431a5830dcf9bdcfd0dba91a0",
+                "a9b0b5cf240a3b7a378fc6c6dedd61ea1555a7bd03bcd115629965b05dd8d7fc",
                 1,
             ),
         ],
@@ -1974,47 +2031,47 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/sandbox.rs",
         &[
             (
-                "1d3d757ac6197721fb5b3e8b4c709a5247c6b6a8c7f5f0b1374105a97da70815",
+                "21bedd3fe703d7764c0026616b47d5daf97fbfa36447f47f26a10b5cfefd84b4",
                 1,
             ),
             (
-                "200af6a39037d86c9fca42b3540109fc6a560dc582c98925666018af6469f170",
+                "4e84ceaa1caa195958b88ed22d26b6d1e789ca8417fe59629074614a4e7100b8",
+                1,
+            ),
+            (
+                "5940f63c8bdc3c394d8e54c7b6deba8e8529d0a5b921c897cf45a23f4d94f94b",
+                1,
+            ),
+            (
+                "6e4cd00c8c8dced3ba1dfe6bfdf749624335b102a8b952c6bc33430cadd913df",
+                1,
+            ),
+            (
+                "7109de400e0c4f3dadd8116f47f0a2974119a18a8d7488093158d54d032b4798",
+                1,
+            ),
+            (
+                "87927df2c7d794eca3102771a06a4b3da45f0924beeb7715e6bd2fd0c917a654",
+                1,
+            ),
+            (
+                "8b1974fee65ca7148d7b05d7e2a5e68f3c46a111c04dfeb6bebf139a9c0ee5ed",
+                1,
+            ),
+            (
+                "8bf1360ab3a1b48ffbec38dcab906b7c7b5e8681952a391bf1323aca036db123",
                 2,
             ),
             (
-                "21041daffca44529b2847fcf39b9deddf5343de5ab82852928c162ba0027841d",
+                "8de02a606709e72b294f7747449b50f5cd1b28d5ee73898fac28d59e83d6d77b",
                 1,
             ),
             (
-                "28137b226deab753bfc4a441481a9e791ddc23a273ef92cf7c995009d69c3b45",
+                "8f720ce431f239fd3832c71566aa0b9e7b4320c2183f6760d7385047da7fba0a",
                 1,
             ),
             (
-                "2d819cb2c8461982eac1eea5e6f3c077d018c2c7062d5771e444394315c9af8d",
-                1,
-            ),
-            (
-                "41bc3246e2124977e3a18ec39cfdeaa9db56c06f569511060981708f49fd3f28",
-                1,
-            ),
-            (
-                "48a3910a9bb9f8ed54f2aca265e5df830a258a500b4d005bc665acf27b353dc5",
-                1,
-            ),
-            (
-                "7feddac47daa2cb91ecd4b0b9fe5652ccf44272c76270f3a7dbf974416db085b",
-                1,
-            ),
-            (
-                "d9a63377271c68b6512b18b5d6022ab89f619007bd0f13726f4f0a4fe876c060",
-                1,
-            ),
-            (
-                "fc571cf25cd5606f55ffe751da75c17960e5d3a6daf4ad8b4ce011a4bf0137f6",
-                1,
-            ),
-            (
-                "ff8a44e780531e17a32cd5d7d766ddeb3dad33d64444ec081ce37856bd4a22ca",
+                "b27051c5dbe7a008d67062f63095b37014ef1b88f4f1f0180d289237271cab70",
                 1,
             ),
         ],
@@ -2022,21 +2079,21 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/ui/app.rs",
         &[(
-            "f21429181c665d0c014b342a4aee17c46d4e582e37f076f719fa350f6e12eff8",
+            "b7af79d5aa59730634d98c20d3fec794b65f77a4c75b6d6e476c8fbe491a0a8d",
             1,
         )],
     ),
     (
         "src/ui/renderer.rs",
         &[(
-            "8483db8b18509f9e207b030ec52fb8caea8071f567fe1214e7e5bcc052a7fb2d",
+            "f915b7e6296aa7d6023439adbe8a3ba928a784a87d51c606c30480b43ef54183",
             2,
         )],
     ),
     (
         "src/ui/slash/features.rs",
         &[(
-            "ee7f122ababd728284c8c0825360968589289954958bf3e0a321d3e675c1c99e",
+            "e59a3142b34d4535d362822c3bf7afc7f4284fda8c3ceec063a0ddfba3296ea1",
             1,
         )],
     ),
@@ -2721,15 +2778,15 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
     ]);
     let exact_non_process = BTreeSet::from([
         (
-            "1d6ccddea3e4bee7c11ea8d4d12dafd2dc82cb6015f16af0cacbcfbb4fbb2b2a".to_string(),
+            "7731da00f43136911c6dc28ad641ac88c4af40639bd4738168ad235d98d9effb".to_string(),
             1,
         ),
         (
-            "6ba0397559c8869254538160d7b7b62ea1e5a3ff91aded328d0a58a6cae12040".to_string(),
+            "793b5bb0809fd91c3813d13713e2e3cf9cc19325c876bea759bc1631905cb673".to_string(),
             1,
         ),
         (
-            "e45715c6647ca997a244579dd7c1ab396c0d5f3b9c155266cfc18f35411e30fc".to_string(),
+            "bfb1f62966ac90ca4e21d0f6749754af021b8f31716fb4396b11c1298ef735f4".to_string(),
             1,
         ),
     ]);
@@ -3521,4 +3578,70 @@ fn inspect(value: Value) {
         1,
         "the second identical inner invocation must not borrow the first occurrence"
     );
+}
+
+#[test]
+fn macro_non_process_identity_structurally_binds_exact_tokens() {
+    fn context(source: &str) -> MacroContext {
+        terminal_calls(source)
+            .expect("fixture must parse and tokenize")
+            .into_iter()
+            .find_map(|call| call.macro_context)
+            .expect("fixture terminal must have a macro context")
+    }
+
+    let relative = r#"
+fn inspect(value: Value) {
+    approved!(
+        value,
+        status,
+        marker += value,
+    );
+}
+"#;
+    let absolute = relative.replace("    approved!", "    ::approved!");
+    let relative_context = context(relative);
+    let absolute_context = context(&absolute);
+    assert_ne!(
+        relative_context.digest, absolute_context.digest,
+        "root qualification must be part of the macro identity"
+    );
+
+    let expected = BTreeMap::from([(
+        ("src/fixture.rs".to_string(), "status,".to_string(), 1),
+        "NON-PROCESS",
+    )]);
+    let approved = BTreeSet::from([(
+        "src/fixture.rs".to_string(),
+        relative_context.digest.clone(),
+        relative_context.occurrence,
+    )]);
+    let violations =
+        creation_boundary_violations("src/fixture.rs", &absolute, &expected, &approved)
+            .expect("absolute reviewer probe must be inspectable");
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].contains("unrecognized macro context"));
+
+    let mutations = [
+        relative.replace("    approved!", "    crate::approved!"),
+        relative.replace("    approved!", "    self::approved!"),
+        relative.replace("    approved!", "    super::approved!"),
+        relative.replace("    approved!", "    r#approved!"),
+        relative.replace("marker += value", "marker + = value"),
+        relative
+            .replace("approved!(", "approved!{")
+            .replace("    );", "    };")
+            .to_string(),
+        relative
+            .replace("approved!(", "approved![")
+            .replace("    );", "    ];")
+            .to_string(),
+    ];
+    let mut identities = BTreeSet::from([relative_context.digest]);
+    for mutation in mutations {
+        assert!(
+            identities.insert(context(&mutation).digest),
+            "path, raw spelling, punctuation spacing, and delimiter mutations must not collide"
+        );
+    }
 }

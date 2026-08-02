@@ -534,8 +534,10 @@ full-source tokens, treats glob imports and out-of-line modules as opaque, and i
 terminal function-item references after normalizing raw identifiers. Terminal method identifiers in
 macro inputs and locally defined `macro_rules!` bodies fail closed unless an exact inventory
 identity proves the site non-process. The identity binds source path and occurrence to SHA-256 of the
-unambiguously framed full macro-context chain, including every complete macro path, delimiter, and
-token body, so a matching terminal line, inner invocation, or macro name alone grants nothing;
+unambiguously framed full macro-context chain. Each invocation structurally encodes exact path tokens
+(including root qualification and raw identifier spelling), punctuation character and spacing,
+token-tree kind, nested delimiter, and literal spelling without reconstructing a path or stringifying
+the token stream. A matching terminal line, inner invocation, or macro name alone grants nothing;
 macro-controlled terminals cannot inherit lexical guard dominance. It rejects
 multiline, qualified-angle or renamed UFCS, and
 ambiguous Windows-capable production terminals that bypass this boundary. A dedicated exact
