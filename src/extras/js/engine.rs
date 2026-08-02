@@ -850,18 +850,10 @@ fn install_selected_skills(
                     index_generation: bundle.index_generation,
                     production: bundle.production,
                 };
-                let attribution =
-                    crate::extras::js::skills::capability::SkillExecutionAttribution {
-                        skill_id: artifact.id.clone(),
-                        export_name: export.name.clone(),
-                        manifest: artifact.capability.clone(),
-                    };
                 let ordinal = Arc::new(AtomicU32::new(0));
                 let start_ordinal = Arc::clone(&ordinal);
                 let start_state = Arc::clone(state);
                 let start_metadata = metadata.clone();
-                let invocation_context = gate.context();
-                let invocation_attribution = attribution.clone();
                 let on_start = Function::new(ctx.clone(), move |argument_shape: String| {
                     let ordinal = start_ordinal
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -898,15 +890,6 @@ fn install_selected_skills(
                             )
                         })?
                         .start(invocation_id.clone(), start_metadata.clone(), bounded_shape);
-                    invocation_context
-                        .begin_invocation(invocation_id.clone(), invocation_attribution.clone())
-                        .map_err(|error| {
-                            Error::new_from_js_message(
-                                "skill capability policy",
-                                "invocation",
-                                error.to_string(),
-                            )
-                        })?;
                     Ok::<String, Error>(invocation_id)
                 })
                 .map_err(|error| {
@@ -920,7 +903,6 @@ fn install_selected_skills(
                     )
                 })?;
                 let terminal_state = Arc::clone(state);
-                let terminal_context = gate.context();
                 let on_terminal = Function::new(
                     ctx.clone(),
                     move |invocation_id: String, success: bool, capability_denied: bool| {
@@ -934,15 +916,6 @@ fn install_selected_skills(
                                 )
                             })?
                             .terminal(&invocation_id, success, capability_denied);
-                        terminal_context
-                            .end_invocation(&invocation_id)
-                            .map_err(|error| {
-                                Error::new_from_js_message(
-                                    "skill capability policy",
-                                    "invocation",
-                                    error.to_string(),
-                                )
-                            })?;
                         Ok::<(), Error>(())
                     },
                 )

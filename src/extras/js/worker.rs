@@ -5,22 +5,33 @@
 //! terminal frame is written. The only global installed here is a bounded `console`; authority
 //! globals and module loaders are deliberately absent.
 
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "sandbox")]
+use rquickjs::prelude::Opt;
 use rquickjs::promise::PromiseState;
-use rquickjs::{Context, Ctx, Error, Function, Object, Persistent, Runtime, Value};
+use rquickjs::{Context, Ctx, Error, Function, IntoJs, Object, Persistent, Runtime, Value};
 
 use super::protocol::{
-    BuildIdentity, ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass, DiagnosticStage,
+    AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass,
+    DiagnosticStage, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
     JsErrorCode, ParentFrame, ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult,
     VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
     WorkerProtocol, WorkerReady, WorkerWireFrame, read_frame, write_frame,
 };
-use super::types::{MEMORY_LIMIT, STACK_LIMIT, STEP_TIMEOUT};
+#[cfg(feature = "sandbox")]
+use super::protocol::{HttpHeader, HttpMethod};
+use super::types::{
+    MEMORY_LIMIT, READ_FILE_MAX_BYTES, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
+};
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::capability::InvocationCapabilityRuntime;
 use crate::sandbox::worker::{
     INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, finalize_internal_worker,
     is_internal_worker_marker_present, standard_streams_are_protocol_pipes,
@@ -35,6 +46,315 @@ const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
 const MAX_VERIFICATION_CASES: usize = 4_096;
 const MAX_VERIFICATION_CASE_ID_BYTES: usize = 128;
 const VERIFICATION_LOADER_VERSION: u16 = 1;
+const EFFECT_PATH_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
+const SPAWN_ARGUMENT_MAX_COUNT: usize = 4_096;
+const SPAWN_ARGUMENTS_MAX_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "sandbox")]
+const FETCH_URL_MAX_BYTES: usize = 64 * 1024;
+#[cfg(feature = "sandbox")]
+const FETCH_REQUEST_HEADER_MAX_COUNT: usize = 64;
+#[cfg(feature = "sandbox")]
+const FETCH_REQUEST_HEADER_MAX_BYTES: usize = 16 * 1024;
+#[cfg(feature = "sandbox")]
+const FETCH_REQUEST_BODY_MAX_BYTES: usize = 256 * 1024;
+
+type ModelEffectDispatcher = Rc<dyn Fn(EffectOperation) -> EffectResult>;
+
+struct WorkerSpawnResult {
+    stdout: String,
+    stderr: String,
+    code: i32,
+    timed_out: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+impl<'js> IntoJs<'js> for WorkerSpawnResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set("stdout", self.stdout)?;
+        object.set("stderr", self.stderr)?;
+        object.set("code", self.code)?;
+        object.set("timed_out", self.timed_out)?;
+        object.set("stdout_truncated", self.stdout_truncated)?;
+        object.set("stderr_truncated", self.stderr_truncated)?;
+        Ok(object.into())
+    }
+}
+
+#[cfg(feature = "sandbox")]
+struct WorkerFetchResult {
+    status: u16,
+    text: String,
+}
+
+#[cfg(feature = "sandbox")]
+impl<'js> IntoJs<'js> for WorkerFetchResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set("status", self.status)?;
+        object.set("text", self.text)?;
+        Ok(object.into())
+    }
+}
+
+fn install_model_effect_globals(
+    context: &Context,
+    effects: ModelEffectDispatcher,
+) -> rquickjs::Result<()> {
+    context.with(|ctx| {
+        let read_effects = effects.clone();
+        let read_file = Function::new(ctx.clone(), move |path: String| {
+            validate_path(&path).map_err(|code| effect_error("read_file", code))?;
+            match read_effects(EffectOperation::ReadFile { path }) {
+                EffectResult::ReadFile { content } => Ok(content),
+                EffectResult::Error(error) => Err(effect_error("read_file", error.code)),
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+        let write_effects = effects.clone();
+        let write_file = Function::new(ctx.clone(), move |path: String, content: String| {
+            validate_path(&path).map_err(|code| effect_error("write_file", code))?;
+            if content.len() > WRITE_FILE_MAX_BYTES {
+                return Err(effect_error("write_file", EffectErrorCode::OutputLimit));
+            }
+            match write_effects(EffectOperation::WriteFile { path, content }) {
+                EffectResult::WriteFile => Ok(()),
+                EffectResult::Error(error) => Err(effect_error("write_file", error.code)),
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+        let spawn_effects = effects.clone();
+        let spawn = Function::new(
+            ctx.clone(),
+            move |program: String, arguments: Vec<String>| {
+                validate_spawn(&program, &arguments).map_err(|code| effect_error("spawn", code))?;
+                match spawn_effects(EffectOperation::Spawn { program, arguments }) {
+                    EffectResult::Spawn {
+                        stdout,
+                        stderr,
+                        exit_code,
+                        timed_out,
+                        stdout_truncated,
+                        stderr_truncated,
+                    } => Ok(WorkerSpawnResult {
+                        stdout,
+                        stderr,
+                        code: exit_code,
+                        timed_out,
+                        stdout_truncated,
+                        stderr_truncated,
+                    }),
+                    EffectResult::Error(error) => Err(effect_error("spawn", error.code)),
+                    _ => Err(rquickjs::Error::Unknown),
+                }
+            },
+        )?;
+        #[cfg(feature = "sandbox")]
+        let fetch = {
+            let fetch_effects = effects;
+            Function::new(ctx.clone(), move |url: String, options: Opt<Object<'_>>| {
+                if url.is_empty() || url.contains('\0') || url.len() > FETCH_URL_MAX_BYTES {
+                    return Err(effect_error("fetch", EffectErrorCode::InvalidTarget));
+                }
+                let (method, headers, body) = parse_fetch_options(options.0.as_ref())?;
+                match fetch_effects(EffectOperation::Fetch {
+                    url,
+                    method,
+                    headers,
+                    body,
+                }) {
+                    EffectResult::Fetch { status, body, .. } => {
+                        Ok(WorkerFetchResult { status, text: body })
+                    }
+                    EffectResult::Error(error) => Err(effect_error("fetch", error.code)),
+                    _ => Err(rquickjs::Error::Unknown),
+                }
+            })?
+        };
+        ctx.globals().set("read_file", read_file)?;
+        ctx.globals().set("write_file", write_file)?;
+        ctx.globals().set("spawn", spawn)?;
+        #[cfg(feature = "sandbox")]
+        ctx.globals().set("fetch", fetch)?;
+        Ok(())
+    })
+}
+
+fn validate_path(path: &str) -> Result<(), EffectErrorCode> {
+    if path.is_empty() || path.contains('\0') || path.len() > EFFECT_PATH_MAX_BYTES {
+        Err(EffectErrorCode::InvalidTarget)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_spawn(program: &str, arguments: &[String]) -> Result<(), EffectErrorCode> {
+    if program.is_empty()
+        || program.contains('\0')
+        || arguments.len() > SPAWN_ARGUMENT_MAX_COUNT
+        || arguments.iter().any(|argument| argument.contains('\0'))
+    {
+        return Err(EffectErrorCode::InvalidTarget);
+    }
+    let total_bytes = arguments.iter().try_fold(program.len(), |total, argument| {
+        total.checked_add(argument.len())
+    });
+    if total_bytes.is_none_or(|total| total > SPAWN_ARGUMENTS_MAX_BYTES) {
+        Err(EffectErrorCode::OutputLimit)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn parse_fetch_options(
+    options: Option<&Object<'_>>,
+) -> rquickjs::Result<(HttpMethod, Vec<HttpHeader>, Option<String>)> {
+    let Some(options) = options else {
+        return Ok((HttpMethod::Get, Vec::new(), None));
+    };
+    for key in options.keys::<String>() {
+        let key = key?;
+        if !matches!(key.as_str(), "method" | "headers" | "body") {
+            return Err(rquickjs::Error::new_from_js_message(
+                "fetch options",
+                "fetch",
+                format!("unsupported field '{key}'"),
+            ));
+        }
+    }
+    let method = options
+        .get::<_, Option<String>>("method")?
+        .unwrap_or_else(|| "GET".into())
+        .to_ascii_uppercase();
+    let method = match method.as_str() {
+        "GET" => HttpMethod::Get,
+        "POST" => HttpMethod::Post,
+        _ => {
+            return Err(rquickjs::Error::new_from_js_message(
+                "fetch options",
+                "fetch",
+                "method must be GET or POST",
+            ));
+        }
+    };
+    let mut headers = Vec::new();
+    let mut header_bytes = 0_usize;
+    if let Some(object) = options.get::<_, Option<Object<'_>>>("headers")? {
+        for property in object.props::<String, String>() {
+            let (name, value) = property?;
+            if headers.len() == FETCH_REQUEST_HEADER_MAX_COUNT {
+                return Err(fetch_options_error(
+                    "request headers exceed the configured limit",
+                ));
+            }
+            reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| fetch_options_error("invalid header name"))?;
+            reqwest::header::HeaderValue::from_str(&value)
+                .map_err(|_| fetch_options_error("invalid header value"))?;
+            header_bytes = header_bytes
+                .checked_add(name.len())
+                .and_then(|total| total.checked_add(value.len()))
+                .ok_or_else(|| {
+                    fetch_options_error("request headers exceed the configured limit")
+                })?;
+            if header_bytes > FETCH_REQUEST_HEADER_MAX_BYTES {
+                return Err(fetch_options_error(
+                    "request headers exceed the configured limit",
+                ));
+            }
+            let lower = name.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "proxy-connection"
+                    | "upgrade"
+                    | "te"
+                    | "proxy-authorization"
+                    | "authorization"
+                    | "cookie"
+                    | "forwarded"
+                    | "x-forwarded-for"
+                    | "x-forwarded-host"
+                    | "x-forwarded-proto"
+                    | "x-real-ip"
+                    | "via"
+            ) {
+                return Err(fetch_options_error(format!(
+                    "header '{lower}' is controlled by the host"
+                )));
+            }
+            headers.push(HttpHeader { name, value });
+        }
+    }
+    let body = options.get::<_, Option<String>>("body")?;
+    if body
+        .as_ref()
+        .is_some_and(|body| body.len() > FETCH_REQUEST_BODY_MAX_BYTES)
+    {
+        return Err(rquickjs::Error::new_from_js_message(
+            "fetch options",
+            "fetch",
+            "request body exceeds the configured limit",
+        ));
+    }
+    if method == HttpMethod::Get && body.is_some() {
+        return Err(rquickjs::Error::new_from_js_message(
+            "fetch options",
+            "fetch",
+            "GET requests cannot have a body",
+        ));
+    }
+    Ok((method, headers, body))
+}
+
+#[cfg(feature = "sandbox")]
+fn fetch_options_error(message: impl Into<String>) -> rquickjs::Error {
+    rquickjs::Error::new_from_js_message("fetch options", "fetch", message.into())
+}
+
+fn effect_error(tool: &'static str, code: EffectErrorCode) -> rquickjs::Error {
+    let code = match code {
+        EffectErrorCode::Denied => "denied",
+        EffectErrorCode::InvalidTarget => "invalid_target",
+        EffectErrorCode::Cancelled => "cancelled",
+        EffectErrorCode::TimedOut => "timed_out",
+        EffectErrorCode::OutputLimit => "output_limit",
+        EffectErrorCode::BackendFailure => "backend_failure",
+        EffectErrorCode::AuditFailure => "audit_failure",
+        EffectErrorCode::OutcomeUnknown => "outcome_unknown",
+    };
+    rquickjs::Error::new_from_js_message("parent effect", tool, code)
+}
+
+/// Worker-owned revocation boundary for all invocation capabilities tied to one fresh runtime.
+/// Dropping it covers timeout, protocol cancellation, panic unwinding, and worker recycle paths.
+#[cfg(feature = "skills")]
+pub(crate) struct WorkerCapabilityLifecycle {
+    capabilities: InvocationCapabilityRuntime,
+}
+
+#[cfg(feature = "skills")]
+impl WorkerCapabilityLifecycle {
+    pub(crate) fn new(capabilities: InvocationCapabilityRuntime) -> Self {
+        Self { capabilities }
+    }
+
+    pub(crate) fn cancel(&self, invocation_id: &super::protocol::InvocationId) {
+        self.capabilities.cancel(invocation_id);
+    }
+}
+
+#[cfg(feature = "skills")]
+impl Drop for WorkerCapabilityLifecycle {
+    fn drop(&mut self) {
+        self.capabilities.recycle();
+    }
+}
 
 const CONSOLE_WRAPPER_SOURCE: &str = r#"
 (emit => {
@@ -366,23 +686,22 @@ fn run_marked_worker() -> i32 {
         return EXIT_FAILURE;
     }
 
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut input = stdin.lock();
-    let mut output = stdout.lock();
-    if bootstrap(&mut input, &mut output).is_ok() {
+    if bootstrap(std::io::stdin(), std::io::stdout()).is_ok() {
         0
     } else {
         EXIT_FAILURE
     }
 }
 
-fn bootstrap(input: &mut impl std::io::Read, output: &mut impl Write) -> Result<(), ()> {
+fn bootstrap<R: std::io::Read + 'static, W: Write + 'static>(
+    mut input: R,
+    mut output: W,
+) -> Result<(), ()> {
     let build = BuildIdentity::current();
     let limits = ExecutionLimits::current();
     let mut protocol = WorkerProtocol::new(build.clone());
 
-    let hello: ParentWireFrame = read_frame(input).map_err(|_| ())?;
+    let hello: ParentWireFrame = read_frame(&mut input).map_err(|_| ())?;
     if !matches!(hello.message, ParentFrame::Hello(_)) {
         return Err(());
     }
@@ -393,15 +712,36 @@ fn bootstrap(input: &mut impl std::io::Read, output: &mut impl Write) -> Result<
     let ready: WorkerWireFrame =
         WireFrame::connection(build.clone(), 1, WorkerFrame::Ready(WorkerReady {}));
     protocol.on_send(&ready).map_err(|_| ())?;
-    write_terminal(output, &ready)?;
+    write_terminal(&mut output, &ready)?;
+
+    let transport = Rc::new(RefCell::new(WorkerTransport {
+        input,
+        output,
+        protocol,
+    }));
 
     loop {
-        let request: ParentWireFrame = read_frame(input).map_err(|_| ())?;
-        protocol.on_receive(&request).map_err(|_| ())?;
+        let request: ParentWireFrame = {
+            let mut transport = transport.borrow_mut();
+            let request = read_frame(&mut transport.input).map_err(|_| ())?;
+            transport.protocol.on_receive(&request).map_err(|_| ())?;
+            request
+        };
         let invocation_id = request.invocation_id.clone();
-        let sequence = request.sequence.checked_add(1).ok_or(())?;
+        let mut sequence = request.sequence.checked_add(1).ok_or(())?;
         let message = match request.message {
-            ParentFrame::RunStep(step) => WorkerFrame::StepResult(execute_run_step(step, limits)),
+            ParentFrame::RunStep(step) => {
+                let (result, terminal_sequence) = execute_brokered_run_step(
+                    step,
+                    limits,
+                    transport.clone(),
+                    build.clone(),
+                    invocation_id.clone().ok_or(())?,
+                    sequence,
+                )?;
+                sequence = terminal_sequence;
+                WorkerFrame::StepResult(result)
+            }
             ParentFrame::VerifyArtifact(request) => {
                 WorkerFrame::VerificationResult(execute_verification(request, limits))
             }
@@ -415,8 +755,9 @@ fn bootstrap(input: &mut impl std::io::Read, output: &mut impl Write) -> Result<
             sequence,
             message,
         };
-        protocol.on_send(&response).map_err(|_| ())?;
-        write_terminal(output, &response)?;
+        let mut transport = transport.borrow_mut();
+        transport.protocol.on_send(&response).map_err(|_| ())?;
+        write_terminal(&mut transport.output, &response)?;
     }
 }
 
@@ -425,9 +766,118 @@ fn write_terminal(output: &mut impl Write, frame: &WorkerWireFrame) -> Result<()
     output.flush().map_err(|_| ())
 }
 
-fn execute_run_step(request: RunStep, limits: ExecutionLimits) -> StepResult {
+fn execute_brokered_run_step<R: std::io::Read + 'static, W: Write + 'static>(
+    request: RunStep,
+    limits: ExecutionLimits,
+    transport: Rc<RefCell<WorkerTransport<R, W>>>,
+    build: BuildIdentity,
+    invocation_id: super::protocol::InvocationId,
+    sequence: u64,
+) -> Result<(StepResult, u64), ()> {
+    let grant_id = request.model_grant_id.clone();
+    let ordinal = Rc::new(Cell::new(0_u32));
+    let sequence = Rc::new(Cell::new(sequence));
+    let protocol_failed = Rc::new(Cell::new(false));
+    let dispatcher = grant_id.map(|grant_id| {
+        let ordinal = ordinal.clone();
+        let sequence = sequence.clone();
+        let protocol_failed = protocol_failed.clone();
+        let transport = transport.clone();
+        Rc::new(move |operation: EffectOperation| {
+            if protocol_failed.get() {
+                return backend_failure();
+            }
+            let effect_ordinal = ordinal.get();
+            let Some(next_ordinal) = effect_ordinal.checked_add(1) else {
+                protocol_failed.set(true);
+                return backend_failure();
+            };
+            ordinal.set(next_ordinal);
+            let request = EffectRequest {
+                effect_ordinal,
+                grant_id: grant_id.clone(),
+                advisory: AdvisoryAttribution::default(),
+                operation,
+            };
+            match transport
+                .borrow_mut()
+                .round_trip(request, &build, &invocation_id, &sequence)
+            {
+                Ok(result) => result,
+                Err(()) => {
+                    protocol_failed.set(true);
+                    backend_failure()
+                }
+            }
+        }) as ModelEffectDispatcher
+    });
+    let terminal = execute_run_step(request, limits, dispatcher);
+    if protocol_failed.get() {
+        Err(())
+    } else {
+        Ok((terminal, sequence.get()))
+    }
+}
+
+struct WorkerTransport<R, W> {
+    input: R,
+    output: W,
+    protocol: WorkerProtocol,
+}
+
+impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
+    fn round_trip(
+        &mut self,
+        request: EffectRequest,
+        build: &BuildIdentity,
+        invocation_id: &super::protocol::InvocationId,
+        sequence: &Cell<u64>,
+    ) -> Result<EffectResult, ()> {
+        let frame = WireFrame::invocation(
+            build.clone(),
+            invocation_id.clone(),
+            sequence.get(),
+            WorkerFrame::EffectRequest(request.clone()),
+        );
+        self.protocol.on_send(&frame).map_err(|_| ())?;
+        write_terminal(&mut self.output, &frame)?;
+        sequence.set(sequence.get().checked_add(1).ok_or(())?);
+        let response: ParentWireFrame = read_frame(&mut self.input).map_err(|_| ())?;
+        self.protocol.on_receive(&response).map_err(|_| ())?;
+        sequence.set(sequence.get().checked_add(1).ok_or(())?);
+        match response.message {
+            ParentFrame::EffectResponse(EffectResponse {
+                effect_ordinal,
+                result,
+            }) if effect_ordinal == request.effect_ordinal => Ok(result),
+            _ => Err(()),
+        }
+    }
+}
+
+fn backend_failure() -> EffectResult {
+    EffectResult::Error(super::protocol::EffectError {
+        code: EffectErrorCode::BackendFailure,
+    })
+}
+
+fn execute_run_step(
+    request: RunStep,
+    limits: ExecutionLimits,
+    effects: Option<ModelEffectDispatcher>,
+) -> StepResult {
+    #[cfg(feature = "skills")]
+    let has_selected_skills = !request.artifacts.is_empty();
     let console = Arc::new(Mutex::new(Vec::new()));
-    let execution = execute_fresh_step(&request.code, ScriptRole::Model, limits, console.clone());
+    let execution = execute_fresh_step(
+        &request.code,
+        ScriptRole::Model,
+        limits,
+        console.clone(),
+        effects,
+        #[cfg(feature = "skills")]
+        &request.artifacts,
+    );
     let console = console
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -437,11 +887,19 @@ fn execute_run_step(request: RunStep, limits: ExecutionLimits) -> StepResult {
             outcome,
             console,
             diagnostic: None,
+            #[cfg(feature = "skills")]
+            skill_events: Vec::new(),
+            #[cfg(feature = "skills")]
+            evidence_complete: !has_selected_skills,
         },
         Err(failure) => StepResult {
             outcome: failure.outcome,
             console,
             diagnostic: Some(failure.diagnostic),
+            #[cfg(feature = "skills")]
+            skill_events: Vec::new(),
+            #[cfg(feature = "skills")]
+            evidence_complete: !has_selected_skills,
         },
     }
 }
@@ -451,6 +909,8 @@ fn execute_fresh_step(
     role: ScriptRole,
     limits: ExecutionLimits,
     console: Arc<Mutex<Vec<ConsoleRecord>>>,
+    effects: Option<ModelEffectDispatcher>,
+    #[cfg(feature = "skills")] artifacts: &[super::skills::SkillArtifact],
 ) -> Result<StepOutcome, ClosedFailure> {
     let runtime = Runtime::new().map_err(|error| initialization_failure(error, role))?;
     runtime.set_memory_limit(MEMORY_LIMIT);
@@ -477,6 +937,18 @@ fn execute_fresh_step(
             role,
         )
     })?;
+    if let Some(effects) = effects {
+        install_model_effect_globals(&context, effects).map_err(|error| {
+            classify_error(
+                &context,
+                error,
+                deadline,
+                &interrupted,
+                DiagnosticStage::Initialization,
+                role,
+            )
+        })?;
+    }
     let clone = context
         .with(|ctx| {
             ctx.eval::<Function, _>(STRICT_CLONE_SOURCE)
@@ -507,6 +979,16 @@ fn execute_fresh_step(
                 role,
             )
         })?;
+    #[cfg(feature = "skills")]
+    for artifact in artifacts {
+        super::realm::load_artifact(&runtime, &context, artifact).map_err(|_| {
+            ClosedFailure::error(
+                JsErrorCode::Internal,
+                DiagnosticStage::Initialization,
+                ScriptRole::SkillSource,
+            )
+        })?;
+    }
     let value = evaluate(&context, source, &runtime, deadline, &interrupted, role)?;
     let mut remaining_jobs = limits.max_pending_jobs;
     drain_jobs(&runtime, deadline, &interrupted, &mut remaining_jobs, role)?;

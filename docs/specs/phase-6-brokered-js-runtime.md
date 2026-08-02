@@ -4,7 +4,7 @@
 - **Specification version**: 0.1.0
 - **Delivery status**: planned
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-01
+- **Last reconciled**: 2026-08-02
 - **Entry dependency**: the indexed Phase 1–5 contracts whose behavior Phase 6 preserves
 - **Exit dependency**: every gate and acceptance requirement in this document
 
@@ -111,6 +111,15 @@ shutdown sends the closed `Shutdown` frame, waits within the same bound, and sti
 cleanup. The next independent request always receives a new generation, so delayed output from
 an old process cannot enter its protocol stream.
 
+All full-agent rebuilds in the parent obtain this same lazy, authority-free supervisor. A rebuild
+snapshots its own permission bridge, file/fetch policy, selected skill artifacts, invocation IDs,
+grants, cancellation, and broker for each `JsTool::call`; none of those values is stored in the
+warm process or supervisor. Model switches and network retries therefore reuse the existing tool
+and worker generation, while dropping an agent closes only that build's permission receiver.
+Subagents and `/btw` intentionally keep their exact restricted tool sets and do not receive JS.
+Lifecycle regression tests assert stable process ID and generation across rebuilds plus denial
+under a rebuilt policy, proving that the old policy did not leak into the reused worker.
+
 ## Wire protocol
 
 IPC uses inherited anonymous pipes and a strictly alternating, half-duplex protocol. Each frame is
@@ -171,13 +180,49 @@ The provisional broker `SkillProposalDraft` omits identity-v2 capability and sig
 that broker operation fails closed until the full typed proposal protocol lands; the direct parent
 proposal service never infers omitted scopes or identity fields.
 
-Model-authored step code retains bounded effect globals and a bounded `propose_skill` writer host.
-Durable proposal enqueue is parent-owned. Stored learned-skill realms receive no effect or writer
+Model-authored step code retains bounded file, fetch, and spawn effect globals. The
+`propose_skill` global is intentionally unavailable and is not advertised until A18 supplies its
+full typed identity-v2 protocol; the parent-owned proposal and admission workers remain outside
+the worker authority boundary. Telemetry treats every structured worker field as an untrusted
+execution claim. The parent requires an exact match to the selected artifact/export and the
+parent-derived turn, tool-call, deterministic invocation, and step outcome before rebuilding a
+canonical event with its own retrieval metadata, index generation, production flag, timestamp,
+and evidence status. Worker feedback, selection, observability, and capability-policy kinds are
+rejected. Positive evidence exists only after a complete canonical batch is accepted by the
+bounded dispatcher. Invalid, incomplete, saturated, disconnected, or failed dispatch records a
+parent-owned `ObservabilityLost` signal and cannot trigger feedback or quarantine. Stored
+learned-skill realms receive no effect or writer
 globals. Learned-skill ABI v2 instead passes one hidden, immutable invocation capability object as
 the first export argument. It contains only the methods declared by the stored artifact. Each
 method closure embeds a parent-created grant ID and becomes unusable when the export promise
 settles, the invocation is cancelled, or its runtime ends. A skill cannot inspect or manufacture a
 grant ID, and retaining an object or method cannot transfer useful authority to a later invocation.
+The A15 cutover loads and executes pure artifacts only; an effectful stored export therefore fails
+closed until A18 wires the exact prepared invocation handle into that hidden capability object.
+
+`src/extras/js/skills/capability.rs` owns the worker-local binding from an explicit invocation ID
+and exact manifest to one opaque grant per declared method. `src/extras/js/realm.rs` constructs a
+null-prototype frozen object immediately before calling the stored export, inserts it at hidden
+argument zero, and keeps its token live only until synchronous return/throw or exact promise
+fulfillment/rejection. Dispatch checks the captured token before constructing an `EffectRequest`;
+a stale method therefore produces a closed denial and no protocol traffic. Cancellation removes
+only the named invocation, while the worker runtime lifecycle clears every prepared and active
+token on timeout, unwind, or recycle. Event attribution follows the request's explicit invocation
+and captured grant; there is no ambient active-invocation map or map-order fallback.
+
+Parent preparation also yields an opaque one-shot handle. The worker must bind that exact handle
+immediately around the intended wrapper `Function::call`; wrapper statement one consumes it before
+argument encoding or other model-controlled work. An unbound call denies, and there is no FIFO,
+metadata lookup, or ambient fallback from which an extra same-export call could borrow a later
+invocation's authority. Ordinary JavaScript calls made through `ctx.eval` are therefore
+unauthorized until A18 routes the selected export call through this Rust seam; A18/A21 production
+call wiring must use it, with no ambient fallback. Async results never expose a private-realm
+promise to the model realm. A Rust-owned settlement registry
+carries only the bounded encoded result string (or a closed rejection) into a promise created from
+the model realm's captured intrinsic, so its prototype and continuation ownership remain
+model-local even when private promise bindings are shadowed. Effect ordinals and the 256-effect
+limit belong to the whole fresh worker runtime request, not to individual nested or overlapping
+capability tokens, and reset only when that disposable runtime is recycled.
 
 File, fetch, proposal, and command operations retain their owning Phase 1–4 validation and limits.
 Parent-brokered JS `spawn` remains disabled on Windows until `mini-agent-uq5c` delivers and verifies

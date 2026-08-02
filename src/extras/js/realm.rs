@@ -6,12 +6,17 @@
 //! JSON strings. Invocation capability construction is deliberately owned by Phase 6 A17.
 
 use rquickjs::context::EvalOptions;
+use rquickjs::function::IntoArgs;
 use rquickjs::object::Property;
-use rquickjs::{Context, Function, Object, Persistent, Runtime, Value};
-use std::collections::HashSet;
+use rquickjs::{Context, Ctx, FromJs, Function, Object, Persistent, Runtime, Value};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-use super::skills::{SKILL_REALM_HARDENING_JS, SkillArtifact, private_skill_source};
+use super::skills::capability::{InvocationCapabilityRuntime, PreparedInvocationHandle};
+use super::skills::{
+    HostCapability, SKILL_REALM_HARDENING_JS, SkillArtifact, private_skill_source,
+};
 use super::worker::STRICT_CLONE_SOURCE;
 
 const BRIDGE_FACTORY_SOURCE: &str = r#"
@@ -26,11 +31,139 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
 })(JSON.parse, Reflect.apply)
 "#;
 
-const MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
+const PURE_MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
 ((freeze, parse) => (invoke, encode) => freeze(function (...values) {
     return parse(invoke(encode(values)));
 }))(Object.freeze, JSON.parse)
 "#;
+
+const MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
+((freeze, parse, PromiseCtor) =>
+ (invoke, encode, claim, revoke, prepareSettlement, abandonSettlement) => freeze(function (...values) {
+    const token = claim();
+    let settlementId;
+    try {
+        let resolveEncoded;
+        let rejectEncoded;
+        const publicPromise = new PromiseCtor((resolve, reject) => {
+            resolveEncoded = encoded => {
+                try { resolve(parse(encoded)); } catch (_) { reject(0); }
+            };
+            rejectEncoded = () => reject(0);
+        });
+        settlementId = prepareSettlement(resolveEncoded, rejectEncoded);
+        const encoded = invoke(token, encode(values), settlementId);
+        if (encoded === undefined) return publicPromise;
+        abandonSettlement(settlementId);
+        return parse(encoded);
+    } catch (_) {
+        if (settlementId !== undefined) abandonSettlement(settlementId);
+        revoke(token);
+        throw 0;
+    }
+}))(Object.freeze, JSON.parse, Promise)
+"#;
+
+const CAPABILITY_BRIDGE_FACTORY_SOURCE: &str = r#"
+((parse, apply, freeze, create, defineProperty, promiseResolve, promiseThen, PromiseCtor) =>
+ (original, encode, dispatch, finish) =>
+ (settleSuccess, settleFailure, methods) =>
+ (token, encodedArguments, settlementId) => {
+    try {
+        const capability = create(null);
+        for (const method of methods) {
+            const invokeEffect = freeze(function (...effectArguments) {
+                try {
+                    return parse(dispatch(token, method, encode(effectArguments)));
+                } catch (_) {
+                    throw 0;
+                }
+            });
+            defineProperty(capability, method, {
+                value: invokeEffect, enumerable: true, writable: false, configurable: false
+            });
+        }
+        freeze(capability);
+        const values = parse(encodedArguments);
+        const result = apply(original, undefined, [capability, ...values]);
+        if (result && typeof result.then === "function") {
+            const privatePromise = apply(promiseResolve, PromiseCtor, [result]);
+            apply(promiseThen, privatePromise, [
+                value => {
+                    try { settleSuccess(settlementId, encode(value)); }
+                    catch (_) { try { settleFailure(settlementId); } catch (_) {} }
+                    finally { finish(token); }
+                },
+                _error => {
+                    try { settleFailure(settlementId); } catch (_) {}
+                    finally { finish(token); }
+                }
+            ]);
+            return undefined;
+        }
+        try { return encode(result); } finally { finish(token); }
+    } catch (_) {
+        finish(token);
+        throw 0;
+    }
+})(JSON.parse, Reflect.apply, Object.freeze, Object.create, Object.defineProperty,
+   Promise.resolve, Promise.prototype.then, Promise)
+"#;
+
+#[derive(Default)]
+struct ModelSettlementRegistry {
+    state: Mutex<ModelSettlementState>,
+}
+
+#[derive(Default)]
+struct ModelSettlementState {
+    next_id: u64,
+    pending: HashMap<u64, ModelSettlement>,
+}
+
+struct ModelSettlement {
+    resolve: Persistent<Function<'static>>,
+    reject: Persistent<Function<'static>>,
+}
+
+impl ModelSettlementRegistry {
+    fn prepare(
+        &self,
+        resolve: Persistent<Function<'static>>,
+        reject: Persistent<Function<'static>>,
+    ) -> rquickjs::Result<u64> {
+        let mut state = self.state.lock().map_err(|_| rquickjs::Error::Unknown)?;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or(rquickjs::Error::Unknown)?;
+        let id = state.next_id;
+        state
+            .pending
+            .insert(id, ModelSettlement { resolve, reject });
+        Ok(id)
+    }
+
+    fn abandon(&self, id: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending.remove(&id);
+        }
+    }
+
+    fn settle(&self, ctx: &Ctx<'_>, id: u64, encoded: Option<String>) -> rquickjs::Result<()> {
+        let settlement = self
+            .state
+            .lock()
+            .map_err(|_| rquickjs::Error::Unknown)?
+            .pending
+            .remove(&id)
+            .ok_or(rquickjs::Error::Unknown)?;
+        match encoded {
+            Some(encoded) => settlement.resolve.restore(ctx)?.call((encoded,)),
+            None => settlement.reject.restore(ctx)?.call(()),
+        }
+    }
+}
 
 /// Closed loader failures. Source text and thrown values never enter the error surface.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -80,17 +213,70 @@ pub(crate) fn load_artifact(
     model_context: &Context,
     artifact: &SkillArtifact,
 ) -> Result<LoadedArtifact, RealmError> {
+    load_artifact_internal(runtime, model_context, artifact, None)
+}
+
+/// Load an ABI-v2 artifact whose wrappers inject a fresh, revocable invocation capability.
+pub(crate) fn load_artifact_with_capabilities(
+    runtime: &Runtime,
+    model_context: &Context,
+    artifact: &SkillArtifact,
+    capabilities: InvocationCapabilityRuntime,
+) -> Result<LoadedArtifact, RealmError> {
+    load_artifact_internal(
+        runtime,
+        model_context,
+        artifact,
+        Some(Arc::new(capabilities)),
+    )
+}
+
+/// Call an installed model wrapper under one exact, opaque invocation binding.
+///
+/// The guard is installed immediately around `Function::call`. Wrapper statement one claims the
+/// handle before argument encoding can execute model-controlled proxy traps or re-enter a wrapper.
+pub(crate) fn call_export_with_capability<'js, A, R>(
+    ctx: &Ctx<'js>,
+    export_name: &str,
+    capabilities: &InvocationCapabilityRuntime,
+    handle: PreparedInvocationHandle,
+    arguments: A,
+) -> rquickjs::Result<R>
+where
+    A: IntoArgs<'js>,
+    R: FromJs<'js>,
+{
+    let wrapper: Function = ctx.globals().get(export_name)?;
+    let _binding = capabilities
+        .bind(handle)
+        .map_err(|_| rquickjs::Error::Unknown)?;
+    wrapper.call(arguments)
+}
+
+fn load_artifact_internal(
+    runtime: &Runtime,
+    model_context: &Context,
+    artifact: &SkillArtifact,
+    capabilities: Option<Arc<InvocationCapabilityRuntime>>,
+) -> Result<LoadedArtifact, RealmError> {
     artifact
         .verify_identity()
         .map_err(|_| RealmError::Identity)?;
     validate_export_names(artifact)?;
     reject_model_collisions(model_context, artifact)?;
+    let settlements = capabilities
+        .as_ref()
+        .map(|_| Arc::new(ModelSettlementRegistry::default()));
 
     let private_context = Context::full(runtime).map_err(|_| RealmError::Initialization)?;
     let (bridge_factory, private_encoder) = private_context
         .with(|ctx| {
             // Capture every boundary primitive before stored source can replace a global.
-            let bridge_factory: Function = ctx.eval(BRIDGE_FACTORY_SOURCE)?;
+            let bridge_factory: Function = ctx.eval(if capabilities.is_some() {
+                CAPABILITY_BRIDGE_FACTORY_SOURCE
+            } else {
+                BRIDGE_FACTORY_SOURCE
+            })?;
             let encoder: Function = ctx.eval(STRICT_CLONE_SOURCE)?;
             ctx.eval::<(), _>(SKILL_REALM_HARDENING_JS)?;
 
@@ -140,8 +326,56 @@ pub(crate) fn load_artifact(
                 .iter()
                 .map(|export| {
                     let original: Function = namespace.get(export.name.as_str())?;
-                    let bridge: Function =
-                        bridge_factory.call((original, private_encoder.clone()))?;
+                    let bridge: Function = if let Some(capabilities) = capabilities.as_ref() {
+                        let settlements = settlements
+                            .as_ref()
+                            .expect("capability loader has settlement registry");
+                        let dispatch_capabilities = capabilities.clone();
+                        let dispatch = Function::new(
+                            ctx.clone(),
+                            move |token: u64, method: String, arguments: String| {
+                                let operation = HostCapability::from_token(&method)
+                                    .ok_or(rquickjs::Error::Unknown)?;
+                                dispatch_capabilities
+                                    .dispatch(token, operation, &arguments)
+                                    .map_err(|_| rquickjs::Error::Unknown)
+                            },
+                        )?;
+                        let finish_capabilities = capabilities.clone();
+                        let finish = Function::new(ctx.clone(), move |token: u64| {
+                            finish_capabilities.finish(token);
+                        })?;
+                        let success_settlements = settlements.clone();
+                        let settle_success = Function::new(
+                            ctx.clone(),
+                            move |ctx: Ctx<'_>, settlement_id: u64, encoded: String| {
+                                success_settlements.settle(&ctx, settlement_id, Some(encoded))
+                            },
+                        )?;
+                        let failure_settlements = settlements.clone();
+                        let settle_failure =
+                            Function::new(ctx.clone(), move |ctx: Ctx<'_>, settlement_id: u64| {
+                                failure_settlements.settle(&ctx, settlement_id, None)
+                            })?;
+                        let methods = artifact
+                            .capability
+                            .grants
+                            .iter()
+                            .map(|scope| scope.capability().as_token())
+                            .collect::<Vec<_>>();
+                        let encoded_methods = serde_json::to_string(&methods)
+                            .map_err(|_| rquickjs::Error::Unknown)?;
+                        let methods = ctx.json_parse(encoded_methods)?;
+                        let capability_factory: Function = bridge_factory.call((
+                            original,
+                            private_encoder.clone(),
+                            dispatch,
+                            finish,
+                        ))?;
+                        capability_factory.call((settle_success, settle_failure, methods))?
+                    } else {
+                        bridge_factory.call((original, private_encoder.clone()))?
+                    };
                     Ok(Persistent::save(&ctx, bridge))
                 })
                 .collect::<rquickjs::Result<Vec<_>>>()
@@ -152,7 +386,8 @@ pub(crate) fn load_artifact(
         return Err(RealmError::PendingInitializationJobs);
     }
 
-    let wrappers = build_model_wrappers(model_context, artifact, bridges)?;
+    let wrappers =
+        build_model_wrappers(model_context, artifact, bridges, capabilities, settlements)?;
     if runtime.is_job_pending() {
         return Err(RealmError::PendingInitializationJobs);
     }
@@ -208,14 +443,37 @@ fn build_model_wrappers(
     model_context: &Context,
     artifact: &SkillArtifact,
     bridges: Vec<Persistent<Function<'static>>>,
+    capabilities: Option<Arc<InvocationCapabilityRuntime>>,
+    settlements: Option<Arc<ModelSettlementRegistry>>,
 ) -> Result<Vec<(String, Persistent<Function<'static>>)>, RealmError> {
     model_context
         .with(|ctx| {
             // These closures are captured before model source runs, so model prototype/global
             // poisoning cannot change the clone or wrapper contract.
             let model_encoder: Function = ctx.eval(STRICT_CLONE_SOURCE)?;
-            let wrapper_factory: Function = ctx.eval(MODEL_WRAPPER_FACTORY_SOURCE)?;
+            let wrapper_factory: Function = ctx.eval(if settlements.is_some() {
+                MODEL_WRAPPER_FACTORY_SOURCE
+            } else {
+                PURE_MODEL_WRAPPER_FACTORY_SOURCE
+            })?;
             let model_encoder = Persistent::save(&ctx, model_encoder);
+            let settlement_functions = if let Some(settlements) = settlements.as_ref() {
+                let prepare_settlements = settlements.clone();
+                let prepare = Function::new(
+                    ctx.clone(),
+                    move |resolve: Persistent<Function<'static>>,
+                          reject: Persistent<Function<'static>>| {
+                        prepare_settlements.prepare(resolve, reject)
+                    },
+                )?;
+                let abandon_settlements = settlements.clone();
+                let abandon = Function::new(ctx.clone(), move |settlement_id: u64| {
+                    abandon_settlements.abandon(settlement_id);
+                })?;
+                Some((prepare, abandon))
+            } else {
+                None
+            };
 
             artifact
                 .exports
@@ -226,8 +484,36 @@ fn build_model_wrappers(
                     // accepts and returns only bounded encoded strings; model arguments and skill
                     // results are never passed to the original function by reference.
                     let invoke = bridge.restore(&ctx)?;
-                    let wrapper: Function =
-                        wrapper_factory.call((invoke, model_encoder.clone().restore(&ctx)?))?;
+                    let wrapper: Function = if let Some((prepare, abandon)) = &settlement_functions
+                    {
+                        let capabilities = capabilities
+                            .as_ref()
+                            .expect("settlement wrappers have invocation capabilities");
+                        let claim_capabilities = capabilities.clone();
+                        let artifact_id = artifact.id.clone();
+                        let export_name = export.name.clone();
+                        let manifest = artifact.capability.clone();
+                        let claim = Function::new(ctx.clone(), move || {
+                            claim_capabilities
+                                .claim_bound(&artifact_id, &export_name, &manifest)
+                                .map_err(|_| rquickjs::Error::Unknown)
+                        })?;
+                        let revoke_capabilities = capabilities.clone();
+                        let revoke = Function::new(ctx.clone(), move |token: u64| {
+                            revoke_capabilities.finish(token);
+                        })?;
+                        wrapper_factory.call((
+                            invoke,
+                            model_encoder.clone().restore(&ctx)?,
+                            claim,
+                            revoke,
+                            prepare.clone(),
+                            abandon.clone(),
+                        ))?
+                    } else {
+                        // Pure A16 wrappers never accept promises and retain their smaller bridge.
+                        wrapper_factory.call((invoke, model_encoder.clone().restore(&ctx)?))?
+                    };
                     Ok((export.name.clone(), Persistent::save(&ctx, wrapper)))
                 })
                 .collect::<rquickjs::Result<Vec<_>>>()
