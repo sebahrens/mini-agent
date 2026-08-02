@@ -267,6 +267,16 @@ pub(crate) fn is_path_changed_error(error: &std::io::Error) -> bool {
         .is_some_and(|source| source.downcast_ref::<PathChangedError>().is_some())
 }
 
+#[cfg(unix)]
+pub(crate) fn is_symlink_loop_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_symlink_loop_error(_error: &std::io::Error) -> bool {
+    false
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AtomicWriteFailure {
     None,
@@ -446,7 +456,14 @@ pub(crate) async fn stable_path_metadata(path: &Path) -> std::io::Result<Checked
     let checked_path = path.clone();
     let metadata = tokio::task::spawn_blocking(move || checked_path_metadata(&checked_path))
         .await
-        .map_err(std::io::Error::other)??;
+        .map_err(std::io::Error::other)?
+        .map_err(|error| {
+            if is_symlink_loop_error(&error) {
+                path_changed_error(&path)
+            } else {
+                error
+            }
+        })?;
     if metadata.file_type().is_symlink() {
         return Err(path_changed_error(&path));
     }
@@ -1823,6 +1840,40 @@ mod tests {
             let metadata = checked_path_metadata(&unreadable).expect("O_PATH needs no read access");
             assert!(metadata.is_file());
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stable_path_metadata_reports_nofollow_symlink_as_path_changed() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("stable_symlink_error");
+        let target = directory.path().join("target.txt");
+        let link = directory.path().join("link.txt");
+        std::fs::write(&target, b"target").expect("write symlink target");
+        symlink(&target, &link).expect("create symlink");
+
+        let error = stable_path_metadata(&link)
+            .await
+            .expect_err("stable metadata must reject symlinks");
+        assert!(is_path_changed_error(&error));
+        assert!(error.to_string().contains("Path changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_symlink_rejection_preserves_owned_regular_file_error() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("private_symlink_error");
+        let target = directory.path().join("target.txt");
+        let link = directory.path().join("link.txt");
+        std::fs::write(&target, b"target").expect("write symlink target");
+        symlink(&target, &link).expect("create symlink");
+
+        let error = open_private_file(&link).expect_err("private open must reject symlinks");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("owned regular file"));
     }
 
     #[test]
