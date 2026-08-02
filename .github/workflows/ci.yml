@@ -146,6 +146,34 @@ jobs:
       - name: Test JS spawn parity through the shared sandbox
         run: cargo test --locked --features js,sandbox
 
+  macos-worker-containment-gate:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Reject a missing macOS Seatbelt blocker probe
+        shell: bash
+        run: |
+          tests=$(cargo test --locked --no-default-features --features js -- --list)
+          count=$(printf '%s\n' "$tests" | grep -c '^extras::js::tests::worker_containment::macos_js_worker_containment: test$')
+          test "$count" -eq 1
+
+      - name: Validate the real macOS Seatbelt fail-closed gate
+        run: >-
+          cargo test --locked --no-default-features --features js
+          macos_js_worker_containment -- --ignored --nocapture
+
+      - name: Test fresh worker runtimes
+        run: cargo test --locked --no-default-features --features js worker_runtime
+
   platform-paths:
     if: github.event_name != 'schedule'
     strategy:

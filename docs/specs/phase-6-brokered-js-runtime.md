@@ -295,6 +295,35 @@ Windows separately deny process creation/exec. macOS must probe the weaker backe
 behavior and report it without upgrading the claim. A backend that is absent, untrusted,
 misconfigured, unverifiable, or unable to apply every required restriction makes JS unavailable.
 
+### macOS standalone-CLI containment gate
+
+The standalone macOS CLI currently reports `Seatbelt` with typed
+`DeprecatedBestEffort` assurance and keeps production JavaScript unavailable. This is a deliberate
+fail-closed result, not a delivered macOS containment backend. A real local probe on macOS 26
+preserves the following platform evidence:
+
+- a deny-default profile without `process-exec` prevents `/usr/bin/sandbox-exec` from executing
+  the initial worker image;
+- allowing the exact initial image is not a one-time grant and remains usable for later exec; and
+- macOS rejects applying a second, tighter Seatbelt profile after the first profile is active.
+
+macOS 15 remains an explicit CI probe target rather than a validated runtime major. The production
+allowlist must not classify it as validated until that runner has produced the same real-backend
+evidence. Both CI rows first prove that the target-gated test exists, so an unsupported target or
+an accidentally compiled-out test cannot pass as a zero-test success.
+
+Consequently the current stable-image design cannot both enter the worker through `sandbox-exec`
+and deny a native-compromised worker from executing the allowed image again. The public
+`sandbox_init` API is deprecated, accepts only named profiles, and documents re-sandboxing as an
+error; the raw profile compile/apply functions used by `sandbox-exec` are private. A one-time
+securely published image whose only pathname is removed before untrusted work is a possible future
+design, not a delivered bypass: its code-signing behavior, publication race, descriptor/path
+re-exec surface, crash cleanup, and full capability matrix remain unvalidated. Until a validated
+standalone mechanism closes this transition, the launcher has no profile, descriptor, rlimit, or
+process-group fallback: every production launch returns unavailable. The ignored real-backend test
+`macos_js_worker_containment` is a blocker regression gate; it must not be represented as proof of
+the complete workspace, skill-store, network, descriptor, resource, or descendant-denial matrix.
+
 The Windows delivery gate is mandatory: an LPAC worker must load from every supported install
 location and start with only the protocol handles. Failure for a location leaves Windows JS
 disabled there. A restricted-token worker, unsafe broad ACL change, or unconfined fallback is

@@ -7,7 +7,10 @@ use std::process::{Child, ExitStatus};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 
-use super::{WorkerBackend, WorkerContainmentStatus, WorkerLaunchError, WorkerProcess};
+use super::{
+    WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus, WorkerLaunchError,
+    WorkerProcess,
+};
 
 const BACKEND: WorkerBackend = WorkerBackend::WindowsLpac;
 const UNAVAILABLE_REASON: &str =
@@ -30,6 +33,7 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
 pub(super) fn containment_status() -> WorkerContainmentStatus {
     WorkerContainmentStatus::Unavailable {
         backend: BACKEND,
+        assurance: WorkerContainmentAssurance::Enforced,
         reason: UNAVAILABLE_REASON.to_string(),
     }
 }

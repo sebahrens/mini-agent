@@ -3,7 +3,10 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::process::{Child, ExitStatus};
 
-use super::{WorkerBackend, WorkerContainmentStatus, WorkerLaunchError, WorkerProcess};
+use super::{
+    WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus, WorkerLaunchError,
+    WorkerProcess,
+};
 
 const BACKEND: WorkerBackend = WorkerBackend::Bubblewrap;
 const UNAVAILABLE_REASON: &str =
@@ -24,6 +27,7 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
 pub(super) fn containment_status() -> WorkerContainmentStatus {
     WorkerContainmentStatus::Unavailable {
         backend: BACKEND,
+        assurance: WorkerContainmentAssurance::Enforced,
         reason: UNAVAILABLE_REASON.to_string(),
     }
 }
