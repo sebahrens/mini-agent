@@ -525,9 +525,11 @@ private Windows creation lock and release it immediately after synchronous spawn
 standard-library output helper is the one synchronous exception: because
 `Command` does not expose its stdio configuration for a faithful spawn-only reimplementation, it
 holds the lock while `Command::output` completes, preserving explicit stdio and builder reuse. No
-guard crosses an async suspension. Inheritable-handle owners also clear their bit during drop on
+guard crosses an async suspension, and async/await/closure-deferred terminals cannot claim lexical
+guard dominance. Inheritable-handle owners also clear their bit during drop on
 every error path before the earlier-acquired lock guard is released. The checked subprocess
-inventory combines parsed import/local-type provenance with full-source tokens and rejects
+inventory recursively resolves parsed imports, type aliases, and local-module re-exports alongside
+full-source tokens and rejects
 multiline, qualified-angle or renamed UFCS, and ambiguous Windows-capable production terminals that
 bypass this boundary. A dedicated exact multiset inventory for the creation helper itself requires
 every raw standard-library, Tokio, and RMCP terminal to remain dominated by a retained crate guard.

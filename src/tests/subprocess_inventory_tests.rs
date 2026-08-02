@@ -9,13 +9,50 @@ use syn::visit::Visit;
 #[derive(Debug, Default)]
 struct SourceProvenance {
     bindings: BTreeMap<String, Option<Vec<String>>>,
+    qualified_bindings: BTreeMap<Vec<String>, Option<Vec<String>>>,
     local_names: BTreeSet<String>,
+    module_path: Vec<String>,
+    opaque_modules: BTreeSet<Vec<String>>,
 }
 
 impl SourceProvenance {
+    fn absolute_target(&self, target: Vec<String>) -> Vec<String> {
+        let mut index = 0;
+        let mut base = match target.first().map(String::as_str) {
+            Some("crate") => {
+                index = 1;
+                Vec::new()
+            }
+            Some("self") => {
+                index = 1;
+                self.module_path.clone()
+            }
+            Some("super") => self.module_path.clone(),
+            _ => return target,
+        };
+        while target.get(index).is_some_and(|segment| segment == "super") {
+            base.pop();
+            index += 1;
+        }
+        base.extend(target.into_iter().skip(index));
+        base
+    }
+
     fn record_binding(&mut self, name: String, target: Vec<String>) {
+        let target = self.absolute_target(target);
         self.bindings
-            .entry(name)
+            .entry(name.clone())
+            .and_modify(|existing| {
+                if existing.as_ref() != Some(&target) {
+                    *existing = None;
+                }
+            })
+            .or_insert_with(|| Some(target.clone()));
+
+        let mut qualified_name = self.module_path.clone();
+        qualified_name.push(name);
+        self.qualified_bindings
+            .entry(qualified_name)
             .and_modify(|existing| {
                 if existing.as_ref() != Some(&target) {
                     *existing = None;
@@ -24,23 +61,68 @@ impl SourceProvenance {
             .or_insert_with(|| Some(target));
     }
 
+    fn record_unknown_binding(&mut self, name: String) {
+        self.bindings.insert(name.clone(), None);
+        let mut qualified_name = self.module_path.clone();
+        qualified_name.push(name);
+        self.qualified_bindings.insert(qualified_name, None);
+    }
+
+    fn record_opaque_module(&mut self) {
+        if !self.module_path.is_empty() {
+            self.opaque_modules.insert(self.module_path.clone());
+        }
+    }
+
+    fn matching_binding(&self, path: &[String]) -> Option<(usize, &Option<Vec<String>>)> {
+        (1..=path.len())
+            .rev()
+            .find_map(|length| {
+                self.qualified_bindings
+                    .get(&path[..length])
+                    .map(|binding| (length, binding))
+            })
+            .or_else(|| {
+                path.first()
+                    .and_then(|first| self.bindings.get(first))
+                    .map(|binding| (1, binding))
+            })
+    }
+
     fn resolve_path(&self, path: &[String]) -> Option<Vec<String>> {
-        let first = path.first()?;
-        if let Some(binding) = self.bindings.get(first) {
-            let mut resolved = binding.clone()?;
-            resolved.extend(path.iter().skip(1).cloned());
-            return Some(resolved);
+        let mut resolved = path.to_vec();
+        let mut seen = BTreeSet::new();
+        while seen.insert(resolved.clone()) {
+            let Some((binding_length, binding)) = self.matching_binding(&resolved) else {
+                return Some(resolved);
+            };
+            let mut next = binding.clone()?;
+            next.extend(resolved.iter().skip(binding_length).cloned());
+            resolved = next;
         }
-        if self.local_names.contains(first) {
-            return None;
-        }
-        Some(path.to_vec())
+        None
     }
 
     fn is_proven_local_path(&self, path: &[String]) -> bool {
+        if self.matching_binding(path).is_some() {
+            return self
+                .resolve_path(path)
+                .and_then(|target| target.first().cloned())
+                .is_some_and(|root| {
+                    self.local_names.contains(&root)
+                        || matches!(root.as_str(), "crate" | "self" | "super")
+                });
+        }
         let Some(first) = path.first() else {
             return false;
         };
+        if self
+            .opaque_modules
+            .iter()
+            .any(|module| path.starts_with(module))
+        {
+            return false;
+        }
         if let Some(binding) = self.bindings.get(first) {
             return binding
                 .as_ref()
@@ -85,7 +167,7 @@ fn collect_use_bindings(
                 collect_use_bindings(item, prefix, provenance);
             }
         }
-        syn::UseTree::Glob(_) => {}
+        syn::UseTree::Glob(_) => provenance.record_opaque_module(),
     }
 }
 
@@ -104,7 +186,9 @@ impl<'ast> Visit<'ast> for SourceProvenance {
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         self.local_names.insert(item.ident.to_string());
+        self.module_path.push(item.ident.to_string());
         syn::visit::visit_item_mod(self, item);
+        self.module_path.pop();
     }
 
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
@@ -123,7 +207,22 @@ impl<'ast> Visit<'ast> for SourceProvenance {
     }
 
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-        self.local_names.insert(item.ident.to_string());
+        if let syn::Type::Path(path) = item.ty.as_ref() {
+            if path.qself.is_none() {
+                self.record_binding(
+                    item.ident.to_string(),
+                    path.path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect(),
+                );
+            } else {
+                self.record_unknown_binding(item.ident.to_string());
+            }
+        } else {
+            self.record_unknown_binding(item.ident.to_string());
+        }
         syn::visit::visit_item_type(self, item);
     }
 
@@ -203,7 +302,30 @@ fn block_holds_creation_guard(block: &syn::Block) -> bool {
 
     let mut uses = GuardUseCounter::default();
     uses.visit_block(block);
-    uses.0 == 0
+    if uses.0 != 0 {
+        return false;
+    }
+
+    #[derive(Default)]
+    struct SuspensionOrDeferralDetector(bool);
+
+    impl<'ast> Visit<'ast> for SuspensionOrDeferralDetector {
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {
+            self.0 = true;
+        }
+
+        fn visit_expr_await(&mut self, _: &'ast syn::ExprAwait) {
+            self.0 = true;
+        }
+
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {
+            self.0 = true;
+        }
+    }
+
+    let mut detector = SuspensionOrDeferralDetector::default();
+    detector.visit_block(block);
+    !detector.0
 }
 
 #[derive(Default)]
@@ -212,30 +334,51 @@ struct FunctionGuardCollector {
 }
 
 impl FunctionGuardCollector {
-    fn record(&mut self, name: String, block: &syn::Block, span: proc_macro2::Span) {
+    fn record(
+        &mut self,
+        name: String,
+        block: &syn::Block,
+        span: proc_macro2::Span,
+        is_async: bool,
+    ) {
         self.scopes.push(FunctionGuardScope {
             name,
             start_line: span.start().line,
             end_line: span.end().line,
-            guard_dominates: block_holds_creation_guard(block),
+            guard_dominates: !is_async && block_holds_creation_guard(block),
         });
     }
 }
 
 impl<'ast> Visit<'ast> for FunctionGuardCollector {
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        self.record(item.sig.ident.to_string(), &item.block, item.span());
+        self.record(
+            item.sig.ident.to_string(),
+            &item.block,
+            item.span(),
+            item.sig.asyncness.is_some(),
+        );
         syn::visit::visit_item_fn(self, item);
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        self.record(item.sig.ident.to_string(), &item.block, item.span());
+        self.record(
+            item.sig.ident.to_string(),
+            &item.block,
+            item.span(),
+            item.sig.asyncness.is_some(),
+        );
         syn::visit::visit_impl_item_fn(self, item);
     }
 
     fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
         if let Some(block) = &item.default {
-            self.record(item.sig.ident.to_string(), block, item.span());
+            self.record(
+                item.sig.ident.to_string(),
+                block,
+                item.span(),
+                item.sig.asyncness.is_some(),
+            );
         }
         syn::visit::visit_trait_item_fn(self, item);
     }
@@ -1472,6 +1615,42 @@ fn bypass(command: &mut std::process::Command) -> std::io::Result<std::process::
 }
 
 #[test]
+fn process_creation_raw_inventory_rejects_guards_across_suspension_and_deferral() {
+    let fixtures = [
+        (
+            r#"
+async fn bypass(command: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    let _guard = creation_guard()?;
+    yield_now().await;
+    tokio::process::Command::spawn(command)
+}
+"#,
+            "bypass|tokio::process::Command::spawn(command)",
+        ),
+        (
+            r#"
+fn bypass(command: &mut std::process::Command) {
+    let _guard = creation_guard().unwrap();
+    let deferred = || std::process::Command::spawn(command);
+}
+"#,
+            "bypass|let deferred = || std::process::Command::spawn(command);",
+        ),
+    ];
+
+    for (fixture, fingerprint) in fixtures {
+        let expected = BTreeMap::from([(fingerprint.to_string(), 1)]);
+        let error = validate_process_creation_raw_inventory(fixture, &expected).expect_err(
+            "a creation guard must not authorize terminals across suspension or deferral",
+        );
+        assert!(
+            error.contains("not dominated by a retained creation guard"),
+            "unexpected validation error: {error}"
+        );
+    }
+}
+
+#[test]
 fn current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes() {
     validate_current_class_assignments().expect("current subprocess classes must be allowed");
 }
@@ -1633,6 +1812,53 @@ fn launch(std_command: &mut tokio, tokio_command: &mut thread) {
             .map(|call| call.name.as_str())
             .collect::<Vec<_>>(),
         ["spawn", "output"]
+    );
+    assert!(calls.iter().all(|call| !call.guarded));
+}
+
+#[test]
+fn token_terminal_discovery_resolves_process_type_aliases_and_module_reexports() {
+    let calls = terminal_calls(
+        r#"
+type Cmd = std::process::Command;
+type IndirectCmd = Cmd;
+
+mod local {
+    pub use std::process::Command;
+}
+
+mod indirect {
+    pub use crate::local::Command;
+}
+
+mod nested {
+    pub mod twice {
+        pub use super::super::local::Command;
+    }
+}
+
+mod globbed {
+    pub use std::process::*;
+}
+
+fn launch(command: &mut std::process::Command) {
+    let _ = Cmd::spawn(command);
+    let _ = IndirectCmd::spawn(command);
+    let _ = local::Command::spawn(command);
+    let _ = indirect::Command::spawn(command);
+    let _ = nested::twice::Command::spawn(command);
+    let _ = globbed::Command::spawn(command);
+}
+"#,
+    )
+    .expect("fixture must tokenize");
+
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["spawn", "spawn", "spawn", "spawn", "spawn", "spawn"]
     );
     assert!(calls.iter().all(|call| !call.guarded));
 }

@@ -111,12 +111,14 @@ the crate-wide creation boundary does not change its trust class. A separate inv
 requires every Windows-capable `TC-*` terminal to use the guarded standard-library, Tokio, or RMCP
 helper. That assertion parses imports and local type/module provenance while tokenizing complete Rust
 sources, so whitespace-separated methods, qualified-angle UFCS, and renamed standard-library/Tokio
-`Command` calls cannot evade it. Only syntactically proven task/thread or local associated `spawn`
-calls are excluded; ambiguous and unrecognized terminals fail closed. Spawn/status helpers hold the
-Windows creation mutex only through
+`Command` calls cannot evade it. Type aliases and local-module re-exports are resolved recursively;
+ambiguous or cyclic provenance fails closed rather than inheriting a local-type exemption. Only
+syntactically proven task/thread or local associated `spawn` calls are excluded; ambiguous and
+unrecognized terminals fail closed. Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so
 explicit stdio and reusable-builder semantics remain exact; that synchronous helper can therefore
-hold the mutex through output completion, but no helper carries it across an async suspension.
+hold the mutex through output completion. Raw terminals in async functions, after `.await`, or in
+deferred async/closure bodies cannot claim lexical guard dominance.
 Target-specific Linux/macOS worker terminals and explicit `TEST-ONLY` sites are outside this Windows
 race boundary.
 `src/process_creation.rs` cannot assign a principal because it preserves the caller's class, so it
