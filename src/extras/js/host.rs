@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,19 +16,28 @@ use std::io::Read;
 #[cfg(feature = "sandbox")]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(feature = "sandbox")]
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
 #[cfg(feature = "sandbox")]
 use std::time::Instant;
 
-#[cfg(feature = "skills")]
-use crate::extras::js::skills::proposal::{JsProposal, ProposalError, ProposalHost};
-#[cfg(feature = "skills")]
-use crate::extras::js::skills::store::EnqueueStatus;
-use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
-use crate::extras::js::types::{
-    READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
+use crate::extras::js::broker::{
+    AuthorizedEffect, HostEffectError, ParentEffectFuture, ParentEffectService,
 };
-use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox};
+use crate::extras::js::protocol::{EffectOperation, EffectResult};
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::proposal::{
+    JsProposal, ProposalEffectService, ProposalError, ProposalHost,
+};
+use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
+use crate::extras::js::types::PermCancellation;
+use crate::extras::js::types::{
+    EffectServiceError, READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
+    canonical_spawn_permission_subject, spawn_policy_input,
+};
+use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox, SandboxPolicy};
 
 #[cfg(feature = "skills")]
 #[derive(Clone, Default)]
@@ -525,7 +535,7 @@ enum FetchOriginPolicy {
 
 #[cfg(feature = "sandbox")]
 #[derive(Debug, Clone)]
-struct FetchPolicy {
+pub(crate) struct FetchPolicy {
     origins: FetchOriginPolicy,
     allow_http: bool,
 }
@@ -542,7 +552,7 @@ impl Default for FetchPolicy {
 
 #[cfg(feature = "sandbox")]
 impl FetchPolicy {
-    fn from_settings(origins: Option<&[String]>, allow_http: bool) -> Self {
+    pub(crate) fn from_settings(origins: Option<&[String]>, allow_http: bool) -> Self {
         let Some(origins) = origins else {
             return Self {
                 allow_http,
@@ -626,25 +636,34 @@ fn fetch_origin(url: &Url) -> Result<FetchOrigin, FetchError> {
 
 #[cfg(feature = "sandbox")]
 trait FetchResolver: Send + Sync {
-    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError>;
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        permission_bridge: &PermissionBridge,
+    ) -> Result<Vec<SocketAddr>, FetchError>;
 }
 
 #[cfg(feature = "sandbox")]
 struct RuntimeFetchResolver {
     runtime: tokio::runtime::Handle,
-    permission_bridge: PermissionBridge,
 }
 
 #[cfg(feature = "sandbox")]
 impl FetchResolver for RuntimeFetchResolver {
-    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError> {
-        if self.permission_bridge.is_cancelled() {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        permission_bridge: &PermissionBridge,
+    ) -> Result<Vec<SocketAddr>, FetchError> {
+        if permission_bridge.is_cancelled() {
             return Err(FetchError::Cancelled);
         }
         if let Ok(address) = host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(address, port)]);
         }
-        let bridge = self.permission_bridge.clone();
+        let bridge = permission_bridge.clone();
         self.runtime.block_on(async move {
             tokio::select! {
                 result = tokio::time::timeout(
@@ -710,41 +729,237 @@ struct FetchExecutor {
 }
 
 #[cfg(feature = "sandbox")]
-impl FetchExecutor {
-    fn execute(&self, raw_url: &str, request: &FetchRequest) -> Result<FetchResult, FetchError> {
-        let mut current = raw_url.to_string();
-        for redirect_count in 0..=FETCH_MAX_REDIRECTS {
-            let url = self.policy.authorize(&current)?;
-            let host = url.host_str().ok_or(FetchError::MissingHost)?;
-            let port = url.port_or_known_default().ok_or(FetchError::MissingPort)?;
-            let mut addresses = self.resolver.resolve(host, port)?;
-            addresses.sort_unstable();
-            addresses.dedup();
-            validate_public_destinations(&addresses)?;
+struct PreparedFetchTarget {
+    url: Url,
+    addresses: Vec<SocketAddr>,
+}
 
-            let permission_key = fetch_permission_key(&url, &addresses);
-            self.permission_bridge
-                .check("js/fetch", &permission_key)
-                .map_err(|error| FetchError::Permission(error.to_string()))?;
+#[cfg(feature = "sandbox")]
+struct PreparedFetchEffect {
+    target: PreparedFetchTarget,
+    request: FetchRequest,
+    control: Arc<FetchCallControl>,
+    deadline: Instant,
+}
 
-            let origin = fetch_origin(&url)?;
-            match self
-                .sender
-                .send(url, request, &addresses, &self.permission_bridge)?
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_ACTIVE: u8 = 0;
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_CANCELLED: u8 = 1;
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_DISPATCHED: u8 = 2;
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_FINISHED_BEFORE_DISPATCH: u8 = 3;
+#[cfg(feature = "sandbox")]
+const FETCH_CALL_FINISHED_AFTER_DISPATCH: u8 = 4;
+
+#[cfg(feature = "sandbox")]
+struct FetchCallControl {
+    cancellation: PermCancellation,
+    phase: AtomicU8,
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchCallControl {
+    fn new() -> Self {
+        Self {
+            cancellation: PermCancellation::new(),
+            phase: AtomicU8::new(FETCH_CALL_ACTIVE),
+        }
+    }
+
+    fn begin_dispatch(&self) -> bool {
+        loop {
+            match self.phase.load(Ordering::Acquire) {
+                FETCH_CALL_ACTIVE => {
+                    if self
+                        .phase
+                        .compare_exchange(
+                            FETCH_CALL_ACTIVE,
+                            FETCH_CALL_DISPATCHED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                FETCH_CALL_DISPATCHED => return !self.cancellation.is_cancelled(),
+                FETCH_CALL_CANCELLED
+                | FETCH_CALL_FINISHED_BEFORE_DISPATCH
+                | FETCH_CALL_FINISHED_AFTER_DISPATCH => return false,
+                _ => unreachable!("fetch call entered an unknown phase"),
+            }
+        }
+    }
+
+    fn cancel(&self, before_dispatch: FetchError) -> FetchError {
+        self.cancellation.cancel();
+        match self.phase.compare_exchange(
+            FETCH_CALL_ACTIVE,
+            FETCH_CALL_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(FETCH_CALL_CANCELLED | FETCH_CALL_FINISHED_BEFORE_DISPATCH) => {
+                before_dispatch
+            }
+            Err(FETCH_CALL_DISPATCHED | FETCH_CALL_FINISHED_AFTER_DISPATCH) => {
+                FetchError::OutcomeUnknown
+            }
+            Err(_) => unreachable!("fetch call entered an unknown phase"),
+        }
+    }
+
+    fn finish(&self) {
+        loop {
+            let current = self.phase.load(Ordering::Acquire);
+            let finished = match current {
+                FETCH_CALL_ACTIVE => FETCH_CALL_FINISHED_BEFORE_DISPATCH,
+                FETCH_CALL_DISPATCHED => FETCH_CALL_FINISHED_AFTER_DISPATCH,
+                FETCH_CALL_CANCELLED
+                | FETCH_CALL_FINISHED_BEFORE_DISPATCH
+                | FETCH_CALL_FINISHED_AFTER_DISPATCH => return,
+                _ => unreachable!("fetch call entered an unknown phase"),
+            };
+            if self
+                .phase
+                .compare_exchange(current, finished, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sandbox")]
+struct FetchCallCompletion(Arc<FetchCallControl>);
+
+#[cfg(feature = "sandbox")]
+impl Drop for FetchCallCompletion {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+#[cfg(feature = "sandbox")]
+struct CancelFetchPrepareOnDrop(Option<Arc<FetchCallControl>>);
+
+#[cfg(feature = "sandbox")]
+impl CancelFetchPrepareOnDrop {
+    fn new(control: Arc<FetchCallControl>) -> Self {
+        Self(Some(control))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(feature = "sandbox")]
+impl Drop for CancelFetchPrepareOnDrop {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take() {
+            let _ = control.cancel(FetchError::Cancelled);
+        }
+    }
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchExecutor {
+    #[cfg(test)]
+    fn execute(&self, raw_url: &str, request: &FetchRequest) -> Result<FetchResult, FetchError> {
+        self.execute_controlled(raw_url, request, Arc::new(FetchCallControl::new()))
+    }
+
+    fn execute_controlled(
+        &self,
+        raw_url: &str,
+        request: &FetchRequest,
+        control: Arc<FetchCallControl>,
+    ) -> Result<FetchResult, FetchError> {
+        let prepared = self.prepare(
+            raw_url,
+            request.clone(),
+            control.clone(),
+            Instant::now() + FETCH_TOTAL_TIMEOUT,
+        )?;
+        self.execute_prepared(prepared)
+    }
+
+    fn prepare(
+        &self,
+        raw_url: &str,
+        request: FetchRequest,
+        control: Arc<FetchCallControl>,
+        deadline: Instant,
+    ) -> Result<PreparedFetchEffect, FetchError> {
+        let permission_bridge = self
+            .permission_bridge
+            .for_host_call(control.cancellation.clone());
+        let target = self.prepare_target(raw_url, &permission_bridge)?;
+        Ok(PreparedFetchEffect {
+            target,
+            request,
+            control,
+            deadline,
+        })
+    }
+
+    fn prepare_target(
+        &self,
+        raw_url: &str,
+        permission_bridge: &PermissionBridge,
+    ) -> Result<PreparedFetchTarget, FetchError> {
+        let url = self.policy.authorize(raw_url)?;
+        let host = url.host_str().ok_or(FetchError::MissingHost)?;
+        let port = url.port_or_known_default().ok_or(FetchError::MissingPort)?;
+        let mut addresses = self.resolver.resolve(host, port, permission_bridge)?;
+        addresses.sort_unstable();
+        addresses.dedup();
+        validate_public_destinations(&addresses)?;
+        let permission_key = fetch_permission_key(&url, &addresses);
+        permission_bridge
+            .check("js/fetch", &permission_key)
+            .map_err(|error| FetchError::Permission(permission_service_error(error)))?;
+        Ok(PreparedFetchTarget { url, addresses })
+    }
+
+    fn execute_prepared(
+        &self,
+        mut prepared: PreparedFetchEffect,
+    ) -> Result<FetchResult, FetchError> {
+        let control = prepared.control.clone();
+        let _completion = FetchCallCompletion(control.clone());
+        let permission_bridge = self
+            .permission_bridge
+            .for_host_call(control.cancellation.clone());
+        for redirect_count in 0..=FETCH_MAX_REDIRECTS {
+            let origin = fetch_origin(&prepared.target.url)?;
+            if permission_bridge.is_cancelled() || !control.begin_dispatch() {
+                return Err(FetchError::Cancelled);
+            }
+            match self.sender.send(
+                prepared.target.url.clone(),
+                &prepared.request,
+                &prepared.target.addresses,
+                &permission_bridge,
+            )? {
                 FetchTransportOutcome::Complete(result) => return Ok(result),
                 FetchTransportOutcome::Redirect(redirect) => {
                     if redirect_count == FETCH_MAX_REDIRECTS {
                         return Err(FetchError::TooManyRedirects);
                     }
                     let redirect = self.policy.authorize(redirect.as_str())?;
-                    if request.method != reqwest::Method::GET {
+                    if prepared.request.method != reqwest::Method::GET {
                         return Err(FetchError::RedirectReplayDenied);
                     }
-                    if !request.headers.is_empty() && origin != fetch_origin(&redirect)? {
+                    if !prepared.request.headers.is_empty() && origin != fetch_origin(&redirect)? {
                         return Err(FetchError::CrossOriginRedirectDenied);
                     }
-                    current = redirect.into();
+                    prepared.target = self.prepare_target(redirect.as_str(), &permission_bridge)?;
                 }
             }
         }
@@ -843,6 +1058,8 @@ const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "sandbox")]
 const FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "sandbox")]
+const FETCH_CANCELLATION_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(feature = "sandbox")]
 const FETCH_REQUEST_HEADER_MAX_BYTES: usize = 16 * 1024;
 #[cfg(feature = "sandbox")]
 const FETCH_REQUEST_HEADER_MAX_COUNT: usize = 64;
@@ -888,6 +1105,59 @@ impl FetchRequest {
             headers: reqwest::header::HeaderMap::new(),
             body: None,
         }
+    }
+
+    #[allow(dead_code)] // Protocol integration starts using this in A15.
+    pub(crate) fn try_new(
+        method: &str,
+        headers: &[(String, String)],
+        body: Option<String>,
+    ) -> Result<Self, FetchError> {
+        let method = match method {
+            "GET" => reqwest::Method::GET,
+            "POST" => reqwest::Method::POST,
+            _ => {
+                return Err(FetchError::InvalidOptions(
+                    "method must be GET or POST".to_string(),
+                ));
+            }
+        };
+        if method == reqwest::Method::GET && body.is_some() {
+            return Err(FetchError::InvalidOptions(
+                "GET requests cannot have a body".to_string(),
+            ));
+        }
+        let mut parsed_headers = reqwest::header::HeaderMap::new();
+        for (name, value) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| FetchError::InvalidOptions("invalid header name".to_string()))?;
+            if is_forbidden_fetch_header(&name) {
+                return Err(FetchError::InvalidOptions(
+                    "header is controlled by the host".to_string(),
+                ));
+            }
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|_| FetchError::InvalidOptions("invalid header value".to_string()))?;
+            parsed_headers.append(name, value);
+        }
+        validate_header_limits(
+            &parsed_headers,
+            FETCH_REQUEST_HEADER_MAX_COUNT,
+            FETCH_REQUEST_HEADER_MAX_BYTES,
+            FetchError::RequestHeadersTooLarge,
+        )?;
+        let body = body.map(String::into_bytes);
+        if body
+            .as_ref()
+            .is_some_and(|body| body.len() > FETCH_REQUEST_BODY_MAX_BYTES)
+        {
+            return Err(FetchError::RequestBodyTooLarge);
+        }
+        Ok(Self {
+            method,
+            headers: parsed_headers,
+            body,
+        })
     }
 
     fn from_options(options: Option<&Object<'_>>) -> Result<Self, FetchError> {
@@ -1012,7 +1282,7 @@ pub(crate) enum FetchError {
     DnsResolutionFailed,
     DestinationDenied,
     TooManyDestinations,
-    Permission(String),
+    Permission(EffectServiceError),
     TooManyRedirects,
     RedirectReplayDenied,
     CrossOriginRedirectDenied,
@@ -1020,6 +1290,7 @@ pub(crate) enum FetchError {
     ClientBuild(String),
     Cancelled,
     TimedOut,
+    OutcomeUnknown,
     RequestHeadersTooLarge,
     RequestBodyTooLarge,
     RequestFailed(String),
@@ -1068,6 +1339,9 @@ impl std::fmt::Display for FetchError {
             Self::ClientBuild(message) => write!(formatter, "fetch client setup failed: {message}"),
             Self::Cancelled => formatter.write_str("fetch cancelled"),
             Self::TimedOut => formatter.write_str("fetch timed out"),
+            Self::OutcomeUnknown => {
+                formatter.write_str("fetch outcome is unknown after request dispatch")
+            }
             Self::RequestHeadersTooLarge => {
                 formatter.write_str("fetch request headers exceed the configured limit")
             }
@@ -1347,10 +1621,67 @@ fn map_io_error(error: std::io::Error) -> FetchError {
     }
 }
 
-fn permission_error(tool: &'static str, error: PermissionBridgeError) -> rquickjs::Error {
-    rquickjs::Error::new_from_js_message("permission check", tool, error.to_string())
+fn service_host_error(tool: &'static str, error: EffectServiceError) -> rquickjs::Error {
+    let access = match tool {
+        "js/read_file" => Some("read"),
+        "js/write_file" => Some("write"),
+        _ => None,
+    };
+    if let Some(access) = access {
+        let reason = match error {
+            EffectServiceError::FileNoConfiguredRoots => {
+                Some("no roots are configured; unrestricted access requires an explicit opt-in")
+            }
+            EffectServiceError::FileInvalidConfiguration => {
+                Some("the configured roots are invalid or ambiguous")
+            }
+            EffectServiceError::FileOutsideConfiguredRoots => {
+                Some("the resolved target is outside the configured roots")
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return rquickjs::Error::new_from_js_message(
+                "file policy",
+                tool,
+                format!("JS file {access} denied: {reason}"),
+            );
+        }
+    }
+    rquickjs::Error::new_from_js_message("parent effect service", tool, error.to_string())
 }
 
+fn file_policy_service_error(reason: AllowPolicyReason) -> EffectServiceError {
+    match reason {
+        AllowPolicyReason::NoConfiguredRoots(_) => EffectServiceError::FileNoConfiguredRoots,
+        AllowPolicyReason::InvalidConfiguration(_) => EffectServiceError::FileInvalidConfiguration,
+        AllowPolicyReason::OutsideConfiguredRoots(_) => {
+            EffectServiceError::FileOutsideConfiguredRoots
+        }
+        AllowPolicyReason::InvalidTarget(_) => EffectServiceError::InvalidTarget,
+        AllowPolicyReason::AmbiguousSymlink(_) => EffectServiceError::FinalSymlink,
+    }
+}
+
+fn permission_service_error(error: PermissionBridgeError) -> EffectServiceError {
+    match error {
+        PermissionBridgeError::Denied(crate::extras::js::types::PermissionDenial::Policy(
+            reason,
+        )) if reason.contains("Doom loop: repeated identical tool call") => {
+            EffectServiceError::DoomLoopDenied
+        }
+        PermissionBridgeError::Denied(_) => EffectServiceError::PermissionDenied,
+        PermissionBridgeError::TimedOut => EffectServiceError::PermissionTimedOut,
+        PermissionBridgeError::Cancelled => EffectServiceError::Cancelled,
+        PermissionBridgeError::InvalidRequest(_)
+        | PermissionBridgeError::RequestChannelClosed
+        | PermissionBridgeError::ResponseChannelClosed
+        | PermissionBridgeError::BackendFailure(_)
+        | PermissionBridgeError::RejectedResponse(_) => EffectServiceError::BackendFailure,
+    }
+}
+
+#[cfg(test)]
 fn timeout_error(tool: &'static str) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("host call", tool, "execution timed out")
 }
@@ -1363,10 +1694,7 @@ fn file_error(
     rquickjs::Error::new_from_js_message(kind, tool, message.into())
 }
 
-fn allow_policy_error(tool: &'static str, reason: AllowPolicyReason) -> rquickjs::Error {
-    rquickjs::Error::new_from_js_message("file access policy", tool, reason.to_string())
-}
-
+#[cfg(test)]
 async fn timeout_host_call<T>(
     tool: &'static str,
     duration: Duration,
@@ -1375,23 +1703,6 @@ async fn timeout_host_call<T>(
     timeout(duration, call)
         .await
         .map_err(|_| timeout_error(tool))?
-}
-
-fn block_on_host_call<T>(
-    runtime: &tokio::runtime::Handle,
-    permission_bridge: &PermissionBridge,
-    tool: &'static str,
-    duration: Duration,
-    call: impl Future<Output = rquickjs::Result<T>>,
-) -> rquickjs::Result<T> {
-    runtime.block_on(async {
-        tokio::select! {
-            result = timeout_host_call(tool, duration, call) => result,
-            _ = permission_bridge.cancelled() => {
-                Err(permission_error(tool, PermissionBridgeError::Cancelled))
-            }
-        }
-    })
 }
 
 struct ResolvedReadTarget {
@@ -1434,110 +1745,89 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     Ok(normalized)
 }
 
-fn permission_path(tool: &'static str, path: &Path) -> rquickjs::Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| file_error(tool, "invalid path", "resolved path is not valid UTF-8"))
+fn file_path_error(error: std::io::Error) -> EffectServiceError {
+    if crate::fs::is_path_changed_error(&error) {
+        return EffectServiceError::TargetChanged;
+    }
+    match error.kind() {
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::NotADirectory
+        | std::io::ErrorKind::IsADirectory => EffectServiceError::InvalidTarget,
+        _ => EffectServiceError::BackendFailure,
+    }
 }
 
-async fn resolve_read_target(path: &str) -> rquickjs::Result<ResolvedReadTarget> {
+fn permission_path(path: &Path) -> Result<String, EffectServiceError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or(EffectServiceError::InvalidTarget)
+}
+
+async fn resolve_read_target(path: &str) -> Result<ResolvedReadTarget, EffectServiceError> {
     let expanded = crate::fs::expand_tilde(path);
-    let absolute = absolute_lexical(Path::new(&expanded)).map_err(rquickjs::Error::Io)?;
+    let absolute = absolute_lexical(Path::new(&expanded)).map_err(file_path_error)?;
     let canonical = tokio::fs::canonicalize(absolute)
         .await
-        .map_err(rquickjs::Error::Io)?;
-    permission_path("js/read_file", &canonical)?;
+        .map_err(file_path_error)?;
+    permission_path(&canonical)?;
     let identity = crate::fs::stable_path_metadata(&canonical)
         .await
-        .map_err(rquickjs::Error::Io)?;
+        .map_err(file_path_error)?;
     Ok(ResolvedReadTarget {
         path: canonical,
         identity,
     })
 }
 
-async fn read_approved_file(target: ResolvedReadTarget) -> rquickjs::Result<String> {
+async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, EffectServiceError> {
     if !target.identity.is_file() {
-        return Err(file_error(
-            "js/read_file",
-            "invalid file type",
-            "read_file only accepts regular files",
-        ));
+        return Err(EffectServiceError::InvalidTarget);
     }
     if target.identity.len() > READ_FILE_MAX_BYTES as u64 {
-        return Err(file_error(
-            "js/read_file",
-            "resource limit",
-            format!("file exceeds {READ_FILE_MAX_BYTES} byte read limit"),
-        ));
+        return Err(EffectServiceError::OutputLimit);
     }
     let file = crate::fs::open_stable_file(&target.path)
         .await
-        .map_err(rquickjs::Error::Io)?;
-    let opened = file.metadata().await.map_err(rquickjs::Error::Io)?;
+        .map_err(file_path_error)?;
+    let opened = file.metadata().await.map_err(file_path_error)?;
     crate::fs::ensure_same_file(&target.path, &target.identity, &opened)
-        .map_err(rquickjs::Error::Io)?;
+        .map_err(file_path_error)?;
     if !opened.is_file() {
-        return Err(file_error(
-            "js/read_file",
-            "invalid file type",
-            "read_file only accepts regular files",
-        ));
+        return Err(EffectServiceError::InvalidTarget);
     }
     if opened.len() > READ_FILE_MAX_BYTES as u64 {
-        return Err(file_error(
-            "js/read_file",
-            "resource limit",
-            format!("file exceeds {READ_FILE_MAX_BYTES} byte read limit"),
-        ));
+        return Err(EffectServiceError::OutputLimit);
     }
 
     let mut bytes = Vec::new();
     file.take((READ_FILE_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .await
-        .map_err(rquickjs::Error::Io)?;
+        .map_err(file_path_error)?;
     if bytes.len() > READ_FILE_MAX_BYTES {
-        return Err(file_error(
-            "js/read_file",
-            "resource limit",
-            format!("file exceeds {READ_FILE_MAX_BYTES} byte read limit"),
-        ));
+        return Err(EffectServiceError::OutputLimit);
     }
-    String::from_utf8(bytes).map_err(|_| {
-        file_error(
-            "js/read_file",
-            "invalid encoding",
-            "file content is not valid UTF-8",
-        )
-    })
+    String::from_utf8(bytes).map_err(|_| EffectServiceError::InvalidBody)
 }
 
-async fn resolve_write_target(path: &str) -> rquickjs::Result<ResolvedWriteTarget> {
+async fn resolve_write_target(path: &str) -> Result<ResolvedWriteTarget, EffectServiceError> {
     use std::path::Component;
 
     let expanded = crate::fs::expand_tilde(path);
-    let absolute = absolute_lexical(Path::new(&expanded)).map_err(rquickjs::Error::Io)?;
+    let absolute = absolute_lexical(Path::new(&expanded)).map_err(file_path_error)?;
     let (path, mode) = match tokio::fs::symlink_metadata(&absolute).await {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
-                return Err(file_error(
-                    "js/write_file",
-                    "invalid file type",
-                    "write_file does not follow final symlinks",
-                ));
+                return Err(EffectServiceError::FinalSymlink);
             }
             if !metadata.is_file() {
-                return Err(file_error(
-                    "js/write_file",
-                    "invalid file type",
-                    "write_file only replaces regular files",
-                ));
+                return Err(EffectServiceError::InvalidTarget);
             }
             (
                 tokio::fs::canonicalize(&absolute)
                     .await
-                    .map_err(rquickjs::Error::Io)?,
+                    .map_err(file_path_error)?,
                 WriteMode::Replace,
             )
         }
@@ -1548,64 +1838,36 @@ async fn resolve_write_target(path: &str) -> rquickjs::Result<ResolvedWriteTarge
                 match tokio::fs::canonicalize(ancestor).await {
                     Ok(canonical) => break canonical,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        let name = ancestor.file_name().ok_or_else(|| {
-                            file_error(
-                                "js/write_file",
-                                "invalid path",
-                                "write target must name a file",
-                            )
-                        })?;
+                        let name = ancestor
+                            .file_name()
+                            .ok_or(EffectServiceError::InvalidTarget)?;
                         missing.push(name.to_os_string());
-                        ancestor = ancestor.parent().ok_or_else(|| {
-                            file_error(
-                                "js/write_file",
-                                "invalid path",
-                                "write target has no existing parent",
-                            )
-                        })?;
+                        ancestor = ancestor.parent().ok_or(EffectServiceError::InvalidTarget)?;
                     }
-                    Err(error) => return Err(rquickjs::Error::Io(error)),
+                    Err(error) => return Err(file_path_error(error)),
                 }
             };
             if missing.len() != 1 {
-                return Err(file_error(
-                    "js/write_file",
-                    "invalid path",
-                    "write target parent directory does not exist",
-                ));
+                return Err(EffectServiceError::InvalidTarget);
             }
             let relative = Path::new(&missing[0]);
             if relative
                 .components()
                 .any(|component| !matches!(component, Component::Normal(_)))
             {
-                return Err(file_error(
-                    "js/write_file",
-                    "invalid path",
-                    "write target contains an invalid path component",
-                ));
+                return Err(EffectServiceError::InvalidTarget);
             }
             (canonical_parent.join(relative), WriteMode::Create)
         }
-        Err(error) => return Err(rquickjs::Error::Io(error)),
+        Err(error) => return Err(file_path_error(error)),
     };
-    permission_path("js/write_file", &path)?;
-    let parent = path.parent().ok_or_else(|| {
-        file_error(
-            "js/write_file",
-            "invalid path",
-            "write target has no parent directory",
-        )
-    })?;
+    permission_path(&path)?;
+    let parent = path.parent().ok_or(EffectServiceError::InvalidTarget)?;
     let parent_identity = crate::fs::stable_path_metadata(parent)
         .await
-        .map_err(rquickjs::Error::Io)?;
+        .map_err(file_path_error)?;
     if !parent_identity.is_dir() {
-        return Err(file_error(
-            "js/write_file",
-            "invalid file type",
-            "write target parent is not a directory",
-        ));
+        return Err(EffectServiceError::InvalidTarget);
     }
     Ok(ResolvedWriteTarget {
         path,
@@ -1614,7 +1876,10 @@ async fn resolve_write_target(path: &str) -> rquickjs::Result<ResolvedWriteTarge
     })
 }
 
-async fn write_approved_file(target: ResolvedWriteTarget, content: String) -> rquickjs::Result<()> {
+async fn write_approved_file(
+    target: ResolvedWriteTarget,
+    content: String,
+) -> Result<(), EffectServiceError> {
     match target.mode {
         WriteMode::Create => {
             crate::fs::atomic_create_resolved_checked(
@@ -1633,7 +1898,133 @@ async fn write_approved_file(target: ResolvedWriteTarget, content: String) -> rq
             .await
         }
     }
-    .map_err(rquickjs::Error::Io)
+    .map_err(file_path_error)
+}
+
+/// Parent-side file service. Its public contract is independent of QuickJS;
+/// the legacy worker closure below is only a value/error adapter.
+#[derive(Clone)]
+pub(crate) struct FileEffectService {
+    permission_bridge: PermissionBridge,
+    allow_config: AllowConfig,
+    timeout: Duration,
+}
+
+struct PreparedReadEffect(ResolvedReadTarget);
+
+struct PreparedWriteEffect(ResolvedWriteTarget);
+
+impl FileEffectService {
+    pub(crate) fn new(
+        permission_bridge: PermissionBridge,
+        allow_config: AllowConfig,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            permission_bridge,
+            allow_config,
+            timeout,
+        }
+    }
+
+    pub(crate) async fn read(
+        &self,
+        path: &str,
+        cancellation: PermCancellation,
+    ) -> Result<String, EffectServiceError> {
+        let bridge = self.permission_bridge.for_host_call(cancellation);
+        let prepared = self.authorize_read(path, bridge.clone()).await?;
+        self.execute_read(prepared, bridge).await
+    }
+
+    async fn authorize_read(
+        &self,
+        path: &str,
+        bridge: PermissionBridge,
+    ) -> Result<PreparedReadEffect, EffectServiceError> {
+        let call = async {
+            let target = resolve_read_target(path).await?;
+            if let AuthorizationDecision::Denied(reason) =
+                self.allow_config.authorize_read(&target.path)
+            {
+                return Err(file_policy_service_error(reason));
+            }
+            let permission_path = permission_path(&target.path)?;
+            bridge
+                .check_path_async("js/read_file", &permission_path)
+                .await
+                .map_err(permission_service_error)?;
+            Ok(PreparedReadEffect(target))
+        };
+        tokio::select! {
+            result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
+            _ = bridge.cancelled() => Err(EffectServiceError::Cancelled),
+        }
+    }
+
+    async fn execute_read(
+        &self,
+        prepared: PreparedReadEffect,
+        bridge: PermissionBridge,
+    ) -> Result<String, EffectServiceError> {
+        let call = async { read_approved_file(prepared.0).await };
+        tokio::select! {
+            result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
+            _ = bridge.cancelled() => Err(EffectServiceError::Cancelled),
+        }
+    }
+
+    pub(crate) async fn write(
+        &self,
+        path: &str,
+        content: String,
+        cancellation: PermCancellation,
+    ) -> Result<(), EffectServiceError> {
+        if content.len() > WRITE_FILE_MAX_BYTES {
+            return Err(EffectServiceError::BodyLimit);
+        }
+        let bridge = self.permission_bridge.for_host_call(cancellation);
+        let prepared = self.authorize_write(path, bridge.clone()).await?;
+        self.execute_write(prepared, content, bridge).await
+    }
+
+    async fn authorize_write(
+        &self,
+        path: &str,
+        bridge: PermissionBridge,
+    ) -> Result<PreparedWriteEffect, EffectServiceError> {
+        let call = async {
+            let target = resolve_write_target(path).await?;
+            if let AuthorizationDecision::Denied(reason) =
+                self.allow_config.authorize_write(&target.path)
+            {
+                return Err(file_policy_service_error(reason));
+            }
+            let permission_path = permission_path(&target.path)?;
+            bridge
+                .check_path_async("js/write_file", &permission_path)
+                .await
+                .map_err(permission_service_error)?;
+            Ok(PreparedWriteEffect(target))
+        };
+        tokio::select! {
+            result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
+            _ = bridge.cancelled() => Err(EffectServiceError::Cancelled),
+        }
+    }
+
+    async fn execute_write(
+        &self,
+        prepared: PreparedWriteEffect,
+        content: String,
+        bridge: PermissionBridge,
+    ) -> Result<(), EffectServiceError> {
+        let call = async { write_approved_file(prepared.0, content).await };
+        tokio::select! {
+            result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
+            _ = bridge.cancelled() => Err(EffectServiceError::Cancelled),
+        }
+    }
 }
 
 pub(crate) fn make_read_file(
@@ -1641,28 +2032,11 @@ pub(crate) fn make_read_file(
     runtime: tokio::runtime::Handle,
     allow_config: AllowConfig,
 ) -> impl Fn(String) -> rquickjs::Result<String> {
+    let service = FileEffectService::new(permission_bridge, allow_config, STEP_TIMEOUT);
     move |path: String| {
-        let target = block_on_host_call(
-            &runtime,
-            &permission_bridge,
-            "js/read_file",
-            STEP_TIMEOUT,
-            resolve_read_target(&path),
-        )?;
-        if let AuthorizationDecision::Denied(reason) = allow_config.authorize_read(&target.path) {
-            return Err(allow_policy_error("js/read_file", reason));
-        }
-        let permission_path = permission_path("js/read_file", &target.path)?;
-        permission_bridge
-            .check_path("js/read_file", &permission_path)
-            .map_err(|error| permission_error("js/read_file", error))?;
-        block_on_host_call(
-            &runtime,
-            &permission_bridge,
-            "js/read_file",
-            STEP_TIMEOUT,
-            read_approved_file(target),
-        )
+        runtime
+            .block_on(service.read(&path, PermCancellation::new()))
+            .map_err(|error| service_host_error("js/read_file", error))
     }
 }
 
@@ -1671,35 +2045,11 @@ pub(crate) fn make_write_file(
     runtime: tokio::runtime::Handle,
     allow_config: AllowConfig,
 ) -> impl Fn(String, String) -> rquickjs::Result<()> {
+    let service = FileEffectService::new(permission_bridge, allow_config, STEP_TIMEOUT);
     move |path: String, content: String| {
-        if content.len() > WRITE_FILE_MAX_BYTES {
-            return Err(file_error(
-                "js/write_file",
-                "resource limit",
-                format!("content exceeds {WRITE_FILE_MAX_BYTES} byte write limit"),
-            ));
-        }
-        let target = block_on_host_call(
-            &runtime,
-            &permission_bridge,
-            "js/write_file",
-            STEP_TIMEOUT,
-            resolve_write_target(&path),
-        )?;
-        if let AuthorizationDecision::Denied(reason) = allow_config.authorize_write(&target.path) {
-            return Err(allow_policy_error("js/write_file", reason));
-        }
-        let permission_path = permission_path("js/write_file", &target.path)?;
-        permission_bridge
-            .check_path("js/write_file", &permission_path)
-            .map_err(|error| permission_error("js/write_file", error))?;
-        block_on_host_call(
-            &runtime,
-            &permission_bridge,
-            "js/write_file",
-            STEP_TIMEOUT,
-            write_approved_file(target, content),
-        )
+        runtime
+            .block_on(service.write(&path, content, PermCancellation::new()))
+            .map_err(|error| service_host_error("js/write_file", error))
     }
 }
 
@@ -1709,25 +2059,248 @@ fn make_fetch(
     runtime: tokio::runtime::Handle,
     policy: FetchPolicy,
 ) -> impl for<'js> Fn(String, Opt<Object<'js>>) -> rquickjs::Result<FetchResult> {
-    let resolver = Arc::new(RuntimeFetchResolver {
-        runtime,
-        permission_bridge: permission_bridge.clone(),
-    });
-    let executor = Arc::new(FetchExecutor {
+    let service = Arc::new(FetchEffectService::new(
+        permission_bridge.clone(),
+        runtime.clone(),
         policy,
-        resolver,
-        sender: Arc::new(BoundFetchSender),
-        permission_bridge,
-    });
+        FETCH_TOTAL_TIMEOUT,
+    ));
     move |url: String, options: Opt<Object<'_>>| {
         let request = FetchRequest::from_options(options.0.as_ref()).map_err(fetch_host_error)?;
-        executor.execute(&url, &request).map_err(fetch_host_error)
+        runtime
+            .block_on(service.execute(url, request, PermCancellation::new()))
+            .map_err(fetch_host_error)
+    }
+}
+
+/// Parent-side network service with an outer wall-clock deadline in addition
+/// to DNS, connect, read, redirect, header, and body bounds.
+#[cfg(feature = "sandbox")]
+pub(crate) struct FetchEffectService {
+    executor: Arc<FetchExecutor>,
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+    timeout: Duration,
+}
+
+#[cfg(feature = "sandbox")]
+impl FetchEffectService {
+    pub(crate) fn new(
+        permission_bridge: PermissionBridge,
+        runtime: tokio::runtime::Handle,
+        policy: FetchPolicy,
+        timeout: Duration,
+    ) -> Self {
+        let resolver = Arc::new(RuntimeFetchResolver {
+            runtime: runtime.clone(),
+        });
+        let executor = Arc::new(FetchExecutor {
+            policy,
+            resolver,
+            sender: Arc::new(BoundFetchSender),
+            permission_bridge: permission_bridge.clone(),
+        });
+        Self {
+            executor,
+            permission_bridge,
+            runtime,
+            timeout,
+        }
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        url: String,
+        request: FetchRequest,
+        cancellation: PermCancellation,
+    ) -> Result<FetchResult, FetchError> {
+        let control = Arc::new(FetchCallControl::new());
+        let prepared = self
+            .authorize(url, request, cancellation.clone(), control.clone())
+            .await?;
+        self.execute_prepared(prepared, cancellation).await
+    }
+
+    async fn authorize(
+        &self,
+        url: String,
+        request: FetchRequest,
+        cancellation: PermCancellation,
+        control: Arc<FetchCallControl>,
+    ) -> Result<PreparedFetchEffect, FetchError> {
+        if cancellation.is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+        let deadline = Instant::now() + self.timeout;
+        let mut cancel_on_drop = CancelFetchPrepareOnDrop::new(control.clone());
+        let task_control = control.clone();
+        let executor = self.executor.clone();
+        let call = self
+            .runtime
+            .spawn_blocking(move || executor.prepare(&url, request, task_control, deadline));
+        let bridge = self.permission_bridge.for_host_call(cancellation);
+        let prepared = await_fetch_prepare(&bridge, self.timeout, call, control).await?;
+        cancel_on_drop.disarm();
+        Ok(prepared)
+    }
+
+    async fn execute_prepared(
+        &self,
+        prepared: PreparedFetchEffect,
+        cancellation: PermCancellation,
+    ) -> Result<FetchResult, FetchError> {
+        let control = prepared.control.clone();
+        let remaining = prepared
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(FetchError::TimedOut)?
+            .min(self.timeout);
+        let executor = self.executor.clone();
+        let call = self
+            .runtime
+            .spawn_blocking(move || executor.execute_prepared(prepared));
+        let bridge = self.permission_bridge.for_host_call(cancellation);
+        await_fetch_host_call(&bridge, remaining, call, control).await
+    }
+}
+
+#[cfg(feature = "sandbox")]
+async fn await_fetch_prepare(
+    permission_bridge: &PermissionBridge,
+    duration: Duration,
+    mut call: tokio::task::JoinHandle<Result<PreparedFetchEffect, FetchError>>,
+    control: Arc<FetchCallControl>,
+) -> Result<PreparedFetchEffect, FetchError> {
+    tokio::select! {
+        result = timeout(duration, &mut call) => match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(FetchError::RequestFailed("fetch executor task failed".to_string())),
+            Err(_) => Err(control.cancel(FetchError::TimedOut)),
+        },
+        _ = permission_bridge.cancelled() => Err(control.cancel(FetchError::Cancelled)),
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn fetch_service_error(error: &FetchError) -> EffectServiceError {
+    match error {
+        FetchError::InvalidUrl
+        | FetchError::SchemeDenied
+        | FetchError::EmbeddedCredentials
+        | FetchError::FragmentDenied
+        | FetchError::MissingHost
+        | FetchError::InvalidHost
+        | FetchError::MissingPort
+        | FetchError::InvalidOptions(_)
+        | FetchError::InvalidRedirect => EffectServiceError::InvalidTarget,
+        FetchError::InvalidOrigin
+        | FetchError::OriginDenied
+        | FetchError::DestinationDenied
+        | FetchError::TooManyDestinations
+        | FetchError::CrossOriginRedirectDenied
+        | FetchError::RedirectReplayDenied => EffectServiceError::TargetDenied,
+        FetchError::Permission(error) => *error,
+        FetchError::Cancelled => EffectServiceError::Cancelled,
+        FetchError::TimedOut => EffectServiceError::TimedOut,
+        FetchError::RequestHeadersTooLarge | FetchError::RequestBodyTooLarge => {
+            EffectServiceError::BodyLimit
+        }
+        FetchError::ResponseHeadersTooLarge | FetchError::ResponseBodyTooLarge => {
+            EffectServiceError::OutputLimit
+        }
+        FetchError::InvalidUtf8 => EffectServiceError::InvalidBody,
+        FetchError::DnsResolutionFailed
+        | FetchError::TooManyRedirects
+        | FetchError::ClientBuild(_)
+        | FetchError::OutcomeUnknown
+        | FetchError::RequestFailed(_)
+        | FetchError::UnsupportedContentEncoding => EffectServiceError::BackendFailure,
+    }
+}
+
+#[cfg(all(feature = "sandbox", test))]
+fn make_fetch_with_timeout(
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+    executor: Arc<FetchExecutor>,
+    duration: Duration,
+) -> impl for<'js> Fn(String, Opt<Object<'js>>) -> rquickjs::Result<FetchResult> {
+    move |url: String, options: Opt<Object<'_>>| {
+        let request = FetchRequest::from_options(options.0.as_ref()).map_err(fetch_host_error)?;
+        let executor = executor.clone();
+        let control = Arc::new(FetchCallControl::new());
+        let task_control = control.clone();
+        let fetch = runtime
+            .spawn_blocking(move || executor.execute_controlled(&url, &request, task_control));
+        block_on_fetch_host_call(&runtime, &permission_bridge, duration, fetch, control)
+            .map_err(fetch_host_error)
     }
 }
 
 #[cfg(feature = "sandbox")]
 fn fetch_host_error(error: FetchError) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("network policy", "js/fetch", error.to_string())
+}
+
+#[cfg(all(feature = "sandbox", test))]
+fn block_on_fetch_host_call(
+    runtime: &tokio::runtime::Handle,
+    permission_bridge: &PermissionBridge,
+    duration: Duration,
+    call: tokio::task::JoinHandle<Result<FetchResult, FetchError>>,
+    control: Arc<FetchCallControl>,
+) -> Result<FetchResult, FetchError> {
+    runtime.block_on(await_fetch_host_call(
+        permission_bridge,
+        duration,
+        call,
+        control,
+    ))
+}
+
+#[cfg(feature = "sandbox")]
+async fn await_fetch_host_call(
+    permission_bridge: &PermissionBridge,
+    duration: Duration,
+    mut call: tokio::task::JoinHandle<Result<FetchResult, FetchError>>,
+    control: Arc<FetchCallControl>,
+) -> Result<FetchResult, FetchError> {
+    enum WaitOutcome {
+        Completed(Result<Result<FetchResult, FetchError>, tokio::task::JoinError>),
+        TimedOut,
+        Cancelled,
+    }
+
+    let outcome = tokio::select! {
+        result = timeout(duration, &mut call) => match result {
+            Ok(result) => WaitOutcome::Completed(result),
+            Err(_) => WaitOutcome::TimedOut,
+        },
+        _ = permission_bridge.cancelled() => WaitOutcome::Cancelled,
+    };
+    match outcome {
+        WaitOutcome::Completed(Ok(result)) => result,
+        WaitOutcome::Completed(Err(_)) => Err(FetchError::RequestFailed(
+            "fetch executor task failed".to_string(),
+        )),
+        WaitOutcome::TimedOut | WaitOutcome::Cancelled => {
+            let before_dispatch = if matches!(outcome, WaitOutcome::TimedOut) {
+                FetchError::TimedOut
+            } else {
+                FetchError::Cancelled
+            };
+            let error = control.cancel(before_dispatch);
+            if timeout(FETCH_CANCELLATION_DRAIN_TIMEOUT, &mut call)
+                .await
+                .is_err()
+            {
+                tokio::spawn(async move {
+                    let _ = call.await;
+                });
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn make_spawn(
@@ -1742,31 +2315,17 @@ pub(crate) fn make_spawn(
 pub(crate) fn make_propose_skill(
     proposal_host: ProposalHost,
 ) -> impl for<'js> Fn(Object<'js>) -> rquickjs::Result<String> {
+    let service = ProposalEffectService::new(proposal_host);
     move |object: Object<'_>| {
-        proposal_host
-            .budget
-            .consume()
-            .map_err(proposal_host_error)?;
+        service.reserve_attempt().map_err(proposal_host_error)?;
         let proposal = JsProposal::from_object(&object).map_err(proposal_host_error)?;
-        let predecessor_id = proposal.predecessor_id.clone();
-        let artifact = proposal
-            .validate_and_canonicalize()
+        let result = service
+            .execute_reserved(proposal)
             .map_err(proposal_host_error)?;
-        let result = proposal_host
-            .sender
-            .enqueue(artifact, predecessor_id)
-            .map_err(proposal_host_error)?;
-        let status = match result.status {
-            EnqueueStatus::Pending => "pending",
-            EnqueueStatus::Verified => "verified",
-            EnqueueStatus::Rejected => "rejected",
-            EnqueueStatus::AwaitingApproval => "awaiting_approval",
-            EnqueueStatus::Approved => "approved",
-        };
         serde_json::to_string(&serde_json::json!({
             "id": result.skill_id,
             "proposal_id": result.proposal_id,
-            "status": status,
+            "status": result.status,
             "report_id": result.report_id,
         }))
         .map_err(|_| proposal_host_error(ProposalError::StoreUnavailable))
@@ -1799,46 +2358,101 @@ const SPAWN_STDERR_MAX_BYTES: usize = 1024 * 1024;
 const SPAWN_COMBINED_MAX_BYTES: usize = 1536 * 1024;
 const CONSOLE_MAX_BYTES_PER_STEP: usize = 256 * 1024;
 
-fn make_spawn_with_timeout(
+/// Parent-side structured process service. Permission identity and execution
+/// consume the same program/argument vector; no shell-like joining occurs.
+#[derive(Clone)]
+pub(crate) struct SpawnEffectService {
     sandbox: Sandbox,
     permission_bridge: PermissionBridge,
-    runtime: tokio::runtime::Handle,
-    duration: Duration,
-) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
-    move |cmd: String, args: Vec<String>| {
-        let permission_command = std::iter::once(cmd.as_str())
-            .chain(args.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ");
-        permission_bridge
-            .check("bash", &permission_command)
-            .map_err(|error| permission_error("js/spawn", error))?;
-        let mut command = sandbox.wrap_command(r#"exec "$0" "$@""#).map_err(|e| {
-            permission_error(
-                "js/spawn",
-                PermissionBridgeError::Denied(crate::extras::js::types::PermissionDenial::Policy(
-                    e,
-                )),
-            )
-        })?;
-        command.arg(&cmd).args(&args);
+    timeout: Duration,
+}
+
+struct PreparedSpawnEffect {
+    program: String,
+    arguments: Vec<String>,
+}
+
+impl SpawnEffectService {
+    pub(crate) fn new(
+        sandbox: Sandbox,
+        permission_bridge: PermissionBridge,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            sandbox,
+            permission_bridge,
+            timeout,
+        }
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        program: &str,
+        arguments: &[String],
+        cancellation: PermCancellation,
+    ) -> Result<SpawnResult, EffectServiceError> {
+        let bridge = self.permission_bridge.for_host_call(cancellation);
+        let prepared = self.authorize(program, arguments, bridge.clone()).await?;
+        self.execute_prepared(prepared, bridge).await
+    }
+
+    async fn authorize(
+        &self,
+        program: &str,
+        arguments: &[String],
+        bridge: PermissionBridge,
+    ) -> Result<PreparedSpawnEffect, EffectServiceError> {
+        if self.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
+            return Err(EffectServiceError::BackendFailure);
+        }
+        if program.is_empty()
+            || program.contains('\0')
+            || arguments.iter().any(|arg| arg.contains('\0'))
+            || (Path::new(program).is_absolute() && !Path::new(program).is_file())
+        {
+            return Err(EffectServiceError::InvalidTarget);
+        }
+        let subject = canonical_spawn_permission_subject(program, arguments)?;
+        let policy_input = spawn_policy_input(program, arguments);
+        bridge
+            .check_structured_async("bash", &subject, policy_input)
+            .await
+            .map_err(permission_service_error)?;
+        Ok(PreparedSpawnEffect {
+            program: program.to_string(),
+            arguments: arguments.to_vec(),
+        })
+    }
+
+    async fn execute_prepared(
+        &self,
+        prepared: PreparedSpawnEffect,
+        bridge: PermissionBridge,
+    ) -> Result<SpawnResult, EffectServiceError> {
+        let mut command = self
+            .sandbox
+            .wrap_command(r#"exec "$0" "$@""#)
+            .map_err(|_| EffectServiceError::BackendFailure)?;
+        command.arg(&prepared.program).args(&prepared.arguments);
         let limits = CommandLimits {
-            timeout: duration,
+            timeout: self.timeout,
             stdout_bytes: SPAWN_STDOUT_MAX_BYTES,
             stderr_bytes: SPAWN_STDERR_MAX_BYTES,
             combined_bytes: SPAWN_COMBINED_MAX_BYTES,
         };
-        let bridge = permission_bridge.clone();
-        let output = runtime.block_on(async {
-            tokio::select! {
-                result = sandbox.output_built_command_with_limits(command, limits) => {
-                    result.map_err(rquickjs::Error::Io)
-                }
-                _ = bridge.cancelled() => {
-                    Err(permission_error("js/spawn", PermissionBridgeError::Cancelled))
-                }
+        let output = tokio::select! {
+            result = self.sandbox.output_built_command_with_limits(command, limits) => {
+                result.map_err(|_| EffectServiceError::BackendFailure)?
             }
-        })?;
+            _ = bridge.cancelled() => return Err(EffectServiceError::Cancelled),
+        };
+        match output.status {
+            CommandStatus::Cancelled => return Err(EffectServiceError::Cancelled),
+            CommandStatus::Failed => return Err(EffectServiceError::BackendFailure),
+            CommandStatus::Completed
+            | CommandStatus::TimedOut
+            | CommandStatus::OutputLimitExceeded(_) => {}
+        }
         let timed_out = output.status == CommandStatus::TimedOut;
         let stdout_truncated = matches!(
             output.status,
@@ -1853,11 +2467,271 @@ fn make_spawn_with_timeout(
         Ok(SpawnResult {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            code: output.exit_status.and_then(|s| s.code()).unwrap_or(-1),
+            code: output
+                .exit_status
+                .and_then(|status| status.code())
+                .unwrap_or(-1),
             timed_out,
             stdout_truncated,
             stderr_truncated,
         })
+    }
+}
+
+enum PreparedParentEffect {
+    Read(PreparedReadEffect),
+    Write {
+        target: PreparedWriteEffect,
+        content: String,
+    },
+    Spawn(PreparedSpawnEffect),
+    #[cfg(feature = "sandbox")]
+    Fetch(PreparedFetchEffect),
+}
+
+/// Concrete implementation of the A11 parent effect seam. Authorization
+/// stores a prepared, exact target; execution can only consume that target.
+pub(crate) struct ParentHostEffectService {
+    file: FileEffectService,
+    spawn: SpawnEffectService,
+    #[cfg(feature = "sandbox")]
+    fetch: Option<FetchEffectService>,
+    prepared: Option<PreparedParentEffect>,
+}
+
+impl ParentHostEffectService {
+    pub(crate) fn new(file: FileEffectService, spawn: SpawnEffectService) -> Self {
+        Self {
+            file,
+            spawn,
+            #[cfg(feature = "sandbox")]
+            fetch: None,
+            prepared: None,
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    pub(crate) fn with_fetch(mut self, fetch: FetchEffectService) -> Self {
+        self.fetch = Some(fetch);
+        self
+    }
+}
+
+impl ParentEffectService for ParentHostEffectService {
+    fn validate_target(
+        &mut self,
+        _authorized: &AuthorizedEffect,
+        operation: &EffectOperation,
+    ) -> Result<(), HostEffectError> {
+        self.prepared = None;
+        match operation {
+            EffectOperation::ReadFile { path } if path.is_empty() || path.contains('\0') => {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::WriteFile { path, .. } if path.is_empty() || path.contains('\0') => {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::WriteFile { content, .. } if content.len() > WRITE_FILE_MAX_BYTES => {
+                Err(HostEffectError::OutputLimit)
+            }
+            EffectOperation::Spawn { program, arguments }
+                if program.is_empty()
+                    || program.contains('\0')
+                    || arguments.iter().any(|argument| argument.contains('\0')) =>
+            {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::Fetch { url, .. } if url.is_empty() || url.contains('\0') => {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::ProposeSkill { draft }
+                if draft.source.is_empty()
+                    || draft.description.is_empty()
+                    || draft.exports.is_empty()
+                    || draft.tests.is_empty() =>
+            {
+                Err(HostEffectError::InvalidTarget)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn ensure_backend(
+        &mut self,
+        _authorized: &AuthorizedEffect,
+        operation: &EffectOperation,
+    ) -> Result<(), HostEffectError> {
+        match operation {
+            #[cfg(feature = "sandbox")]
+            EffectOperation::Fetch { .. } if self.fetch.is_none() => {
+                Err(HostEffectError::BackendFailure)
+            }
+            #[cfg(not(feature = "sandbox"))]
+            EffectOperation::Fetch { .. } => Err(HostEffectError::BackendFailure),
+            EffectOperation::Spawn { .. }
+                if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable =>
+            {
+                Err(HostEffectError::BackendFailure)
+            }
+            // A12's direct proposal service accepts the complete v2 proposal.
+            // The provisional worker draft omits identity-bearing fields, so
+            // the broker must fail closed instead of inventing them.
+            EffectOperation::ProposeSkill { .. } => Err(HostEffectError::BackendFailure),
+            _ => Ok(()),
+        }
+    }
+
+    fn authorize<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ParentEffectFuture<'a, Result<(), HostEffectError>> {
+        Box::pin(async move {
+            self.prepared = None;
+            let prepared = match operation {
+                EffectOperation::ReadFile { path } => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    PreparedParentEffect::Read(
+                        self.file
+                            .authorize_read(path, bridge)
+                            .await
+                            .map_err(HostEffectError::from)?,
+                    )
+                }
+                EffectOperation::WriteFile { path, content } => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    let target = self
+                        .file
+                        .authorize_write(path, bridge)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    PreparedParentEffect::Write {
+                        target,
+                        content: content.clone(),
+                    }
+                }
+                EffectOperation::Spawn { program, arguments } => {
+                    let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
+                    PreparedParentEffect::Spawn(
+                        self.spawn
+                            .authorize(program, arguments, bridge)
+                            .await
+                            .map_err(HostEffectError::from)?,
+                    )
+                }
+                #[cfg(feature = "sandbox")]
+                EffectOperation::Fetch {
+                    url,
+                    method,
+                    headers,
+                    body,
+                } => {
+                    let fetch = self.fetch.as_ref().ok_or(HostEffectError::BackendFailure)?;
+                    let method = match method {
+                        crate::extras::js::protocol::HttpMethod::Get => "GET",
+                        crate::extras::js::protocol::HttpMethod::Post => "POST",
+                    };
+                    let headers = headers
+                        .iter()
+                        .map(|header| (header.name.clone(), header.value.clone()))
+                        .collect::<Vec<_>>();
+                    let request = FetchRequest::try_new(method, &headers, body.clone())
+                        .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
+                    let control = Arc::new(FetchCallControl::new());
+                    PreparedParentEffect::Fetch(
+                        fetch
+                            .authorize(url.clone(), request, cancellation, control)
+                            .await
+                            .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?,
+                    )
+                }
+                #[cfg(not(feature = "sandbox"))]
+                EffectOperation::Fetch { .. } => return Err(HostEffectError::BackendFailure),
+                EffectOperation::ProposeSkill { .. } => {
+                    return Err(HostEffectError::BackendFailure);
+                }
+            };
+            self.prepared = Some(prepared);
+            Ok(())
+        })
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        _operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ParentEffectFuture<'a, Result<EffectResult, HostEffectError>> {
+        Box::pin(async move {
+            let prepared = self
+                .prepared
+                .take()
+                .ok_or(HostEffectError::BackendFailure)?;
+            match prepared {
+                PreparedParentEffect::Read(target) => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    let content = self
+                        .file
+                        .execute_read(target, bridge)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    Ok(EffectResult::ReadFile { content })
+                }
+                PreparedParentEffect::Write { target, content } => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    self.file
+                        .execute_write(target, content, bridge)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    Ok(EffectResult::WriteFile)
+                }
+                PreparedParentEffect::Spawn(target) => {
+                    let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
+                    let result = self
+                        .spawn
+                        .execute_prepared(target, bridge)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    Ok(EffectResult::Spawn {
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                        exit_code: result.code,
+                        timed_out: result.timed_out,
+                        stdout_truncated: result.stdout_truncated,
+                        stderr_truncated: result.stderr_truncated,
+                    })
+                }
+                #[cfg(feature = "sandbox")]
+                PreparedParentEffect::Fetch(target) => {
+                    let fetch = self.fetch.as_ref().ok_or(HostEffectError::BackendFailure)?;
+                    let result = fetch
+                        .execute_prepared(target, cancellation)
+                        .await
+                        .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
+                    Ok(EffectResult::Fetch {
+                        status: result.status,
+                        headers: Vec::new(),
+                        body: result.text,
+                        truncated: false,
+                    })
+                }
+            }
+        })
+    }
+}
+
+fn make_spawn_with_timeout(
+    sandbox: Sandbox,
+    permission_bridge: PermissionBridge,
+    runtime: tokio::runtime::Handle,
+    duration: Duration,
+) -> impl Fn(String, Vec<String>) -> rquickjs::Result<SpawnResult> {
+    let service = SpawnEffectService::new(sandbox, permission_bridge, duration);
+    move |cmd: String, args: Vec<String>| {
+        runtime
+            .block_on(service.execute(&cmd, &args, PermCancellation::new()))
+            .map_err(|error| service_host_error("js/spawn", error))
     }
 }
 
@@ -1957,6 +2831,8 @@ pub(crate) fn register_host_globals(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    #[cfg(feature = "sandbox")]
+    use std::sync::Condvar;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2382,7 +3258,12 @@ mod tests {
 
     #[cfg(feature = "sandbox")]
     impl FetchResolver for FakeFetchResolver {
-        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, FetchError> {
+        fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+            _permission_bridge: &PermissionBridge,
+        ) -> Result<Vec<SocketAddr>, FetchError> {
             self.responses
                 .lock()
                 .unwrap()
@@ -2431,6 +3312,31 @@ mod tests {
     }
 
     #[cfg(feature = "sandbox")]
+    struct BlockingFetchSender {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    #[cfg(feature = "sandbox")]
+    impl FetchSender for BlockingFetchSender {
+        fn send(
+            &self,
+            _url: Url,
+            _request: &FetchRequest,
+            _addresses: &[SocketAddr],
+            _permission_bridge: &PermissionBridge,
+        ) -> Result<FetchTransportOutcome, FetchError> {
+            self.started.notify_one();
+            let (released, wake) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(completed_fetch())
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
     fn fetch_permission(action: Action) -> PermCheck {
         let config = PermissionConfig {
             js_fetch: Some(ToolPerm::Simple(action)),
@@ -2456,6 +3362,61 @@ mod tests {
             status: 200,
             text: "ok".to_string(),
         })
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_effect_service_is_cancellable_and_recovers_after_target_error() {
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let sender = Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())]));
+        let service = FetchEffectService {
+            executor: Arc::new(FetchExecutor {
+                policy: FetchPolicy::from_settings(None, false),
+                resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+                sender: sender.clone(),
+                permission_bridge: owner.bridge(),
+            }),
+            permission_bridge: owner.bridge(),
+            runtime: tokio::runtime::Handle::current(),
+            timeout: Duration::from_secs(1),
+        };
+
+        assert_eq!(
+            service
+                .execute(
+                    "not a url".to_string(),
+                    FetchRequest::get(),
+                    PermCancellation::new(),
+                )
+                .await,
+            Err(FetchError::InvalidUrl)
+        );
+        let cancellation = PermCancellation::new();
+        cancellation.cancel();
+        assert_eq!(
+            service
+                .execute(
+                    "https://example.com/".to_string(),
+                    FetchRequest::get(),
+                    cancellation,
+                )
+                .await,
+            Err(FetchError::Cancelled)
+        );
+        assert_eq!(
+            service
+                .execute(
+                    "https://example.com/".to_string(),
+                    FetchRequest::get(),
+                    PermCancellation::new(),
+                )
+                .await,
+            Ok(FetchResult {
+                status: 200,
+                text: "ok".to_string(),
+            })
+        );
+        assert_eq!(sender.call_count(), 1);
     }
 
     #[cfg(feature = "sandbox")]
@@ -2509,6 +3470,222 @@ mod tests {
         .await
         .expect("fake fetch task panicked");
         (result, sender)
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_host_call_bounds_dispatched_request_and_leaves_js_context_usable() {
+        let outer_timeout = Duration::from_millis(25);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let owner =
+            PermissionBridgeOwner::new(Some(fetch_permission(Action::Allow)), None, STEP_TIMEOUT);
+        let executor = Arc::new(FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: Arc::new(BlockingFetchSender {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            permission_bridge: owner.bridge(),
+        });
+        let fetch = make_fetch_with_timeout(
+            owner.bridge(),
+            tokio::runtime::Handle::current(),
+            executor,
+            outer_timeout,
+        );
+
+        let host_call = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            let runtime = rquickjs::Runtime::new().expect("create QuickJS runtime");
+            let context = Context::full(&runtime).expect("create QuickJS context");
+            context.with(|ctx| {
+                ctx.globals()
+                    .set("fetch", Func::from(fetch))
+                    .expect("install fetch host global");
+                assert!(matches!(
+                    ctx.eval::<(), _>("fetch('https://example.com/')"),
+                    Err(rquickjs::Error::Exception)
+                ));
+                let error = ctx
+                    .catch()
+                    .as_exception()
+                    .expect("fetch host error must be an exception")
+                    .message()
+                    .expect("fetch host error must have a message");
+                let recovery = ctx
+                    .eval::<i32, _>("6 * 7")
+                    .expect("subsequent JS evaluation must remain usable");
+                (error, recovery)
+            })
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("blocked sender must start");
+        let started_at = Instant::now();
+        let completed = tokio::time::timeout(Duration::from_secs(1), host_call).await;
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_one();
+
+        let (error, recovery) = completed
+            .expect("outer fetch timeout must bound the host call")
+            .expect("fetch host-call task panicked");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "outer fetch timeout exceeded the host-call bound"
+        );
+
+        assert!(
+            error.contains(&FetchError::OutcomeUnknown.to_string()),
+            "unexpected dispatched-fetch timeout error: {error}"
+        );
+        assert_eq!(recovery, 42);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_timeout_cancels_delayed_permission_before_dispatch_and_reaps_executor() {
+        let outer_timeout = Duration::from_millis(25);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(
+            Some(fetch_permission(Action::Ask)),
+            Some(ask_tx),
+            STEP_TIMEOUT,
+        );
+        let sender = Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())]));
+        let executor = Arc::new(FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: sender.clone(),
+            permission_bridge: owner.bridge(),
+        });
+        let fetch = make_fetch_with_timeout(
+            owner.bridge(),
+            tokio::runtime::Handle::current(),
+            executor.clone(),
+            outer_timeout,
+        );
+
+        let host_call = tokio::task::spawn_blocking(move || {
+            fetch("https://example.com/".to_string(), Opt(None))
+                .expect_err("permission wait must exceed the outer timeout")
+                .to_string()
+        });
+        let permission = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
+            .await
+            .expect("fetch must reach permission before its outer timeout")
+            .expect("permission channel closed");
+        let error = tokio::time::timeout(Duration::from_secs(1), host_call)
+            .await
+            .expect("outer timeout must return")
+            .expect("fetch host-call task panicked");
+        let retained_executor_after_timeout = Arc::strong_count(&executor);
+
+        let _ = permission.reply.send(UserDecision::AllowOnce);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&executor) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fetch executor did not finish after the permission resolved");
+
+        assert!(error.contains(&FetchError::TimedOut.to_string()));
+        assert_eq!(
+            retained_executor_after_timeout, 1,
+            "timed-out host call left a detached executor"
+        );
+        assert_eq!(
+            sender.call_count(),
+            0,
+            "permission approved after timeout reached the network sender"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_host_call_cancellation_marks_dispatched_request_outcome_unknown() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let owner =
+            PermissionBridgeOwner::new(Some(fetch_permission(Action::Allow)), None, STEP_TIMEOUT);
+        let executor = Arc::new(FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: Arc::new(BlockingFetchSender {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            permission_bridge: owner.bridge(),
+        });
+        let fetch = make_fetch_with_timeout(
+            owner.bridge(),
+            tokio::runtime::Handle::current(),
+            executor,
+            FETCH_TOTAL_TIMEOUT,
+        );
+        let host_call = tokio::task::spawn_blocking(move || {
+            fetch("https://example.com/".to_string(), Opt(None))
+                .expect_err("cancelled fetch executor must not complete")
+                .to_string()
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("blocked sender must start");
+        owner.shutdown();
+        let completed = tokio::time::timeout(Duration::from_secs(1), host_call).await;
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_one();
+
+        let error = completed
+            .expect("fetch cancellation must bound the host call")
+            .expect("fetch host-call task panicked");
+        assert!(
+            error.contains(&FetchError::OutcomeUnknown.to_string()),
+            "unexpected dispatched-fetch cancellation error: {error}"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_host_call_preserves_completed_fetch() {
+        let owner =
+            PermissionBridgeOwner::new(Some(fetch_permission(Action::Allow)), None, STEP_TIMEOUT);
+        let executor = Arc::new(FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
+            sender: Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())])),
+            permission_bridge: owner.bridge(),
+        });
+        let fetch = make_fetch_with_timeout(
+            owner.bridge(),
+            tokio::runtime::Handle::current(),
+            executor,
+            FETCH_TOTAL_TIMEOUT,
+        );
+
+        let result = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            fetch("https://example.com/".to_string(), Opt(None))
+        })
+        .await
+        .expect("fetch host-call task panicked")
+        .expect("completed fetch must survive the outer host-call wrapper");
+
+        assert_eq!(
+            result,
+            FetchResult {
+                status: 200,
+                text: "ok".to_string(),
+            }
+        );
     }
 
     #[cfg(feature = "sandbox")]
@@ -2824,7 +4001,9 @@ mod tests {
         drop(ask_rx);
         assert!(matches!(
             result,
-            Err(FetchError::Permission(ref message)) if message.contains("timed out")
+            Err(FetchError::Permission(
+                EffectServiceError::PermissionTimedOut
+            ))
         ));
         assert_eq!(sender.call_count(), 0);
 
@@ -2842,8 +4021,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(FetchError::Permission(ref message))
-                if message.to_ascii_lowercase().contains("channel")
+            Err(FetchError::Permission(EffectServiceError::BackendFailure))
         ));
         assert_eq!(sender.call_count(), 0);
     }
@@ -3790,7 +4968,11 @@ mod tests {
             .await
             .expect("spawn should request permission");
         assert_eq!(request.tool, "bash");
-        assert_eq!(request.input, format!("touch {}", target.to_string_lossy()));
+        assert_eq!(
+            request.input,
+            canonical_spawn_permission_subject("touch", &[target.to_string_lossy().into_owned()])
+                .unwrap()
+        );
         request
             .reply
             .send(UserDecision::Deny)

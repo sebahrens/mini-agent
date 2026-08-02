@@ -190,6 +190,7 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
                 },
                 SkillRecordMetadata {
                     status: "active".to_string(),
+                    quarantine_reason: None,
                     supersedes_id: None,
                     superseded_by_id: None,
                     row_version: 1,
@@ -251,8 +252,8 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
                 .unwrap();
                 let tests = serde_json::to_string(&artifact.tests).unwrap();
                 let capability = serde_json::json!({
-                    "tier": artifact.capability.tier.as_token(),
-                    "allowed_hosts": []
+                    "abi_version": artifact.abi_version,
+                    "manifest": artifact.capability,
                 })
                 .to_string();
                 insert

@@ -4,7 +4,7 @@ use crate::extras::js::skills::held_out::{
 };
 use crate::extras::js::skills::store::{AdminIdentity, SkillStore};
 use crate::extras::js::skills::{
-    CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
+    CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
 };
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use std::collections::BTreeMap;
@@ -131,8 +131,7 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
             signature: "fakeIsPresent(): boolean".to_string(),
         }],
         vec!["fakeIsPresent() === true".to_string()],
-        CapabilityManifest::new(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])
-            .expect("manifest"),
+        test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile]).expect("manifest"),
     )
     .expect("artifact");
     let mut fake_files = BTreeMap::new();

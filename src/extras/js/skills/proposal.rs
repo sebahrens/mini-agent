@@ -12,8 +12,10 @@ use std::time::Duration;
 
 use super::store::{EnqueueResult, SkillStore, StoreError, current_timestamp};
 use super::{
-    CapabilityManifest, CapabilityTier, HostCapability, IdentityError, SkillArtifact, SkillExport,
+    CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, IdentityError, SkillArtifact,
+    SkillExport,
 };
+use crate::extras::js::types::{EffectServiceError, PermCancellation};
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_DESCRIPTION_BYTES: usize = 1024;
@@ -36,7 +38,24 @@ pub(crate) struct JsExport {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct JsCapability {
     pub tier: String,
-    pub allowed_hosts: Vec<String>,
+    pub grants: Vec<JsCapabilityScope>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum JsCapabilityScope {
+    ReadFile {
+        workspace_prefixes: Vec<String>,
+    },
+    WriteFile {
+        workspace_prefixes: Vec<String>,
+    },
+    Fetch {
+        origins: Vec<String>,
+        methods: Vec<String>,
+    },
+    Spawn {
+        programs: Vec<String>,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -103,7 +122,7 @@ impl JsProposal {
                     field: "capability",
                     reason: "must be an object",
                 })?;
-        reject_unknown_keys(&capability, &["tier", "allowed_hosts"], "capability")?;
+        reject_unknown_keys(&capability, &["tier", "grants"], "capability")?;
 
         Ok(Self {
             source: required_string(object, "source", MAX_SOURCE_BYTES)?,
@@ -112,13 +131,16 @@ impl JsProposal {
             tests: required_string_array(object, "tests", 1, MAX_TESTS, MAX_TEST_BYTES)?,
             capability: JsCapability {
                 tier: required_string(&capability, "tier", MAX_TAG_BYTES)?,
-                allowed_hosts: required_string_array(
-                    &capability,
-                    "allowed_hosts",
-                    0,
-                    4,
-                    MAX_TAG_BYTES,
-                )?,
+                grants: required_array(&capability, "grants", 0, 4)?
+                    .iter::<Object<'_>>()
+                    .map(|scope| {
+                        let scope = scope.map_err(|_| ProposalError::InvalidField {
+                            field: "capability.grants",
+                            reason: "must be an array of objects",
+                        })?;
+                        parse_capability_scope(&scope)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             },
             tags: optional_string_array(object, "tags", MAX_TAGS, MAX_TAG_BYTES)?,
             predecessor_id: object
@@ -188,6 +210,18 @@ impl JsProposal {
             validate_text("tags", tag, MAX_TAG_BYTES, false)?;
             aggregate = aggregate.saturating_add(tag.len());
         }
+        for grant in &self.capability.grants {
+            aggregate = aggregate.saturating_add(match grant {
+                JsCapabilityScope::ReadFile { workspace_prefixes }
+                | JsCapabilityScope::WriteFile { workspace_prefixes } => {
+                    workspace_prefixes.iter().map(String::len).sum()
+                }
+                JsCapabilityScope::Fetch { origins, methods } => {
+                    origins.iter().chain(methods).map(String::len).sum()
+                }
+                JsCapabilityScope::Spawn { programs } => programs.iter().map(String::len).sum(),
+            });
+        }
         if aggregate > MAX_CANONICAL_INPUT_BYTES {
             return Err(ProposalError::PayloadTooLarge);
         }
@@ -197,22 +231,39 @@ impl JsProposal {
 
         let tier = CapabilityTier::from_token(&self.capability.tier)
             .ok_or_else(|| ProposalError::InvalidCapability("unknown or forbidden tier".into()))?;
-        if self.capability.allowed_hosts.len() > 4 {
+        if self.capability.grants.len() > 4 {
             return Err(ProposalError::InvalidCapability(
-                "too many allowed hosts".into(),
+                "too many capability grants".into(),
             ));
         }
-        let hosts = self
+        let grants = self
             .capability
-            .allowed_hosts
+            .grants
             .into_iter()
-            .map(|host| {
-                HostCapability::from_token(&host).ok_or_else(|| {
-                    ProposalError::InvalidCapability(format!("unknown or forbidden host {host}"))
-                })
+            .map(|scope| match scope {
+                JsCapabilityScope::ReadFile { workspace_prefixes } => {
+                    Ok(CapabilityScope::ReadFile { workspace_prefixes })
+                }
+                JsCapabilityScope::WriteFile { workspace_prefixes } => {
+                    Ok(CapabilityScope::WriteFile { workspace_prefixes })
+                }
+                JsCapabilityScope::Fetch { origins, methods } => {
+                    let methods = methods
+                        .into_iter()
+                        .map(|method| match method.as_str() {
+                            "GET" => Ok(HttpMethod::Get),
+                            "POST" => Ok(HttpMethod::Post),
+                            _ => Err(ProposalError::InvalidCapability(format!(
+                                "unknown or non-canonical HTTP method {method}"
+                            ))),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(CapabilityScope::Fetch { origins, methods })
+                }
+                JsCapabilityScope::Spawn { programs } => Ok(CapabilityScope::Spawn { programs }),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let capability = CapabilityManifest::new(tier, hosts)
+        let capability = CapabilityManifest::new(tier, grants)
             .map_err(|error| ProposalError::InvalidCapability(error.to_string()))?;
         SkillArtifact::new(
             self.source,
@@ -223,6 +274,52 @@ impl JsProposal {
             capability,
         )
         .map_err(ProposalError::Identity)
+    }
+}
+
+fn parse_capability_scope(object: &Object<'_>) -> Result<JsCapabilityScope, ProposalError> {
+    let kind = required_string(object, "kind", MAX_TAG_BYTES)?;
+    match kind.as_str() {
+        "read_file" => {
+            reject_unknown_keys(object, &["kind", "workspace_prefixes"], "capability grant")?;
+            Ok(JsCapabilityScope::ReadFile {
+                workspace_prefixes: required_string_array(
+                    object,
+                    "workspace_prefixes",
+                    1,
+                    32,
+                    MAX_DESCRIPTION_BYTES,
+                )?,
+            })
+        }
+        "write_file" => {
+            reject_unknown_keys(object, &["kind", "workspace_prefixes"], "capability grant")?;
+            Ok(JsCapabilityScope::WriteFile {
+                workspace_prefixes: required_string_array(
+                    object,
+                    "workspace_prefixes",
+                    1,
+                    32,
+                    MAX_DESCRIPTION_BYTES,
+                )?,
+            })
+        }
+        "fetch" => {
+            reject_unknown_keys(object, &["kind", "origins", "methods"], "capability grant")?;
+            Ok(JsCapabilityScope::Fetch {
+                origins: required_string_array(object, "origins", 1, 32, MAX_DESCRIPTION_BYTES)?,
+                methods: required_string_array(object, "methods", 1, 2, MAX_TAG_BYTES)?,
+            })
+        }
+        "spawn" => {
+            reject_unknown_keys(object, &["kind", "programs"], "capability grant")?;
+            Ok(JsCapabilityScope::Spawn {
+                programs: required_string_array(object, "programs", 1, 32, MAX_TAG_BYTES)?,
+            })
+        }
+        _ => Err(ProposalError::InvalidCapability(format!(
+            "unknown or forbidden capability grant {kind}"
+        ))),
     }
 }
 
@@ -479,6 +576,133 @@ impl ProposalHost {
     }
 }
 
+/// Parent-side proposal canonicalization and durable queue service. QuickJS
+/// object parsing is intentionally kept outside this API.
+#[derive(Clone)]
+pub(crate) struct ProposalEffectService {
+    host: ProposalHost,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProposalEffectResult {
+    pub(crate) skill_id: String,
+    pub(crate) proposal_id: String,
+    pub(crate) status: &'static str,
+    pub(crate) report_id: Option<String>,
+}
+
+pub(crate) struct PreparedProposalEffect {
+    artifact: SkillArtifact,
+    predecessor_id: Option<String>,
+}
+
+impl ProposalEffectService {
+    pub(crate) fn new(host: ProposalHost) -> Self {
+        Self { host }
+    }
+
+    pub(crate) fn execute(
+        &self,
+        proposal: JsProposal,
+    ) -> Result<ProposalEffectResult, ProposalError> {
+        self.reserve_attempt()?;
+        self.execute_reserved(proposal)
+    }
+
+    /// Cancellation-aware parent API. Cancellation before dispatch is exact;
+    /// once the bounded queue command is handed off, cancellation returns the
+    /// truthful unknown-outcome class while the blocking waiter drains on the
+    /// blocking pool.
+    pub(crate) async fn execute_cancellable(
+        &self,
+        proposal: JsProposal,
+        cancellation: PermCancellation,
+    ) -> Result<ProposalEffectResult, EffectServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(EffectServiceError::Cancelled);
+        }
+        self.reserve_attempt().map_err(proposal_service_error)?;
+        let prepared = self
+            .authorize_reserved(proposal)
+            .map_err(proposal_service_error)?;
+        if cancellation.is_cancelled() {
+            return Err(EffectServiceError::Cancelled);
+        }
+        let service = self.clone();
+        let execution = tokio::task::spawn_blocking(move || service.execute_prepared(prepared));
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(EffectServiceError::OutcomeUnknown),
+            result = execution => result
+                .map_err(|_| EffectServiceError::BackendFailure)?
+                .map_err(proposal_service_error),
+        }
+    }
+
+    pub(crate) fn reserve_attempt(&self) -> Result<(), ProposalError> {
+        self.host.budget.consume()
+    }
+
+    pub(crate) fn execute_reserved(
+        &self,
+        proposal: JsProposal,
+    ) -> Result<ProposalEffectResult, ProposalError> {
+        let prepared = self.authorize_reserved(proposal)?;
+        self.execute_prepared(prepared)
+    }
+
+    pub(crate) fn authorize_reserved(
+        &self,
+        proposal: JsProposal,
+    ) -> Result<PreparedProposalEffect, ProposalError> {
+        let predecessor_id = proposal.predecessor_id.clone();
+        let artifact = proposal.validate_and_canonicalize()?;
+        Ok(PreparedProposalEffect {
+            artifact,
+            predecessor_id,
+        })
+    }
+
+    pub(crate) fn execute_prepared(
+        &self,
+        prepared: PreparedProposalEffect,
+    ) -> Result<ProposalEffectResult, ProposalError> {
+        let result = self
+            .host
+            .sender
+            .enqueue(prepared.artifact, prepared.predecessor_id)?;
+        let status = match result.status {
+            super::store::EnqueueStatus::Pending => "pending",
+            super::store::EnqueueStatus::Verified => "verified",
+            super::store::EnqueueStatus::Rejected => "rejected",
+            super::store::EnqueueStatus::AwaitingApproval => "awaiting_approval",
+            super::store::EnqueueStatus::Approved => "approved",
+        };
+        Ok(ProposalEffectResult {
+            skill_id: result.skill_id,
+            proposal_id: result.proposal_id,
+            status,
+            report_id: result.report_id,
+        })
+    }
+}
+
+fn proposal_service_error(error: ProposalError) -> EffectServiceError {
+    match error {
+        ProposalError::InvalidField { .. }
+        | ProposalError::UnknownField { .. }
+        | ProposalError::InvalidCapability(_)
+        | ProposalError::Identity(_) => EffectServiceError::InvalidTarget,
+        ProposalError::PayloadTooLarge => EffectServiceError::BodyLimit,
+        ProposalError::BudgetExhausted => EffectServiceError::PermissionDenied,
+        ProposalError::QueueTimeout => EffectServiceError::TimedOut,
+        ProposalError::QueueFull
+        | ProposalError::QueueClosed
+        | ProposalError::StoreUnavailable
+        | ProposalError::WorkerUnavailable => EffectServiceError::BackendFailure,
+    }
+}
+
 impl ProposalSender {
     pub(crate) fn enqueue(
         &self,
@@ -507,6 +731,19 @@ impl ProposalSender {
 
 pub(crate) struct ProposalReceiver {
     receiver: mpsc::Receiver<ProposalCommand>,
+}
+
+#[cfg(test)]
+impl ProposalReceiver {
+    pub(crate) fn respond_next(
+        &self,
+        delay: Duration,
+        result: Result<EnqueueResult, ProposalError>,
+    ) {
+        let command = self.receiver.recv().expect("proposal command");
+        std::thread::sleep(delay);
+        let _ = command.reply.send(result);
+    }
 }
 
 pub(crate) struct ProposalWorker {

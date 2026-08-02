@@ -11,6 +11,96 @@ pub const THREAD_STACK: usize = 8 * 1024 * 1024; // 8 MiB OS thread stack
 pub const READ_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const WRITE_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// Closed failures returned by parent-side effect services.
+///
+/// The service layer deliberately carries no QuickJS values or errors. Worker
+/// adapters translate these classes at the process boundary without exposing
+/// backend details, paths, command output, or response bodies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum EffectServiceError {
+    #[error("effect target is invalid")]
+    InvalidTarget,
+    #[error("write_file does not follow final symlinks")]
+    FinalSymlink,
+    #[error("Path changed after permission check")]
+    TargetChanged,
+    #[error("effect target is outside the configured policy")]
+    TargetDenied,
+    #[error("no roots are configured; unrestricted access requires an explicit opt-in")]
+    FileNoConfiguredRoots,
+    #[error("the configured roots are invalid or ambiguous")]
+    FileInvalidConfiguration,
+    #[error("the resolved target is outside the configured roots")]
+    FileOutsideConfiguredRoots,
+    #[error("Permission denied by user")]
+    PermissionDenied,
+    #[error("Doom loop: repeated identical tool call")]
+    DoomLoopDenied,
+    #[error("effect permission prompt timed out")]
+    PermissionTimedOut,
+    #[error("effect was cancelled")]
+    Cancelled,
+    #[error("effect timed out")]
+    TimedOut,
+    #[error("resource limit: effect output exceeded its limit")]
+    OutputLimit,
+    #[error("resource limit: effect body exceeded its limit")]
+    BodyLimit,
+    #[error("invalid encoding: effect body is invalid")]
+    InvalidBody,
+    #[error("effect backend is unavailable")]
+    BackendFailure,
+    #[error("effect outcome is unknown after dispatch")]
+    OutcomeUnknown,
+}
+
+/// Reversibly canonical permission identity for one structured spawn request.
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnPermissionSubject<'a> {
+    version: u8,
+    program: &'a str,
+    arguments: &'a [String],
+}
+
+pub(crate) fn canonical_spawn_permission_subject(
+    program: &str,
+    arguments: &[String],
+) -> Result<String, EffectServiceError> {
+    serde_json::to_string(&SpawnPermissionSubject {
+        version: 1,
+        program,
+        arguments,
+    })
+    .map_err(|_| EffectServiceError::InvalidTarget)
+}
+
+/// Compatibility rendering used only to evaluate existing Bash policy rules.
+/// Authority, prompting, session approval, and execution use the structured
+/// canonical subject above.
+pub(crate) fn spawn_policy_input(program: &str, arguments: &[String]) -> String {
+    std::iter::once(program)
+        .chain(arguments.iter().map(String::as_str))
+        .map(quote_spawn_policy_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_spawn_policy_word(word: &str) -> String {
+    if !word.is_empty()
+        && word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
+        })
+    {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\"'\"'"))
+}
+
 static NEXT_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct JsRequest {
@@ -111,6 +201,7 @@ impl SkillExecutionBundle {
                     artifact: crate::extras::js::skills::SkillArtifact {
                         id: resolved.id.clone(),
                         identity_version: resolved.identity_version,
+                        abi_version: resolved.abi_version,
                         source: resolved.source.clone(),
                         description: resolved.description.clone(),
                         tags: resolved.tags.clone(),

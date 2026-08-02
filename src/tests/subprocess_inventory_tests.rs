@@ -147,6 +147,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/extras/js/supervisor.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/skills/telemetry.rs",
         ".spawn(move || {",
         1,
@@ -165,6 +171,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/extras/js/supervisor.rs",
+        ".spawn(move || {",
+        3,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/tool.rs",
         ".spawn(move || {",
         1,
@@ -177,16 +189,35 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/loop/headless.rs",
+        "src/sandbox/worker/macos.rs",
         ".output()",
         1,
-        "TC-LOOP-VALIDATION",
+        "TC-SUPPORT-UTILITY",
     ),
     (
-        "src/extras/loop/headless.rs",
-        "match tokio::process::Command::new(shell)",
+        "src/sandbox/worker/macos.rs",
+        "let output = std::process::Command::new(SW_VERS)",
         1,
-        "TC-LOOP-VALIDATION",
+        "TC-SUPPORT-UTILITY",
+    ),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/extras/loop/validation.rs",
+        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "std::process::Command::new(\"/bin/kill\")",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/extras/loop/mod.rs",
@@ -275,6 +306,57 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-MODEL-ACTION",
     ),
+    ("src/sandbox/worker.rs", ".spawn()", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker.rs",
+        "let mut command = Command::new(executable);",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/sandbox/worker/linux.rs", ".status()", 1, "TEST-ONLY"),
+    ("src/sandbox/worker/linux.rs", ".spawn()?;", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker/linux.rs",
+        "if std::process::Command::new(WORKER_PATH)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "if std::thread::Builder::new().spawn(|| {}).is_ok() {",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = Command::new(WORKER_PATH)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = command.spawn()?;",
+        4,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut command = Command::new(bwrap);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
     ("src/session/mod.rs", ".output()", 1, "TC-INTERNAL-GIT"),
     (
         "src/session/mod.rs",
@@ -306,18 +388,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "std::process::Command::new(\"bash\")",
         1,
         "TC-EXPLICIT-USER-SHELL",
-    ),
-    (
-        "src/ui/event_handler.rs",
-        ".output()",
-        1,
-        "TC-LOOP-VALIDATION",
-    ),
-    (
-        "src/ui/event_handler.rs",
-        "match tokio::process::Command::new(shell)",
-        1,
-        "TC-LOOP-VALIDATION",
     ),
     ("src/ui/input/mod.rs", ".status();", 1, "TC-SUPPORT-UTILITY"),
     (
@@ -372,6 +442,7 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
     "TC-LSP-SERVICE",
     "TC-MCP-STDIO",
     "TC-MODEL-ACTION",
+    "TC-BROKER-JS-WORKER",
     "TC-PROJECT-AUTOMATION",
     "TC-SUPPORT-UTILITY",
 ];
@@ -454,6 +525,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/extras/js/supervisor.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/skills/telemetry.rs",
         ".spawn(move || {",
         1,
@@ -472,6 +549,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/extras/js/supervisor.rs",
+        ".spawn(move || {",
+        3,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/tool.rs",
         ".spawn(move || {",
         1,
@@ -482,6 +565,25 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "requests.spawn(async move {",
         1,
         "NON-PROCESS",
+    ),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/extras/loop/validation.rs",
+        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "std::process::Command::new(\"/bin/kill\")",
+        1,
+        "TEST-ONLY",
     ),
     ("src/sandbox.rs", ".status();", 2, "TC-LIFECYCLE-HELPER"),
     (
@@ -526,6 +628,57 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-MODEL-ACTION",
     ),
+    ("src/sandbox/worker.rs", ".spawn()", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker.rs",
+        "let mut command = Command::new(executable);",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/sandbox/worker/linux.rs", ".status()", 1, "TEST-ONLY"),
+    ("src/sandbox/worker/linux.rs", ".spawn()?;", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker/linux.rs",
+        "if std::process::Command::new(WORKER_PATH)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "if std::thread::Builder::new().spawn(|| {}).is_ok() {",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = Command::new(WORKER_PATH)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut child = command.spawn()?;",
+        4,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/linux.rs",
+        "let mut command = Command::new(bwrap);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
     (
         "src/ui/app.rs",
         "if std::process::Command::new(\"lazygit\")",
@@ -557,13 +710,12 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/docs.rs", "TC-SUPPORT-UTILITY"),
     ("src/extras/git_worktree/mod.rs", "TC-INTERNAL-GIT"),
     ("src/extras/hooks/subprocess.rs", "TC-PROJECT-AUTOMATION"),
-    ("src/extras/loop/headless.rs", "TC-LOOP-VALIDATION"),
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
+    ("src/sandbox/worker/macos.rs", "TC-SUPPORT-UTILITY"),
     ("src/session/mod.rs", "TC-INTERNAL-GIT"),
     ("src/startup.rs", "TC-EXPLICIT-USER-SHELL"),
-    ("src/ui/event_handler.rs", "TC-LOOP-VALIDATION"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/slash/memory.rs", "TC-SUPPORT-UTILITY"),
@@ -646,11 +798,6 @@ fn validate_class_assignments(
     }
 
     for ((path, source, occurrence), classification) in inventory {
-        if *classification == "TC-BROKER-JS-WORKER" {
-            return Err(format!(
-                "broker-only JS worker cannot classify a current site: {path} occurrence {occurrence}: {source}"
-            ));
-        }
         if !ALLOWED_CURRENT_CLASSES.contains(classification) {
             return Err(format!(
                 "class {classification} is not allowed for current launch inventory"
@@ -786,7 +933,7 @@ fn production_subprocess_sites_have_a_trust_classification() {
 }
 
 #[test]
-fn current_subprocess_inventory_rejects_broker_and_cross_family_classes() {
+fn current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes() {
     validate_current_class_assignments().expect("current subprocess classes must be allowed");
 }
 
@@ -827,6 +974,13 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
             1,
             "TC-MODEL-ACTION",
             "a lifecycle helper in the mixed sandbox family",
+        ),
+        (
+            "src/sandbox/worker/linux.rs",
+            "let Ok(mut child) = command.spawn() else {",
+            1,
+            "TC-MODEL-ACTION",
+            "the broker-only Linux preflight launch",
         ),
         (
             "src/ui/app.rs",
