@@ -17,6 +17,8 @@ use super::protocol::{
     VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerWireFrame, read_frame,
     write_frame,
 };
+#[cfg(feature = "skills")]
+use super::protocol::{SkillCallRequest, SkillCallResponse};
 use super::types::{PermCancellation, STEP_TIMEOUT};
 #[cfg(not(test))]
 use crate::sandbox::worker::ProductionWorkerLauncher;
@@ -36,6 +38,14 @@ pub(crate) trait InvocationEffectHandler: Send {
         request: EffectRequest,
         cancellation: PermCancellation,
     ) -> EffectFuture<'_>;
+
+    #[cfg(feature = "skills")]
+    fn handle_skill_call(&mut self, request: SkillCallRequest) -> SkillCallResponse {
+        SkillCallResponse {
+            request_ordinal: request.request_ordinal,
+            authorization: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -670,6 +680,30 @@ async fn run_invocation<H: InvocationEffectHandler>(
                         effect_ordinal: request.effect_ordinal,
                         result,
                     }),
+                );
+                connection
+                    .protocol
+                    .on_send(&response)
+                    .map_err(|_| WorkerError::Protocol)?;
+                write_parent(connection, response, cancellation, deadline).await?;
+                connection.sequence = advance(connection.sequence)?;
+            }
+            #[cfg(feature = "skills")]
+            WorkerFrame::SkillCallRequest(request) => {
+                let Some(handler) = effects.as_deref_mut() else {
+                    return Err(WorkerError::UnexpectedVerificationEffect);
+                };
+                if cancellation.is_cancelled() {
+                    return Err(WorkerError::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(WorkerError::TimedOut);
+                }
+                let response = WireFrame::invocation(
+                    connection.build.clone(),
+                    invocation.clone(),
+                    connection.sequence,
+                    ParentFrame::SkillCallResponse(handler.handle_skill_call(request)),
                 );
                 connection
                     .protocol

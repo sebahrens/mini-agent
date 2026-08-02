@@ -15,10 +15,12 @@ use tokio::task::{AbortHandle, JoinSet};
 
 use crate::agent::tools::ToolError;
 use crate::extras::js::audit::{AuditError, EffectAudit};
-#[cfg(feature = "skills")]
-use crate::extras::js::broker::PreparedSkillManifest;
 use crate::extras::js::broker::{
     GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant, SharedEffectAudit,
+};
+#[cfg(feature = "skills")]
+use crate::extras::js::broker::{
+    PreparedSkillManifest, SkillCallAuthority, SkillExportAuthoritySpec,
 };
 #[cfg(feature = "sandbox")]
 use crate::extras::js::host::FetchEffectService;
@@ -837,12 +839,10 @@ impl Tool for JsTool {
             id
         });
         #[cfg(feature = "skills")]
-        let skill_invocations = issue_skill_invocations(
+        let skill_call_authority = build_skill_call_authority(
             &skill_bundle,
             &prepared_skill_manifests,
             &skill_tool_call_id,
-            &invocation_id,
-            &mut grants,
             grant_expires_at,
         )?;
         let bridge = self
@@ -878,6 +878,8 @@ impl Tool for JsTool {
             audit,
         )
         .map_err(|_| ToolError::Msg("JS invocation authority unavailable".into()))?;
+        #[cfg(feature = "skills")]
+        let broker = broker.with_skill_call_authority(skill_call_authority);
         let run_step = RunStep::new(args.code).with_model_grant(model_grant_id);
         #[cfg(feature = "skills")]
         let run_step = if let Some(grant_id) = proposal_grant_id {
@@ -902,7 +904,6 @@ impl Tool for JsTool {
                     capability: skill.capability.clone(),
                 })
                 .collect(),
-            skill_invocations,
             skill_bundle.turn_id.clone(),
             skill_tool_call_id.clone(),
         );
@@ -997,69 +998,34 @@ fn validate_skill_bundle_bounds(
 }
 
 #[cfg(feature = "skills")]
-fn issue_skill_invocations(
+fn build_skill_call_authority(
     bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
     prepared_manifests: &[PreparedSkillManifest],
     tool_call_id: &str,
-    bound_invocation: &InvocationId,
-    grants: &mut Vec<InvocationGrant>,
     expires_at: Instant,
-) -> Result<Vec<crate::extras::js::protocol::SkillInvocationGrant>, ToolError> {
+) -> Result<SkillCallAuthority, ToolError> {
     if prepared_manifests.len() != bundle.skills.len() {
         return Err(ToolError::Msg(
             "skill invocation authority unavailable".into(),
         ));
     }
-    let mut issued = Vec::new();
+    let mut specs = Vec::new();
     for (skill, prepared_manifest) in bundle.skills.iter().zip(prepared_manifests) {
         for export in &skill.exports {
-            let invocation_id = crate::extras::js::skills::telemetry::stable_invocation_id(
-                &bundle.turn_id,
-                tool_call_id,
-                &skill.id,
-                &export.name,
-                0,
-            );
-            let wire_invocation_id = InvocationId::new(invocation_id.clone())
-                .map_err(|_| ToolError::Msg("skill invocation identity unavailable".into()))?;
-            let mut capability_grants = Vec::with_capacity(skill.capability.grants.len());
-            for scope in &skill.capability.grants {
-                let skill_capability = scope.capability();
-                let capability = match skill_capability {
-                    crate::extras::js::skills::HostCapability::ReadFile => HostCapability::ReadFile,
-                    crate::extras::js::skills::HostCapability::WriteFile => {
-                        HostCapability::WriteFile
-                    }
-                    crate::extras::js::skills::HostCapability::Spawn => HostCapability::Spawn,
-                    crate::extras::js::skills::HostCapability::Fetch => HostCapability::Fetch,
-                };
-                let grant = InvocationGrant::issue_prepared_scoped_skill(
-                    bound_invocation.clone(),
-                    GrantPrincipal::Skill {
-                        artifact_id: skill.id.clone(),
-                        export: export.name.clone(),
-                        invocation_id: invocation_id.clone(),
-                    },
-                    capability,
-                    prepared_manifest,
-                    expires_at,
-                )
-                .map_err(|_| ToolError::Msg("skill invocation authority unavailable".into()))?;
-                capability_grants.push(crate::extras::js::protocol::SkillCapabilityGrant {
-                    capability: skill_capability,
-                    grant_id: grant.grant_id().clone(),
-                });
-                grants.push(grant);
-            }
-            issued.push(crate::extras::js::protocol::SkillInvocationGrant {
+            specs.push(SkillExportAuthoritySpec {
                 artifact_id: skill.id.clone(),
                 export_name: export.name.clone(),
-                invocation_id: wire_invocation_id,
-                grants: capability_grants,
+                prepared_manifest: prepared_manifest.clone(),
             });
         }
     }
-    Ok(issued)
+    SkillCallAuthority::new(
+        bundle.turn_id.clone(),
+        tool_call_id.to_string(),
+        expires_at,
+        specs,
+    )
+    .map_err(|_| ToolError::Msg("skill invocation authority unavailable".into()))
 }
 
 #[cfg(feature = "skills")]

@@ -2070,6 +2070,8 @@ fn run_scripted_supervisor_worker() -> ! {
             ParentFrame::Hello(_) | ParentFrame::EffectResponse(EffectResponse { .. }) => {
                 std::process::exit(1)
             }
+            #[cfg(feature = "skills")]
+            ParentFrame::SkillCallResponse(_) => std::process::exit(1),
         }
     }
 }

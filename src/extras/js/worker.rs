@@ -28,8 +28,8 @@ use super::protocol::{
 use super::protocol::{HttpHeader, HttpMethod};
 #[cfg(feature = "skills")]
 use super::protocol::{
-    MAX_SKILL_ARTIFACTS_PER_STEP, MAX_SKILL_CAPABILITY_GRANTS_PER_STEP,
-    MAX_SKILL_EXPORTS_PER_ARTIFACT,
+    MAX_SKILL_ARTIFACTS_PER_STEP, MAX_SKILL_CALLS_PER_STEP, MAX_SKILL_CAPABILITY_GRANTS_PER_STEP,
+    MAX_SKILL_EXPORTS_PER_ARTIFACT, SkillCallRequest, SkillCallResponse, SkillInvocationGrant,
 };
 use super::types::{
     MEMORY_LIMIT, READ_FILE_MAX_BYTES, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
@@ -70,6 +70,9 @@ type WorkerEffectDispatcher = Arc<
         + Send
         + Sync,
 >;
+#[cfg(feature = "skills")]
+type WorkerSkillCallAuthorizer =
+    Arc<dyn Fn(String, String, u32) -> Result<SkillInvocationGrant, ()> + Send + Sync>;
 
 #[cfg(feature = "skills")]
 #[derive(Clone)]
@@ -918,6 +921,8 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
             }
             ParentFrame::Shutdown => return Ok(()),
             ParentFrame::Hello(_) | ParentFrame::EffectResponse(_) => return Err(()),
+            #[cfg(feature = "skills")]
+            ParentFrame::SkillCallResponse(_) => return Err(()),
         };
         let response = WireFrame {
             protocol_version: super::protocol::PROTOCOL_VERSION,
@@ -947,9 +952,13 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
 ) -> Result<(StepResult, u64), ()> {
     let model_grant_id = request.model_grant_id.clone();
     let ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    #[cfg(feature = "skills")]
+    let skill_request_ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let sequence = Arc::new(Mutex::new(sequence));
     let protocol_failed = Arc::new(AtomicBool::new(false));
     let wire_dispatcher: WorkerEffectDispatcher = {
+        let effect_build = build.clone();
+        let effect_invocation_id = invocation_id.clone();
         let ordinal = ordinal.clone();
         let sequence = sequence.clone();
         let protocol_failed = protocol_failed.clone();
@@ -970,7 +979,7 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                 operation,
             };
             let result = transport.lock().map_err(|_| ()).and_then(|mut transport| {
-                transport.round_trip(request, &build, &invocation_id, &sequence)
+                transport.round_trip(request, &effect_build, &effect_invocation_id, &sequence)
             });
             match result {
                 Ok(result) => result,
@@ -987,7 +996,49 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
             dispatcher(grant_id.clone(), AdvisoryAttribution::default(), operation)
         }) as ModelEffectDispatcher
     });
-    let terminal = execute_run_step(request, limits, model_dispatcher, wire_dispatcher);
+    #[cfg(feature = "skills")]
+    let skill_call_authorizer = {
+        let skill_request_ordinal = skill_request_ordinal.clone();
+        let sequence = sequence.clone();
+        let protocol_failed = protocol_failed.clone();
+        let transport = transport.clone();
+        let build = build.clone();
+        let invocation_id = invocation_id.clone();
+        Arc::new(
+            move |artifact_id: String, export_name: String, call_ordinal: u32| {
+                if protocol_failed.load(Ordering::Acquire) {
+                    return Err(());
+                }
+                let request_ordinal = skill_request_ordinal.fetch_add(1, Ordering::AcqRel);
+                if request_ordinal >= MAX_SKILL_CALLS_PER_STEP {
+                    protocol_failed.store(true, Ordering::Release);
+                    return Err(());
+                }
+                let request = SkillCallRequest {
+                    request_ordinal,
+                    artifact_id,
+                    export_name,
+                    call_ordinal,
+                };
+                let result = transport.lock().map_err(|_| ()).and_then(|mut transport| {
+                    transport.skill_call_round_trip(request, &build, &invocation_id, &sequence)
+                });
+                if result.is_err() {
+                    protocol_failed.store(true, Ordering::Release);
+                }
+                result
+            },
+        )
+            as Arc<dyn Fn(String, String, u32) -> Result<SkillInvocationGrant, ()> + Send + Sync>
+    };
+    let terminal = execute_run_step(
+        request,
+        limits,
+        model_dispatcher,
+        wire_dispatcher,
+        #[cfg(feature = "skills")]
+        skill_call_authorizer,
+    );
     if protocol_failed.load(Ordering::Acquire) {
         Err(())
     } else {
@@ -1035,6 +1086,41 @@ impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
             _ => Err(()),
         }
     }
+
+    #[cfg(feature = "skills")]
+    fn skill_call_round_trip(
+        &mut self,
+        request: SkillCallRequest,
+        build: &BuildIdentity,
+        invocation_id: &super::protocol::InvocationId,
+        sequence: &Mutex<u64>,
+    ) -> Result<SkillInvocationGrant, ()> {
+        let frame = WireFrame::invocation(
+            build.clone(),
+            invocation_id.clone(),
+            *sequence.lock().map_err(|_| ())?,
+            WorkerFrame::SkillCallRequest(request.clone()),
+        );
+        self.protocol.on_send(&frame).map_err(|_| ())?;
+        write_terminal(&mut self.output, &frame)?;
+        {
+            let mut sequence = sequence.lock().map_err(|_| ())?;
+            *sequence = sequence.checked_add(1).ok_or(())?;
+        }
+        let response: ParentWireFrame = read_frame(&mut self.input).map_err(|_| ())?;
+        self.protocol.on_receive(&response).map_err(|_| ())?;
+        {
+            let mut sequence = sequence.lock().map_err(|_| ())?;
+            *sequence = sequence.checked_add(1).ok_or(())?;
+        }
+        match response.message {
+            ParentFrame::SkillCallResponse(SkillCallResponse {
+                request_ordinal,
+                authorization: Some(authorization),
+            }) if request_ordinal == request.request_ordinal => Ok(authorization),
+            _ => Err(()),
+        }
+    }
 }
 
 fn backend_failure() -> EffectResult {
@@ -1048,6 +1134,7 @@ fn prepare_bound_exports(
     request: &RunStep,
     capabilities: &InvocationCapabilityRuntime,
     events: Arc<Mutex<WorkerEventState>>,
+    authorize_call: WorkerSkillCallAuthorizer,
 ) -> Result<
     std::collections::HashMap<
         String,
@@ -1056,35 +1143,14 @@ fn prepare_bound_exports(
     (),
 > {
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::AtomicU32;
 
     validate_skill_authority_bounds(request)?;
     if request.artifacts.is_empty() {
-        return request
-            .skill_invocations
-            .is_empty()
-            .then(HashMap::new)
-            .ok_or(());
+        return Ok(HashMap::new());
     }
     if request.turn_id.is_empty() || request.tool_call_id.is_empty() {
         return Err(());
     }
-    let mut issued = HashMap::new();
-    for invocation in &request.skill_invocations {
-        if issued
-            .insert(
-                (
-                    invocation.artifact_id.clone(),
-                    invocation.export_name.clone(),
-                ),
-                invocation,
-            )
-            .is_some()
-        {
-            return Err(());
-        }
-    }
-
     let mut prepared = HashMap::new();
     let mut seen_artifacts = HashSet::new();
     for artifact in &request.artifacts {
@@ -1093,50 +1159,56 @@ fn prepare_bound_exports(
         }
         let mut exports = HashMap::new();
         for export in &artifact.exports {
-            let invocation = issued
-                .remove(&(artifact.id.clone(), export.name.clone()))
-                .ok_or(())?;
-            let expected_invocation = stable_invocation_id(
-                &request.turn_id,
-                &request.tool_call_id,
-                &artifact.id,
-                &export.name,
-                0,
-            );
-            if invocation.invocation_id.as_str() != expected_invocation {
-                return Err(());
-            }
-            let authorization = InvocationAuthorization::new(
-                invocation.invocation_id.clone(),
-                artifact.id.clone(),
-                export.name.clone(),
-                artifact.capability.clone(),
-                invocation
-                    .grants
-                    .iter()
-                    .map(|grant| (grant.capability, grant.grant_id.clone())),
-            )
-            .map_err(|_| ())?;
-            let handle = capabilities.prepare(authorization).map_err(|_| ())?;
             let metadata = WorkerEventMetadata {
                 skill_id: artifact.id.clone(),
                 export_name: export.name.clone(),
                 turn_id: request.turn_id.clone(),
                 tool_call_id: request.tool_call_id.clone(),
             };
-            let ordinal = Arc::new(AtomicU32::new(0));
+            let call_authorizer = authorize_call.clone();
+            let call_capabilities = capabilities.clone();
+            let call_manifest = artifact.capability.clone();
+            let call_artifact_id = artifact.id.clone();
+            let call_export_name = export.name.clone();
+            let call_turn_id = request.turn_id.clone();
+            let call_tool_call_id = request.tool_call_id.clone();
+            let authorize = Arc::new(move |call_ordinal: u32| {
+                let issued = call_authorizer(
+                    call_artifact_id.clone(),
+                    call_export_name.clone(),
+                    call_ordinal,
+                )?;
+                let expected_invocation = stable_invocation_id(
+                    &call_turn_id,
+                    &call_tool_call_id,
+                    &call_artifact_id,
+                    &call_export_name,
+                    call_ordinal,
+                );
+                if issued.artifact_id != call_artifact_id
+                    || issued.export_name != call_export_name
+                    || issued.invocation_id.as_str() != expected_invocation
+                {
+                    return Err(());
+                }
+                let authorization = InvocationAuthorization::new(
+                    issued.invocation_id,
+                    call_artifact_id.clone(),
+                    call_export_name.clone(),
+                    call_manifest.clone(),
+                    issued
+                        .grants
+                        .into_iter()
+                        .map(|grant| (grant.capability, grant.grant_id)),
+                )
+                .map_err(|_| ())?;
+                let invocation_id = expected_invocation;
+                let handle = call_capabilities.prepare(authorization).map_err(|_| ())?;
+                Ok((handle, invocation_id))
+            });
             let start_events = events.clone();
             let start_metadata = metadata.clone();
-            let start_ordinal = ordinal.clone();
-            let on_start = Arc::new(move |shape: String| {
-                let ordinal = start_ordinal.fetch_add(1, Ordering::AcqRel);
-                let id = stable_invocation_id(
-                    &start_metadata.turn_id,
-                    &start_metadata.tool_call_id,
-                    &start_metadata.skill_id,
-                    &start_metadata.export_name,
-                    ordinal,
-                );
+            let on_start = Arc::new(move |id: String, shape: String| {
                 let shape = if shape.len()
                     <= crate::extras::js::skills::telemetry::MAX_ARGUMENT_SHAPE_BYTES
                 {
@@ -1149,7 +1221,7 @@ fn prepare_bound_exports(
                     start_metadata.clone(),
                     shape,
                 );
-                Ok(id)
+                Ok(())
             });
             let terminal_events = events.clone();
             let on_terminal = Arc::new(move |invocation_id: String, success: bool| {
@@ -1162,16 +1234,13 @@ fn prepare_bound_exports(
             exports.insert(
                 export.name.clone(),
                 super::realm::BoundExportInvocation {
-                    handle,
+                    authorize,
                     on_start,
                     on_terminal,
                 },
             );
         }
         prepared.insert(artifact.id.clone(), exports);
-    }
-    if !issued.is_empty() {
-        return Err(());
     }
     Ok(prepared)
 }
@@ -1181,15 +1250,11 @@ fn validate_skill_authority_bounds(request: &RunStep) -> Result<(), ()> {
     if request.artifacts.len() > MAX_SKILL_ARTIFACTS_PER_STEP {
         return Err(());
     }
-    let mut total_exports = 0_usize;
     let mut expected_grants = 0_usize;
     for artifact in &request.artifacts {
         if artifact.exports.len() > MAX_SKILL_EXPORTS_PER_ARTIFACT {
             return Err(());
         }
-        total_exports = total_exports
-            .checked_add(artifact.exports.len())
-            .ok_or(())?;
         expected_grants = expected_grants
             .checked_add(
                 artifact
@@ -1203,19 +1268,7 @@ fn validate_skill_authority_bounds(request: &RunStep) -> Result<(), ()> {
             return Err(());
         }
     }
-    if request.skill_invocations.len() != total_exports {
-        return Err(());
-    }
-    let mut actual_grants = 0_usize;
-    for invocation in &request.skill_invocations {
-        actual_grants = actual_grants
-            .checked_add(invocation.grants.len())
-            .ok_or(())?;
-        if actual_grants > MAX_SKILL_CAPABILITY_GRANTS_PER_STEP {
-            return Err(());
-        }
-    }
-    (actual_grants == expected_grants).then_some(()).ok_or(())
+    Ok(())
 }
 
 #[cfg(all(test, feature = "skills"))]
@@ -1245,7 +1298,6 @@ mod skill_authority_bound_tests {
     fn step(artifacts: Vec<SkillArtifact>) -> RunStep {
         RunStep::new("1".into()).with_skills(
             artifacts,
-            vec![],
             "bounded-worker-turn".into(),
             "bounded-worker-call".into(),
         )
@@ -1296,6 +1348,7 @@ fn execute_run_step(
     limits: ExecutionLimits,
     effects: Option<ModelEffectDispatcher>,
     _wire_effects: WorkerEffectDispatcher,
+    #[cfg(feature = "skills")] authorize_skill_call: WorkerSkillCallAuthorizer,
 ) -> StepResult {
     let console = Arc::new(Mutex::new(Vec::new()));
     #[cfg(feature = "skills")]
@@ -1314,7 +1367,12 @@ fn execute_run_step(
     #[cfg(feature = "skills")]
     let _capability_lifecycle = WorkerCapabilityLifecycle::new(capability_runtime.clone());
     #[cfg(feature = "skills")]
-    let bindings = match prepare_bound_exports(&request, &capability_runtime, event_state.clone()) {
+    let bindings = match prepare_bound_exports(
+        &request,
+        &capability_runtime,
+        event_state.clone(),
+        authorize_skill_call,
+    ) {
         Ok(bindings) => bindings,
         Err(()) => {
             return StepResult {

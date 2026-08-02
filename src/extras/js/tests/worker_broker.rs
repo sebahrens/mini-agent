@@ -20,6 +20,10 @@ use crate::extras::js::broker::{
     ParentEffectService, copy_and_hash_executable, copy_and_hash_executable_controlled,
     resolve_program_identity, run_executable_preparation,
 };
+#[cfg(feature = "skills")]
+use crate::extras::js::broker::{SkillCallAuthority, SkillExportAuthoritySpec};
+#[cfg(feature = "skills")]
+use crate::extras::js::protocol::SkillCallRequest;
 use crate::extras::js::protocol::{
     AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpHeader, HttpMethod, InvocationId,
     SkillProposalDraft,
@@ -930,6 +934,97 @@ fn prepared_manifest_resolves_once_then_mints_distinct_singleton_grants_with_one
         grant.spawn_program_bindings_json_for_test()
             == grants[0].spawn_program_bindings_json_for_test()
     }));
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn reusable_export_mints_fresh_exact_authority_and_denies_replay_revocation_and_expiry() {
+    let outer = invocation("reusable-export-outer");
+    let artifact_id = "a".repeat(64);
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::ReadOnly,
+        vec![CapabilityScope::ReadFile {
+            workspace_prefixes: vec!["Cargo.toml".into()],
+        }],
+    )
+    .unwrap();
+    let prepared = InvocationGrant::prepare_skill_manifest_with_resolver(manifest, |_| {
+        unreachable!("read-only manifest does not resolve executables")
+    })
+    .unwrap();
+    let authority = SkillCallAuthority::new(
+        "reusable-turn".into(),
+        "reusable-tool-call".into(),
+        Instant::now() + Duration::from_secs(10),
+        vec![SkillExportAuthoritySpec {
+            artifact_id: artifact_id.clone(),
+            export_name: "read".into(),
+            prepared_manifest: prepared.clone(),
+        }],
+    )
+    .unwrap();
+    let (active_broker, _record, _audit) = broker(
+        outer,
+        vec![],
+        BTreeSet::from([HostCapability::ReadFile]),
+        ServiceFailures::default(),
+    );
+    let mut active_broker = active_broker.with_skill_call_authority(authority);
+    let request = |request_ordinal, call_ordinal| SkillCallRequest {
+        request_ordinal,
+        artifact_id: artifact_id.clone(),
+        export_name: "read".into(),
+        call_ordinal,
+    };
+
+    let first = active_broker
+        .authorize_skill_call(request(0, 0))
+        .authorization
+        .unwrap();
+    let second = active_broker
+        .authorize_skill_call(request(1, 1))
+        .authorization
+        .unwrap();
+    assert_ne!(first.invocation_id, second.invocation_id);
+    assert_ne!(first.grants[0].grant_id, second.grants[0].grant_id);
+    assert!(
+        active_broker
+            .authorize_skill_call(request(2, 0))
+            .authorization
+            .is_none()
+    );
+    assert!(active_broker.revoke_skill_export(&artifact_id, "read"));
+    assert!(
+        active_broker
+            .authorize_skill_call(request(3, 2))
+            .authorization
+            .is_none()
+    );
+
+    let expired = SkillCallAuthority::new(
+        "expired-turn".into(),
+        "expired-tool-call".into(),
+        Instant::now() - Duration::from_millis(1),
+        vec![SkillExportAuthoritySpec {
+            artifact_id: artifact_id.clone(),
+            export_name: "read".into(),
+            prepared_manifest: prepared,
+        }],
+    )
+    .unwrap();
+    let (expired_broker, _record, _audit) = broker(
+        invocation("expired-export-outer"),
+        vec![],
+        BTreeSet::from([HostCapability::ReadFile]),
+        ServiceFailures::default(),
+    );
+    assert!(
+        expired_broker
+            .with_skill_call_authority(expired)
+            .authorize_skill_call(request(0, 0))
+            .authorization
+            .is_none()
+    );
 }
 
 #[test]

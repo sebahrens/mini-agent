@@ -217,14 +217,17 @@ only the named invocation, while the worker runtime lifecycle clears every prepa
 token on timeout, unwind, or recycle. Event attribution follows the request's explicit invocation
 and captured grant; there is no ambient active-invocation map or map-order fallback.
 
-Parent preparation also yields an opaque one-shot handle. The worker must bind that exact handle
-immediately around the intended wrapper `Function::call`; wrapper statement one consumes it before
-argument encoding or other model-controlled work. Production issues exactly one handle for each
-selected artifact/export pair and publishes a Rust-owned dispatcher that can consume only that
-handle. An unbound or second same-export call denies before emitting an invocation observation,
-and there is no FIFO, pool, metadata lookup, or ambient fallback from which it could borrow another
-export's authority. Pure and effectful exports use the same dispatcher seam; only methods present
-in the authoritative manifest are installed on the hidden capability object. Async results never expose a private-realm
+Parent preparation retains only a reusable artifact/export binding inside the parent broker; it
+does not yield reusable bearer authority. On each wrapper entry, the Rust-owned worker dispatcher
+requests the next exact artifact/export call ordinal. The parent validates that ordinal against its
+selected-export table, derives the invocation ID, and mints new scoped grants. The worker prepares
+one opaque handle from that response and binds it immediately around the intended wrapper
+`Function::call`; wrapper statement one consumes it before argument encoding or other
+model-controlled work. Replaying that handle or requesting a stale, expired, revoked, unknown, or
+out-of-order call denies before stored source executes. There is no FIFO, pool, metadata lookup, or
+ambient fallback from which one export can borrow another export's authority. Pure and effectful
+exports use the same dispatcher seam; only methods present in the authoritative manifest are
+installed on the hidden capability object. Async results never expose a private-realm
 promise to the model realm. A Rust-owned settlement registry
 carries only the bounded encoded result string (or a closed rejection) into a promise created from
 the model realm's captured intrinsic, so its prototype and continuation ownership remain

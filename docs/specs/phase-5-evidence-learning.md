@@ -138,6 +138,11 @@ skill ID, export, and call ordinal. A retry of the same acknowledged tool call r
 event insertion is idempotent. A genuinely new call gets a new ordinal. `turn_id` is allocated
 once when a user prompt starts and survives model/tool retries until that turn settles.
 
+The installed export binding is reusable, but call authority is not. Each genuinely new call asks
+the parent for the next ordinal and receives freshly minted, exactly attributed, one-shot
+authority. Consuming one call handle cannot consume or lend another call's authority; replay,
+expiry, or revocation denies before stored source executes.
+
 Exception and rejection events persist only the Phase 6 sanitized class, stable code, and
 source-free numeric location. They never persist a raw thrown value, message, stack, source
 snippet, effect result, prompt/content field, or secret.

@@ -19,13 +19,15 @@ use super::skills::{
 };
 use super::worker::STRICT_CLONE_SOURCE;
 
-type StartObservation = dyn Fn(String) -> Result<String, ()> + Send + Sync + 'static;
+type CallAuthorization =
+    dyn Fn(u32) -> Result<(PreparedInvocationHandle, String), ()> + Send + Sync + 'static;
+type StartObservation = dyn Fn(String, String) -> Result<(), ()> + Send + Sync + 'static;
 type TerminalObservation = dyn Fn(String, bool) -> Result<(), ()> + Send + Sync + 'static;
 
 /// One model-visible export's exact parent-prepared call and observation hooks.
 #[derive(Clone)]
 pub(crate) struct BoundExportInvocation {
-    pub(crate) handle: PreparedInvocationHandle,
+    pub(crate) authorize: Arc<CallAuthorization>,
     pub(crate) on_start: Arc<StartObservation>,
     pub(crate) on_terminal: Arc<TerminalObservation>,
 }
@@ -276,7 +278,7 @@ pub(crate) fn load_artifact_with_capabilities(
     )
 }
 
-/// Install Rust-owned model dispatchers that consume only their exact one-shot handles.
+/// Install Rust-owned model dispatchers backed by fresh parent authority for every call.
 pub(crate) fn load_artifact_with_bound_exports(
     runtime: &Runtime,
     model_context: &Context,
@@ -666,7 +668,8 @@ fn build_bound_dispatcher<'js>(
     binding: BoundExportInvocation,
 ) -> rquickjs::Result<(Function<'js>, Arc<Mutex<Option<DispatcherResources>>>)> {
     let private_wrapper = Persistent::save(ctx, wrapper);
-    let remaining = Arc::new(Mutex::new(Some(binding.handle)));
+    let next_call_ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let authorize = binding.authorize;
     let start = binding.on_start;
     let terminal = binding.on_terminal;
     let terminal_host = {
@@ -689,15 +692,19 @@ fn build_bound_dispatcher<'js>(
         move |ctx: Ctx<'js>,
               Rest(arguments): Rest<Value<'js>>|
               -> rquickjs::Result<Persistent<Value<'static>>> {
-            // Taking the exact handle and minting the observation happen in this one Rust entry.
-            // A second call fails before `on_start` and cannot borrow another export's authority.
-            let handle = remaining
-                .lock()
-                .map_err(|_| rquickjs::Error::Unknown)?
-                .take()
-                .ok_or(rquickjs::Error::Unknown)?;
-            let invocation_id =
-                start(argument_shape(&arguments)).map_err(|_| rquickjs::Error::Unknown)?;
+            // Each entry asks the parent for the next exact ordinal. The returned opaque handle
+            // remains one-shot; only the export binding itself is reusable.
+            let call_ordinal = next_call_ordinal
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |ordinal| ordinal.checked_add(1),
+                )
+                .map_err(|_| rquickjs::Error::Unknown)?;
+            let (handle, invocation_id) =
+                authorize(call_ordinal).map_err(|_| rquickjs::Error::Unknown)?;
+            start(invocation_id.clone(), argument_shape(&arguments))
+                .map_err(|_| rquickjs::Error::Unknown)?;
             let resources = dispatch_resources
                 .lock()
                 .map_err(|_| rquickjs::Error::Unknown)?
@@ -736,7 +743,11 @@ fn argument_shape(arguments: &[Value<'_>]) -> String {
             } else if value.as_array().is_some() {
                 "array"
             } else {
-                value.type_name()
+                match value.type_name() {
+                    "bool" => "boolean",
+                    "int" | "float" => "number",
+                    other => other,
+                }
             }
         })
         .collect::<Vec<_>>();

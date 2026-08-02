@@ -16,6 +16,8 @@ pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
 #[cfg(feature = "skills")]
+pub(crate) const MAX_SKILL_CALLS_PER_STEP: u32 = 256;
+#[cfg(feature = "skills")]
 pub(crate) const MAX_SKILL_ARTIFACTS_PER_STEP: usize = 64;
 #[cfg(feature = "skills")]
 pub(crate) const MAX_SKILL_EXPORTS_PER_ARTIFACT: usize = 32;
@@ -211,6 +213,8 @@ pub(crate) enum ParentFrame {
     RunStep(RunStep),
     VerifyArtifact(VerifyArtifact),
     EffectResponse(EffectResponse),
+    #[cfg(feature = "skills")]
+    SkillCallResponse(SkillCallResponse),
     Shutdown,
 }
 
@@ -224,6 +228,8 @@ pub(crate) enum ParentFrame {
 pub(crate) enum WorkerFrame {
     Ready(WorkerReady),
     EffectRequest(EffectRequest),
+    #[cfg(feature = "skills")]
+    SkillCallRequest(SkillCallRequest),
     StepResult(StepResult),
     VerificationResult(VerificationResult),
     ProtocolFault(ProtocolFault),
@@ -247,8 +253,6 @@ pub(crate) struct RunStep {
     #[cfg(feature = "skills")]
     pub(crate) artifacts: Vec<super::skills::SkillArtifact>,
     #[cfg(feature = "skills")]
-    pub(crate) skill_invocations: Vec<SkillInvocationGrant>,
-    #[cfg(feature = "skills")]
     pub(crate) turn_id: String,
     #[cfg(feature = "skills")]
     pub(crate) tool_call_id: String,
@@ -263,8 +267,6 @@ impl RunStep {
             proposal_grant_id: None,
             #[cfg(feature = "skills")]
             artifacts: Vec::new(),
-            #[cfg(feature = "skills")]
-            skill_invocations: Vec::new(),
             #[cfg(feature = "skills")]
             turn_id: String::new(),
             #[cfg(feature = "skills")]
@@ -287,12 +289,10 @@ impl RunStep {
     pub(crate) fn with_skills(
         mut self,
         artifacts: Vec<super::skills::SkillArtifact>,
-        skill_invocations: Vec<SkillInvocationGrant>,
         turn_id: String,
         tool_call_id: String,
     ) -> Self {
         self.artifacts = artifacts;
-        self.skill_invocations = skill_invocations;
         self.turn_id = turn_id;
         self.tool_call_id = tool_call_id;
         self
@@ -316,6 +316,29 @@ pub(crate) struct SkillInvocationGrant {
 pub(crate) struct SkillCapabilityGrant {
     pub(crate) capability: super::skills::HostCapability,
     pub(crate) grant_id: GrantId,
+}
+
+/// A worker request to begin one genuinely new call through a reusable persisted export.
+///
+/// Artifact/export/ordinal fields are untrusted lookup hints. The parent owns the selected-export
+/// table and derives the returned invocation identity itself.
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillCallRequest {
+    pub(crate) request_ordinal: u32,
+    pub(crate) artifact_id: String,
+    pub(crate) export_name: String,
+    pub(crate) call_ordinal: u32,
+}
+
+/// Parent response carrying fresh one-shot authority for one persisted-export call.
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillCallResponse {
+    pub(crate) request_ordinal: u32,
+    pub(crate) authorization: Option<SkillInvocationGrant>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -801,10 +824,18 @@ pub(crate) enum ParentState {
     AwaitWorker {
         invocation: InvocationId,
         next_effect: u32,
+        next_skill_call: u32,
     },
     AwaitEffectResponseSent {
         invocation: InvocationId,
         effect: u32,
+        next_skill_call: u32,
+    },
+    #[cfg(feature = "skills")]
+    AwaitSkillCallResponseSent {
+        invocation: InvocationId,
+        next_effect: u32,
+        request_ordinal: u32,
     },
     Closed,
 }
@@ -816,10 +847,18 @@ pub(crate) enum WorkerState {
     Running {
         invocation: InvocationId,
         next_effect: u32,
+        next_skill_call: u32,
     },
     AwaitParentEffect {
         invocation: InvocationId,
         effect: u32,
+        next_skill_call: u32,
+    },
+    #[cfg(feature = "skills")]
+    AwaitParentSkillCall {
+        invocation: InvocationId,
+        next_effect: u32,
+        request_ordinal: u32,
     },
     Closed,
 }
@@ -850,6 +889,12 @@ pub(crate) enum ProtocolError {
     EffectOrdinal { expected: u32, actual: u32 },
     #[error("invocation exceeded the maximum of {maximum} effects")]
     TooManyEffects { maximum: u32 },
+    #[cfg(feature = "skills")]
+    #[error("skill-call request ordinal mismatch: expected {expected}, received {actual}")]
+    SkillCallOrdinal { expected: u32, actual: u32 },
+    #[cfg(feature = "skills")]
+    #[error("invocation exceeded the maximum of {maximum} persisted skill calls")]
+    TooManySkillCalls { maximum: u32 },
     #[error("terminal result does not match the invocation request")]
     WrongTerminal {
         expected: &'static str,
@@ -910,6 +955,7 @@ impl ParentProtocol {
                 Some(ParentState::AwaitWorker {
                     invocation,
                     next_effect: 0,
+                    next_skill_call: 0,
                 })
             }
             (ParentState::Idle, ParentFrame::VerifyArtifact(_)) => {
@@ -918,10 +964,15 @@ impl ParentProtocol {
                 Some(ParentState::AwaitWorker {
                     invocation,
                     next_effect: 0,
+                    next_skill_call: 0,
                 })
             }
             (
-                ParentState::AwaitEffectResponseSent { invocation, effect },
+                ParentState::AwaitEffectResponseSent {
+                    invocation,
+                    effect,
+                    next_skill_call,
+                },
                 ParentFrame::EffectResponse(response),
             ) => {
                 validate_invocation(frame, invocation)?;
@@ -929,6 +980,24 @@ impl ParentProtocol {
                 Some(ParentState::AwaitWorker {
                     invocation: invocation.clone(),
                     next_effect: effect + 1,
+                    next_skill_call: *next_skill_call,
+                })
+            }
+            #[cfg(feature = "skills")]
+            (
+                ParentState::AwaitSkillCallResponseSent {
+                    invocation,
+                    next_effect,
+                    request_ordinal,
+                },
+                ParentFrame::SkillCallResponse(response),
+            ) => {
+                validate_invocation(frame, invocation)?;
+                validate_skill_call(*request_ordinal, response.request_ordinal)?;
+                Some(ParentState::AwaitWorker {
+                    invocation: invocation.clone(),
+                    next_effect: *next_effect,
+                    next_skill_call: request_ordinal + 1,
                 })
             }
             (ParentState::Idle, ParentFrame::Shutdown) => {
@@ -956,6 +1025,7 @@ impl ParentProtocol {
                 ParentState::AwaitWorker {
                     invocation,
                     next_effect,
+                    next_skill_call,
                 },
                 WorkerFrame::EffectRequest(request),
             ) => {
@@ -969,6 +1039,29 @@ impl ParentProtocol {
                 Some(ParentState::AwaitEffectResponseSent {
                     invocation: invocation.clone(),
                     effect: request.effect_ordinal,
+                    next_skill_call: *next_skill_call,
+                })
+            }
+            #[cfg(feature = "skills")]
+            (
+                ParentState::AwaitWorker {
+                    invocation,
+                    next_effect,
+                    next_skill_call,
+                },
+                WorkerFrame::SkillCallRequest(request),
+            ) => {
+                validate_invocation(frame, invocation)?;
+                if *next_skill_call >= MAX_SKILL_CALLS_PER_STEP {
+                    return Err(ProtocolError::TooManySkillCalls {
+                        maximum: MAX_SKILL_CALLS_PER_STEP,
+                    });
+                }
+                validate_skill_call(*next_skill_call, request.request_ordinal)?;
+                Some(ParentState::AwaitSkillCallResponseSent {
+                    invocation: invocation.clone(),
+                    next_effect: *next_effect,
+                    request_ordinal: request.request_ordinal,
                 })
             }
             (ParentState::AwaitWorker { invocation, .. }, WorkerFrame::StepResult(_)) => {
@@ -1071,6 +1164,7 @@ impl WorkerProtocol {
                 Some(WorkerState::Running {
                     invocation,
                     next_effect: 0,
+                    next_skill_call: 0,
                 })
             }
             (WorkerState::Idle, ParentFrame::VerifyArtifact(_)) => {
@@ -1079,10 +1173,15 @@ impl WorkerProtocol {
                 Some(WorkerState::Running {
                     invocation,
                     next_effect: 0,
+                    next_skill_call: 0,
                 })
             }
             (
-                WorkerState::AwaitParentEffect { invocation, effect },
+                WorkerState::AwaitParentEffect {
+                    invocation,
+                    effect,
+                    next_skill_call,
+                },
                 ParentFrame::EffectResponse(response),
             ) => {
                 validate_invocation(frame, invocation)?;
@@ -1090,6 +1189,24 @@ impl WorkerProtocol {
                 Some(WorkerState::Running {
                     invocation: invocation.clone(),
                     next_effect: effect + 1,
+                    next_skill_call: *next_skill_call,
+                })
+            }
+            #[cfg(feature = "skills")]
+            (
+                WorkerState::AwaitParentSkillCall {
+                    invocation,
+                    next_effect,
+                    request_ordinal,
+                },
+                ParentFrame::SkillCallResponse(response),
+            ) => {
+                validate_invocation(frame, invocation)?;
+                validate_skill_call(*request_ordinal, response.request_ordinal)?;
+                Some(WorkerState::Running {
+                    invocation: invocation.clone(),
+                    next_effect: *next_effect,
+                    next_skill_call: request_ordinal + 1,
                 })
             }
             (WorkerState::Idle, ParentFrame::Shutdown) => {
@@ -1115,6 +1232,7 @@ impl WorkerProtocol {
                 WorkerState::Running {
                     invocation,
                     next_effect,
+                    next_skill_call,
                 },
                 WorkerFrame::EffectRequest(request),
             ) => {
@@ -1128,6 +1246,29 @@ impl WorkerProtocol {
                 Some(WorkerState::AwaitParentEffect {
                     invocation: invocation.clone(),
                     effect: request.effect_ordinal,
+                    next_skill_call: *next_skill_call,
+                })
+            }
+            #[cfg(feature = "skills")]
+            (
+                WorkerState::Running {
+                    invocation,
+                    next_effect,
+                    next_skill_call,
+                },
+                WorkerFrame::SkillCallRequest(request),
+            ) => {
+                validate_invocation(frame, invocation)?;
+                if *next_skill_call >= MAX_SKILL_CALLS_PER_STEP {
+                    return Err(ProtocolError::TooManySkillCalls {
+                        maximum: MAX_SKILL_CALLS_PER_STEP,
+                    });
+                }
+                validate_skill_call(*next_skill_call, request.request_ordinal)?;
+                Some(WorkerState::AwaitParentSkillCall {
+                    invocation: invocation.clone(),
+                    next_effect: *next_effect,
+                    request_ordinal: request.request_ordinal,
                 })
             }
             (WorkerState::Running { invocation, .. }, WorkerFrame::StepResult(_)) => {
@@ -1257,6 +1398,15 @@ fn validate_effect(expected: u32, actual: u32) -> Result<(), ProtocolError> {
     }
 }
 
+#[cfg(feature = "skills")]
+fn validate_skill_call(expected: u32, actual: u32) -> Result<(), ProtocolError> {
+    if expected != actual {
+        Err(ProtocolError::SkillCallOrdinal { expected, actual })
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_fault_invocation<M, S>(frame: &WireFrame<M>, state: &S) -> Result<(), ProtocolError>
 where
     S: ActiveInvocation,
@@ -1276,6 +1426,8 @@ impl ActiveInvocation for ParentState {
         match self {
             Self::AwaitWorker { invocation, .. }
             | Self::AwaitEffectResponseSent { invocation, .. } => Some(invocation),
+            #[cfg(feature = "skills")]
+            Self::AwaitSkillCallResponseSent { invocation, .. } => Some(invocation),
             Self::AwaitReady | Self::Idle | Self::Closed => None,
         }
     }
@@ -1287,6 +1439,8 @@ impl ActiveInvocation for WorkerState {
             Self::Running { invocation, .. } | Self::AwaitParentEffect { invocation, .. } => {
                 Some(invocation)
             }
+            #[cfg(feature = "skills")]
+            Self::AwaitParentSkillCall { invocation, .. } => Some(invocation),
             Self::AwaitHello | Self::Idle | Self::Closed => None,
         }
     }
@@ -1298,6 +1452,8 @@ fn parent_state_name(state: &ParentState) -> &'static str {
         ParentState::Idle => "idle",
         ParentState::AwaitWorker { .. } => "await_worker",
         ParentState::AwaitEffectResponseSent { .. } => "await_effect_response_sent",
+        #[cfg(feature = "skills")]
+        ParentState::AwaitSkillCallResponseSent { .. } => "await_skill_call_response_sent",
         ParentState::Closed => "closed",
     }
 }
@@ -1308,6 +1464,8 @@ fn worker_state_name(state: &WorkerState) -> &'static str {
         WorkerState::Idle => "idle",
         WorkerState::Running { .. } => "running",
         WorkerState::AwaitParentEffect { .. } => "await_parent_effect",
+        #[cfg(feature = "skills")]
+        WorkerState::AwaitParentSkillCall { .. } => "await_parent_skill_call",
         WorkerState::Closed => "closed",
     }
 }
@@ -1318,6 +1476,8 @@ fn parent_message_name(message: &ParentFrame) -> &'static str {
         ParentFrame::RunStep(_) => "run_step",
         ParentFrame::VerifyArtifact(_) => "verify_artifact",
         ParentFrame::EffectResponse(_) => "effect_response",
+        #[cfg(feature = "skills")]
+        ParentFrame::SkillCallResponse(_) => "skill_call_response",
         ParentFrame::Shutdown => "shutdown",
     }
 }
@@ -1326,6 +1486,8 @@ fn worker_message_name(message: &WorkerFrame) -> &'static str {
     match message {
         WorkerFrame::Ready(_) => "ready",
         WorkerFrame::EffectRequest(_) => "effect_request",
+        #[cfg(feature = "skills")]
+        WorkerFrame::SkillCallRequest(_) => "skill_call_request",
         WorkerFrame::StepResult(_) => "step_result",
         WorkerFrame::VerificationResult(_) => "verification_result",
         WorkerFrame::ProtocolFault(_) => "protocol_fault",

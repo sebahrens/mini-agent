@@ -30,6 +30,11 @@ use super::protocol::{
 };
 pub(crate) use super::protocol::{EffectOperation, EffectResult};
 #[cfg(feature = "skills")]
+use super::protocol::{
+    MAX_SKILL_CAPABILITY_GRANTS_PER_STEP, SkillCallRequest, SkillCallResponse,
+    SkillCapabilityGrant, SkillInvocationGrant,
+};
+#[cfg(feature = "skills")]
 use super::skills::{
     CapabilityManifest, CapabilityScope, HostCapability as SkillHostCapability,
     HttpMethod as SkillHttpMethod,
@@ -272,6 +277,84 @@ pub(crate) struct SpawnExecutableIdentity {
 pub(crate) struct PreparedSkillManifest {
     manifest: CapabilityManifest,
     spawn_program_identities: BTreeMap<String, SpawnExecutableIdentity>,
+}
+
+/// Parent-owned reusable binding metadata for one selected persisted export.
+///
+/// This contains no bearer grant. It is retained only inside the parent broker and is used to
+/// mint fresh, one-shot call authority after the worker requests the next exact ordinal.
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SkillExportAuthoritySpec {
+    pub(crate) artifact_id: String,
+    pub(crate) export_name: String,
+    pub(crate) prepared_manifest: PreparedSkillManifest,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug)]
+struct SkillExportAuthority {
+    prepared_manifest: PreparedSkillManifest,
+    next_call_ordinal: u32,
+    revoked: bool,
+}
+
+/// Parent-only authority source for reusable persisted exports in one outer JS step.
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug)]
+pub(crate) struct SkillCallAuthority {
+    turn_id: String,
+    tool_call_id: String,
+    expires_at: Instant,
+    exports: HashMap<(String, String), SkillExportAuthority>,
+}
+
+#[cfg(feature = "skills")]
+impl SkillCallAuthority {
+    pub(crate) fn new(
+        turn_id: String,
+        tool_call_id: String,
+        expires_at: Instant,
+        specs: Vec<SkillExportAuthoritySpec>,
+    ) -> Result<Self, BrokerBuildError> {
+        if turn_id.is_empty() || tool_call_id.is_empty() {
+            return Err(BrokerBuildError::InvalidSkillCallAuthority);
+        }
+        let mut exports = HashMap::with_capacity(specs.len());
+        for spec in specs {
+            if exports
+                .insert(
+                    (spec.artifact_id, spec.export_name),
+                    SkillExportAuthority {
+                        prepared_manifest: spec.prepared_manifest,
+                        next_call_ordinal: 0,
+                        revoked: false,
+                    },
+                )
+                .is_some()
+            {
+                return Err(BrokerBuildError::InvalidSkillCallAuthority);
+            }
+        }
+        Ok(Self {
+            turn_id,
+            tool_call_id,
+            expires_at,
+            exports,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_export(&mut self, artifact_id: &str, export_name: &str) -> bool {
+        let Some(authority) = self
+            .exports
+            .get_mut(&(artifact_id.to_string(), export_name.to_string()))
+        else {
+            return false;
+        };
+        authority.revoked = true;
+        true
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -823,6 +906,9 @@ pub(crate) enum BrokerBuildError {
     TimedOut,
     #[error("scoped grant executable preparation worker failed")]
     ExecutablePreparationFailed,
+    #[cfg(feature = "skills")]
+    #[error("persisted skill call authority is invalid")]
+    InvalidSkillCallAuthority,
 }
 
 /// One invocation's parent-owned grant table and policy state.
@@ -834,6 +920,10 @@ pub(crate) struct InvocationBroker<S> {
     state: InvocationState,
     service: S,
     audit: SharedEffectAudit,
+    #[cfg(feature = "skills")]
+    skill_calls: Option<SkillCallAuthority>,
+    #[cfg(feature = "skills")]
+    issued_skill_grants: usize,
     #[cfg(test)]
     fail_completion_durability: Option<super::audit::AuditFailurePoint>,
 }
@@ -860,9 +950,114 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             state: InvocationState::Active,
             service,
             audit,
+            #[cfg(feature = "skills")]
+            skill_calls: None,
+            #[cfg(feature = "skills")]
+            issued_skill_grants: 0,
             #[cfg(test)]
             fail_completion_durability: None,
         })
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_skill_call_authority(mut self, authority: SkillCallAuthority) -> Self {
+        self.skill_calls = Some(authority);
+        self
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn authorize_skill_call(&mut self, request: SkillCallRequest) -> SkillCallResponse {
+        let authorization = self.issue_skill_call(&request).ok();
+        SkillCallResponse {
+            request_ordinal: request.request_ordinal,
+            authorization,
+        }
+    }
+
+    #[cfg(feature = "skills")]
+    fn issue_skill_call(&mut self, request: &SkillCallRequest) -> Result<SkillInvocationGrant, ()> {
+        self.ensure_active().map_err(|_| ())?;
+        let authority = self.skill_calls.as_mut().ok_or(())?;
+        if Instant::now() >= authority.expires_at {
+            return Err(());
+        }
+        let export = authority
+            .exports
+            .get_mut(&(request.artifact_id.clone(), request.export_name.clone()))
+            .ok_or(())?;
+        if export.revoked || export.next_call_ordinal != request.call_ordinal {
+            return Err(());
+        }
+        let invocation_id = super::skills::telemetry::stable_invocation_id(
+            &authority.turn_id,
+            &authority.tool_call_id,
+            &request.artifact_id,
+            &request.export_name,
+            request.call_ordinal,
+        );
+        let wire_invocation_id = InvocationId::new(invocation_id.clone()).map_err(|_| ())?;
+        let required_grants = export.prepared_manifest.manifest.grants.len();
+        let next_grant_count = self
+            .issued_skill_grants
+            .checked_add(required_grants)
+            .ok_or(())?;
+        let next_call_ordinal = export.next_call_ordinal.checked_add(1).ok_or(())?;
+        if next_grant_count > MAX_SKILL_CAPABILITY_GRANTS_PER_STEP {
+            return Err(());
+        }
+        let mut wire_grants = Vec::with_capacity(required_grants);
+        let mut issued = Vec::with_capacity(required_grants);
+        for scope in &export.prepared_manifest.manifest.grants {
+            let skill_capability = scope.capability();
+            let capability = match skill_capability {
+                SkillHostCapability::ReadFile => HostCapability::ReadFile,
+                SkillHostCapability::WriteFile => HostCapability::WriteFile,
+                SkillHostCapability::Fetch => HostCapability::Fetch,
+                SkillHostCapability::Spawn => HostCapability::Spawn,
+            };
+            let grant = InvocationGrant::issue_prepared_scoped_skill(
+                self.invocation_id.clone(),
+                GrantPrincipal::Skill {
+                    artifact_id: request.artifact_id.clone(),
+                    export: request.export_name.clone(),
+                    invocation_id: invocation_id.clone(),
+                },
+                capability,
+                &export.prepared_manifest,
+                authority.expires_at,
+            )
+            .map_err(|_| ())?;
+            wire_grants.push(SkillCapabilityGrant {
+                capability: skill_capability,
+                grant_id: grant.grant_id().clone(),
+            });
+            issued.push(grant);
+        }
+        let mut new_grant_ids = HashSet::with_capacity(issued.len());
+        if issued.iter().any(|grant| {
+            self.grants.contains_key(&grant.grant_id)
+                || !new_grant_ids.insert(grant.grant_id.clone())
+        }) {
+            return Err(());
+        }
+        for grant in issued {
+            self.grants.insert(grant.grant_id.clone(), grant);
+        }
+        self.issued_skill_grants = next_grant_count;
+        export.next_call_ordinal = next_call_ordinal;
+        Ok(SkillInvocationGrant {
+            artifact_id: request.artifact_id.clone(),
+            export_name: request.export_name.clone(),
+            invocation_id: wire_invocation_id,
+            grants: wire_grants,
+        })
+    }
+
+    #[cfg(all(test, feature = "skills"))]
+    pub(crate) fn revoke_skill_export(&mut self, artifact_id: &str, export_name: &str) -> bool {
+        self.skill_calls
+            .as_mut()
+            .is_some_and(|authority| authority.revoke_export(artifact_id, export_name))
     }
 
     pub(crate) async fn dispatch(
@@ -1504,6 +1699,11 @@ impl<S: ParentEffectService> InvocationEffectHandler for InvocationBroker<S> {
                 Err(error) => error.into_wire_result(),
             }
         })
+    }
+
+    #[cfg(feature = "skills")]
+    fn handle_skill_call(&mut self, request: SkillCallRequest) -> SkillCallResponse {
+        self.authorize_skill_call(request)
     }
 }
 
