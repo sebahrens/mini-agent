@@ -186,7 +186,6 @@ class FeatureGraphTests(unittest.TestCase):
             "test": self.workflow_text.replace(
                 "cargo test --locked ${{ matrix.features }}",
                 "cargo test --locked",
-                1,
             ),
             "clippy": self.workflow_text.replace(
                 "cargo clippy --locked ${{ matrix.features }}",
@@ -215,11 +214,8 @@ class FeatureGraphTests(unittest.TestCase):
             "test block shell comment": (
                 "test",
                 self.workflow_text.replace(
-                    "run: cargo test --locked ${{ matrix.features }}",
-                    "run: |\n"
-                    "          # ${{ matrix.features }}\n"
-                    "          cargo test --locked",
-                    1,
+                    "cargo test --locked ${{ matrix.features }}",
+                    "cargo test --locked # ${{ matrix.features }}",
                 ),
             ),
         }
@@ -235,7 +231,6 @@ class FeatureGraphTests(unittest.TestCase):
         workflow = self.workflow_text.replace(
             "cargo test --locked ${{ matrix.features }}",
             "cargo test --locked; echo ${{ matrix.features }}",
-            1,
         )
 
         self.assertIn(
@@ -250,7 +245,6 @@ class FeatureGraphTests(unittest.TestCase):
                 workflow = self.workflow_text.replace(
                     "cargo test --locked ${{ matrix.features }}",
                     f"cargo test --locked {redirection} ${{{{ matrix.features }}}}",
-                    1,
                 )
                 self.assertIn(
                     "test job Cargo command must consume "
@@ -262,7 +256,6 @@ class FeatureGraphTests(unittest.TestCase):
         workflow = self.workflow_text.replace(
             "cargo test --locked ${{ matrix.features }}",
             "cargo test --locked prefix-${{ matrix.features }}",
-            1,
         )
 
         self.assertIn(
@@ -274,14 +267,16 @@ class FeatureGraphTests(unittest.TestCase):
         workflow = self.workflow_text.replace(
             "cargo test --locked ${{ matrix.features }}",
             'cargo test --locked "${{ matrix.features }}"',
-            1,
         )
 
         self.assertEqual([], feature_graph.validate_workflow_commands(workflow))
 
     def test_workflow_command_accepts_multiline_cargo_invocation(self) -> None:
         workflow = self.workflow_text.replace(
-            "run: cargo test --locked ${{ matrix.features }}",
+            "cargo test --locked ${{ matrix.features }}",
+            "cargo test --locked",
+        ).replace(
+            "run: cargo test --locked",
             "run: |\n"
             "          cargo test --locked \\\n"
             "            ${{ matrix.features }}",
