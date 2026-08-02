@@ -122,14 +122,14 @@ fn seed_v2(paths: &AppPaths, generations: &str) {
 fn skill_admission_schema_migrates_and_reopens() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("fresh store");
-    assert_eq!(store.schema_version().expect("version"), 5);
+    assert_eq!(store.schema_version().expect("version"), 6);
     drop(store);
     assert_eq!(
         SkillStore::open_at(&paths)
             .expect("reopen")
             .schema_version()
             .expect("version"),
-        5
+        6
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -155,7 +155,7 @@ fn skill_admission_schema_upgrades_phase3_v2_without_losing_generation_shape() {
     );
 
     let store = SkillStore::open_at(&paths).expect("upgrade Phase 3 v2");
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     let state = store.generation_state().expect("generation state");
     assert_eq!(state.desired_generation, 7);
     assert_eq!(state.applied_generation, 6);
@@ -180,7 +180,7 @@ fn skill_admission_schema_upgrades_legacy_phase4_v2_collision() {
     );
 
     let store = SkillStore::open_at(&paths).expect("upgrade legacy Phase 4 v2");
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     let state = store
         .generation_state()
         .expect("normalized generation state");
@@ -229,7 +229,7 @@ fn skill_admission_schema_quarantines_all_identity_v1_tiers_without_inference() 
     drop(connection);
 
     let mut store = SkillStore::open_at(&paths).expect("migrate identity v1");
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     assert!(store.list_retrievable().unwrap().is_empty());
 
     let rows = store

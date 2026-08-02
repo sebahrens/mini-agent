@@ -7,13 +7,18 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::coordinator::{
     CoordinatedMutationError, CoordinatorError, IndexCoordinator, PublicationReport,
 };
-use super::store::{SkillStore, StoreError};
+use super::store::{
+    ApprovalAuthorizationRequest, ApprovalTransition, SkillStore, StoreError,
+    approval_manifest_digest, consume_approval_authorization,
+};
+
+const APPROVAL_AUTHORIZATION_LIFETIME_SECONDS: i64 = 300;
 
 /// Version of the canonical lifecycle evidence encoding.
 pub const EVIDENCE_SNAPSHOT_VERSION: u32 = 1;
@@ -232,11 +237,28 @@ pub struct ReplacementTransitionOutcome {
 
 #[derive(Debug, Clone)]
 pub struct HumanApproval {
-    pub approval_id: String,
-    pub actor_id: String,
-    pub authenticated: bool,
-    pub evaluation_report_id: String,
-    pub expected_row_version: i64,
+    approval_id: String,
+    actor_id: String,
+    evaluation_report_id: String,
+    expected_row_version: i64,
+}
+
+impl HumanApproval {
+    pub(crate) fn verified(
+        approval_id: impl Into<String>,
+        actor_id: impl Into<String>,
+        evaluation_report_id: impl Into<String>,
+        expected_row_version: i64,
+    ) -> Result<Self, LifecycleError> {
+        let approval = Self {
+            approval_id: approval_id.into(),
+            actor_id: actor_id.into(),
+            evaluation_report_id: evaluation_report_id.into(),
+            expected_row_version,
+        };
+        validate_human_approval(&approval)?;
+        Ok(approval)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -562,6 +584,7 @@ impl<'a> LifecycleService<'a> {
 
     /// Record Phase 4's first authenticated approval after the unchanged
     /// verified artifact has entered non-retrievable root canary.
+    #[cfg(test)]
     pub(crate) fn record_root_canary_approval(
         &mut self,
         skill_id: &str,
@@ -620,7 +643,40 @@ impl<'a> LifecycleService<'a> {
             reason: "second_authenticated_root_activation".to_string(),
             snapshot: snapshot.clone(),
         };
-        let tx = self.store.connection_mut().transaction()?;
+        {
+            let tx = self
+                .store
+                .connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(replayed) = read_idempotent_transition(&tx, &request)? {
+                tx.commit()?;
+                return Ok(replayed);
+            }
+            tx.commit()?;
+        }
+        let artifact = self
+            .store
+            .get(skill_id)?
+            .ok_or_else(|| LifecycleError::Store(StoreError::NotFound(skill_id.to_string())))?;
+        let expires_at = created_at
+            .checked_add(APPROVAL_AUTHORIZATION_LIFETIME_SECONDS)
+            .ok_or(LifecycleError::InvalidHumanApproval)?;
+        let authorization =
+            self.store
+                .issue_approval_authorization(ApprovalAuthorizationRequest {
+                    authorization_id: approval.approval_id.clone(),
+                    principal: approval.actor_id.clone(),
+                    artifact_id: skill_id.to_string(),
+                    report_id: approval.evaluation_report_id.clone(),
+                    manifest_digest: approval_manifest_digest(&artifact)?,
+                    transition: ApprovalTransition::CanaryToActive,
+                    issued_at: created_at,
+                    expires_at,
+                })?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(replayed) = read_idempotent_transition(&tx, &request)? {
             tx.commit()?;
             return Ok(replayed);
@@ -661,6 +717,14 @@ impl<'a> LifecycleService<'a> {
         {
             return Err(LifecycleError::InvalidHumanApproval);
         }
+        consume_approval_authorization(
+            &tx,
+            &authorization,
+            &artifact,
+            &approval.evaluation_report_id,
+            ApprovalTransition::CanaryToActive,
+            created_at,
+        )?;
         insert_approval(
             &tx,
             skill_id,
@@ -985,8 +1049,7 @@ impl<'a> LifecycleService<'a> {
 }
 
 fn validate_human_approval(approval: &HumanApproval) -> Result<(), LifecycleError> {
-    if !approval.authenticated
-        || approval.approval_id.is_empty()
+    if approval.approval_id.is_empty()
         || approval.actor_id.is_empty()
         || approval.evaluation_report_id.is_empty()
         || approval.expected_row_version < 1

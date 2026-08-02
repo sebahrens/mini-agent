@@ -69,13 +69,8 @@ fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
             [&root_artifact.id],
         )
         .unwrap();
-    let first_approval = HumanApproval {
-        approval_id: "phase4-root-approval".into(),
-        actor_id: "owner".into(),
-        authenticated: true,
-        evaluation_report_id: "root-report".into(),
-        expected_row_version: 1,
-    };
+    let first_approval =
+        HumanApproval::verified("phase4-root-approval", "owner", "root-report", 1).unwrap();
     let mut lifecycle = LifecycleService::new(&mut store);
     lifecycle.register_policy("phase5-v1", "{}", 0).unwrap();
     lifecycle
@@ -102,10 +97,8 @@ fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
         generation as i64,
     )
     .unwrap();
-    let second_approval = HumanApproval {
-        approval_id: "phase5-root-activation".into(),
-        ..first_approval.clone()
-    };
+    let second_approval =
+        HumanApproval::verified("phase5-root-activation", "owner", "root-report", 1).unwrap();
     CoordinatedLifecycle::new(&coordinator)
         .activate_root(
             "activate-root",

@@ -231,13 +231,7 @@ fn skill_root_activation_requires_two_authenticated_human_actions() {
     service
         .register_policy("v1", r#"{"root":"human"}"#, 0)
         .unwrap();
-    let first = HumanApproval {
-        approval_id: "approval-phase4".into(),
-        actor_id: "owner".into(),
-        authenticated: true,
-        evaluation_report_id: "report-1".into(),
-        expected_row_version: 1,
-    };
+    let first = HumanApproval::verified("approval-phase4", "owner", "report-1", 1).unwrap();
     service
         .record_root_canary_approval(&predecessor.id, &first, 1)
         .unwrap();
@@ -252,30 +246,11 @@ fn skill_root_activation_requires_two_authenticated_human_actions() {
         0,
     )
     .unwrap();
-    let unauthenticated = HumanApproval {
-        approval_id: "approval-forged".into(),
-        actor_id: "model".into(),
-        authenticated: false,
-        evaluation_report_id: "report-1".into(),
-        expected_row_version: 1,
-    };
     assert!(matches!(
-        service.activate_root(
-            "root-activation",
-            &predecessor.id,
-            &unauthenticated,
-            &snapshot,
-            2
-        ),
+        HumanApproval::verified("approval-forged", "", "report-1", 1),
         Err(LifecycleError::InvalidHumanApproval)
     ));
-    let second = HumanApproval {
-        approval_id: "approval-phase5".into(),
-        actor_id: "owner".into(),
-        authenticated: true,
-        evaluation_report_id: "report-1".into(),
-        expected_row_version: 1,
-    };
+    let second = HumanApproval::verified("approval-phase5", "owner", "report-1", 1).unwrap();
     let activated = service
         .activate_root("root-activation", &predecessor.id, &second, &snapshot, 3)
         .unwrap();

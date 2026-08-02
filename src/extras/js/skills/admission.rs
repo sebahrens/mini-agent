@@ -10,9 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::admission_store::{AdmissionStore, AuthenticatedApproval};
+use super::admission_store::AdmissionStore;
 use super::embed::{Embedder, SkillDocument};
 use super::held_out::{HeldOutError, HeldOutEvaluationReport, evaluate};
+#[cfg(test)]
+use super::store::ApprovalAuthorization;
 use super::store::{
     AdminIdentity, CanaryApprovalResult, EvaluationReportRecord, MAX_EVALUATION_ATTEMPTS,
     ProposalLease, ProposalStatus, SkillStore, StoreError,
@@ -359,18 +361,25 @@ impl AdmissionEvaluator {
                     &current_report,
                     &current_artifact,
                 )?;
-                let approval = AuthenticatedApproval::new(
+                let expires_at = now
+                    .checked_add(MAX_AUTH_AGE_SECONDS)
+                    .ok_or(AdmissionError::UnauthenticatedApproval)?;
+                let mut admission = AdmissionStore::new(&mut self.store);
+                let authorization = admission.authorize_canary(
                     decision.decision_id,
                     decision.principal,
-                    decision.authenticated_at,
+                    &artifact,
+                    &report.report_id,
+                    now,
+                    expires_at,
                 )?;
-                let result = AdmissionStore::new(&mut self.store).approve_canary(
+                let result = admission.approve_canary(
                     &proposal.proposal_id,
                     &artifact.id,
                     &report.report_id,
                     artifact_version,
                     proposal.row_version,
-                    &approval,
+                    &authorization,
                     now,
                 )?;
                 if self
@@ -484,6 +493,50 @@ impl AdmissionEvaluator {
     #[cfg(test)]
     pub(crate) fn store_mut(&mut self) -> &mut SkillStore {
         &mut self.store
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn authorize_canary_for_test(
+        &mut self,
+        authorization_id: &str,
+        principal: &str,
+        artifact: &SkillArtifact,
+        report_id: &str,
+        issued_at: i64,
+        expires_at: i64,
+    ) -> Result<ApprovalAuthorization, AdmissionError> {
+        Ok(AdmissionStore::new(&mut self.store).authorize_canary(
+            authorization_id.to_string(),
+            principal.to_string(),
+            artifact,
+            report_id,
+            issued_at,
+            expires_at,
+        )?)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn consume_canary_for_test(
+        &mut self,
+        proposal_id: &str,
+        artifact_id: &str,
+        report_id: &str,
+        artifact_version: u64,
+        proposal_version: u64,
+        authorization: &ApprovalAuthorization,
+        now: i64,
+    ) -> Result<CanaryApprovalResult, AdmissionError> {
+        Ok(AdmissionStore::new(&mut self.store).approve_canary(
+            proposal_id,
+            artifact_id,
+            report_id,
+            artifact_version,
+            proposal_version,
+            authorization,
+            now,
+        )?)
     }
 }
 

@@ -8,7 +8,7 @@
 //! All operations return typed errors and never panic on corruption.
 
 use crate::paths::AppPaths;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact,
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
 #[derive(Debug, Clone, PartialEq)]
@@ -190,12 +190,9 @@ pub(crate) struct HeldOutSuiteRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CanaryApprovalInput {
-    pub approval_id: String,
     pub proposal_id: String,
     pub skill_id: String,
     pub report_id: String,
-    pub approver_id: String,
-    pub authenticated_at: i64,
     pub expected_artifact_version: u64,
     pub expected_proposal_version: u64,
 }
@@ -205,6 +202,50 @@ pub(crate) struct CanaryApprovalResult {
     pub skill_id: String,
     pub generation: u64,
     pub idempotent: bool,
+}
+
+/// The exact lifecycle edge authorized by one parent-owned human interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalTransition {
+    VerifiedToCanary,
+    CanaryToActive,
+}
+
+impl ApprovalTransition {
+    pub(super) fn as_token(self) -> &'static str {
+        match self {
+            Self::VerifiedToCanary => "verified_to_canary",
+            Self::CanaryToActive => "canary_to_active",
+        }
+    }
+}
+
+/// Durable, one-use authority returned only after the parent persists an exact binding.
+///
+/// Fields deliberately remain private. Callers can request an authorization, but cannot
+/// construct or retarget one before handing it to the transactional consumer.
+#[derive(Debug, Clone)]
+pub(crate) struct ApprovalAuthorization {
+    authorization_id: String,
+    principal: String,
+    artifact_id: String,
+    report_id: String,
+    manifest_digest: String,
+    transition: ApprovalTransition,
+    issued_at: i64,
+    expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ApprovalAuthorizationRequest {
+    pub authorization_id: String,
+    pub principal: String,
+    pub artifact_id: String,
+    pub report_id: String,
+    pub manifest_digest: String,
+    pub transition: ApprovalTransition,
+    pub issued_at: i64,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1151,9 +1192,10 @@ impl SkillStore {
         }
         let revision_changed = tx.execute(
             "UPDATE skill_revisions
-             SET status = 'verified', row_version = row_version + 1, updated_at = ?1
-             WHERE id = ?2 AND status = 'pending'",
-            params![now, report.skill_id],
+             SET status = 'verified', evaluation_report_id = ?1,
+                 row_version = row_version + 1, updated_at = ?2
+             WHERE id = ?3 AND status = 'pending'",
+            params![report.report_id, now, report.skill_id],
         )?;
         if revision_changed != 1 {
             return Err(StoreError::Stale(report.skill_id.clone()));
@@ -1406,43 +1448,163 @@ impl SkillStore {
         .transpose()
     }
 
-    pub(super) fn approve_canary_transaction(
+    /// Persist one exact parent-owned authorization before attempting its transition.
+    /// A later transition failure therefore leaves a fresh token available for an exact retry.
+    pub(super) fn issue_approval_authorization(
         &mut self,
-        input: &CanaryApprovalInput,
-        now: i64,
-    ) -> Result<CanaryApprovalResult, StoreError> {
-        if input.approval_id.trim().is_empty()
-            || input.approver_id.trim().is_empty()
-            || input.authenticated_at > now
+        request: ApprovalAuthorizationRequest,
+    ) -> Result<ApprovalAuthorization, StoreError> {
+        if request.authorization_id.trim().is_empty()
+            || request.authorization_id.len() > 256
+            || request.principal.trim().is_empty()
+            || request.principal.len() > 256
+            || request.artifact_id.trim().is_empty()
+            || request.report_id.trim().is_empty()
+            || request.manifest_digest.len() != 64
+            || !request
+                .manifest_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || request.issued_at < 0
+            || request.expires_at <= request.issued_at
         {
             return Err(StoreError::Unauthorized);
         }
-        let tx = self.db.transaction()?;
-        let existing: Option<(String, String, String, i64)> = tx
+
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let artifact = tx
             .query_row(
-                "SELECT proposal_id, skill_id, report_id, generation
-                 FROM skill_approvals WHERE approval_id = ?1",
-                [&input.approval_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                "SELECT id, identity_version, source, description, tags_json,
+                        exports_json, tests_json, capability_json, status
+                   FROM skill_revisions WHERE id = ?1",
+                [&request.artifact_id],
+                read_artifact_row,
             )
-            .optional()?;
-        if let Some((proposal_id, skill_id, report_id, generation)) = existing {
-            if proposal_id == input.proposal_id
-                && skill_id == input.skill_id
-                && report_id == input.report_id
-            {
-                tx.commit()?;
-                return Ok(CanaryApprovalResult {
-                    skill_id,
-                    generation: u64::try_from(generation)
-                        .map_err(|_| StoreError::CorruptRow("negative generation".to_string()))?,
-                    idempotent: true,
-                });
-            }
-            return Err(StoreError::Constraint(
-                "approval identity collision".to_string(),
-            ));
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(request.artifact_id.clone()))??;
+        artifact.verify_identity()?;
+        if approval_manifest_digest(&artifact)? != request.manifest_digest {
+            return Err(StoreError::Unauthorized);
         }
+        let bound_report: Option<String> = tx
+            .query_row(
+                "SELECT evaluation_report_id FROM skill_revisions WHERE id = ?1",
+                [&request.artifact_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if bound_report.as_deref() != Some(request.report_id.as_str()) {
+            return Err(StoreError::Unauthorized);
+        }
+
+        let changed = tx.execute(
+            "INSERT OR IGNORE INTO skill_approval_authorizations (
+                authorization_id, principal, artifact_id, report_id, manifest_digest,
+                transition, issued_at, expires_at, consumed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+            params![
+                request.authorization_id,
+                request.principal,
+                request.artifact_id,
+                request.report_id,
+                request.manifest_digest,
+                request.transition.as_token(),
+                request.issued_at,
+                request.expires_at,
+            ],
+        )?;
+        if changed != 1 {
+            let existing: Option<(
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                i64,
+                Option<i64>,
+            )> = tx
+                .query_row(
+                    "SELECT principal, artifact_id, report_id, manifest_digest, transition,
+                            issued_at, expires_at, consumed_at
+                       FROM skill_approval_authorizations
+                      WHERE authorization_id = ?1",
+                    [&request.authorization_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                principal,
+                artifact_id,
+                report_id,
+                manifest_digest,
+                transition,
+                issued_at,
+                expires_at,
+                consumed_at,
+            )) = existing
+            else {
+                return Err(StoreError::Unauthorized);
+            };
+            if principal != request.principal
+                || artifact_id != request.artifact_id
+                || report_id != request.report_id
+                || manifest_digest != request.manifest_digest
+                || transition != request.transition.as_token()
+                || consumed_at.is_some()
+                || request.issued_at < issued_at
+                || request.issued_at >= expires_at
+            {
+                return Err(StoreError::Unauthorized);
+            }
+            tx.commit()?;
+            return Ok(ApprovalAuthorization {
+                authorization_id: request.authorization_id,
+                principal,
+                artifact_id,
+                report_id,
+                manifest_digest,
+                transition: request.transition,
+                issued_at,
+                expires_at,
+            });
+        }
+        tx.commit()?;
+        Ok(ApprovalAuthorization {
+            authorization_id: request.authorization_id,
+            principal: request.principal,
+            artifact_id: request.artifact_id,
+            report_id: request.report_id,
+            manifest_digest: request.manifest_digest,
+            transition: request.transition,
+            issued_at: request.issued_at,
+            expires_at: request.expires_at,
+        })
+    }
+
+    pub(super) fn approve_canary_transaction(
+        &mut self,
+        input: &CanaryApprovalInput,
+        authorization: &ApprovalAuthorization,
+        now: i64,
+    ) -> Result<CanaryApprovalResult, StoreError> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let stored_artifact = tx
             .query_row(
@@ -1500,6 +1662,14 @@ impl SkillStore {
         if u64::try_from(artifact_version).ok() != Some(input.expected_artifact_version) {
             return Err(StoreError::Stale(input.skill_id.clone()));
         }
+        consume_approval_authorization(
+            &tx,
+            authorization,
+            &stored_artifact,
+            &input.report_id,
+            ApprovalTransition::VerifiedToCanary,
+            now,
+        )?;
         let generation: i64 = tx.query_row(
             "SELECT desired_generation FROM skill_generations WHERE singleton = 1",
             [],
@@ -1541,16 +1711,30 @@ impl SkillStore {
                 proposal_version, generation
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                input.approval_id,
+                authorization.authorization_id,
                 input.proposal_id,
                 input.skill_id,
                 input.report_id,
-                input.approver_id,
-                input.authenticated_at,
+                authorization.principal,
+                authorization.issued_at,
                 now,
                 artifact_version,
                 sql_version(input.expected_proposal_version)?,
                 next_generation
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO skill_lifecycle_approvals (
+                approval_id, skill_id, approval_kind, actor_id,
+                artifact_row_version, evaluation_report_id, created_at
+             ) VALUES (?1, ?2, 'phase4_canary', ?3, ?4, ?5, ?6)",
+            params![
+                authorization.authorization_id,
+                input.skill_id,
+                authorization.principal,
+                artifact_version + 1,
+                input.report_id,
+                now,
             ],
         )?;
         let generation_changed = tx.execute(
@@ -1758,6 +1942,67 @@ impl SkillStore {
     pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.db
     }
+}
+
+pub(super) fn approval_manifest_digest(artifact: &SkillArtifact) -> Result<String, StoreError> {
+    artifact.verify_identity()?;
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "identity_version": artifact.identity_version,
+        "abi_version": SKILL_ABI_VERSION,
+        "exports": artifact.exports,
+        "capability": artifact.capability,
+    }))?;
+    Ok(format!("{:x}", Sha256::digest(manifest)))
+}
+
+pub(super) fn consume_approval_authorization(
+    tx: &Transaction<'_>,
+    authorization: &ApprovalAuthorization,
+    artifact: &SkillArtifact,
+    report_id: &str,
+    transition: ApprovalTransition,
+    now: i64,
+) -> Result<(), StoreError> {
+    artifact.verify_identity()?;
+    if authorization.artifact_id != artifact.id
+        || authorization.report_id != report_id
+        || authorization.transition != transition
+        || authorization.manifest_digest != approval_manifest_digest(artifact)?
+        || now < authorization.issued_at
+        || now >= authorization.expires_at
+    {
+        return Err(StoreError::Unauthorized);
+    }
+    let changed = tx.execute(
+        "UPDATE skill_approval_authorizations
+            SET consumed_at = ?1
+          WHERE authorization_id = ?2
+            AND principal = ?3
+            AND artifact_id = ?4
+            AND report_id = ?5
+            AND manifest_digest = ?6
+            AND transition = ?7
+            AND issued_at = ?8
+            AND expires_at = ?9
+            AND consumed_at IS NULL
+            AND issued_at <= ?1
+            AND expires_at > ?1",
+        params![
+            now,
+            authorization.authorization_id,
+            authorization.principal,
+            authorization.artifact_id,
+            authorization.report_id,
+            authorization.manifest_digest,
+            transition.as_token(),
+            authorization.issued_at,
+            authorization.expires_at,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::Unauthorized);
+    }
+    Ok(())
 }
 
 fn is_full_skill_id(id: &str) -> bool {
@@ -2530,6 +2775,47 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
             Err(error) => {
                 let _ = db.execute_batch("ROLLBACK;");
                 return Err(error);
+            }
+        }
+    }
+
+    // Migration 5 -> 6: persist exact one-time parent approval authority separately from
+    // lifecycle evidence. A token is consumed only inside the transition transaction.
+    if current_version < 6 {
+        db.execute_batch("BEGIN IMMEDIATE;")?;
+        let migration = db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_approval_authorizations (
+                authorization_id TEXT PRIMARY KEY,
+                principal        TEXT NOT NULL,
+                artifact_id      TEXT NOT NULL,
+                report_id        TEXT NOT NULL,
+                manifest_digest  TEXT NOT NULL,
+                transition       TEXT NOT NULL,
+                issued_at        INTEGER NOT NULL,
+                expires_at       INTEGER NOT NULL,
+                consumed_at      INTEGER,
+                FOREIGN KEY (artifact_id) REFERENCES skill_revisions(id)
+                    ON DELETE CASCADE,
+                CHECK (length(authorization_id) BETWEEN 1 AND 256),
+                CHECK (length(principal) BETWEEN 1 AND 256),
+                CHECK (length(manifest_digest) = 64),
+                CHECK (transition IN ('verified_to_canary', 'canary_to_active')),
+                CHECK (issued_at >= 0),
+                CHECK (expires_at > issued_at),
+                CHECK (consumed_at IS NULL OR
+                       (consumed_at >= issued_at AND consumed_at < expires_at))
+            );
+            CREATE INDEX IF NOT EXISTS skill_approval_authorizations_binding_idx
+                ON skill_approval_authorizations(
+                    artifact_id, report_id, transition, consumed_at, expires_at
+                );
+            PRAGMA user_version = 6;",
+        );
+        match migration {
+            Ok(()) => db.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = db.execute_batch("ROLLBACK;");
+                return Err(error.into());
             }
         }
     }

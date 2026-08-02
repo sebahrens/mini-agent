@@ -4,35 +4,11 @@
 //! call these operations. No public store API can move a revision to canary or
 //! active.
 
-use super::store::{CanaryApprovalInput, CanaryApprovalResult, SkillStore, StoreError};
-
-#[derive(Debug, Clone)]
-pub(super) struct AuthenticatedApproval {
-    approval_id: String,
-    approver_id: String,
-    authenticated_at: i64,
-}
-
-impl AuthenticatedApproval {
-    pub(super) fn new(
-        approval_id: String,
-        approver_id: String,
-        authenticated_at: i64,
-    ) -> Result<Self, StoreError> {
-        if approval_id.trim().is_empty()
-            || approver_id.trim().is_empty()
-            || approval_id.len() > 256
-            || approver_id.len() > 256
-        {
-            return Err(StoreError::Unauthorized);
-        }
-        Ok(Self {
-            approval_id,
-            approver_id,
-            authenticated_at,
-        })
-    }
-}
+use super::SkillArtifact;
+use super::store::{
+    ApprovalAuthorization, ApprovalAuthorizationRequest, ApprovalTransition, CanaryApprovalInput,
+    CanaryApprovalResult, SkillStore, StoreError, approval_manifest_digest,
+};
 
 pub(super) struct AdmissionStore<'a> {
     store: &'a mut SkillStore,
@@ -44,6 +20,29 @@ impl<'a> AdmissionStore<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn authorize_canary(
+        &mut self,
+        authorization_id: String,
+        principal: String,
+        artifact: &SkillArtifact,
+        report_id: &str,
+        issued_at: i64,
+        expires_at: i64,
+    ) -> Result<ApprovalAuthorization, StoreError> {
+        self.store
+            .issue_approval_authorization(ApprovalAuthorizationRequest {
+                authorization_id,
+                principal,
+                artifact_id: artifact.id.clone(),
+                report_id: report_id.to_string(),
+                manifest_digest: approval_manifest_digest(artifact)?,
+                transition: ApprovalTransition::VerifiedToCanary,
+                issued_at,
+                expires_at,
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn approve_canary(
         &mut self,
         proposal_id: &str,
@@ -51,20 +50,18 @@ impl<'a> AdmissionStore<'a> {
         report_id: &str,
         expected_artifact_version: u64,
         expected_proposal_version: u64,
-        approval: &AuthenticatedApproval,
+        authorization: &ApprovalAuthorization,
         now: i64,
     ) -> Result<CanaryApprovalResult, StoreError> {
         self.store.approve_canary_transaction(
             &CanaryApprovalInput {
-                approval_id: approval.approval_id.clone(),
                 proposal_id: proposal_id.to_string(),
                 skill_id: skill_id.to_string(),
                 report_id: report_id.to_string(),
-                approver_id: approval.approver_id.clone(),
-                authenticated_at: approval.authenticated_at,
                 expected_artifact_version,
                 expected_proposal_version,
             },
+            authorization,
             now,
         )
     }
