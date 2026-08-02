@@ -144,6 +144,14 @@ parent re-parses and normalizes the target and arguments, obtains any required p
 deadlines and output limits, writes the effect audit, and performs the effect. A worker assertion
 of artifact identity, capability tier, scope, permission, or prior approval never authorizes it.
 
+`src/extras/js/broker.rs` implements the parent-only invocation grant table and the narrow
+supervisor callback. It issues opaque grant IDs, derives the effective principal only from its
+table, intersects grant and session capabilities, validates invocation, expiry, attribution,
+target, permission, and backend readiness, and erases all grant state on terminal, cancellation,
+or worker recycle transitions. The module exposes only an abstract authorized-effect seam: the
+real file, fetch, spawn, and proposal services and their detailed narrowing remain owned by the
+host-effect integration task.
+
 Model-authored step code retains bounded effect globals and a bounded `propose_skill` writer host.
 Durable proposal enqueue is parent-owned. Stored learned-skill realms receive no effect or writer
 globals. Learned-skill ABI v2 instead passes one hidden, immutable invocation capability object as
