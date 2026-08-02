@@ -40,7 +40,7 @@ fn paths() -> (PathBuf, AppPaths) {
 
 fn pure_artifact() -> SkillArtifact {
     SkillArtifact::new(
-        "function normalize(v) { return String(v).trim(); }".to_string(),
+        "function normalize(_cap, v) { return String(v).trim(); }".to_string(),
         "Normalize a value.".to_string(),
         vec!["normalize".to_string()],
         vec![SkillExport {
@@ -123,7 +123,7 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
     let (root, paths) = paths();
     let mut store = SkillStore::open_at(&paths).expect("store");
     let artifact = SkillArtifact::new(
-        "function fakeIsPresent() { return typeof read_file === 'function'; }".to_string(),
+        "function fakeIsPresent(cap, path) { return path === undefined ? typeof cap.read_file === 'function' : cap.read_file(path); }".to_string(),
         "Prove the declared read fake is present.".to_string(),
         vec!["fake".to_string()],
         vec![SkillExport {
@@ -135,7 +135,10 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
     )
     .expect("artifact");
     let mut fake_files = BTreeMap::new();
-    fake_files.insert("/hidden/input".to_string(), "held-out-secret".to_string());
+    fake_files.insert(
+        "fixtures/hidden/input".to_string(),
+        "held-out-secret".to_string(),
+    );
     let suite = HeldOutSuiteDraft {
         selector: HeldOutSelector {
             tags: vec!["fake".to_string()],
@@ -143,12 +146,12 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
             capability_tier: Some("read_only".to_string()),
         },
         cases: vec![HeldOutCase {
-            expression: "read_file('/hidden/input')".to_string(),
+            expression: "fakeIsPresent('fixtures/hidden/input')".to_string(),
             expected: ExpectedJsValue::String("held-out-secret".to_string()),
             fake_files,
             transcript: TranscriptExpectation {
                 reads: 1,
-                read_paths: vec!["/hidden/input".to_string()],
+                read_paths: vec!["fixtures/hidden/input".to_string()],
                 ..TranscriptExpectation::default()
             },
         }],
@@ -158,7 +161,7 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
     let report = evaluate(&store, &artifact, None).expect("evaluate");
     let serialized = serde_json::to_string(&report).unwrap();
     assert!(!serialized.contains("held-out-secret"));
-    assert!(!serialized.contains("/hidden/input"));
+    assert!(!serialized.contains("fixtures/hidden/input"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -172,7 +175,7 @@ fn skill_held_out_evaluator_inherits_predecessor_regressions() {
         .expect("suite");
     let predecessor = pure_artifact();
     let candidate = SkillArtifact::new(
-        "function normalize(v) { return String(v); }".to_string(),
+        "function normalize(_cap, v) { return String(v); }".to_string(),
         "Normalize a value differently.".to_string(),
         vec!["normalize".to_string()],
         predecessor.exports.clone(),
@@ -184,6 +187,31 @@ fn skill_held_out_evaluator_inherits_predecessor_regressions() {
         evaluate(&store, &candidate, Some(&predecessor)),
         Err(HeldOutError::Inherited(_))
     ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_held_out_evaluator_runs_predecessor_tests_against_unchanged_candidate_identity() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let admin = AdminIdentity::authenticated("reviewer").unwrap();
+    pure_suite("value")
+        .import(&mut store, &admin, 10)
+        .expect("suite");
+    let predecessor = pure_artifact();
+    let candidate = SkillArtifact::new(
+        predecessor.source.clone(),
+        "Same implementation with a distinct embedded regression.".to_string(),
+        vec!["normalize".to_string()],
+        predecessor.exports.clone(),
+        vec!["normalize(' y ') === 'y'".to_string()],
+        CapabilityManifest::pure(),
+    )
+    .expect("candidate");
+    assert_ne!(candidate.tests, predecessor.tests);
+
+    evaluate(&store, &candidate, Some(&predecessor))
+        .expect("predecessor scripts must run without rewriting candidate identity");
     let _ = std::fs::remove_dir_all(root);
 }
 

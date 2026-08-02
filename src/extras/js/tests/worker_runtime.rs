@@ -4,13 +4,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(not(feature = "skills"))]
+use crate::extras::js::protocol::ArtifactInput;
 use crate::extras::js::protocol::{
-    AdvisoryAttribution, ArtifactInput, BuildIdentity, ConsoleLevel, DiagnosticClass,
-    DiagnosticStage, EffectOperation, EffectRequest, EffectResponse, EffectResult, GrantId,
-    InvocationId, JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame, RunStep,
-    ScriptRole, StepOutcome, StepResult, VerificationCase, VerificationCaseResult,
-    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady,
-    WorkerWireFrame, read_frame, write_frame,
+    AdvisoryAttribution, BuildIdentity, ConsoleLevel, DiagnosticClass, DiagnosticStage,
+    EffectOperation, EffectRequest, EffectResponse, EffectResult, GrantId, InvocationId,
+    JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame, RunStep, ScriptRole,
+    StepOutcome, StepResult, VerificationCase, VerificationCaseResult, VerificationResult,
+    VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady, WorkerWireFrame,
+    read_frame, write_frame,
 };
 use crate::extras::js::supervisor::{
     EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
@@ -52,24 +54,57 @@ fn verify_artifact(
     tests: Vec<String>,
     cases: Vec<(&str, &str)>,
 ) -> ParentWireFrame {
+    let source = source.into();
+    #[cfg(feature = "skills")]
+    let artifact = crate::extras::js::skills::SkillArtifact::new(
+        if source.is_empty() {
+            "function answer(_cap) { return 42; }".into()
+        } else {
+            source
+        },
+        format!("verification fixture {invocation}"),
+        vec![],
+        vec![crate::extras::js::skills::SkillExport {
+            name: "answer".into(),
+            signature: "answer()".into(),
+        }],
+        tests.clone(),
+        crate::extras::js::skills::CapabilityManifest::pure(),
+    )
+    .unwrap();
+    #[cfg(not(feature = "skills"))]
+    let artifact = ArtifactInput {
+        artifact_id: format!("artifact-{invocation}"),
+        source,
+        exports: vec!["answer".into()],
+        tests: tests.clone(),
+    };
+    let mut verification_cases = tests
+        .into_iter()
+        .enumerate()
+        .map(|(index, script)| VerificationCase {
+            case_id: format!("embedded-{index}"),
+            script,
+            #[cfg(feature = "skills")]
+            kind: crate::extras::js::protocol::VerificationCaseKind::Embedded,
+        })
+        .collect::<Vec<_>>();
+    verification_cases.extend(cases.into_iter().map(|(case_id, script)| VerificationCase {
+        case_id: case_id.into(),
+        script: script.into(),
+        #[cfg(feature = "skills")]
+        kind: crate::extras::js::protocol::VerificationCaseKind::HeldOut {
+            expected: crate::extras::js::protocol::VerificationExpectedValue::Boolean(true),
+            fake_files: Default::default(),
+        },
+    }));
     WireFrame::invocation(
         BuildIdentity::current(),
         InvocationId::new(invocation).unwrap(),
         sequence,
         ParentFrame::VerifyArtifact(VerifyArtifact {
-            artifact: ArtifactInput {
-                artifact_id: format!("artifact-{invocation}"),
-                source: source.into(),
-                exports: vec!["answer".into()],
-                tests,
-            },
-            cases: cases
-                .into_iter()
-                .map(|(case_id, script)| VerificationCase {
-                    case_id: case_id.into(),
-                    script: script.into(),
-                })
-                .collect(),
+            artifact,
+            cases: verification_cases,
         }),
     )
 }
@@ -513,7 +548,206 @@ fn worker_runtime_console_is_bounded_and_reports_truncation() {
     assert_eq!(results[2].outcome, StepOutcome::Value("42".into()));
 }
 
+#[cfg(feature = "skills")]
 #[test]
+fn worker_runtime_verification_reloads_production_realm_for_every_case() {
+    let results = verification_results(
+        vec![verify_artifact(
+            2,
+            "isolated-production-loader",
+            "let count = 0; function answer(_cap) { return ++count; }",
+            vec!["answer() === 1".into(), "answer() === 1".into()],
+            vec![("held-out-fresh", "answer() === 1")],
+        )],
+        10_000,
+        10_000,
+    );
+    assert_eq!(results.len(), 1);
+    assert!(results[0].passed);
+    assert_eq!(results[0].loader_version, 1);
+    assert_eq!(results[0].cases.len(), 3);
+    assert!(results[0].cases.iter().all(|case| case.passed));
+    assert!(
+        results[0]
+            .cases
+            .iter()
+            .all(|case| case.transcript.is_empty())
+    );
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn worker_runtime_verification_bounds_transcripts_across_the_whole_request() {
+    use crate::extras::js::protocol::VerificationCaseKind;
+    use crate::extras::js::skills::{
+        CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
+    };
+
+    let artifact = SkillArtifact::new(
+        "function answer(cap) { for (let i = 0; i < 129; i += 1) cap.write_file('tmp/out', String(i)); return true; }".into(),
+        "aggregate transcript bound fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "answer".into(),
+            signature: "answer(): boolean".into(),
+        }],
+        vec!["answer()".into()],
+        test_manifest(CapabilityTier::SideEffecting, vec![HostCapability::WriteFile]).unwrap(),
+    )
+    .unwrap();
+    let bounded = WireFrame::invocation(
+        BuildIdentity::current(),
+        InvocationId::new("bounded-transcripts").unwrap(),
+        2,
+        ParentFrame::VerifyArtifact(VerifyArtifact {
+            artifact,
+            cases: vec![
+                VerificationCase {
+                    case_id: "first".into(),
+                    script: "answer()".into(),
+                    kind: VerificationCaseKind::Embedded,
+                },
+                VerificationCase {
+                    case_id: "second".into(),
+                    script: "answer()".into(),
+                    kind: VerificationCaseKind::Embedded,
+                },
+            ],
+        }),
+    );
+    let results = verification_results(
+        vec![
+            bounded,
+            verify_artifact(
+                4,
+                "bounded-transcript-fresh",
+                "",
+                vec![],
+                vec![("fresh", "true")],
+            ),
+        ],
+        10_000,
+        10_000,
+    );
+
+    assert!(!results[0].passed);
+    assert!(results[0].cases[0].passed);
+    assert!(!results[0].cases[1].passed);
+    assert!(
+        results[0]
+            .cases
+            .iter()
+            .map(|case| case.transcript.call_count())
+            .sum::<usize>()
+            <= crate::extras::js::skills::fakes::VERIFICATION_TRANSCRIPT_MAX_CALLS
+    );
+    assert!(results[1].passed);
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn worker_runtime_verification_rejects_large_write_transcripts_before_terminal_framing() {
+    use crate::extras::js::protocol::VerificationCaseKind;
+    use crate::extras::js::skills::{
+        CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
+    };
+
+    let artifact = SkillArtifact::new(
+        "function answer(cap) { const payload = 'x'.repeat(4096); for (let i = 0; i < 256; i += 1) cap.write_file('tmp/out', payload); return true; }".into(),
+        "large write transcript fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "answer".into(),
+            signature: "answer(): boolean".into(),
+        }],
+        vec!["true".into()],
+        test_manifest(CapabilityTier::SideEffecting, vec![HostCapability::WriteFile]).unwrap(),
+    )
+    .unwrap();
+    let request = WireFrame::invocation(
+        BuildIdentity::current(),
+        InvocationId::new("large-write-transcript").unwrap(),
+        2,
+        ParentFrame::VerifyArtifact(VerifyArtifact {
+            artifact,
+            cases: vec![VerificationCase {
+                case_id: "large-writes".into(),
+                script: "answer()".into(),
+                kind: VerificationCaseKind::Embedded,
+            }],
+        }),
+    );
+    let results = verification_results(
+        vec![
+            request,
+            verify_artifact(4, "large-write-fresh", "", vec![], vec![("fresh", "true")]),
+        ],
+        10_000,
+        10_000,
+    );
+
+    assert!(!results[0].passed);
+    assert!(results[0].cases[0].diagnostic.is_some());
+    assert!(
+        serde_json::to_vec(&results[0]).unwrap().len()
+            < crate::extras::js::protocol::MAX_FRAME_BYTES
+    );
+    assert!(results[1].passed);
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn worker_runtime_verification_rejects_large_spawn_transcripts_before_cloning_arguments() {
+    use crate::extras::js::protocol::VerificationCaseKind;
+    use crate::extras::js::skills::{
+        CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
+    };
+
+    let artifact = SkillArtifact::new(
+        "function answer(cap) { const args = Array.from({length: 64}, () => 'x'.repeat(4096)); for (let i = 0; i < 256; i += 1) cap.spawn('printf', args); return true; }".into(),
+        "large spawn transcript fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "answer".into(),
+            signature: "answer(): boolean".into(),
+        }],
+        vec!["true".into()],
+        test_manifest(CapabilityTier::SideEffecting, vec![HostCapability::Spawn]).unwrap(),
+    )
+    .unwrap();
+    let request = WireFrame::invocation(
+        BuildIdentity::current(),
+        InvocationId::new("large-spawn-transcript").unwrap(),
+        2,
+        ParentFrame::VerifyArtifact(VerifyArtifact {
+            artifact,
+            cases: vec![VerificationCase {
+                case_id: "large-spawns".into(),
+                script: "answer()".into(),
+                kind: VerificationCaseKind::Embedded,
+            }],
+        }),
+    );
+    let results = verification_results(
+        vec![
+            request,
+            verify_artifact(4, "large-spawn-fresh", "", vec![], vec![("fresh", "true")]),
+        ],
+        10_000,
+        10_000,
+    );
+
+    assert!(!results[0].passed);
+    assert!(results[0].cases[0].diagnostic.is_some());
+    assert!(
+        serde_json::to_vec(&results[0]).unwrap().len()
+            < crate::extras::js::protocol::MAX_FRAME_BYTES
+    );
+    assert!(results[1].passed);
+}
+
+#[test]
+#[cfg(not(feature = "skills"))]
 fn worker_runtime_verification_owns_one_fresh_runtime_per_whole_request() {
     let requests = vec![
         verify_artifact(
@@ -559,6 +793,7 @@ fn worker_runtime_verification_owns_one_fresh_runtime_per_whole_request() {
 }
 
 #[test]
+#[cfg(not(feature = "skills"))]
 fn worker_runtime_verification_rejects_source_promises_and_recovers() {
     let results = verification_results(
         vec![
@@ -604,6 +839,7 @@ fn worker_runtime_verification_rejects_source_promises_and_recovers() {
 }
 
 #[test]
+#[cfg(not(feature = "skills"))]
 fn worker_runtime_verification_stops_after_resource_faults_and_shares_job_budget() {
     let job_results = verification_results(
         vec![
@@ -683,21 +919,38 @@ fn worker_runtime_verification_stops_after_resource_faults_and_shares_job_budget
 
 #[test]
 fn worker_runtime_verification_bounds_terminal_result_expansion() {
+    #[cfg(feature = "skills")]
+    let artifact = crate::extras::js::skills::SkillArtifact::new(
+        "function answer() { return 42; }".into(),
+        "oversized verification fixture".into(),
+        vec![],
+        vec![crate::extras::js::skills::SkillExport {
+            name: "answer".into(),
+            signature: "answer()".into(),
+        }],
+        vec!["true".into()],
+        crate::extras::js::skills::CapabilityManifest::pure(),
+    )
+    .unwrap();
+    #[cfg(not(feature = "skills"))]
+    let artifact = ArtifactInput {
+        artifact_id: "oversized".into(),
+        source: String::new(),
+        exports: vec![],
+        tests: vec![],
+    };
     let oversized = WireFrame::invocation(
         BuildIdentity::current(),
         InvocationId::new("oversized-verification").unwrap(),
         2,
         ParentFrame::VerifyArtifact(VerifyArtifact {
-            artifact: ArtifactInput {
-                artifact_id: "oversized".into(),
-                source: String::new(),
-                exports: vec![],
-                tests: vec![],
-            },
+            artifact,
             cases: (0..4_097)
                 .map(|index| VerificationCase {
                     case_id: format!("case-{index}"),
                     script: "false".into(),
+                    #[cfg(feature = "skills")]
+                    kind: crate::extras::js::protocol::VerificationCaseKind::Embedded,
                 })
                 .collect(),
         }),
@@ -1661,16 +1914,36 @@ async fn worker_supervisor_recovery_clean_shutdown_reaps_and_restarts() {
 }
 
 fn held_out_verification() -> VerifyArtifact {
+    #[cfg(feature = "skills")]
+    let artifact = crate::extras::js::skills::SkillArtifact::new(
+        "function answer() { return 42; }".into(),
+        "supervisor verification fixture".into(),
+        vec![],
+        vec![crate::extras::js::skills::SkillExport {
+            name: "answer".into(),
+            signature: "answer()".into(),
+        }],
+        vec!["true".into()],
+        crate::extras::js::skills::CapabilityManifest::pure(),
+    )
+    .unwrap();
+    #[cfg(not(feature = "skills"))]
+    let artifact = ArtifactInput {
+        artifact_id: "supervisor-artifact".into(),
+        source: "exports.answer = () => 42".into(),
+        exports: vec!["answer".into()],
+        tests: vec!["true".into()],
+    };
     VerifyArtifact {
-        artifact: ArtifactInput {
-            artifact_id: "supervisor-artifact".into(),
-            source: "exports.answer = () => 42".into(),
-            exports: vec!["answer".into()],
-            tests: vec!["true".into()],
-        },
+        artifact,
         cases: vec![VerificationCase {
             case_id: "held-out".into(),
             script: "true".into(),
+            #[cfg(feature = "skills")]
+            kind: crate::extras::js::protocol::VerificationCaseKind::HeldOut {
+                expected: crate::extras::js::protocol::VerificationExpectedValue::Boolean(true),
+                fake_files: Default::default(),
+            },
         }],
     }
 }
@@ -2040,6 +2313,8 @@ fn run_scripted_supervisor_worker() -> ! {
                         case_id: format!("embedded-{index}"),
                         passed: true,
                         diagnostic: None,
+                        #[cfg(feature = "skills")]
+                        transcript: Default::default(),
                     })
                     .collect::<Vec<_>>();
                 cases.extend(
@@ -2050,6 +2325,8 @@ fn run_scripted_supervisor_worker() -> ! {
                             case_id: case.case_id.clone(),
                             passed: true,
                             diagnostic: None,
+                            #[cfg(feature = "skills")]
+                            transcript: Default::default(),
                         }),
                 );
                 let terminal = WireFrame::invocation(

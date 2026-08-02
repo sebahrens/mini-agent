@@ -36,7 +36,7 @@ impl Drop for TempPaths {
 
 fn artifact() -> SkillArtifact {
     SkillArtifact::new(
-        "function increment(value) { return value + 1; }".to_string(),
+        "function increment(_cap, value) { return value + 1; }".to_string(),
         "Increment a number.".to_string(),
         vec!["math".to_string(), "number".to_string()],
         vec![SkillExport {
@@ -83,7 +83,7 @@ fn skill_store_identity_tamper_and_collision_fail_closed() {
     let tamper = store
         .conn_mut()
         .execute(
-            "UPDATE skill_revisions SET source = 'function increment() { return 99; }' WHERE id = ?",
+            "UPDATE skill_revisions SET source = 'function increment(_cap) { return 99; }' WHERE id = ?",
             [&artifact.id],
         )
         .unwrap_err();

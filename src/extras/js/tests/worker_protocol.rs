@@ -4,6 +4,35 @@ use uuid::Uuid;
 
 use crate::extras::js::protocol::*;
 
+#[cfg(feature = "skills")]
+fn verification_artifact(
+    source: String,
+    tests: Vec<String>,
+) -> crate::extras::js::skills::SkillArtifact {
+    crate::extras::js::skills::SkillArtifact::new(
+        source,
+        "worker protocol fixture".into(),
+        vec![],
+        vec![crate::extras::js::skills::SkillExport {
+            name: "answer".into(),
+            signature: "answer()".into(),
+        }],
+        tests,
+        crate::extras::js::skills::CapabilityManifest::pure(),
+    )
+    .unwrap()
+}
+
+#[cfg(not(feature = "skills"))]
+fn verification_artifact(source: String, tests: Vec<String>) -> ArtifactInput {
+    ArtifactInput {
+        artifact_id: "advisory-id".into(),
+        source,
+        exports: vec!["answer".into()],
+        tests,
+    }
+}
+
 fn build() -> BuildIdentity {
     BuildIdentity::new("test-build-1").unwrap()
 }
@@ -39,15 +68,15 @@ fn verify(sequence: u64) -> ParentWireFrame {
     invoked(
         sequence,
         ParentFrame::VerifyArtifact(VerifyArtifact {
-            artifact: ArtifactInput {
-                artifact_id: "advisory-id".into(),
-                source: "exports.answer = () => 42".into(),
-                exports: vec!["answer".into()],
-                tests: vec!["answer() === 42".into()],
-            },
+            artifact: verification_artifact(
+                "function answer() { return 42; }".into(),
+                vec!["answer() === 42".into()],
+            ),
             cases: vec![VerificationCase {
                 case_id: "embedded-0".into(),
                 script: "answer() === 42".into(),
+                #[cfg(feature = "skills")]
+                kind: VerificationCaseKind::Embedded,
             }],
         }),
     )
@@ -107,6 +136,8 @@ fn verification_result(sequence: u64) -> WorkerWireFrame {
                 case_id: "embedded-0".into(),
                 passed: true,
                 diagnostic: None,
+                #[cfg(feature = "skills")]
+                transcript: Default::default(),
             }],
             loader_version: 1,
         }),
@@ -248,12 +279,10 @@ fn worker_protocol_bounds_outbound_and_nested_payloads() {
     let nested = invoked(
         2,
         ParentFrame::VerifyArtifact(VerifyArtifact {
-            artifact: ArtifactInput {
-                artifact_id: "id".into(),
-                source: String::new(),
-                exports: vec![],
-                tests: vec!["x".repeat(MAX_FRAME_BYTES)],
-            },
+            artifact: verification_artifact(
+                "function answer() { return 42; }".into(),
+                vec!["x".repeat(MAX_FRAME_BYTES)],
+            ),
             cases: vec![],
         }),
     );

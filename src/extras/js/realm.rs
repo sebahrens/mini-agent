@@ -257,7 +257,7 @@ pub(crate) fn load_artifact(
     model_context: &Context,
     artifact: &SkillArtifact,
 ) -> Result<LoadedArtifact, RealmError> {
-    load_artifact_internal(runtime, model_context, artifact, None, None)
+    load_artifact_internal(runtime, model_context, artifact, None, None, None)
 }
 
 /// Load an ABI-v2 artifact whose wrappers inject a fresh, revocable invocation capability.
@@ -272,6 +272,7 @@ pub(crate) fn load_artifact_with_capabilities(
         model_context,
         artifact,
         Some(Arc::new(capabilities)),
+        None,
         None,
     )
 }
@@ -290,6 +291,30 @@ pub(crate) fn load_artifact_with_bound_exports(
         artifact,
         Some(Arc::new(capabilities)),
         Some(Arc::new(bindings)),
+        None,
+    )
+}
+
+/// Verification-only mutation entry that keeps the production loader path intact.
+///
+/// The artifact is fully validated and its declared namespace is resolved before the selected
+/// bridge target is replaced. Production callers always pass through the same internal loader
+/// with no mutation.
+pub(crate) fn load_artifact_with_bound_exports_for_verification(
+    runtime: &Runtime,
+    model_context: &Context,
+    artifact: &SkillArtifact,
+    capabilities: InvocationCapabilityRuntime,
+    bindings: HashMap<String, BoundExportInvocation>,
+    mutated_export: Option<&str>,
+) -> Result<LoadedArtifact, RealmError> {
+    load_artifact_internal(
+        runtime,
+        model_context,
+        artifact,
+        Some(Arc::new(capabilities)),
+        Some(Arc::new(bindings)),
+        mutated_export,
     )
 }
 
@@ -351,6 +376,7 @@ fn load_artifact_internal(
     artifact: &SkillArtifact,
     capabilities: Option<Arc<InvocationCapabilityRuntime>>,
     bound_exports: Option<Arc<HashMap<String, BoundExportInvocation>>>,
+    mutated_export: Option<&str>,
 ) -> Result<LoadedArtifact, RealmError> {
     artifact
         .verify_identity()
@@ -418,7 +444,11 @@ fn load_artifact_internal(
                 .exports
                 .iter()
                 .map(|export| {
-                    let original: Function = namespace.get(export.name.as_str())?;
+                    let original: Function = if mutated_export == Some(export.name.as_str()) {
+                        ctx.eval("(() => { throw 0; })")?
+                    } else {
+                        namespace.get(export.name.as_str())?
+                    };
                     let bridge: Function = if let Some(capabilities) = capabilities.as_ref() {
                         let settlements = settlements
                             .as_ref()

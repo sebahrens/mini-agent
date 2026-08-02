@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 
 use super::fakes::{FAKES_VERSION, FakeTranscript};
 use super::store::{AdminIdentity, HeldOutSuiteRecord, SkillStore, StoreError};
-use super::verify::{VERIFIER_VERSION, VerificationError, verify_held_out_case, verify_skill};
+use super::verify::{
+    VERIFIER_VERSION, VerificationError, verify_held_out_case, verify_inherited_cases, verify_skill,
+};
 use super::{CapabilityTier, SkillArtifact};
 
 const SUITE_FORMAT_VERSION: u32 = 1;
@@ -303,9 +305,7 @@ pub(crate) fn evaluate(
         predecessor
             .verify_identity()
             .map_err(|error| HeldOutError::Identity(error.to_string()))?;
-        let mut inherited = artifact.clone();
-        inherited.tests = predecessor.tests.clone();
-        verify_skill(&inherited).map_err(HeldOutError::Inherited)?;
+        verify_inherited_cases(artifact, &predecessor.tests).map_err(HeldOutError::Inherited)?;
     }
 
     let mut suites = select_suites(store, artifact)?;

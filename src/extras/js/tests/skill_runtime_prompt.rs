@@ -44,7 +44,7 @@ impl Drop for TempPaths {
 
 fn learned_skill() -> SkillArtifact {
     SkillArtifact::new(
-        "function uniqueLearnedSource(value) { return value.trim(); }".to_string(),
+        "function uniqueLearnedSource(_cap, value) { return value.trim(); }".to_string(),
         "Trim surrounding whitespace from text.".to_string(),
         vec!["text".to_string(), "trim".to_string()],
         vec![SkillExport {

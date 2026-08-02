@@ -12,6 +12,7 @@ use crate::extras::js::skills::capability::{
     CapabilityError, InvocationAuthorization, InvocationCapabilityRuntime,
 };
 use crate::extras::js::skills::turn::{ResolvedSkill, SkillTurnContext, TurnSkillBundle};
+use crate::extras::js::skills::verify::verify_skill;
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
 };
@@ -61,6 +62,92 @@ fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
         index_generation: 7,
         skills,
     }))
+}
+
+fn differential_artifact(source: &str, test: &str) -> SkillArtifact {
+    SkillArtifact::new(
+        source.to_string(),
+        "production/verifier loader differential".to_string(),
+        vec!["differential".to_string()],
+        vec![SkillExport {
+            name: "probe".to_string(),
+            signature: "probe()".to_string(),
+        }],
+        vec![test.to_string()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn production_and_verifier_make_identical_loader_decisions_for_differential_artifacts() {
+    let cases = [
+        (
+            "valid",
+            "function probe(_cap) { return true; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "raw-vs-wrapper",
+            "return; function probe(_cap) { return true; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "top-level-effect",
+            "read_file('fixtures/a'); function probe(_cap) { return true; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "ambient-global",
+            "const ambient = typeof read_file; function probe(cap) { return ambient === 'undefined' && typeof cap.read_file === 'undefined'; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "undeclared-export",
+            "function other(_cap) { return true; }",
+            "true",
+            "probe()",
+        ),
+        (
+            "async-export",
+            "async function probe(_cap) { return true; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "constructor-escape",
+            "function probe(_cap) { let escaped = false; try { escaped = !!({}).constructor.constructor('return this')().modelSentinel; } catch (_) {} return !escaped && typeof Function === 'undefined'; }",
+            "probe()",
+            "probe()",
+        ),
+        (
+            "stack-behavior",
+            "function probe(_cap, depth) { return depth === 0 ? true : probe(_cap, depth - 1); }",
+            "probe(100000)",
+            "probe(100000)",
+        ),
+    ];
+
+    for (name, source, test, production_expression) in cases {
+        let artifact = differential_artifact(source, test);
+        let verifier_accepted = verify_skill(&artifact).is_ok();
+        let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&artifact, 0)]));
+        let production = tool
+            .call(JsArgs {
+                code: production_expression.to_string(),
+            })
+            .await
+            .unwrap();
+        let production_accepted = !production.starts_with("JS error:");
+        assert_eq!(
+            verifier_accepted, production_accepted,
+            "loader decision diverged for {name}: production={production:?}"
+        );
+    }
 }
 
 #[test]

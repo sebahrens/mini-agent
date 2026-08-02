@@ -62,7 +62,7 @@ fn resolve_test_paths(temp_base: &PathBuf) -> Result<AppPaths, Box<dyn std::erro
 /// Create a minimal valid test skill artifact.
 fn minimal_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
     Ok(SkillArtifact::new(
-        "function greet() { return 'hello'; }".to_string(),
+        "function greet(_cap) { return 'hello'; }".to_string(),
         "A simple greeting function.".to_string(),
         vec!["test".to_string(), "example".to_string()],
         vec![SkillExport {
@@ -77,7 +77,7 @@ fn minimal_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
 /// Create a skill with ReadOnly capability.
 fn readonly_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
     Ok(SkillArtifact::new(
-        "function readConfig() { try { read_file('/etc/config'); return false; } catch (error) { return String(error).includes('File not found'); } }".to_string(),
+        "function readConfig(cap) { try { cap.read_file('/etc/config'); return false; } catch (error) { return true; } }".to_string(),
         "Read system configuration.".to_string(),
         vec!["config".to_string(), "read".to_string()],
         vec![SkillExport {
@@ -92,14 +92,14 @@ fn readonly_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
 /// Create a skill with SideEffecting capability.
 fn sideeffecting_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
     Ok(SkillArtifact::new(
-        "function deploy() { return spawn('deploy.sh', []); }".to_string(),
+        "function deploy(cap) { return cap.spawn('printf', []); }".to_string(),
         "Deploy the application.".to_string(),
         vec!["deploy".to_string()],
         vec![SkillExport {
             name: "deploy".to_string(),
             signature: "() => object".to_string(),
         }],
-        vec!["typeof deploy() === 'string'".to_string()],
+        vec!["deploy().code === 0".to_string()],
         test_manifest(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])?,
     )?)
 }
@@ -613,7 +613,7 @@ fn test_various_tag_normalization() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create skills with different tag variations.
     let skill1 = SkillArtifact::new(
-        "function test() { return true; }".to_string(),
+        "function test(_cap) { return true; }".to_string(),
         "Test skill".to_string(),
         vec!["TAG".to_string(), "tag".to_string(), "  tag  ".to_string()],
         vec![SkillExport {
@@ -657,7 +657,7 @@ fn test_capability_manifest_serialization() -> Result<(), Box<dyn std::error::Er
     )?;
 
     let skill = SkillArtifact::new(
-        "function test() { return true; }".to_string(),
+        "function test(_cap) { return true; }".to_string(),
         "Test skill with capabilities.".to_string(),
         vec!["test".to_string()],
         vec![SkillExport {

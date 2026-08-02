@@ -43,7 +43,7 @@ fn paths() -> (PathBuf, AppPaths) {
 
 fn artifact(source_suffix: &str) -> SkillArtifact {
     SkillArtifact::new(
-        format!("function normalize(v) {{ return String(v).trim(); }}{source_suffix}"),
+        format!("function normalize(_cap, v) {{ return String(v).trim(); }}{source_suffix}"),
         "Normalize a value.".to_string(),
         vec!["normalize".to_string()],
         vec![SkillExport {

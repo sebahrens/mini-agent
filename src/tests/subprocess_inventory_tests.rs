@@ -160,7 +160,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/js/skills/verify.rs",
-        "handle.spawn(&program, &args).map_err(|reason| {",
+        ".spawn(|| supervisor.verify_blocking(request))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/worker.rs",
+        ".spawn(&program, &arguments)",
         1,
         "NON-PROCESS",
     ),
@@ -526,7 +532,13 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/js/skills/verify.rs",
-        "handle.spawn(&program, &args).map_err(|reason| {",
+        ".spawn(|| supervisor.verify_blocking(request))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/worker.rs",
+        ".spawn(&program, &arguments)",
         1,
         "NON-PROCESS",
     ),
