@@ -254,6 +254,10 @@ fn skill_root_activation_requires_two_authenticated_human_actions() {
     let authorization = service
         .authorize_root_for_test(&predecessor.id, &second, 2)
         .unwrap();
+    let other = HumanApproval::verified("approval-phase5-other", "other", "report-1", 1).unwrap();
+    let other_authorization = service
+        .authorize_root_for_test(&predecessor.id, &other, 2)
+        .unwrap();
     let activated = service
         .activate_root(
             "root-activation",
@@ -265,6 +269,17 @@ fn skill_root_activation_requires_two_authenticated_human_actions() {
         )
         .unwrap();
     assert_eq!(activated.status, LifecycleStatus::Active);
+    assert!(matches!(
+        service.activate_root(
+            "root-activation",
+            &predecessor.id,
+            &other,
+            &other_authorization,
+            &snapshot,
+            4,
+        ),
+        Err(LifecycleError::IdempotencyConflict)
+    ));
     assert!(
         service
             .activate_root(

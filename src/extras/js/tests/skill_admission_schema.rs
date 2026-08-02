@@ -362,6 +362,90 @@ fn skill_admission_schema_v6_rejects_v5_root_canary_without_first_approval() {
 }
 
 #[test]
+fn skill_admission_schema_v6_rejects_v5_root_canary_with_unapproved_proposal() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = artifact("/* v5-root-canary-unapproved-proposal */");
+    let proposal = store
+        .enqueue_proposal(&artifact, None, 10)
+        .expect("enqueue");
+    let lease = store.claim_due_proposal("worker", 20, 5).unwrap().unwrap();
+    let evaluation = report(&lease.proposal_id, &lease.skill_id, lease.attempt);
+    store
+        .complete_evaluation(
+            &proposal.proposal_id,
+            "worker",
+            lease.row_version,
+            &evaluation,
+            22,
+        )
+        .expect("complete evaluation");
+    let proposal_version = store
+        .get_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap()
+        .row_version;
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO skill_approvals (
+                approval_id, proposal_id, skill_id, report_id, approver_id,
+                authenticated_at, approved_at, artifact_version,
+                proposal_version, generation
+             ) VALUES ('v5-orphaned-approval', ?1, ?2, ?3, 'owner', 23, 23, 1, ?4, 1)",
+            rusqlite::params![
+                proposal.proposal_id,
+                artifact.id,
+                evaluation.report_id,
+                i64::try_from(proposal_version).unwrap(),
+            ],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+                SET status = 'canary', row_version = 2,
+                    evaluation_report_id = ?2, lineage_root_id = id
+              WHERE id = ?1",
+            rusqlite::params![artifact.id, evaluation.report_id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute_batch(
+            "DELETE FROM skill_lifecycle_approvals;
+             DROP TABLE skill_approval_authorizations;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(store);
+
+    assert!(matches!(
+        SkillStore::open_at(&paths),
+        Err(StoreError::CorruptRow(message))
+            if message.contains("could not be backfilled exactly")
+    ));
+    let database = paths.local_data_dir.join("skills/skills.db");
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    let lifecycle_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM skill_lifecycle_approvals WHERE skill_id = ?1",
+            [&artifact.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lifecycle_rows, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn skill_admission_schema_upgrades_phase3_v2_without_losing_generation_shape() {
     let (root, paths) = paths();
     seed_v2(

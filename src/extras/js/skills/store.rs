@@ -2865,9 +2865,21 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                         a.artifact_version + 1, a.report_id, a.approved_at
                    FROM skill_approvals a
                    JOIN skill_revisions r ON r.id = a.skill_id
+                   JOIN skill_proposals p
+                     ON p.proposal_id = a.proposal_id
+                    AND p.skill_id = a.skill_id
+                    AND p.report_id = a.report_id
+                    AND p.status = 'approved'
+                    AND p.row_version = a.proposal_version + 1
+                   JOIN evaluation_reports e
+                     ON e.report_id = a.report_id
+                    AND e.proposal_id = a.proposal_id
+                    AND e.skill_id = a.skill_id
+                    AND e.outcome = 'passed'
                   WHERE r.status IN ('canary', 'active')
                     AND r.supersedes_id IS NULL
-                    AND r.evaluation_report_id = a.report_id;
+                    AND r.evaluation_report_id = a.report_id
+                    AND r.row_version = a.artifact_version + 1;
 
                  CREATE TABLE IF NOT EXISTS skill_approval_authorizations (
                 authorization_id TEXT PRIMARY KEY,
@@ -2908,16 +2920,49 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
             let stranded_root_canary: i64 = db.query_row(
                 "SELECT COUNT(*)
                    FROM skill_revisions r
-                   LEFT JOIN skill_approvals a ON a.skill_id = r.id
-                   LEFT JOIN skill_lifecycle_approvals l
-                     ON l.skill_id = r.id AND l.approval_kind = 'phase4_canary'
                   WHERE r.status = 'canary' AND r.supersedes_id IS NULL
-                    AND (a.approval_id IS NULL
-                         OR l.approval_id IS NULL
-                         OR l.approval_id IS NOT a.approval_id
-                         OR l.actor_id IS NOT a.approver_id
-                         OR l.artifact_row_version IS NOT a.artifact_version + 1
-                         OR l.evaluation_report_id IS NOT a.report_id)",
+                    AND (
+                        (SELECT COUNT(*)
+                           FROM skill_approvals a
+                           JOIN skill_proposals p
+                             ON p.proposal_id = a.proposal_id
+                            AND p.skill_id = a.skill_id
+                            AND p.report_id = a.report_id
+                            AND p.status = 'approved'
+                            AND p.row_version = a.proposal_version + 1
+                           JOIN evaluation_reports e
+                             ON e.report_id = a.report_id
+                            AND e.proposal_id = a.proposal_id
+                            AND e.skill_id = a.skill_id
+                            AND e.outcome = 'passed'
+                          WHERE a.skill_id = r.id
+                            AND a.report_id = r.evaluation_report_id
+                            AND r.row_version = a.artifact_version + 1) <> 1
+                        OR
+                        (SELECT COUNT(*)
+                           FROM skill_lifecycle_approvals l
+                           JOIN skill_approvals a
+                             ON a.approval_id = l.approval_id
+                            AND a.skill_id = l.skill_id
+                            AND a.approver_id = l.actor_id
+                            AND a.report_id = l.evaluation_report_id
+                            AND a.artifact_version + 1 = l.artifact_row_version
+                           JOIN skill_proposals p
+                             ON p.proposal_id = a.proposal_id
+                            AND p.skill_id = a.skill_id
+                            AND p.report_id = a.report_id
+                            AND p.status = 'approved'
+                            AND p.row_version = a.proposal_version + 1
+                           JOIN evaluation_reports e
+                             ON e.report_id = a.report_id
+                            AND e.proposal_id = a.proposal_id
+                            AND e.skill_id = a.skill_id
+                            AND e.outcome = 'passed'
+                          WHERE l.skill_id = r.id
+                            AND l.approval_kind = 'phase4_canary'
+                            AND l.evaluation_report_id = r.evaluation_report_id
+                            AND l.artifact_row_version = r.row_version) <> 1
+                    )",
                 [],
                 |row| row.get(0),
             )?;

@@ -685,7 +685,7 @@ impl<'a> LifecycleService<'a> {
                 .store
                 .connection_mut()
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some(replayed) = read_idempotent_transition(&tx, &request)? {
+            if let Some(replayed) = read_idempotent_root_transition(&tx, &request, approval)? {
                 tx.commit()?;
                 return Ok(replayed);
             }
@@ -699,7 +699,7 @@ impl<'a> LifecycleService<'a> {
             .store
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(replayed) = read_idempotent_transition(&tx, &request)? {
+        if let Some(replayed) = read_idempotent_root_transition(&tx, &request, approval)? {
             tx.commit()?;
             return Ok(replayed);
         }
@@ -1292,6 +1292,37 @@ fn read_idempotent_transition(
         desired_generation,
         replayed: true,
     }))
+}
+
+fn read_idempotent_root_transition(
+    tx: &Transaction<'_>,
+    request: &TransitionRequest,
+    approval: &HumanApproval,
+) -> Result<Option<TransitionOutcome>, LifecycleError> {
+    let Some(outcome) = read_idempotent_transition(tx, request)? else {
+        return Ok(None);
+    };
+    let exact_approval_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM skill_lifecycle_approvals
+          WHERE approval_id = ?1
+            AND skill_id = ?2
+            AND approval_kind = 'phase5_root_activation'
+            AND actor_id = ?3
+            AND artifact_row_version = ?4
+            AND evaluation_report_id = ?5",
+        params![
+            approval.approval_id,
+            request.skill_id,
+            approval.actor_id,
+            approval.expected_row_version,
+            approval.evaluation_report_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if exact_approval_count != 1 {
+        return Err(LifecycleError::IdempotencyConflict);
+    }
+    Ok(Some(outcome))
 }
 
 fn validate_lineage(
