@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::extras::js::audit::EffectAudit;
 use crate::extras::js::broker::{
     GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant,
 };
@@ -16,6 +17,7 @@ use crate::extras::js::tool::PermissionBridgeOwner;
 use crate::extras::js::types::{
     EffectServiceError, PermCancellation, WRITE_FILE_MAX_BYTES, canonical_spawn_permission_subject,
 };
+use crate::paths::AppPaths;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 use crate::sandbox::Sandbox;
@@ -28,6 +30,23 @@ impl TestDirectory {
             std::env::temp_dir().join(format!("mini-agent-effects-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create effect-service test directory");
         Self(path)
+    }
+
+    fn audit(&self, tag: &str) -> EffectAudit {
+        let root = self.0.join(format!("audit-{tag}"));
+        EffectAudit::open(
+            AppPaths {
+                config_dir: root.join("config"),
+                data_dir: root.join("data"),
+                local_data_dir: root.join("local"),
+                state_dir: root.join("state"),
+                cache_dir: root.join("cache"),
+                credentials_dir: root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap()
     }
 }
 
@@ -190,6 +209,7 @@ async fn worker_effect_services_real_broker_prepares_then_executes_exact_target(
         vec![grant],
         BTreeSet::from([HostCapability::ReadFile]),
         service,
+        Arc::new(Mutex::new(directory.audit("read"))),
     )
     .unwrap();
 
@@ -235,6 +255,7 @@ async fn worker_effect_services_real_broker_prepares_then_executes_exact_target(
         vec![grant],
         BTreeSet::from([HostCapability::WriteFile]),
         service,
+        Arc::new(Mutex::new(directory.audit("write"))),
     )
     .unwrap();
     assert_eq!(
@@ -295,6 +316,7 @@ async fn worker_effect_services_broker_rejects_unavailable_spawn_before_prompt()
         vec![grant],
         BTreeSet::from([HostCapability::Spawn]),
         service,
+        Arc::new(Mutex::new(directory.audit("spawn-backend"))),
     )
     .unwrap();
     assert_eq!(

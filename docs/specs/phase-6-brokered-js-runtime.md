@@ -279,6 +279,29 @@ previous-record hash. It contains no source, prompt, argument or file content, r
 environment value, credential, secret, raw filesystem path, URL user information, URL path/query,
 or command argument.
 
+The broker owns one closed ordering for every typed operation:
+
+1. validate the worker request and parent invocation/grant identity;
+2. intersect the live grant with session policy, validate and authorize the exact target, and
+   retain the prepared parent target;
+3. derive redacted metadata from that prepared target, append the intent, and successfully sync it;
+4. execute the prepared effect exactly once;
+5. append and sync a bounded completion or explicit `outcome_unknown` record; and
+6. only then return the effect response to the worker.
+
+Wire effect ordinals are zero-based. Audit sequences are the checked, one-based representation of
+those ordinals, while replay identity is derived from the parent invocation identity plus the
+original ordinal. A repeated invocation/ordinal pair is denied before execution. Validation,
+grant/session/target authorization, audit append, or audit sync failure executes no effect. A
+completion append/sync failure returns the closed audit operational error, retires the invocation,
+and leaves the already-durable intent available for conservative `outcome_unknown` recovery; it
+never retries the effect. The audit writer is shared by parent brokers behind one exclusive
+process-local lock, matching the single private on-disk writer.
+
+Grant expiry remains a lease boundary while waiting for that shared writer. The broker rechecks
+expiry after acquiring the audit lock and before appending intent, so a grant that expires under
+writer contention cannot reach either the audit or the effect backend.
+
 Target correlation uses HMAC-SHA-256 with a dedicated parent-only audit key and an explicit
 metadata allow-list; plain unkeyed hashes are forbidden because paths and URLs are often guessable.
 Each tag covers a length-prefixed, domain-separated tuple of operation, metadata kind, and canonical
@@ -288,7 +311,10 @@ fetch record stores only method, normalized scheme/effective port, one target ta
 normalized host, and a separate target tag for the canonical path and query; host labels, query
 names, and query values are never stored in plaintext.
 A command record stores its operation and a keyed digest of the resolved executable, with no
-arguments or environment. Redirect targets receive independent records. The target-correlation
+arguments or environment. Redirect targets require independent records. Brokered fetch currently
+fails closed after the first response and before a redirected second send until independent-hop
+records are implemented; the direct legacy fetch mode may still follow its separately authorized
+redirect policy. The target-correlation
 digest is separate from the audit chain hash, is domain-separated by operation and metadata type,
 and supports equality correlation only; it cannot be used as authorization or reversed to recover
 the target.
