@@ -2,7 +2,7 @@
 
 use crate::extras::js::skills::store::SkillStore;
 use crate::extras::js::skills::{
-    CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
+    CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
 };
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -85,7 +85,7 @@ fn readonly_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
             signature: "() => string".to_string(),
         }],
         vec!["readConfig() === true".to_string()],
-        CapabilityManifest::new(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])?,
+        test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile])?,
     )?)
 }
 
@@ -100,7 +100,7 @@ fn sideeffecting_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
             signature: "() => object".to_string(),
         }],
         vec!["typeof deploy() === 'string'".to_string()],
-        CapabilityManifest::new(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])?,
+        test_manifest(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])?,
     )?)
 }
 
@@ -164,8 +164,8 @@ fn insert_schema_v1_artifact(
         })
         .collect::<Vec<_>>();
     let capability = serde_json::json!({
-        "tier": skill.capability.tier.as_token(),
-        "allowed_hosts": skill.capability.allowed_hosts.iter().map(|host| host.as_token()).collect::<Vec<_>>(),
+        "abi_version": skill.abi_version,
+        "manifest": skill.capability,
     });
     db.execute(
         "INSERT INTO skill_revisions (
@@ -388,10 +388,8 @@ fn test_list_retrievable_only_active() -> Result<(), Box<dyn std::error::Error>>
                 .collect::<Vec<_>>()
         ))?;
         let capability_json = serde_json::to_string(&serde_json::json!({
-            "tier": skill3.capability.tier.as_token(),
-            "allowed_hosts": skill3.capability.allowed_hosts.iter()
-                .map(|h| h.as_token())
-                .collect::<Vec<_>>()
+            "abi_version": skill3.abi_version,
+            "manifest": skill3.capability,
         }))?;
 
         store.conn_mut().execute(
@@ -600,10 +598,7 @@ fn test_capability_persistence() -> Result<(), Box<dyn std::error::Error>> {
 
         let retrieved = store.get(&skill.id)?.expect("Skill not found");
         assert_eq!(retrieved.capability.tier, original_capabilities.tier);
-        assert_eq!(
-            retrieved.capability.allowed_hosts,
-            original_capabilities.allowed_hosts
-        );
+        assert_eq!(retrieved.capability.grants, original_capabilities.grants);
     }
 
     // Clean up.
@@ -652,7 +647,7 @@ fn test_capability_manifest_serialization() -> Result<(), Box<dyn std::error::Er
     let temp_dir = temp_app_paths();
     let paths = resolve_test_paths(&temp_dir)?;
 
-    let capability = CapabilityManifest::new(
+    let capability = test_manifest(
         CapabilityTier::SideEffecting,
         vec![
             HostCapability::ReadFile,
@@ -670,7 +665,7 @@ fn test_capability_manifest_serialization() -> Result<(), Box<dyn std::error::Er
             signature: "() => void".to_string(),
         }],
         vec!["test() === true".to_string()],
-        CapabilityManifest::new(
+        test_manifest(
             CapabilityTier::SideEffecting,
             vec![
                 HostCapability::ReadFile,
@@ -686,7 +681,7 @@ fn test_capability_manifest_serialization() -> Result<(), Box<dyn std::error::Er
 
         let retrieved = store.get(&skill.id)?.expect("Skill not found");
         assert_eq!(retrieved.capability.tier, capability.tier);
-        assert_eq!(retrieved.capability.allowed_hosts, capability.allowed_hosts);
+        assert_eq!(retrieved.capability.grants, capability.grants);
     }
 
     // Clean up.
@@ -791,7 +786,7 @@ fn test_schema_v1_to_v3_migration_preserves_rows_and_rebuilds_active_only_fts()
             store
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            4
+            5
         );
         assert_eq!(
             store
