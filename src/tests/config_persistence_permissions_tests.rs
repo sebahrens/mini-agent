@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::load::{atomic_config_write, parse_config_content, read_config_content};
+#[cfg(unix)]
+use crate::config::load::read_config_content;
+use crate::config::load::{atomic_config_write, parse_config_content};
 
 struct TempDir(PathBuf);
 

@@ -7,9 +7,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use crate::fs::atomic_write_within_sync;
 use crate::fs::{
     AtomicWriteCancellation, atomic_create_resolved_checked_cancellable, atomic_create_sync,
-    atomic_write, atomic_write_with_failure_sync, atomic_write_within_sync,
+    atomic_write, atomic_write_with_failure_sync,
 };
 
 /// A unique temp directory per call, removed on drop. Uniqueness (process id +

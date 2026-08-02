@@ -29,15 +29,17 @@ use crate::extras::js::skills::proposal::{
 use crate::extras::js::skills::proposal::{ProposalError, ProposalHost};
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::PermCancellation;
+#[cfg(any(test, feature = "sandbox"))]
+use crate::extras::js::types::STEP_TIMEOUT;
 use crate::extras::js::types::{
-    EffectServiceError, READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
+    EffectServiceError, READ_FILE_MAX_BYTES, SpawnResult, WRITE_FILE_MAX_BYTES,
     canonical_spawn_permission_subject, spawn_policy_input,
 };
-#[cfg(any(target_os = "linux", not(unix)))]
+#[cfg(target_os = "linux")]
 use crate::sandbox::SandboxCommand;
-use crate::sandbox::{
-    CommandCancellation, CommandLimits, CommandOutputLimit, CommandStatus, Sandbox, SandboxPolicy,
-};
+#[cfg(unix)]
+use crate::sandbox::{CommandCancellation, CommandLimits, CommandOutputLimit, CommandStatus};
+use crate::sandbox::{Sandbox, SandboxPolicy};
 #[cfg(feature = "sandbox")]
 use reqwest::Url;
 #[cfg(feature = "sandbox")]
@@ -2866,14 +2868,24 @@ impl SpawnEffectService {
         .await
     }
 
+    #[cfg(not(unix))]
     async fn execute_prepared(
         &self,
         prepared: PreparedSpawnEffect,
         bridge: PermissionBridge,
     ) -> Result<SpawnResult, EffectServiceError> {
         prepared.revalidate()?;
-        #[cfg(not(unix))]
-        let command: SandboxCommand = return Err(EffectServiceError::BackendFailure);
+        let _ = bridge;
+        Err(EffectServiceError::BackendFailure)
+    }
+
+    #[cfg(unix)]
+    async fn execute_prepared(
+        &self,
+        prepared: PreparedSpawnEffect,
+        bridge: PermissionBridge,
+    ) -> Result<SpawnResult, EffectServiceError> {
+        prepared.revalidate()?;
 
         #[cfg(target_os = "linux")]
         let command = match &prepared.target {

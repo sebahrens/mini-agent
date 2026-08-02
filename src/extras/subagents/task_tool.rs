@@ -251,7 +251,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     ),
                 )
                 .await;
-                let mut run = match result {
+                let run = match result {
                     Ok(run) => run,
                     Err(_) => {
                         let output = Err("timeout: subagent exceeded 300s".to_string());
@@ -261,6 +261,9 @@ editing in a known location, grepping for a literal you will act on immediately.
                         };
                     }
                 };
+
+                #[cfg(feature = "hooks")]
+                let mut run = run;
 
                 #[cfg(feature = "hooks")]
                 if let Ok(response) = run.response.as_ref()
