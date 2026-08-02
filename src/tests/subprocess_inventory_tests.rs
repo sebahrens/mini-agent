@@ -1167,6 +1167,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-BROKER-JS-WORKER",
     ),
+    ("src/sandbox/worker/windows.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker/windows.rs",
+        "Command::new(executable)",
+        1,
+        "TEST-ONLY",
+    ),
     ("src/session/mod.rs", ".output()", 1, "TC-INTERNAL-GIT"),
     (
         "src/session/mod.rs",
@@ -2466,6 +2473,13 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "let mut command = Command::new(bwrap);",
         1,
         "TC-BROKER-JS-WORKER",
+    ),
+    ("src/sandbox/worker/windows.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker/windows.rs",
+        "Command::new(executable)",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/ui/app.rs",

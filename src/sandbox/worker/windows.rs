@@ -165,7 +165,7 @@ pub(super) struct WorkerChild {
 enum WorkerChildInner {
     Contained {
         process: WinHandle,
-        job: WinHandle,
+        job: Option<WinHandle>,
         process_id: u32,
         status: Option<ExitStatus>,
     },
@@ -178,7 +178,7 @@ impl WorkerChild {
         Self {
             inner: WorkerChildInner::Contained {
                 process,
-                job,
+                job: Some(job),
                 process_id,
                 status: None,
             },
@@ -203,6 +203,9 @@ impl WorkerChild {
     pub(super) fn terminate_tree(&mut self) -> io::Result<()> {
         match &mut self.inner {
             WorkerChildInner::Contained { job, .. } => {
+                let job = job
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("JavaScript worker Job was already closed"))?;
                 // SAFETY: `job` is the directly owned creation-time Job for this worker. The
                 // call terminates every member synchronously and does not retain the handle.
                 if unsafe { TerminateJobObject(job.raw(), 1) } == 0 {
@@ -213,6 +216,33 @@ impl WorkerChild {
             #[cfg(test)]
             WorkerChildInner::Unconfined(child) => child.kill(),
         }
+    }
+
+    #[cfg(test)]
+    fn runtime_controls_match(&self) -> Result<(), feasibility::GateError> {
+        let WorkerChildInner::Contained { process, job, .. } = &self.inner else {
+            return Err(feasibility::GateError(
+                "Windows containment probe received an uncontained child".to_string(),
+            ));
+        };
+        let job = job.as_ref().ok_or_else(|| {
+            feasibility::GateError("Windows containment Job was already closed".to_string())
+        })?;
+        feasibility::verify_runtime_controls(process, job)
+    }
+
+    #[cfg(test)]
+    fn close_job_for_probe(&mut self) -> Result<(), feasibility::GateError> {
+        let WorkerChildInner::Contained { job, .. } = &mut self.inner else {
+            return Err(feasibility::GateError(
+                "Windows containment probe received an uncontained child".to_string(),
+            ));
+        };
+        let job = job.take().ok_or_else(|| {
+            feasibility::GateError("Windows containment Job was already closed".to_string())
+        })?;
+        drop(job);
+        Ok(())
     }
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -285,18 +315,21 @@ fn process_exit_status(process: &WinHandle) -> io::Result<ExitStatus> {
 #[allow(dead_code)]
 mod feasibility {
     use super::{WinHandle, WorkerChild, close_unowned_handle};
-    use crate::process_creation::CreationGuard;
+    use crate::process_creation::{CreationGuard, StdCommandCreationExt};
     use crate::sandbox::worker::{
         INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, WorkerBackend, WorkerProcess,
     };
     use std::ffi::{OsStr, c_void};
     use std::fmt;
     use std::fs::{File, OpenOptions};
-    use std::io::{self, Read, Write};
+    use std::io::{self, BufRead, BufReader, Read, Write};
     use std::mem::{size_of, size_of_val};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::{AsRawHandle, AsRawSocket};
     use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitStatus};
     use std::ptr::{null, null_mut};
     use std::time::Duration;
 
@@ -336,26 +369,36 @@ mod feasibility {
         STD_OUTPUT_HANDLE,
     };
     use windows_sys::Win32::System::JobObjects::{
-        CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
-        JobObjectExtendedLimitInformation, SetInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
+        JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAndIoAccountingInformation,
+        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        SetInformationJobObject,
     };
     use windows_sys::Win32::System::Memory::{
         GetProcessHeap, HEAP_ZERO_MEMORY, HeapAlloc, HeapFree,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::SystemServices::JOB_OBJECT_UILIMIT_ALL;
+    use windows_sys::Win32::System::SystemServices::{
+        PROCESS_MITIGATION_ASLR_POLICY, PROCESS_MITIGATION_DYNAMIC_CODE_POLICY,
+        PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY, PROCESS_MITIGATION_IMAGE_LOAD_POLICY,
+        PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY,
+    };
     use windows_sys::Win32::System::Threading::{
         CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-        GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-        OpenProcessToken, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+        GetExitCodeProcess, GetProcessMitigationPolicy, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+        PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
         PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
         PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-        STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ProcessASLRPolicy,
+        ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy, ProcessImageLoadPolicy,
+        ProcessSystemCallDisablePolicy, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
     use windows_sys::Win32::System::WindowsProgramming::{
         DRIVE_FIXED, PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
@@ -376,11 +419,24 @@ mod feasibility {
         | (1u64 << 60); // prefer System32 image resolution
     const CHILD_TEST_NAME: &str = "sandbox::worker::platform::tests::windows_lpac_gate_child";
     const INSTALLED_EXE_ENV: &str = "MINI_AGENT_LPAC_CARGO_INSTALL_EXE";
+    const PROTECTED_EXE_ENV: &str = "MINI_AGENT_LPAC_PROTECTED_EXE";
     const SENTINEL_ENV: &str = "MINI_AGENT_LPAC_SENTINEL";
     const CANARY_HANDLE_ENV: &str = "MINI_AGENT_LPAC_OMITTED_HANDLE";
     const READY_DENIED: &[u8] =
         b"MINI_AGENT_LPAC_READY_V2:LPAC:ZERO_CAPS:NO_CONSOLE:WORKSPACE_DENIED:HANDLE_LIST_EXACT\n";
     const READY_OPENED: &[u8] = b"MINI_AGENT_LPAC_READY_V1:AUTHORITY_LEAKED\n";
+    const CONTAINMENT_CHILD_TEST_NAME: &str =
+        "extras::js::tests::worker_containment::windows_containment_probe_child";
+    const PROTOCOL_CHILD_TEST_NAME: &str =
+        "extras::js::tests::worker_runtime::worker_bootstrap_test_child";
+    const CONTAINMENT_MARKER_VALUE: &str = "windows-containment-probe-v1";
+    const CONTAINMENT_READY: &[u8] = b"MINI_AGENT_WINDOWS_CONTAINMENT_PASS_V1\n";
+    const PROBE_WORKSPACE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_WORKSPACE";
+    const PROBE_SKILL_DATABASE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE";
+    const PROBE_FILE_HANDLE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE";
+    const PROBE_SOCKET_HANDLE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_SOCKET_HANDLE";
+    const PROBE_TCP_PORT_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_TCP_PORT";
+    const PROBE_UDP_PORT_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_UDP_PORT";
     const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
@@ -892,6 +948,12 @@ mod feasibility {
         dacl: *mut ACL,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct FileSecuritySnapshot {
+        owner: Vec<u8>,
+        dacl: Vec<u8>,
+    }
+
     fn read_file_security(path: &Path) -> Result<FileSecurity, GateError> {
         let path = wide_null(path.as_os_str())?;
         let mut owner = null_mut();
@@ -931,6 +993,75 @@ mod feasibility {
             owner,
             dacl,
         })
+    }
+
+    fn snapshot_file_security(security: &FileSecurity) -> Result<FileSecuritySnapshot, GateError> {
+        // SAFETY: `owner` is a validated SID inside the live owned security descriptor.
+        let owner_bytes = unsafe { GetLengthSid(security.owner) } as usize;
+        if owner_bytes == 0 {
+            return Err(last_error("measure path-owner SID"));
+        }
+        let mut information = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` is non-null and remains inside the live owned descriptor, while the
+        // initialized output buffer has the exact size required for this synchronous query.
+        if unsafe {
+            GetAclInformation(
+                security.dacl,
+                (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(last_error("measure path DACL"));
+        }
+        let dacl_bytes = information.AclBytesInUse as usize;
+        if dacl_bytes < size_of::<ACL>() {
+            return Err(GateError(
+                "path DACL snapshot was structurally truncated".to_string(),
+            ));
+        }
+        // SAFETY: both pointers and measured lengths refer to regions inside the live security
+        // descriptor; the bytes are copied before that descriptor can be dropped.
+        let owner = unsafe { std::slice::from_raw_parts(security.owner.cast::<u8>(), owner_bytes) }
+            .to_vec();
+        // SAFETY: same owned-descriptor lifetime and exact measured-byte argument as above.
+        let dacl =
+            unsafe { std::slice::from_raw_parts(security.dacl.cast::<u8>(), dacl_bytes) }.to_vec();
+        Ok(FileSecuritySnapshot { owner, dacl })
+    }
+
+    fn effective_file_rights(dacl: *mut ACL, sid: PSID) -> Result<u32, GateError> {
+        let trustee = trustee_for_sid(sid);
+        let mut rights = 0u32;
+        // SAFETY: the caller keeps the DACL and exact SID live through this synchronous query;
+        // GetEffectiveRightsFromAclW retains neither pointer.
+        let result = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+        if result != 0 {
+            return Err(win32_error("inspect effective file rights", result));
+        }
+        Ok(mapped_file_mask(rights))
+    }
+
+    fn verify_current_user_cannot_modify(
+        path: &Path,
+        policy: &SidPolicy,
+        require_non_owner: bool,
+    ) -> Result<FileSecuritySnapshot, GateError> {
+        let security = read_file_security(path)?;
+        if require_non_owner && sid_equal(security.owner, policy.user.as_psid()) {
+            return Err(GateError(
+                "protected negative control is owned by the current user".to_string(),
+            ));
+        }
+        let rights = effective_file_rights(security.dacl, policy.user.as_psid())?;
+        if dangerous_write_mask(rights) {
+            return Err(GateError(
+                "protected negative control is writable or deletable by the current user"
+                    .to_string(),
+            ));
+        }
+        snapshot_file_security(&security)
     }
 
     pub(super) fn mapped_file_mask(mask: u32) -> u32 {
@@ -1438,14 +1569,144 @@ mod feasibility {
 
     pub(super) struct ProductionLaunchHooks {
         fail_at: Option<ProductionFailurePoint>,
-        test_child: bool,
+        child: ProductionChild,
+        #[cfg(test)]
+        containment: Option<ContainmentProbeConfiguration>,
+        #[cfg(test)]
+        executable_override: Option<PathBuf>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProductionChild {
+        Worker,
+        FailureTest,
+        #[cfg(test)]
+        ContainmentTest,
+        #[cfg(test)]
+        ProtocolTest,
+    }
+
+    #[cfg(test)]
+    #[derive(Debug)]
+    pub(super) struct ContainmentProbeConfiguration {
+        workspace: PathBuf,
+        skill_database: PathBuf,
+        file_handle: HANDLE,
+        socket_handle: HANDLE,
+        file_canary: Option<File>,
+        socket_canary: Option<TcpListener>,
+        tcp_port: u16,
+        udp_port: u16,
+    }
+
+    #[cfg(test)]
+    struct ProbeCanaryInheritance {
+        handles: [HANDLE; 2],
+        _file_canary: Option<File>,
+        _socket_canary: Option<TcpListener>,
+        cleared: bool,
+    }
+
+    #[cfg(test)]
+    impl ProbeCanaryInheritance {
+        fn new(
+            configuration: Option<&mut ContainmentProbeConfiguration>,
+        ) -> Result<Self, GateError> {
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+            let Some(configuration) = configuration else {
+                return Ok(Self {
+                    handles: [null_mut(), null_mut()],
+                    _file_canary: None,
+                    _socket_canary: None,
+                    cleared: true,
+                });
+            };
+            let handles = [configuration.file_handle, configuration.socket_handle];
+            let mut armed = Self {
+                handles,
+                _file_canary: configuration.file_canary.take(),
+                _socket_canary: configuration.socket_canary.take(),
+                cleared: false,
+            };
+            if armed._file_canary.is_none() || armed._socket_canary.is_none() {
+                return Err(GateError(
+                    "Windows containment canary ownership was already transferred".to_string(),
+                ));
+            }
+            for (index, handle) in handles.into_iter().enumerate() {
+                if handle.is_null() || handle == (-1isize as HANDLE) {
+                    armed.clear_best_effort();
+                    return Err(GateError(format!(
+                        "Windows containment canary {index} is not a valid handle"
+                    )));
+                }
+                // SAFETY: `armed` owns both canary resources through the complete production
+                // launch. The shared creation lock is already held, and this call changes only
+                // the inheritance flag without retaining or closing the handle.
+                if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                    == 0
+                {
+                    armed.clear_best_effort();
+                    return Err(last_error("mark omitted containment canary inheritable"));
+                }
+            }
+            armed.cleared = false;
+            Ok(armed)
+        }
+
+        fn clear(&mut self) -> Result<(), GateError> {
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+            if self.cleared {
+                return Ok(());
+            }
+            for handle in self.handles {
+                // SAFETY: each owned resource remains live, the creation lock remains held, and
+                // this call clears only its inheritance bit.
+                if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                    return Err(last_error("clear omitted containment-canary inheritance"));
+                }
+            }
+            self.cleared = true;
+            Ok(())
+        }
+
+        fn clear_best_effort(&mut self) {
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+            for handle in self.handles {
+                if !handle.is_null() && handle != (-1isize as HANDLE) {
+                    // SAFETY: Drop/error cleanup changes only the owned live handle's inherit bit
+                    // while the creation lock is still held. The owned resource closes
+                    // immediately afterward even if this best-effort clear fails.
+                    unsafe {
+                        SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                    }
+                }
+            }
+            self.cleared = true;
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ProbeCanaryInheritance {
+        fn drop(&mut self) {
+            if !self.cleared {
+                self.clear_best_effort();
+            }
+        }
     }
 
     impl ProductionLaunchHooks {
         pub(super) const fn production() -> Self {
             Self {
                 fail_at: None,
-                test_child: false,
+                child: ProductionChild::Worker,
+                #[cfg(test)]
+                containment: None,
+                #[cfg(test)]
+                executable_override: None,
             }
         }
 
@@ -1453,7 +1714,42 @@ mod feasibility {
         pub(super) const fn fail_at(point: ProductionFailurePoint) -> Self {
             Self {
                 fail_at: Some(point),
-                test_child: true,
+                child: ProductionChild::FailureTest,
+                containment: None,
+                executable_override: None,
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn containment(
+            configuration: ContainmentProbeConfiguration,
+            executable: PathBuf,
+        ) -> Self {
+            Self {
+                fail_at: None,
+                child: ProductionChild::ContainmentTest,
+                containment: Some(configuration),
+                executable_override: Some(executable),
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn protocol_test(executable: PathBuf) -> Self {
+            Self {
+                fail_at: None,
+                child: ProductionChild::ProtocolTest,
+                containment: None,
+                executable_override: Some(executable),
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn installed_worker(executable: PathBuf) -> Self {
+            Self {
+                fail_at: None,
+                child: ProductionChild::Worker,
+                containment: None,
+                executable_override: Some(executable),
             }
         }
 
@@ -1727,6 +2023,23 @@ mod feasibility {
                 .map_err(|error| GateError(format!("sync workspace sentinel: {error}")))?;
             Ok(Self(path))
         }
+
+        fn skill_database_file() -> Result<Self, GateError> {
+            let path = std::env::temp_dir().join(format!(
+                "mini-agent-lpac-skill-database-sentinel-{}.sqlite3",
+                std::process::id()
+            ));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|error| GateError(format!("create skill database sentinel: {error}")))?;
+            file.write_all(b"LPAC must not read or write this skill database sentinel")
+                .map_err(|error| GateError(format!("write skill database sentinel: {error}")))?;
+            file.sync_all()
+                .map_err(|error| GateError(format!("sync skill database sentinel: {error}")))?;
+            Ok(Self(path))
+        }
     }
 
     impl Drop for Sentinel {
@@ -1922,11 +2235,11 @@ mod feasibility {
                 GateError("LOCALAPPDATA is required for the archive case".to_string())
             })?;
         let directories = [
-            build_parent.join(format!(".mini-agent-lpac-containment-build-{suffix}")),
-            install_parent.join(format!(".mini-agent-lpac-containment-install-{suffix}")),
-            archive_root.join(format!("mini-agent-lpac-containment-archive-{suffix}")),
-            install_parent.join(format!(".mini-agent-lpac-image-install-{suffix}")),
-            archive_root.join(format!("mini-agent-lpac-image-archive-{suffix}")),
+            build_parent.join(format!(".mini agent λ lpac containment build {suffix}")),
+            install_parent.join(format!(".mini agent λ lpac containment install {suffix}")),
+            archive_root.join(format!("mini agent λ lpac containment archive {suffix}")),
+            install_parent.join(format!(".mini agent λ lpac image install {suffix}")),
+            archive_root.join(format!("mini agent λ lpac image archive {suffix}")),
         ];
 
         Ok(artifact_contracts()
@@ -1999,25 +2312,70 @@ mod feasibility {
             .map_err(|_| GateError(format!("{label} reader panicked")))?
     }
 
-    fn production_command_line(executable: &Path, test_child: bool) -> Result<Vec<u16>, GateError> {
+    fn production_command_line(
+        executable: &Path,
+        child: ProductionChild,
+    ) -> Result<Vec<u16>, GateError> {
         let display = executable.as_os_str().to_string_lossy();
         if display.contains('"') {
             return Err(GateError(
                 "Windows worker executable path contains a quote".to_string(),
             ));
         }
-        let arguments = if test_child {
-            " --exact sandbox::worker::platform::tests::windows_production_failure_child --nocapture --test-threads=1"
-        } else {
-            ""
+        let arguments = match child {
+            ProductionChild::Worker => "".to_string(),
+            ProductionChild::FailureTest => " --exact sandbox::worker::platform::tests::windows_production_failure_child --nocapture --test-threads=1".to_string(),
+            #[cfg(test)]
+            ProductionChild::ContainmentTest => format!(
+                " --exact {CONTAINMENT_CHILD_TEST_NAME} --nocapture --test-threads=1"
+            ),
+            #[cfg(test)]
+            ProductionChild::ProtocolTest => format!(
+                " --exact {PROTOCOL_CHILD_TEST_NAME} --nocapture --test-threads=1"
+            ),
         };
         Ok(wide_string(&format!("\"{display}\"{arguments}")))
     }
 
-    fn production_environment_block() -> Result<Vec<u16>, GateError> {
-        let mut entries = vec![format!(
-            "{INTERNAL_WORKER_MARKER}={INTERNAL_WORKER_MARKER_VALUE}"
-        )];
+    fn production_environment_block(hooks: &ProductionLaunchHooks) -> Result<Vec<u16>, GateError> {
+        let marker = match hooks.child {
+            ProductionChild::Worker | ProductionChild::FailureTest => INTERNAL_WORKER_MARKER_VALUE,
+            #[cfg(test)]
+            ProductionChild::ContainmentTest => CONTAINMENT_MARKER_VALUE,
+            #[cfg(test)]
+            ProductionChild::ProtocolTest => INTERNAL_WORKER_MARKER_VALUE,
+        };
+        let mut entries = vec![format!("{INTERNAL_WORKER_MARKER}={marker}")];
+        #[cfg(test)]
+        if let Some(probe) = &hooks.containment {
+            for (name, value) in [
+                (
+                    PROBE_WORKSPACE_ENV,
+                    probe.workspace.to_string_lossy().into_owned(),
+                ),
+                (
+                    PROBE_SKILL_DATABASE_ENV,
+                    probe.skill_database.to_string_lossy().into_owned(),
+                ),
+                (
+                    PROBE_FILE_HANDLE_ENV,
+                    (probe.file_handle as usize).to_string(),
+                ),
+                (
+                    PROBE_SOCKET_HANDLE_ENV,
+                    (probe.socket_handle as usize).to_string(),
+                ),
+                (PROBE_TCP_PORT_ENV, probe.tcp_port.to_string()),
+                (PROBE_UDP_PORT_ENV, probe.udp_port.to_string()),
+            ] {
+                if value.contains('\0') || value.contains('=') {
+                    return Err(GateError(format!(
+                        "{name} cannot enter the probe environment"
+                    )));
+                }
+                entries.push(format!("{name}={value}"));
+            }
+        }
         // SystemRoot is non-secret loader configuration required by Windows system DLL
         // resolution. No PATH, profile, credential, workspace, or application variable crosses.
         if let Some(system_root) = std::env::var_os("SystemRoot") {
@@ -2039,13 +2397,21 @@ mod feasibility {
         Ok(block)
     }
 
+    fn production_executable(hooks: &ProductionLaunchHooks) -> Result<PathBuf, GateError> {
+        #[cfg(test)]
+        if let Some(executable) = &hooks.executable_override {
+            return Ok(executable.clone());
+        }
+        std::env::current_exe()
+            .map_err(|error| GateError(format!("resolve current executable: {error}")))
+    }
+
     pub(super) fn production_preflight() -> Result<(), GateError> {
         let hooks = ProductionLaunchHooks::production();
         hooks.checkpoint(ProductionFailurePoint::CreateProfile)?;
         let profile = AppContainerProfile::production_zero_capability()?;
         hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
-        let executable = std::env::current_exe()
-            .map_err(|error| GateError(format!("resolve current executable: {error}")))?;
+        let executable = production_executable(&hooks)?;
         let policy = SidPolicy::current()?;
         let (_executable, _location, image_lock) =
             prepare_executable_acl(&executable, profile.sid, &policy)?;
@@ -2107,18 +2473,19 @@ mod feasibility {
     }
 
     pub(super) fn launch_production(
-        hooks: ProductionLaunchHooks,
+        mut hooks: ProductionLaunchHooks,
     ) -> Result<WorkerProcess, GateError> {
         hooks.checkpoint(ProductionFailurePoint::CreateProfile)?;
         let profile = AppContainerProfile::production_zero_capability()?;
         hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
-        let executable = std::env::current_exe()
-            .map_err(|error| GateError(format!("resolve current executable: {error}")))?;
+        let executable = production_executable(&hooks)?;
         let policy = SidPolicy::current()?;
         let (executable, _location, image_lock) =
             prepare_executable_acl(&executable, profile.sid, &policy)?;
         let inheritance_guard = crate::process_creation::creation_guard()?;
         let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
+        #[cfg(test)]
+        let mut probe_canary_inheritance = ProbeCanaryInheritance::new(hooks.containment.as_mut())?;
         let job = production_job(&hooks)?;
 
         let security_capabilities = SECURITY_CAPABILITIES {
@@ -2161,8 +2528,8 @@ mod feasibility {
             .parent()
             .ok_or_else(|| GateError("worker executable has no parent directory".to_string()))?;
         let child_directory_wide = wide_null(child_directory.as_os_str())?;
-        let mut command_line = production_command_line(&executable, hooks.test_child)?;
-        let environment = production_environment_block()?;
+        let mut command_line = production_command_line(&executable, hooks.child)?;
+        let environment = production_environment_block(&hooks)?;
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -2194,6 +2561,12 @@ mod feasibility {
         } == 0
         {
             return Err(last_error("create zero-capability LPAC JavaScript worker"));
+        }
+        #[cfg(test)]
+        if let Err(error) = probe_canary_inheritance.clear() {
+            close_unowned_handle(process_information.hProcess);
+            close_unowned_handle(process_information.hThread);
+            return Err(error);
         }
         #[cfg(test)]
         LAST_PRODUCTION_TEST_PID.store(
@@ -2334,6 +2707,444 @@ mod feasibility {
             (Err(gate), Err(cleanup)) => Err(GateError(format!(
                 "{gate}; AppContainer profile cleanup also failed: {cleanup}"
             ))),
+        }
+    }
+
+    pub(super) fn run_protected_install_negative_control() -> Result<(), GateError> {
+        let profile = AppContainerProfile::stable_zero_capability()?;
+        let result = (|| {
+            let policy = SidPolicy::current()?;
+            verify_protected_install_fails_closed(profile.sid, &policy)
+        })();
+        let cleanup = profile.finish();
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(gate), Err(cleanup)) => Err(GateError(format!(
+                "{gate}; AppContainer profile cleanup also failed: {cleanup}"
+            ))),
+        }
+    }
+
+    fn verify_protected_install_fails_closed(
+        appcontainer_sid: PSID,
+        policy: &SidPolicy,
+    ) -> Result<(), GateError> {
+        let protected = std::env::var_os(PROTECTED_EXE_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                GateError(format!(
+                    "{PROTECTED_EXE_ENV} must name the protected machine-wide negative-control image"
+                ))
+            })?;
+        reject_unc_or_remote_syntax(&protected)?;
+        reject_reparse_components(&protected)?;
+        let protected = std::fs::canonicalize(&protected).map_err(|error| {
+            GateError(format!(
+                "canonicalize protected machine-wide negative control: {error}"
+            ))
+        })?;
+        if classify_install_location(&protected) != InstallLocation::ProtectedMachineWide {
+            return Err(GateError(format!(
+                "{PROTECTED_EXE_ENV} is not beneath a protected machine-wide root"
+            )));
+        }
+        let before = verify_current_user_cannot_modify(&protected, policy, true)?;
+        let parent = protected.parent().ok_or_else(|| {
+            GateError("protected machine-wide control has no parent directory".to_string())
+        })?;
+        verify_current_user_cannot_modify(parent, policy, false)?;
+        match OpenOptions::new().write(true).open(&protected) {
+            Ok(_) => {
+                return Err(GateError(
+                    "protected negative control accepted a current-user write handle".to_string(),
+                ));
+            }
+            Err(error) if access_was_denied(&error) => {}
+            Err(error) => {
+                return Err(GateError(format!(
+                    "protected negative-control write probe failed ambiguously: {error}"
+                )));
+            }
+        }
+        let error = prepare_executable_acl(&protected, appcontainer_sid, policy)
+            .expect_err("protected machine-wide image must fail closed before ACL mutation");
+        if !error.0.contains("ProtectedMachineWide") {
+            return Err(GateError(format!(
+                "protected machine-wide image failed for an unrelated reason: {error}"
+            )));
+        }
+        let after = snapshot_file_security(&read_file_security(&protected)?)?;
+        if before != after {
+            return Err(GateError(
+                "protected machine-wide negative-control owner or DACL changed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_production_containment_probe() -> Result<(), GateError> {
+        let _nested_parent_job = ensure_compatible_parent_job()?;
+
+        for specification in artifact_matrix()? {
+            let policy = SidPolicy::current()?;
+            let source_lock = validate_source_artifact(
+                &specification.source,
+                specification.source_expected,
+                &policy,
+            )?;
+            let artifact = DisposableArtifact::copy_into(
+                &specification.source,
+                source_lock,
+                specification.directory,
+                specification.destination_expected,
+                specification.probe,
+            )?;
+            let probe = match artifact.probe {
+                ProbeKind::Harness => {
+                    run_single_production_containment(artifact.executable.clone()).and_then(|()| {
+                        run_production_protocol_round_trip(ProductionLaunchHooks::protocol_test(
+                            artifact.executable.clone(),
+                        ))
+                    })
+                }
+                ProbeKind::ImageLoadingOnly => run_production_protocol_round_trip(
+                    ProductionLaunchHooks::installed_worker(artifact.executable.clone()),
+                ),
+            };
+            let cleanup = artifact.cleanup();
+            match (probe, cleanup) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+                (Err(probe), Err(cleanup)) => {
+                    return Err(GateError(format!(
+                        "{probe}; disposable artifact cleanup also failed: {cleanup}"
+                    )));
+                }
+            }
+        }
+
+        eprintln!(
+            "WINDOWS_CONTAINMENT_PASS backend=lpac job_close=pass nested_parent_job=pass protocol=pass"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn run_single_production_containment(executable: PathBuf) -> Result<(), GateError> {
+        let workspace = Sentinel::workspace_file()?;
+        let skill_database = Sentinel::skill_database_file()?;
+        let file_canary = File::open(&workspace.0)
+            .map_err(|error| GateError(format!("open omitted file-handle canary: {error}")))?;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| GateError(format!("bind TCP denial canary: {error}")))?;
+        let udp_listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| GateError(format!("bind UDP denial canary: {error}")))?;
+        let tcp_port = tcp_listener
+            .local_addr()
+            .map_err(|error| GateError(format!("read TCP denial port: {error}")))?
+            .port();
+        let udp_port = udp_listener
+            .local_addr()
+            .map_err(|error| GateError(format!("read UDP denial port: {error}")))?
+            .port();
+        let configuration = ContainmentProbeConfiguration {
+            workspace: workspace.0.clone(),
+            skill_database: skill_database.0.clone(),
+            file_handle: file_canary.as_raw_handle(),
+            socket_handle: tcp_listener.as_raw_socket() as HANDLE,
+            file_canary: Some(file_canary),
+            socket_canary: Some(tcp_listener),
+            tcp_port,
+            udp_port,
+        };
+
+        let mut process = launch_production(ProductionLaunchHooks::containment(
+            configuration,
+            executable,
+        ))?;
+        let readiness = process
+            .output
+            .try_clone()
+            .map_err(|error| GateError(format!("clone containment readiness pipe: {error}")))?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            sender.send(read_fixed_containment_ready(readiness)).ok();
+        });
+        let readiness = receiver
+            .recv_timeout(CHILD_TIMEOUT)
+            .map_err(|_| GateError("Windows containment readiness timed out".to_string()))??;
+        if readiness != CONTAINMENT_READY {
+            return Err(GateError(
+                "Windows containment child emitted no fixed pass frame".to_string(),
+            ));
+        }
+        reader
+            .join()
+            .map_err(|_| GateError("Windows containment readiness reader panicked".to_string()))?;
+
+        process.process.runtime_controls_match()?;
+        process.process.close_job_for_probe()?;
+        let status = wait_for_worker_exit_after_job_close(&mut process)?;
+        let job_close_kills_worker = !status.success();
+        if !job_close_kills_worker {
+            return Err(GateError(
+                "closing the kill-on-close Job did not terminate the worker".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn ensure_compatible_parent_job() -> Result<Option<WinHandle>, GateError> {
+        let mut in_job = 0;
+        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle, null queries any Job, and
+        // the initialized BOOL output is live for the synchronous call.
+        if unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } == 0 {
+            return Err(last_error("query nested parent Job membership"));
+        }
+        if in_job != 0 {
+            return Ok(None);
+        }
+
+        let job = WinHandle::from_created(
+            // SAFETY: null attributes and name create one private Job whose sole owned handle is
+            // transferred immediately to WinHandle.
+            unsafe { CreateJobObjectW(null(), null()) },
+            "create compatible outer containment-probe Job",
+        )?;
+        // SAFETY: the Job is directly owned and live, while GetCurrentProcess returns the valid
+        // borrowed pseudo-handle for this test process. The call retains the process membership,
+        // not either handle value.
+        if unsafe { AssignProcessToJobObject(job.raw(), GetCurrentProcess()) } == 0 {
+            return Err(last_error(
+                "assign containment-probe parent to compatible outer Job",
+            ));
+        }
+        let mut in_exact_job = 0;
+        // SAFETY: both handles remain live and the initialized BOOL is writable for the call.
+        if unsafe { IsProcessInJob(GetCurrentProcess(), job.raw(), &mut in_exact_job) } == 0 {
+            return Err(last_error("verify compatible outer Job membership"));
+        }
+        if in_exact_job == 0 {
+            return Err(GateError(
+                "containment-probe parent escaped its compatible outer Job".to_string(),
+            ));
+        }
+        Ok(Some(job))
+    }
+
+    #[cfg(test)]
+    fn read_fixed_containment_ready(output: File) -> Result<&'static [u8], GateError> {
+        let mut reader = BufReader::new(output);
+        let mut observed = 0usize;
+        loop {
+            let mut line = Vec::new();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| GateError(format!("read containment readiness: {error}")))?;
+            if read == 0 {
+                return Err(GateError(
+                    "Windows containment child exited before readiness".to_string(),
+                ));
+            }
+            observed = observed.saturating_add(read);
+            if observed > 64 * 1024 {
+                return Err(GateError(
+                    "Windows containment readiness preamble exceeded 64 KiB".to_string(),
+                ));
+            }
+            if line
+                .windows(CONTAINMENT_READY.len())
+                .any(|window| window == CONTAINMENT_READY)
+            {
+                return Ok(CONTAINMENT_READY);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_worker_exit_after_job_close(
+        process: &mut WorkerProcess,
+    ) -> Result<ExitStatus, GateError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = process
+                .try_wait()
+                .map_err(|error| GateError(format!("poll Job-close worker exit: {error}")))?
+            {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(GateError(
+                    "Job close did not reap the Windows worker within five seconds".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(test)]
+    fn read_worker_frame_after_preamble(
+        input: &mut impl Read,
+    ) -> Result<crate::extras::js::protocol::WorkerWireFrame, GateError> {
+        let mut preamble = Vec::new();
+        let mut window = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            input
+                .read_exact(&mut byte)
+                .map_err(|error| GateError(format!("read Windows worker frame: {error}")))?;
+            window.push(byte[0]);
+            if window.len() < 5 {
+                continue;
+            }
+            let length =
+                u32::from_be_bytes(window[..4].try_into().expect("four-byte window")) as usize;
+            if length > 0
+                && length <= crate::extras::js::protocol::MAX_FRAME_BYTES
+                && window[4] == b'{'
+            {
+                let mut encoded = window[..5].to_vec();
+                let mut tail = vec![0u8; length - 1];
+                input.read_exact(&mut tail).map_err(|error| {
+                    GateError(format!("read Windows worker frame payload: {error}"))
+                })?;
+                encoded.extend_from_slice(&tail);
+                if let Ok(frame) = crate::extras::js::protocol::read_frame(&mut encoded.as_slice())
+                {
+                    return Ok(frame);
+                }
+            }
+            preamble.push(window.remove(0));
+            if preamble.len() > 4096 {
+                return Err(GateError(
+                    "Windows worker emitted an unbounded libtest preamble".to_string(),
+                ));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn read_worker_frame_bounded(
+        output: &File,
+    ) -> Result<crate::extras::js::protocol::WorkerWireFrame, GateError> {
+        let mut output = output
+            .try_clone()
+            .map_err(|error| GateError(format!("clone Windows worker output pipe: {error}")))?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(read_worker_frame_after_preamble(&mut output))
+                .ok();
+        });
+        let frame = receiver
+            .recv_timeout(CHILD_TIMEOUT)
+            .map_err(|_| GateError("Windows worker protocol read timed out".to_string()))??;
+        reader
+            .join()
+            .map_err(|_| GateError("Windows worker protocol reader panicked".to_string()))?;
+        Ok(frame)
+    }
+
+    #[cfg(test)]
+    fn run_production_protocol_round_trip(hooks: ProductionLaunchHooks) -> Result<(), GateError> {
+        use crate::extras::js::protocol::{
+            BuildIdentity, InvocationId, ParentFrame, ParentHello, ParentProtocol, RunStep,
+            StepOutcome, WireFrame, WorkerFrame, write_frame,
+        };
+
+        let mut process = launch_production(hooks)?;
+        process.process.runtime_controls_match()?;
+        let build = BuildIdentity::current();
+        let mut protocol = ParentProtocol::new(build.clone());
+        let hello = WireFrame::connection(build.clone(), 0, ParentFrame::Hello(ParentHello {}));
+        protocol
+            .on_send(&hello)
+            .map_err(|error| GateError(format!("validate Windows Hello: {error}")))?;
+        write_frame(&mut process.input, &hello)
+            .map_err(|error| GateError(format!("write Windows Hello: {error}")))?;
+        process
+            .input
+            .flush()
+            .map_err(|error| GateError(format!("flush Windows Hello: {error}")))?;
+        let ready = read_worker_frame_bounded(&process.output)?;
+        protocol
+            .on_receive(&ready)
+            .map_err(|error| GateError(format!("validate Windows Ready: {error}")))?;
+        if !matches!(ready.message, WorkerFrame::Ready(_)) {
+            return Err(GateError("Windows worker did not emit Ready".to_string()));
+        }
+
+        let invocation = InvocationId::new("windows-containment-protocol")
+            .map_err(|error| GateError(format!("construct Windows invocation: {error}")))?;
+        let step = WireFrame::invocation(
+            build.clone(),
+            invocation,
+            2,
+            ParentFrame::RunStep(RunStep::new("6 * 7".to_string())),
+        );
+        protocol
+            .on_send(&step)
+            .map_err(|error| GateError(format!("validate Windows RunStep: {error}")))?;
+        write_frame(&mut process.input, &step)
+            .map_err(|error| GateError(format!("write Windows RunStep: {error}")))?;
+        process
+            .input
+            .flush()
+            .map_err(|error| GateError(format!("flush Windows RunStep: {error}")))?;
+        let result = read_worker_frame_bounded(&process.output)?;
+        protocol
+            .on_receive(&result)
+            .map_err(|error| GateError(format!("validate Windows StepResult: {error}")))?;
+        let WorkerFrame::StepResult(result) = result.message else {
+            return Err(GateError(
+                "Windows worker returned no StepResult".to_string(),
+            ));
+        };
+        if result.outcome != StepOutcome::Value("42".to_string()) {
+            return Err(GateError(
+                "Windows worker protocol evaluation returned the wrong value".to_string(),
+            ));
+        }
+
+        let shutdown = WireFrame::connection(build, 4, ParentFrame::Shutdown);
+        protocol
+            .on_send(&shutdown)
+            .map_err(|error| GateError(format!("validate Windows Shutdown: {error}")))?;
+        write_frame(&mut process.input, &shutdown)
+            .map_err(|error| GateError(format!("write Windows Shutdown: {error}")))?;
+        process
+            .input
+            .flush()
+            .map_err(|error| GateError(format!("flush Windows Shutdown: {error}")))?;
+        let status = wait_for_protocol_worker_exit(&mut process)?;
+        if !status.success() {
+            return Err(GateError(
+                "Windows production protocol worker exited unsuccessfully".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn wait_for_protocol_worker_exit(process: &mut WorkerProcess) -> Result<ExitStatus, GateError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = process
+                .try_wait()
+                .map_err(|error| GateError(format!("poll Windows protocol worker: {error}")))?
+            {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(GateError(
+                    "Windows protocol worker did not exit within five seconds".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -2633,7 +3444,294 @@ mod feasibility {
         handles.iter().all(|handle| {
             let mut flags = 0u32;
             (unsafe { GetHandleInformation(*handle, &mut flags) }) != 0
-        })
+        }) && super::standard_streams_are_protocol_pipes()
+    }
+
+    fn access_was_denied(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 10013))
+    }
+
+    fn inherited_handle_is_invalid(name: &str) -> bool {
+        let Ok(value) = std::env::var(name) else {
+            return false;
+        };
+        let Ok(value) = value.parse::<usize>() else {
+            return false;
+        };
+        let mut flags = 0u32;
+        // SAFETY: `flags` is an initialized output slot. The numeric handle was supplied by the
+        // test parent and deliberately omitted from HANDLE_LIST; no ownership is assumed.
+        (unsafe { GetHandleInformation(value as HANDLE, &mut flags) }) == 0
+            // SAFETY: GetLastError is read immediately after the failed query and has no pointer
+            // or ownership effects.
+            && unsafe { GetLastError() } == ERROR_INVALID_HANDLE
+    }
+
+    fn mitigation_policy_matches_for_handle(process: HANDLE) -> bool {
+        fn query<T: Default>(process: HANDLE, policy: i32) -> Option<T> {
+            let mut value = T::default();
+            // SAFETY: `process` is a borrowed live process handle and `value` is an initialized
+            // output buffer of the exact type/size requested for this synchronous query. The
+            // function retains neither the handle nor the pointer.
+            if unsafe {
+                GetProcessMitigationPolicy(
+                    process,
+                    policy,
+                    (&mut value as *mut T).cast(),
+                    size_of::<T>(),
+                )
+            } == 0
+            {
+                return None;
+            }
+            Some(value)
+        }
+
+        let Some(aslr) = query::<PROCESS_MITIGATION_ASLR_POLICY>(process, ProcessASLRPolicy) else {
+            return false;
+        };
+        let Some(extension) = query::<PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY>(
+            process,
+            ProcessExtensionPointDisablePolicy,
+        ) else {
+            return false;
+        };
+        let Some(image) =
+            query::<PROCESS_MITIGATION_IMAGE_LOAD_POLICY>(process, ProcessImageLoadPolicy)
+        else {
+            return false;
+        };
+        let Some(dynamic_code) =
+            query::<PROCESS_MITIGATION_DYNAMIC_CODE_POLICY>(process, ProcessDynamicCodePolicy)
+        else {
+            return false;
+        };
+        let Some(system_calls) = query::<PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY>(
+            process,
+            ProcessSystemCallDisablePolicy,
+        ) else {
+            return false;
+        };
+        // SAFETY: these are the documented `Flags` members of initialized union values returned
+        // by GetProcessMitigationPolicy.
+        let aslr = unsafe { aslr.Anonymous.Flags };
+        // SAFETY: same initialized-union argument as above.
+        let extension = unsafe { extension.Anonymous.Flags };
+        // SAFETY: same initialized-union argument as above.
+        let image = unsafe { image.Anonymous.Flags };
+        // SAFETY: same initialized-union argument as above.
+        let dynamic_code = unsafe { dynamic_code.Anonymous.Flags };
+        // SAFETY: same initialized-union argument as above.
+        let system_calls = unsafe { system_calls.Anonymous.Flags };
+        aslr & 0b111 == 0b111
+            && extension & 0b1 == 0b1
+            && image & 0b111 == 0b111
+            && dynamic_code & 0b1 == 0
+            && system_calls & 0b1 == 0
+    }
+
+    fn mitigation_policy_matches() -> bool {
+        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle valid in this process.
+        mitigation_policy_matches_for_handle(unsafe { GetCurrentProcess() })
+    }
+
+    pub(super) fn verify_runtime_controls(
+        process: &WinHandle,
+        job: &WinHandle,
+    ) -> Result<(), GateError> {
+        let mut in_creation_job = 0;
+        // SAFETY: both handles are directly owned and live. This query retains neither.
+        if unsafe { IsProcessInJob(process.raw(), job.raw(), &mut in_creation_job) } == 0 {
+            return Err(last_error("verify exact creation-time Job membership"));
+        }
+        if in_creation_job == 0 {
+            return Err(GateError(
+                "worker escaped the exact creation-time Job".to_string(),
+            ));
+        }
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // SAFETY: the Job handle is live and `limits` is an initialized exact-size output buffer.
+        if unsafe {
+            QueryInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("query JavaScript worker Job limits"));
+        }
+        let required_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | JOB_OBJECT_LIMIT_PROCESS_TIME;
+        let creation_time_job_limits_match =
+            limits.BasicLimitInformation.LimitFlags & required_flags == required_flags
+                && limits.BasicLimitInformation.ActiveProcessLimit == 1
+                && limits.BasicLimitInformation.PerProcessUserTimeLimit == PROCESS_CPU_LIMIT_100NS
+                && limits.ProcessMemoryLimit == PROCESS_MEMORY_LIMIT_BYTES;
+        if !creation_time_job_limits_match {
+            return Err(GateError(
+                "creation-time Job limits differ from the reviewed policy".to_string(),
+            ));
+        }
+
+        let mut accounting = JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the Job handle is live and `accounting` is an initialized exact-size output.
+        if unsafe {
+            QueryInformationJobObject(
+                job.raw(),
+                JobObjectBasicAndIoAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("query single active JavaScript worker process"));
+        }
+        if accounting.BasicInfo.ActiveProcesses != 1 {
+            return Err(GateError(
+                "creation-time Job did not contain exactly one active process".to_string(),
+            ));
+        }
+
+        let mut ui = JOBOBJECT_BASIC_UI_RESTRICTIONS::default();
+        // SAFETY: the Job handle is live and `ui` is an initialized exact-size output buffer.
+        if unsafe {
+            QueryInformationJobObject(
+                job.raw(),
+                JobObjectBasicUIRestrictions,
+                (&mut ui as *mut JOBOBJECT_BASIC_UI_RESTRICTIONS).cast(),
+                size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("query JavaScript worker Job UI restrictions"));
+        }
+        if ui.UIRestrictionsClass != JOB_OBJECT_UILIMIT_ALL {
+            return Err(GateError(
+                "creation-time Job UI restrictions differ from the reviewed policy".to_string(),
+            ));
+        }
+        if !mitigation_policy_matches_for_handle(process.raw()) {
+            return Err(GateError(
+                "effective process mitigations differ from the reviewed policy".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn run_containment_child_probe() -> io::Result<()> {
+        let workspace = PathBuf::from(
+            std::env::var_os(PROBE_WORKSPACE_ENV)
+                .ok_or_else(|| io::Error::other("missing workspace sentinel probe metadata"))?,
+        );
+        let skill_database =
+            PathBuf::from(std::env::var_os(PROBE_SKILL_DATABASE_ENV).ok_or_else(|| {
+                io::Error::other("missing skill-database sentinel probe metadata")
+            })?);
+        let tcp_port = std::env::var(PROBE_TCP_PORT_ENV)
+            .map_err(|_| io::Error::other("missing TCP probe metadata"))?
+            .parse::<u16>()
+            .map_err(|_| io::Error::other("invalid TCP probe metadata"))?;
+        let udp_port = std::env::var(PROBE_UDP_PORT_ENV)
+            .map_err(|_| io::Error::other("missing UDP probe metadata"))?
+            .parse::<u16>()
+            .map_err(|_| io::Error::other("invalid UDP probe metadata"))?;
+
+        let workspace_read_denied =
+            File::open(&workspace).is_err_and(|error| access_was_denied(&error));
+        let workspace_write_denied = OpenOptions::new()
+            .append(true)
+            .open(&workspace)
+            .is_err_and(|error| access_was_denied(&error));
+        let skill_database_read_denied =
+            File::open(&skill_database).is_err_and(|error| access_was_denied(&error));
+        let skill_database_write_denied = OpenOptions::new()
+            .append(true)
+            .open(&skill_database)
+            .is_err_and(|error| access_was_denied(&error));
+        let credential_environment_absent = [
+            "PATH",
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AZURE_CLIENT_SECRET",
+            "GITHUB_TOKEN",
+            "MINI_AGENT_CONFIG",
+            "MINI_AGENT_WORKSPACE",
+        ]
+        .into_iter()
+        .all(|name| std::env::var_os(name).is_none());
+
+        let tcp_address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_port));
+        let tcp_denied = TcpStream::connect_timeout(&tcp_address, Duration::from_secs(2))
+            .is_err_and(|error| access_was_denied(&error));
+        let udp_denied = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Err(error) => access_was_denied(&error),
+            Ok(socket) => socket
+                .send_to(
+                    b"lpac-network-canary",
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_port),
+                )
+                .is_err_and(|error| access_was_denied(&error)),
+        };
+        let network_denied = tcp_denied && udp_denied;
+
+        let child_process_denied = std::env::current_exe()
+            .ok()
+            .and_then(|executable| {
+                Command::new(executable)
+                    .arg("--version")
+                    .status_guarded()
+                    .err()
+            })
+            .is_some_and(|error| access_was_denied(&error));
+        let unlisted_file_handle_denied = inherited_handle_is_invalid(PROBE_FILE_HANDLE_ENV);
+        let unlisted_socket_handle_denied = inherited_handle_is_invalid(PROBE_SOCKET_HANDLE_ENV);
+        let protocol_handles_exact = exact_protocol_std_handles();
+        let token_is_zero_capability_lpac =
+            child_token_is_zero_capability_lpac().map_err(|error| io::Error::other(error.0))?;
+        let no_console = no_console_devices();
+        let mut in_job = 0;
+        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle, null queries any Job, and
+        // the initialized BOOL output lives for the call.
+        let creation_time_job_membership =
+            unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } != 0
+                && in_job != 0;
+        let mitigation_policy_matches = mitigation_policy_matches();
+
+        let passed = workspace_read_denied
+            && workspace_write_denied
+            && skill_database_read_denied
+            && skill_database_write_denied
+            && credential_environment_absent
+            && network_denied
+            && child_process_denied
+            && unlisted_file_handle_denied
+            && unlisted_socket_handle_denied
+            && protocol_handles_exact
+            && token_is_zero_capability_lpac
+            && no_console
+            && creation_time_job_membership
+            && mitigation_policy_matches;
+        if !passed {
+            return Err(io::Error::other("Windows containment child probe failed"));
+        }
+        std::io::stdout().lock().write_all(CONTAINMENT_READY)?;
+        std::io::stdout().lock().flush()?;
+        std::thread::park_timeout(Duration::from_secs(30));
+        Err(io::Error::other(
+            "Windows containment Job did not terminate the probe child",
+        ))
     }
 
     pub(super) fn run_child() {
@@ -2691,6 +3789,18 @@ mod feasibility {
 #[cfg(test)]
 fn run_lpac_image_loading_gate() -> Result<(), feasibility::GateError> {
     feasibility::run_artifact_matrix()
+}
+
+#[cfg(test)]
+pub(super) fn run_containment_probe() -> io::Result<()> {
+    feasibility::run_protected_install_negative_control()
+        .map_err(|error| io::Error::other(error.0))?;
+    feasibility::run_production_containment_probe().map_err(|error| io::Error::other(error.0))
+}
+
+#[cfg(test)]
+pub(super) fn run_containment_child_probe() -> io::Result<()> {
+    feasibility::run_containment_child_probe()
 }
 
 #[cfg(test)]
