@@ -506,6 +506,7 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
         index: usize,
         group: &proc_macro2::Group,
         macro_rules_body: bool,
+        parent_context: Option<&MacroContext>,
     ) -> String {
         fn invocation_path(tokens: &[TokenTree], bang_index: usize) -> String {
             let Some(mut cursor) = bang_index.checked_sub(1) else {
@@ -551,7 +552,20 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
             format!("{}!", invocation_path(tokens, bang_index))
         };
         let canonical = format!("{prefix}{delimiter}({})", group.stream());
-        format!("{:x}", Sha256::digest(canonical.as_bytes()))
+        let Some(parent_context) = parent_context else {
+            return format!("{:x}", Sha256::digest(canonical.as_bytes()));
+        };
+
+        fn hash_frame(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"mini-agent:macro-context-chain:v1");
+        hash_frame(&mut hasher, parent_context.digest.as_bytes());
+        hash_frame(&mut hasher, canonical.as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 
     fn is_method_or_ufcs(tokens: &[TokenTree], index: usize) -> bool {
@@ -641,7 +655,13 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
                 let begins_macro = matches!(macro_arguments, Some(TokenTree::Punct(punct)) if punct.as_char() == '!')
                     || macro_rules_body;
                 let group_context = if begins_macro {
-                    let digest = macro_digest(&tokens, index, group, macro_rules_body);
+                    let digest = macro_digest(
+                        &tokens,
+                        index,
+                        group,
+                        macro_rules_body,
+                        macro_context.as_ref(),
+                    );
                     let occurrence = macro_occurrences.entry(digest.clone()).or_default();
                     *occurrence += 1;
                     Some(MacroContext {
@@ -3365,5 +3385,140 @@ fn inspect(value: Value) {
         duplicate_violations.len(),
         1,
         "an identical second invocation must not borrow the first occurrence's identity"
+    );
+}
+
+#[test]
+fn macro_non_process_identity_binds_full_nesting_chain() {
+    fn terminal_context(source: &str) -> MacroContext {
+        terminal_calls(source)
+            .expect("fixture must tokenize")
+            .into_iter()
+            .find_map(|call| call.macro_context)
+            .expect("fixture terminal must have a macro context")
+    }
+
+    fn assert_rejected(source: &str, approved: &BTreeSet<(String, String, usize)>) {
+        let expected = BTreeMap::from([(
+            ("src/fixture.rs".to_string(), "status,".to_string(), 1),
+            "NON-PROCESS",
+        )]);
+        let violations =
+            creation_boundary_violations("src/fixture.rs", source, &expected, approved)
+                .expect("reviewer fixture must be inspectable");
+        assert_eq!(violations.len(), 1, "nested context must fail closed");
+        assert!(violations[0].contains("unrecognized macro context"));
+    }
+
+    let standalone = r#"
+fn inspect(value: Value) {
+    approved!(
+        value,
+        status,
+    );
+}
+"#;
+    let standalone_context = terminal_context(standalone);
+    let approved = BTreeSet::from([(
+        "src/fixture.rs".to_string(),
+        standalone_context.digest.clone(),
+        standalone_context.occurrence,
+    )]);
+
+    let nested = r#"
+fn inspect(value: Value) {
+    outer!(
+        approved!(
+            value,
+            status,
+        )
+    );
+}
+"#;
+    let nested_context = terminal_context(nested);
+    assert_ne!(standalone_context.digest, nested_context.digest);
+    assert_rejected(nested, &approved);
+
+    let multi_level = r#"
+fn inspect(value: Value) {
+    outer!(
+        middle!(
+            approved!(
+                value,
+                status,
+            )
+        )
+    );
+}
+"#;
+    let reordered = r#"
+fn inspect(value: Value) {
+    middle!(
+        outer!(
+            approved!(
+                value,
+                status,
+            )
+        )
+    );
+}
+"#;
+    let multi_level_context = terminal_context(multi_level);
+    let reordered_context = terminal_context(reordered);
+    assert_ne!(nested_context.digest, multi_level_context.digest);
+    assert_ne!(multi_level_context.digest, reordered_context.digest);
+    assert_rejected(multi_level, &approved);
+    assert_rejected(reordered, &approved);
+
+    let duplicate_inner = r#"
+fn inspect(value: Value) {
+    outer!(
+        approved!(
+            value,
+            status,
+        );
+        approved!(
+            value,
+            status,
+        )
+    );
+}
+"#;
+    let duplicate_contexts: Vec<_> = terminal_calls(duplicate_inner)
+        .expect("duplicate fixture must tokenize")
+        .into_iter()
+        .filter_map(|call| call.macro_context)
+        .collect();
+    assert_eq!(duplicate_contexts.len(), 2);
+    assert_eq!(duplicate_contexts[0].digest, duplicate_contexts[1].digest);
+    assert_eq!(duplicate_contexts[0].occurrence, 1);
+    assert_eq!(duplicate_contexts[1].occurrence, 2);
+
+    let first_duplicate_approved = BTreeSet::from([(
+        "src/fixture.rs".to_string(),
+        duplicate_contexts[0].digest.clone(),
+        duplicate_contexts[0].occurrence,
+    )]);
+    let duplicate_expected = BTreeMap::from([
+        (
+            ("src/fixture.rs".to_string(), "status,".to_string(), 1),
+            "NON-PROCESS",
+        ),
+        (
+            ("src/fixture.rs".to_string(), "status,".to_string(), 2),
+            "NON-PROCESS",
+        ),
+    ]);
+    let duplicate_violations = creation_boundary_violations(
+        "src/fixture.rs",
+        duplicate_inner,
+        &duplicate_expected,
+        &first_duplicate_approved,
+    )
+    .expect("duplicate fixture must be inspectable");
+    assert_eq!(
+        duplicate_violations.len(),
+        1,
+        "the second identical inner invocation must not borrow the first occurrence"
     );
 }

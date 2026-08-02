@@ -118,8 +118,9 @@ function-item references and raw terminal identifiers are inventoried even when 
 call has another name. Terminal method identifiers in macro inputs and locally defined
 `macro_rules!` expansion bodies are treated as process terminals unless an exact inventory
 identity classifies the site as non-process. That identity binds the source path, occurrence, and
-SHA-256 of the canonical complete macro path, delimiter, and token body; matching only the terminal
-line or macro name cannot confer an exemption. Only
+SHA-256 of the unambiguously framed full macro-context chain, including each complete macro path,
+delimiter, and token body; matching only the terminal line, inner invocation, or macro name cannot
+confer an exemption. Only
 syntactically proven task/thread or local associated `spawn` calls are excluded; ambiguous and
 unrecognized terminals fail closed. Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so
