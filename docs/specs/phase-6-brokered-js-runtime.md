@@ -516,6 +516,14 @@ an inheritable canary omitted from `HANDLE_LIST`, and access denial for a parent
 sentinel before emitting its fixed readiness frame. Profile and disposable-artifact cleanup errors
 are part of the gate result rather than silently treated as success.
 
+Windows handle inheritance is process-global state. Every mini-agent `CreateProcessW` call with
+`bInheritHandles=TRUE` uses one shared creation lock, acquired before the first handle is made
+inheritable and released only after every intended child endpoint and excluded canary has had its
+inherit bit cleared or its handle closed. The production and feasibility launchers share this
+lock. Inheritable-handle owners also clear their bit during drop on every error path before the
+earlier-acquired lock guard is released. Any future inheriting Windows launcher is inside this
+boundary and must reuse the same lock.
+
 On a standard-user Windows checkout, prepare and run the complete gate with:
 
 ```powershell
@@ -525,12 +533,13 @@ $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $cargoHome 'bin\mini-agent.ex
 cargo test --locked --no-default-features --features js windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --nocapture --exact
 ```
 
-This source-level gate has not been executed on Windows as part of the macOS-authored change. Its
-result remains unverified until the ignored test passes on `windows-latest` and a standard-user
-Windows installation for every location that will be advertised. Production Windows worker status
-therefore remains unavailable: this spike does not deliver the A26 launcher, does not permit a
-restricted-token or unconfined fallback, and does not satisfy the separate `mini-agent-uq5c`
-general-command sandbox.
+Construction of the production LPAC policy and attribute list is not runtime evidence: it cannot
+prove that Windows accepts the combined token, Job, mitigation, handle, console, and executable
+controls or that the resulting child observes them. Production Windows worker status therefore
+remains unavailable until a sacrificial launch probes those combined controls on the running host.
+Neither the construction preflight nor the narrower image-loading rows may report availability.
+There is no restricted-token or unconfined fallback, and this worker boundary does not satisfy the
+separate `mini-agent-uq5c` general-command sandbox.
 
 ## Failure semantics
 

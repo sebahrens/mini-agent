@@ -194,6 +194,37 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
+      - name: Verify exact Windows production launcher test discovery
+        shell: pwsh
+        run: |
+          $output = cargo test --locked --no-default-features --features js -- --list 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            $output | Write-Output
+            exit $LASTEXITCODE
+          }
+          $actual = @(
+            $output |
+              ForEach-Object { $_.ToString().Trim() } |
+              Where-Object { $_ -match '^sandbox::worker::.*windows_production_.*: test$' } |
+              Sort-Object
+          )
+          $expected = @(
+            'sandbox::worker::platform::tests::windows_production_failure_child: test'
+            'sandbox::worker::platform::tests::windows_production_failure_injection_closes_raii_handles_and_reaps_children: test'
+            'sandbox::worker::platform::tests::windows_production_inheriting_process_lock_serializes_launch_windows: test'
+            'sandbox::worker::platform::tests::windows_production_policy_has_required_limits_and_compatible_mitigations: test'
+            'sandbox::worker::platform::tests::windows_production_status_waits_for_runtime_containment_probe: test'
+            'sandbox::worker::tests::windows_production_launcher_source_keeps_creation_time_authority_closed: test'
+          ) | Sort-Object
+          if ($actual.Count -eq 0) {
+            throw 'No target-gated Windows production launcher tests were discovered'
+          }
+          $difference = @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual)
+          if ($difference.Count -ne 0) {
+            $difference | Format-Table | Out-String | Write-Output
+            throw "Windows production launcher discovery differed from the exact expected set"
+          }
+
       - name: Test Windows LPAC launcher policy and failure cleanup
         run: >-
           cargo test --locked --no-default-features --features js
