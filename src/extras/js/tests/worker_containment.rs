@@ -28,10 +28,8 @@ fn macos_worker_status_is_typed_deprecated_best_effort_and_fail_closed() {
 
     assert_eq!(backend, WorkerBackend::Seatbelt);
     assert_eq!(assurance, WorkerContainmentAssurance::DeprecatedBestEffort);
-    assert!(reason.contains("sandbox-exec"));
-    assert!(reason.contains("initial exec"));
-    assert!(reason.contains("reusable"));
-    assert!(reason.contains("tighten"));
+    assert!(reason.contains("undocumented/deprecated best-effort MAC policy"));
+    assert!(reason.contains("unavailable") || reason.contains("disabled"));
 }
 
 /// Real evidence for the macOS fail-closed gate.
@@ -86,12 +84,12 @@ fn macos_js_worker_containment() {
         String::from_utf8_lossy(&reusable_exact_exec.stderr)
     );
 
+    // Apply a deliberately permissive first profile. Because it denies no operation, the nested
+    // `sandbox_apply` failure below cannot be attributed to a missing file, Mach, IPC, or process
+    // allowance in the outer profile; the only boundary introduced here is that the process is
+    // already sandboxed.
     let outer_profile = r#"(version 1)
-(deny default)
-(allow process-exec
-    (literal "/usr/bin/sandbox-exec")
-    (literal "/usr/bin/true"))
-(allow file-read*)"#;
+(allow default)"#;
     let inner_profile = r#"(version 1)
 (deny default)
 (allow process-exec (literal "/usr/bin/true"))

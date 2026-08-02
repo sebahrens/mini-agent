@@ -14,7 +14,7 @@ const BACKEND: WorkerBackend = WorkerBackend::Seatbelt;
 const ASSURANCE: WorkerContainmentAssurance = WorkerContainmentAssurance::DeprecatedBestEffort;
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const SW_VERS: &str = "/usr/bin/sw_vers";
-const VALIDATED_MACOS_MAJORS: &[u32] = &[15, 26];
+const VALIDATED_MACOS_MAJORS: &[u32] = &[26];
 const EXEC_TRANSITION_BLOCKER: &str = "sandbox-exec requires an initial exec allowance; a stable exact worker-image allowance remains reusable after launch, and macOS rejects an attempt to tighten an already applied Seatbelt profile, so that image cannot subsequently be denied";
 
 pub(super) fn standard_streams_are_protocol_pipes() -> bool {
@@ -47,12 +47,20 @@ pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
 
 fn unavailable_reason() -> String {
     if !trusted_system_executable(Path::new(SANDBOX_EXEC)) {
-        return format!(
-            "the undocumented/deprecated best-effort MAC policy is unavailable because {SANDBOX_EXEC} is missing or untrusted"
-        );
+        return missing_sandbox_exec_reason();
     }
 
-    match macos_major_version() {
+    unavailable_reason_from_version_probe(macos_major_version())
+}
+
+fn missing_sandbox_exec_reason() -> String {
+    format!(
+        "the undocumented/deprecated best-effort MAC policy is unavailable because {SANDBOX_EXEC} is missing or untrusted"
+    )
+}
+
+fn unavailable_reason_from_version_probe(macos_major: Result<u32, String>) -> String {
+    match macos_major {
         Ok(major) => unavailable_reason_for_major(major),
         Err(reason) => format!(
             "the undocumented/deprecated best-effort MAC policy is disabled because the macOS major version could not be validated: {reason}"
@@ -153,16 +161,26 @@ mod tests {
         for invalid in [b"".as_slice(), b"0.1", b"future", b".15"] {
             assert!(parse_macos_major(invalid).is_err(), "accepted {invalid:?}");
         }
-        assert_eq!(VALIDATED_MACOS_MAJORS, &[15, 26]);
+        assert_eq!(VALIDATED_MACOS_MAJORS, &[26]);
     }
 
     #[test]
-    fn unvalidated_macos_major_is_distinct_from_the_validated_platform_blocker() {
-        let unknown = unavailable_reason_for_major(27);
-        assert!(unknown.contains("unvalidated macOS major version 27"));
+    fn unavailable_reasons_distinguish_missing_unknown_and_supported_probes() {
+        let missing = missing_sandbox_exec_reason();
+        assert!(missing.contains("sandbox-exec"));
+        assert!(missing.contains("missing or untrusted"));
+        assert!(!missing.contains("stable exact worker-image"));
+
+        let failed_version =
+            unavailable_reason_from_version_probe(Err("version probe failed".into()));
+        assert!(failed_version.contains("major version could not be validated"));
+        assert!(failed_version.contains("version probe failed"));
+
+        let unknown = unavailable_reason_from_version_probe(Ok(15));
+        assert!(unknown.contains("unvalidated macOS major version 15"));
         assert!(!unknown.contains("stable exact worker-image"));
 
-        let validated = unavailable_reason_for_major(26);
+        let validated = unavailable_reason_from_version_probe(Ok(26));
         assert!(validated.contains("stable exact worker-image"));
         assert!(validated.contains("remains reusable"));
     }

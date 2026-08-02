@@ -292,13 +292,18 @@ misconfigured, unverifiable, or unable to apply every required restriction makes
 
 The standalone macOS CLI currently reports `Seatbelt` with typed
 `DeprecatedBestEffort` assurance and keeps production JavaScript unavailable. This is a deliberate
-fail-closed result, not a delivered macOS containment backend. Real probes on validated macOS 15
-and 26 runners preserve the following platform evidence:
+fail-closed result, not a delivered macOS containment backend. A real local probe on macOS 26
+preserves the following platform evidence:
 
 - a deny-default profile without `process-exec` prevents `/usr/bin/sandbox-exec` from executing
   the initial worker image;
 - allowing the exact initial image is not a one-time grant and remains usable for later exec; and
 - macOS rejects applying a second, tighter Seatbelt profile after the first profile is active.
+
+macOS 15 remains an explicit CI probe target rather than a validated runtime major. The production
+allowlist must not classify it as validated until that runner has produced the same real-backend
+evidence. Both CI rows first prove that the target-gated test exists, so an unsupported target or
+an accidentally compiled-out test cannot pass as a zero-test success.
 
 Consequently the current stable-image design cannot both enter the worker through `sandbox-exec`
 and deny a native-compromised worker from executing the allowed image again. The public
