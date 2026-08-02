@@ -12,6 +12,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 #[cfg(feature = "js")]
 pub(crate) mod worker;
 
+#[cfg(feature = "js")]
+pub(crate) type SandboxCommand = Command;
+
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     enabled: bool,
@@ -397,6 +400,39 @@ impl Sandbox {
     }
 
     pub fn wrap_command(&self, command: &str) -> Result<Command, String> {
+        self.wrap_command_with_preserved_fds(command, 0)
+    }
+
+    #[cfg(feature = "js")]
+    pub(crate) fn wrap_command_preserving_executable_fd(
+        &self,
+        command: &str,
+    ) -> Result<Command, String> {
+        if !self.supports_identity_preserving_spawn() {
+            return Err("sandbox backend cannot preserve an executable identity".to_string());
+        }
+        self.wrap_command_with_preserved_fds(command, 1)
+    }
+
+    #[cfg(feature = "js")]
+    pub(crate) fn supports_identity_preserving_spawn(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self.policy(), SandboxPolicy::Disabled)
+                || (matches!(self.policy(), SandboxPolicy::RequiredAndAvailable)
+                    && self.backend == "bwrap")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    fn wrap_command_with_preserved_fds(
+        &self,
+        command: &str,
+        preserved_fds: usize,
+    ) -> Result<Command, String> {
         match self.policy() {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
@@ -451,7 +487,13 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
-        Ok(self.build_bwrap_command(bwrap, command, &cwd, &cache_dir))
+        Ok(self.build_bwrap_command_with_preserved_fds(
+            bwrap,
+            command,
+            &cwd,
+            &cache_dir,
+            preserved_fds,
+        ))
     }
 
     fn build_seatbelt_command(
@@ -499,7 +541,21 @@ impl Sandbox {
         cwd: &Path,
         cache_dir: &Path,
     ) -> Command {
+        self.build_bwrap_command_with_preserved_fds(bwrap, command, cwd, cache_dir, 0)
+    }
+
+    fn build_bwrap_command_with_preserved_fds(
+        &self,
+        bwrap: &Path,
+        command: &str,
+        cwd: &Path,
+        cache_dir: &Path,
+        preserved_fds: usize,
+    ) -> Command {
         let mut cmd = Command::new(bwrap);
+        if preserved_fds > 0 {
+            cmd.arg("--preserve-fds").arg(preserved_fds.to_string());
+        }
         cmd.arg("--clearenv");
         for (k, v) in essential_env() {
             cmd.arg("--setenv").arg(k).arg(v);

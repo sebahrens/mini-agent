@@ -638,7 +638,7 @@ async fn scoped_capability_intersection_normalizes_fetch_method_and_spawn_identi
         ServiceFailures::default(),
         Some(Ok(NormalizedTarget::Spawn {
             program: "printf".into(),
-            resolved_executable: "/different/path/printf".into(),
+            resolved_executable: resolve_program_identity("true").unwrap(),
         })),
     );
     assert_eq!(
@@ -649,6 +649,119 @@ async fn scoped_capability_intersection_normalizes_fetch_method_and_spawn_identi
     );
     assert_eq!(record.lock().unwrap().authorizations, 0);
     assert!(identity_broker.audit_records_for_test().is_empty());
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn scoped_spawn_keeps_each_program_bound_to_its_own_executable_identity() {
+    let invocation_id = invocation("inv-scoped-spawn-name-binding");
+    let principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-spawn-binding".into(),
+        export: "run".into(),
+        invocation_id: invocation_id.to_string(),
+    };
+    let advisory = AdvisoryAttribution {
+        artifact_id: Some("artifact-spawn-binding".into()),
+        export: Some("run".into()),
+    };
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn {
+            programs: vec!["bar".into(), "foo".into()],
+        }],
+    )
+    .unwrap();
+    let foo_identity = resolve_program_identity("printf").unwrap();
+    let bar_identity = resolve_program_identity("true").unwrap();
+    let grant = InvocationGrant::issue_scoped_skill_with_resolver(
+        invocation_id.clone(),
+        principal,
+        manifest,
+        Instant::now() + Duration::from_secs(10),
+        |program| match program {
+            "foo" => Ok(foo_identity.clone()),
+            "bar" => Ok(bar_identity.clone()),
+            _ => unreachable!(),
+        },
+    )
+    .unwrap();
+    let operation = EffectOperation::Spawn {
+        program: "foo".into(),
+        arguments: vec![],
+    };
+    let request = EffectRequest {
+        effect_ordinal: 1,
+        grant_id: grant.grant_id().clone(),
+        advisory,
+        operation,
+    };
+    let (mut broker, record, _audit_root) = broker_with_normalized_target(
+        invocation_id,
+        vec![grant],
+        BTreeSet::from([HostCapability::Spawn]),
+        ServiceFailures::default(),
+        Some(Ok(NormalizedTarget::Spawn {
+            program: "foo".into(),
+            resolved_executable: bar_identity,
+        })),
+    );
+
+    assert_eq!(
+        broker.dispatch(request, PermCancellation::new()).await,
+        Err(HostEffectError::ManifestDenied)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.authorizations, 0);
+    assert_eq!(record.execute_calls, 0);
+    assert!(broker.audit_records_for_test().is_empty());
+}
+
+#[cfg(feature = "skills")]
+#[test]
+fn scoped_spawn_binding_map_is_deterministic_and_bounded() {
+    let invocation_id = invocation("inv-scoped-spawn-map-bounds");
+    let principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-spawn-map".into(),
+        export: "run".into(),
+        invocation_id: invocation_id.to_string(),
+    };
+    let identity = resolve_program_identity("printf").unwrap();
+    let manifest = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn {
+            programs: vec!["bar".into(), "foo".into()],
+        }],
+    )
+    .unwrap();
+    let grant = InvocationGrant::issue_scoped_skill_with_resolver(
+        invocation_id.clone(),
+        principal.clone(),
+        manifest,
+        Instant::now() + Duration::from_secs(10),
+        |_| Ok(identity.clone()),
+    )
+    .unwrap();
+    let encoded = grant.spawn_program_bindings_json_for_test();
+    let decoded: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.keys().cloned().collect::<Vec<_>>(), ["bar", "foo"]);
+
+    let programs = (0..257).map(|index| format!("p{index:03}")).collect();
+    let oversized = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Spawn { programs }],
+    )
+    .unwrap();
+    assert_eq!(
+        InvocationGrant::issue_scoped_skill_with_resolver(
+            invocation_id,
+            principal,
+            oversized,
+            Instant::now() + Duration::from_secs(10),
+            |_| Ok(identity.clone()),
+        ),
+        Err(crate::extras::js::broker::BrokerBuildError::InvalidManifest)
+    );
 }
 
 #[tokio::test]

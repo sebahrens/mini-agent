@@ -25,8 +25,8 @@ use std::sync::{
 use std::time::Instant;
 
 use crate::extras::js::broker::{
-    AuthorizedEffect, AuthorizedTarget, HostEffectError, NormalizedTarget, ParentEffectFuture,
-    ParentEffectService, resolve_program_identity,
+    AuthorizedEffect, AuthorizedTarget, GrantPrincipal, HostEffectError, NormalizedTarget,
+    ParentEffectFuture, ParentEffectService, SpawnExecutableIdentity, resolve_program_identity,
 };
 use crate::extras::js::protocol::{EffectOperation, EffectResult};
 #[cfg(feature = "skills")]
@@ -39,6 +39,8 @@ use crate::extras::js::types::{
     EffectServiceError, READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
     canonical_spawn_permission_subject, spawn_policy_input,
 };
+#[cfg(any(target_os = "linux", not(unix)))]
+use crate::sandbox::SandboxCommand;
 use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox, SandboxPolicy};
 
 #[cfg(feature = "skills")]
@@ -2458,8 +2460,84 @@ pub(crate) struct SpawnEffectService {
 }
 
 struct PreparedSpawnEffect {
-    program: String,
+    executable: SpawnExecutableIdentity,
     arguments: Vec<String>,
+    #[cfg(unix)]
+    executable_file: std::fs::File,
+}
+
+impl PreparedSpawnEffect {
+    fn capture(program: &str, arguments: Vec<String>) -> Result<Self, EffectServiceError> {
+        let executable = resolve_program_identity(program)?;
+        #[cfg(unix)]
+        let executable_file = {
+            let file = std::fs::File::open(executable.canonical_path())
+                .map_err(|_| EffectServiceError::InvalidTarget)?;
+            let opened = file
+                .metadata()
+                .map_err(|_| EffectServiceError::InvalidTarget)?;
+            let current = std::fs::symlink_metadata(executable.canonical_path())
+                .map_err(|_| EffectServiceError::InvalidTarget)?;
+            if !executable.matches_metadata(&opened)
+                || !executable.matches_metadata(&current)
+                || !opened.is_file()
+            {
+                return Err(EffectServiceError::TargetChanged);
+            }
+            file
+        };
+        Ok(Self {
+            executable,
+            arguments,
+            #[cfg(unix)]
+            executable_file,
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), EffectServiceError> {
+        let current = std::fs::symlink_metadata(self.executable.canonical_path())
+            .map_err(|_| EffectServiceError::TargetChanged)?;
+        if !self.executable.matches_metadata(&current) {
+            return Err(EffectServiceError::TargetChanged);
+        }
+        #[cfg(unix)]
+        {
+            let opened = self
+                .executable_file
+                .metadata()
+                .map_err(|_| EffectServiceError::TargetChanged)?;
+            if !self.executable.matches_metadata(&opened) {
+                return Err(EffectServiceError::TargetChanged);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn inherit_executable_fd(command: &mut SandboxCommand, executable_file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    const CHILD_EXECUTABLE_FD: libc::c_int = 3;
+    let source_fd = executable_file.as_raw_fd();
+    // SAFETY: this callback uses only async-signal-safe fcntl/dup2 operations between fork and
+    // exec. `PreparedSpawnEffect` owns the source file until the command has been spawned.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if source_fd == CHILD_EXECUTABLE_FD {
+                let flags = libc::fcntl(source_fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(source_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(source_fd, CHILD_EXECUTABLE_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 impl SpawnEffectService {
@@ -2508,11 +2586,7 @@ impl SpawnEffectService {
             .check_structured_async("bash", &subject, policy_input)
             .await
             .map_err(permission_service_error)?;
-        let program = resolve_program_identity(program)?;
-        Ok(PreparedSpawnEffect {
-            program,
-            arguments: arguments.to_vec(),
-        })
+        PreparedSpawnEffect::capture(program, arguments.to_vec())
     }
 
     async fn execute_prepared(
@@ -2520,11 +2594,40 @@ impl SpawnEffectService {
         prepared: PreparedSpawnEffect,
         bridge: PermissionBridge,
     ) -> Result<SpawnResult, EffectServiceError> {
-        let mut command = self
-            .sandbox
-            .wrap_command(r#"exec "$0" "$@""#)
-            .map_err(|_| EffectServiceError::BackendFailure)?;
-        command.arg(&prepared.program).args(&prepared.arguments);
+        prepared.revalidate()?;
+        #[cfg(not(unix))]
+        let command: SandboxCommand = return Err(EffectServiceError::BackendFailure);
+
+        #[cfg(target_os = "linux")]
+        let command = {
+            const CHILD_EXECUTABLE_PATH: &str = "/proc/self/fd/3";
+
+            let mut command = self
+                .sandbox
+                .wrap_command_preserving_executable_fd(&format!(
+                    "exec {CHILD_EXECUTABLE_PATH} \"$@\""
+                ))
+                .map_err(|_| EffectServiceError::BackendFailure)?;
+            inherit_executable_fd(&mut command, &prepared.executable_file);
+            command.arg("approved-executable").args(&prepared.arguments);
+            command
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let command = {
+            // macOS has no fexecve/execveat equivalent and rejects exec through /dev/fd.
+            // Learned-skill callers fail in `ensure_backend`; model-authored/direct callers keep
+            // legacy availability with this immediately-preceding identity check and explicit
+            // residual rename window between this check and exec.
+            prepared.revalidate()?;
+            let mut command = self
+                .sandbox
+                .wrap_command(r#"exec "$0" "$@""#)
+                .map_err(|_| EffectServiceError::BackendFailure)?;
+            command
+                .arg(prepared.executable.canonical_path())
+                .args(&prepared.arguments);
+            command
+        };
         let limits = CommandLimits {
             timeout: self.timeout,
             stdout_bytes: SPAWN_STDOUT_MAX_BYTES,
@@ -2683,7 +2786,7 @@ impl ParentEffectService for ParentHostEffectService {
 
     fn ensure_backend(
         &mut self,
-        _authorized: &AuthorizedEffect,
+        authorized: &AuthorizedEffect,
         operation: &EffectOperation,
     ) -> Result<(), HostEffectError> {
         match operation {
@@ -2694,7 +2797,9 @@ impl ParentEffectService for ParentHostEffectService {
             #[cfg(not(feature = "sandbox"))]
             EffectOperation::Fetch { .. } => Err(HostEffectError::BackendFailure),
             EffectOperation::Spawn { .. }
-                if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable =>
+                if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable
+                    || (matches!(authorized.principal(), GrantPrincipal::Skill { .. })
+                        && !self.spawn.sandbox.supports_identity_preserving_spawn()) =>
             {
                 Err(HostEffectError::BackendFailure)
             }
@@ -2755,12 +2860,10 @@ impl ParentEffectService for ParentHostEffectService {
                     {
                         return Err(HostEffectError::InvalidTarget);
                     }
-                    let resolved =
-                        resolve_program_identity(program).map_err(HostEffectError::from)?;
-                    self.prepared = Some(PreparedParentEffect::Spawn(PreparedSpawnEffect {
-                        program: resolved.clone(),
-                        arguments: arguments.clone(),
-                    }));
+                    let prepared = PreparedSpawnEffect::capture(program, arguments.clone())
+                        .map_err(HostEffectError::from)?;
+                    let resolved = prepared.executable.clone();
+                    self.prepared = Some(PreparedParentEffect::Spawn(prepared));
                     Ok(NormalizedTarget::Spawn {
                         program: program.nfc().collect(),
                         resolved_executable: resolved,
@@ -2883,16 +2986,22 @@ impl ParentEffectService for ParentHostEffectService {
                         return Err(HostEffectError::BackendFailure);
                     }
                     let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
-                    let subject =
-                        canonical_spawn_permission_subject(&target.program, &target.arguments)
-                            .map_err(HostEffectError::from)?;
-                    let policy_input = spawn_policy_input(&target.program, &target.arguments);
+                    let subject = canonical_spawn_permission_subject(
+                        target.executable.canonical_path(),
+                        &target.arguments,
+                    )
+                    .map_err(HostEffectError::from)?;
+                    let policy_input =
+                        spawn_policy_input(target.executable.canonical_path(), &target.arguments);
                     bridge
                         .check_structured_async("bash", &subject, policy_input)
                         .await
                         .map_err(permission_service_error)
                         .map_err(HostEffectError::from)?;
-                    let resolved_executable = target.program.clone();
+                    // The permission decision may have been blocked on Ask. Rebind it to the
+                    // exact inode captured during normalization before durable audit.
+                    target.revalidate().map_err(HostEffectError::from)?;
+                    let resolved_executable = target.executable.canonical_path().to_string();
                     (
                         PreparedParentEffect::Spawn(target),
                         AuthorizedTarget::Spawn {
@@ -3899,6 +4008,306 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].state, AuditState::Intent);
         assert_eq!(records[1].state, AuditState::Completed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn brokered_spawn_replacement_during_ask_executes_nothing_and_records_no_intent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new();
+        let executable = directory.path().join("approved-command");
+        let replacement = directory.path().join("replacement-command");
+        let marker = directory.path().join("must-not-exist");
+        let script = |label: &str| {
+            format!(
+                "#!/bin/sh\nprintf '%s' '{label}' > '{}'\n",
+                marker.to_string_lossy()
+            )
+        };
+        std::fs::write(&executable, script("approved")).unwrap();
+        std::fs::write(&replacement, script("replacement")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let permission =
+            host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(directory.path()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let invocation = InvocationId::new("spawn-ask-replacement").unwrap();
+        let grant = InvocationGrant::issue(
+            invocation.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: "spawn-replacement".into(),
+            },
+            BTreeSet::from([HostCapability::Spawn]),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let request = EffectRequest {
+            effect_ordinal: 0,
+            grant_id: grant.grant_id().clone(),
+            advisory: AdvisoryAttribution::default(),
+            operation: EffectOperation::Spawn {
+                program: executable.to_string_lossy().into_owned(),
+                arguments: vec![],
+            },
+        };
+        let audit_root = directory.path().join("audit-spawn-replacement");
+        let audit = EffectAudit::open(
+            AppPaths {
+                config_dir: audit_root.join("config"),
+                data_dir: audit_root.join("data"),
+                local_data_dir: audit_root.join("local"),
+                state_dir: audit_root.join("state"),
+                cache_dir: audit_root.join("cache"),
+                credentials_dir: audit_root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap();
+        let mut broker = InvocationBroker::new(
+            invocation,
+            vec![grant],
+            BTreeSet::from([HostCapability::Spawn]),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        let dispatch = tokio::spawn(async move {
+            let result = broker.dispatch(request, PermCancellation::new()).await;
+            (result, broker)
+        });
+        let prompt = ask_rx
+            .recv()
+            .await
+            .expect("spawn should request permission");
+        std::fs::rename(&replacement, &executable).unwrap();
+        prompt.reply.send(UserDecision::AllowOnce).unwrap();
+
+        let (result, broker) = dispatch.await.unwrap();
+        assert_eq!(result, Err(HostEffectError::InvalidTarget));
+        assert!(
+            !marker.exists(),
+            "an executable ran after its identity changed"
+        );
+        assert!(
+            broker.audit_records_for_test().is_empty(),
+            "a denied replacement must not acquire a durable authorized intent"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_spawn_dispatches_the_opened_executable_identity_not_a_replacement_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new();
+        let executable = directory.path().join("approved-command");
+        let replacement = directory.path().join("replacement-command");
+        std::fs::write(&executable, "#!/bin/sh\nprintf approved").unwrap();
+        std::fs::write(&replacement, "#!/bin/sh\nprintf replacement").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let prepared =
+            PreparedSpawnEffect::capture(executable.to_string_lossy().as_ref(), Vec::new())
+                .unwrap();
+        let sandbox = Sandbox::new(false, "bwrap");
+        let mut command = sandbox
+            .wrap_command_preserving_executable_fd("exec /proc/self/fd/3 \"$@\"")
+            .unwrap();
+        inherit_executable_fd(&mut command, &prepared.executable_file);
+        command.arg("approved-executable");
+
+        std::fs::rename(&replacement, &executable).unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(
+                command,
+                CommandLimits {
+                    timeout: Duration::from_secs(1),
+                    stdout_bytes: 1024,
+                    stderr_bytes: 1024,
+                    combined_bytes: 2048,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Completed);
+        assert_eq!(output.stdout, b"approved");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn model_authored_spawn_remains_available_without_identity_preserving_dispatch() {
+        let directory = TempDir::new();
+        let permission =
+            host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(directory.path()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let invocation = InvocationId::new("model-spawn-non-preserving").unwrap();
+        let grant = InvocationGrant::issue(
+            invocation.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: "model-spawn".into(),
+            },
+            BTreeSet::from([HostCapability::Spawn]),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let request = EffectRequest {
+            effect_ordinal: 0,
+            grant_id: grant.grant_id().clone(),
+            advisory: AdvisoryAttribution::default(),
+            operation: EffectOperation::Spawn {
+                program: "printf".into(),
+                arguments: vec!["available".into()],
+            },
+        };
+        let audit_root = directory.path().join("audit-model-spawn");
+        let audit = EffectAudit::open(
+            AppPaths {
+                config_dir: audit_root.join("config"),
+                data_dir: audit_root.join("data"),
+                local_data_dir: audit_root.join("local"),
+                state_dir: audit_root.join("state"),
+                cache_dir: audit_root.join("cache"),
+                credentials_dir: audit_root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap();
+        let mut broker = InvocationBroker::new(
+            invocation,
+            vec![grant],
+            BTreeSet::from([HostCapability::Spawn]),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+
+        let dispatch = tokio::spawn(async move {
+            let result = broker.dispatch(request, PermCancellation::new()).await;
+            (result, broker)
+        });
+        let prompt = ask_rx.recv().await.expect("model spawn should reach Ask");
+        prompt.reply.send(UserDecision::AllowOnce).unwrap();
+        let (result, broker) = dispatch.await.unwrap();
+        let result = result.unwrap();
+        assert!(matches!(
+            result,
+            EffectResult::Spawn {
+                stdout,
+                exit_code: 0,
+                ..
+            } if stdout == "available"
+        ));
+        assert_eq!(broker.audit_records_for_test().len(), 2);
+    }
+
+    #[cfg(all(feature = "skills", target_os = "macos"))]
+    #[tokio::test]
+    async fn learned_skill_spawn_fails_closed_on_macos_before_permission_or_audit() {
+        let directory = TempDir::new();
+        let permission =
+            host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(directory.path()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let (mut broker, request) = scoped_host_broker(
+            &directory,
+            "macos-spawn-denied",
+            service,
+            CapabilityScope::Spawn {
+                programs: vec!["printf".into()],
+            },
+            EffectOperation::Spawn {
+                program: "printf".into(),
+                arguments: vec!["must-not-run".into()],
+            },
+        );
+
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::BackendFailure)
+        );
+        assert!(ask_rx.try_recv().is_err());
+        assert!(broker.audit_records_for_test().is_empty());
+    }
+
+    #[cfg(all(feature = "skills", windows))]
+    #[tokio::test]
+    async fn learned_skill_spawn_fails_closed_on_windows_before_permission_or_audit() {
+        let directory = TempDir::new();
+        let permission =
+            host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(directory.path()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let (mut broker, request) = scoped_host_broker(
+            &directory,
+            "windows-spawn-denied",
+            service,
+            CapabilityScope::Spawn {
+                programs: vec!["cmd".into()],
+            },
+            EffectOperation::Spawn {
+                program: "cmd".into(),
+                arguments: vec!["/C".into(), "exit".into(), "0".into()],
+            },
+        );
+
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::BackendFailure)
+        );
+        assert!(ask_rx.try_recv().is_err());
+        assert!(broker.audit_records_for_test().is_empty());
     }
 
     #[cfg(feature = "sandbox")]

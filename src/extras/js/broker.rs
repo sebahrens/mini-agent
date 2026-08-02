@@ -4,6 +4,8 @@
 //! them against parent-created invocation grants, applies every fail-closed preflight, and only
 //! then hands an authorized operation to the parent effect-service seam.
 
+#[cfg(feature = "skills")]
+use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -11,6 +13,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -90,7 +93,42 @@ pub(crate) struct InvocationGrant {
     #[cfg(feature = "skills")]
     manifest: Option<CapabilityManifest>,
     #[cfg(feature = "skills")]
-    spawn_program_identities: BTreeSet<String>,
+    spawn_program_identities: BTreeMap<String, SpawnExecutableIdentity>,
+}
+
+#[cfg(feature = "skills")]
+const MAX_SPAWN_PROGRAM_BINDINGS: usize = 256;
+const MAX_RESOLVED_EXECUTABLE_BYTES: usize = 4096;
+
+/// Stable parent-owned identity for one resolved executable. The canonical path is the
+/// permission/audit label; the platform identity prevents a path replacement from borrowing it.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub(crate) struct SpawnExecutableIdentity {
+    canonical_path: String,
+    platform: PlatformExecutableIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "platform", rename_all = "snake_case")]
+enum PlatformExecutableIdentity {
+    Unix {
+        device: u64,
+        inode: u64,
+    },
+    Windows {
+        volume_serial_number: u32,
+        file_index: u64,
+    },
+}
+
+impl SpawnExecutableIdentity {
+    pub(crate) fn canonical_path(&self) -> &str {
+        &self.canonical_path
+    }
+
+    pub(crate) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        platform_executable_identity(metadata).is_some_and(|identity| identity == self.platform)
+    }
 }
 
 impl InvocationGrant {
@@ -110,7 +148,7 @@ impl InvocationGrant {
             #[cfg(feature = "skills")]
             manifest: None,
             #[cfg(feature = "skills")]
-            spawn_program_identities: BTreeSet::new(),
+            spawn_program_identities: BTreeMap::new(),
         }
     }
 
@@ -121,23 +159,49 @@ impl InvocationGrant {
         manifest: CapabilityManifest,
         expires_at: Instant,
     ) -> Result<Self, BrokerBuildError> {
+        Self::issue_scoped_skill_with_resolver_inner(
+            bound_invocation,
+            principal,
+            manifest,
+            expires_at,
+            resolve_program_identity,
+        )
+    }
+
+    #[cfg(feature = "skills")]
+    fn issue_scoped_skill_with_resolver_inner(
+        bound_invocation: InvocationId,
+        principal: GrantPrincipal,
+        manifest: CapabilityManifest,
+        expires_at: Instant,
+        resolver: impl Fn(&str) -> Result<SpawnExecutableIdentity, EffectServiceError>,
+    ) -> Result<Self, BrokerBuildError> {
         if !matches!(principal, GrantPrincipal::Skill { .. }) {
             return Err(BrokerBuildError::InvalidScopedPrincipal);
         }
         manifest
             .validate()
             .map_err(|_| BrokerBuildError::InvalidManifest)?;
-        let spawn_program_identities = manifest
+        let spawn_programs = manifest
             .grants
             .iter()
             .filter_map(|scope| match scope {
                 CapabilityScope::Spawn { programs } => Some(programs),
                 _ => None,
             })
-            .flatten()
-            .map(|program| resolve_program_identity(program))
-            .collect::<Result<BTreeSet<_>, _>>()
-            .map_err(|_| BrokerBuildError::UnavailableManifestProgram)?;
+            .flatten();
+        let mut spawn_program_identities = BTreeMap::new();
+        for program in spawn_programs {
+            if spawn_program_identities.len() >= MAX_SPAWN_PROGRAM_BINDINGS {
+                return Err(BrokerBuildError::InvalidManifest);
+            }
+            let identity =
+                resolver(program).map_err(|_| BrokerBuildError::UnavailableManifestProgram)?;
+            if identity.canonical_path.len() > MAX_RESOLVED_EXECUTABLE_BYTES {
+                return Err(BrokerBuildError::InvalidManifest);
+            }
+            spawn_program_identities.insert(program.clone(), identity);
+        }
         let allowed = manifest
             .grants
             .iter()
@@ -152,6 +216,28 @@ impl InvocationGrant {
         grant.manifest = Some(manifest);
         grant.spawn_program_identities = spawn_program_identities;
         Ok(grant)
+    }
+
+    #[cfg(all(test, feature = "skills"))]
+    pub(crate) fn issue_scoped_skill_with_resolver(
+        bound_invocation: InvocationId,
+        principal: GrantPrincipal,
+        manifest: CapabilityManifest,
+        expires_at: Instant,
+        resolver: impl Fn(&str) -> Result<SpawnExecutableIdentity, EffectServiceError>,
+    ) -> Result<Self, BrokerBuildError> {
+        Self::issue_scoped_skill_with_resolver_inner(
+            bound_invocation,
+            principal,
+            manifest,
+            expires_at,
+            resolver,
+        )
+    }
+
+    #[cfg(all(test, feature = "skills"))]
+    pub(crate) fn spawn_program_bindings_json_for_test(&self) -> String {
+        serde_json::to_string(&self.spawn_program_identities).expect("bindings serialize")
     }
 
     pub(crate) fn grant_id(&self) -> &GrantId {
@@ -309,7 +395,7 @@ pub(crate) enum NormalizedTarget {
     },
     Spawn {
         program: String,
-        resolved_executable: String,
+        resolved_executable: SpawnExecutableIdentity,
     },
     ProposeSkill,
 }
@@ -734,7 +820,7 @@ fn enforce_manifest_scope(
             },
         ) => {
             programs.contains(program)
-                && grant.spawn_program_identities.contains(resolved_executable)
+                && grant.spawn_program_identities.get(program) == Some(resolved_executable)
         }
         _ => false,
     };
@@ -771,7 +857,9 @@ fn path_scope_contains(prefix: &str, target: &str) -> bool {
 
 /// Resolve a program once to the executable identity carried through scope,
 /// permission, durable audit, and execution.
-pub(crate) fn resolve_program_identity(program: &str) -> Result<String, EffectServiceError> {
+pub(crate) fn resolve_program_identity(
+    program: &str,
+) -> Result<SpawnExecutableIdentity, EffectServiceError> {
     let source = Path::new(program);
     let candidates = if source.is_absolute() || source.components().count() > 1 {
         spawn_executable_candidates(source.to_path_buf())
@@ -797,12 +885,54 @@ pub(crate) fn resolve_program_identity(program: &str) -> Result<String, EffectSe
         }
         let canonical =
             std::fs::canonicalize(candidate).map_err(|_| EffectServiceError::InvalidTarget)?;
-        return canonical
+        let canonical_path = canonical
             .to_str()
             .map(str::to_string)
-            .ok_or(EffectServiceError::InvalidTarget);
+            .ok_or(EffectServiceError::InvalidTarget)?;
+        if canonical_path.len() > MAX_RESOLVED_EXECUTABLE_BYTES {
+            return Err(EffectServiceError::InvalidTarget);
+        }
+        let metadata =
+            std::fs::symlink_metadata(&canonical).map_err(|_| EffectServiceError::InvalidTarget)?;
+        let platform =
+            platform_executable_identity(&metadata).ok_or(EffectServiceError::InvalidTarget)?;
+        return Ok(SpawnExecutableIdentity {
+            canonical_path,
+            platform,
+        });
     }
     Err(EffectServiceError::InvalidTarget)
+}
+
+#[cfg(unix)]
+fn platform_executable_identity(
+    metadata: &std::fs::Metadata,
+) -> Option<PlatformExecutableIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(PlatformExecutableIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn platform_executable_identity(
+    metadata: &std::fs::Metadata,
+) -> Option<PlatformExecutableIdentity> {
+    use std::os::windows::fs::MetadataExt;
+
+    Some(PlatformExecutableIdentity::Windows {
+        volume_serial_number: metadata.volume_serial_number()?,
+        file_index: metadata.file_index()?,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_executable_identity(
+    _metadata: &std::fs::Metadata,
+) -> Option<PlatformExecutableIdentity> {
+    None
 }
 
 fn spawn_executable_candidates(path: PathBuf) -> Vec<PathBuf> {
