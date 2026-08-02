@@ -124,10 +124,6 @@ impl SkillCapabilityGate {
             )
         })
     }
-
-    pub(crate) fn context(&self) -> crate::extras::js::skills::capability::CapabilityContext {
-        self.context.clone()
-    }
 }
 
 #[cfg(feature = "skills")]

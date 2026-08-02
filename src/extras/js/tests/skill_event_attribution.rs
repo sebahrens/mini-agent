@@ -1,8 +1,13 @@
+use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId};
+use crate::extras::js::skills::capability::{
+    CapabilityError, InvocationAuthorization, InvocationCapabilityRuntime, PreparedInvocationHandle,
+};
 use crate::extras::js::skills::telemetry::{
     EventBatch, SkillEvent, SkillEventKind, TelemetryError, TelemetryIngestor, stable_invocation_id,
 };
 use crate::extras::js::skills::{
-    CapabilityManifest, SkillArtifact, SkillExport, store::SkillStore,
+    CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
+    store::SkillStore, test_manifest,
 };
 use crate::extras::js::{
     engine::run_instrumented_step_for_test,
@@ -94,6 +99,195 @@ fn stable_ids_reuse_acknowledged_calls_but_separate_ordinals() {
         stable_invocation_id("turn", "tool", "skill", "run", 1)
     );
     assert_eq!(first.len(), 64);
+}
+
+#[test]
+fn effect_attribution_comes_from_the_explicit_invocation_not_map_order() {
+    let manifest = test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile]).unwrap();
+    let effects = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = effects.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |effect| {
+        captured.lock().unwrap().push(effect);
+        Ok(EffectResult::ReadFile {
+            content: "ok".into(),
+        })
+    });
+    let skill_id = "c".repeat(64);
+    let mut handles = Vec::new();
+    for (name, byte) in [("event-first", 11), ("event-second", 12)] {
+        handles.push(
+            capabilities
+                .prepare(
+                    InvocationAuthorization::new(
+                        InvocationId::new(name).unwrap(),
+                        skill_id.clone(),
+                        "run".into(),
+                        manifest.clone(),
+                        [(
+                            HostCapability::ReadFile,
+                            GrantId::new(uuid::Uuid::from_bytes([byte; 16])).unwrap(),
+                        )],
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+        );
+    }
+    let first = capabilities
+        .begin(handles[0], &skill_id, "run", &manifest)
+        .unwrap();
+    let second = capabilities
+        .begin(handles[1], &skill_id, "run", &manifest)
+        .unwrap();
+    capabilities
+        .dispatch(first, HostCapability::ReadFile, r#"["first"]"#)
+        .unwrap();
+    capabilities
+        .dispatch(second, HostCapability::ReadFile, r#"["second"]"#)
+        .unwrap();
+    capabilities.finish(first);
+    capabilities.finish(second);
+    assert!(matches!(
+        capabilities.dispatch(first, HostCapability::ReadFile, r#"["stale"]"#),
+        Err(CapabilityError::Revoked)
+    ));
+    let effects = effects.lock().unwrap();
+    assert_eq!(effects.len(), 2);
+    assert_eq!(effects[0].invocation_id.as_str(), "event-first");
+    assert_eq!(effects[1].invocation_id.as_str(), "event-second");
+    assert!(effects.iter().all(|effect| {
+        effect.request.advisory.artifact_id.as_deref() == Some(skill_id.as_str())
+            && effect.request.advisory.export.as_deref() == Some("run")
+    }));
+}
+
+#[test]
+fn nested_same_and_different_exports_keep_exact_handles_and_outer_authority() {
+    let manifest = test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile]).unwrap();
+    let skill_id = "d".repeat(64);
+    let runtime_slot: std::sync::Arc<std::sync::Mutex<Option<InvocationCapabilityRuntime>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let nested: std::sync::Arc<
+        std::sync::Mutex<std::collections::VecDeque<PreparedInvocationHandle>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let effects = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_runtime = runtime_slot.clone();
+    let captured_nested = nested.clone();
+    let captured_effects = effects.clone();
+    let captured_skill_id = skill_id.clone();
+    let captured_manifest = manifest.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |effect| {
+        let recurse = matches!(
+            &effect.request.operation,
+            crate::extras::js::protocol::EffectOperation::ReadFile { path }
+                if path == "outer-before"
+        );
+        captured_effects.lock().unwrap().push(effect);
+        if recurse {
+            let runtime = captured_runtime
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("runtime installed before dispatch");
+            for expected_export in ["inner", "outer"] {
+                let handle = captured_nested
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("nested handle prepared");
+                let token = runtime
+                    .begin(
+                        handle,
+                        &captured_skill_id,
+                        expected_export,
+                        &captured_manifest,
+                    )
+                    .unwrap();
+                runtime
+                    .dispatch(
+                        token,
+                        HostCapability::ReadFile,
+                        &format!(r#"["nested-{expected_export}"]"#),
+                    )
+                    .unwrap();
+                runtime.finish(token);
+            }
+        }
+        Ok(EffectResult::ReadFile {
+            content: "ok".into(),
+        })
+    });
+    *runtime_slot.lock().unwrap() = Some(capabilities.clone());
+
+    let prepare = |name: &str, export: &str, byte: u8| {
+        capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    InvocationId::new(name).unwrap(),
+                    skill_id.clone(),
+                    export.into(),
+                    manifest.clone(),
+                    [(
+                        HostCapability::ReadFile,
+                        GrantId::new(uuid::Uuid::from_bytes([byte; 16])).unwrap(),
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    };
+    let outer = prepare("nested-outer", "outer", 21);
+    let inner = prepare("nested-inner", "inner", 22);
+    let same_export = prepare("nested-same-export", "outer", 23);
+    nested.lock().unwrap().extend([inner, same_export]);
+
+    let outer_token = capabilities
+        .begin(outer, &skill_id, "outer", &manifest)
+        .unwrap();
+    capabilities
+        .dispatch(outer_token, HostCapability::ReadFile, r#"["outer-before"]"#)
+        .unwrap();
+    capabilities
+        .dispatch(outer_token, HostCapability::ReadFile, r#"["outer-after"]"#)
+        .unwrap();
+    capabilities.finish(outer_token);
+
+    let effects = effects.lock().unwrap();
+    let identities = effects
+        .iter()
+        .map(|effect| {
+            (
+                effect.invocation_id.as_str(),
+                effect.request.grant_id.clone(),
+                effect.request.effect_ordinal,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        vec![
+            (
+                "nested-outer",
+                GrantId::new(uuid::Uuid::from_bytes([21; 16])).unwrap(),
+                0
+            ),
+            (
+                "nested-inner",
+                GrantId::new(uuid::Uuid::from_bytes([22; 16])).unwrap(),
+                1
+            ),
+            (
+                "nested-same-export",
+                GrantId::new(uuid::Uuid::from_bytes([23; 16])).unwrap(),
+                2
+            ),
+            (
+                "nested-outer",
+                GrantId::new(uuid::Uuid::from_bytes([21; 16])).unwrap(),
+                3
+            ),
+        ]
+    );
 }
 
 #[test]

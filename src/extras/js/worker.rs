@@ -21,6 +21,8 @@ use super::protocol::{
     WorkerProtocol, WorkerReady, WorkerWireFrame, read_frame, write_frame,
 };
 use super::types::{MEMORY_LIMIT, STACK_LIMIT, STEP_TIMEOUT};
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::capability::InvocationCapabilityRuntime;
 use crate::sandbox::worker::{
     INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, finalize_internal_worker,
     is_internal_worker_marker_present, standard_streams_are_protocol_pipes,
@@ -35,6 +37,31 @@ const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
 const MAX_VERIFICATION_CASES: usize = 4_096;
 const MAX_VERIFICATION_CASE_ID_BYTES: usize = 128;
 const VERIFICATION_LOADER_VERSION: u16 = 1;
+
+/// Worker-owned revocation boundary for all invocation capabilities tied to one fresh runtime.
+/// Dropping it covers timeout, protocol cancellation, panic unwinding, and worker recycle paths.
+#[cfg(feature = "skills")]
+pub(crate) struct WorkerCapabilityLifecycle {
+    capabilities: InvocationCapabilityRuntime,
+}
+
+#[cfg(feature = "skills")]
+impl WorkerCapabilityLifecycle {
+    pub(crate) fn new(capabilities: InvocationCapabilityRuntime) -> Self {
+        Self { capabilities }
+    }
+
+    pub(crate) fn cancel(&self, invocation_id: &super::protocol::InvocationId) {
+        self.capabilities.cancel(invocation_id);
+    }
+}
+
+#[cfg(feature = "skills")]
+impl Drop for WorkerCapabilityLifecycle {
+    fn drop(&mut self) {
+        self.capabilities.recycle();
+    }
+}
 
 const CONSOLE_WRAPPER_SOURCE: &str = r#"
 (emit => {
