@@ -176,6 +176,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".output()",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let output = std::process::Command::new(SW_VERS)",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
     ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/extras/loop/validation.rs",
@@ -588,6 +600,7 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
+    ("src/sandbox/worker/macos.rs", "TC-SUPPORT-UTILITY"),
     ("src/session/mod.rs", "TC-INTERNAL-GIT"),
     ("src/startup.rs", "TC-EXPLICIT-USER-SHELL"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),

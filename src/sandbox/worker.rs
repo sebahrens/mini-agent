@@ -76,11 +76,21 @@ impl fmt::Display for WorkerBackend {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkerContainmentStatus {
-    Available(WorkerBackend),
+    Available {
+        backend: WorkerBackend,
+        assurance: WorkerContainmentAssurance,
+    },
     Unavailable {
         backend: WorkerBackend,
+        assurance: WorkerContainmentAssurance,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerContainmentAssurance {
+    Enforced,
+    DeprecatedBestEffort,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -230,7 +240,14 @@ impl TestWorkerLauncher {
 #[cfg(test)]
 impl WorkerLauncher for TestWorkerLauncher {
     fn containment_status(&self) -> WorkerContainmentStatus {
-        WorkerContainmentStatus::Available(WorkerBackend::for_current_platform())
+        WorkerContainmentStatus::Available {
+            backend: WorkerBackend::for_current_platform(),
+            assurance: if cfg!(target_os = "macos") {
+                WorkerContainmentAssurance::DeprecatedBestEffort
+            } else {
+                WorkerContainmentAssurance::Enforced
+            },
+        }
     }
 
     fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
@@ -362,7 +379,12 @@ mod tests {
 
     #[test]
     fn worker_launcher_production_is_fail_closed_until_backend_delivery() {
-        let WorkerContainmentStatus::Unavailable { backend, reason } = containment_status() else {
+        let WorkerContainmentStatus::Unavailable {
+            backend,
+            assurance: _,
+            reason,
+        } = containment_status()
+        else {
             panic!("production worker launcher must remain unavailable in A06");
         };
         assert_eq!(backend, WorkerBackend::for_current_platform());

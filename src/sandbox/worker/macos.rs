@@ -1,13 +1,21 @@
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::{Child, ExitStatus};
 
-use super::{WorkerBackend, WorkerContainmentStatus, WorkerLaunchError, WorkerProcess};
+use super::{
+    WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus, WorkerLaunchError,
+    WorkerProcess,
+};
 
 const BACKEND: WorkerBackend = WorkerBackend::Seatbelt;
-const UNAVAILABLE_REASON: &str =
-    "the broker-only Seatbelt/descriptor/rlimit backend has not been delivered";
+const ASSURANCE: WorkerContainmentAssurance = WorkerContainmentAssurance::DeprecatedBestEffort;
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+const SW_VERS: &str = "/usr/bin/sw_vers";
+const VALIDATED_MACOS_MAJORS: &[u32] = &[15, 26];
+const EXEC_TRANSITION_BLOCKER: &str = "sandbox-exec requires an initial exec allowance; a stable exact worker-image allowance remains reusable after launch, and macOS rejects an attempt to tighten an already applied Seatbelt profile, so that image cannot subsequently be denied";
 
 pub(super) fn standard_streams_are_protocol_pipes() -> bool {
     fn is_pipe(fd: RawFd) -> bool {
@@ -22,17 +30,87 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
 }
 
 pub(super) fn containment_status() -> WorkerContainmentStatus {
+    let reason = unavailable_reason();
     WorkerContainmentStatus::Unavailable {
         backend: BACKEND,
-        reason: UNAVAILABLE_REASON.to_string(),
+        assurance: ASSURANCE,
+        reason,
     }
 }
 
 pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
     Err(WorkerLaunchError::Unavailable {
         backend: BACKEND,
-        reason: UNAVAILABLE_REASON.to_string(),
+        reason: unavailable_reason(),
     })
+}
+
+fn unavailable_reason() -> String {
+    if !trusted_system_executable(Path::new(SANDBOX_EXEC)) {
+        return format!(
+            "the undocumented/deprecated best-effort MAC policy is unavailable because {SANDBOX_EXEC} is missing or untrusted"
+        );
+    }
+
+    match macos_major_version() {
+        Ok(major) => unavailable_reason_for_major(major),
+        Err(reason) => format!(
+            "the undocumented/deprecated best-effort MAC policy is disabled because the macOS major version could not be validated: {reason}"
+        ),
+    }
+}
+
+fn unavailable_reason_for_major(major: u32) -> String {
+    if !VALIDATED_MACOS_MAJORS.contains(&major) {
+        return format!(
+            "the undocumented/deprecated best-effort MAC policy is disabled on unvalidated macOS major version {major}"
+        );
+    }
+    format!(
+        "the undocumented/deprecated best-effort MAC policy is disabled: {EXEC_TRANSITION_BLOCKER}"
+    )
+}
+
+fn trusted_system_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_file()
+        && metadata.uid() == 0
+        && metadata.mode() & 0o022 == 0
+        && metadata.mode() & 0o111 != 0
+}
+
+fn macos_major_version() -> Result<u32, String> {
+    if !trusted_system_executable(Path::new(SW_VERS)) {
+        return Err(format!("{SW_VERS} is missing or untrusted"));
+    }
+    let output = std::process::Command::new(SW_VERS)
+        .env_clear()
+        .arg("-productVersion")
+        .output()
+        .map_err(|_| format!("{SW_VERS} could not be executed"))?;
+    if !output.status.success() {
+        return Err(format!("{SW_VERS} rejected the version query"));
+    }
+    parse_macos_major(&output.stdout)
+}
+
+fn parse_macos_major(version: &[u8]) -> Result<u32, String> {
+    let version = std::str::from_utf8(version)
+        .map_err(|_| "the version was not UTF-8".to_string())?
+        .trim();
+    let major = version
+        .split('.')
+        .next()
+        .filter(|component| !component.is_empty())
+        .ok_or_else(|| "the version was empty".to_string())?
+        .parse::<u32>()
+        .map_err(|_| "the major version was not numeric".to_string())?;
+    if major == 0 {
+        return Err("the major version was zero".to_string());
+    }
+    Ok(major)
 }
 
 #[derive(Debug)]
@@ -61,5 +139,31 @@ impl WorkerChild {
 
     pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.wait()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_major_parser_is_strict_and_allowlist_is_explicit() {
+        assert_eq!(parse_macos_major(b"15.7.5\n").unwrap(), 15);
+        assert_eq!(parse_macos_major(b"26.5.2\n").unwrap(), 26);
+        for invalid in [b"".as_slice(), b"0.1", b"future", b".15"] {
+            assert!(parse_macos_major(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert_eq!(VALIDATED_MACOS_MAJORS, &[15, 26]);
+    }
+
+    #[test]
+    fn unvalidated_macos_major_is_distinct_from_the_validated_platform_blocker() {
+        let unknown = unavailable_reason_for_major(27);
+        assert!(unknown.contains("unvalidated macOS major version 27"));
+        assert!(!unknown.contains("stable exact worker-image"));
+
+        let validated = unavailable_reason_for_major(26);
+        assert!(validated.contains("stable exact worker-image"));
+        assert!(validated.contains("remains reusable"));
     }
 }
