@@ -659,6 +659,9 @@ impl<'a> LifecycleService<'a> {
         created_at: i64,
     ) -> Result<TransitionOutcome, LifecycleError> {
         validate_human_approval(approval)?;
+        if !authorization.binds_approval(&approval.approval_id, &approval.actor_id) {
+            return Err(StoreError::Unauthorized.into());
+        }
         if idempotency_key.is_empty()
             || snapshot.artifact_id != skill_id
             || snapshot.predecessor_id.is_some()

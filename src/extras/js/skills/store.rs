@@ -236,6 +236,12 @@ pub(crate) struct ApprovalAuthorization {
     expires_at: i64,
 }
 
+impl ApprovalAuthorization {
+    pub(super) fn binds_approval(&self, approval_id: &str, actor_id: &str) -> bool {
+        self.authorization_id == approval_id && self.principal == actor_id
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ApprovalAuthorizationRequest {
     pub authorization_id: String,
@@ -2901,12 +2907,13 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
             )?;
             let stranded_root_canary: i64 = db.query_row(
                 "SELECT COUNT(*)
-                   FROM skill_approvals a
-                   JOIN skill_revisions r ON r.id = a.skill_id
+                   FROM skill_revisions r
+                   LEFT JOIN skill_approvals a ON a.skill_id = r.id
                    LEFT JOIN skill_lifecycle_approvals l
-                     ON l.skill_id = a.skill_id AND l.approval_kind = 'phase4_canary'
+                     ON l.skill_id = r.id AND l.approval_kind = 'phase4_canary'
                   WHERE r.status = 'canary' AND r.supersedes_id IS NULL
-                    AND (l.approval_id IS NULL
+                    AND (a.approval_id IS NULL
+                         OR l.approval_id IS NULL
                          OR l.approval_id IS NOT a.approval_id
                          OR l.actor_id IS NOT a.approver_id
                          OR l.artifact_row_version IS NOT a.artifact_version + 1

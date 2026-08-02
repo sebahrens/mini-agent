@@ -855,9 +855,13 @@ fn authenticated_approval_authorization_cannot_cross_transition_or_replay() {
         1,
     )
     .unwrap();
-    let reused =
-        HumanApproval::verified("distinct-root-review", "reviewer", report_id, row_version)
-            .unwrap();
+    let reused = HumanApproval::verified(
+        "distinct-root-review",
+        "reviewer",
+        report_id.clone(),
+        row_version,
+    )
+    .unwrap();
     assert!(matches!(
         lifecycle.activate_root(
             "cross-transition",
@@ -871,5 +875,60 @@ fn authenticated_approval_authorization_cannot_cross_transition_or_replay() {
             crate::extras::js::skills::store::StoreError::Unauthorized
         ))
     ));
+
+    let approval_a = HumanApproval::verified(
+        "root-review-a",
+        "reviewer-a",
+        report_id.clone(),
+        row_version,
+    )
+    .unwrap();
+    let approval_b =
+        HumanApproval::verified("root-review-b", "reviewer-b", report_id, row_version).unwrap();
+    let authorization_a = lifecycle
+        .authorize_root_for_test(&artifact.id, &approval_a, 23)
+        .unwrap();
+    let authorization_b = lifecycle
+        .authorize_root_for_test(&artifact.id, &approval_b, 23)
+        .unwrap();
+    assert!(matches!(
+        lifecycle.activate_root(
+            "cross-paired-root-authority",
+            &artifact.id,
+            &approval_a,
+            &authorization_b,
+            &snapshot,
+            24,
+        ),
+        Err(LifecycleError::Store(
+            crate::extras::js::skills::store::StoreError::Unauthorized
+        ))
+    ));
+    drop(lifecycle);
+    let consumed: (Option<i64>, Option<i64>) = evaluator
+        .store()
+        .conn()
+        .query_row(
+            "SELECT
+                (SELECT consumed_at FROM skill_approval_authorizations
+                  WHERE authorization_id = 'root-review-a'),
+                (SELECT consumed_at FROM skill_approval_authorizations
+                  WHERE authorization_id = 'root-review-b')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(consumed, (None, None));
+    let mut lifecycle = LifecycleService::new(evaluator.store_mut());
+    lifecycle
+        .activate_root(
+            "exact-paired-root-authority",
+            &artifact.id,
+            &approval_a,
+            &authorization_a,
+            &snapshot,
+            24,
+        )
+        .unwrap();
     let _ = std::fs::remove_dir_all(root);
 }

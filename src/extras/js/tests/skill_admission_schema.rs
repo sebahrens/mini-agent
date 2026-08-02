@@ -310,6 +310,58 @@ fn skill_admission_schema_v6_backfills_v5_root_canary_and_can_activate() {
 }
 
 #[test]
+fn skill_admission_schema_v6_rejects_v5_root_canary_without_first_approval() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = artifact("/* v5-unapproved-root-canary */");
+    store.insert_verified(&artifact).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+                SET status = 'canary', lineage_root_id = id,
+                    evaluation_report_id = ?2
+              WHERE id = ?1",
+            rusqlite::params![artifact.id, "a".repeat(64)],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute_batch(
+            "DROP TABLE skill_approval_authorizations;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(store);
+
+    assert!(matches!(
+        SkillStore::open_at(&paths),
+        Err(StoreError::CorruptRow(message))
+            if message.contains("could not be backfilled exactly")
+    ));
+    let database = paths.local_data_dir.join("skills/skills.db");
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name = 'skill_approval_authorizations'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn skill_admission_schema_upgrades_phase3_v2_without_losing_generation_shape() {
     let (root, paths) = paths();
     seed_v2(
