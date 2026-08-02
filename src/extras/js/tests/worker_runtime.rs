@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use crate::extras::js::protocol::ArtifactInput;
 use crate::extras::js::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, DiagnosticClass, DiagnosticStage,
-    EffectOperation, EffectRequest, EffectResponse, EffectResult, GrantId, InvocationId,
-    JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame, RunStep, ScriptRole,
-    StepOutcome, StepResult, VerificationCase, VerificationCaseResult, VerificationResult,
-    VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady, WorkerWireFrame,
-    read_frame, write_frame,
+    EffectError, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
+    GrantId, InvocationId, JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame,
+    RunStep, ScriptRole, StepOutcome, StepResult, VerificationCase, VerificationCaseResult,
+    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady,
+    WorkerWireFrame, read_frame, write_frame,
 };
 use crate::extras::js::supervisor::{
     EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
@@ -2210,8 +2210,15 @@ fn run_scripted_supervisor_worker() -> ! {
         output.flush().unwrap();
         std::process::exit(72);
     }
-    let ready = WireFrame::connection(build.clone(), 1, WorkerFrame::Ready(WorkerReady {}));
-    protocol.on_send(&ready).unwrap();
+    let ready_build = if startup == "build-mismatch" {
+        BuildIdentity::new(format!("{}+{}", env!("CARGO_PKG_VERSION"), "f".repeat(64))).unwrap()
+    } else {
+        build.clone()
+    };
+    let ready = WireFrame::connection(ready_build, 1, WorkerFrame::Ready(WorkerReady {}));
+    if startup != "build-mismatch" {
+        protocol.on_send(&ready).unwrap();
+    }
     write_frame(&mut output, &ready).unwrap();
     output.flush().unwrap();
 
@@ -2223,7 +2230,37 @@ fn run_scripted_supervisor_worker() -> ! {
                 let invocation = request.invocation_id.clone().unwrap();
                 match step.code.as_str() {
                     "crash" => std::process::exit(73),
+                    "panic" => {
+                        std::panic::set_hook(Box::new(|_| {}));
+                        let _ = std::panic::catch_unwind(|| panic!("scripted worker panic"));
+                        std::process::exit(77);
+                    }
+                    "os-kill" => std::process::abort(),
+                    "abnormal-exit" => std::process::exit(76),
                     "deadline" => std::thread::park_timeout(Duration::from_secs(30)),
+                    "malformed-protocol" => {
+                        output.write_all(&[0, 0, 0, 1, b'{']).unwrap();
+                        output.flush().unwrap();
+                        std::thread::park_timeout(Duration::from_secs(30));
+                    }
+                    "protocol-fault" => {
+                        let fault = WireFrame::invocation(
+                            build.clone(),
+                            invocation.clone(),
+                            request.sequence + 1,
+                            WorkerFrame::ProtocolFault(
+                                crate::extras::js::protocol::ProtocolFault {
+                                    code:
+                                        crate::extras::js::protocol::ProtocolFaultCode::InvalidState,
+                                    stage: crate::extras::js::protocol::ProtocolStage::Invocation,
+                                },
+                            ),
+                        );
+                        protocol.on_send(&fault).unwrap();
+                        write_frame(&mut output, &fault).unwrap();
+                        output.flush().unwrap();
+                        std::thread::park_timeout(Duration::from_secs(30));
+                    }
                     "stale-response" => {
                         #[cfg(unix)]
                         {
@@ -2250,7 +2287,7 @@ fn run_scripted_supervisor_worker() -> ! {
                 let mut sequence = request.sequence + 1;
                 let effect_count = match step.code.as_str() {
                     "two-effects" => 2,
-                    "effect-pending" | "crash-pending-effect" => 1,
+                    "effect-pending" | "crash-pending-effect" | "outcome-unknown" => 1,
                     _ => 0,
                 };
                 for ordinal in 0..effect_count {
@@ -2276,20 +2313,43 @@ fn run_scripted_supervisor_worker() -> ! {
                     }
                     let response: ParentWireFrame = read_frame(&mut input).unwrap();
                     assert!(matches!(response.message, ParentFrame::EffectResponse(_)));
+                    let outcome_unknown = matches!(
+                        response.message,
+                        ParentFrame::EffectResponse(EffectResponse {
+                            result: EffectResult::Error(EffectError {
+                                code: EffectErrorCode::OutcomeUnknown,
+                            }),
+                            ..
+                        })
+                    );
                     protocol.on_receive(&response).unwrap();
                     sequence = response.sequence + 1;
+                    if outcome_unknown {
+                        break;
+                    }
                 }
-                let value = if step.code == "two-effects" {
-                    "effects-complete"
+                let outcome = if step.code == "js-error" || step.code == "outcome-unknown" {
+                    StepOutcome::Error(JsErrorCode::Exception)
+                } else if step.code == "timeout-step" {
+                    StepOutcome::Timeout
+                } else if step.code == "oom-step" {
+                    StepOutcome::OutOfMemory
                 } else {
-                    "success"
+                    StepOutcome::Value(
+                        if step.code == "two-effects" {
+                            "effects-complete"
+                        } else {
+                            "success"
+                        }
+                        .into(),
+                    )
                 };
                 let terminal = WireFrame::invocation(
                     build.clone(),
                     invocation,
                     sequence,
                     WorkerFrame::StepResult(StepResult {
-                        outcome: StepOutcome::Value(value.into()),
+                        outcome,
                         console: Vec::new(),
                         diagnostic: None,
                         #[cfg(feature = "skills")]

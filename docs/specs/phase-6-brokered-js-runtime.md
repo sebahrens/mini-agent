@@ -564,6 +564,23 @@ is a protocol fault. Optional corrective metadata is limited to a source-free lo
 submitted script. It contains no filename, function name, property/key name, target, ordinal,
 effect result, or other source-derived string.
 
+Worker reuse is a parent-owned, deterministic decision. A successful value, void result, ordinary
+JavaScript exception, or fully recorded effect error may leave the contained process warm, but the
+worker still creates a fresh QuickJS `Runtime` for the next request. A JavaScript timeout or OOM
+terminal poisons the process even though its terminal frame is well formed. A watchdog timeout,
+cancellation, malformed or invalid-state frame, build/version mismatch, stale generation,
+unexpected verification effect, transport failure, process exit/signal/panic, or shutdown fault
+kills and reaps the complete containment tree and erases all invocation grants before another
+request can launch. Warm processes are additionally retired after 256 completed requests or 15
+minutes, whichever comes first. Clean shutdown retires the idle process and a later request starts
+a fresh generation.
+
+An unavailable audit prevents broker construction and therefore sends no request to a worker. An
+effect whose durable completion is `outcome_unknown` terminates that invocation without retry; its
+authority is erased like every other terminal invocation. It may leave the process reusable only
+because the process and protocol remain sound—never because the effect is safe to repeat. A29 owns
+the effect-specific cancellation and reconciliation details.
+
 If QuickJS cannot be classified without trusting exception-controlled text, the worker returns the
 generic `javascript_exception` or `promise_rejection` code. Arbitrary exception `name`, message,
 stack, thrown value, source line/snippet, cause, aggregate members, effect result, console-derived

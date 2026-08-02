@@ -3501,31 +3501,33 @@ pub(crate) fn register_host_globals(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "sandbox", feature = "skills"))]
+    #[cfg(any(unix, feature = "sandbox", feature = "skills"))]
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     #[cfg(feature = "sandbox")]
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    #[cfg(feature = "skills")]
+    #[cfg(any(unix, feature = "skills"))]
     use std::time::Instant;
 
     use super::*;
     #[cfg(feature = "sandbox")]
     use crate::extras::js::audit::AuditFailurePoint;
     #[cfg(any(feature = "sandbox", feature = "skills"))]
-    use crate::extras::js::audit::{AuditState, EffectAudit};
-    #[cfg(any(feature = "sandbox", feature = "skills"))]
+    use crate::extras::js::audit::AuditState;
+    #[cfg(any(unix, feature = "sandbox", feature = "skills"))]
+    use crate::extras::js::audit::EffectAudit;
+    #[cfg(any(unix, feature = "sandbox", feature = "skills"))]
     use crate::extras::js::broker::{
         GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant,
     };
-    #[cfg(any(feature = "sandbox", feature = "skills"))]
+    #[cfg(any(unix, feature = "sandbox", feature = "skills"))]
     use crate::extras::js::protocol::{AdvisoryAttribution, EffectRequest, InvocationId};
     #[cfg(feature = "skills")]
     use crate::extras::js::skills::{CapabilityManifest, CapabilityScope, CapabilityTier};
     use crate::extras::js::tool::PermissionBridgeOwner;
-    #[cfg(any(feature = "sandbox", feature = "skills"))]
+    #[cfg(any(unix, feature = "sandbox", feature = "skills"))]
     use crate::paths::AppPaths;
     use crate::permission::ask::{AskSender, UserDecision};
     use crate::permission::checker::{PermCheck, PermissionChecker};

@@ -28,6 +28,8 @@ const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_PROCESS_AGE: Duration = Duration::from_secs(15 * 60);
+const MAX_PROCESS_INVOCATIONS: u64 = 256;
 
 pub(crate) type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectResult> + Send + 'a>>;
 
@@ -46,6 +48,14 @@ pub(crate) trait InvocationEffectHandler: Send {
             authorization: None,
         }
     }
+
+    /// Erase invocation authority after a terminal result that leaves the worker reusable.
+    fn finish_invocation(&mut self) {}
+
+    /// Erase invocation authority after any worker/process/protocol fault or poisoned runtime.
+    fn recycle_invocation(&mut self) {
+        self.finish_invocation();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -58,6 +68,8 @@ pub(crate) enum WorkerError {
     Transport,
     #[error("JavaScript worker violated its protocol")]
     Protocol,
+    #[error("JavaScript worker build identity differs from the parent")]
+    BuildMismatch,
     #[error("JavaScript worker invocation was cancelled")]
     Cancelled,
     #[error("JavaScript worker invocation exceeded its deadline")]
@@ -83,6 +95,7 @@ struct SupervisorInner {
     active_generation: AtomicU64,
     accepts_test_preamble: bool,
     watchdog: Duration,
+    reuse_policy: WorkerReusePolicy,
 }
 
 struct SupervisorState {
@@ -98,6 +111,35 @@ struct WorkerConnection {
     process: WorkerProcess,
     protocol: ParentProtocol,
     stderr_drain: BoundedStderrDrain,
+    created_at: Instant,
+    completed_invocations: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WorkerReusePolicy {
+    max_age: Duration,
+    max_invocations: u64,
+}
+
+impl WorkerReusePolicy {
+    pub(crate) const fn new(max_age: Duration, max_invocations: u64) -> Self {
+        Self {
+            max_age,
+            max_invocations,
+        }
+    }
+
+    fn permits(&self, connection: &WorkerConnection, now: Instant) -> bool {
+        self.max_invocations > 0
+            && connection.completed_invocations < self.max_invocations
+            && now.saturating_duration_since(connection.created_at) < self.max_age
+    }
+}
+
+impl Default for WorkerReusePolicy {
+    fn default() -> Self {
+        Self::new(MAX_PROCESS_AGE, MAX_PROCESS_INVOCATIONS)
+    }
 }
 
 struct BoundedStderrDrain {
@@ -161,6 +203,20 @@ impl JsWorkerSupervisor {
         accepts_test_preamble: bool,
         watchdog: Duration,
     ) -> Self {
+        Self::new_with_policy(
+            launcher,
+            accepts_test_preamble,
+            watchdog,
+            WorkerReusePolicy::default(),
+        )
+    }
+
+    fn new_with_policy(
+        launcher: Arc<dyn WorkerLauncher>,
+        accepts_test_preamble: bool,
+        watchdog: Duration,
+        reuse_policy: WorkerReusePolicy,
+    ) -> Self {
         Self(Arc::new(SupervisorInner {
             transport: tokio::sync::Mutex::new(SupervisorState {
                 idle: None,
@@ -172,6 +228,7 @@ impl JsWorkerSupervisor {
             active_generation: AtomicU64::new(0),
             accepts_test_preamble,
             watchdog,
+            reuse_policy,
         }))
     }
 
@@ -186,6 +243,15 @@ impl JsWorkerSupervisor {
         watchdog: Duration,
     ) -> Self {
         Self::new(Arc::new(launcher), true, watchdog)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_launcher_and_policy_for_test(
+        launcher: impl WorkerLauncher + 'static,
+        watchdog: Duration,
+        reuse_policy: WorkerReusePolicy,
+    ) -> Self {
+        Self::new_with_policy(Arc::new(launcher), true, watchdog, reuse_policy)
     }
 
     pub(crate) async fn execute(
@@ -263,15 +329,20 @@ impl JsWorkerSupervisor {
     async fn invoke<H: InvocationEffectHandler>(
         &self,
         request: InvocationRequest,
-        mut effects: Option<&mut H>,
+        effects: Option<&mut H>,
         cancellation: PermCancellation,
         invocation: Option<InvocationId>,
     ) -> Result<InvocationTerminal, WorkerError> {
+        let mut authority = InvocationAuthority::new(effects);
         // The single deadline starts before lease acquisition and therefore bounds queueing,
         // startup, protocol I/O, JavaScript execution, and parent-brokered effect handling.
         let deadline = Instant::now() + self.0.watchdog;
         let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
-        let mut connection = match state.idle.take() {
+        let mut connection = match state
+            .idle
+            .take()
+            .filter(|connection| self.0.reuse_policy.permits(connection, Instant::now()))
+        {
             Some(connection) => connection,
             None => {
                 let generation = allocate_counter(&mut state.next_generation)?;
@@ -307,12 +378,27 @@ impl JsWorkerSupervisor {
             &mut connection,
             invocation,
             request,
-            &mut effects,
+            authority.handler(),
             &cancellation,
             deadline,
         )
         .await;
-        if result.is_ok() {
+        let reusable_terminal = matches!(
+            &result,
+            Ok(InvocationTerminal::Step(StepResult {
+                outcome: super::protocol::StepOutcome::Value(_)
+                    | super::protocol::StepOutcome::Void
+                    | super::protocol::StepOutcome::Error(_),
+                ..
+            })) | Ok(InvocationTerminal::Verification(_))
+        );
+        if reusable_terminal {
+            authority.finish();
+            connection.completed_invocations = connection.completed_invocations.saturating_add(1);
+        } else {
+            authority.recycle();
+        }
+        if reusable_terminal && self.0.reuse_policy.permits(&connection, Instant::now()) {
             state.idle = Some(connection);
         }
         active.armed = false;
@@ -416,6 +502,46 @@ struct ActiveGeneration<'a> {
     armed: bool,
 }
 
+struct InvocationAuthority<'a, H: InvocationEffectHandler> {
+    handler: Option<&'a mut H>,
+    terminal: bool,
+}
+
+impl<'a, H: InvocationEffectHandler> InvocationAuthority<'a, H> {
+    fn new(handler: Option<&'a mut H>) -> Self {
+        Self {
+            handler,
+            terminal: false,
+        }
+    }
+
+    fn handler(&mut self) -> &mut Option<&'a mut H> {
+        &mut self.handler
+    }
+
+    fn finish(&mut self) {
+        if let Some(handler) = self.handler.as_deref_mut() {
+            handler.finish_invocation();
+        }
+        self.terminal = true;
+    }
+
+    fn recycle(&mut self) {
+        if let Some(handler) = self.handler.as_deref_mut() {
+            handler.recycle_invocation();
+        }
+        self.terminal = true;
+    }
+}
+
+impl<H: InvocationEffectHandler> Drop for InvocationAuthority<'_, H> {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.recycle();
+        }
+    }
+}
+
 impl Drop for ActiveGeneration<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -481,6 +607,8 @@ async fn launch_connection(
         process,
         protocol: ParentProtocol::new(build.clone()),
         stderr_drain,
+        created_at: Instant::now(),
+        completed_invocations: 0,
     };
     let hello = WireFrame::connection(build, 0, ParentFrame::Hello(ParentHello {}));
     connection
@@ -499,7 +627,7 @@ async fn launch_connection(
     connection
         .protocol
         .on_receive(&ready)
-        .map_err(|_| WorkerError::Protocol)?;
+        .map_err(map_protocol_error)?;
     if !matches!(ready.message, WorkerFrame::Ready(_)) {
         return Err(WorkerError::Protocol);
     }
@@ -643,7 +771,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
         connection
             .protocol
             .on_receive(&frame)
-            .map_err(|_| WorkerError::Protocol)?;
+            .map_err(map_protocol_error)?;
         connection.sequence = advance(connection.sequence)?;
         match frame.message {
             WorkerFrame::EffectRequest(request) => {
@@ -716,7 +844,15 @@ async fn run_invocation<H: InvocationEffectHandler>(
             WorkerFrame::VerificationResult(result) => {
                 return Ok(InvocationTerminal::Verification(result));
             }
-            WorkerFrame::ProtocolFault(_) => return Err(WorkerError::Protocol),
+            WorkerFrame::ProtocolFault(fault) => {
+                return Err(
+                    if fault.code == super::protocol::ProtocolFaultCode::BuildMismatch {
+                        WorkerError::BuildMismatch
+                    } else {
+                        WorkerError::Protocol
+                    },
+                );
+            }
             WorkerFrame::Ready(_) => return Err(WorkerError::Protocol),
         }
     }
@@ -743,7 +879,7 @@ async fn write_parent(
         .await?
         .map_err(|_| WorkerError::Transport)?;
     validate_generation(connection.generation, tagged.generation)?;
-    tagged.result.map_err(|_| WorkerError::Transport)
+    tagged.result.map_err(map_frame_error)
 }
 
 async fn read_worker(
@@ -786,7 +922,7 @@ async fn read_worker(
     {
         return Err(WorkerError::Transport);
     }
-    tagged.result.map_err(|_| WorkerError::Transport)
+    tagged.result.map_err(map_frame_error)
 }
 
 struct TaggedIo<T> {
@@ -891,6 +1027,26 @@ fn map_launch_error(error: WorkerLaunchError) -> WorkerError {
     match error {
         WorkerLaunchError::Unavailable { .. } => WorkerError::ContainmentUnavailable,
         WorkerLaunchError::Io { .. } | WorkerLaunchError::MissingPipe { .. } => WorkerError::Launch,
+    }
+}
+
+fn map_protocol_error(error: super::protocol::ProtocolError) -> WorkerError {
+    match error {
+        super::protocol::ProtocolError::BuildMismatch { .. }
+        | super::protocol::ProtocolError::VersionMismatch { .. } => WorkerError::BuildMismatch,
+        _ => WorkerError::Protocol,
+    }
+}
+
+fn map_frame_error(error: FrameError) -> WorkerError {
+    match error {
+        FrameError::Io(_)
+        | FrameError::TruncatedHeader { .. }
+        | FrameError::TruncatedBody { .. } => WorkerError::Transport,
+        FrameError::ZeroLength
+        | FrameError::FrameTooLarge { .. }
+        | FrameError::InvalidJson
+        | FrameError::Serialization => WorkerError::Protocol,
     }
 }
 
