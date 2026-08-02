@@ -9,7 +9,9 @@ use crate::extras::js::skills::held_out::{
 use crate::extras::js::skills::lifecycle::{
     EvidenceSnapshot, HumanApproval, LifecycleError, LifecycleService,
 };
-use crate::extras::js::skills::store::{AdminIdentity, ProposalStatus, SkillStore};
+use crate::extras::js::skills::store::{
+    AdminIdentity, MAX_EVALUATION_ATTEMPTS, ProposalStatus, SkillStore,
+};
 use crate::extras::js::skills::verify::worker_error;
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::extras::js::supervisor::WorkerError;
@@ -115,10 +117,39 @@ fn verification_scheduler_cancellation_retries_without_rejecting_candidate() {
         .unwrap()
         .expect("proposal remains queued");
     assert_eq!(proposal.status, ProposalStatus::Pending);
-    assert_eq!(proposal.attempt_count, 1);
+    assert_eq!(proposal.attempt_count, 0);
     assert_eq!(proposal.next_attempt_at, Some(21));
     assert_eq!(proposal.lease_owner, None);
     assert_eq!(proposal.lease_expires_at, None);
+    assert_eq!(proposal.report_id, None);
+    assert_eq!(proposal.reason_code, None);
+    assert_eq!(
+        evaluator.store().revision_status(&artifact.id).unwrap(),
+        Some("pending".to_string())
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn verification_scheduler_cancellation_never_exhausts_artifact_retry_budget() {
+    let (root, _paths, mut evaluator, artifact) = evaluator(true);
+
+    for attempt in 0..=MAX_EVALUATION_ATTEMPTS {
+        evaluator.fail_next_verification_for_test(worker_error(WorkerError::Cancelled));
+        let now = 20 + i64::from(attempt) * 2;
+        let error = evaluator
+            .evaluate_next(now)
+            .expect_err("scheduler cancellation must remain infrastructure-only");
+        assert!(matches!(error, AdmissionError::Retryable(_)));
+    }
+
+    let proposal = evaluator
+        .store()
+        .get_proposal(&artifact.id)
+        .unwrap()
+        .expect("proposal remains queued after repeated infrastructure failures");
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+    assert_eq!(proposal.attempt_count, 0);
     assert_eq!(proposal.report_id, None);
     assert_eq!(proposal.reason_code, None);
     assert_eq!(

@@ -125,6 +125,18 @@ impl AdmissionEvaluator {
                 )?;
                 Err(AdmissionError::Retryable(error))
             }
+            Err(EvaluationFailure::Infrastructure { error }) => {
+                let exponent = lease.attempt.saturating_sub(1).min(8);
+                let delay = (1i64 << exponent).min(MAX_RETRY_BACKOFF_SECONDS);
+                self.store.retry_infrastructure_proposal(
+                    &lease.proposal_id,
+                    &self.worker_id,
+                    lease.row_version,
+                    now.saturating_add(delay),
+                    now,
+                )?;
+                Err(AdmissionError::Retryable(error))
+            }
         }
     }
 
@@ -799,8 +811,7 @@ fn classify_verification(
     fallback_detail: &'static str,
 ) -> EvaluationFailure {
     if let VerificationError::InfrastructureUnavailable(message) = error {
-        return EvaluationFailure::Retryable {
-            code: "evaluation_infrastructure_unavailable",
+        return EvaluationFailure::Infrastructure {
             error: message.clone(),
         };
     }
@@ -842,6 +853,9 @@ enum EvaluationFailure {
     SuiteRequired,
     Retryable {
         code: &'static str,
+        error: String,
+    },
+    Infrastructure {
         error: String,
     },
 }
@@ -976,12 +990,6 @@ mod scheduler_tests {
             "embedded_test_failed",
             "embedded verification failed",
         );
-        assert!(matches!(
-            failure,
-            EvaluationFailure::Retryable {
-                code: "evaluation_infrastructure_unavailable",
-                ..
-            }
-        ));
+        assert!(matches!(failure, EvaluationFailure::Infrastructure { .. }));
     }
 }
