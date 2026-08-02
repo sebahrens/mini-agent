@@ -1658,7 +1658,10 @@ async fn worker_broker_grants_never_allow_a_skill_to_propose_another_skill() {
 async fn worker_broker_grants_expiring_during_ask_never_execute() {
     let invocation_id = invocation("inv-expiring-ask");
     let case = operation_cases(&invocation_id).remove(0);
-    let expires_at = Instant::now() + Duration::from_secs(1);
+    // Full cross-platform suites can leave this task unscheduled for more than a second before
+    // dispatch begins. Keep the expiry comfortably beyond setup so the test exercises expiry
+    // during the Ask wait, rather than an unrelated pre-dispatch expiry.
+    let expires_at = Instant::now() + Duration::from_secs(5);
     let grant = grant(&case, &invocation_id, expires_at);
     let effect = request(&case, &grant);
     let record = Arc::new(Mutex::new(ServiceRecord::default()));
