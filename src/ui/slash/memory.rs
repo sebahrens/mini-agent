@@ -9,6 +9,8 @@ use crate::ui::slash::write_result;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::process_creation::StdCommandCreationExt;
+
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     #[cfg(not(feature = "memory"))]
     {
@@ -263,7 +265,7 @@ fn edit_memory_file_with_shell(shell: &Path, path: &Path, editor: &str) -> std::
         .arg(format!("{} \"$1\"", editor))
         .arg("sh")
         .arg(&temp.path)
-        .status()?;
+        .status_guarded()?;
     if !status.success() {
         return Err(std::io::Error::other(format!(
             "editor exited unsuccessfully: {status}"

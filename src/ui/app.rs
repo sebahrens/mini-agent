@@ -13,6 +13,7 @@ use crate::config;
 use crate::event::{AgentEvent, BtwEvent, UserEvent};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
+use crate::process_creation::StdCommandCreationExt;
 use crate::provider::AnyAgent;
 use crate::session::MessageRole;
 use crate::ui::event_handler;
@@ -1654,7 +1655,7 @@ impl<'a> App<'a> {
             std::process::Command::new("bash")
                 .arg("-c")
                 .arg(&cmd_owned)
-                .output()
+                .output_guarded()
         })
         .await
         .map_err(|e| anyhow::anyhow!("spawn error: {}", e))?
@@ -1851,7 +1852,7 @@ impl<'a> App<'a> {
     fn run_lazygit(&mut self) -> anyhow::Result<()> {
         if std::process::Command::new("lazygit")
             .arg("--version")
-            .output()
+            .output_guarded()
             .is_err()
         {
             self.renderer.write_line(
@@ -1869,7 +1870,7 @@ impl<'a> App<'a> {
         let _ = stdout.execute(crossterm::event::DisableMouseCapture);
         let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
         let _ = stdout.flush();
-        let _ = std::process::Command::new("lazygit").status();
+        let _ = std::process::Command::new("lazygit").status_guarded();
         let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
         let _ = stdout.execute(crossterm::terminal::Clear(
             crossterm::terminal::ClearType::All,

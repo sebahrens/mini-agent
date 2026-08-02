@@ -7,6 +7,8 @@ use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::process_creation::StdCommandCreationExt;
+
 pub const TOOL_RESULT_SAVE_THRESHOLD: usize = 12_000;
 pub const TOOL_RESULT_HEAD_CHARS: usize = 2_000;
 pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
@@ -294,7 +296,7 @@ impl Session {
         let out = std::process::Command::new("git")
             .args(["status", "--porcelain=v2", "--branch"])
             .current_dir(dir)
-            .output()
+            .output_guarded()
             .ok()?;
         if !out.status.success() {
             return None;

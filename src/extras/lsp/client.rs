@@ -16,6 +16,7 @@ use tokio::sync::{Notify, oneshot};
 
 use super::rpc;
 use crate::config::types::LspServerConfig;
+use crate::process_creation::TokioCommandCreationExt;
 
 /// `file://` URI for a path, with minimal percent-encoding (anything outside
 /// RFC 3986 unreserved + `/` is hex-escaped). Relative paths resolve against
@@ -82,7 +83,7 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
+            .spawn_guarded()
             .map_err(|e| {
                 tracing::debug!("lsp[{name}]: cannot spawn '{}': {e}", cfg.command);
                 e

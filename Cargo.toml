@@ -129,6 +129,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_UI_Shell",
@@ -143,7 +144,9 @@ rustix = { version = "1.1", features = ["process", "thread"] }
 seccompiler = "0.5"
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }
+syn = { version = "2", features = ["full", "visit"] }
 
 [build-dependencies]
 sha2 = "0.10"

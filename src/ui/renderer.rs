@@ -11,6 +11,8 @@ use crossterm::terminal::{Clear, ClearType};
 use regex::Regex;
 use smallvec::SmallVec;
 
+use crate::process_creation::StdCommandCreationExt;
+
 use super::feed::{BlockStyle, Feed, style_from_color};
 use super::markdown::word_wrap;
 use super::statusline::StatusSpan;
@@ -1449,7 +1451,7 @@ pub fn open_url(url: &str) -> anyhow::Result<()> {
             .args(args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .spawn_guarded()
         else {
             continue; // opener not installed
         };
@@ -1480,7 +1482,7 @@ pub fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .spawn_guarded()
         else {
             continue; // tool not installed
         };

@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use include_dir::{Dir, include_dir};
 
+use crate::process_creation::StdCommandCreationExt;
+
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/docs");
 
 pub fn global_docs_dir() -> PathBuf {
@@ -19,7 +21,9 @@ pub fn show_get_started() -> anyhow::Result<()> {
             doc_path.display()
         );
     }
-    let status = std::process::Command::new("less").arg(&doc_path).status()?;
+    let status = std::process::Command::new("less")
+        .arg(&doc_path)
+        .status_guarded()?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }

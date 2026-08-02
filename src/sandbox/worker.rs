@@ -577,7 +577,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     fn worker_launcher_production_is_fail_closed_until_backend_delivery() {
         let WorkerContainmentStatus::Unavailable {
             backend,
@@ -585,7 +585,7 @@ mod tests {
             reason,
         } = containment_status()
         else {
-            panic!("production worker launcher must remain unavailable in A06");
+            panic!("macOS production worker launcher must remain unavailable");
         };
         assert_eq!(backend, WorkerBackend::for_current_platform());
         assert!(!reason.trim().is_empty());
@@ -627,6 +627,60 @@ mod tests {
             "prove only that `CreateProcessW` accepts the production image with the requested"
         ));
         assert!(specification.contains("They do not prove the resulting token"));
+    }
+
+    #[test]
+    fn windows_production_launcher_source_keeps_creation_time_authority_closed() {
+        let source = include_str!("worker/windows.rs");
+        let creation_source = include_str!("../process_creation.rs");
+        for required in [
+            "PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES",
+            "PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY",
+            "PROC_THREAD_ATTRIBUTE_JOB_LIST",
+            "PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY",
+            "PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY",
+            "PROC_THREAD_ATTRIBUTE_HANDLE_LIST",
+            "PROCESS_CREATION_CHILD_PROCESS_RESTRICTED",
+            "PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT",
+            "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+            "JOB_OBJECT_LIMIT_ACTIVE_PROCESS",
+            "JOB_OBJECT_LIMIT_PROCESS_MEMORY",
+            "JOB_OBJECT_LIMIT_PROCESS_TIME",
+            "JOB_OBJECT_UILIMIT_ALL",
+            "ProcessMemoryLimit = PROCESS_MEMORY_LIMIT_BYTES",
+            "PerProcessUserTimeLimit = PROCESS_CPU_LIMIT_100NS",
+            "AttributeList::new(6)",
+            "TRUE,\n                EXTENDED_STARTUPINFO_PRESENT",
+            "WorkerChild::contained(process, job",
+        ] {
+            assert!(
+                source.contains(required),
+                "Windows production launcher lost required primitive {required}"
+            );
+        }
+        assert!(source.contains("pipes.child_input.clear_inherit()?"));
+        assert!(source.contains("pipes.child_output.clear_inherit()?"));
+        assert!(source.contains("pipes.child_error.clear_inherit()?"));
+        assert!(source.contains("drop(inheritance_guard);"));
+        assert!(
+            source
+                .matches("crate::process_creation::creation_guard()?")
+                .count()
+                >= 3
+        );
+        assert!(creation_source.contains("static PROCESS_CREATION_LOCK: Mutex<()>"));
+        assert!(creation_source.contains("trait StdCommandCreationExt"));
+        assert!(creation_source.contains("trait TokioCommandCreationExt"));
+        assert!(creation_source.contains("trait RmcpCommandCreationExt"));
+        assert!(source.contains("Windows LPAC runtime containment probe has not passed"));
+        assert!(!source.contains("PREFLIGHT.get_or_init"));
+        assert!(source.contains("WorkerLaunchError::Unavailable {"));
+        assert!(source.contains("crate::process_creation::creation_guard()?"));
+        assert!(source.contains("Capabilities: null_mut(),\n            CapabilityCount: 0"));
+        assert!(!source.contains("AssignProcessToJobObject"));
+        assert!(!source.contains("PROC_THREAD_ATTRIBUTE_PARENT_PROCESS"));
+        assert!(!source.contains("PROCESS_CREATION_MITIGATION_POLICY_WIN32K"));
+        assert!(!source.contains("PROCESS_CREATION_MITIGATION_POLICY_PROHIBIT_DYNAMIC_CODE"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::io::Read;
 
 use compact_str::CompactString;
 
+use crate::process_creation::StdCommandCreationExt;
 use crate::ui::events::render_session;
 use crate::ui::slash::{SlashCtx, undo_last, write_error, write_ok, write_result};
 
@@ -285,7 +286,10 @@ async fn handle_undo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         std::io::stdin().read_exact(&mut buf).is_ok() && (buf[0] == b'y' || buf[0] == b'Y');
 
     if do_stash {
-        match std::process::Command::new("git").args(["stash"]).output() {
+        match std::process::Command::new("git")
+            .args(["stash"])
+            .output_guarded()
+        {
             Ok(out) if out.status.success() => {
                 write_ok(ctx.renderer, "git stash done");
             }

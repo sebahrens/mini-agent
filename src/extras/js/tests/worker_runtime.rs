@@ -18,6 +18,8 @@ use crate::extras::js::supervisor::{
     EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
 };
 use crate::extras::js::types::PermCancellation;
+#[cfg(windows)]
+use crate::sandbox::worker::ProductionWorkerLauncher;
 use crate::sandbox::worker::{
     TestSupervisorStartup, TestWorkerLauncher, WorkerLaunchError, WorkerLauncher, WorkerProcess,
 };
@@ -25,6 +27,21 @@ use crate::sandbox::worker::{
 const TEST_CREDENTIAL_CANARY: &str = "A07_CREDENTIAL_CANARY_MUST_NOT_LEAK";
 const TEST_CONFIG_CANARY: &str = "A07_CONFIG_CANARY_MUST_NOT_LEAK";
 const TEST_WORKSPACE_CANARY: &str = "A07_WORKSPACE_CANARY_MUST_NOT_LEAK";
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_production_supervisor_rejects_until_runtime_probe_passes() {
+    let supervisor = JsWorkerSupervisor::with_launcher_for_test(ProductionWorkerLauncher);
+    let error = supervisor
+        .execute(
+            RunStep::new("must-not-launch".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .expect_err("unprobed Windows containment must not reach production launch");
+    assert_eq!(error, WorkerError::ContainmentUnavailable);
+}
 
 fn hello(sequence: u64) -> ParentWireFrame {
     WireFrame::connection(

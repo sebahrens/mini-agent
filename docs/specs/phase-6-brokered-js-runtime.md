@@ -544,6 +544,35 @@ an inheritable canary omitted from `HANDLE_LIST`, and access denial for a parent
 sentinel before emitting its fixed readiness frame. Profile and disposable-artifact cleanup errors
 are part of the gate result rather than silently treated as success.
 
+Windows handle inheritance is process-global state. The LPAC launcher and every production
+standard-library, Tokio, or reviewed third-party process terminal in mini-agent use one crate-wide
+creation lock. LPAC acquires it before the first handle is made inheritable and releases it only
+after every intended child endpoint and excluded canary has had its inherit bit cleared or its
+handle closed. Spawn/status command helpers acquire the same outer lock before entering Rust's
+private Windows creation lock and release it immediately after synchronous spawn. The
+standard-library output helper is the one synchronous exception: because
+`Command` does not expose its stdio configuration for a faithful spawn-only reimplementation, it
+holds the lock while `Command::output` completes, preserving explicit stdio and builder reuse. No
+guard crosses an async suspension, and async/await/closure-deferred terminals cannot claim lexical
+guard dominance; macro-contained raw terminals are likewise non-dominant because expansion can
+defer execution. Inheritable-handle owners also clear their bit during drop on
+every error path before the earlier-acquired lock guard is released. The checked subprocess
+inventory recursively resolves parsed imports, type aliases, and local-module re-exports alongside
+full-source tokens, treats glob imports and out-of-line modules as opaque, and inventories associated
+terminal function-item references after normalizing raw identifiers. Terminal method identifiers in
+macro inputs and locally defined `macro_rules!` bodies fail closed unless an exact inventory
+identity proves the site non-process. The identity binds source path and occurrence to SHA-256 of the
+unambiguously framed full macro-context chain. Each invocation structurally encodes exact path tokens
+(including root qualification and raw identifier spelling), punctuation character and spacing,
+token-tree kind, nested delimiter, and literal spelling without reconstructing a path or stringifying
+the token stream. A matching terminal line, inner invocation, or macro name alone grants nothing;
+macro-controlled terminals cannot inherit lexical guard dominance. It rejects
+multiline, qualified-angle or renamed UFCS, and
+ambiguous Windows-capable production terminals that bypass this boundary. A dedicated exact
+multiset inventory for the creation helper itself requires
+every raw standard-library, Tokio, and RMCP terminal to remain dominated by a retained crate guard.
+Any future raw or third-party Windows launcher is inside the same boundary and must reuse it.
+
 On a standard-user Windows checkout, prepare and run the complete gate with:
 
 ```powershell
@@ -553,12 +582,15 @@ $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $cargoHome 'bin\mini-agent.ex
 cargo test --locked --no-default-features --features js windows_lpac_can_load_current_exe_with_only_protocol_handles -- --ignored --nocapture --exact
 ```
 
-This source-level gate has not been executed on Windows as part of the macOS-authored change. Its
-result remains unverified until the ignored test passes on `windows-latest` and a standard-user
-Windows installation for every location that will be advertised. Production Windows worker status
-therefore remains unavailable: this spike does not deliver the A26 launcher, does not permit a
-restricted-token or unconfined fallback, and does not satisfy the separate `mini-agent-uq5c`
-general-command sandbox.
+Construction of the production LPAC policy and attribute list is not runtime evidence: it cannot
+prove that Windows accepts the combined token, Job, mitigation, handle, console, and executable
+controls or that the resulting child observes them. Production Windows worker status therefore
+remains unavailable until a sacrificial launch probes those combined controls on the running host.
+Neither the construction preflight nor the narrower image-loading rows may report availability.
+While status is unavailable, the production launcher returns the typed unavailable error without
+calling `CreateProcessW`; only the internal sacrificial-probe/test seam may call the raw production
+launcher. There is no restricted-token or unconfined fallback, and this worker boundary does not
+satisfy the separate `mini-agent-uq5c` general-command sandbox.
 
 ## Failure semantics
 
