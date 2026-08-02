@@ -629,8 +629,8 @@ sandbox required by parent-brokered JS `spawn`.
 
 The potentially blocking Windows creation call runs on one owned helper thread behind a five-second
 caller-side deadline. Cancellation and timeout do not claim to interrupt the operating-system call.
-If it returns late, the supervisor still owns and tears down the result before releasing the launch
-lease. A permanently blocked creation call cannot be forcibly stopped and remains an explicit
+If it returns late, the preflight helper retains sole ownership and tears down the result before it
+exits. A permanently blocked creation call cannot be forcibly stopped and remains an explicit
 availability residual; no second launch helper or worker may be created around it.
 
 ### Windows production containment and install-location gate
