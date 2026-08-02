@@ -1,13 +1,21 @@
 use std::io::{Read, Write};
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::extras::js::protocol::{
-    ArtifactInput, BuildIdentity, ConsoleLevel, DiagnosticClass, DiagnosticStage, InvocationId,
-    JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame, RunStep, ScriptRole,
-    StepOutcome, StepResult, VerificationCase, VerificationResult, VerifyArtifact, WireFrame,
-    WorkerFrame, WorkerWireFrame, read_frame, write_frame,
+    AdvisoryAttribution, ArtifactInput, BuildIdentity, ConsoleLevel, DiagnosticClass,
+    DiagnosticStage, EffectOperation, EffectRequest, EffectResponse, EffectResult, GrantId,
+    InvocationId, JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame, RunStep,
+    ScriptRole, StepOutcome, StepResult, VerificationCase, VerificationCaseResult,
+    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady,
+    WorkerWireFrame, read_frame, write_frame,
 };
+use crate::extras::js::supervisor::{
+    EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
+};
+use crate::extras::js::types::PermCancellation;
 use crate::sandbox::worker::{TestWorkerLauncher, WorkerLauncher};
 
 const TEST_CREDENTIAL_CANARY: &str = "A07_CREDENTIAL_CANARY_MUST_NOT_LEAK";
@@ -827,6 +835,489 @@ fn worker_bootstrap_initializes_no_parent_authority_surface() {
     }
 }
 
+#[derive(Clone, Default)]
+struct RecordingEffects {
+    ordinals: Arc<Mutex<Vec<u32>>>,
+}
+
+impl InvocationEffectHandler for RecordingEffects {
+    fn handle_effect(
+        &mut self,
+        request: EffectRequest,
+        _cancellation: PermCancellation,
+    ) -> EffectFuture<'_> {
+        self.ordinals.lock().unwrap().push(request.effect_ordinal);
+        Box::pin(async move {
+            EffectResult::ReadFile {
+                content: format!("effect-{}", request.effect_ordinal),
+            }
+        })
+    }
+}
+
+struct PendingEffectDrop {
+    dropped: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for PendingEffectDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GatedEffects {
+    started: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    ordinals: Arc<Mutex<Vec<u32>>>,
+    cancellation: Arc<Mutex<Option<PermCancellation>>>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl GatedEffects {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            ordinals: Arc::new(Mutex::new(Vec::new())),
+            cancellation: Arc::new(Mutex::new(None)),
+            dropped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn wait_started(&self) {
+        self.started.acquire().await.unwrap().forget();
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+impl InvocationEffectHandler for GatedEffects {
+    fn handle_effect(
+        &mut self,
+        request: EffectRequest,
+        cancellation: PermCancellation,
+    ) -> EffectFuture<'_> {
+        self.ordinals.lock().unwrap().push(request.effect_ordinal);
+        *self.cancellation.lock().unwrap() = Some(cancellation);
+        let started = self.started.clone();
+        let release = self.release.clone();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            if request.effect_ordinal == 0 {
+                let mut pending = PendingEffectDrop {
+                    dropped,
+                    armed: true,
+                };
+                started.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                pending.armed = false;
+            }
+            EffectResult::ReadFile {
+                content: format!("effect-{}", request.effect_ordinal),
+            }
+        })
+    }
+}
+
+fn scripted_supervisor(stderr_bytes: usize) -> Arc<JsWorkerSupervisor> {
+    Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+        TestWorkerLauncher::scripted_internal_worker(stderr_bytes),
+    ))
+}
+
+fn held_out_verification() -> VerifyArtifact {
+    VerifyArtifact {
+        artifact: ArtifactInput {
+            artifact_id: "supervisor-artifact".into(),
+            source: "exports.answer = () => 42".into(),
+            exports: vec!["answer".into()],
+            tests: vec!["true".into()],
+        },
+        cases: vec![VerificationCase {
+            case_id: "held-out".into(),
+            script: "true".into(),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn worker_supervisor_transport_serializes_concurrent_callers_and_orders_effects() {
+    let supervisor = scripted_supervisor(0);
+    let gated = GatedEffects::new();
+    let first_effects = gated.clone();
+    let first_supervisor = supervisor.clone();
+    let first = tokio::spawn(async move {
+        first_supervisor
+            .execute(
+                RunStep {
+                    code: "two-effects".into(),
+                },
+                first_effects,
+                PermCancellation::new(),
+            )
+            .await
+    });
+    gated.wait_started().await;
+
+    let second_supervisor = supervisor.clone();
+    let second = tokio::spawn(async move {
+        second_supervisor
+            .execute(
+                RunStep {
+                    code: "success".into(),
+                },
+                RecordingEffects::default(),
+                PermCancellation::new(),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !second.is_finished(),
+        "second caller bypassed transport owner"
+    );
+
+    gated.release();
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(first.outcome, StepOutcome::Value("effects-complete".into()));
+    assert_eq!(second.outcome, StepOutcome::Value("success".into()));
+    assert_eq!(*gated.ordinals.lock().unwrap(), vec![0, 1]);
+}
+
+#[test]
+fn worker_supervisor_transport_run_and_verify_reuse_one_serialized_connection() {
+    let supervisor = scripted_supervisor(0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let first = runtime
+        .block_on(supervisor.execute(
+            RunStep {
+                code: "success".into(),
+            },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        ))
+        .unwrap();
+    assert_eq!(first.outcome, StepOutcome::Value("success".into()));
+    let first_generation = runtime.block_on(supervisor.generation_for_test()).unwrap();
+    drop(runtime);
+
+    let verification = supervisor.verify_blocking(held_out_verification()).unwrap();
+    assert!(verification.passed);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert_eq!(
+        runtime.block_on(supervisor.generation_for_test()),
+        Some(first_generation)
+    );
+}
+
+#[tokio::test]
+async fn worker_supervisor_transport_cancellation_drops_effect_and_starts_next_generation() {
+    let supervisor = scripted_supervisor(0);
+    let gated = GatedEffects::new();
+    let cancellation = PermCancellation::new();
+    let task_supervisor = supervisor.clone();
+    let task_effects = gated.clone();
+    let task_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        task_supervisor
+            .execute(
+                RunStep {
+                    code: "effect-pending".into(),
+                },
+                task_effects,
+                task_cancellation,
+            )
+            .await
+    });
+    gated.wait_started().await;
+    let first_generation = supervisor.active_generation_for_test().await.unwrap();
+    cancellation.cancel();
+    assert_eq!(task.await.unwrap(), Err(WorkerError::Cancelled));
+    assert!(gated.dropped.load(Ordering::Acquire));
+    assert!(
+        gated
+            .cancellation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_cancelled()
+    );
+
+    let recovered = supervisor
+        .execute(
+            RunStep {
+                code: "success".into(),
+            },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
+    assert!(supervisor.generation_for_test().await.unwrap() > first_generation);
+}
+
+#[tokio::test]
+async fn worker_supervisor_transport_dropped_caller_releases_owner_and_cancels_handler() {
+    let supervisor = scripted_supervisor(0);
+    let gated = GatedEffects::new();
+    let task_supervisor = supervisor.clone();
+    let task_effects = gated.clone();
+    let task = tokio::spawn(async move {
+        task_supervisor
+            .execute(
+                RunStep {
+                    code: "effect-pending".into(),
+                },
+                task_effects,
+                PermCancellation::new(),
+            )
+            .await
+    });
+    gated.wait_started().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor.execute(
+            RunStep {
+                code: "success".into(),
+            },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        ),
+    )
+    .await
+    .expect("dropped caller retained transport ownership")
+    .unwrap();
+    assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
+    assert!(gated.dropped.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn worker_supervisor_transport_rejects_stale_generation_before_protocol_state() {
+    assert_eq!(
+        crate::extras::js::supervisor::validate_generation_for_test(2, 1),
+        Err(WorkerError::StaleGeneration)
+    );
+    assert!(crate::extras::js::supervisor::validate_generation_for_test(2, 2).is_ok());
+
+    let supervisor = scripted_supervisor(0);
+    let result = supervisor
+        .execute(
+            RunStep {
+                code: "success".into(),
+            },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, StepOutcome::Value("success".into()));
+}
+
+#[tokio::test]
+async fn worker_supervisor_transport_bounds_stderr_without_blocking_worker() {
+    let supervisor = scripted_supervisor(256 * 1024);
+    let result = supervisor
+        .execute(
+            RunStep {
+                code: "success".into(),
+            },
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, StepOutcome::Value("success".into()));
+    let stats = supervisor.stderr_stats_for_test().await.unwrap();
+    assert_eq!(stats.retained_bytes, 0);
+    assert!(stats.observed_bytes <= 4096);
+    assert!(stats.truncated);
+}
+
+#[test]
+fn worker_supervisor_transport_rejects_verify_blocking_inside_tokio_and_keeps_state_authority_free()
+{
+    let supervisor = scripted_supervisor(0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let error = runtime.block_on(async { supervisor.verify_blocking(held_out_verification()) });
+    assert_eq!(error, Err(WorkerError::BlockingVerifyInAsyncRuntime));
+
+    let source = include_str!("../supervisor.rs");
+    let declarations = source
+        .split_once("// BEGIN AUTHORITY-FREE SUPERVISOR STATE")
+        .unwrap()
+        .1
+        .split_once("// END AUTHORITY-FREE SUPERVISOR STATE")
+        .unwrap()
+        .0;
+    for forbidden in [
+        "Sandbox",
+        "AllowConfig",
+        "permission",
+        "approval",
+        "SkillBundle",
+        "proposal",
+        "audit",
+        "GrantId",
+        "InvocationEffectHandler",
+    ] {
+        assert!(
+            !declarations.contains(forbidden),
+            "supervisor state retained invocation authority: {forbidden}"
+        );
+    }
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<JsWorkerSupervisor>();
+}
+
+fn run_scripted_supervisor_worker() -> ! {
+    let stderr_bytes = std::env::var("MINI_AGENT_TEST_SUPERVISOR_STDERR_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if stderr_bytes > 0 {
+        let mut stderr = std::io::stderr().lock();
+        let chunk = [b'x'; 4096];
+        let mut remaining = stderr_bytes;
+        while remaining > 0 {
+            let length = remaining.min(chunk.len());
+            stderr.write_all(&chunk[..length]).unwrap();
+            remaining -= length;
+        }
+        stderr.flush().unwrap();
+    }
+
+    let build = BuildIdentity::current();
+    let mut protocol = WorkerProtocol::new(build.clone());
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    let hello: ParentWireFrame = read_frame(&mut input).unwrap();
+    protocol.on_receive(&hello).unwrap();
+    let ready = WireFrame::connection(build.clone(), 1, WorkerFrame::Ready(WorkerReady {}));
+    protocol.on_send(&ready).unwrap();
+    write_frame(&mut output, &ready).unwrap();
+    output.flush().unwrap();
+
+    loop {
+        let request: ParentWireFrame = read_frame(&mut input).unwrap();
+        protocol.on_receive(&request).unwrap();
+        let invocation = request.invocation_id.clone().unwrap();
+        match request.message {
+            ParentFrame::RunStep(step) => {
+                let mut sequence = request.sequence + 1;
+                let effect_count = match step.code.as_str() {
+                    "two-effects" => 2,
+                    "effect-pending" => 1,
+                    _ => 0,
+                };
+                for ordinal in 0..effect_count {
+                    let effect = WireFrame::invocation(
+                        build.clone(),
+                        invocation.clone(),
+                        sequence,
+                        WorkerFrame::EffectRequest(EffectRequest {
+                            effect_ordinal: ordinal,
+                            grant_id: GrantId::new(uuid::Uuid::from_u128(1)).unwrap(),
+                            advisory: AdvisoryAttribution::default(),
+                            operation: EffectOperation::ReadFile {
+                                path: "fixture".into(),
+                            },
+                        }),
+                    );
+                    protocol.on_send(&effect).unwrap();
+                    write_frame(&mut output, &effect).unwrap();
+                    output.flush().unwrap();
+                    let response: ParentWireFrame = read_frame(&mut input).unwrap();
+                    assert!(matches!(response.message, ParentFrame::EffectResponse(_)));
+                    protocol.on_receive(&response).unwrap();
+                    sequence = response.sequence + 1;
+                }
+                let value = if step.code == "two-effects" {
+                    "effects-complete"
+                } else {
+                    "success"
+                };
+                let terminal = WireFrame::invocation(
+                    build.clone(),
+                    invocation,
+                    sequence,
+                    WorkerFrame::StepResult(StepResult {
+                        outcome: StepOutcome::Value(value.into()),
+                        console: Vec::new(),
+                        diagnostic: None,
+                    }),
+                );
+                protocol.on_send(&terminal).unwrap();
+                write_frame(&mut output, &terminal).unwrap();
+                output.flush().unwrap();
+            }
+            ParentFrame::VerifyArtifact(verification) => {
+                let mut cases = verification
+                    .artifact
+                    .tests
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| VerificationCaseResult {
+                        case_id: format!("embedded-{index}"),
+                        passed: true,
+                        diagnostic: None,
+                    })
+                    .collect::<Vec<_>>();
+                cases.extend(
+                    verification
+                        .cases
+                        .iter()
+                        .map(|case| VerificationCaseResult {
+                            case_id: case.case_id.clone(),
+                            passed: true,
+                            diagnostic: None,
+                        }),
+                );
+                let terminal = WireFrame::invocation(
+                    build.clone(),
+                    invocation,
+                    request.sequence + 1,
+                    WorkerFrame::VerificationResult(VerificationResult {
+                        passed: true,
+                        cases,
+                        loader_version: 1,
+                    }),
+                );
+                protocol.on_send(&terminal).unwrap();
+                write_frame(&mut output, &terminal).unwrap();
+                output.flush().unwrap();
+            }
+            ParentFrame::Shutdown => std::process::exit(0),
+            ParentFrame::Hello(_) | ParentFrame::EffectResponse(EffectResponse { .. }) => {
+                std::process::exit(1)
+            }
+        }
+    }
+}
+
 #[test]
 fn worker_bootstrap_test_child() {
     if crate::sandbox::worker::is_internal_worker_marker_present() {
@@ -840,6 +1331,9 @@ fn worker_bootstrap_test_child() {
                 std::env::var_os(key).is_none(),
                 "test worker inherited forbidden environment key {key}"
             );
+        }
+        if std::env::var_os("MINI_AGENT_TEST_SUPERVISOR_SCRIPT").is_some() {
+            run_scripted_supervisor_worker();
         }
         crate::extras::js::worker::exit_test_worker();
     }

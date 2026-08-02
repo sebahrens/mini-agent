@@ -92,6 +92,13 @@ automatically. Worker stdout is protocol-only. Console output is returned as bou
 data, while a bounded stderr pipe carries only sanitized diagnostics and never source, prompts,
 arguments, file or response contents, environment values, or secrets.
 
+`src/extras/js/supervisor.rs` owns the parent-side serialized transport lease shared by run and
+verification requests. The shared state retains only process, protocol, generation, and bounded
+stderr-drain data; per-invocation effect authority remains method-local. Dropping or cancelling an
+in-flight lease invalidates that worker connection, so the next independent request launches a
+new generation. Watchdog, exhaustive fault recovery, and bounded group reaping remain separate
+Phase 6 delivery units; this module boundary does not mark Phase 6 as delivered.
+
 ## Wire protocol
 
 IPC uses inherited anonymous pipes and a strictly alternating, half-duplex protocol. Each frame is
