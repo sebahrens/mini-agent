@@ -1,10 +1,10 @@
 # JS Engine Integration — Architecture Overview
 
 - **Document role**: non-normative architecture overview
-- **Overview version**: 1.0.0
-- **Delivery status**: mixed; see the normative index
+- **Overview version**: 2.0.0
+- **Delivery status**: Phase 6 implementation complete; final evidence pending
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-08-02
 
 The sole normative JS corpus is
 [`docs/specs/00-index.md`](docs/specs/00-index.md) and the phase specifications it indexes. If this
@@ -13,194 +13,168 @@ must be corrected.
 
 ## Purpose
 
-mini-agent embeds QuickJS through `rquickjs` as a bounded code-action primitive. The in-process
-engine gives the model a compact JavaScript surface and later serves as the runtime for immutable,
-retrieved skills.
+mini-agent exposes QuickJS as a bounded code-action primitive without placing an interpreter in
+the trusted parent. The parent launches the current executable in an internal, contained worker
+mode, exchanges closed JSON frames over anonymous pipes, and performs every external effect through
+its own policy services.
 
-This architecture supplements existing tools. It does not itself remove Bash, port shell hooks,
-or prove full Windows readiness.
+This architecture supplements Bash and other process-bearing features. It does not port shell
+hooks or make hooks, MCP servers, LSPs, loop validation, or the explicit interactive shell part of
+the JS worker boundary.
 
-## Stable engine boundaries
-
-- Each `JsTool` instance owns one dedicated OS thread with an 8 MiB thread stack.
-- QuickJS `Runtime`, `Context`, and values remain on that thread; every `JsTool` field is
-  `Send + Sync`.
-- Every step creates and drops a fresh runtime.
-- Every runtime receives the 64 MiB heap limit, 512 KiB JS stack limit, and an interrupt deadline
-  before evaluation.
-- Evaluation retains the returned `Value`, extracts bounded exception stack text, and drains the
-  pending-job queue under deadline and job-count bounds.
-- Blocking host calls have independent deadlines and cancellation because the QuickJS interrupt
-  handler runs only during bytecode execution.
-
-The normative runtime contract is
-[`phase-1-js-engine.md § Runtime lifecycle`](docs/specs/phase-1-js-engine.md#runtime-lifecycle).
-
-## Threading model
+## Execution and trust boundary
 
 ```text
-[Tokio / agent]                         [dedicated js-engine thread]
-JsTool::call(request)
-  ├─ send bounded request ────────────→ create fresh Runtime + Context
-  ├─ service permission bridge ←────── host global requests authorization/effect
-  └─ await bounded reply ←──────────── eval, drain jobs, return outcome
+[trusted parent]
+JsTool -> process-wide lazy supervisor -> platform worker launcher
+   |              |                            |
+   |              | JSON frames                v
+   |              +-------------------> [contained same-exe worker]
+   |                                      fresh Runtime per request
+   |<-- typed effect request ------------ private skill/model realms
+   |
+   +-> invocation grant table -> permission/narrowing -> durable intent
+       -> parent file/fetch/spawn/proposal service -> durable completion
 ```
 
-The synchronous JS thread never owns the asynchronous permission policy. A bounded bridge carries
-permission requests to Tokio and propagates denial, non-interactive `Ask`, backend failure,
-timeout, cancellation, and shutdown distinctly.
+- The parent lazily keeps at most one worker process alive and services one invocation at a time.
+- The process may remain warm after a safe terminal result, but QuickJS state never does.
+- Each `RunStep` and whole `VerifyArtifact` request creates and drops a fresh 64 MiB-heap,
+  512 KiB-stack `Runtime`; each verification case receives a fresh `Context` and fake state.
+- The interrupt deadline is installed before evaluation. The parent watchdog covers launch, IPC,
+  evaluation, permission waits, effects, and pending-job drain.
+- `JsTool`, the supervisor, broker, audit, and host services contain only `Send + Sync` parent
+  state. No production parent field or value contains a QuickJS `Runtime`, `Context`, or value.
+- A transport, protocol, timeout, cancellation, resource, or containment fault kills and reaps the
+  complete worker boundary and erases every invocation grant.
 
-## Primitive host surface
+The worker protocol is length-prefixed, bounded JSON with a closed version/build/sequence state
+machine. Worker stdout is protocol-only. Diagnostics expose only closed class/code and validated
+source-free stage/script-role/line/column metadata; exception messages, stacks, thrown values,
+source, prompts, arguments, effect results, contents, environment, and secrets never cross the
+production diagnostic boundary.
 
-Phase 1 exposes `read_file`, `write_file`, `spawn`, and bounded `console.log`. It permanently omits
-`require`, `import`, and `final_answer`; Phase 2 may add permission-gated `fetch`.
+## Capability broker and residual authority
 
-Both file globals always require permission for a securely resolved target:
+All real file, fetch, command, and proposal effects execute in the parent. For each request, the
+parent builds an immutable table of opaque, invocation-bound grants from the authoritative selected
+artifacts and model-authored host surface. It intersects each request with the session permission
+policy, Phase 2 target narrowing, backend readiness, expiry, and exact target before performing an
+effect.
 
-- reads bind approval to canonical target identity and use a bounded stable no-follow read;
-- writes bind approval to the resolved final target and use descriptor-relative, no-follow atomic
-  publication; and
-- a Phase 2 path allow-list can only narrow access, never grant it.
+Private realms and hidden capability objects prevent one JavaScript artifact from receiving
+another artifact's source-level API. They are not a native security boundary. A worker that
+compromises QuickJS may attempt to borrow the union of all live current-step grant handles. It
+still cannot mint authority, escape the parent-created invocation, bypass parent permissions or
+target scopes, or gain ambient filesystem/network/credential/database access removed by platform
+containment.
 
-`spawn()` always follows the existing process permission policy and creates the command through
-`Sandbox::wrap_command`. Permission and wrapper routing do not imply that an OS isolation backend
-is effective.
+Stored skills initialize without effect or writer globals. Each export call consumes a fresh
+parent-issued handle and receives a null-prototype frozen capability object containing only its
+declared identity-v2 methods. Model-authored code separately receives the bounded primitive effect
+surface and, when configured, one model-only `propose_skill` grant. A proposal cannot execute in
+the proposing step.
 
-The normative host contract is
-[`phase-1-js-engine.md § Host globals`](docs/specs/phase-1-js-engine.md#host-globals).
+## Durable effects and cancellation
 
-## Isolation and platform boundary
+The private parent audit is a length-prefixed, hash-chained sequence. For every real effect the
+parent validates authority, appends and syncs durable intent, performs the operation, and then
+appends and syncs a closed completion. Audit failure before intent performs no effect.
+One fixed private version-1 HMAC key correlates redacted targets across size-rotated, hash-linked
+segments; key rotation is not implemented. A machine-wide file lock allows one active parent
+writer for the audit store. Its process-wide `OnceLock` caches the first success or failure, so a
+failed parent does not retry until process restart.
 
-The QuickJS VM and a spawned child are separate trust boundaries:
+Cancellation is exact while waiting for a worker lease, target normalization, permission, or any
+other pre-dispatch step. Once a write, fetch, subprocess, or queued proposal may have started, a
+timeout, cancellation, or transport loss can make the result ambiguous. The parent records
+`OutcomeUnknown`, drains or tears down the owned work within a fixed bound, revokes the invocation,
+and recycles the worker. It never reports false success/failure or automatically retries an
+ambiguous external effect.
 
-| Boundary | Phase 1 | Phase 2 |
-|----------|---------|---------|
-| QuickJS VM | hard heap/stack/time/job bounds; no ambient module system | unchanged |
-| File host calls | secure resolution + mandatory permission | optional narrowing allow-lists; permission remains mandatory |
-| Process creation | mandatory permission + shared wrapper; effective backend is runtime-dependent | verified effective isolation on Linux/macOS |
-| Network | no global | bounded, allow-listed, permission-gated `fetch` |
-| Windows process isolation | not delivered | not delivered |
+Parent-brokered command effects still use the general `Sandbox::wrap_command` path and require a
+backend that owns the complete descendant lifetime. The worker itself never uses that
+workspace-visible profile; it has a dedicated broker-only launcher.
 
-Windows readiness requires separate verified process-isolation/lifecycle work plus the storage,
-ACL, archive, migration, CI, and release gates in the normative corpus. The portable in-process
-engine does not turn an unisolated child process into a sandbox.
+## Platform containment
 
-The normative hardening contract is
-[`phase-2-sandbox.md`](docs/specs/phase-2-sandbox.md).
+| Platform | Broker-only worker guarantee |
+|----------|------------------------------|
+| Linux | Availability is cached only after a real preflight of a trusted empty-root `bwrap` profile. It maps the exact worker/runtime files, no workspace/cache/configuration, a private proc/dev/tmp, cleared environment, user/PID/network/IPC/UTS namespaces, dropped capabilities, rlimits, non-dumpability, `no_new_privs`, and seccomp process/exec/socket denial. Any failure is unavailable with no uncontained retry. |
+| macOS | Production JS is unavailable. The real deprecated-Seatbelt probe proves the stable worker image cannot be permitted for initial execution and denied for later re-exec. A weaker best-effort profile, descriptor-only restriction, or process-group cleanup is not an accepted fallback. |
+| Windows | A process-wide `OnceLock` reports available only after one sacrificial same-launcher attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, closed containment probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots. The full hosted standard-user canary records those observations only for its reference runner, and its final artifact remains pending. LPAC contains the evaluator only; parent-brokered general `spawn` remains disabled. |
 
-### Linux subprocess capability boundary
+Platform status is typed and source-free. Backend absence or failed attestation disables JS; it
+never selects the historical in-parent engine or an uncontained worker. The reproducible resource
+methodology is in [`docs/benchmarks/js-worker.md`](docs/benchmarks/js-worker.md); its checked-in
+aggregate remains explicitly pending external runs.
 
-Linux `bwrap` subprocess isolation is opt-in and fail-closed. When requested, the wrapper builds an
-empty mount namespace rather than read-mounting `/`. It exposes the current workspace and the
-mini-agent application cache read/write, a private ephemeral `/tmp`, and only explicit read-only
-runtime roots and selected non-secret `/etc` files. The sandbox root is remounted read-only after
-those nested mounts are installed.
+On Windows the OS creation call runs on an owned helper thread behind a five-second caller-side
+deadline; the call itself is not cancellable. A late return remains owned and is torn down, but a
+permanently blocked call is an explicit availability residual and does not permit a second launcher.
+LPAC is not a filesystem namespace, so host ACLs can still expose objects to the stable package
+identity. Normal startup and `--print-config` containment-status evaluation create or reuse a
+persistent AppContainer profile and may add a persistent exact read/execute ACE to a supported,
+user-owned installed executable. No automatic cleanup, ACL rollback, or consent prompt exists.
 
-The same wrapper creates user, PID, IPC, UTS, cgroup, and network namespaces, supplies a synthetic
-`/dev`, and clears the environment before restoring a narrow non-credential allow-list. The
-network namespace has no host or external IP connectivity; in particular, host loopback listeners
-are not reachable. Filesystem Unix-domain sockets inside the workspace or application-cache bind
-mount remain reachable and are not covered by the IP-network guarantee. A missing or untrusted
-backend executable, invalid workspace/cache root, namespace failure, mount failure, or child setup
-failure denies execution rather than falling back to the host.
+## Skills, identity, and verification
 
-| State | Read/write/process/device/environment/network result |
-|-------|------------------------------------------------------|
-| Sandbox disabled | Host capabilities are inherited intentionally and reported as such |
-| Linux `bwrap` available | The checked-in capability matrix above is applied |
-| Linux `bwrap` unavailable or setup fails | Subprocess launch is denied |
-| `zerobox` selected | Only its workspace-write request is known; no mini-agent network-isolation claim is made |
+Agent Skills and learned JavaScript skills remain separate:
 
-This boundary does not include seccomp filtering, CPU/memory quotas, Unix-domain socket filtering,
-kernel/system metadata exposed by `/proc`, kernel confidentiality, or Windows process isolation.
-The process working directory defines the workspace exposure, so starting mini-agent in a broad
-directory intentionally broadens visible and writable state. The `bwrap` executable and every
-parent directory must be root-owned and not group/world-writable.
-In-process permission-gated fetch remains separate from subprocess network isolation.
+1. Agent Skills are progressively disclosed instruction/resource packages. `allowed-tools` and
+   bundled scripts grant no authority.
+2. Learned JavaScript skills are immutable identity-v2 artifacts. Their SHA-256 identity covers
+   the complete canonical source, ordered tests and exports, discovery metadata, ABI version, and
+   structured capability scopes.
 
-## Feature relationships
+Identity-v1 rows are quarantined before JS availability and cannot execute, verify, receive
+evidence, promote, or become rollback targets. Explicit reproposal creates a new identity-v2 row;
+scopes are never inferred.
 
-- `js` enables the Phase 1 engine.
-- `sandbox` is independent of `js` and extends the shared process sandbox.
-- `skills` implies `js` but not `sandbox`.
-- `mcp` remains independent and retains its own discovery and permission path.
+Retrieval occurs once before model generation from the user prompt. The parent freezes one bundle
+for the turn and sends it directly to the worker; the worker never opens SQLite or computes
+embeddings. Production and verification share the same private-realm loader and hidden-capability
+ABI. Verification uses deterministic in-memory fakes only, fresh context/fake/transcript state per
+case, and exact JavaScript boolean `true` semantics.
 
-A feature combination compiling does not mean its owning phase has passed its exit gate. See
-[`00-index.md § Feature relationships`](docs/specs/00-index.md#feature-relationships).
+Phase 4 retains independent held-out evaluation and explicit human approval into non-retrievable
+canary state. Phase 5 retains directly attributed evidence, limited Tier 0/1 automation,
+quarantine, immutable repair, supersession, rollback, and retention. Write, process, and network
+authority retain their human gates.
 
-## Skill architecture
+## Other process trust classes
 
-Phase 3 introduces two deliberately separate forms of reusable capability:
+[`docs/specs/subprocess-trust.md`](docs/specs/subprocess-trust.md) owns the separate contracts:
 
-1. Open Agent Skills are validated instruction/resource packages discovered progressively.
-2. Learned JavaScript skills are immutable verified artifacts bound into a frozen turn bundle.
+- project/global hooks are trusted automation and may need workspace state and credentials;
+- MCP and LSP children are long-lived workspace services with their own configuration trust;
+- loop validation is an explicit user-configured command;
+- `!` is an explicit human shell with ambient authority; and
+- model-authored Bash/JS commands use the general action sandbox.
 
-A learned artifact ID is the full SHA-256 of a versioned canonical payload covering source,
-ordered embedded tests, ordered exports/signatures, retrieval description/tags, capability
-manifest, and identity schema version. Operational status, timestamps, telemetry, embeddings, and
-lineage are outside identity.
-
-Retrieval occurs once before model generation using the current user prompt and bounded
-deterministic context. The model sees a compact metadata manifest; every JS call in that turn
-receives the same immutable source snapshot. The JS thread does not query SQLite or generate
-embeddings.
-
-The normative storage/retrieval contract is
-[`phase-3-skill-library.md`](docs/specs/phase-3-skill-library.md).
-
-## Verification and lifecycle ownership
-
-All candidate verification runs in a fresh bounded no-effect context:
-
-- Tier 0 receives no host globals.
-- Tier 1/2 receive only declared deterministic in-memory fakes.
-- At least one embedded test is required, and every test must evaluate to the exact JavaScript
-  boolean `true`.
-- Mutation checks require each declared export to affect at least one test.
-- Trusted held-out suites remain hidden from proposing agents.
-
-Phase ownership is intentionally asymmetric:
-
-- Phase 3 owns immutable identity, no-effect verification, and manual admission.
-- Phase 4 owns bounded agent proposals, independent evaluation, and explicit human approval into a
-  non-retrievable canary. It has no automatic activation path.
-- Phase 5 owns directly attributed evidence, deterministic replacement routing, allowed Tier 0/1
-  automatic promotion, automatic quarantine, immutable repair, supersession, and rollback.
-  Write/process/network capabilities always retain a human gate.
-
-The normative lifecycle contracts are
-[`phase-4-auto-admission.md`](docs/specs/phase-4-auto-admission.md) and
-[`phase-5-evidence-learning.md`](docs/specs/phase-5-evidence-learning.md).
-
-## Storage architecture
-
-One typed `AppPaths` resolver owns configuration, portable data, local durable data, state, cache,
-credentials, and project roots. Learned-skill databases and evidence are machine-local; model
-downloads and rebuildable indexes are cache; OAuth material has a separate private credential
-root. Persistent modules do not select roots from the current working directory.
-
-Portable Agent Skills use the open `SKILL.md` directory format. ZIP is a validated transport,
-`allowed-tools` grants no authority, and bundled scripts do not become learned JS without the
-normal identity, verification, capability, admission, and evidence gates.
-
-The normative storage contract is
-[`platform-paths.md`](docs/specs/platform-paths.md).
+These classes may reuse lifecycle utilities, but none may borrow the broker-only worker profile or
+claim its containment guarantees.
 
 ## Current source map
 
-Production source is at the repository root:
-
 ```text
 src/extras/js/
-├── engine.rs
-├── host.rs
-├── mod.rs
-├── tool.rs
-├── types.rs
-├── tests/
-└── skills/        # Phase 3 learned-skill implementation
+├── tool.rs           # JsTool, per-call parent policy and services
+├── supervisor.rs     # one serialized contained process and watchdog
+├── broker.rs         # invocation grants and effect authorization
+├── audit.rs          # durable parent effect intent/completion chain
+├── protocol.rs       # closed bounded wire types/state
+├── worker.rs         # internal worker bootstrap and fresh runtimes
+├── realm.rs          # private skill/model realms and verification loader
+├── host.rs           # parent effect services; historical test globals
+├── engine.rs         # test-only historical evaluator
+└── skills/           # identity, storage, retrieval, admission, lifecycle
+
+src/sandbox/worker/
+├── linux.rs          # empty-root broker-only bubblewrap
+├── macos.rs          # fail-closed reusable-exec blocker
+└── windows.rs        # LPAC, Job, attestation, full canary gate
 ```
 
-Tool registration lives in `src/agent/builder.rs`; the shared process wrapper lives in
-`src/sandbox.rs`. Source line numbers are deliberately omitted because they are not specification
-identifiers.
+Tool registration lives in `src/agent/builder.rs`; general model-command isolation remains in
+`src/sandbox.rs`.

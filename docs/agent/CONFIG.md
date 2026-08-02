@@ -68,6 +68,21 @@ The corresponding overrides are `ZS_CONFIG_DIR`, `ZS_DATA_DIR`,
 zerostack never uses the current directory as a fallback for user-global
 state.
 
+The brokered JavaScript effect audit permits one active parent writer for its private state store
+across the machine. A second parent cannot initialize JS auditing while that lock is held. The
+first initialization success or failure is cached for the process lifetime; restart the blocked
+parent to retry after the other process exits or the storage problem is repaired. Audit segments
+rotate by size while retaining one fixed version-1 private target-correlation key. Key rotation is
+not currently implemented.
+
+On Windows, normal startup and `--print-config` evaluate JavaScript worker containment status. The
+status preflight creates or reuses a persistent AppContainer profile and may add that profile's
+exact read/execute ACE to a supported, user-owned installed executable. These changes persist after
+exit, and zerostack currently provides no automatic profile cleanup, ACL rollback, or separate
+consent prompt. LPAC is not a filesystem namespace; host objects readable through applicable ACLs
+can remain visible, while the broader filesystem/network/child canaries are hosted
+reference-runner observations rather than local-attestation guarantees.
+
 ## Importing portable Agent Skills
 
 Install one local Agent Skills directory containing `SKILL.md`, or one ZIP
@@ -346,8 +361,8 @@ Accepted top-level keys:
 | `accept_all`              | boolean | Select standard permission mode with auto-allow within CWD (equivalent to `default_permission_mode = "standard"`). Overridden by `yolo` if true.                            |
 | `yolo`                    | boolean | Select yolo mode (allow all, ask for destructive bash commands).                                                                                                            |
 | `permission-modes`        | array   | List of mode names that apply config-based rules. Default: `["guarded", "standard", "yolo"]`. Modes excluded from this list skip config rule matching entirely.             |
-| `sandbox`                 | boolean | Enforce the configured subprocess sandbox for bash and JS spawn. Default: `false`; an unavailable requested backend fails startup rather than running unsandboxed. |
-| `sandbox-backend`         | string  | Process sandbox backend. Defaults to `bwrap` on Linux and `seatbelt` on macOS; Windows has no supported Phase 2 backend and therefore fails closed when sandboxing is requested. `zerobox` remains available as an explicitly selected backend with backend-defined guarantees. |
+| `sandbox`                 | boolean | Enforce the configured **general subprocess** sandbox for Bash and parent-brokered JS `spawn`. Default: `false`; an unavailable requested backend fails rather than running that requested command unsandboxed. This setting does not opt out of the mandatory broker-only JS worker containment. |
+| `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux and `seatbelt` on macOS; Windows has no supported Phase 2 general-command backend and JS `spawn` remains disabled there. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
 | `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
 | `js-fetch-allow-http`     | boolean | Permit public-address HTTP origins for JS `fetch()` in addition to HTTPS. Default: `false`. Private, loopback, link-local, metadata, multicast, and reserved destinations remain denied. |
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `guarded`, `yolo`.                                          |
@@ -369,6 +384,13 @@ Accepted top-level keys:
 | `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
 | `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
 | `colors`                  | object  | Background color overrides for the TUI. See the colors section below.                                                                                                       |
+
+JavaScript worker containment is a runtime prerequisite, not a user-selected sandbox mode.
+`--print-config` reports its backend, assurance, and availability separately from the general
+subprocess backend. Linux becomes available only after the real empty-root `bwrap` preflight;
+macOS reports unavailable because of the stable-image Seatbelt re-exec blocker; Windows requires a
+cached minimal LPAC/Job production attestation. No unavailable worker backend falls back to
+in-parent or uncontained JavaScript.
 
 ## System Prompt Suffix (`SUFFIX.md`)
 

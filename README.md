@@ -1,14 +1,14 @@
 # mini-agent / JS Engine Integration
 
-Research and implementation workspace for a minimal coding agent with a bounded embedded
-JavaScript engine.
+Minimal coding agent with a bounded, brokered JavaScript runtime. QuickJS executes only in a
+contained same-executable worker; the parent retains permissions, effects, persistence, and audit.
 
 ## Repository layout
 
 | Path | Purpose |
 |------|---------|
 | `src/` | Production mini-agent source |
-| `src/extras/js/` | Phase 1 JS engine integration |
+| `src/extras/js/` | Brokered JS runtime, parent supervisor/effects, skills, and worker entry |
 | `spike/` | QuickJS proof-of-concept research |
 | `docs/specs/` | Normative phased JS specifications and superseded research |
 | `ARCHITECTURE.md` | Non-normative architecture overview |
@@ -35,6 +35,8 @@ authority, feature relationships, phase dependencies, and exit semantics.
 - [Phase 3: skill library](docs/specs/phase-3-skill-library.md)
 - [Phase 4: agent proposals and human-gated admission](docs/specs/phase-4-auto-admission.md)
 - [Phase 5: evidence-based self-learning](docs/specs/phase-5-evidence-learning.md)
+- [Phase 6: brokered JS runtime](docs/specs/phase-6-brokered-js-runtime.md)
+- [Subprocess trust classes](docs/specs/subprocess-trust.md)
 
 [ARCHITECTURE.md](ARCHITECTURE.md) and [SPEC.md](SPEC.md) are maintained overviews only. The
 [dated JS blueprint](docs/specs/2026-07-27-js-engine-blueprint.md) is a superseded research
@@ -42,19 +44,25 @@ artifact retained for history and must not guide implementation.
 
 ## Core boundaries
 
-- One dedicated 8 MiB OS thread per `JsTool`; QuickJS state stays on that thread.
-- A fresh runtime for every step, with hard heap/stack limits, an interrupt deadline, and bounded
-  pending-job drain.
-- File globals always use secure target resolution and mandatory permissions.
-- Process spawn always uses the existing permission policy and `Sandbox::wrap_command`.
-- VM isolation is distinct from child-process isolation; Windows process isolation is not
-  delivered by Phases 1 or 2.
-- Learned-skill identity covers the full versioned execution/discovery payload, including ordered
-  tests; only exact JavaScript boolean `true` passes a test.
+- The parent lazily supervises at most one contained same-executable worker and serializes its JSON
+  pipe protocol. QuickJS types never exist in the production parent.
+- Every step and whole verification request creates and drops a fresh bounded `Runtime`; every
+  verification case receives a fresh `Context`.
+- File, fetch, proposal, and command effects execute only in parent services after exact grant,
+  session permission, target narrowing, durable intent, and deadline checks.
+- A native-compromised worker can attempt to borrow the union of current-step grants. Source-level
+  private realms are not a native security boundary; platform containment removes ambient host
+  authority and the parent remains the trusted computing base.
+- An effect interrupted after dispatch may be recorded as `OutcomeUnknown`. It is never retried
+  automatically, and the worker and all invocation authority are recycled.
+- Parent-brokered process spawn uses `Sandbox::wrap_command`; the worker itself uses a separate,
+  workspace-invisible, broker-only launcher.
+- Learned-skill identity version 2 covers the full versioned execution/discovery payload, ABI,
+  ordered tests, and structured target scopes; only exact JavaScript boolean `true` passes a test.
 - Phase 4 requires human approval into non-retrievable canary state. Phase 5 owns the limited,
   evidence-based automatic lifecycle.
 
-## Linux subprocess sandbox
+## General Linux subprocess sandbox
 
 Sandboxing is opt-in (`--sandbox` or `sandbox = true`) and fail-closed. Without it, subprocesses
 inherit the host filesystem, environment, devices, process namespaces, and network. With the
@@ -79,8 +87,27 @@ backend-defined read/process/device/environment/network behavior and is not repo
 the Linux `bwrap` guarantee.
 
 Use `mini-agent --sandbox --sandbox-backend bwrap --print-config` to see the configured backend,
-availability, and effective capability report. Permission-gated in-process HTTP fetches are a
-separate boundary; subprocess network isolation does not bypass or replace fetch permissions.
+availability, and effective capability report. Parent-brokered, permission-gated HTTP fetches are
+a separate boundary; subprocess network isolation does not bypass or replace fetch permissions.
+
+## Broker-only JavaScript worker
+
+The worker boundary is mandatory and independent of the optional general subprocess setting:
+
+| Platform | Production JS status |
+|----------|----------------------|
+| Linux | Available only after a real empty-root `bwrap` preflight proves trusted runtime mounts, isolated namespaces/network, rlimits, non-dumpability, `no_new_privs`, and seccomp process/exec denial. The workspace, cache, configuration, credentials, and ambient environment are absent. |
+| macOS | Unavailable. The real Seatbelt probe proves that allowing the stable image for initial execution also leaves it reusable for later exec; deprecated best-effort Seatbelt is not accepted as a fallback. |
+| Windows | Available only after a process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, protocol probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots; the full hosted canary records those observations only for its reference runner, and its final artifact remains pending. General JS `spawn` is still disabled. |
+
+Hooks, MCP servers, LSPs, loop validation, and the explicit interactive shell are separate trust
+classes with different workspace, credential, and lifecycle needs. They never inherit the
+broker-only worker profile merely because they also create processes.
+
+On Windows, startup and `--print-config` status checks create or reuse a persistent AppContainer
+profile and may add a persistent exact read/execute ACE to a supported, user-owned installed
+executable. LPAC is not a filesystem namespace, and no automatic cleanup, ACL rollback, or consent
+prompt is provided.
 
 ## Phase status
 
@@ -90,16 +117,17 @@ separate boundary; subprocess network isolation does not bypass or replace fetch
 | 1 | Core JS engine, host globals, permissions, process wrapper | Delivered |
 | 2 | `fetch`, narrowing allow-lists, Linux/macOS process isolation | Delivered |
 | 3 | Agent Skills, immutable learned skills, and prompt-time retrieval | Delivered |
-| 4 | Agent proposals, held-out evaluation, human-gated canary | Planned |
-| 5 | Evidence, promotion, quarantine, repair, rollback | Complete |
+| 4 | Agent proposals, held-out evaluation, human-gated canary | Delivered |
+| 5 | Evidence, promotion, quarantine, repair, rollback | Delivered |
+| 6 | Contained worker, protocol, parent broker/audit, private realms | Implementation complete; final evidence pending |
 
 ## Cargo features
 
 | Feature | Implies | Adds |
 |---------|---------|------|
 | `memory` | — | Project memory loading, editing, and context injection |
-| `js` | — | QuickJS engine and host globals (`rquickjs`) |
-| `sandbox` | — | Shared Linux/macOS process isolation; with `js`, sandboxed `spawn` and the permission-gated `fetch` global |
+| `js` | — | Brokered QuickJS worker plus parent-owned effect globals (`rquickjs`) |
+| `sandbox` | — | Shared Linux/macOS general-process isolation; with `js`, enables parent-brokered `spawn` where complete descendant containment exists and the permission-gated `fetch` global |
 | `skills` | `js` | Agent Skills catalog plus learned-skill store, hybrid retrieval, and no-effect verifier |
 | `skills-embed` | `skills` | Local BGE embedding inference (`fastembed` → ONNX Runtime) |
 | `skills-embed-dynamic` | `skills-embed` | Links ONNX Runtime at run time via `ORT_DYLIB_PATH`, for hosts without prebuilt `ort-sys` binaries |

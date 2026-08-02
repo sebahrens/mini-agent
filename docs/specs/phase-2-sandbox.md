@@ -1,10 +1,10 @@
 # Phase 2 — Sandbox Hardening
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-01
+- **Last reconciled**: 2026-08-02
 - **Entry dependency**: Phase 1 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 2 blocker
 
@@ -144,8 +144,8 @@ failure, permission denial, races, timeout, and I/O errors have no read/write ef
 ## General subprocess integration
 
 Phase 2 extends the existing `Sandbox` implementation for general commands rather than creating a
-JS-only command path. Model-authored `spawn()` continues to reach `Sandbox::wrap_command`; after
-Phase 6 it reaches that wrapper through the parent capability broker. The wrapper selects and
+JS-only command path. Model-authored `spawn()` reaches `Sandbox::wrap_command` through the parent
+capability broker. The wrapper selects and
 configures the effective general-process backend. It must not be used to launch the Phase 6 worker,
 whose broker-only containment has no workspace/cache visibility and fails closed independently.
 
@@ -222,10 +222,11 @@ no requested child and is never retried unsandboxed.
 ## Windows behavior
 
 Phase 2's in-process QuickJS placement is historical and superseded by Phase 6; Phase 2 did not
-make the full action primitive secure or release-ready on Windows. Phase 6 separately defines a
-contained JS worker but keeps parent-brokered JS `spawn` disabled until the general Windows command
-sandbox has its own normative backend, lifecycle/termination semantics, ACL interactions, CI, and
-release gate.
+make the full action primitive secure or release-ready on Windows. Phase 6 separately implements a
+zero-capability LPAC worker with a creation-time Job Object. That worker boundary contains only
+QuickJS evaluation and does not confer authority on a brokered child command. Parent-brokered JS
+`spawn` therefore remains disabled on Windows until the general command path has its own normative
+backend, complete descendant-lifetime ownership, CI, and release gate.
 
 ## Acceptance criteria
 

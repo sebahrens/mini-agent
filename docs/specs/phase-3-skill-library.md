@@ -1,10 +1,10 @@
 # Phase 3 — Skill Library
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-31
+- **Last reconciled**: 2026-08-02
 - **Entry dependencies**: Foundation and Phase 1 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 3 blocker
 
@@ -22,8 +22,9 @@ admission or evidence-based promotion.
 phase's identity-v1 flat capability shape, same-context runtime binding, and verifier runtime
 ownership. Phase 3 remains authoritative for immutable full-payload identity, SQLite storage,
 manual admission, frozen turn bundles, retrieval, declared exports, and deterministic verifier
-semantics. The index maps the exact section-level boundary; Phase 6 is planned, so this notice does
-not mark its identity-v2 or worker implementation delivered.
+semantics. The index maps the exact section-level boundary. Identity v2 and contained execution are
+now the current production contract; identity-v1 rows are preserved only as quarantined historical
+lineage and are never executed or used to infer version-2 scopes.
 
 ---
 
@@ -103,19 +104,22 @@ is a sibling feature so its resources are never mistaken for verified JS globals
 | `src/extras/skills/index.rs` | IMPLEMENTED | Progressive metadata discovery for instruction skills |
 | `src/extras/js/mod.rs` | IMPLEMENTED | Declares the feature-gated skill modules |
 | `src/extras/js/types.rs` | IMPLEMENTED | Carries the resolved skill bundle; Phase 6 supersedes runtime ownership |
-| `src/extras/js/engine.rs` | IMPLEMENTED | Evaluates selected skills and agent code as separate scripts; Phase 6 supersedes execution ownership |
-| `src/extras/js/tool.rs` | IMPLEMENTED | Snapshots the current bundle; Phase 6 delegates execution to the supervisor |
+| `src/extras/js/engine.rs` | TEST-ONLY | Historical evaluator retained for regression coverage; never a production fallback |
+| `src/extras/js/worker.rs`, `realm.rs` | IMPLEMENTED | Production private-realm loading, fresh runtime/context ownership, and hidden capability ABI |
+| `src/extras/js/tool.rs`, `supervisor.rs` | IMPLEMENTED | Snapshot the current bundle and dispatch it to the contained worker |
 | `src/agent/runner.rs` | EXISTS | Retrieve from the user prompt before the first model call |
 
 ---
 
 ## Immutable skill artifact — `src/extras/js/skills/mod.rs`
 
-The type shape below records delivered identity version 1. Its flat `allowed_hosts` list is
-superseded for new Phase 6 artifacts by identity version 2 structured capability scopes. Identity
+The type shape below records delivered identity version 1 for historical context. Its flat
+`allowed_hosts` list is superseded by identity version 2 structured capability scopes. Identity
 version 2 retains every other execution/discovery-bearing field, includes its ABI version and the
 complete canonical structured scopes in the hash, and is governed by Phase 6's `Persistence
-boundary`. No reader may interpret this version-1 example as permission to infer version-2 scopes.
+boundary`. Version-1 rows are quarantined and ineligible for execution, verification, evidence,
+promotion, or rollback. No reader may interpret this example as permission to infer version-2
+scopes.
 
 ```rust
 pub struct SkillArtifact {

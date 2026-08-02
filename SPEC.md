@@ -1,145 +1,200 @@
-# JS Engine — Implementation Overview
+# JavaScript Runtime — Implementation Overview
 
 - **Document role**: non-normative implementation overview
-- **Overview version**: 1.0.0
-- **Delivery status**: mixed; see the normative index
+- **Overview version**: 2.0.0
+- **Delivery status**: Phase 6 implementation complete; final evidence pending
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-08-02
 
-This document is a maintained overview, not a generated contract. The sole normative JS corpus is
-[`docs/specs/00-index.md`](docs/specs/00-index.md) and the phase specifications it indexes.
-Implementers must cite and follow the owning normative section. Code snippets, tracker text, dated
-blueprints, and this overview cannot override it.
+The sole normative JS corpus is
+[`docs/specs/00-index.md`](docs/specs/00-index.md) and the specifications it indexes. This file maps
+the current implementation; it cannot override those contracts.
 
 ## Foundation — paths and persistence
 
-Normative specification:
-[`docs/specs/platform-paths.md`](docs/specs/platform-paths.md)
+Normative specification: [`platform-paths.md`](docs/specs/platform-paths.md)
 
 - Construct one typed `AppPaths` resolver at startup.
 - Keep configuration, portable data, machine-local data, state, cache, credentials, and project
   roots distinct.
-- Store the learned-skill database and lifecycle evidence under machine-local data.
-- Validate directory/ZIP Agent Skills without execution and without trusting archive names.
-- Treat `allowed-tools` as metadata only.
-- Qualify Windows storage/security support until resolver, ACL, migration, archive, CI, and release
-  gates pass.
+- Keep the learned-skill database and lifecycle evidence in machine-local data and the brokered
+  effect audit in private state storage.
+- Validate Agent Skill directories/ZIPs without execution; `allowed-tools` is metadata only.
+- Keep platform storage/security claims qualified by their resolver, ACL, migration, archive, CI,
+  and release gates.
 
-## Phase 1 — core JS engine
+## Phase 1 — preserved engine semantics
 
-Normative specification:
-[`docs/specs/phase-1-js-engine.md`](docs/specs/phase-1-js-engine.md)
+Normative specification: [`phase-1-js-engine.md`](docs/specs/phase-1-js-engine.md)
 
-Implementation areas:
+Phase 1's in-parent thread is historical. Phase 6 preserves these behavior requirements inside the
+contained worker:
 
-| Concern | Location |
-|---------|----------|
-| Runtime lifecycle, eval, and pending jobs | `src/extras/js/engine.rs` |
-| Host globals, secure file effects, and spawn | `src/extras/js/host.rs` |
-| Tool lifecycle and permission bridge | `src/extras/js/tool.rs` |
-| Request/response types and limits | `src/extras/js/types.rs` |
-| Registration | `src/agent/builder.rs`, `src/extras/mod.rs` |
+- one fresh runtime per step, a 64 MiB heap, 512 KiB JS stack, pre-eval interrupt deadline,
+  bounded pending-job drain, and bounded values/output;
+- no `require`, `import`, or `final_answer`;
+- secure path identity and mandatory permission for real file operations;
+- stable typed outcomes; and
+- only closed diagnostic class/code plus validated source-free location metadata.
 
-Stable requirements:
+`src/extras/js/engine.rs` is test-only. Production QuickJS ownership is in `worker.rs` and
+`realm.rs`; no QuickJS type exists in the parent `JsTool` or supervisor.
 
-- one dedicated 8 MiB OS thread per `JsTool`;
-- only `Send + Sync` fields in `JsTool`, with no QuickJS state crossing threads;
-- one fresh runtime per step with the 64 MiB heap limit, 512 KiB JS stack limit, interrupt
-  deadline, `Value` evaluation, bounded stack extraction, and pending-job drain;
-- independent timeout/cancellation for every host call;
-- mandatory permission on securely resolved reads and writes;
-- mandatory process permission plus `Sandbox::wrap_command` for every spawn; and
-- no `require`, `import`, `fetch`, or `final_answer` in Phase 1.
+## Phase 2 — parent effect narrowing and general commands
 
-VM isolation and child-process isolation are distinct. Phase 1 does not promise an effective
-macOS or Windows process sandbox.
+Normative specification: [`phase-2-sandbox.md`](docs/specs/phase-2-sandbox.md)
 
-## Phase 2 — sandbox hardening
+- `fetch` remains HTTP(S)-only, origin/address/redirect validated, permission-gated, bounded, and
+  deadline-limited, but now executes in the parent.
+- File allow-lists narrow the exact securely resolved target and never grant permission.
+- A parent-brokered model command reaches `Sandbox::wrap_command` with structural argv identity.
+- The Linux/macOS general-process profiles remain workspace-visible and must never launch the JS
+  worker.
+- General Windows command isolation is not delivered. LPAC worker containment does not authorize
+  JS `spawn`, which remains disabled there.
 
-Normative specification:
-[`docs/specs/phase-2-sandbox.md`](docs/specs/phase-2-sandbox.md)
+## Phase 3 — skill library and identity v2
 
-- Keep `sandbox` independent from `js`; combined features enable the JS integrations.
-- Add bounded HTTP(S)-only `fetch` with URL/redirect validation, narrowing allow-lists, mandatory
-  `js/fetch` permission, and finite deadlines.
-- Apply file allow-lists only to resolved targets and only as a restriction before the mandatory
-  Phase 1 permission.
-- Extend the shared process wrapper and verify effective isolation on Linux and macOS.
-- On Linux, the opt-in `bwrap` policy exposes only the workspace, application cache, private
-  temporary storage, and explicit read-only runtime assets; it clears credential-bearing
-  environment state, creates process/device/network boundaries, and denies launch on setup error.
-  Disabling sandboxing intentionally inherits host capabilities and is reported distinctly.
-- Do not claim Windows process isolation; it is outside Phase 2.
+Normative specification: [`phase-3-skill-library.md`](docs/specs/phase-3-skill-library.md)
 
-## Phase 3 — skill library
+- `skills` implies `js` and remains independent of the optional embedding backends.
+- Keep Agent Skills separate from learned JavaScript artifacts.
+- Identity v2 is the full SHA-256 of canonical source, ordered tests, ordered exports/signatures,
+  discovery metadata, ABI version, and structured target scopes.
+- Identity-v1 rows are quarantined and cannot execute, verify, receive evidence, promote, or be
+  selected for rollback. Reproposal never infers scopes.
+- Retrieve once from the user prompt before model generation and freeze one turn bundle.
+- Production and verification share the contained private-realm loader and hidden-capability ABI.
+  Verification gets only declared deterministic fakes, fresh case state, mutation coverage, and
+  exact boolean-`true` tests.
 
-Normative specification:
-[`docs/specs/phase-3-skill-library.md`](docs/specs/phase-3-skill-library.md)
+## Phase 4 — parent-owned proposals
 
-- `skills` implies `js` and does not imply `sandbox`.
-- Keep portable Agent Skills separate from learned JavaScript artifacts.
-- Use the full 64-character SHA-256 of the versioned canonical execution/discovery payload,
-  including source, ordered tests, ordered exports/signatures, description/tags, capability, and
-  identity version.
-- Verify in a fresh no-effect context. Tests are nonempty and every expression must return exact
-  JavaScript boolean `true`; mutation checks cover every export.
-- Precompute embeddings, combine exact/ANN dense and lexical retrieval, and freeze one bundle
-  before model generation for the whole user turn. Exact ranking remains the ANN recall oracle.
-- Admit manually verified artifacts as active in Phase 3; reserve proposal/canary states for later
-  phases.
+Normative specification: [`phase-4-auto-admission.md`](docs/specs/phase-4-auto-admission.md)
 
-## Phase 4 — agent proposals and human-gated admission
-
-Normative specification:
-[`docs/specs/phase-4-auto-admission.md`](docs/specs/phase-4-auto-admission.md)
-
-The stable filename predates the final ownership split; Phase 4 does not auto-activate code.
-
-- Bound and durably enqueue structured proposals without evaluating them on the submitting
-  runtime.
-- Reload persisted bytes, recompute full identity, and run embedded, inherited, mutation, and
-  independent held-out gates in no-effect verification.
-- Keep held-out fixtures outside proposing-agent visibility and control.
-- Require an explicit authenticated human action to enter non-retrievable canary state.
-- Never mark an agent proposal active in Phase 4.
+- Only model-authored code may receive the bounded `propose_skill` global.
+- The worker serializes a complete identity-v2 draft; it never opens the store or owns durable
+  enqueue.
+- The parent validates/canonicalizes the draft, consumes the attempt budget, writes audit intent,
+  and enqueues it.
+- Independent held-out evaluation and explicit authenticated human approval are required before a
+  revision enters non-retrievable canary state. Phase 4 never activates code automatically.
 
 ## Phase 5 — evidence-based lifecycle
 
-Normative specification:
-[`docs/specs/phase-5-evidence-learning.md`](docs/specs/phase-5-evidence-learning.md)
+Normative specification: [`phase-5-evidence-learning.md`](docs/specs/phase-5-evidence-learning.md)
 
-- Attribute selected, injected, invoked, returned, thrown, timeout, OOM, policy, and targeted
-  feedback events without retaining raw prompts, arguments, or file content.
-- Route replacement canaries deterministically after lineage retrieval and before manifest
-  construction.
-- Permit evidence-gated automatic promotion only for eligible pure/read-only replacements.
-- Keep write/process/network revisions human-gated.
-- Quarantine severe integrity/capability failures immediately and behavioral failures only from
-  direct evidence with a minimum sample.
-- Create repair as a new immutable revision; make promotion, supersession, rollback, evidence, and
-  index-generation changes transactional.
+- Validate worker-attributed terminal events against the parent invocation/grant table before
+  durable evidence ingestion.
+- Permit evidence-gated automation only for eligible pure/read-only replacements; write, process,
+  and network capabilities retain a human gate.
+- Keep quarantine, repair-as-new-identity, supersession, rollback, index publication, and retention
+  transactional and generation-safe.
+- An effect-audit `OutcomeUnknown` is ambiguous, never positive evidence, and never replayed.
+
+## Phase 6 — brokered runtime
+
+Normative specification: [`phase-6-brokered-js-runtime.md`](docs/specs/phase-6-brokered-js-runtime.md)
+
+### Parent implementation
+
+| Concern | Location |
+|---------|----------|
+| `JsTool`, permissions, per-call services | `src/extras/js/tool.rs` |
+| Serialized process ownership/watchdog | `src/extras/js/supervisor.rs` |
+| Closed JSON wire protocol | `src/extras/js/protocol.rs` |
+| Invocation grants and effect authorization | `src/extras/js/broker.rs` |
+| Durable intent/completion audit | `src/extras/js/audit.rs` |
+| File/fetch/spawn effect services | `src/extras/js/host.rs` |
+| Proposal service | `src/extras/js/skills/proposal.rs` |
+
+The parent is the trusted computing base for credentials, configuration, permission prompts,
+paths, databases, persistence, audit, and all external effects. It keeps one lazy process-wide
+supervisor and one serialized worker. Invocation authority is method-local and never stored in the
+warm process or shared supervisor.
+
+The effect audit uses one fixed private version-1 target-correlation key across hash-chained,
+size-rotated segments; key rotation is not delivered. One machine-wide file lock admits a single
+active parent writer for the resolved audit store. A process-wide `OnceLock` caches initialization
+success or failure, so recovery from contention or a repaired storage fault requires restarting
+the parent before initialization is attempted again.
+
+### Worker implementation
+
+| Concern | Location |
+|---------|----------|
+| Same-executable bootstrap and fresh runtimes | `src/extras/js/worker.rs` |
+| Private realms, export wrappers, verifier loader | `src/extras/js/realm.rs` |
+| Linux empty-root containment | `src/sandbox/worker/linux.rs` |
+| macOS unavailable blocker | `src/sandbox/worker/macos.rs` |
+| Windows LPAC/Job and attestation | `src/sandbox/worker/windows.rs` |
+
+The process may remain warm after a safe result, but every `RunStep` and whole `VerifyArtifact`
+gets a fresh runtime and every verification case gets a fresh context. All protocol values are
+owned, bounded Rust data before crossing the pipe.
+
+### Authority ceiling and effects
+
+Realm capabilities limit source-level access, not a native-compromised worker. The maximum
+brokered authority of such a worker is the union of live current-step handles. Each effect still
+requires an unexpired parent-created invocation/grant, exact declared target scope, session
+permission, narrowing policy, backend readiness, and durable intent.
+
+If an effect may have started but completion is uncertain, the parent records `OutcomeUnknown`,
+revokes the invocation, recycles the complete worker boundary, and never automatically retries.
+
+### Platform status
+
+| Platform | Status |
+|----------|--------|
+| Linux | Enforced only after the real trusted empty-root `bwrap`/namespace/rlimit/seccomp preflight succeeds; otherwise unavailable. |
+| macOS | Unavailable because deprecated Seatbelt cannot permit the stable initial image while denying its later reuse for exec. No best-effort fallback. |
+| Windows | A process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, closed protocol probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots. The full hosted canary records those observations only for its reference runner; final evidence is pending. General JS `spawn` remains disabled. |
+
+The Windows OS creation call itself is not cancellable. It runs on one owned helper thread behind a
+five-second caller-side deadline; a late result is torn down, while a permanently blocked call is
+an explicit availability residual and cannot cause a second launch helper to be created.
+LPAC does not create a filesystem namespace, so host ACLs can retain visibility for the stable
+package identity. Normal startup and `--print-config` status evaluation create or reuse a
+persistent AppContainer profile and may add a persistent exact read/execute ACE to a supported,
+user-owned installed executable. There is no automatic cleanup, ACL rollback, or consent prompt.
+
+The Phase 6 delivery line remains evidence-pending until the required CI artifacts and reviewed
+[`js-worker` resource aggregate](docs/benchmarks/js-worker.md) are checked in.
+
+## Separate process trust classes
+
+[`subprocess-trust.md`](docs/specs/subprocess-trust.md) remains authoritative for process classes
+outside the worker. Project hooks, MCP servers, LSPs, loop validation, explicit interactive shell,
+support utilities, and model-authored commands have distinct principals, workspace/credential
+needs, and lifecycle guarantees. None inherits the broker-only worker profile.
 
 ## Phase and feature matrix
 
-| Capability | Required completed phase | Cargo relationship |
-|------------|--------------------------|--------------------|
-| Primitive bounded JS | Phase 1 | `js` |
-| Linux/macOS process hardening and `fetch` | Phase 2 | `sandbox` independent; integration uses `js,sandbox` |
+| Capability | Owning phase | Cargo relationship |
+|------------|--------------|--------------------|
+| Preserved bounded JavaScript semantics | Phase 1 | `js` |
+| General Linux/macOS command hardening and parent fetch | Phase 2 | `sandbox` independent; integration uses `js,sandbox` |
 | Manual learned-skill retrieval | Phase 3 + Foundation | `skills` implies `js` |
 | Agent proposal to human-approved canary | Phase 4 | extends `skills` |
 | Evidence-based lifecycle automation | Phase 5 | extends `skills` |
+| Contained production and verification execution | Phase 6 | mandatory whenever `js` is enabled; backend absence disables JS |
 
-Compilation alone is not phase completion. Entry dependencies and exit meaning are normative in
-[`docs/specs/00-index.md § Phase entry and exit rules`](docs/specs/00-index.md#phase-entry-and-exit-rules).
+Compilation alone is not phase completion. Entry dependencies and exit meaning remain normative in
+the specification index.
 
 ## Permanent prohibitions
 
-- No QuickJS `Runtime`, `Context`, `Rc`, or `RefCell` in `JsTool`.
-- No runtime reuse across steps.
-- No direct process path that bypasses `Sandbox::wrap_command`.
-- No permission-free file or network host global.
+- No production QuickJS `Runtime`, `Context`, function, promise, or value in the parent.
+- No runtime reuse across requests or context/state reuse across verification cases.
+- No in-parent or uncontained JavaScript fallback.
+- No arbitrary exception message, stack, thrown value, source, content, or secret in diagnostics.
+- No real effect in the worker and no effect before parent authorization plus durable intent.
+- No general model command that bypasses `Sandbox::wrap_command`; the broker-only worker uses its
+  separate dedicated launcher and never the workspace-visible general profile.
+- No permission-free file/network/process/proposal host operation.
 - No `require`, `import`, or `final_answer`.
-- No short or source-only learned-skill identity.
-- No truthy-value test semantics; only exact JavaScript boolean `true` passes.
-- No Phase 4 automatic activation.
-- No unqualified Windows sandbox/storage/security claim before its normative gates pass.
+- No source-only/short identity, inferred identity-v2 scope, or identity-v1 execution.
+- No truthy-value verifier semantics; only exact JavaScript boolean `true` passes.
+- No claim that LPAC worker containment provides Windows general-command containment.
+- No Phase 6 delivery claim before final cross-platform and resource evidence is reviewed.

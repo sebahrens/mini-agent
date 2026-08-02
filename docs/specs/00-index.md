@@ -1,7 +1,7 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-08-01
@@ -37,8 +37,8 @@ planning context only; it cannot override the cited section.
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS general-process isolation |
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Delivered | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
-| 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Complete | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
-| 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Planned | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
+| 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Delivered | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
+| 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Implementation complete; final evidence pending | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
 
 Prior research artifacts superseded by this index:
 
@@ -62,8 +62,10 @@ its original phase.
 
 Cargo features are not phase-completion claims:
 
-- `js` currently enables the delivered Phase 1 engine and primitive host API. Phase 6 defines the
-  required replacement runtime architecture but does not claim that replacement is implemented.
+- `js` enables the brokered Phase 6 architecture. The parent owns one lazy supervisor and all
+  policy, persistence, and effects; the same executable enters a contained worker mode and creates
+  a fresh QuickJS `Runtime` for every request. A missing or failed containment backend makes JS
+  unavailable rather than selecting the historical Phase 1 in-process path.
 - `sandbox` is independent of `js` and extends the shared process sandbox. `js,sandbox` enables
   Phase 2 integrations; `js` alone still uses the existing `Sandbox::wrap_command` behavior.
 - `skills` implies `js`; it does not imply `sandbox`. Phase 3 verification remains no-effect in
@@ -72,9 +74,9 @@ Cargo features are not phase-completion claims:
   permission checks.
 - Phases 4 and 5 extend the `skills` implementation; they do not grant a candidate a new Cargo
   feature or a path around lifecycle gates.
-- Phase 6 does not create a trust-bearing Cargo-feature relationship. When delivered, its contained
-  worker is mandatory for every JavaScript feature combination; backend absence disables JS rather
-  than selecting the Phase 1 execution path.
+- Phase 6 does not create a trust-bearing Cargo-feature relationship. Its contained worker is
+  mandatory for every JavaScript feature combination; backend absence disables JS rather than
+  selecting the Phase 1 execution path.
 
 ## Cross-phase dependencies
 
@@ -87,7 +89,7 @@ Cargo features are not phase-completion claims:
 | Pending/verified/canary states and held-out evaluation cases | Phase 4 | Phase 5 evidence policy |
 | Invocation events and lineage transitions | Phase 5 | Automatic quarantine, repair, promotion, and rollback |
 | Historical fresh-runtime limits and host semantics | Phase 1/2 | Phase 6 worker runtime and parent capability broker |
-| Broker-only worker containment, protocol, realm loader, and effect audit | Phase 6 | All production and verification JavaScript execution after Phase 6 delivery |
+| Broker-only worker containment, protocol, realm loader, and effect audit | Phase 6 | All production and verification JavaScript execution |
 
 ## Phase entry and exit rules
 
@@ -130,13 +132,15 @@ The monorepo was flattened: production source and the workspace `Cargo.toml` are
 root. Paths under `zerostack/` in a superseded artifact are historical, not aliases that new
 tracker issues may cite.
 
-Phase 1–3 code exists under `src/extras/js/`, with the portable Agent Skills catalog in
-`src/extras/skills/`. The Phase 4
-proposal, held-out evaluation, approval transaction, and active-only visibility boundary are
-delivered. Phase 5 evidence-learning is complete. Current code still contains Phase 1's
-in-process implementation; Phase 6 explicitly supersedes that delivery baseline as the normative
-target, but the replacement is not yet delivered. Source line numbers are intentionally omitted
-here because they drift; tracker tasks must resolve current symbols before editing.
+Phase 1–5 behavior remains implemented under `src/extras/js/`, with the portable Agent Skills
+catalog in `src/extras/skills/`. Phase 6 moved production and verification QuickJS ownership into
+the contained same-executable worker in `worker.rs`/`realm.rs`; `engine.rs` is retained only for
+historical regression tests. `tool.rs`, `supervisor.rs`, `broker.rs`, and `audit.rs` remain in the
+trusted parent and own invocation policy, transport, effects, and durable audit. Phase 5 is
+delivered. Phase 6 implementation is complete, but its delivery row remains evidence-pending until
+the required cross-platform CI artifacts and reviewed resource record are available. Source line
+numbers are intentionally omitted here because they drift; tracker tasks must resolve current
+symbols before editing.
 
 ## Build commands (mandatory)
 

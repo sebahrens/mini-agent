@@ -1,10 +1,10 @@
 # Phase 1 — Core JS Engine Integration
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-01
+- **Last reconciled**: 2026-08-02
 - **Entry dependency**: none for the non-persistent engine
 - **Exit dependency**: every acceptance criterion below and every Phase 1 blocker
 
@@ -15,8 +15,8 @@ The corpus authority and conflict rules are defined in
 in-parent process/thread ownership, independent host-call deadline wording, and exception
 disclosure. The host behavior, permission semantics, runtime freshness, resource limits, stable
 error categories, and evaluation rules below otherwise remain the historical contract that the
-Phase 6 worker and parent broker must preserve. Phase 6 is planned; this notice is not a delivery
-claim.
+Phase 6 worker and parent broker preserve. Phase 6 now owns production execution placement; this
+document remains normative only for the explicitly preserved behavior.
 
 ## Overview
 
@@ -39,9 +39,9 @@ establish an unqualified Windows release claim.
 
 ## Feature gate
 
-`js = ["dep:rquickjs"]` enables the engine and remains non-default until this phase exits.
-All JS-specific production code is gated by `#[cfg(feature = "js")]`; the default build remains
-unchanged.
+`js = ["dep:rquickjs"]` enables the engine and is part of the default build. All JS-specific
+production code is gated by `#[cfg(feature = "js")]`; `--no-default-features` omits it unless it is
+selected explicitly.
 
 The `sandbox` feature belongs to Phase 2 and is independent. A `js`-only build still routes
 `spawn()` through the existing `Sandbox::wrap_command`; whether that wrapper provides effective
@@ -53,10 +53,12 @@ Production files live at the repository root:
 
 | Concern | Location |
 |---------|----------|
-| Historical Phase 1 runtime lifecycle and JS thread | `src/extras/js/engine.rs` (superseded ownership; behavior/limits retained) |
+| Historical Phase 1 runtime lifecycle and JS thread | `src/extras/js/engine.rs` (`#[cfg(test)]`; superseded ownership, regression behavior retained) |
 | `JsTool` implementation | `src/extras/js/tool.rs` |
-| Host globals and secure file operations | `src/extras/js/host.rs` |
-| Request/response and permission-bridge types | `src/extras/js/types.rs` |
+| Parent effect services and secure file operations | `src/extras/js/host.rs` |
+| Request/response and permission-bridge types | `src/extras/js/types.rs`, `src/extras/js/protocol.rs` |
+| Production runtime and private realms | `src/extras/js/worker.rs`, `src/extras/js/realm.rs` |
+| Parent worker ownership and effect authorization | `src/extras/js/supervisor.rs`, `src/extras/js/broker.rs` |
 | Module registration | `src/extras/js/mod.rs`, `src/extras/mod.rs` |
 | Agent tool registration | `src/agent/builder.rs` |
 | JS integration tests | `src/extras/js/tests/` |
@@ -216,8 +218,9 @@ metadata. It never returns arbitrary exception message/stack text or a thrown va
 
 `src/agent/builder.rs` registers one `JsTool` under `#[cfg(feature = "js")]` before the tool
 allow-list is applied. Historically, `JsTool::new` created the engine thread so one tool could not
-share a QuickJS runtime with another. Phase 6 supersedes that construction rule with one lazily
-started contained worker and a fresh runtime for each request.
+share a QuickJS runtime with another. The current construction obtains one process-wide lazy
+supervisor. A contained process may survive a successful request, but each request receives a fresh
+runtime and invocation-local authority.
 
 Registration does not remove or silently replace another action tool. Windows availability is
 controlled by verified platform support in code and CI, not by an overview-document claim.

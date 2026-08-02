@@ -169,10 +169,20 @@ If you want to use zerostack from scripts, from other programs, or if you just w
 
 ## 6. Feature contract
 
-The default build and every pre-built release archive include the embedded
-JavaScript engine (`js` feature). The `mini-agent-lite-*` release archives
+The default build and every pre-built release archive include the brokered
+JavaScript engine (`js` feature). QuickJS runs only in a contained same-executable worker; the
+parent retains permissions, external effects, persistence, and audit. Linux requires its real
+empty-root `bwrap` preflight, macOS currently reports unavailable because Seatbelt cannot prevent
+stable-image re-exec, and Windows requires a cached minimal LPAC/Job production attestation.
+There is no in-parent or uncontained fallback. The `mini-agent-lite-*` release archives
 are built with `--no-default-features` and omit JS and other default features
 — use those only when you need a minimal binary without the JS runtime.
+
+On Windows, ordinary startup and `--print-config` evaluate worker status. That check creates or
+reuses a persistent AppContainer profile and may add a persistent read/execute ACE for that
+profile to a supported, user-owned installed executable. It has no automatic cleanup, ACL rollback,
+or separate consent prompt. The local attestation does not test general host filesystem/network
+denial; broader canaries are pending hosted reference-runner evidence.
 
 Everything else above ships in the default build. A few extras are compiled in
 only when you ask for them: lifecycle hooks (`--features hooks`), a

@@ -1,10 +1,10 @@
 # Phase 5 — Evidence-Based Self-Learning
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.0.0
-- **Delivery status**: complete
+- **Specification version**: 1.1.0
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-01
+- **Last reconciled**: 2026-08-02
 - **Entry dependencies**: Foundation and Phases 1–4 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 5 blocker
 - **Target scale**: up to 100,000 local/shared skill revisions
@@ -21,7 +21,8 @@ its handling of identity-version migration: identity-v1 artifacts become ineligi
 quarantined before Phase 6 execution, rollback cannot reactivate them, and explicit reproposal is
 required for identity version 2. Phase 5's evidence thresholds, transactional lifecycle/index
 coordination, immutable lineage, repair, rollback mechanics for eligible artifacts, privacy, and
-retention remain authoritative. Phase 6 is planned; this extension is not marked delivered here.
+retention remain authoritative. Phase 6's identity-v1 quarantine and identity-v2 eligibility
+extension is implemented on the current production path.
 
 ---
 
@@ -71,7 +72,7 @@ evaluation cases, and index entries.
 
 ### Phase 6 identity-v1 migration extension
 
-Before Phase 6 can advertise JS availability, a parent-owned migration runs under the same
+Before JS can advertise Phase 6 availability, a parent-owned migration runs under the same
 exclusive lifecycle/index-generation gate used for quarantine. It removes every identity-v1
 artifact from retrievable and canary snapshots before any worker request can name it. A version-1
 row in `pending`, `verified`, `canary`, `active`, or `superseded` transitions transactionally to
@@ -255,6 +256,11 @@ and validates them against the parent invocation/grant table before parent-side 
 Queue overflow, attribution mismatch, or SQLite failure marks the turn's evidence incomplete; the
 user-visible tool result remains valid, but the turn contributes no promotion or rate-based
 quarantine evidence.
+
+The brokered effect audit is separate from skill evidence. If an approved effect may have happened
+but cannot be classified after cancellation, deadline, or transport failure, the audit records
+`OutcomeUnknown`, revokes the invocation, and forces worker recycle. That ambiguous result never
+counts as a successful skill outcome, positive evidence, or a reason to replay the effect.
 
 ---
 
@@ -509,8 +515,8 @@ manager:
 |----------|--------|
 | Schema, typed rows, tombstones | `src/extras/js/skills/store.rs` |
 | Lifecycle, root activation, supersession, rollback | `src/extras/js/skills/lifecycle.rs` |
-| Wrapper events and off-thread ingestion | `src/extras/js/engine.rs`, `types.rs`, `skills/telemetry.rs` |
-| Capability intersection | `src/extras/js/skills/capability.rs`, `src/extras/js/host.rs` |
+| Worker-attributed terminal events and parent ingestion | `src/extras/js/worker.rs`, `protocol.rs`, `types.rs`, `skills/telemetry.rs` |
+| Capability intersection and authoritative attribution | `src/extras/js/skills/capability.rs`, `src/extras/js/broker.rs`, `src/extras/js/tool.rs` |
 | Canary routing | `src/extras/js/skills/router.rs` |
 | Promotion evidence and leases | `src/extras/js/skills/policy.rs`, `scheduler.rs` |
 | Generation publication | `src/extras/js/skills/coordinator.rs` |
