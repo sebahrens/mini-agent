@@ -2,6 +2,10 @@ use rquickjs::context::EvalOptions;
 use rquickjs::promise::PromiseState;
 use rquickjs::{Context, Error, Function, Persistent, Promise, Runtime, Value};
 
+use crate::extras::js::realm::{RealmError, load_artifact};
+use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+use crate::extras::js::types::{MEMORY_LIMIT, STACK_LIMIT};
+
 const MAX_CLONE_BYTES: usize = 1_024;
 const MAX_EXCEPTION_MESSAGE_BYTES: usize = 252;
 const MAX_EXCEPTION_STACK_BYTES: usize = 32;
@@ -368,4 +372,274 @@ fn values_cross_the_boundary_only_through_the_declared_json_clone_contract() {
         strict_json_encode(&skill_context, &over_limit_expression),
         Err(CloneError::TooLarge)
     );
+}
+
+fn artifact(source: &str, exports: &[&str]) -> SkillArtifact {
+    SkillArtifact::new(
+        source.to_string(),
+        "private realm test skill".to_string(),
+        vec!["test".to_string()],
+        exports
+            .iter()
+            .map(|name| SkillExport {
+                name: (*name).to_string(),
+                signature: format!("{name}()"),
+            })
+            .collect(),
+        vec!["true".to_string()],
+        CapabilityManifest::pure(),
+    )
+    .expect("construct identity-v2 artifact")
+}
+
+fn bounded_runtime() -> Runtime {
+    let runtime = Runtime::new().expect("create runtime");
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    runtime
+}
+
+#[test]
+fn production_loader_installs_only_frozen_declared_wrappers() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let skill = artifact(
+        "const secret = 40; function increment(value) { return {value: value + secret}; } function undeclared() { return 0; }",
+        &["increment"],
+    );
+
+    let loaded = load_artifact(&runtime, &model, &skill).expect("load pure artifact");
+    assert_eq!(loaded.artifact_id(), skill.id);
+    assert_eq!(loaded.exports(), &["increment"]);
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>(
+                "JSON.stringify({result: increment(2), frozen: Object.isFrozen(increment), undeclared: typeof undeclared})",
+            )
+            .expect("call cloned wrapper"),
+            r#"{"result":{"value":42},"frozen":true,"undeclared":"undefined"}"#
+        );
+        assert!(
+            ctx.eval::<bool, _>(
+                "(() => { const original = increment; try { increment.extra = 1; increment = () => 0; } catch (_) {} return increment === original && increment.extra === undefined; })()",
+            )
+            .expect("inspect frozen wrapper")
+        );
+    });
+}
+
+#[test]
+fn loader_rejects_collisions_and_missing_exports_without_partial_publication() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    model.with(|ctx| {
+        ctx.globals()
+            .set("occupied", 7)
+            .expect("set occupied global");
+    });
+    let collision = artifact(
+        "throw new Error('collision source must not execute')",
+        &["occupied"],
+    );
+    assert!(matches!(
+        load_artifact(&runtime, &model, &collision),
+        Err(RealmError::ExportCollision)
+    ));
+
+    let missing = artifact(
+        "function other() { return 1; }",
+        &["missing", "alsoMissing"],
+    );
+    assert!(matches!(
+        load_artifact(&runtime, &model, &missing),
+        Err(RealmError::MissingExport)
+    ));
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("[typeof missing, typeof alsoMissing].join(',')")
+                .expect("inspect exact publication"),
+            "undefined,undefined"
+        );
+        assert_eq!(ctx.eval::<i32, _>("occupied").unwrap(), 7);
+    });
+}
+
+#[test]
+fn loader_rejects_identity_and_abi_mismatch_before_source_evaluation() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let mut tampered = artifact("function safe() { return 1; }", &["safe"]);
+    tampered.source = "throw new Error('must not execute')".to_string();
+
+    assert!(matches!(
+        load_artifact(&runtime, &model, &tampered),
+        Err(RealmError::Identity)
+    ));
+
+    let mut old_abi = artifact("function safe() { return 1; }", &["safe"]);
+    old_abi.abi_version = 1;
+    old_abi.id = old_abi.compute_identity();
+    assert!(matches!(
+        load_artifact(&runtime, &model, &old_abi),
+        Err(RealmError::Identity)
+    ));
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("typeof safe").expect("inspect model"),
+            "undefined"
+        );
+    });
+}
+
+#[test]
+fn initialization_has_no_authority_and_rejects_pending_jobs() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    model.with(|ctx| {
+        ctx.globals()
+            .set("effectCalls", 0)
+            .expect("set effect canary");
+        ctx.eval::<(), _>(
+            "for (const name of ['read_file', 'write_file', 'fetch', 'spawn', 'propose_skill']) { globalThis[name] = () => { globalThis.effectCalls += 1; return 'model'; }; }",
+        )
+        .expect("install model-only canaries");
+    });
+
+    let inspect = artifact(
+        "try { read_file('secret'); } catch (_) {} try { write_file('x', 'y'); } catch (_) {} try { fetch('https://example.com'); } catch (_) {} try { spawn('printf', []); } catch (_) {} try { propose_skill({}); } catch (_) {} function inspect() { return [typeof read_file, typeof write_file, typeof fetch, typeof spawn, typeof propose_skill, typeof require, typeof module, typeof exports].join(','); }",
+        &["inspect"],
+    );
+    load_artifact(&runtime, &model, &inspect).expect("load authority-free skill");
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("inspect()")
+                .expect("inspect private globals"),
+            "undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined"
+        );
+        assert_eq!(
+            ctx.eval::<i32, _>("effectCalls")
+                .expect("inspect effect canary"),
+            0,
+            "stored initialization must never reach a model effect or proposal host"
+        );
+    });
+
+    let pending = artifact(
+        "Promise.resolve().then(() => 1); function neverInstalled() { return 1; }",
+        &["neverInstalled"],
+    );
+    assert!(matches!(
+        load_artifact(&runtime, &model, &pending),
+        Err(RealmError::PendingInitializationJobs)
+    ));
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("typeof neverInstalled")
+                .expect("inspect rejected export"),
+            "undefined"
+        );
+    });
+
+    let module_source = artifact(
+        "import value from 'forbidden'; function moduleLoaded() { return value; }",
+        &["moduleLoaded"],
+    );
+    assert!(matches!(
+        load_artifact(&runtime, &model, &module_source),
+        Err(RealmError::Initialization)
+    ));
+}
+
+#[test]
+fn private_realms_resist_escape_and_cross_artifact_contamination() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    model.with(|ctx| {
+        ctx.globals()
+            .set("modelSentinel", "model")
+            .expect("set model sentinel");
+    });
+    let first = artifact(
+        "const helper = 40; try { Object.prototype.poisoned = true; } catch (_) {} function first() { let recovered = false; try { recovered = !!({}).constructor.constructor('return this')().modelSentinel; } catch (_) {} return {value: helper + 1, recovered, dynamic: typeof Function, poisoned: ({}).poisoned === true}; }",
+        &["first"],
+    );
+    let second = artifact(
+        "const helper = 1; function second() { return {value: helper + 1, seesFirst: typeof first}; }",
+        &["second"],
+    );
+
+    load_artifact(&runtime, &model, &first).expect("load first private realm");
+    load_artifact(&runtime, &model, &second).expect("load second private realm");
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("JSON.stringify({first: first(), second: second(), model: modelSentinel, modelPoisoned: ({}).poisoned === true})")
+                .expect("inspect isolated realms"),
+            r#"{"first":{"value":41,"recovered":false,"dynamic":"undefined","poisoned":false},"second":{"value":2,"seesFirst":"undefined"},"model":"model","modelPoisoned":false}"#
+        );
+    });
+}
+
+#[test]
+fn wrapper_boundary_rejects_executable_cyclic_accessor_and_async_values() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let skill = artifact(
+        "function echo(value) { return value; } function closure() { return () => 1; } function pending() { return Promise.resolve(1); } function oversized() { return 'x'.repeat(70000); } function throwsSecret() { throw new Error('private thrown value'); }",
+        &["echo", "closure", "pending", "oversized", "throwsSecret"],
+    );
+    load_artifact(&runtime, &model, &skill).expect("load boundary skill");
+
+    model.with(|ctx| {
+        assert!(ctx.eval::<Value, _>("echo(() => 1)").is_err());
+        assert!(ctx.eval::<Value, _>("closure()").is_err());
+        assert!(ctx.eval::<Value, _>("pending()").is_err());
+        assert!(ctx.eval::<Value, _>("oversized()").is_err());
+        assert!(ctx.eval::<Value, _>("echo('x'.repeat(70000))").is_err());
+        assert!(ctx.eval::<Value, _>("echo(new Date(0))").is_err());
+        assert_eq!(
+            ctx.eval::<String, _>(
+                "(() => { try { throwsSecret(); } catch (value) { return [typeof value, value === 0, String(value)].join(','); } })()",
+            )
+            .expect("inspect sanitized skill exception"),
+            "number,true,0",
+            "arbitrary skill exception objects must not cross into the model realm"
+        );
+        assert!(
+            ctx.eval::<Value, _>("(() => { const value = {}; value.self = value; return echo(value); })()")
+                .is_err()
+        );
+        assert!(
+            ctx.eval::<Value, _>("echo(Object.defineProperty({}, 'x', {enumerable: true, get() { throw new Error('must not run'); }}))")
+                .is_err()
+        );
+    });
+    assert!(
+        !runtime.is_job_pending(),
+        "a rejected async export must not leave a live continuation"
+    );
+}
+
+#[test]
+fn every_fresh_runtime_gets_new_skill_and_model_realms() {
+    for expected in [1, 2, 3] {
+        let runtime = bounded_runtime();
+        let model = Context::full(&runtime).expect("create model context");
+        let source = format!(
+            "const privateCounter = 1; function value() {{ return [privateCounter, {expected}]; }}"
+        );
+        let skill = artifact(&source, &["value"]);
+        load_artifact(&runtime, &model, &skill).expect("load into fresh runtime");
+        model.with(|ctx| {
+            assert_eq!(
+                ctx.eval::<String, _>("JSON.stringify(value())")
+                    .expect("call fresh wrapper"),
+                format!("[1,{expected}]")
+            );
+            assert_eq!(
+                ctx.eval::<String, _>("typeof privateCounter")
+                    .expect("inspect model realm"),
+                "undefined"
+            );
+        });
+    }
 }
