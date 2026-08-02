@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - phase6-integration
     tags:
       - 'v*'
   pull_request:
@@ -35,6 +36,9 @@ jobs:
 
       - name: Test Cargo feature graph gate
         run: python3 -m unittest scripts.tests.test_check_feature_graph
+
+      - name: Test Phase 6 cross-platform CI gate
+        run: python3 -m unittest scripts.tests.test_phase6_ci_workflow
 
       - name: Verify Cargo feature graph
         run: python3 scripts/check_feature_graph.py
@@ -143,16 +147,78 @@ jobs:
         run: >-
           cargo test --locked sandbox::
 
-      - name: Verify Linux JS worker containment test is present
+      - name: Verify Linux Phase 6 probes and adversarial suites are present
         shell: bash
         run: |
-          cargo test --locked --no-default-features --features js -- --list \
-            | grep -F 'extras::js::tests::worker_containment::linux_js_worker_containment: test'
+          js_tests=$(cargo test --locked --no-default-features --features js -- --list)
+          skills_tests=$(cargo test --locked --no-default-features --features skills -- --list)
+          containment_count=$(printf '%s\n' "$js_tests" | grep -c '^extras::js::tests::worker_containment::linux_js_worker_containment: test$')
+          test "$containment_count" -eq 1
+
+          require_suite() {
+            listing=$1
+            name=$2
+            pattern=$3
+            count=$(printf '%s\n' "$listing" | grep -Ec "$pattern" || true)
+            if [ "$count" -lt 1 ]; then
+              echo "$name must execute at least one test" >&2
+              exit 1
+            fi
+          }
+          for listing in "$js_tests" "$skills_tests"; do
+            require_suite "$listing" worker_protocol '^extras::js::tests::worker_protocol::'
+            require_suite "$listing" worker_runtime '^extras::js::tests::worker_runtime::worker_runtime_'
+            require_suite "$listing" worker_supervisor '^extras::js::tests::worker_runtime::worker_supervisor_'
+            require_suite "$listing" worker_broker '^extras::js::tests::worker_broker::worker_broker_'
+            require_suite "$listing" js_effect_audit '^extras::js::tests::worker_broker::js_effect_audit_'
+            require_suite "$listing" worker_fault_matrix '^extras::js::tests::worker_fault_matrix::'
+            require_suite "$listing" javascript_worker_status '^(agent::builder::js_tests::unavailable_worker_containment_|print::tests::config_reports_)'
+          done
+          require_suite "$skills_tests" skill_realm_isolation '^extras::js::tests::skill_realm_isolation::'
+          require_suite "$skills_tests" capability_manifest_v2 '^extras::js::tests::capability_manifest_v2::'
+          require_suite "$skills_tests" worker_verifier '^extras::js::tests::worker_runtime::worker_runtime_verification_'
+          require_suite "$skills_tests" skill_held_out_evaluator '^extras::js::tests::skill_held_out_evaluator::'
+          require_suite "$skills_tests" skill_admission_gate '^extras::js::tests::skill_admission_gate::'
 
       - name: Test Linux JS worker containment
-        run: >-
+        shell: bash
+        run: |
+          cargo test --locked --no-default-features --features js \
+            linux_js_worker_containment -- --ignored --nocapture
+          echo 'PHASE6_REAL_PROBE=passed' >> "$GITHUB_ENV"
+
+      - name: Measure Linux JS worker resources without gating noisy timing percentiles
+        shell: bash
+        run: |
+          benchmark_root="${RUNNER_TEMP}/js-worker-benchmark-install"
+          cargo install --locked --path . --debug --no-default-features --features js \
+            --root "$benchmark_root"
+          export MINI_AGENT_JS_WORKER_BENCH_EXE="$benchmark_root/bin/mini-agent"
+          MINI_AGENT_JS_WORKER_BENCH=1 \
+          MINI_AGENT_JS_WORKER_BENCH_OUTPUT="${RUNNER_TEMP}/js-worker-${RUNNER_OS}-reference.json" \
+            cargo test --locked --no-default-features --features js \
+              js_worker_resource_benchmark -- --ignored --nocapture
+          MINI_AGENT_JS_WORKER_BENCH=1 \
+          MINI_AGENT_JS_WORKER_BENCH_COMPARE="${RUNNER_TEMP}/js-worker-${RUNNER_OS}-reference.json" \
+          MINI_AGENT_JS_WORKER_BENCH_OUTPUT="${RUNNER_TEMP}/js-worker-${RUNNER_OS}.json" \
+            cargo test --locked --no-default-features --features js \
+              js_worker_resource_benchmark -- --ignored --nocapture
+          echo 'PHASE6_RESOURCE=recorded' >> "$GITHUB_ENV"
+
+      - name: Archive Linux JS worker resource measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: js-worker-resource-${{ runner.os }}
+          path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
+          if-no-files-found: error
+
+      - name: Run Phase 6 adversarial suites under js and skills
+        shell: bash
+        run: |
           cargo test --locked --no-default-features --features js
-          linux_js_worker_containment -- --ignored --nocapture
+          cargo test --locked --no-default-features --features skills
+          echo 'PHASE6_ADVERSARIAL=passed' >> "$GITHUB_ENV"
 
       - name: Test JS spawn parity through the shared sandbox
         run: cargo test --locked --features js,sandbox
@@ -167,6 +233,43 @@ jobs:
           test "$snapshot_count" -eq 3
           cargo test --locked --no-default-features --features js,sandbox,skills learned_skill_spawn_fails_closed_on_linux_without_snapshot_backend
           cargo test --locked --no-default-features --features js,sandbox,skills linux_spawn_ -- --ignored --nocapture
+
+      - name: Write source-free Phase 6 gate evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $probe = if ($env:PHASE6_REAL_PROBE) { $env:PHASE6_REAL_PROBE } else { 'not-run' }
+          $adversarial = if ($env:PHASE6_ADVERSARIAL) { $env:PHASE6_ADVERSARIAL } else { 'not-run' }
+          @{
+            schema_version = 1
+            platform = 'linux'
+            runner = 'ubuntu-latest'
+            result = '${{ job.status }}'
+            containment = @{
+              backend = 'bubblewrap'
+              assurance = 'enforced'
+              real_probe = $probe
+              native_resource_gate = 'rlimit-seccomp-probed'
+            }
+            adversarial = @{
+              feature_rows = @('js', 'skills')
+              suites = $adversarial
+              zero_test_guard = 'enforced'
+            }
+            raw_output = $false
+          } | ConvertTo-Json -Depth 4 | Set-Content 'phase6-gate-evidence.json'
+          "PHASE6_GATE platform=linux result=${{ job.status }} probe=$probe suites=$adversarial raw_output=false" |
+            Set-Content 'phase6-gate-evidence.log'
+
+      - name: Archive source-free Phase 6 gate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phase6-worker-gate-linux
+          path: |
+            phase6-gate-evidence.json
+            phase6-gate-evidence.log
+          if-no-files-found: error
 
   macos-worker-containment-gate:
     if: github.event_name != 'schedule'
@@ -184,17 +287,115 @@ jobs:
       - name: Reject a missing macOS Seatbelt blocker probe
         shell: bash
         run: |
-          tests=$(cargo test --locked --no-default-features --features js -- --list)
-          count=$(printf '%s\n' "$tests" | grep -c '^extras::js::tests::worker_containment::macos_js_worker_containment: test$')
-          test "$count" -eq 1
+          js_tests=$(cargo test --locked --no-default-features --features js -- --list)
+          skills_tests=$(cargo test --locked --no-default-features --features skills -- --list)
+          containment_count=$(printf '%s\n' "$js_tests" | grep -c '^extras::js::tests::worker_containment::macos_js_worker_containment: test$')
+          test "$containment_count" -eq 1
+
+          require_suite() {
+            listing=$1
+            name=$2
+            pattern=$3
+            count=$(printf '%s\n' "$listing" | grep -Ec "$pattern" || true)
+            if [ "$count" -lt 1 ]; then
+              echo "$name must execute at least one test" >&2
+              exit 1
+            fi
+          }
+          for listing in "$js_tests" "$skills_tests"; do
+            require_suite "$listing" worker_protocol '^extras::js::tests::worker_protocol::'
+            require_suite "$listing" worker_runtime '^extras::js::tests::worker_runtime::worker_runtime_'
+            require_suite "$listing" worker_supervisor '^extras::js::tests::worker_runtime::worker_supervisor_'
+            require_suite "$listing" worker_broker '^extras::js::tests::worker_broker::worker_broker_'
+            require_suite "$listing" js_effect_audit '^extras::js::tests::worker_broker::js_effect_audit_'
+            require_suite "$listing" worker_fault_matrix '^extras::js::tests::worker_fault_matrix::'
+            require_suite "$listing" javascript_worker_status '^(agent::builder::js_tests::unavailable_worker_containment_|print::tests::config_reports_)'
+          done
+          require_suite "$skills_tests" skill_realm_isolation '^extras::js::tests::skill_realm_isolation::'
+          require_suite "$skills_tests" capability_manifest_v2 '^extras::js::tests::capability_manifest_v2::'
+          require_suite "$skills_tests" worker_verifier '^extras::js::tests::worker_runtime::worker_runtime_verification_'
+          require_suite "$skills_tests" skill_held_out_evaluator '^extras::js::tests::skill_held_out_evaluator::'
+          require_suite "$skills_tests" skill_admission_gate '^extras::js::tests::skill_admission_gate::'
 
       - name: Validate the real macOS Seatbelt fail-closed gate
-        run: >-
-          cargo test --locked --no-default-features --features js
-          macos_js_worker_containment -- --ignored --nocapture
+        shell: bash
+        run: |
+          cargo test --locked --no-default-features --features js \
+            macos_js_worker_containment -- --ignored --nocapture
+          echo 'PHASE6_REAL_PROBE=passed' >> "$GITHUB_ENV"
 
-      - name: Test fresh worker runtimes
-        run: cargo test --locked --no-default-features --features js worker_runtime
+      - name: Measure macOS JS worker resources without gating noisy timing percentiles
+        if: matrix.os == 'macos-26'
+        shell: bash
+        run: |
+          benchmark_root="${RUNNER_TEMP}/js-worker-benchmark-install"
+          cargo install --locked --path . --debug --no-default-features --features js \
+            --root "$benchmark_root"
+          export MINI_AGENT_JS_WORKER_BENCH_EXE="$benchmark_root/bin/mini-agent"
+          MINI_AGENT_JS_WORKER_BENCH=1 \
+          MINI_AGENT_JS_WORKER_BENCH_OUTPUT="${RUNNER_TEMP}/js-worker-${RUNNER_OS}-reference.json" \
+            cargo test --locked --no-default-features --features js \
+              js_worker_resource_benchmark -- --ignored --nocapture
+          MINI_AGENT_JS_WORKER_BENCH=1 \
+          MINI_AGENT_JS_WORKER_BENCH_COMPARE="${RUNNER_TEMP}/js-worker-${RUNNER_OS}-reference.json" \
+          MINI_AGENT_JS_WORKER_BENCH_OUTPUT="${RUNNER_TEMP}/js-worker-${RUNNER_OS}.json" \
+            cargo test --locked --no-default-features --features js \
+              js_worker_resource_benchmark -- --ignored --nocapture
+          echo 'PHASE6_RESOURCE=recorded' >> "$GITHUB_ENV"
+
+      - name: Archive macOS JS worker resource measurements
+        if: always() && matrix.os == 'macos-26'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: js-worker-resource-${{ runner.os }}
+          path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
+          if-no-files-found: error
+
+      - name: Run Phase 6 adversarial suites under js and skills
+        shell: bash
+        run: |
+          cargo test --locked --no-default-features --features js
+          cargo test --locked --no-default-features --features skills
+          echo 'PHASE6_ADVERSARIAL=passed' >> "$GITHUB_ENV"
+
+      - name: Write source-free Phase 6 gate evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $probe = if ($env:PHASE6_REAL_PROBE) { $env:PHASE6_REAL_PROBE } else { 'not-run' }
+          $adversarial = if ($env:PHASE6_ADVERSARIAL) { $env:PHASE6_ADVERSARIAL } else { 'not-run' }
+          $resource = if ($env:PHASE6_RESOURCE) { $env:PHASE6_RESOURCE } else { 'not-run' }
+          @{
+            schema_version = 1
+            platform = 'macos'
+            runner = '${{ matrix.os }}'
+            result = '${{ job.status }}'
+            containment = @{
+              backend = 'seatbelt'
+              assurance = 'deprecated-best-effort-fail-closed'
+              real_probe = $probe
+              resource_measurement = $resource
+              native_resource_gate = 'unavailable-no-production-worker'
+            }
+            adversarial = @{
+              feature_rows = @('js', 'skills')
+              suites = $adversarial
+              zero_test_guard = 'enforced'
+            }
+            raw_output = $false
+          } | ConvertTo-Json -Depth 4 | Set-Content 'phase6-gate-evidence.json'
+          "PHASE6_GATE platform=macos runner=${{ matrix.os }} result=${{ job.status }} probe=$probe suites=$adversarial raw_output=false" |
+            Set-Content 'phase6-gate-evidence.log'
+
+      - name: Archive source-free Phase 6 gate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phase6-worker-gate-${{ matrix.os }}
+          path: |
+            phase6-gate-evidence.json
+            phase6-gate-evidence.log
+          if-no-files-found: error
 
   windows-worker-launcher-unit:
     if: github.event_name != 'schedule'
@@ -337,14 +538,37 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "test discovery failed with exit code $LASTEXITCODE"
           }
+          $skillsTests = cargo test --locked --no-default-features --features skills -- --list
+          if ($LASTEXITCODE -ne 0) {
+            throw "skills test discovery failed with exit code $LASTEXITCODE"
+          }
           $containment = @($tests | Select-String '^extras::js::tests::worker_containment::windows_js_worker_containment: test$')
           if ($containment.Count -ne 1) {
             throw "expected exactly one Windows containment probe, found $($containment.Count)"
           }
-          $runtime = @($tests | Select-String '^extras::js::tests::worker_runtime::.+: test$')
-          if ($runtime.Count -lt 1) {
-            throw 'worker_runtime filter would execute zero tests'
+
+          function Assert-Suite([object[]] $Listing, [string] $Name, [string] $Pattern) {
+            $matches = @($Listing | Select-String $Pattern)
+            if ($matches.Count -lt 1) {
+              throw "$Name must execute at least one test"
+            }
           }
+          function Assert-CoreSuites([object[]] $Listing) {
+            Assert-Suite $Listing 'worker_protocol' '^extras::js::tests::worker_protocol::'
+            Assert-Suite $Listing 'worker_runtime' '^extras::js::tests::worker_runtime::worker_runtime_'
+            Assert-Suite $Listing 'worker_supervisor' '^extras::js::tests::worker_runtime::worker_supervisor_'
+            Assert-Suite $Listing 'worker_broker' '^extras::js::tests::worker_broker::worker_broker_'
+            Assert-Suite $Listing 'js_effect_audit' '^extras::js::tests::worker_broker::js_effect_audit_'
+            Assert-Suite $Listing 'worker_fault_matrix' '^extras::js::tests::worker_fault_matrix::'
+            Assert-Suite $Listing 'javascript_worker_status' '^(agent::builder::js_tests::unavailable_worker_containment_|print::tests::config_reports_)'
+          }
+          Assert-CoreSuites $tests
+          Assert-CoreSuites $skillsTests
+          Assert-Suite $skillsTests 'skill_realm_isolation' '^extras::js::tests::skill_realm_isolation::'
+          Assert-Suite $skillsTests 'capability_manifest_v2' '^extras::js::tests::capability_manifest_v2::'
+          Assert-Suite $skillsTests 'worker_verifier' '^extras::js::tests::worker_runtime::worker_runtime_verification_'
+          Assert-Suite $skillsTests 'skill_held_out_evaluator' '^extras::js::tests::skill_held_out_evaluator::'
+          Assert-Suite $skillsTests 'skill_admission_gate' '^extras::js::tests::skill_admission_gate::'
 
       - name: Validate the real Windows LPAC, Job, resource, and install-location gate
         shell: pwsh
@@ -358,9 +582,331 @@ jobs:
           if (-not $evidence.Contains($expected)) {
             throw 'Windows containment probe emitted no exact fixed pass evidence'
           }
+          'PHASE6_REAL_PROBE=passed' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Test fresh Windows worker runtimes
-        run: cargo test --locked --no-default-features --features js worker_runtime
+      - name: Measure Windows JS worker resources without gating noisy timing percentiles
+        shell: pwsh
+        run: |
+          $env:MINI_AGENT_JS_WORKER_BENCH = '1'
+          $env:MINI_AGENT_JS_WORKER_BENCH_EXE = $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE
+          $env:MINI_AGENT_JS_WORKER_BENCH_OUTPUT = "$env:RUNNER_TEMP/js-worker-$env:RUNNER_OS-reference.json"
+          cargo test --locked --no-default-features --features js js_worker_resource_benchmark -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Windows JS worker reference resource record was not produced'
+          }
+          $env:MINI_AGENT_JS_WORKER_BENCH_COMPARE = "$env:RUNNER_TEMP/js-worker-$env:RUNNER_OS-reference.json"
+          $env:MINI_AGENT_JS_WORKER_BENCH_OUTPUT = "$env:RUNNER_TEMP/js-worker-$env:RUNNER_OS.json"
+          cargo test --locked --no-default-features --features js js_worker_resource_benchmark -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Windows JS worker resource record was not produced'
+          }
+          'PHASE6_RESOURCE=recorded' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Archive Windows JS worker resource measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: js-worker-resource-${{ runner.os }}
+          path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
+          if-no-files-found: error
+
+      - name: Validate the complete gate from a separate standard-user installation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $userName = 'phase6ci'
+          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+            throw "the isolated Phase 6 standard-user account already exists"
+          }
+          $passwordText = 'P6!' + [guid]::NewGuid().ToString('N') + 'aA1'
+          $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
+          $user = New-LocalUser -Name $userName -Password $password -PasswordNeverExpires -UserMayNotChangePassword
+          $ordinaryUser = Get-LocalGroupMember -Group 'Users' |
+            Where-Object { $_.SID -eq $user.SID }
+          if (-not $ordinaryUser) {
+            Add-LocalGroupMember -Group 'Users' -Member $user
+          }
+          $administrator = Get-LocalGroupMember -Group 'Administrators' |
+            Where-Object { $_.SID -eq $user.SID }
+          if ($administrator) {
+            throw 'the Phase 6 probe account unexpectedly has administrator authority'
+          }
+
+          $standardRoot = Join-Path $env:RUNNER_TEMP 'phase6 standard user λ'
+          $sourceArchive = Join-Path $standardRoot 'source.zip'
+          $sourceRoot = Join-Path $standardRoot 'source checkout'
+          $cargoHome = Join-Path $standardRoot 'cargo home'
+          $userHome = Join-Path $standardRoot 'user home'
+          $userTemp = Join-Path $standardRoot 'user temp'
+          $evidenceRoot = Join-Path $standardRoot 'evidence'
+          $buildEnvironment = Join-Path $standardRoot 'build-environment.json'
+          New-Item -ItemType Directory -Path $standardRoot, $sourceRoot, $cargoHome, $userHome, $userTemp, $evidenceRoot -Force | Out-Null
+          git archive --format=zip --output=$sourceArchive HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "git archive failed with exit code $LASTEXITCODE"
+          }
+          Expand-Archive -LiteralPath $sourceArchive -DestinationPath $sourceRoot
+
+          $toolchainCargo = (rustup which cargo).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $toolchainCargo -PathType Leaf)) {
+            throw 'rustup did not resolve the exact Cargo toolchain binary'
+          }
+          $toolchainBin = Split-Path -Parent $toolchainCargo
+          $toolchainRoot = Split-Path -Parent $toolchainBin
+          & icacls.exe $toolchainRoot /grant "${userName}:(OI)(CI)RX" /T /Q | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw 'could not grant the standard user read/execute access to the Rust toolchain'
+          }
+          & icacls.exe $standardRoot /setowner $userName /T /C /Q | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw 'could not assign the isolated checkout to the standard user'
+          }
+          & icacls.exe $standardRoot /grant "${userName}:(OI)(CI)M" /T /Q | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw 'could not grant the standard user access to its isolated checkout'
+          }
+          $sensitivePathRoots = @(
+            $env:HOME,
+            $env:USERPROFILE,
+            $env:TEMP,
+            $env:TMP,
+            $env:RUNNER_TEMP,
+            $env:GITHUB_WORKSPACE
+          ) | Where-Object { $_ } | ForEach-Object {
+            [System.IO.Path]::GetFullPath($_).TrimEnd('\')
+          }
+          function Test-RequiredBuildPath([string] $Candidate) {
+            if (-not $Candidate) {
+              return $false
+            }
+            try {
+              $fullCandidate = [System.IO.Path]::GetFullPath($Candidate).TrimEnd('\')
+            } catch {
+              return $false
+            }
+            foreach ($sensitiveRoot in $sensitivePathRoots) {
+              if ($fullCandidate.Equals($sensitiveRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+                  $fullCandidate.StartsWith("$sensitiveRoot\", [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+              }
+            }
+            return $true
+          }
+          $buildPath = @($env:PATH -split ';' | Where-Object { Test-RequiredBuildPath $_ }) -join ';'
+          if (-not $buildPath) {
+            throw 'no non-user compiler path entries remained for the standard-user build'
+          }
+          @{
+            PATH = $buildPath
+            INCLUDE = $env:INCLUDE
+            LIB = $env:LIB
+            LIBPATH = $env:LIBPATH
+            VCINSTALLDIR = $env:VCINSTALLDIR
+            VCToolsInstallDir = $env:VCToolsInstallDir
+            WindowsSdkDir = $env:WindowsSdkDir
+            WindowsSDKVersion = $env:WindowsSDKVersion
+            UCRTVersion = $env:UCRTVersion
+            UniversalCRTSdkDir = $env:UniversalCRTSdkDir
+          } | ConvertTo-Json | Set-Content -LiteralPath $buildEnvironment
+
+          $protectedRoot = Join-Path $env:ProgramFiles 'mini-agent-a31-standard-user-gate'
+          New-Item -ItemType Directory -Path $protectedRoot -Force | Out-Null
+          $protected = Join-Path $protectedRoot 'mini-agent.exe'
+          Copy-Item -LiteralPath $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE -Destination $protected -Force
+          $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+          $none = [System.Security.AccessControl.InheritanceFlags]::None
+          $propagation = [System.Security.AccessControl.PropagationFlags]::None
+          $allow = [System.Security.AccessControl.AccessControlType]::Allow
+          $deny = [System.Security.AccessControl.AccessControlType]::Deny
+          function Protect-StandardUserControl([string] $Path, [bool] $Directory) {
+            if ($Directory) {
+              $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+            } else {
+              $acl = [System.Security.AccessControl.FileSecurity]::new()
+            }
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.SetOwner($systemSid)
+            [void] $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+              $systemSid,
+              [System.Security.AccessControl.FileSystemRights]::FullControl,
+              $none,
+              $propagation,
+              $allow
+            ))
+            [void] $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+              $user.SID,
+              [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+              $none,
+              $propagation,
+              $allow
+            ))
+            $denied = [System.Security.AccessControl.FileSystemRights]::Write -bor
+              [System.Security.AccessControl.FileSystemRights]::Delete -bor
+              [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+              [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+            if ($Directory) {
+              $denied = $denied -bor [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles
+            }
+            [void] $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+              $user.SID,
+              $denied,
+              $none,
+              $propagation,
+              $deny
+            ))
+            Set-Acl -LiteralPath $Path -AclObject $acl
+          }
+          Protect-StandardUserControl -Path $protected -Directory $false
+          Protect-StandardUserControl -Path $protectedRoot -Directory $true
+
+          $probeScript = Join-Path $standardRoot 'run-standard-user-gate.ps1'
+          @'
+          param(
+            [Parameter(Mandatory)][string] $CargoExe,
+            [Parameter(Mandatory)][string] $ToolchainBin,
+            [Parameter(Mandatory)][string] $SourceRoot,
+            [Parameter(Mandatory)][string] $CargoHome,
+            [Parameter(Mandatory)][string] $ProtectedExe,
+            [Parameter(Mandatory)][string] $EvidenceRoot,
+            [Parameter(Mandatory)][string] $BuildEnvironment,
+            [Parameter(Mandatory)][string] $ExpectedAccount,
+            [Parameter(Mandatory)][string] $UserHome,
+            [Parameter(Mandatory)][string] $UserTemp
+          )
+          $ErrorActionPreference = 'Stop'
+          $tokenIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          if (-not [string]::Equals(
+            $tokenIdentity.Name,
+            $ExpectedAccount,
+            [System.StringComparison]::OrdinalIgnoreCase
+          )) {
+            exit 10
+          }
+          $tokenPrincipal = [System.Security.Principal.WindowsPrincipal]::new($tokenIdentity)
+          if ($tokenPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            exit 11
+          }
+          $forbiddenPrefixes = @('ACTIONS_', 'GITHUB_', 'RUNNER_', 'MINI_AGENT_')
+          $inheritedSensitive = @(Get-ChildItem Env: | Where-Object {
+            $name = $_.Name
+            $hasForbiddenPrefix = @($forbiddenPrefixes | Where-Object {
+              $name.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase)
+            }).Count -ne 0
+            $hasForbiddenCredentialName = $name -match '(?i)(TOKEN|SECRET|PASSWORD|PRIVATE_KEY|ACCESS_KEY|API_KEY)$'
+            $hasForbiddenPrefix -or $hasForbiddenCredentialName -or $name -in @('CI', 'GH_TOKEN', 'SSH_AUTH_SOCK')
+          })
+          if ($inheritedSensitive.Count -ne 0) {
+            exit 12
+          }
+          foreach ($ownedPath in @($UserHome, $UserTemp)) {
+            $ownerSid = (Get-Acl -LiteralPath $ownedPath).GetOwner(
+              [System.Security.Principal.SecurityIdentifier]
+            ).Value
+            if ($ownerSid -ne $tokenIdentity.User.Value) {
+              exit 13
+            }
+          }
+          [Environment]::SetEnvironmentVariable('HOME', $UserHome, 'Process')
+          [Environment]::SetEnvironmentVariable('USERPROFILE', $UserHome, 'Process')
+          [Environment]::SetEnvironmentVariable('TEMP', $UserTemp, 'Process')
+          [Environment]::SetEnvironmentVariable('TMP', $UserTemp, 'Process')
+          $buildVariables = Get-Content -LiteralPath $BuildEnvironment -Raw | ConvertFrom-Json
+          foreach ($property in $buildVariables.PSObject.Properties) {
+            if ($null -ne $property.Value) {
+              [Environment]::SetEnvironmentVariable($property.Name, [string] $property.Value, 'Process')
+            }
+          }
+          $env:PATH = "$ToolchainBin;$env:PATH"
+          $env:CARGO_HOME = $CargoHome
+          $env:CARGO_TARGET_DIR = Join-Path $SourceRoot 'target'
+          $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $CargoHome 'bin\mini-agent.exe'
+          $env:MINI_AGENT_LPAC_PROTECTED_EXE = $ProtectedExe
+          Set-Location $SourceRoot
+
+          $installLog = Join-Path $EvidenceRoot 'install.raw'
+          & $CargoExe install --locked --path . --debug --no-default-features --features js --root $CargoHome *> $installLog
+          if ($LASTEXITCODE -ne 0) {
+            exit 20
+          }
+          $probeLog = Join-Path $EvidenceRoot 'probe.raw'
+          & $CargoExe test --locked --no-default-features --features js windows_js_worker_containment -- --ignored --nocapture --test-threads=1 *> $probeLog
+          if ($LASTEXITCODE -ne 0) {
+            exit 21
+          }
+          $probeText = Get-Content -LiteralPath $probeLog -Raw
+          $expected = 'WINDOWS_CONTAINMENT_PASS backend=lpac job_close=pass nested_parent_job=pass protocol=pass'
+          if (-not $probeText.Contains($expected)) {
+            exit 22
+          }
+          Remove-Item -LiteralPath $installLog, $probeLog -Force
+          @{
+            schema_version = 1
+            platform = 'windows'
+            account = 'separate-local-standard-user'
+            administrator = $false
+            environment = 'new-allowlisted-non-admin'
+            install = 'cargo-debug-js'
+            containment_probe = 'passed'
+            protected_control = 'system-owned-read-execute-only'
+            raw_output = $false
+          } | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $EvidenceRoot 'phase6-standard-user-evidence.json')
+          'PHASE6_STANDARD_USER platform=windows account=non-admin environment=allowlisted install=cargo-debug-js probe=passed raw_output=false' |
+            Set-Content (Join-Path $EvidenceRoot 'phase6-standard-user-evidence.log')
+          '@ | Set-Content -LiteralPath $probeScript -Encoding utf8
+
+          function Quote-Argument([string] $Value) {
+            return '"' + $Value.Replace('"', '\"') + '"'
+          }
+          $arguments = @(
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            (Quote-Argument $probeScript),
+            '-CargoExe',
+            (Quote-Argument $toolchainCargo),
+            '-ToolchainBin',
+            (Quote-Argument $toolchainBin),
+            '-SourceRoot',
+            (Quote-Argument $sourceRoot),
+            '-CargoHome',
+            (Quote-Argument $cargoHome),
+            '-ProtectedExe',
+            (Quote-Argument $protected),
+            '-EvidenceRoot',
+            (Quote-Argument $evidenceRoot),
+            '-BuildEnvironment',
+            (Quote-Argument $buildEnvironment),
+            '-ExpectedAccount',
+            (Quote-Argument "$env:COMPUTERNAME\$userName"),
+            '-UserHome',
+            (Quote-Argument $userHome),
+            '-UserTemp',
+            (Quote-Argument $userTemp)
+          ) -join ' '
+          $credential = [System.Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$userName", $password)
+          $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $standardRoot -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "standard-user containment gate failed closed with exit code $($process.ExitCode)"
+          }
+          Copy-Item -LiteralPath (Join-Path $evidenceRoot 'phase6-standard-user-evidence.json') -Destination .
+          Copy-Item -LiteralPath (Join-Path $evidenceRoot 'phase6-standard-user-evidence.log') -Destination .
+          'PHASE6_STANDARD_USER=passed' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run Phase 6 adversarial suites under js and skills
+        shell: pwsh
+        run: |
+          cargo test --locked --no-default-features --features js
+          if ($LASTEXITCODE -ne 0) {
+            throw "js adversarial suite failed with exit code $LASTEXITCODE"
+          }
+          cargo test --locked --no-default-features --features skills
+          if ($LASTEXITCODE -ne 0) {
+            throw "skills adversarial suite failed with exit code $LASTEXITCODE"
+          }
+          'PHASE6_ADVERSARIAL=passed' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify installed binary status is callable
         shell: pwsh
@@ -381,6 +927,114 @@ jobs:
           path: |
             windows-worker-containment.txt
             windows-installed-print-config.txt
+          if-no-files-found: error
+
+      - name: Write source-free Phase 6 gate evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $probe = if ($env:PHASE6_REAL_PROBE) { $env:PHASE6_REAL_PROBE } else { 'not-run' }
+          $adversarial = if ($env:PHASE6_ADVERSARIAL) { $env:PHASE6_ADVERSARIAL } else { 'not-run' }
+          $standardUser = if ($env:PHASE6_STANDARD_USER) { $env:PHASE6_STANDARD_USER } else { 'not-run' }
+          $resource = if ($env:PHASE6_RESOURCE) { $env:PHASE6_RESOURCE } else { 'not-run' }
+          @{
+            schema_version = 1
+            platform = 'windows'
+            runner = 'windows-latest'
+            result = '${{ job.status }}'
+            containment = @{
+              backend = 'windows-lpac'
+              assurance = 'enforced'
+              real_probe = $probe
+              standard_user_probe = $standardUser
+              resource_measurement = $resource
+              native_resource_gate = 'job-limits-probed'
+            }
+            adversarial = @{
+              feature_rows = @('js', 'skills')
+              suites = $adversarial
+              zero_test_guard = 'enforced'
+            }
+            raw_output = $false
+          } | ConvertTo-Json -Depth 4 | Set-Content 'phase6-gate-evidence.json'
+          "PHASE6_GATE platform=windows result=${{ job.status }} probe=$probe suites=$adversarial raw_output=false" |
+            Set-Content 'phase6-gate-evidence.log'
+
+      - name: Archive source-free Phase 6 gate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phase6-worker-gate-windows
+          path: |
+            phase6-gate-evidence.json
+            phase6-gate-evidence.log
+            phase6-standard-user-evidence.json
+            phase6-standard-user-evidence.log
+          if-no-files-found: error
+
+      - name: Remove the temporary Phase 6 standard-user account
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-LocalUser -Name 'phase6ci' -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name 'phase6ci'
+          }
+
+  phase6-cross-platform-gate:
+    if: always() && github.event_name != 'schedule'
+    needs:
+      - linux-sandbox-policy
+      - macos-worker-containment-gate
+      - windows-worker-containment-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every Phase 6 platform gate
+        shell: bash
+        env:
+          LINUX_RESULT: ${{ needs.linux-sandbox-policy.result }}
+          MACOS_RESULT: ${{ needs.macos-worker-containment-gate.result }}
+          WINDOWS_RESULT: ${{ needs.windows-worker-containment-gate.result }}
+        run: |
+          for result in "$LINUX_RESULT" "$MACOS_RESULT" "$WINDOWS_RESULT"; do
+            if [ "$result" != 'success' ]; then
+              echo 'A required Phase 6 platform gate did not succeed' >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Download all Phase 6 worker resource records
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: js-worker-resource-*
+          path: ${{ runner.temp }}/js-worker-resources
+          merge-multiple: true
+
+      - name: Require one named resource record from every platform
+        shell: bash
+        run: |
+          test -f "${RUNNER_TEMP}/js-worker-resources/js-worker-Linux.json"
+          test -f "${RUNNER_TEMP}/js-worker-resources/js-worker-macOS.json"
+          test -f "${RUNNER_TEMP}/js-worker-resources/js-worker-Windows.json"
+
+      - name: Validate and aggregate the cross-platform worker resource baseline
+        shell: bash
+        run: |
+          MINI_AGENT_JS_WORKER_BENCH_INPUTS="${RUNNER_TEMP}/js-worker-resources/js-worker-Linux.json:${RUNNER_TEMP}/js-worker-resources/js-worker-macOS.json:${RUNNER_TEMP}/js-worker-resources/js-worker-Windows.json" \
+          MINI_AGENT_JS_WORKER_BENCH_OUTPUT="${RUNNER_TEMP}/js-worker-baseline.json" \
+            cargo test --locked --no-default-features --features js \
+              js_worker_resource_aggregate -- --ignored --nocapture
+
+      - name: Archive the validated cross-platform worker resource baseline
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: js-worker-resource-baseline
+          path: ${{ runner.temp }}/js-worker-baseline.json
           if-no-files-found: error
 
   platform-paths:
