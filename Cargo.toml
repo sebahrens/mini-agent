@@ -110,7 +110,7 @@ http = "1"
 agent-client-protocol = { version = "1.0.1", optional = true }
 blocking = { version = "1", optional = true }
 lsp-types = { version = "0.97", optional = true }
-rquickjs = { version = "0.12", features = ["full"], optional = true }
+rquickjs = { version = "0.12", default-features = false, features = ["std"], optional = true }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 matrixmultiply = { version = "0.3.11", optional = true, features = ["threading"] }

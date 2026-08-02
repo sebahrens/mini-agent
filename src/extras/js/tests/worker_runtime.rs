@@ -263,6 +263,34 @@ fn worker_runtime_fresh_steps_cover_values_promises_console_and_absent_authority
 }
 
 #[test]
+fn worker_runtime_rejects_module_loading_and_recovers() {
+    let results = run_steps(
+        &[
+            "import('file:///tmp/mini-agent-no-loader.js')",
+            "40 + 2",
+            "import('file:///tmp/mini-agent-native-loader.so')",
+            "40 + 2",
+            "import value from 'file:///tmp/mini-agent-no-loader.js'; value",
+            "40 + 2",
+        ],
+        10_000,
+        10_000,
+    );
+
+    for index in [0, 2, 4] {
+        assert_closed_error(
+            &results[index],
+            JsErrorCode::Exception,
+            DiagnosticClass::Exception,
+            DiagnosticStage::Evaluation,
+        );
+    }
+    for index in [1, 3, 5] {
+        assert_eq!(results[index].outcome, StepOutcome::Value("42".into()));
+    }
+}
+
+#[test]
 fn worker_runtime_redacts_syntax_throw_rejection_and_stack_then_recovers() {
     const SECRET: &str = "A08_EXCEPTION_SECRET_MUST_NOT_LEAK";
     let results = run_steps(

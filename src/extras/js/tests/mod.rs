@@ -539,6 +539,55 @@ async fn js_outcome_mapping() {
 }
 
 #[tokio::test]
+async fn runtime_has_no_require_or_dynamic_module_loader() {
+    use std::time::Duration;
+
+    use crate::extras::js::engine::run_step_for_test;
+    use crate::extras::js::tool::PermissionBridgeOwner;
+
+    let sandbox = Sandbox::new(false, "bwrap");
+    let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+    let bridge = owner.bridge();
+    let runtime = tokio::runtime::Handle::current();
+    let allow_config = AllowConfig::unrestricted(&std::env::current_dir().unwrap());
+    let run = |code: &str| {
+        run_step_for_test(
+            code,
+            &sandbox,
+            &bridge,
+            &PermCancellation::new(),
+            &runtime,
+            &allow_config,
+            Duration::from_secs(2),
+            10_000,
+        )
+    };
+
+    assert_eq!(
+        run("typeof require"),
+        JsOutcome::Value("undefined".to_string())
+    );
+    for dynamic_import in [
+        "import('file:///tmp/mini-agent-no-loader.js')",
+        "import('file:///tmp/mini-agent-native-loader.so')",
+    ] {
+        assert!(
+            matches!(run(dynamic_import), JsOutcome::Error(_)),
+            "dynamic import unexpectedly resolved without a configured loader"
+        );
+    }
+    assert!(
+        matches!(
+            run("import value from 'file:///tmp/mini-agent-no-loader.js'; value"),
+            JsOutcome::Error(_)
+        ),
+        "an import declaration entered the script-only evaluation path"
+    );
+
+    owner.shutdown();
+}
+
+#[tokio::test]
 async fn test_js_reply_receiver_drop_is_non_fatal() {
     use std::sync::mpsc;
     use std::time::Duration;
