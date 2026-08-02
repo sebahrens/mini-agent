@@ -58,6 +58,7 @@ mod skill_targeted_feedback;
 mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
+mod worker_broker;
 #[cfg(target_os = "macos")]
 mod worker_containment;
 mod worker_protocol;
