@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -9,6 +10,7 @@ use std::fs::File;
 
 const MARKER: &str = "MINI_AGENT_INTERNAL_JS_WORKER";
 const MARKER_VALUE: &str = "brokered-v1";
+static WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 const BUILD_ID: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "+",
@@ -55,6 +57,12 @@ fn worker_command(marker: &str) -> Command {
     command
 }
 
+fn serial_worker_test() -> MutexGuard<'static, ()> {
+    WORKER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn wait_bounded(child: &mut Child) -> ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -79,6 +87,7 @@ fn decode_single_frame(bytes: &[u8]) -> serde_json::Value {
 
 #[test]
 fn worker_bootstrap_production_main_emits_ready_from_byte_zero_before_clap_or_tokio() {
+    let _serial = serial_worker_test();
     let mut child = worker_command(MARKER_VALUE).spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
     input.write_all(&hello()).unwrap();
@@ -96,6 +105,7 @@ fn worker_bootstrap_production_main_emits_ready_from_byte_zero_before_clap_or_to
 
 #[test]
 fn worker_bootstrap_production_main_rejects_malformed_hello_without_fallthrough() {
+    let _serial = serial_worker_test();
     let mut child = worker_command(MARKER_VALUE).spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
     input.write_all(b"forged-worker-input").unwrap();
@@ -110,6 +120,7 @@ fn worker_bootstrap_production_main_rejects_malformed_hello_without_fallthrough(
 
 #[test]
 fn worker_bootstrap_production_main_rejects_invalid_marker_value() {
+    let _serial = serial_worker_test();
     let mut child = worker_command("forged-value").spawn().unwrap();
     drop(child.stdin.take());
 
@@ -123,6 +134,7 @@ fn worker_bootstrap_production_main_rejects_invalid_marker_value() {
 #[cfg(unix)]
 #[test]
 fn worker_bootstrap_production_main_rejects_regular_file_stdio() {
+    let _serial = serial_worker_test();
     let base = std::env::temp_dir().join(format!("mini-agent-a07-{}", std::process::id()));
     let input_path = base.with_extension("stdin");
     let output_path = base.with_extension("stdout");
@@ -153,6 +165,7 @@ fn worker_bootstrap_production_main_rejects_regular_file_stdio() {
 #[cfg(unix)]
 #[test]
 fn worker_bootstrap_production_main_rejects_null_stdout() {
+    let _serial = serial_worker_test();
     let mut command = worker_command(MARKER_VALUE);
     command.stdout(File::options().write(true).open("/dev/null").unwrap());
     let mut child = command.spawn().unwrap();
@@ -168,6 +181,7 @@ fn worker_bootstrap_production_main_rejects_null_stdout() {
 #[cfg(unix)]
 #[test]
 fn worker_bootstrap_production_main_rejects_regular_file_stderr() {
+    let _serial = serial_worker_test();
     let error_path =
         std::env::temp_dir().join(format!("mini-agent-a07-stderr-{}", std::process::id()));
     let mut command = worker_command(MARKER_VALUE);
@@ -190,6 +204,7 @@ fn worker_bootstrap_production_main_rejects_regular_file_stderr() {
 #[cfg(unix)]
 #[test]
 fn worker_bootstrap_production_main_rejects_socket_stdio() {
+    let _serial = serial_worker_test();
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
 
