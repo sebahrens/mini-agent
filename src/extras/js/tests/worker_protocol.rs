@@ -112,6 +112,18 @@ fn effect_response(sequence: u64, ordinal: u32) -> ParentWireFrame {
     )
 }
 
+fn outcome_unknown_response(sequence: u64, ordinal: u32) -> ParentWireFrame {
+    invoked(
+        sequence,
+        ParentFrame::EffectResponse(EffectResponse {
+            effect_ordinal: ordinal,
+            result: EffectResult::Error(crate::extras::js::protocol::EffectError {
+                code: crate::extras::js::protocol::EffectErrorCode::OutcomeUnknown,
+            }),
+        }),
+    )
+}
+
 #[cfg(feature = "skills")]
 fn skill_call_request(sequence: u64, request_ordinal: u32, call_ordinal: u32) -> WorkerWireFrame {
     invoked(
@@ -380,6 +392,30 @@ fn worker_protocol_run_step_complete_transition_table() {
     worker.on_receive(&shutdown).unwrap();
     assert_eq!(parent.state(), &ParentState::Closed);
     assert_eq!(worker.state(), &WorkerState::Closed);
+}
+
+#[test]
+fn worker_protocol_outcome_unknown_response_is_invocation_terminal() {
+    let mut parent = ParentProtocol::new(build());
+    let mut worker = WorkerProtocol::new(build());
+
+    parent.on_send(&hello()).unwrap();
+    worker.on_receive(&hello()).unwrap();
+    worker.on_send(&ready()).unwrap();
+    parent.on_receive(&ready()).unwrap();
+    parent.on_send(&run(2)).unwrap();
+    worker.on_receive(&run(2)).unwrap();
+    worker.on_send(&effect_request(3, 0)).unwrap();
+    parent.on_receive(&effect_request(3, 0)).unwrap();
+    parent.on_send(&outcome_unknown_response(4, 0)).unwrap();
+    worker.on_receive(&outcome_unknown_response(4, 0)).unwrap();
+
+    assert_eq!(parent.state(), &ParentState::Closed);
+    assert_eq!(worker.state(), &WorkerState::Closed);
+    assert!(matches!(
+        worker.on_send(&effect_request(5, 1)),
+        Err(ProtocolError::InvalidTransition { .. })
+    ));
 }
 
 #[cfg(feature = "skills")]

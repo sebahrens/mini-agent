@@ -982,7 +982,17 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                 transport.round_trip(request, &effect_build, &effect_invocation_id, &sequence)
             });
             match result {
-                Ok(result) => result,
+                Ok(result) => {
+                    if matches!(
+                        &result,
+                        EffectResult::Error(super::protocol::EffectError {
+                            code: EffectErrorCode::OutcomeUnknown,
+                        })
+                    ) {
+                        protocol_failed.store(true, Ordering::Release);
+                    }
+                    result
+                }
                 Err(()) => {
                     protocol_failed.store(true, Ordering::Release);
                     backend_failure()

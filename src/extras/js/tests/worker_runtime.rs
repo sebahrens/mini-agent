@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use crate::extras::js::protocol::ArtifactInput;
 use crate::extras::js::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, DiagnosticClass, DiagnosticStage,
-    EffectOperation, EffectRequest, EffectResponse, EffectResult, GrantId, InvocationId,
-    JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame, RunStep, ScriptRole,
-    StepOutcome, StepResult, VerificationCase, VerificationCaseResult, VerificationResult,
-    VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady, WorkerWireFrame,
-    read_frame, write_frame,
+    EffectError, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
+    GrantId, InvocationId, JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame,
+    RunStep, ScriptRole, StepOutcome, StepResult, VerificationCase, VerificationCaseResult,
+    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady,
+    WorkerWireFrame, read_frame, write_frame,
 };
 use crate::extras::js::supervisor::{
     EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
@@ -2205,6 +2205,72 @@ fn verification_scheduler_worker_fault_does_not_close_the_single_queue() {
     assert!(launcher.live_processes.load(Ordering::Acquire) <= 1);
 }
 
+fn verification_with_source(source: &str) -> VerifyArtifact {
+    #[cfg(feature = "skills")]
+    let artifact = crate::extras::js::skills::SkillArtifact::new(
+        source.into(),
+        "supervisor verification fault fixture".into(),
+        vec![],
+        vec![crate::extras::js::skills::SkillExport {
+            name: "answer".into(),
+            signature: "answer()".into(),
+        }],
+        vec!["true".into()],
+        crate::extras::js::skills::CapabilityManifest::pure(),
+    )
+    .unwrap();
+    #[cfg(not(feature = "skills"))]
+    let artifact = ArtifactInput {
+        artifact_id: "supervisor-fault-artifact".into(),
+        source: source.into(),
+        exports: vec!["answer".into()],
+        tests: vec!["true".into()],
+    };
+    VerifyArtifact {
+        artifact,
+        cases: vec![VerificationCase {
+            case_id: "held-out-fault".into(),
+            script: "true".into(),
+            #[cfg(feature = "skills")]
+            kind: crate::extras::js::protocol::VerificationCaseKind::HeldOut {
+                expected: crate::extras::js::protocol::VerificationExpectedValue::Boolean(true),
+                fake_files: Default::default(),
+            },
+        }],
+    }
+}
+
+fn verification_with_embedded_test(script: &str) -> VerifyArtifact {
+    #[cfg(feature = "skills")]
+    let artifact = crate::extras::js::skills::SkillArtifact::new(
+        "function answer() { return true; }".into(),
+        "supervisor verification resource fixture".into(),
+        vec![],
+        vec![crate::extras::js::skills::SkillExport {
+            name: "answer".into(),
+            signature: "answer()".into(),
+        }],
+        vec!["true".into()],
+        crate::extras::js::skills::CapabilityManifest::pure(),
+    )
+    .unwrap();
+    #[cfg(not(feature = "skills"))]
+    let artifact = ArtifactInput {
+        artifact_id: "supervisor-resource-artifact".into(),
+        source: "exports.answer = () => true".into(),
+        exports: vec!["answer".into()],
+        tests: vec!["true".into()],
+    };
+    VerifyArtifact {
+        artifact,
+        cases: vec![VerificationCase {
+            case_id: "embedded-resource".into(),
+            script: script.into(),
+            #[cfg(feature = "skills")]
+            kind: crate::extras::js::protocol::VerificationCaseKind::Embedded,
+        }],
+    }
+}
 #[tokio::test]
 async fn worker_supervisor_transport_serializes_concurrent_callers_and_orders_effects() {
     let supervisor = scripted_supervisor(0);
@@ -2275,6 +2341,72 @@ fn worker_supervisor_transport_run_and_verify_reuse_one_serialized_connection() 
         runtime.block_on(supervisor.generation_for_test()),
         Some(first_generation)
     );
+}
+
+#[test]
+fn worker_supervisor_real_verification_resource_terminal_recycles_generation() {
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        TestWorkerLauncher::internal_worker_process_with_limits(50, 10_000),
+        Duration::from_secs(2),
+    );
+    let result = supervisor
+        .verify_blocking(verification_with_embedded_test("while (true) {}"))
+        .unwrap();
+    assert!(!result.passed);
+    assert!(
+        result.cases.iter().any(|case| {
+            case.diagnostic
+                .as_ref()
+                .is_some_and(|diagnostic| diagnostic.class == DiagnosticClass::ResourceLimit)
+        }),
+        "unexpected verification result: {result:?}"
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert_eq!(runtime.block_on(supervisor.generation_for_test()), None);
+    let next = runtime
+        .block_on(supervisor.execute(
+            RunStep::new("42".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        ))
+        .unwrap();
+    assert_eq!(next.outcome, StepOutcome::Value("42".into()));
+    assert_eq!(runtime.block_on(supervisor.generation_for_test()), Some(2));
+    runtime.block_on(supervisor.shutdown_for_test()).unwrap();
+}
+
+#[test]
+fn worker_supervisor_verification_internal_terminal_recycles_generation() {
+    let supervisor = scripted_supervisor(0);
+    let result = supervisor
+        .verify_blocking(verification_with_source("__verification_internal__"))
+        .unwrap();
+    assert!(!result.passed);
+    assert!(result.cases.iter().any(|case| {
+        case.diagnostic
+            .as_ref()
+            .is_some_and(|diagnostic| diagnostic.class == DiagnosticClass::Internal)
+    }));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert_eq!(runtime.block_on(supervisor.generation_for_test()), None);
+    let next = runtime
+        .block_on(supervisor.execute(
+            RunStep::new("success".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        ))
+        .unwrap();
+    assert_eq!(next.outcome, StepOutcome::Value("success".into()));
+    assert_eq!(runtime.block_on(supervisor.generation_for_test()), Some(2));
+    runtime.block_on(supervisor.shutdown_for_test()).unwrap();
 }
 
 #[tokio::test]
@@ -2467,8 +2599,15 @@ fn run_scripted_supervisor_worker() -> ! {
         output.flush().unwrap();
         std::process::exit(72);
     }
-    let ready = WireFrame::connection(build.clone(), 1, WorkerFrame::Ready(WorkerReady {}));
-    protocol.on_send(&ready).unwrap();
+    let ready_build = if startup == "build-mismatch" {
+        BuildIdentity::new(format!("{}+{}", env!("CARGO_PKG_VERSION"), "f".repeat(64))).unwrap()
+    } else {
+        build.clone()
+    };
+    let ready = WireFrame::connection(ready_build, 1, WorkerFrame::Ready(WorkerReady {}));
+    if startup != "build-mismatch" {
+        protocol.on_send(&ready).unwrap();
+    }
     write_frame(&mut output, &ready).unwrap();
     output.flush().unwrap();
 
@@ -2480,7 +2619,37 @@ fn run_scripted_supervisor_worker() -> ! {
                 let invocation = request.invocation_id.clone().unwrap();
                 match step.code.as_str() {
                     "crash" => std::process::exit(73),
+                    "panic" => {
+                        std::panic::set_hook(Box::new(|_| {}));
+                        let _ = std::panic::catch_unwind(|| panic!("scripted worker panic"));
+                        std::process::exit(77);
+                    }
+                    "os-kill" => std::process::abort(),
+                    "abnormal-exit" => std::process::exit(76),
                     "deadline" => std::thread::park_timeout(Duration::from_secs(30)),
+                    "malformed-protocol" => {
+                        output.write_all(&[0, 0, 0, 1, b'{']).unwrap();
+                        output.flush().unwrap();
+                        std::thread::park_timeout(Duration::from_secs(30));
+                    }
+                    "protocol-fault" => {
+                        let fault = WireFrame::invocation(
+                            build.clone(),
+                            invocation.clone(),
+                            request.sequence + 1,
+                            WorkerFrame::ProtocolFault(
+                                crate::extras::js::protocol::ProtocolFault {
+                                    code:
+                                        crate::extras::js::protocol::ProtocolFaultCode::InvalidState,
+                                    stage: crate::extras::js::protocol::ProtocolStage::Invocation,
+                                },
+                            ),
+                        );
+                        protocol.on_send(&fault).unwrap();
+                        write_frame(&mut output, &fault).unwrap();
+                        output.flush().unwrap();
+                        std::thread::park_timeout(Duration::from_secs(30));
+                    }
                     "stale-response" => {
                         #[cfg(unix)]
                         {
@@ -2507,7 +2676,7 @@ fn run_scripted_supervisor_worker() -> ! {
                 let mut sequence = request.sequence + 1;
                 let effect_count = match step.code.as_str() {
                     "two-effects" => 2,
-                    "effect-pending" | "crash-pending-effect" => 1,
+                    "effect-pending" | "crash-pending-effect" | "outcome-unknown" => 1,
                     _ => 0,
                 };
                 for ordinal in 0..effect_count {
@@ -2533,20 +2702,53 @@ fn run_scripted_supervisor_worker() -> ! {
                     }
                     let response: ParentWireFrame = read_frame(&mut input).unwrap();
                     assert!(matches!(response.message, ParentFrame::EffectResponse(_)));
+                    let outcome_unknown = matches!(
+                        response.message,
+                        ParentFrame::EffectResponse(EffectResponse {
+                            result: EffectResult::Error(EffectError {
+                                code: EffectErrorCode::OutcomeUnknown,
+                            }),
+                            ..
+                        })
+                    );
                     protocol.on_receive(&response).unwrap();
                     sequence = response.sequence + 1;
+                    if outcome_unknown {
+                        break;
+                    }
                 }
-                let value = if step.code == "two-effects" {
-                    "effects-complete"
+                let outcome = if step.code == "js-error" || step.code == "outcome-unknown" {
+                    StepOutcome::Error(JsErrorCode::Exception)
+                } else if let Some(code) = step.code.strip_prefix("js-error-") {
+                    StepOutcome::Error(match code {
+                        "syntax" => JsErrorCode::Syntax,
+                        "exception" => JsErrorCode::Exception,
+                        "stack" => JsErrorCode::StackLimit,
+                        "jobs" => JsErrorCode::JobLimit,
+                        "result" => JsErrorCode::InvalidResult,
+                        "internal" => JsErrorCode::Internal,
+                        _ => std::process::exit(78),
+                    })
+                } else if step.code == "timeout-step" {
+                    StepOutcome::Timeout
+                } else if step.code == "oom-step" {
+                    StepOutcome::OutOfMemory
                 } else {
-                    "success"
+                    StepOutcome::Value(
+                        if step.code == "two-effects" {
+                            "effects-complete"
+                        } else {
+                            "success"
+                        }
+                        .into(),
+                    )
                 };
                 let terminal = WireFrame::invocation(
                     build.clone(),
                     invocation,
                     sequence,
                     WorkerFrame::StepResult(StepResult {
-                        outcome: StepOutcome::Value(value.into()),
+                        outcome,
                         console: Vec::new(),
                         diagnostic: None,
                         #[cfg(feature = "skills")]
@@ -2561,6 +2763,7 @@ fn run_scripted_supervisor_worker() -> ! {
             }
             ParentFrame::VerifyArtifact(verification) => {
                 let invocation = request.invocation_id.clone().unwrap();
+                let internal = verification.artifact.source == "__verification_internal__";
                 let mut cases = verification
                     .artifact
                     .tests
@@ -2568,8 +2771,14 @@ fn run_scripted_supervisor_worker() -> ! {
                     .enumerate()
                     .map(|(index, _)| VerificationCaseResult {
                         case_id: format!("embedded-{index}"),
-                        passed: true,
-                        diagnostic: None,
+                        passed: !internal,
+                        diagnostic: internal.then_some(crate::extras::js::protocol::Diagnostic {
+                            class: DiagnosticClass::Internal,
+                            stage: DiagnosticStage::Verification,
+                            script_role: ScriptRole::EmbeddedTest,
+                            line: None,
+                            column: None,
+                        }),
                         #[cfg(feature = "skills")]
                         transcript: Default::default(),
                     })
@@ -2580,8 +2789,16 @@ fn run_scripted_supervisor_worker() -> ! {
                         .iter()
                         .map(|case| VerificationCaseResult {
                             case_id: case.case_id.clone(),
-                            passed: true,
-                            diagnostic: None,
+                            passed: !internal,
+                            diagnostic: internal.then_some(
+                                crate::extras::js::protocol::Diagnostic {
+                                    class: DiagnosticClass::Internal,
+                                    stage: DiagnosticStage::Verification,
+                                    script_role: ScriptRole::HeldOutTest,
+                                    line: None,
+                                    column: None,
+                                },
+                            ),
                             #[cfg(feature = "skills")]
                             transcript: Default::default(),
                         }),
@@ -2591,7 +2808,7 @@ fn run_scripted_supervisor_worker() -> ! {
                     invocation,
                     request.sequence + 1,
                     WorkerFrame::VerificationResult(VerificationResult {
-                        passed: true,
+                        passed: !internal,
                         cases,
                         loader_version: 1,
                     }),

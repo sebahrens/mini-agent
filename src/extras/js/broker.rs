@@ -1705,6 +1705,14 @@ impl<S: ParentEffectService> InvocationEffectHandler for InvocationBroker<S> {
     fn handle_skill_call(&mut self, request: SkillCallRequest) -> SkillCallResponse {
         self.authorize_skill_call(request)
     }
+
+    fn finish_invocation(&mut self) {
+        self.finish();
+    }
+
+    fn recycle_invocation(&mut self) {
+        self.recycle();
+    }
 }
 
 fn attribution_matches(principal: &GrantPrincipal, advisory: &AdvisoryAttribution) -> bool {

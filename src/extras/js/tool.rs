@@ -702,6 +702,16 @@ impl JsTool {
             Ok(audit),
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_failed_audit_for_test(
+        sandbox: Sandbox,
+        allow_config: AllowConfig,
+        supervisor: Arc<JsWorkerSupervisor>,
+        error: AuditError,
+    ) -> Self {
+        Self::new_with_runtime(sandbox, None, None, allow_config, supervisor, Err(error))
+    }
 }
 
 fn shared_effect_audit() -> Result<SharedEffectAudit, AuditError> {
@@ -1510,6 +1520,32 @@ mod js_permission_bridge {
             true,
         ));
         assert_eq!(disconnected.observability_lost_for_test(), 1);
+    }
+
+    #[tokio::test]
+    async fn js_audit_unavailable_returns_exact_error_without_launching_a_worker() {
+        use rig::tool::Tool;
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::scripted_internal_worker(0),
+        ));
+        let tool = JsTool::new_with_failed_audit_for_test(
+            Sandbox::new(false, "bwrap"),
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor.clone(),
+            AuditError::Unavailable,
+        );
+
+        let error = tool
+            .call(JsArgs {
+                code: "40 + 2".into(),
+            })
+            .await
+            .expect_err("unavailable audit must fail before worker launch");
+
+        assert_eq!(error.to_string(), "JS effect audit unavailable");
+        assert_eq!(supervisor.generation_for_test().await, None);
+        assert_eq!(supervisor.active_generation_for_test().await, None);
     }
 
     #[tokio::test]

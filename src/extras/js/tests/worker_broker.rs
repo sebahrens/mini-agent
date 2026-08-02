@@ -26,17 +26,34 @@ use crate::extras::js::broker::{SkillCallAuthority, SkillExportAuthoritySpec};
 use crate::extras::js::protocol::SkillCallRequest;
 use crate::extras::js::protocol::{
     AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpHeader, HttpMethod, InvocationId,
-    SkillProposalDraft,
+    RunStep, SkillProposalDraft, StepOutcome,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod as SkillHttpMethod,
 };
-use crate::extras::js::supervisor::InvocationEffectHandler;
+use crate::extras::js::supervisor::{InvocationEffectHandler, JsWorkerSupervisor, WorkerError};
 use crate::extras::js::types::PermCancellation;
 use crate::paths::{AppPaths, EffectAuditPathOwner};
+use crate::sandbox::worker::TestWorkerLauncher;
 
 type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+struct NoEffects;
+
+impl InvocationEffectHandler for NoEffects {
+    fn handle_effect(
+        &mut self,
+        _request: EffectRequest,
+        _cancellation: PermCancellation,
+    ) -> crate::extras::js::supervisor::EffectFuture<'_> {
+        Box::pin(async {
+            EffectResult::Error(crate::extras::js::protocol::EffectError {
+                code: EffectErrorCode::Denied,
+            })
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ServiceFailures {
@@ -1458,6 +1475,77 @@ async fn worker_broker_grants_erase_authority_on_terminal_cancel_and_recycle() {
         );
         assert_eq!(record.lock().unwrap().executions, 0);
     }
+}
+
+#[tokio::test]
+async fn worker_broker_outcome_unknown_terminates_caught_javascript_before_second_dispatch() {
+    let invocation_id = invocation("inv-outcome-unknown-terminal");
+    let case = OperationCase {
+        name: "read_file",
+        operation: EffectOperation::ReadFile {
+            path: "docs/first.txt".into(),
+        },
+        capability: HostCapability::ReadFile,
+        principal: GrantPrincipal::ModelAuthored {
+            tool_call_id: "tool-call-outcome-unknown".into(),
+        },
+        advisory: AdvisoryAttribution::default(),
+    };
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let grant_id = grant.grant_id().clone();
+    let (broker, record, audit_root) = broker(
+        invocation_id.clone(),
+        vec![grant],
+        BTreeSet::from([HostCapability::ReadFile]),
+        ServiceFailures {
+            execution: Some(HostEffectError::OutcomeUnknown),
+            ..ServiceFailures::default()
+        },
+    );
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        TestWorkerLauncher::internal_worker_process_with_limits(500, 10_000),
+        Duration::from_secs(2),
+    );
+    let request = RunStep::new(
+        r#"
+        try { read_file("docs/first.txt"); } catch (_) {}
+        try { read_file("docs/second.txt"); } catch (_) {}
+        "caught"
+        "#
+        .into(),
+    )
+    .with_model_grant(grant_id);
+
+    assert_eq!(
+        supervisor
+            .execute_bound(invocation_id, request, broker, PermCancellation::new())
+            .await,
+        Err(WorkerError::EffectOutcomeUnknown)
+    );
+    let record = record.lock().unwrap().clone();
+    assert_eq!(record.execute_calls, 1);
+    assert_eq!(record.executions, 0);
+    let recovered = EffectAudit::open(audit_root.owner()).unwrap();
+    assert_eq!(recovered.records().len(), 2);
+    assert_eq!(recovered.records()[0].state, AuditState::Intent);
+    assert_eq!(recovered.records()[1].state, AuditState::OutcomeUnknown);
+    assert_eq!(supervisor.generation_for_test().await, None);
+
+    let next = supervisor
+        .execute(
+            RunStep::new("42".into()),
+            NoEffects,
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.outcome, StepOutcome::Value("42".into()));
+    assert_eq!(supervisor.generation_for_test().await, Some(2));
+    supervisor.shutdown_for_test().await.unwrap();
 }
 
 #[tokio::test]

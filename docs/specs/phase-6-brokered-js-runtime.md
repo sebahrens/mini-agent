@@ -571,6 +571,27 @@ is a protocol fault. Optional corrective metadata is limited to a source-free lo
 submitted script. It contains no filename, function name, property/key name, target, ordinal,
 effect result, or other source-derived string.
 
+Worker reuse is a parent-owned, deterministic decision. A successful value or void result and the
+explicitly allowlisted `syntax`, `exception`, and `invalid_result` JavaScript errors may leave the
+contained process warm, but the worker still creates a fresh QuickJS `Runtime` for the next
+request. Stack/job resource errors, internal errors, JavaScript timeout/OOM terminals, and
+verification results containing a `resource_limit` or `internal` diagnostic poison the process
+even though their terminal frames are well formed. A watchdog timeout, cancellation, malformed or
+invalid-state frame, build/version mismatch, stale generation, unexpected verification effect,
+transport failure, process exit/signal/panic, or shutdown fault also kills and reaps the complete
+containment tree and erases all invocation grants before another request can launch. Warm
+processes are retired after 256 completed requests or 15 minutes, whichever comes first. The age
+deadline is enforced by an independent idle-retirement timer, so the parent reaps an expired idle
+worker even when no later request arrives. Clean shutdown retires the idle process and a later
+request starts a fresh generation.
+
+An unavailable audit prevents broker construction and therefore sends no request to a worker. An
+effect whose durable completion is `outcome_unknown` immediately erases invocation authority,
+closes that invocation in both protocol state machines, and forces process recycle without retry.
+JavaScript cannot catch that error and dispatch another effect: a caught second call fails locally
+inside the closing worker and never reaches the parent broker. A29 owns the effect-specific
+cancellation and reconciliation details.
+
 If QuickJS cannot be classified without trusting exception-controlled text, the worker returns the
 generic `javascript_exception` or `promise_rejection` code. Arbitrary exception `name`, message,
 stack, thrown value, source line/snippet, cause, aggregate members, effect result, console-derived
