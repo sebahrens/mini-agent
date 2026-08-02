@@ -210,6 +210,7 @@ pub(crate) type WorkerWireFrame = WireFrame<WorkerFrame>;
 )]
 pub(crate) enum ParentFrame {
     Hello(ParentHello),
+    ContainmentProbe(ContainmentProbe),
     RunStep(RunStep),
     VerifyArtifact(VerifyArtifact),
     EffectResponse(EffectResponse),
@@ -227,6 +228,7 @@ pub(crate) enum ParentFrame {
 )]
 pub(crate) enum WorkerFrame {
     Ready(WorkerReady),
+    ContainmentAttested(ContainmentAttestation),
     EffectRequest(EffectRequest),
     #[cfg(feature = "skills")]
     SkillCallRequest(SkillCallRequest),
@@ -242,6 +244,20 @@ pub(crate) struct ParentHello {}
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkerReady {}
+
+/// Closed request used only by the Windows production runtime preflight.
+///
+/// The worker returns no observations. It emits [`ContainmentAttestation::Passed`] only after
+/// its own LPAC token, capability set, protocol handles, and console boundary all match policy.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContainmentProbe {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContainmentAttestation {
+    Passed,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -855,6 +871,7 @@ enum InvocationKind {
 pub(crate) enum ParentState {
     AwaitReady,
     Idle,
+    AwaitContainmentAttestation,
     AwaitWorker {
         invocation: InvocationId,
         next_effect: u32,
@@ -878,6 +895,7 @@ pub(crate) enum ParentState {
 pub(crate) enum WorkerState {
     AwaitHello,
     Idle,
+    AttestingContainment,
     Running {
         invocation: InvocationId,
         next_effect: u32,
@@ -992,6 +1010,10 @@ impl ParentProtocol {
                     next_skill_call: 0,
                 })
             }
+            (ParentState::Idle, ParentFrame::ContainmentProbe(_)) => {
+                require_connection(frame)?;
+                Some(ParentState::AwaitContainmentAttestation)
+            }
             (ParentState::Idle, ParentFrame::VerifyArtifact(_)) => {
                 let invocation = require_invocation(frame)?.clone();
                 self.active_kind = Some(InvocationKind::VerifyArtifact);
@@ -1057,6 +1079,13 @@ impl ParentProtocol {
         self.validate_header(frame)?;
         let transition = match (&self.state, &frame.message) {
             (ParentState::AwaitReady, WorkerFrame::Ready(_)) if self.hello_sent => {
+                require_connection(frame)?;
+                Some(ParentState::Idle)
+            }
+            (
+                ParentState::AwaitContainmentAttestation,
+                WorkerFrame::ContainmentAttested(ContainmentAttestation::Passed),
+            ) => {
                 require_connection(frame)?;
                 Some(ParentState::Idle)
             }
@@ -1206,6 +1235,10 @@ impl WorkerProtocol {
                     next_skill_call: 0,
                 })
             }
+            (WorkerState::Idle, ParentFrame::ContainmentProbe(_)) => {
+                require_connection(frame)?;
+                Some(WorkerState::AttestingContainment)
+            }
             (WorkerState::Idle, ParentFrame::VerifyArtifact(_)) => {
                 let invocation = require_invocation(frame)?.clone();
                 self.active_kind = Some(InvocationKind::VerifyArtifact);
@@ -1269,6 +1302,13 @@ impl WorkerProtocol {
         self.validate_header(frame)?;
         let transition = match (&self.state, &frame.message) {
             (WorkerState::AwaitHello, WorkerFrame::Ready(_)) if self.hello_received => {
+                require_connection(frame)?;
+                Some(WorkerState::Idle)
+            }
+            (
+                WorkerState::AttestingContainment,
+                WorkerFrame::ContainmentAttested(ContainmentAttestation::Passed),
+            ) => {
                 require_connection(frame)?;
                 Some(WorkerState::Idle)
             }
@@ -1481,7 +1521,9 @@ impl ActiveInvocation for ParentState {
             | Self::AwaitEffectResponseSent { invocation, .. } => Some(invocation),
             #[cfg(feature = "skills")]
             Self::AwaitSkillCallResponseSent { invocation, .. } => Some(invocation),
-            Self::AwaitReady | Self::Idle | Self::Closed => None,
+            Self::AwaitReady | Self::Idle | Self::AwaitContainmentAttestation | Self::Closed => {
+                None
+            }
         }
     }
 }
@@ -1494,7 +1536,7 @@ impl ActiveInvocation for WorkerState {
             }
             #[cfg(feature = "skills")]
             Self::AwaitParentSkillCall { invocation, .. } => Some(invocation),
-            Self::AwaitHello | Self::Idle | Self::Closed => None,
+            Self::AwaitHello | Self::Idle | Self::AttestingContainment | Self::Closed => None,
         }
     }
 }
@@ -1503,6 +1545,7 @@ fn parent_state_name(state: &ParentState) -> &'static str {
     match state {
         ParentState::AwaitReady => "await_ready",
         ParentState::Idle => "idle",
+        ParentState::AwaitContainmentAttestation => "await_containment_attestation",
         ParentState::AwaitWorker { .. } => "await_worker",
         ParentState::AwaitEffectResponseSent { .. } => "await_effect_response_sent",
         #[cfg(feature = "skills")]
@@ -1515,6 +1558,7 @@ fn worker_state_name(state: &WorkerState) -> &'static str {
     match state {
         WorkerState::AwaitHello => "await_hello",
         WorkerState::Idle => "idle",
+        WorkerState::AttestingContainment => "attesting_containment",
         WorkerState::Running { .. } => "running",
         WorkerState::AwaitParentEffect { .. } => "await_parent_effect",
         #[cfg(feature = "skills")]
@@ -1526,6 +1570,7 @@ fn worker_state_name(state: &WorkerState) -> &'static str {
 fn parent_message_name(message: &ParentFrame) -> &'static str {
     match message {
         ParentFrame::Hello(_) => "hello",
+        ParentFrame::ContainmentProbe(_) => "containment_probe",
         ParentFrame::RunStep(_) => "run_step",
         ParentFrame::VerifyArtifact(_) => "verify_artifact",
         ParentFrame::EffectResponse(_) => "effect_response",
@@ -1538,6 +1583,7 @@ fn parent_message_name(message: &ParentFrame) -> &'static str {
 fn worker_message_name(message: &WorkerFrame) -> &'static str {
     match message {
         WorkerFrame::Ready(_) => "ready",
+        WorkerFrame::ContainmentAttested(_) => "containment_attested",
         WorkerFrame::EffectRequest(_) => "effect_request",
         #[cfg(feature = "skills")]
         WorkerFrame::SkillCallRequest(_) => "skill_call_request",

@@ -136,6 +136,8 @@ jobs:
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ''
 
       - name: Install bubblewrap
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
@@ -284,6 +286,8 @@ jobs:
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ''
 
       - name: Reject a missing macOS Seatbelt blocker probe
         shell: bash
@@ -406,6 +410,8 @@ jobs:
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ''
 
       - name: Verify exact Windows production launcher test discovery
         shell: pwsh
@@ -422,14 +428,14 @@ jobs:
               Sort-Object
           )
           $expected = @(
-            'extras::js::tests::worker_runtime::windows_production_supervisor_rejects_until_runtime_probe_passes: test'
+            'extras::js::tests::worker_runtime::windows_production_supervisor_rejects_nonproduction_test_image: test'
             'sandbox::worker::platform::tests::windows_production_failure_child: test'
             'sandbox::worker::platform::tests::windows_production_failure_injection_closes_raii_handles_and_reaps_children: test'
             'sandbox::worker::platform::tests::windows_production_creation_boundary_excludes_ordinary_piped_child: test'
             'sandbox::worker::platform::tests::windows_production_inheriting_process_lock_serializes_launch_windows: test'
-            'sandbox::worker::platform::tests::windows_production_launch_returns_typed_unavailable_without_child: test'
+            'sandbox::worker::platform::tests::windows_production_launch_uses_cached_unavailable_without_second_child: test'
             'sandbox::worker::platform::tests::windows_production_policy_has_required_limits_and_compatible_mitigations: test'
-            'sandbox::worker::platform::tests::windows_production_status_waits_for_runtime_containment_probe: test'
+            'sandbox::worker::platform::tests::windows_production_status_fails_closed_for_nonproduction_test_image: test'
             'sandbox::worker::tests::windows_production_launcher_source_keeps_creation_time_authority_closed: test'
           ) | Sort-Object
           if ($actual.Count -eq 0) {
@@ -454,6 +460,8 @@ jobs:
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ''
 
       - name: Install the exact JS binary beneath a Unicode path with spaces
         shell: pwsh
@@ -829,6 +837,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit 20
           }
+          $installedBinary = Join-Path $CargoHome 'bin\mini-agent.exe'
+          $statusText = & $installedBinary --print-config 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0 -or -not $statusText) {
+            exit 23
+          }
+          $requiredStatus = [ordered]@{
+            compiled = '(?m)^  compiled[^\S\r\n]+true\r?$'
+            backend = '(?m)^  backend[^\S\r\n]+windows-lpac\r?$'
+            status = '(?m)^  status[^\S\r\n]+available\r?$'
+            assurance = '(?m)^  assurance[^\S\r\n]+enforced\r?$'
+            launch = '(?m)^  worker launch[^\S\r\n]+enabled with validated containment\r?$'
+            processes = '(?m)^  native process limit[^\S\r\n]+1 worker process\r?$'
+            memory = '(?m)^  native memory limit[^\S\r\n]+256 MiB\r?$'
+            cpu = '(?m)^  native CPU limit[^\S\r\n]+35 seconds\r?$'
+            spawn = '(?m)^  parent-brokered spawn[^\S\r\n]+disabled on Windows\r?$'
+          }
+          foreach ($entry in $requiredStatus.GetEnumerator()) {
+            if ($statusText -notmatch $entry.Value) {
+              exit 24
+            }
+          }
           $probeLog = Join-Path $EvidenceRoot 'probe.raw'
           & $CargoExe test --locked --no-default-features --features js windows_js_worker_containment -- --ignored --nocapture --test-threads=1 *> $probeLog
           if ($LASTEXITCODE -ne 0) {
@@ -847,6 +876,7 @@ jobs:
             administrator = $false
             environment = 'new-allowlisted-non-admin'
             install = 'cargo-debug-js'
+            public_cached_status = 'available-enforced'
             containment_probe = 'passed'
             protected_control = 'system-owned-read-execute-only'
             raw_output = $false
@@ -909,7 +939,7 @@ jobs:
           }
           'PHASE6_ADVERSARIAL=passed' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Verify installed binary status is callable
+      - name: Verify installed binary reports validated Windows containment
         shell: pwsh
         run: |
           & $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE --print-config 2>&1 | Tee-Object -FilePath windows-installed-print-config.txt
@@ -918,6 +948,23 @@ jobs:
           }
           if ((Get-Item -LiteralPath windows-installed-print-config.txt).Length -eq 0) {
             throw 'installed --print-config emitted no evidence'
+          }
+          $evidence = Get-Content -LiteralPath windows-installed-print-config.txt -Raw
+          $required = [ordered]@{
+            compiled = '(?m)^  compiled[^\S\r\n]+true\r?$'
+            backend = '(?m)^  backend[^\S\r\n]+windows-lpac\r?$'
+            status = '(?m)^  status[^\S\r\n]+available\r?$'
+            assurance = '(?m)^  assurance[^\S\r\n]+enforced\r?$'
+            launch = '(?m)^  worker launch[^\S\r\n]+enabled with validated containment\r?$'
+            processes = '(?m)^  native process limit[^\S\r\n]+1 worker process\r?$'
+            memory = '(?m)^  native memory limit[^\S\r\n]+256 MiB\r?$'
+            cpu = '(?m)^  native CPU limit[^\S\r\n]+35 seconds\r?$'
+            spawn = '(?m)^  parent-brokered spawn[^\S\r\n]+disabled on Windows\r?$'
+          }
+          foreach ($entry in $required.GetEnumerator()) {
+            if ($evidence -notmatch $entry.Value) {
+              throw "installed --print-config lacks validated Windows worker $($entry.Key) evidence"
+            }
           }
 
       - name: Archive Windows containment evidence
@@ -1007,6 +1054,8 @@ jobs:
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ''
 
       - name: Download all Phase 6 worker resource records
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

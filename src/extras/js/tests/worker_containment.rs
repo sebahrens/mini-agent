@@ -248,6 +248,16 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
     for required in [
         "run_containment_probe",
         "run_containment_child_probe",
+        "ParentFrame::ContainmentProbe(ContainmentProbe {})",
+        "WorkerFrame::ContainmentAttested(ContainmentAttestation::Passed)",
+        "child_token_is_zero_capability_lpac().unwrap_or(false)",
+        "exact_protocol_std_handles()",
+        "no_console_devices()",
+        "ProcessChildProcessPolicy",
+        "PROCESS_MITIGATION_CHILD_PROCESS_POLICY",
+        "run_runtime_preflight_owned",
+        "mini-agent-windows-preflight",
+        "recv_timeout(remaining)",
         "WINDOWS_CONTAINMENT_PASS backend=lpac job_close=pass nested_parent_job=pass protocol=pass",
         "workspace_read_denied",
         "workspace_write_denied",
@@ -281,6 +291,35 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
             "missing Windows real-containment evidence: {required}"
         );
     }
+}
+
+#[test]
+fn windows_preflight_deadline_dominates_creation_lock_and_process_launch() {
+    let source = include_str!("../../../sandbox/worker/windows.rs");
+    let launch = source
+        .split("pub(super) fn launch_production")
+        .nth(1)
+        .and_then(|tail| tail.split("enum RuntimePreflightTarget").next())
+        .expect("production Windows launch source must remain inspectable");
+    let creation_lock = launch
+        .find("crate::process_creation::creation_guard()?")
+        .expect("production launch must acquire the shared creation lock");
+    let post_lock_deadline = launch[creation_lock..]
+        .find("hooks.require_before_deadline()?")
+        .map(|offset| creation_lock + offset)
+        .expect("production launch must recheck its deadline after waiting for the lock");
+    let create_process = launch
+        .find("CreateProcessW(")
+        .expect("production launch must retain the reviewed CreateProcessW boundary");
+    let pre_create_deadline = launch[..create_process]
+        .rfind("hooks.require_before_deadline()?")
+        .expect("production launch must check its deadline immediately before CreateProcessW");
+
+    assert!(creation_lock < post_lock_deadline);
+    assert!(post_lock_deadline < pre_create_deadline);
+    assert!(pre_create_deadline < create_process);
+    assert!(source.contains(".with_deadline(deadline)"));
+    assert!(source.contains("CreateProcessW itself is not cancellable"));
 }
 
 #[cfg(target_os = "windows")]

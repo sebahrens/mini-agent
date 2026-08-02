@@ -919,6 +919,22 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
             ParentFrame::VerifyArtifact(request) => {
                 WorkerFrame::VerificationResult(execute_verification(request, limits))
             }
+            ParentFrame::ContainmentProbe(probe) => {
+                #[cfg(target_os = "windows")]
+                {
+                    if !crate::sandbox::worker::attest_windows_containment(&probe) {
+                        return Err(());
+                    }
+                    WorkerFrame::ContainmentAttested(
+                        super::protocol::ContainmentAttestation::Passed,
+                    )
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = probe;
+                    return Err(());
+                }
+            }
             ParentFrame::Shutdown => return Ok(()),
             ParentFrame::Hello(_) | ParentFrame::EffectResponse(_) => return Err(()),
             #[cfg(feature = "skills")]

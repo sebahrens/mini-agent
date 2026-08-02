@@ -11,9 +11,14 @@ CI records Linux, macOS, and Windows. An empty `platform_evidence` array and
 results. A platform whose production containment is unavailable emits a status-only
 `containment_unavailable` record with closed backend, assurance, and reason code. It contains no
 latency, memory, or count fields and does not satisfy a resource target. In the current design,
-macOS is unavailable due the reusable-exec Seatbelt blocker and Windows remains unavailable until
-its runtime containment gate can authorize production launch; only Linux can currently produce a
-measured baseline.
+macOS is unavailable due the reusable-exec Seatbelt blocker. Windows can produce a measured
+baseline only after the configured installed executable independently passes the same runtime LPAC
+child attestation, Job/resource/mitigation/child-process-policy checks, authenticated protocol, and
+clean-shutdown preflight as production status. The caller wait starts before launch preparation;
+the propagated deadline prevents a creation-lock wait that finishes late from starting a process.
+Because synchronous `CreateProcessW` is not cancellable, a result that returns late remains owned
+by the helper until teardown rather than implying a hard bound on the worker's complete lifetime.
+The benchmark's executable-specific cache is test-only and cannot alter production availability.
 
 ## Reference method
 

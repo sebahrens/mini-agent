@@ -57,6 +57,17 @@ fn ready() -> WorkerWireFrame {
     connection(1, WorkerFrame::Ready(WorkerReady {}))
 }
 
+fn containment_probe(sequence: u64) -> ParentWireFrame {
+    connection(sequence, ParentFrame::ContainmentProbe(ContainmentProbe {}))
+}
+
+fn containment_attested(sequence: u64) -> WorkerWireFrame {
+    connection(
+        sequence,
+        WorkerFrame::ContainmentAttested(ContainmentAttestation::Passed),
+    )
+}
+
 fn run(sequence: u64) -> ParentWireFrame {
     invoked(
         sequence,
@@ -392,6 +403,31 @@ fn worker_protocol_run_step_complete_transition_table() {
     worker.on_receive(&shutdown).unwrap();
     assert_eq!(parent.state(), &ParentState::Closed);
     assert_eq!(worker.state(), &WorkerState::Closed);
+}
+
+#[test]
+fn worker_protocol_containment_attestation_is_closed_and_connection_scoped() {
+    let mut parent = ParentProtocol::new(build());
+    let mut worker = WorkerProtocol::new(build());
+
+    parent.on_send(&hello()).unwrap();
+    worker.on_receive(&hello()).unwrap();
+    worker.on_send(&ready()).unwrap();
+    parent.on_receive(&ready()).unwrap();
+    parent.on_send(&containment_probe(2)).unwrap();
+    worker.on_receive(&containment_probe(2)).unwrap();
+    assert_eq!(parent.state(), &ParentState::AwaitContainmentAttestation);
+    assert_eq!(worker.state(), &WorkerState::AttestingContainment);
+    worker.on_send(&containment_attested(3)).unwrap();
+    parent.on_receive(&containment_attested(3)).unwrap();
+    assert_eq!(parent.state(), &ParentState::Idle);
+    assert_eq!(worker.state(), &WorkerState::Idle);
+
+    let invoked_probe = invoked(4, ParentFrame::ContainmentProbe(ContainmentProbe {}));
+    assert!(matches!(
+        parent.on_send(&invoked_probe),
+        Err(ProtocolError::UnexpectedInvocation)
+    ));
 }
 
 #[test]

@@ -1648,7 +1648,9 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     },
                 );
             }
-            WorkerFrame::Ready(_) => return Err(WorkerError::Protocol),
+            WorkerFrame::Ready(_) | WorkerFrame::ContainmentAttested(_) => {
+                return Err(WorkerError::Protocol);
+            }
         }
     }
 }

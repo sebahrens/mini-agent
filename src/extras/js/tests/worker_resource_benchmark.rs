@@ -19,8 +19,8 @@ use crate::extras::js::supervisor::{
 };
 use crate::extras::js::types::PermCancellation;
 use crate::sandbox::worker::{
-    BenchmarkWorkerLauncher, ProductionWorkerLauncher, TestWorkerLauncher,
-    WorkerContainmentAssurance, WorkerContainmentStatus, WorkerLauncher,
+    BenchmarkWorkerLauncher, TestWorkerLauncher, WorkerContainmentAssurance,
+    WorkerContainmentStatus, WorkerLauncher,
 };
 
 const WARMUPS: usize = 10;
@@ -746,9 +746,9 @@ fn benchmark_report_template() -> BenchmarkReport {
     }
 }
 
-fn production_supervisor(executable: PathBuf) -> Arc<JsWorkerSupervisor> {
+fn production_supervisor(launcher: BenchmarkWorkerLauncher) -> Arc<JsWorkerSupervisor> {
     Arc::new(JsWorkerSupervisor::with_production_launcher_for_benchmark(
-        BenchmarkWorkerLauncher::new(executable),
+        launcher,
     ))
 }
 
@@ -950,6 +950,7 @@ async fn cancel_and_recover(supervisor: Arc<JsWorkerSupervisor>) -> Result<(), W
 
 async fn run_production_benchmark(
     worker_executable: PathBuf,
+    launcher: BenchmarkWorkerLauncher,
     backend: String,
     assurance: String,
 ) -> Result<BenchmarkRun, Box<dyn std::error::Error>> {
@@ -961,7 +962,7 @@ async fn run_production_benchmark(
     let mut process_counts = ProcessCountAccumulator::default();
     let mut cold = Vec::with_capacity(SAMPLES);
     for iteration in 0..(WARMUPS + SAMPLES) {
-        let supervisor = production_supervisor(worker_executable.clone());
+        let supervisor = production_supervisor(launcher.clone());
         let started = Instant::now();
         supervisor.prepare_ready_for_benchmark_for_test().await?;
         let elapsed = elapsed_us(started);
@@ -973,7 +974,7 @@ async fn run_production_benchmark(
         supervisor.shutdown_for_test().await?;
     }
 
-    let supervisor = production_supervisor(worker_executable.clone());
+    let supervisor = production_supervisor(launcher);
     supervisor.prepare_ready_for_benchmark_for_test().await?;
     process_counts.observe(observe_worker_processes(&supervisor, &worker_executable).await?);
 
@@ -1362,10 +1363,13 @@ async fn js_worker_resource_benchmark() -> Result<(), Box<dyn std::error::Error>
     );
     let mut report = benchmark_report_template();
     report.evidence_state = "single_platform_record".into();
-    let evidence = match ProductionWorkerLauncher.containment_status() {
+    let worker_executable = benchmark_executable()?;
+    let launcher = BenchmarkWorkerLauncher::new(worker_executable.clone());
+    let evidence = match launcher.containment_status() {
         WorkerContainmentStatus::Available { backend, assurance } => {
             let mut run = run_production_benchmark(
-                benchmark_executable()?,
+                worker_executable,
+                launcher,
                 backend.to_string(),
                 assurance_label(assurance),
             )
