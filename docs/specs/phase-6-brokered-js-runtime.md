@@ -527,9 +527,11 @@ standard-library output helper is the one synchronous exception: because
 holds the lock while `Command::output` completes, preserving explicit stdio and builder reuse. No
 guard crosses an async suspension. Inheritable-handle owners also clear their bit during drop on
 every error path before the earlier-acquired lock guard is released. The checked subprocess
-inventory tokenizes full Rust sources and rejects multiline, UFCS, and unrecognized Windows-capable
-production terminals that bypass this boundary. Any future raw or third-party Windows launcher is
-inside the same boundary and must reuse it.
+inventory combines parsed import/local-type provenance with full-source tokens and rejects
+multiline, qualified-angle or renamed UFCS, and ambiguous Windows-capable production terminals that
+bypass this boundary. A dedicated exact multiset inventory for the creation helper itself requires
+every raw standard-library, Tokio, and RMCP terminal to remain dominated by a retained crate guard.
+Any future raw or third-party Windows launcher is inside the same boundary and must reuse it.
 
 On a standard-user Windows checkout, prepare and run the complete gate with:
 
