@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::extras::js::protocol::{
@@ -1057,6 +1057,87 @@ impl WorkerLauncher for DelayedLaunchLauncher {
     }
 }
 
+#[derive(Clone)]
+struct BlockedFirstLaunchLauncher {
+    launches: Arc<AtomicUsize>,
+    completed_launches: Arc<AtomicUsize>,
+    live_processes: Arc<AtomicUsize>,
+    max_live_processes: Arc<AtomicUsize>,
+    release_first: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl BlockedFirstLaunchLauncher {
+    fn new() -> Self {
+        Self {
+            launches: Arc::new(AtomicUsize::new(0)),
+            completed_launches: Arc::new(AtomicUsize::new(0)),
+            live_processes: Arc::new(AtomicUsize::new(0)),
+            max_live_processes: Arc::new(AtomicUsize::new(0)),
+            release_first: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    fn release_first_launch(&self) {
+        let (released, wake) = &*self.release_first;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+
+    async fn wait_for_launches(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.launches.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocked launcher was not entered");
+    }
+
+    async fn wait_for_completed_launches(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.completed_launches.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("released launcher did not return");
+    }
+
+    async fn wait_for_live_processes(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.live_processes.load(Ordering::Acquire) != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker process count did not reach its expected value");
+    }
+}
+
+impl WorkerLauncher for BlockedFirstLaunchLauncher {
+    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
+        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
+    }
+
+    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        if self.launches.fetch_add(1, Ordering::AcqRel) == 0 {
+            let (released, wake) = &*self.release_first;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+        let mut process = TestWorkerLauncher::scripted_internal_worker(0).launch()?;
+        process.observe_reap_for_test(self.live_processes.clone());
+        self.max_live_processes.fetch_max(
+            self.live_processes.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
+        self.completed_launches.fetch_add(1, Ordering::Release);
+        Ok(process)
+    }
+}
+
 struct TreeTerminationFailureLauncher {
     live_processes: Arc<AtomicUsize>,
 }
@@ -1196,6 +1277,92 @@ async fn worker_supervisor_cancellation_bounds_synchronous_launch_and_reaps_late
     );
     supervisor.shutdown_for_test().await.unwrap();
     launcher.wait_for_live_processes(0).await;
+}
+
+async fn assert_blocked_startup_does_not_accumulate_launches(repeated_call_count: usize) {
+    let launcher = BlockedFirstLaunchLauncher::new();
+    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        launcher.clone(),
+        Duration::from_millis(200),
+    ));
+
+    assert_eq!(
+        supervisor
+            .execute(
+                RunStep {
+                    code: "success".into(),
+                },
+                RecordingEffects::default(),
+                PermCancellation::new(),
+            )
+            .await,
+        Err(WorkerError::TimedOut)
+    );
+    launcher.wait_for_launches(1).await;
+
+    let repeated = (0..repeated_call_count)
+        .map(|_| {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move {
+                supervisor
+                    .execute(
+                        RunStep {
+                            code: "success".into(),
+                        },
+                        RecordingEffects::default(),
+                        PermCancellation::new(),
+                    )
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut repeated_results = Vec::new();
+    for request in repeated {
+        repeated_results.push(request.await.unwrap());
+    }
+    let launches_while_first_was_blocked = launcher.launches.load(Ordering::Acquire);
+
+    // Release and clean up before making assertions so the intentionally failing old behavior
+    // cannot strand its synchronous launch thread or any worker process in the test binary.
+    launcher.release_first_launch();
+    launcher
+        .wait_for_completed_launches(launches_while_first_was_blocked)
+        .await;
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+    let maximum_live = launcher.max_live_processes.load(Ordering::Acquire);
+
+    assert_eq!(
+        launches_while_first_was_blocked, 1,
+        "immediate callers started additional detached launch threads"
+    );
+    assert!(
+        repeated_results
+            .iter()
+            .all(|result| *result == Err(WorkerError::TimedOut)),
+        "callers waiting behind an in-flight launch did not respect their own deadlines"
+    );
+    assert!(
+        maximum_live <= 1,
+        "overlapping launches created {maximum_live} workers"
+    );
+}
+
+#[tokio::test]
+async fn worker_supervisor_immediate_next_call_waits_behind_in_flight_launch() {
+    assert_blocked_startup_does_not_accumulate_launches(1).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_repeated_calls_do_not_accumulate_in_flight_launches() {
+    assert_blocked_startup_does_not_accumulate_launches(8).await;
 }
 
 #[tokio::test]

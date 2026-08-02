@@ -68,6 +68,7 @@ pub(crate) struct JsWorkerSupervisor(Arc<SupervisorInner>);
 // BEGIN AUTHORITY-FREE SUPERVISOR STATE
 struct SupervisorInner {
     transport: tokio::sync::Mutex<SupervisorState>,
+    launch_gate: Arc<tokio::sync::Mutex<()>>,
     launcher: Arc<dyn WorkerLauncher>,
     active_generation: AtomicU64,
     accepts_test_preamble: bool,
@@ -155,6 +156,7 @@ impl JsWorkerSupervisor {
                 next_generation: 1,
                 next_invocation: 1,
             }),
+            launch_gate: Arc::new(tokio::sync::Mutex::new(())),
             launcher,
             active_generation: AtomicU64::new(0),
             accepts_test_preamble,
@@ -236,6 +238,7 @@ impl JsWorkerSupervisor {
                 let generation = allocate_counter(&mut state.next_generation)?;
                 launch_connection(
                     self.0.launcher.clone(),
+                    self.0.launch_gate.clone(),
                     generation,
                     self.0.accepts_test_preamble,
                     &cancellation,
@@ -409,12 +412,13 @@ impl InvocationEffectHandler for RejectEffects {
 
 async fn launch_connection(
     launcher: Arc<dyn WorkerLauncher>,
+    launch_gate: Arc<tokio::sync::Mutex<()>>,
     generation: u64,
     accepts_test_preamble: bool,
     cancellation: &PermCancellation,
     deadline: Instant,
 ) -> Result<WorkerConnection, WorkerError> {
-    let process = launch_process(launcher, cancellation, deadline).await?;
+    let process = launch_process(launcher, launch_gate, cancellation, deadline).await?;
     let stderr_drain = start_stderr_drain(&process)?;
     let build = BuildIdentity::current();
     let mut connection = WorkerConnection {
@@ -452,14 +456,19 @@ async fn launch_connection(
 
 async fn launch_process(
     launcher: Arc<dyn WorkerLauncher>,
+    launch_gate: Arc<tokio::sync::Mutex<()>>,
     cancellation: &PermCancellation,
     deadline: Instant,
 ) -> Result<WorkerProcess, WorkerError> {
+    // This lease belongs to the supervisor rather than one invocation. It moves through the
+    // synchronous launch and any late-result cleanup, so a timed-out caller cannot enable another
+    // OS launch while its abandoned launcher thread is still running.
+    let launch_lease = await_controlled(launch_gate.lock_owned(), cancellation, deadline).await?;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("mini-agent-js-worker-launch".into())
         .spawn(move || {
-            let delivered = LaunchDelivery::new(launcher.launch());
+            let delivered = LaunchDelivery::new(launcher.launch(), launch_lease);
             if let Err(mut rejected) = sender.send(delivered) {
                 // Cancellation, caller-future drop, or the whole-call watchdog may win while the
                 // synchronous platform launcher is still running. A process returned afterward
@@ -480,12 +489,17 @@ async fn launch_process(
 
 struct LaunchDelivery {
     result: Option<Result<WorkerProcess, WorkerLaunchError>>,
+    launch_lease: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl LaunchDelivery {
-    fn new(result: Result<WorkerProcess, WorkerLaunchError>) -> Self {
+    fn new(
+        result: Result<WorkerProcess, WorkerLaunchError>,
+        launch_lease: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Self {
         Self {
             result: Some(result),
+            launch_lease: Some(launch_lease),
         }
     }
 
@@ -497,22 +511,52 @@ impl LaunchDelivery {
         if let Some(Ok(mut process)) = self.result.take() {
             let _ = process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
         }
+        self.launch_lease.take();
     }
 }
 
 impl Drop for LaunchDelivery {
     fn drop(&mut self) {
-        let Some(Ok(mut process)) = self.result.take() else {
+        let Some(Ok(process)) = self.result.take() else {
             return;
+        };
+        let retirement = LateLaunchRetirement {
+            process: Some(process),
+            launch_lease: self.launch_lease.take(),
         };
         // If a ready channel value loses a cancellation/deadline race, dropping the receiver must
         // not run the bounded process teardown on the async executor. The cleanup thread owns the
-        // only remaining process handle and performs the same full-tree retirement.
+        // only remaining process handle and the launch lease until full-tree retirement finishes.
+        // If spawning that thread fails, dropping its closure invokes the same ordered cleanup.
         let _ = std::thread::Builder::new()
             .name("mini-agent-js-late-launch-reap".into())
             .spawn(move || {
-                let _ = process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
+                retirement.retire();
             });
+    }
+}
+
+struct LateLaunchRetirement {
+    process: Option<WorkerProcess>,
+    launch_lease: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl LateLaunchRetirement {
+    fn retire(mut self) {
+        self.retire_now();
+    }
+
+    fn retire_now(&mut self) {
+        if let Some(mut process) = self.process.take() {
+            let _ = process.terminate_and_reap(PROCESS_REAP_TIMEOUT);
+        }
+        self.launch_lease.take();
+    }
+}
+
+impl Drop for LateLaunchRetirement {
+    fn drop(&mut self) {
+        self.retire_now();
     }
 }
 

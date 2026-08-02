@@ -99,7 +99,9 @@ in-flight lease invalidates that worker connection, so the next independent requ
 new generation. One 30-second watchdog starts before lease acquisition and covers startup, IPC,
 execution, and pending parent effects. The synchronous platform launch runs outside the async
 lease task; cancellation or the watchdog can therefore win during launch, and any process returned
-afterward is killed and reaped without becoming a generation. A worker exit is observed while reads and effects are
+afterward is killed and reaped without becoming a generation. One supervisor-owned launch lease
+spans the platform call and any late-result teardown, so subsequent callers wait within their own
+deadlines without creating more launcher threads or workers. A worker exit is observed while reads and effects are
 pending, and any startup fault, malformed frame, crash, cancellation, deadline, or caller-future
 drop destroys the connection instead of attempting resynchronization. Cleanup closes/kills the
 backend-owned containment tree and reaps its root within a fixed bound; the platform
