@@ -763,7 +763,7 @@ fn install_selected_skills(
             Ok::<_, JsOutcome>(())
         })?;
 
-        let private_source = crate::extras::js::skills::private_skill_source(&artifact);
+        let private_source = crate::extras::js::skills::legacy_private_skill_source(&artifact);
         let namespace = {
             let _active = gate.enter(artifact.capability.clone());
             let namespace = context.with(|ctx| {

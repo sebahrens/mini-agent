@@ -122,7 +122,7 @@ const STRING_GATE_SOURCE: &str = r#"
 })()
 "#;
 
-const STRICT_CLONE_SOURCE: &str = r#"
+pub(super) const STRICT_CLONE_SOURCE: &str = r#"
 (() => {
     const uncurryThis = Function.prototype.bind.bind(Function.prototype.call);
     const getPrototypeOf = Object.getPrototypeOf;

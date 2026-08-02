@@ -97,7 +97,18 @@ pub const SKILL_REALM_HARDENING_JS: &str = r#"
 })()
 "#;
 
-pub(crate) fn private_skill_source(skill: &SkillArtifact) -> String {
+/// Return the immutable artifact source unchanged for evaluation as a QuickJS Script.
+///
+/// Export lookup and namespace construction are loader operations. In particular, this helper
+/// must not wrap source in a function because doing so changes Script grammar.
+pub(crate) fn private_skill_source(skill: &SkillArtifact) -> &str {
+    &skill.source
+}
+
+/// Compatibility wrapper for the Phase 3 in-process engine. The Phase 6 realm loader uses
+/// [`private_skill_source`]; A15/A21 remove the remaining compatibility callers when production
+/// registration and verification move onto the worker loader.
+pub(crate) fn legacy_private_skill_source(skill: &SkillArtifact) -> String {
     let published = skill
         .exports
         .iter()

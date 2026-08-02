@@ -251,6 +251,24 @@ establish the source-level operations required by the future loader. They do not
 contexts a native security boundary, and they do not authorize arbitrary exception text on any
 production result, wire, diagnostic, or log surface.
 
+`src/extras/js/realm.rs` is the worker-owned implementation point for this contract. Before stored
+source is evaluated it validates the full identity-v2 artifact and ABI, rejects invalid or
+colliding export names, creates a new private `Context`, captures the pristine clone/bridge
+intrinsics, and applies realm hardening. The exact stored source is evaluated as a Script, without
+a generated function wrapper that could change its grammar. Effect, proposal, and module-system
+globals are absent from the private context. The loader resolves declared bindings into its own
+null-prototype namespace with own data properties; source-created getters or Proxies never become
+the namespace boundary. Any initialization exception or queued job—including a job queued while
+extracting exports or constructing wrappers—rejects the artifact without publishing an export.
+Duplicate exports and every deterministic publication failure are rejected before the first model
+global is mutated; an engine resource failure rejects the disposable request/runtime. Exact
+declared functions are exposed to the model only through frozen, non-writable, non-configurable
+wrappers whose arguments and results travel as strict-cloned, 64-KiB-bounded JSON strings. No
+QuickJS object,
+closure, symbol, accessor, cycle, promise, or host value is a boundary value. Capability-object
+injection and promise-lifetime revocation remain a separate invocation-binding layer and may not
+weaken this pure loader contract.
+
 ## Effect audit
 
 Before every real brokered call—including `read_file`—the parent appends and durably syncs an
