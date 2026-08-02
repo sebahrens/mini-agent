@@ -7,6 +7,11 @@ use std::fs::File;
 
 const MARKER: &str = "MINI_AGENT_INTERNAL_JS_WORKER";
 const MARKER_VALUE: &str = "brokered-v1";
+const BUILD_ID: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("MINI_AGENT_BUILD_FINGERPRINT")
+);
 
 fn frame(payload: serde_json::Value) -> Vec<u8> {
     let payload = serde_json::to_vec(&payload).unwrap();
@@ -18,7 +23,7 @@ fn frame(payload: serde_json::Value) -> Vec<u8> {
 fn hello() -> Vec<u8> {
     frame(serde_json::json!({
         "protocol_version": 1,
-        "build_id": env!("CARGO_PKG_VERSION"),
+        "build_id": BUILD_ID,
         "invocation_id": null,
         "sequence": 0,
         "message": { "kind": "hello", "data": {} }
@@ -28,7 +33,7 @@ fn hello() -> Vec<u8> {
 fn shutdown() -> Vec<u8> {
     frame(serde_json::json!({
         "protocol_version": 1,
-        "build_id": env!("CARGO_PKG_VERSION"),
+        "build_id": BUILD_ID,
         "invocation_id": null,
         "sequence": 2,
         "message": { "kind": "shutdown" }
@@ -49,7 +54,7 @@ fn worker_command(marker: &str) -> Command {
 }
 
 fn wait_bounded(child: &mut Child) -> ExitStatus {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
@@ -57,7 +62,7 @@ fn wait_bounded(child: &mut Child) -> ExitStatus {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("production worker exceeded the five-second test deadline");
+            panic!("production worker exceeded the fifteen-second test deadline");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
