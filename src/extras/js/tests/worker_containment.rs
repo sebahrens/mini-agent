@@ -241,6 +241,68 @@ fn linux_worker_launcher_owns_group_teardown_and_pipe_failures() {
     assert!(source.contains("core artifact"));
 }
 
+#[test]
+fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
+    let source = include_str!("../../../sandbox/worker/windows.rs");
+
+    for required in [
+        "run_containment_probe",
+        "run_containment_child_probe",
+        "WINDOWS_CONTAINMENT_PASS backend=lpac job_close=pass nested_parent_job=pass protocol=pass",
+        "workspace_read_denied",
+        "workspace_write_denied",
+        "skill_database_read_denied",
+        "skill_database_write_denied",
+        "credential_environment_absent",
+        "network_denied",
+        "child_process_denied",
+        "unlisted_file_handle_denied",
+        "unlisted_socket_handle_denied",
+        "file_canary: Option<File>",
+        "socket_canary: Option<TcpListener>",
+        "configuration.file_canary.take()",
+        "configuration.socket_canary.take()",
+        "creation_time_job_limits_match",
+        "job_close_kills_worker",
+        "nested_parent_job",
+        "mitigation_policy_matches",
+        "ProcessDynamicCodePolicy",
+        "ProcessSystemCallDisablePolicy",
+        "run_production_protocol_round_trip",
+        "mini agent λ lpac",
+        "MINI_AGENT_LPAC_PROTECTED_EXE",
+        "ProtectedMachineWide",
+        "verify_current_user_cannot_modify",
+        "snapshot_file_security",
+        "protected machine-wide negative-control owner or DACL changed",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing Windows real-containment evidence: {required}"
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires the real Windows LPAC/AppContainer and Job backend"]
+fn windows_js_worker_containment() {
+    crate::sandbox::worker::run_windows_containment_probe()
+        .expect("Windows JS worker containment and install-location probes must pass");
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_containment_probe_child() {
+    if std::env::var_os(crate::sandbox::worker::INTERNAL_WORKER_MARKER).as_deref()
+        != Some(std::ffi::OsStr::new("windows-containment-probe-v1"))
+    {
+        return;
+    }
+    crate::sandbox::worker::run_windows_containment_child_probe()
+        .expect("contained Windows child probe must pass");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires a real trusted bubblewrap backend and Linux namespace/seccomp support"]

@@ -592,6 +592,71 @@ calling `CreateProcessW`; only the internal sacrificial-probe/test seam may call
 launcher. There is no restricted-token or unconfined fallback, and this worker boundary does not
 satisfy the separate `mini-agent-uq5c` general-command sandbox.
 
+### Windows production containment and install-location gate
+
+The A26 production launcher constructs a zero-capability LPAC process with the exact protocol
+handle list, child-process restriction, compatible mitigations, and creation-time Job limits. That
+construction is not availability evidence. Windows worker status remains unavailable until the
+ignored real-backend test `windows_js_worker_containment` passes in the same process image and
+under the same launcher path used by production.
+
+The A27 test must prove all of the following before emitting its fixed, source-free pass frame:
+
+- the child cannot read or write a workspace sentinel or a separately rooted skill-database
+  sentinel and receives none of the parent's credential environment;
+- zero-capability LPAC denies loopback TCP/UDP access and the creation-time child-process policy
+  denies a second process;
+- the three standard protocol handles are distinct anonymous pipes, while inheritable file and
+  socket canaries omitted from `HANDLE_LIST` are invalid in the child;
+- the process belongs to the exact creation-time Job, that Job reports active-process limit one,
+  256 MiB per-process memory, the reviewed CPU-time ceiling, kill-on-close, and all UI
+  restrictions, and closing it terminates and reaps the worker;
+- the effective mitigation policy contains every queryable reviewed A26 mitigation and no
+  unproved Win32k or dynamic-code prohibition. Heap-corruption termination remains a mandatory
+  creation-time policy bit, but Windows exposes no post-creation query for that legacy bit, so the
+  gate does not represent it as separately observed runtime state;
+- a complete authenticated worker protocol exchange reaches `Ready` and evaluates a trivial
+  request through a fresh runtime; and
+- creation succeeds when the test parent is already in a compatible Job; when it is not, the probe
+  first enters a private compatible outer Job. If Windows cannot apply the required nested
+  creation-time Job list, the gate fails closed and worker status remains unavailable.
+
+The install matrix uses the exact debug artifact produced by
+`cargo install --locked --path . --debug --no-default-features --features js`. Cargo installation
+and extracted-archive cases must include spaces and non-ASCII path components. Cargo-home and
+user-owned local archive locations are only supported after the full matrix passes. A copy under a
+protected machine-wide root is a mandatory negative control: the launcher must report the
+location unsupported and must not add or widen an ACL. UNC, remote, reparse, other-user-owned, and
+unknown roots remain unsupported.
+
+After an administrator has staged an unchanged negative-control copy beneath `%ProgramFiles%`, a
+standard user runs the complete A27 gate. When the test host is not already in a Job, the probe
+first assigns itself to a private compatible outer Job so the production child exercises nested
+creation-time Job assignment:
+
+```powershell
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$env:CARGO_HOME = $cargoHome
+$env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE = Join-Path $cargoHome 'bin\mini-agent.exe'
+$env:MINI_AGENT_LPAC_PROTECTED_EXE = 'C:\Program Files\mini-agent-a27-gate\mini-agent.exe'
+cargo test --locked --no-default-features --features js windows_js_worker_containment -- --ignored --nocapture --test-threads=1
+```
+
+The user running the test must not own or be able to modify the protected copy or delete it through
+its parent. The gate verifies owner and effective current-user rights, confirms that a write handle
+is access-denied, snapshots the file owner and DACL before and after the rejected preparation, and
+then exercises only private disposable copies for the supported user-owned rows.
+
+The `windows-worker-containment-gate` CI job first lists tests and requires exactly one target-gated
+`windows_js_worker_containment` test plus at least one `worker_runtime` test, so a cfg mistake or
+filter drift cannot pass by running zero tests. It installs beneath a path containing spaces and
+Unicode, prepares the protected-location negative control, runs the ignored real probe, exercises
+the worker runtime, invokes the installed binary's `--print-config`, and archives both outputs.
+That hosted-runner evidence does not replace the required standard-user run. Windows availability
+remains unverified until both `windows-latest` and a standard-user Windows installation pass; no
+restricted-token or unconfined fallback is allowed, and this gate does not satisfy the separate
+`mini-agent-uq5c` general-command sandbox.
+
 ## Failure semantics
 
 Every production failure uses a closed sanitized diagnostic contract. `class` is one of `syntax`,

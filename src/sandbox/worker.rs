@@ -68,6 +68,16 @@ pub(crate) fn run_linux_core_crash_child_probe() -> io::Result<()> {
     platform::run_core_crash_child_probe()
 }
 
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn run_windows_containment_probe() -> io::Result<()> {
+    platform::run_containment_probe()
+}
+
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn run_windows_containment_child_probe() -> io::Result<()> {
+    platform::run_containment_child_probe()
+}
+
 #[cfg(target_os = "linux")]
 #[path = "worker/linux.rs"]
 mod platform;
@@ -677,7 +687,13 @@ mod tests {
         assert!(source.contains("WorkerLaunchError::Unavailable {"));
         assert!(source.contains("crate::process_creation::creation_guard()?"));
         assert!(source.contains("Capabilities: null_mut(),\n            CapabilityCount: 0"));
-        assert!(!source.contains("AssignProcessToJobObject"));
+        assert_eq!(
+            source.matches("AssignProcessToJobObject").count(),
+            2,
+            "only the test-only compatible parent-Job probe may assign a process after creation"
+        );
+        assert!(source.contains("#[cfg(test)]\n    fn ensure_compatible_parent_job()"));
+        assert!(source.contains("AssignProcessToJobObject(job.raw(), GetCurrentProcess())"));
         assert!(!source.contains("PROC_THREAD_ATTRIBUTE_PARENT_PROCESS"));
         assert!(!source.contains("PROCESS_CREATION_MITIGATION_POLICY_WIN32K"));
         assert!(!source.contains("PROCESS_CREATION_MITIGATION_POLICY_PROHIBIT_DYNAMIC_CODE"));
