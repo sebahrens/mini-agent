@@ -96,16 +96,18 @@ fn verify_artifact(
         exports: vec!["answer".into()],
         tests: tests.clone(),
     };
+    #[cfg(feature = "skills")]
     let mut verification_cases = tests
         .into_iter()
         .enumerate()
         .map(|(index, script)| VerificationCase {
             case_id: format!("embedded-{index}"),
             script,
-            #[cfg(feature = "skills")]
             kind: crate::extras::js::protocol::VerificationCaseKind::Embedded,
         })
         .collect::<Vec<_>>();
+    #[cfg(not(feature = "skills"))]
+    let mut verification_cases = Vec::new();
     verification_cases.extend(cases.into_iter().map(|(case_id, script)| VerificationCase {
         case_id: case_id.into(),
         script: script.into(),
