@@ -172,12 +172,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/js/tool.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/tool.rs",
         "requests.spawn(async move {",
         1,
         "NON-PROCESS",
@@ -540,12 +534,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "src/extras/js/supervisor.rs",
         ".spawn(move || {",
         3,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/tool.rs",
-        ".spawn(move || {",
-        1,
         "NON-PROCESS",
     ),
     (

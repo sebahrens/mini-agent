@@ -6,6 +6,8 @@
 //! contents, model output, or environment values.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -13,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::store::{SkillStore, current_timestamp};
+use crate::extras::js::protocol::StepOutcome;
 
 pub const MAX_EVENT_BATCH: usize = 256;
 pub const MAX_ARGUMENT_SHAPE_BYTES: usize = 512;
@@ -234,6 +237,297 @@ impl EventBatch {
     }
 }
 
+/// Parent-owned metadata for one selected artifact. Worker event fields are
+/// claims only; this is the source of identity and retrieval-policy truth.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParentSkillBinding {
+    pub(crate) skill_id: String,
+    pub(crate) exports: BTreeSet<String>,
+    pub(crate) retrieval_score: f64,
+    pub(crate) retrieval_rank: u32,
+}
+
+/// Immutable per-call telemetry authority retained only by the parent.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParentTelemetryContext {
+    pub(crate) turn_id: String,
+    pub(crate) tool_call_id: String,
+    pub(crate) query_fingerprint: Option<String>,
+    pub(crate) index_generation: u64,
+    pub(crate) production: bool,
+    pub(crate) step_outcome: StepOutcome,
+    pub(crate) skills: Vec<ParentSkillBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ParentBindingError {
+    #[error("worker event shape is invalid")]
+    InvalidShape,
+    #[error("worker event kind is not execution-observable")]
+    ForbiddenKind,
+    #[error("worker event attribution does not match the parent snapshot")]
+    AttributionMismatch,
+    #[error("worker execution evidence is structurally incomplete")]
+    IncompleteEvidence,
+    #[error("parent event batch exceeds the configured bound")]
+    BatchTooLarge,
+}
+
+/// Validate untrusted worker observations and rebuild a canonical batch from
+/// parent-owned identity and policy state.
+///
+/// A selected artifact must have exactly one worker-observed injection. Every
+/// invocation must use the deterministic parent turn/tool/artifact/export
+/// mapping and have exactly one terminal observation. Selection,
+/// user-feedback, observability, and capability-policy events are parent-owned
+/// and can never be emitted by the worker.
+pub(crate) fn bind_worker_events(
+    context: &ParentTelemetryContext,
+    worker_events: &[SkillEvent],
+) -> Result<EventBatch, ParentBindingError> {
+    if worker_events.len() > MAX_EVENT_BATCH {
+        return Err(ParentBindingError::BatchTooLarge);
+    }
+
+    let selected = context
+        .skills
+        .iter()
+        .map(|skill| (skill.skill_id.as_str(), skill))
+        .collect::<BTreeMap<_, _>>();
+    if selected.len() != context.skills.len() {
+        return Err(ParentBindingError::AttributionMismatch);
+    }
+    if selected.is_empty() {
+        return if worker_events.is_empty() {
+            EventBatch::new(Vec::new()).map_err(|_| ParentBindingError::InvalidShape)
+        } else {
+            Err(ParentBindingError::AttributionMismatch)
+        };
+    }
+
+    let mut injected = BTreeSet::new();
+    let mut ordinals = BTreeMap::<(String, String), u32>::new();
+    let mut open_invocations = BTreeMap::<String, (String, String)>::new();
+    let mut canonical_worker_events = Vec::with_capacity(worker_events.len());
+    let created_at = current_timestamp().map_err(|_| ParentBindingError::InvalidShape)?;
+
+    for claim in worker_events {
+        claim
+            .validate()
+            .map_err(|_| ParentBindingError::InvalidShape)?;
+        if claim.turn_id != context.turn_id
+            || claim.tool_call_id.as_deref() != Some(context.tool_call_id.as_str())
+        {
+            return Err(ParentBindingError::AttributionMismatch);
+        }
+        let Some(binding) = selected.get(claim.skill_id.as_str()) else {
+            return Err(ParentBindingError::AttributionMismatch);
+        };
+
+        match claim.kind {
+            SkillEventKind::Injected => {
+                if claim.invocation_id.is_some()
+                    || claim.export_name.is_some()
+                    || claim.outcome.is_some()
+                    || claim.latency_us.is_some()
+                    || claim.argument_shape.is_some()
+                    || !injected.insert(binding.skill_id.clone())
+                {
+                    return Err(ParentBindingError::InvalidShape);
+                }
+            }
+            SkillEventKind::Invoked => {
+                let export_name = claim
+                    .export_name
+                    .as_deref()
+                    .ok_or(ParentBindingError::InvalidShape)?;
+                if !binding.exports.contains(export_name)
+                    || claim.outcome.is_some()
+                    || claim.latency_us.is_some()
+                {
+                    return Err(ParentBindingError::AttributionMismatch);
+                }
+                let ordinal = ordinals
+                    .entry((binding.skill_id.clone(), export_name.to_string()))
+                    .or_default();
+                let expected = stable_invocation_id(
+                    &context.turn_id,
+                    &context.tool_call_id,
+                    &binding.skill_id,
+                    export_name,
+                    *ordinal,
+                );
+                *ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(ParentBindingError::IncompleteEvidence)?;
+                if claim.invocation_id.as_deref() != Some(expected.as_str())
+                    || open_invocations
+                        .insert(
+                            expected,
+                            (binding.skill_id.clone(), export_name.to_string()),
+                        )
+                        .is_some()
+                {
+                    return Err(ParentBindingError::AttributionMismatch);
+                }
+            }
+            SkillEventKind::Returned | SkillEventKind::Threw => {
+                validate_terminal_claim(claim, binding, &mut open_invocations)?;
+            }
+            SkillEventKind::TimedOut => {
+                if context.step_outcome != StepOutcome::Timeout {
+                    return Err(ParentBindingError::AttributionMismatch);
+                }
+                validate_terminal_claim(claim, binding, &mut open_invocations)?;
+            }
+            SkillEventKind::Oom => {
+                if context.step_outcome != StepOutcome::OutOfMemory {
+                    return Err(ParentBindingError::AttributionMismatch);
+                }
+                validate_terminal_claim(claim, binding, &mut open_invocations)?;
+            }
+            SkillEventKind::Selected
+            | SkillEventKind::CapabilityDenied
+            | SkillEventKind::UserPositive
+            | SkillEventKind::UserNegative
+            | SkillEventKind::ObservabilityLost => {
+                return Err(ParentBindingError::ForbiddenKind);
+            }
+        }
+
+        canonical_worker_events.push(canonical_event(claim, binding, context, created_at, true));
+    }
+
+    let expected_injections = selected.keys().copied().collect::<BTreeSet<_>>();
+    let observed_injections = injected.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if observed_injections != expected_injections || !open_invocations.is_empty() {
+        return Err(ParentBindingError::IncompleteEvidence);
+    }
+
+    let mut canonical = Vec::with_capacity(context.skills.len() + canonical_worker_events.len());
+    for binding in &context.skills {
+        canonical.push(parent_lifecycle_event(
+            binding,
+            context,
+            SkillEventKind::Selected,
+            created_at,
+            true,
+        ));
+    }
+    canonical.extend(canonical_worker_events);
+    EventBatch::new(canonical).map_err(|error| match error {
+        TelemetryError::BatchTooLarge => ParentBindingError::BatchTooLarge,
+        _ => ParentBindingError::InvalidShape,
+    })
+}
+
+fn validate_terminal_claim(
+    claim: &SkillEvent,
+    binding: &ParentSkillBinding,
+    open_invocations: &mut BTreeMap<String, (String, String)>,
+) -> Result<(), ParentBindingError> {
+    if claim.argument_shape.is_some() || claim.outcome.is_none() {
+        return Err(ParentBindingError::InvalidShape);
+    }
+    let invocation_id = claim
+        .invocation_id
+        .as_deref()
+        .ok_or(ParentBindingError::InvalidShape)?;
+    let export_name = claim
+        .export_name
+        .as_deref()
+        .ok_or(ParentBindingError::InvalidShape)?;
+    match open_invocations.remove(invocation_id) {
+        Some((skill_id, export))
+            if skill_id == binding.skill_id
+                && export == export_name
+                && binding.exports.contains(export_name) =>
+        {
+            Ok(())
+        }
+        _ => Err(ParentBindingError::AttributionMismatch),
+    }
+}
+
+fn canonical_event(
+    claim: &SkillEvent,
+    binding: &ParentSkillBinding,
+    context: &ParentTelemetryContext,
+    created_at: i64,
+    evidence_complete: bool,
+) -> SkillEvent {
+    SkillEvent {
+        invocation_id: claim.invocation_id.clone(),
+        skill_id: binding.skill_id.clone(),
+        turn_id: context.turn_id.clone(),
+        tool_call_id: Some(context.tool_call_id.clone()),
+        kind: claim.kind,
+        export_name: claim.export_name.clone(),
+        outcome: claim.outcome.clone(),
+        latency_us: claim.latency_us,
+        retrieval_score: Some(binding.retrieval_score),
+        retrieval_rank: Some(binding.retrieval_rank),
+        query_fingerprint: context.query_fingerprint.clone(),
+        index_generation: context.index_generation,
+        evidence_complete,
+        production: context.production,
+        argument_shape: claim.argument_shape.clone(),
+        created_at,
+    }
+}
+
+fn parent_lifecycle_event(
+    binding: &ParentSkillBinding,
+    context: &ParentTelemetryContext,
+    kind: SkillEventKind,
+    created_at: i64,
+    evidence_complete: bool,
+) -> SkillEvent {
+    SkillEvent {
+        invocation_id: None,
+        skill_id: binding.skill_id.clone(),
+        turn_id: context.turn_id.clone(),
+        tool_call_id: Some(context.tool_call_id.clone()),
+        kind,
+        export_name: None,
+        outcome: None,
+        latency_us: None,
+        retrieval_score: Some(binding.retrieval_score),
+        retrieval_rank: Some(binding.retrieval_rank),
+        query_fingerprint: context.query_fingerprint.clone(),
+        index_generation: context.index_generation,
+        evidence_complete,
+        production: context.production,
+        argument_shape: None,
+        created_at,
+    }
+}
+
+pub(crate) fn observability_lost_batch(
+    context: &ParentTelemetryContext,
+) -> Result<EventBatch, ParentBindingError> {
+    let created_at = current_timestamp().map_err(|_| ParentBindingError::InvalidShape)?;
+    EventBatch::new(
+        context
+            .skills
+            .iter()
+            .map(|binding| {
+                parent_lifecycle_event(
+                    binding,
+                    context,
+                    SkillEventKind::ObservabilityLost,
+                    created_at,
+                    false,
+                )
+            })
+            .collect(),
+    )
+    .map_err(|error| match error {
+        TelemetryError::BatchTooLarge => ParentBindingError::BatchTooLarge,
+        _ => ParentBindingError::InvalidShape,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestionReport {
     pub inserted: usize,
@@ -284,6 +578,7 @@ pub struct TelemetryIngestor<'a> {
 #[derive(Clone)]
 pub struct TelemetryDispatcher {
     tx: SyncSender<EventBatch>,
+    observability_lost: Arc<AtomicU64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -315,6 +610,8 @@ impl TelemetryDispatcher {
     ) -> Result<Self, DispatchError> {
         let mut store = SkillStore::open_at(paths)?;
         let (tx, rx) = std::sync::mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
+        let observability_lost = Arc::new(AtomicU64::new(0));
+        let worker_observability_lost = Arc::clone(&observability_lost);
         std::thread::Builder::new()
             .name("skill-telemetry".into())
             .spawn(move || {
@@ -327,6 +624,7 @@ impl TelemetryDispatcher {
                         }
                         Ok(_) => {}
                         Err(error) => {
+                            worker_observability_lost.fetch_add(1, Ordering::Relaxed);
                             // Never include event payloads in diagnostics.
                             tracing::error!(
                                 error = %error,
@@ -338,7 +636,10 @@ impl TelemetryDispatcher {
                 }
             })
             .map_err(|_| DispatchError::Disconnected)?;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            observability_lost,
+        })
     }
 
     pub fn try_dispatch(&self, batch: EventBatch) -> Result<(), DispatchError> {
@@ -346,6 +647,30 @@ impl TelemetryDispatcher {
             TrySendError::Full(_) => DispatchError::Saturated,
             TrySendError::Disconnected(_) => DispatchError::Disconnected,
         })
+    }
+
+    /// Record a parent-owned signal even when the bounded telemetry queue is
+    /// saturated or disconnected and therefore cannot persist an event.
+    pub(crate) fn record_observability_lost(&self, reason: &'static str) {
+        self.observability_lost.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            event_kind = SkillEventKind::ObservabilityLost.as_token(),
+            reason,
+            "skill telemetry observability was lost; positive evidence was excluded"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_sender_for_test(tx: SyncSender<EventBatch>) -> Self {
+        Self {
+            tx,
+            observability_lost: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observability_lost_for_test(&self) -> u64 {
+        self.observability_lost.load(Ordering::Relaxed)
     }
 }
 

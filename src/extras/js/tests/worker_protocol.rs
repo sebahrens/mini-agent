@@ -31,9 +31,7 @@ fn ready() -> WorkerWireFrame {
 fn run(sequence: u64) -> ParentWireFrame {
     invoked(
         sequence,
-        ParentFrame::RunStep(RunStep {
-            code: "40 + 2".into(),
-        }),
+        ParentFrame::RunStep(RunStep::new("40 + 2".into())),
     )
 }
 
@@ -92,6 +90,10 @@ fn step_result(sequence: u64) -> WorkerWireFrame {
             outcome: StepOutcome::Value("42".into()),
             console: vec![],
             diagnostic: None,
+            #[cfg(feature = "skills")]
+            skill_events: vec![],
+            #[cfg(feature = "skills")]
+            evidence_complete: true,
         }),
     )
 }
@@ -233,9 +235,7 @@ fn worker_protocol_rejects_unknown_fields_and_invalid_wire_ids() {
 fn worker_protocol_bounds_outbound_and_nested_payloads() {
     let frame = invoked(
         2,
-        ParentFrame::RunStep(RunStep {
-            code: "x".repeat(MAX_FRAME_BYTES),
-        }),
+        ParentFrame::RunStep(RunStep::new("x".repeat(MAX_FRAME_BYTES))),
     );
     assert_eq!(
         write_frame(&mut Vec::new(), &frame),

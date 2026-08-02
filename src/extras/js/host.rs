@@ -3,8 +3,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(feature = "sandbox")]
+#[cfg(all(feature = "sandbox", test))]
 use rquickjs::prelude::Opt;
+#[cfg(test)]
 use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -27,20 +28,22 @@ use crate::extras::js::broker::{
     AuthorizedEffect, AuthorizedTarget, HostEffectError, ParentEffectFuture, ParentEffectService,
 };
 use crate::extras::js::protocol::{EffectOperation, EffectResult};
-#[cfg(feature = "skills")]
+#[cfg(all(feature = "skills", test))]
 use crate::extras::js::skills::proposal::{
     JsProposal, PreparedProposalEffect, ProposalEffectService, ProposalError, ProposalHost,
     proposal_service_error,
 };
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::PermCancellation;
+#[cfg(test)]
+use crate::extras::js::types::STEP_TIMEOUT;
 use crate::extras::js::types::{
-    EffectServiceError, READ_FILE_MAX_BYTES, STEP_TIMEOUT, SpawnResult, WRITE_FILE_MAX_BYTES,
+    EffectServiceError, READ_FILE_MAX_BYTES, SpawnResult, WRITE_FILE_MAX_BYTES,
     canonical_spawn_permission_subject, spawn_policy_input,
 };
 use crate::sandbox::{CommandLimits, CommandOutputLimit, CommandStatus, Sandbox, SandboxPolicy};
 
-#[cfg(feature = "skills")]
+#[cfg(all(feature = "skills", test))]
 #[derive(Clone, Default)]
 pub(crate) struct SkillCapabilityGate {
     stack: std::sync::Arc<std::sync::Mutex<Vec<crate::extras::js::skills::CapabilityManifest>>>,
@@ -52,7 +55,7 @@ pub(crate) struct SkillCapabilityGate {
     context: crate::extras::js::skills::capability::CapabilityContext,
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(feature = "skills", test))]
 impl SkillCapabilityGate {
     pub(crate) fn register(
         &self,
@@ -127,12 +130,12 @@ impl SkillCapabilityGate {
     }
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(feature = "skills", test))]
 pub(crate) struct SkillCapabilityGuard {
     gate: SkillCapabilityGate,
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(feature = "skills", test))]
 impl Drop for SkillCapabilityGuard {
     fn drop(&mut self) {
         let _ = self
@@ -218,6 +221,11 @@ pub(crate) struct AllowConfig {
 }
 
 impl AllowConfig {
+    #[cfg(feature = "sandbox")]
+    pub(crate) fn fetch_policy(&self) -> FetchPolicy {
+        self.fetch.clone()
+    }
+
     pub(crate) fn from_settings(
         startup_base: &Path,
         configured_base: Option<&str>,
@@ -494,6 +502,7 @@ fn authorize_resolved(
     }
 }
 
+#[cfg(test)]
 impl<'js> IntoJs<'js> for SpawnResult {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
         let obj = Object::new(ctx.clone())?;
@@ -1089,6 +1098,7 @@ pub(crate) struct FetchResult {
 }
 
 #[cfg(feature = "sandbox")]
+#[cfg(test)]
 impl<'js> IntoJs<'js> for FetchResult {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
         let object = Object::new(ctx.clone())?;
@@ -1169,6 +1179,7 @@ impl FetchRequest {
         })
     }
 
+    #[cfg(test)]
     fn from_options(options: Option<&Object<'_>>) -> Result<Self, FetchError> {
         let Some(options) = options else {
             return Ok(Self::get());
@@ -1634,6 +1645,7 @@ fn map_io_error(error: std::io::Error) -> FetchError {
     }
 }
 
+#[cfg(test)]
 fn service_host_error(tool: &'static str, error: EffectServiceError) -> rquickjs::Error {
     let access = match tool {
         "js/read_file" => Some("read"),
@@ -1699,6 +1711,7 @@ fn timeout_error(tool: &'static str) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("host call", tool, "execution timed out")
 }
 
+#[cfg(test)]
 fn file_error(
     tool: &'static str,
     kind: &'static str,
@@ -2040,6 +2053,7 @@ impl FileEffectService {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn make_read_file(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
@@ -2053,6 +2067,7 @@ pub(crate) fn make_read_file(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn make_write_file(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
@@ -2066,7 +2081,7 @@ pub(crate) fn make_write_file(
     }
 }
 
-#[cfg(feature = "sandbox")]
+#[cfg(all(feature = "sandbox", test))]
 fn make_fetch(
     permission_bridge: PermissionBridge,
     runtime: tokio::runtime::Handle,
@@ -2251,7 +2266,7 @@ fn make_fetch_with_timeout(
     }
 }
 
-#[cfg(feature = "sandbox")]
+#[cfg(all(feature = "sandbox", test))]
 fn fetch_host_error(error: FetchError) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("network policy", "js/fetch", error.to_string())
 }
@@ -2317,6 +2332,7 @@ async fn await_fetch_host_call(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn make_spawn(
     sandbox: Sandbox,
     permission_bridge: PermissionBridge,
@@ -2325,7 +2341,7 @@ pub(crate) fn make_spawn(
     make_spawn_with_timeout(sandbox, permission_bridge, runtime, STEP_TIMEOUT)
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(feature = "skills", test))]
 pub(crate) fn make_propose_skill(
     proposal_host: ProposalHost,
 ) -> impl for<'js> Fn(Object<'js>) -> rquickjs::Result<String> {
@@ -2346,12 +2362,12 @@ pub(crate) fn make_propose_skill(
     }
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(feature = "skills", test))]
 fn proposal_host_error(error: ProposalError) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("proposal", "js/propose_skill", error.to_string())
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(feature = "skills", test))]
 pub(crate) fn register_proposal_global(
     ctx: &Context,
     proposal_host: Option<ProposalHost>,
@@ -2892,6 +2908,7 @@ impl ParentEffectService for ParentHostEffectService {
     }
 }
 
+#[cfg(test)]
 fn make_spawn_with_timeout(
     sandbox: Sandbox,
     permission_bridge: PermissionBridge,
@@ -2906,6 +2923,7 @@ fn make_spawn_with_timeout(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn register_host_globals(
     ctx: &Context,
     sandbox: Sandbox,

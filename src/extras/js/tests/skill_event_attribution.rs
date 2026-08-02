@@ -1,9 +1,10 @@
-use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId};
+use crate::extras::js::protocol::{EffectResult, GrantId, InvocationId, StepOutcome};
 use crate::extras::js::skills::capability::{
     CapabilityError, InvocationAuthorization, InvocationCapabilityRuntime, PreparedInvocationHandle,
 };
 use crate::extras::js::skills::telemetry::{
-    EventBatch, SkillEvent, SkillEventKind, TelemetryError, TelemetryIngestor, stable_invocation_id,
+    EventBatch, ParentBindingError, ParentSkillBinding, ParentTelemetryContext, SkillEvent,
+    SkillEventKind, TelemetryError, TelemetryIngestor, bind_worker_events, stable_invocation_id,
 };
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
@@ -99,6 +100,127 @@ fn stable_ids_reuse_acknowledged_calls_but_separate_ordinals() {
         stable_invocation_id("turn", "tool", "skill", "run", 1)
     );
     assert_eq!(first.len(), 64);
+}
+
+fn parent_context(artifact: &SkillArtifact) -> ParentTelemetryContext {
+    ParentTelemetryContext {
+        turn_id: "parent-turn".into(),
+        tool_call_id: "parent-tool".into(),
+        query_fingerprint: Some("parent-query".into()),
+        index_generation: 41,
+        production: true,
+        step_outcome: StepOutcome::Value("ok".into()),
+        skills: vec![ParentSkillBinding {
+            skill_id: artifact.id.clone(),
+            exports: ["run".to_string()].into_iter().collect(),
+            retrieval_score: 0.75,
+            retrieval_rank: 2,
+        }],
+    }
+}
+
+fn worker_claim(
+    context: &ParentTelemetryContext,
+    artifact: &SkillArtifact,
+    kind: SkillEventKind,
+) -> SkillEvent {
+    let invocation = stable_invocation_id(
+        &context.turn_id,
+        &context.tool_call_id,
+        &artifact.id,
+        "run",
+        0,
+    );
+    SkillEvent {
+        invocation_id: matches!(kind, SkillEventKind::Invoked)
+            .then_some(invocation.clone())
+            .or_else(|| kind.is_terminal().then_some(invocation)),
+        skill_id: artifact.id.clone(),
+        turn_id: context.turn_id.clone(),
+        tool_call_id: Some(context.tool_call_id.clone()),
+        kind,
+        export_name: (matches!(kind, SkillEventKind::Invoked) || kind.is_terminal())
+            .then(|| "run".into()),
+        outcome: kind.is_terminal().then(|| "fulfilled".into()),
+        latency_us: kind.is_terminal().then_some(10),
+        // Deliberately forged policy fields. A successful binding must replace
+        // every one of them with parent-owned state.
+        retrieval_score: Some(-100.0),
+        retrieval_rank: Some(999),
+        query_fingerprint: Some("worker-query".into()),
+        index_generation: 999,
+        evidence_complete: false,
+        production: false,
+        argument_shape: (kind == SkillEventKind::Invoked)
+            .then(|| r#"{"argc":0,"types":[]}"#.into()),
+        created_at: 1,
+    }
+}
+
+#[test]
+fn parent_binding_rebuilds_policy_fields_and_requires_exact_selected_mapping() {
+    let (_root, _store, artifact) = store();
+    let context = parent_context(&artifact);
+    let events = vec![
+        worker_claim(&context, &artifact, SkillEventKind::Injected),
+        worker_claim(&context, &artifact, SkillEventKind::Invoked),
+        worker_claim(&context, &artifact, SkillEventKind::Returned),
+    ];
+    let batch = bind_worker_events(&context, &events).expect("valid worker observations");
+    assert_eq!(batch.events().len(), 4, "parent adds Selected");
+    assert!(batch.events().iter().all(|event| {
+        event.turn_id == context.turn_id
+            && event.tool_call_id.as_deref() == Some(context.tool_call_id.as_str())
+            && event.index_generation == context.index_generation
+            && event.production
+            && event.evidence_complete
+            && event.retrieval_score == Some(0.75)
+            && event.retrieval_rank == Some(2)
+            && event.query_fingerprint.as_deref() == Some("parent-query")
+    }));
+
+    let mut cross_skill = events.clone();
+    cross_skill[1].skill_id = "0".repeat(64);
+    assert_eq!(
+        bind_worker_events(&context, &cross_skill).unwrap_err(),
+        ParentBindingError::AttributionMismatch
+    );
+
+    let mut cross_turn = events.clone();
+    cross_turn[1].turn_id = "another-turn".into();
+    assert_eq!(
+        bind_worker_events(&context, &cross_turn).unwrap_err(),
+        ParentBindingError::AttributionMismatch
+    );
+}
+
+#[test]
+fn parent_binding_rejects_feedback_policy_kinds_and_incomplete_execution() {
+    let (_root, _store, artifact) = store();
+    let context = parent_context(&artifact);
+    for forbidden in [
+        SkillEventKind::Selected,
+        SkillEventKind::CapabilityDenied,
+        SkillEventKind::UserPositive,
+        SkillEventKind::UserNegative,
+        SkillEventKind::ObservabilityLost,
+    ] {
+        let claim = worker_claim(&context, &artifact, forbidden);
+        assert_eq!(
+            bind_worker_events(&context, &[claim]).unwrap_err(),
+            ParentBindingError::ForbiddenKind,
+            "worker kind {forbidden:?} must remain parent-owned"
+        );
+    }
+
+    let incomplete = vec![
+        worker_claim(&context, &artifact, SkillEventKind::Injected),
+        worker_claim(&context, &artifact, SkillEventKind::Invoked),
+    ];
+    assert_eq!(
+        bind_worker_events(&context, &incomplete).unwrap_err(),
+        ParentBindingError::IncompleteEvidence
+    );
 }
 
 #[test]

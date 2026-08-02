@@ -18,9 +18,9 @@ use super::protocol::{
     write_frame,
 };
 use super::types::{PermCancellation, STEP_TIMEOUT};
-use crate::sandbox::worker::{
-    ProductionWorkerLauncher, WorkerLaunchError, WorkerLauncher, WorkerProcess,
-};
+#[cfg(not(test))]
+use crate::sandbox::worker::ProductionWorkerLauncher;
+use crate::sandbox::worker::{WorkerLaunchError, WorkerLauncher, WorkerProcess};
 
 const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -136,11 +136,12 @@ impl JsWorkerSupervisor {
         static SHARED: OnceLock<Arc<JsWorkerSupervisor>> = OnceLock::new();
         SHARED
             .get_or_init(|| {
-                Arc::new(Self::new(
-                    Arc::new(ProductionWorkerLauncher),
-                    false,
-                    STEP_TIMEOUT,
-                ))
+                #[cfg(test)]
+                let launcher =
+                    Arc::new(crate::sandbox::worker::TestWorkerLauncher::internal_worker_process());
+                #[cfg(not(test))]
+                let launcher = Arc::new(ProductionWorkerLauncher);
+                Arc::new(Self::new(launcher, cfg!(test), STEP_TIMEOUT))
             })
             .clone()
     }
@@ -183,11 +184,37 @@ impl JsWorkerSupervisor {
         mut effects: impl InvocationEffectHandler,
         cancellation: PermCancellation,
     ) -> Result<StepResult, WorkerError> {
+        self.execute_inner(request, &mut effects, cancellation, None)
+            .await
+    }
+
+    /// Execute using the parent-created identity that also binds the invocation broker.
+    ///
+    /// The identity remains method-local and is never retained once the invocation finishes.
+    pub(crate) async fn execute_bound(
+        &self,
+        invocation: InvocationId,
+        request: RunStep,
+        mut effects: impl InvocationEffectHandler,
+        cancellation: PermCancellation,
+    ) -> Result<StepResult, WorkerError> {
+        self.execute_inner(request, &mut effects, cancellation, Some(invocation))
+            .await
+    }
+
+    async fn execute_inner(
+        &self,
+        request: RunStep,
+        effects: &mut impl InvocationEffectHandler,
+        cancellation: PermCancellation,
+        invocation: Option<InvocationId>,
+    ) -> Result<StepResult, WorkerError> {
         match self
             .invoke(
                 InvocationRequest::Run(request),
-                Some(&mut effects),
+                Some(effects),
                 cancellation,
+                invocation,
             )
             .await?
         {
@@ -213,6 +240,7 @@ impl JsWorkerSupervisor {
                     InvocationRequest::Verify(request),
                     None,
                     PermCancellation::new(),
+                    None,
                 )
                 .await?
             {
@@ -227,6 +255,7 @@ impl JsWorkerSupervisor {
         request: InvocationRequest,
         mut effects: Option<&mut H>,
         cancellation: PermCancellation,
+        invocation: Option<InvocationId>,
     ) -> Result<InvocationTerminal, WorkerError> {
         // The single deadline starts before lease acquisition and therefore bounds queueing,
         // startup, protocol I/O, JavaScript execution, and parent-brokered effect handling.
@@ -247,12 +276,15 @@ impl JsWorkerSupervisor {
                 .await?
             }
         };
-        let invocation = InvocationId::new(format!(
-            "js-{}-{}",
-            connection.generation,
-            allocate_counter(&mut state.next_invocation)?
-        ))
-        .map_err(|_| WorkerError::IdentityExhausted)?;
+        let invocation = match invocation {
+            Some(invocation) => invocation,
+            None => InvocationId::new(format!(
+                "js-{}-{}",
+                connection.generation,
+                allocate_counter(&mut state.next_invocation)?
+            ))
+            .map_err(|_| WorkerError::IdentityExhausted)?,
+        };
         self.0
             .active_generation
             .store(connection.generation, Ordering::Release);
@@ -336,6 +368,17 @@ impl JsWorkerSupervisor {
             .idle
             .as_ref()
             .map(|connection| connection.generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn process_id_for_test(&self) -> Option<u32> {
+        self.0
+            .transport
+            .lock()
+            .await
+            .idle
+            .as_ref()
+            .map(|connection| connection.process.id())
     }
 
     #[cfg(test)]
