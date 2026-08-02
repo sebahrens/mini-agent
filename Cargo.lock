@@ -2693,6 +2693,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "smallvec",
+ "syn 2.0.119",
  "thiserror 2.0.19",
  "tokio",
  "toml",

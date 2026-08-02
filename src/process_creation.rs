@@ -3,8 +3,9 @@
 //! Rust's standard library protects its own inheritable pipe setup with a private lock. The
 //! broker-only Windows worker also needs raw inheritable handles, so every production `Command`
 //! terminal in this crate enters this outer boundary before standard-library or Tokio process
-//! creation. The guard is held only through synchronous spawn; waits and async work happen after
-//! it is released.
+//! creation. Spawn/status helpers release the guard after synchronous spawn. The output helper must
+//! retain it through synchronous `Command::output` to preserve opaque stdio and reusable-builder
+//! semantics; no guard crosses async work.
 
 use std::io;
 use std::process::{Child, ExitStatus, Output};
