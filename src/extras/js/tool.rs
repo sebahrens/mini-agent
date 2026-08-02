@@ -1,11 +1,10 @@
 use std::fmt;
 #[cfg(feature = "skills")]
 use std::sync::atomic::AtomicU64;
+#[cfg(feature = "skills")]
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use compact_str::CompactString;
@@ -15,18 +14,24 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::agent::tools::ToolError;
-use crate::extras::js::engine::{NormalExecutionHosts, js_thread_main};
-use crate::extras::js::host::AllowConfig;
+use crate::extras::js::audit::{AuditError, EffectAudit};
+use crate::extras::js::broker::{
+    GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant, SharedEffectAudit,
+};
+#[cfg(feature = "sandbox")]
+use crate::extras::js::host::FetchEffectService;
+use crate::extras::js::host::{
+    AllowConfig, FileEffectService, ParentHostEffectService, SpawnEffectService,
+};
+use crate::extras::js::protocol::{InvocationId, JsErrorCode, RunStep, StepOutcome};
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::admission::AdmissionWorker;
 #[cfg(feature = "skills")]
-use crate::extras::js::skills::proposal::{
-    AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalHost, ProposalWorker,
-};
+use crate::extras::js::skills::proposal::ProposalWorker;
+use crate::extras::js::supervisor::{JsWorkerSupervisor, WorkerError};
 use crate::extras::js::types::{
-    JsOutcome, JsRequest, JsResponse, PermCancellation, PermOutcome, PermRequest,
-    PermRequestBuildError, PermResponse, PermResponseRejection, PermissionBackendFailure,
-    PermissionDenial, STEP_TIMEOUT, THREAD_STACK,
+    PermCancellation, PermOutcome, PermRequest, PermRequestBuildError, PermResponse,
+    PermResponseRejection, PermissionBackendFailure, PermissionDenial, STEP_TIMEOUT,
 };
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 use crate::permission::checker::{CheckResult, PermCheck};
@@ -541,15 +546,17 @@ async fn resolve_permission(
 }
 
 pub struct JsTool {
-    tx: Option<mpsc::Sender<JsRequest>>,
+    sandbox: Sandbox,
+    allow_config: AllowConfig,
+    supervisor: Arc<JsWorkerSupervisor>,
+    audit: Result<SharedEffectAudit, AuditError>,
     permission_bridge: PermissionBridgeOwner,
-    js_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "sandbox")]
     runtime: tokio::runtime::Handle,
-    _thread_stopped: Arc<AtomicBool>,
     #[cfg(feature = "skills")]
     skill_turn_context: Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     #[cfg(feature = "skills")]
-    proposal_worker: Option<ProposalWorker>,
+    _proposal_worker: Option<ProposalWorker>,
     #[cfg(feature = "skills")]
     _admission_worker: Option<AdmissionWorker>,
     #[cfg(feature = "skills")]
@@ -565,12 +572,13 @@ impl JsTool {
         ask_tx: Option<AskSender>,
         allow_config: AllowConfig,
     ) -> Self {
-        Self::new_with_hosts(
+        Self::new_with_runtime(
             sandbox,
             permission,
             ask_tx,
             allow_config,
-            NormalExecutionHosts::default(),
+            JsWorkerSupervisor::shared(),
+            shared_effect_audit(),
         )
     }
 
@@ -582,18 +590,8 @@ impl JsTool {
         allow_config: AllowConfig,
         proposal_worker: ProposalWorker,
     ) -> Self {
-        let proposal_host = ProposalHost::new(
-            proposal_worker.sender(),
-            AttemptBudget::new(DEFAULT_SESSION_ATTEMPTS),
-        );
-        let mut tool = Self::new_with_hosts(
-            sandbox,
-            permission,
-            ask_tx,
-            allow_config,
-            NormalExecutionHosts::with_proposal(proposal_host),
-        );
-        tool.proposal_worker = Some(proposal_worker);
+        let mut tool = Self::new(sandbox, permission, ask_tx, allow_config);
+        tool._proposal_worker = Some(proposal_worker);
         tool
     }
 
@@ -613,48 +611,32 @@ impl JsTool {
         tool
     }
 
-    fn new_with_hosts(
+    fn new_with_runtime(
         sandbox: Sandbox,
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
         allow_config: AllowConfig,
-        execution_hosts: NormalExecutionHosts,
+        supervisor: Arc<JsWorkerSupervisor>,
+        audit: Result<SharedEffectAudit, AuditError>,
     ) -> Self {
         let permission_bridge = PermissionBridgeOwner::new(permission, ask_tx, STEP_TIMEOUT);
-        let bridge = permission_bridge.bridge();
-        let (tx, rx) = mpsc::channel();
+        #[cfg(feature = "sandbox")]
         let runtime = tokio::runtime::Handle::current();
-        let js_runtime = runtime.clone();
-        let thread_stopped = Arc::new(AtomicBool::new(false));
-        let thread_stopped_on_exit = Arc::clone(&thread_stopped);
-        let js_thread = std::thread::Builder::new()
-            .name("js-engine".into())
-            .stack_size(THREAD_STACK)
-            .spawn(move || {
-                let _stopped = ThreadStopped(thread_stopped_on_exit);
-                js_thread_main(
-                    rx,
-                    sandbox,
-                    bridge,
-                    js_runtime,
-                    allow_config,
-                    execution_hosts,
-                );
-            })
-            .expect("failed to spawn JS thread");
 
         Self {
-            tx: Some(tx),
+            sandbox,
+            allow_config,
+            supervisor,
+            audit,
             permission_bridge,
-            js_thread: Some(js_thread),
+            #[cfg(feature = "sandbox")]
             runtime,
-            _thread_stopped: thread_stopped,
             #[cfg(feature = "skills")]
             skill_turn_context: Arc::new(crate::extras::js::skills::turn::SkillTurnContext::new(
                 crate::extras::js::skills::turn::TurnSkillBundle::empty("unconfigured"),
             )),
             #[cfg(feature = "skills")]
-            proposal_worker: None,
+            _proposal_worker: None,
             #[cfg(feature = "skills")]
             _admission_worker: None,
             #[cfg(feature = "skills")]
@@ -684,47 +666,52 @@ impl JsTool {
     }
 
     #[cfg(test)]
-    fn thread_stopped_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self._thread_stopped)
+    pub(crate) fn new_with_runtime_for_test(
+        sandbox: Sandbox,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        allow_config: AllowConfig,
+        supervisor: Arc<JsWorkerSupervisor>,
+        audit: SharedEffectAudit,
+    ) -> Self {
+        Self::new_with_runtime(
+            sandbox,
+            permission,
+            ask_tx,
+            allow_config,
+            supervisor,
+            Ok(audit),
+        )
     }
 }
 
-struct ThreadStopped(Arc<AtomicBool>);
-
-impl Drop for ThreadStopped {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-impl Drop for JsTool {
-    fn drop(&mut self) {
-        self.permission_bridge.shutdown();
-        self.tx.take();
-
-        let Some(js_thread) = self.js_thread.take() else {
-            return;
-        };
-        if js_thread.is_finished() {
-            let _ = js_thread.join();
-        } else {
-            // Drop cannot await; retain the task long enough to make the intentional detach explicit.
-            std::mem::drop(self.runtime.spawn_blocking(move || {
-                let _ = js_thread.join();
-            }));
-        }
-    }
-}
-
-async fn await_js_response(
-    reply_rx: oneshot::Receiver<JsResponse>,
-    timeout: Duration,
-) -> Result<JsResponse, ToolError> {
-    match tokio::time::timeout(timeout, reply_rx).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => Err(ToolError::Msg("JS engine reply channel closed".into())),
-        Err(_) => Err(ToolError::Msg("JS engine reply timeout".into())),
-    }
+fn shared_effect_audit() -> Result<SharedEffectAudit, AuditError> {
+    static SHARED: OnceLock<Result<SharedEffectAudit, AuditError>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            #[cfg(test)]
+            let paths = {
+                let root = std::env::temp_dir().join(format!(
+                    "mini-agent-js-tool-audit-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+                crate::paths::AppPaths {
+                    config_dir: root.join("config"),
+                    data_dir: root.join("data"),
+                    local_data_dir: root.join("local"),
+                    state_dir: root.join("state"),
+                    cache_dir: root.join("cache"),
+                    credentials_dir: root.join("credentials"),
+                    project_dir: None,
+                }
+            };
+            #[cfg(not(test))]
+            let paths = crate::paths::process_paths().map_err(|_| AuditError::PathUnavailable)?;
+            EffectAudit::open(paths.effect_audit())
+                .map(|audit| Arc::new(std::sync::Mutex::new(audit)))
+        })
+        .clone()
 }
 
 impl Tool for JsTool {
@@ -742,20 +729,9 @@ impl Tool for JsTool {
             "read_file(path), write_file(path, content), spawn(cmd, args), console.log(...)"
                 .to_string()
         };
-        #[cfg(feature = "skills")]
-        let globals = {
-            let mut globals = globals;
-            if self.proposal_worker.is_some() {
-                globals.push_str(
-                    ", propose_skill({source, description, exports, tests, capability, tags?, \
-                     predecessor_id?})",
-                );
-            }
-            globals
-        };
         format!(
             "Execute JavaScript code. Available globals: {globals}. Returns the last expression \
-             value as a string. Errors include the stack trace for self-correction."
+             value as a string. Runtime failures use closed, source-free error classes."
         )
     }
 
@@ -778,7 +754,6 @@ impl Tool for JsTool {
 
         let cancellation = PermCancellation::new();
         let mut cancel_on_drop = CancelOnDrop::new(cancellation.clone());
-        let (reply_tx, reply_rx) = oneshot::channel();
         #[cfg(feature = "skills")]
         let skill_bundle = self.skill_turn_context.snapshot();
         #[cfg(feature = "skills")]
@@ -787,81 +762,127 @@ impl Tool for JsTool {
             skill_bundle.turn_id,
             self.skill_tool_call_ordinal.fetch_add(1, Ordering::Relaxed)
         );
-        self.tx
-            .as_ref()
-            .ok_or_else(|| ToolError::Msg("JS engine thread disconnected".into()))?
-            .send(JsRequest {
-                code: args.code,
-                #[cfg(feature = "skills")]
-                skill_bundle,
-                #[cfg(feature = "skills")]
-                skill_tool_call_id,
-                cancellation,
-                reply: reply_tx,
-            })
-            .map_err(|_| ToolError::Msg("JS engine thread disconnected".into()))?;
-
-        let response = await_js_response(reply_rx, STEP_TIMEOUT).await?;
+        #[cfg(not(feature = "skills"))]
+        let skill_tool_call_id = format!("js:{}", uuid::Uuid::new_v4());
+        let invocation_id = InvocationId::new(format!("tool:{}", uuid::Uuid::new_v4()))
+            .map_err(|_| ToolError::Msg("JS invocation identity unavailable".into()))?;
+        let grant = InvocationGrant::issue(
+            invocation_id.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: skill_tool_call_id.clone(),
+            },
+            HostCapability::all(),
+            Instant::now() + STEP_TIMEOUT,
+        );
+        let model_grant_id = grant.grant_id().clone();
+        let bridge = self
+            .permission_bridge
+            .bridge()
+            .for_invocation(cancellation.clone());
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(bridge.clone(), self.allow_config.clone(), STEP_TIMEOUT),
+            SpawnEffectService::new(self.sandbox.clone(), bridge.clone(), STEP_TIMEOUT),
+        );
+        #[cfg(feature = "sandbox")]
+        let service = service.with_fetch(FetchEffectService::new(
+            bridge,
+            self.runtime.clone(),
+            self.allow_config.fetch_policy(),
+            STEP_TIMEOUT,
+        ));
+        let audit = self
+            .audit
+            .clone()
+            .map_err(|_| ToolError::Msg("JS effect audit unavailable".into()))?;
+        let broker = InvocationBroker::new(
+            invocation_id.clone(),
+            vec![grant],
+            HostCapability::all(),
+            service,
+            audit,
+        )
+        .map_err(|_| ToolError::Msg("JS invocation authority unavailable".into()))?;
+        let run_step = RunStep::new(args.code).with_model_grant(model_grant_id);
+        #[cfg(feature = "skills")]
+        let run_step = run_step.with_skills(
+            skill_bundle
+                .skills
+                .iter()
+                .map(|skill| crate::extras::js::skills::SkillArtifact {
+                    id: skill.id.clone(),
+                    identity_version: skill.identity_version,
+                    abi_version: skill.abi_version,
+                    source: skill.source.clone(),
+                    description: skill.description.clone(),
+                    tags: skill.tags.clone(),
+                    exports: skill.exports.clone(),
+                    tests: skill.tests.clone(),
+                    capability: skill.capability.clone(),
+                })
+                .collect(),
+            skill_bundle.turn_id.clone(),
+            skill_tool_call_id.clone(),
+        );
+        let response = match self
+            .supervisor
+            .execute_bound(invocation_id, run_step, broker, cancellation)
+            .await
+        {
+            Ok(response) => response,
+            Err(WorkerError::TimedOut) => {
+                return Ok("JS error: execution timed out (30s limit exceeded)".into());
+            }
+            Err(error) => return Err(worker_tool_error(error)),
+        };
         cancel_on_drop.disarm();
 
         #[cfg(feature = "skills")]
-        if !response.skill_events.is_empty() {
-            match crate::extras::js::skills::telemetry::EventBatch::new(response.skill_events) {
-                Ok(batch) => {
-                    if let Some(dispatcher) = &self.telemetry {
-                        if let Err(error) = dispatcher.try_dispatch(batch) {
-                            tracing::error!(
-                                error = %error,
-                                "skill telemetry queue unavailable; turn evidence was excluded"
-                            );
-                        }
-                    } else {
-                        tracing::warn!(
-                            "skill telemetry dispatcher is not configured; turn evidence was excluded"
-                        );
-                    }
-                }
-                Err(error) => tracing::error!(
-                    error = %error,
-                    "invalid skill event batch was excluded"
-                ),
-            }
+        if !response.skill_events.is_empty()
+            && let Ok(batch) =
+                crate::extras::js::skills::telemetry::EventBatch::new(response.skill_events.clone())
+            && let Some(dispatcher) = &self.telemetry
+            && let Err(error) = dispatcher.try_dispatch(batch)
+        {
+            tracing::error!(error = %error, "skill telemetry queue unavailable");
+        }
+        #[cfg(feature = "skills")]
+        if !response.evidence_complete && !skill_bundle.skills.is_empty() {
+            tracing::warn!(
+                turn_id = %skill_bundle.turn_id,
+                "learned-skill execution evidence is unavailable; no positive evidence was recorded"
+            );
         }
 
         match response.outcome {
-            JsOutcome::Value(value) => Ok(value),
-            JsOutcome::Void => Ok(String::new()),
-            JsOutcome::Error(error) => Ok(format!("JS error:\n{error}")),
-            JsOutcome::Timeout => Ok("JS error: execution timed out (30s limit exceeded)".into()),
-            JsOutcome::OomKilled => Ok("JS error: out of memory (64 MiB limit exceeded)".into()),
+            StepOutcome::Value(value) => Ok(value),
+            StepOutcome::Void => Ok(String::new()),
+            StepOutcome::Error(code) => Ok(format!("JS error: {}", js_error_code(code))),
+            StepOutcome::Timeout => Ok("JS error: execution timed out (30s limit exceeded)".into()),
+            StepOutcome::OutOfMemory => {
+                Ok("JS error: out of memory (64 MiB limit exceeded)".into())
+            }
         }
+    }
+}
+
+fn worker_tool_error(error: WorkerError) -> ToolError {
+    ToolError::Msg(error.to_string())
+}
+
+fn js_error_code(code: JsErrorCode) -> &'static str {
+    match code {
+        JsErrorCode::Syntax => "syntax error",
+        JsErrorCode::Exception => "exception",
+        JsErrorCode::StackLimit => "stack limit exceeded",
+        JsErrorCode::JobLimit => "job limit exceeded",
+        JsErrorCode::InvalidResult => "invalid result",
+        JsErrorCode::Internal => "internal error",
     }
 }
 
 #[derive(Deserialize)]
 pub struct JsArgs {
     pub code: String,
-}
-
-#[cfg(test)]
-mod js_tool_reply {
-    use super::*;
-
-    #[tokio::test]
-    async fn stalled_js_engine_reply_returns_timeout_error() {
-        let (_reply_tx, reply_rx) = oneshot::channel();
-        let started = Instant::now();
-
-        let error = await_js_response(reply_rx, Duration::from_millis(30))
-            .await
-            .expect_err("stalled reply should time out");
-
-        assert!(matches!(
-            error,
-            ToolError::Msg(message) if message == "JS engine reply timeout"
-        ));
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
 }
 
 #[cfg(test)]
@@ -1112,32 +1133,84 @@ mod js_permission_bridge {
     }
 
     #[tokio::test]
-    async fn js_permission_bridge_tool_drop_stops_receiver_and_js_thread() {
+    async fn js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<JsTool>();
 
         let (ask_tx, mut ask_rx) = tokio_mpsc::channel(1);
+        let supervisor = JsWorkerSupervisor::shared();
         let tool = JsTool::new(
             Sandbox::new(false, "bwrap"),
-            Some(permission(Action::Ask)),
+            None,
             Some(ask_tx),
             AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
         );
-        let thread_stopped = tool.thread_stopped_flag();
+        assert_eq!(
+            tool.call(JsArgs {
+                code: "20 + 1".into()
+            })
+            .await
+            .expect("first agent JS call failed"),
+            "21"
+        );
+        let generation = supervisor
+            .generation_for_test()
+            .await
+            .expect("first call should launch the worker");
+        let process_id = supervisor
+            .process_id_for_test()
+            .await
+            .expect("first call should retain one worker process");
         drop(tool);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !thread_stopped.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("JS thread did not stop after tool drop");
         assert!(
             tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
                 .await
                 .expect("permission receiver did not stop")
                 .is_none()
         );
+
+        let rebuilt = JsTool::new(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::from_settings(
+                &std::env::current_dir().unwrap(),
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+        );
+        assert_eq!(
+            rebuilt
+                .call(JsArgs {
+                    code: "20 + 2".into()
+                })
+                .await
+                .expect("rebuilt agent JS call failed"),
+            "22"
+        );
+        let denied_path = std::env::temp_dir().join(format!(
+            "mini-agent-js-rebuild-denied-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let denied = rebuilt
+            .call(JsArgs {
+                code: format!(
+                    "try {{ write_file({:?}, 'leaked'); 'allowed' }} catch (_) {{ 'denied' }}",
+                    denied_path.to_string_lossy()
+                ),
+            })
+            .await
+            .expect("rebuilt policy check failed");
+        assert_eq!(denied, "denied");
+        assert!(
+            !denied_path.exists(),
+            "prior allow policy leaked into rebuild"
+        );
+        assert_eq!(supervisor.generation_for_test().await, Some(generation));
+        assert_eq!(supervisor.process_id_for_test().await, Some(process_id));
     }
 }

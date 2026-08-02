@@ -41,7 +41,7 @@ fn run_step(sequence: u64, invocation: &str, code: impl Into<String>) -> ParentW
         BuildIdentity::current(),
         InvocationId::new(invocation).unwrap(),
         sequence,
-        ParentFrame::RunStep(RunStep { code: code.into() }),
+        ParentFrame::RunStep(RunStep::new(code.into())),
     )
 }
 
@@ -857,6 +857,45 @@ impl InvocationEffectHandler for RecordingEffects {
     }
 }
 
+#[cfg(feature = "sandbox")]
+#[derive(Clone, Default)]
+struct NestedFetchEffects {
+    ordinals: Arc<Mutex<Vec<u32>>>,
+    active: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "sandbox")]
+impl InvocationEffectHandler for NestedFetchEffects {
+    fn handle_effect(
+        &mut self,
+        request: EffectRequest,
+        _cancellation: PermCancellation,
+    ) -> EffectFuture<'_> {
+        assert!(
+            !self.active.swap(true, Ordering::AcqRel),
+            "worker issued overlapping effect requests"
+        );
+        self.ordinals.lock().unwrap().push(request.effect_ordinal);
+        let active = self.active.clone();
+        Box::pin(async move {
+            let result = match request.operation {
+                EffectOperation::ReadFile { .. } => EffectResult::ReadFile {
+                    content: "nested".into(),
+                },
+                EffectOperation::Fetch { .. } => EffectResult::Fetch {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: "done".into(),
+                    truncated: false,
+                },
+                _ => panic!("unexpected nested fetch operation"),
+            };
+            active.store(false, Ordering::Release);
+            result
+        })
+    }
+}
+
 struct PendingEffectDrop {
     dropped: Arc<AtomicBool>,
     armed: bool,
@@ -1170,14 +1209,46 @@ fn recovery_supervisor(
 async fn execute_success(supervisor: &JsWorkerSupervisor) -> StepResult {
     supervisor
         .execute(
-            RunStep {
-                code: "success".into(),
-            },
+            RunStep::new("success".into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         )
         .await
         .expect("worker supervisor must recover on the next invocation")
+}
+
+#[cfg(feature = "sandbox")]
+#[tokio::test]
+async fn worker_runtime_nested_fetch_getter_serializes_monotonic_effects() {
+    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+        TestWorkerLauncher::internal_worker_process(),
+    ));
+    let effects = NestedFetchEffects::default();
+    let observed = effects.ordinals.clone();
+    let request = RunStep::new(
+        r#"
+        const options = {};
+        Object.defineProperty(options, "method", {
+            enumerable: true,
+            get() { read_file("nested.txt"); return "GET"; }
+        });
+        JSON.stringify(fetch("https://example.com", options));
+        "#
+        .into(),
+    )
+    .with_model_grant(GrantId::new(uuid::Uuid::new_v4()).unwrap());
+
+    let result = supervisor
+        .execute(request, effects, PermCancellation::new())
+        .await
+        .expect("nested fetch execution should complete");
+
+    assert_eq!(
+        result.outcome,
+        StepOutcome::Value(r#"{"status":200,"text":"done"}"#.into())
+    );
+    assert_eq!(*observed.lock().unwrap(), vec![0, 1]);
+    supervisor.shutdown_for_test().await.unwrap();
 }
 
 async fn assert_fault_then_recovery(
@@ -1188,7 +1259,7 @@ async fn assert_fault_then_recovery(
     let (supervisor, launcher) = recovery_supervisor(first_startup, Duration::from_secs(2));
     let error = supervisor
         .execute(
-            RunStep { code: code.into() },
+            RunStep::new(code.into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         )
@@ -1212,9 +1283,7 @@ async fn worker_supervisor_watchdog_bounds_synchronous_launch_and_reaps_late_pro
     let started = Instant::now();
     let result = supervisor
         .execute(
-            RunStep {
-                code: "success".into(),
-            },
+            RunStep::new("success".into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         )
@@ -1248,9 +1317,7 @@ async fn worker_supervisor_cancellation_bounds_synchronous_launch_and_reaps_late
     let request = tokio::spawn(async move {
         request_supervisor
             .execute(
-                RunStep {
-                    code: "success".into(),
-                },
+                RunStep::new("success".into()),
                 RecordingEffects::default(),
                 request_cancellation,
             )
@@ -1289,9 +1356,7 @@ async fn assert_blocked_startup_does_not_accumulate_launches(repeated_call_count
     assert_eq!(
         supervisor
             .execute(
-                RunStep {
-                    code: "success".into(),
-                },
+                RunStep::new("success".into()),
                 RecordingEffects::default(),
                 PermCancellation::new(),
             )
@@ -1306,9 +1371,7 @@ async fn assert_blocked_startup_does_not_accumulate_launches(repeated_call_count
             tokio::spawn(async move {
                 supervisor
                     .execute(
-                        RunStep {
-                            code: "success".into(),
-                        },
+                        RunStep::new("success".into()),
                         RecordingEffects::default(),
                         PermCancellation::new(),
                     )
@@ -1424,9 +1487,7 @@ async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler()
     let task = tokio::spawn(async move {
         task_supervisor
             .execute(
-                RunStep {
-                    code: "crash-pending-effect".into(),
-                },
+                RunStep::new("crash-pending-effect".into()),
                 task_effects,
                 PermCancellation::new(),
             )
@@ -1468,9 +1529,7 @@ async fn worker_supervisor_recovery_watchdog_and_caller_drop() {
     assert_eq!(
         supervisor
             .execute(
-                RunStep {
-                    code: "deadline".into(),
-                },
+                RunStep::new("deadline".into()),
                 RecordingEffects::default(),
                 PermCancellation::new(),
             )
@@ -1488,9 +1547,7 @@ async fn worker_supervisor_recovery_watchdog_and_caller_drop() {
     let dropped = tokio::spawn(async move {
         task_supervisor
             .execute(
-                RunStep {
-                    code: "effect-pending".into(),
-                },
+                RunStep::new("effect-pending".into()),
                 task_effects,
                 PermCancellation::new(),
             )
@@ -1548,9 +1605,7 @@ async fn worker_supervisor_reaps_root_exited_descendant_holding_protocol_pipe() 
     let stale = tokio::time::timeout(
         Duration::from_secs(2),
         supervisor.execute(
-            RunStep {
-                code: "stale-response".into(),
-            },
+            RunStep::new("stale-response".into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         ),
@@ -1629,9 +1684,7 @@ async fn worker_supervisor_transport_serializes_concurrent_callers_and_orders_ef
     let first = tokio::spawn(async move {
         first_supervisor
             .execute(
-                RunStep {
-                    code: "two-effects".into(),
-                },
+                RunStep::new("two-effects".into()),
                 first_effects,
                 PermCancellation::new(),
             )
@@ -1643,9 +1696,7 @@ async fn worker_supervisor_transport_serializes_concurrent_callers_and_orders_ef
     let second = tokio::spawn(async move {
         second_supervisor
             .execute(
-                RunStep {
-                    code: "success".into(),
-                },
+                RunStep::new("success".into()),
                 RecordingEffects::default(),
                 PermCancellation::new(),
             )
@@ -1674,9 +1725,7 @@ fn worker_supervisor_transport_run_and_verify_reuse_one_serialized_connection() 
         .unwrap();
     let first = runtime
         .block_on(supervisor.execute(
-            RunStep {
-                code: "success".into(),
-            },
+            RunStep::new("success".into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         ))
@@ -1709,9 +1758,7 @@ async fn worker_supervisor_transport_cancellation_drops_effect_and_starts_next_g
     let task = tokio::spawn(async move {
         task_supervisor
             .execute(
-                RunStep {
-                    code: "effect-pending".into(),
-                },
+                RunStep::new("effect-pending".into()),
                 task_effects,
                 task_cancellation,
             )
@@ -1734,9 +1781,7 @@ async fn worker_supervisor_transport_cancellation_drops_effect_and_starts_next_g
 
     let recovered = supervisor
         .execute(
-            RunStep {
-                code: "success".into(),
-            },
+            RunStep::new("success".into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         )
@@ -1755,9 +1800,7 @@ async fn worker_supervisor_transport_dropped_caller_releases_owner_and_cancels_h
     let task = tokio::spawn(async move {
         task_supervisor
             .execute(
-                RunStep {
-                    code: "effect-pending".into(),
-                },
+                RunStep::new("effect-pending".into()),
                 task_effects,
                 PermCancellation::new(),
             )
@@ -1770,9 +1813,7 @@ async fn worker_supervisor_transport_dropped_caller_releases_owner_and_cancels_h
     let recovered = tokio::time::timeout(
         Duration::from_secs(5),
         supervisor.execute(
-            RunStep {
-                code: "success".into(),
-            },
+            RunStep::new("success".into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         ),
@@ -1795,9 +1836,7 @@ async fn worker_supervisor_transport_rejects_stale_generation_before_protocol_st
     let supervisor = scripted_supervisor(0);
     let result = supervisor
         .execute(
-            RunStep {
-                code: "success".into(),
-            },
+            RunStep::new("success".into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         )
@@ -1811,9 +1850,7 @@ async fn worker_supervisor_transport_bounds_stderr_without_blocking_worker() {
     let supervisor = scripted_supervisor(256 * 1024);
     let result = supervisor
         .execute(
-            RunStep {
-                code: "success".into(),
-            },
+            RunStep::new("success".into()),
             RecordingEffects::default(),
             PermCancellation::new(),
         )
@@ -1982,6 +2019,10 @@ fn run_scripted_supervisor_worker() -> ! {
                         outcome: StepOutcome::Value(value.into()),
                         console: Vec::new(),
                         diagnostic: None,
+                        #[cfg(feature = "skills")]
+                        skill_events: Vec::new(),
+                        #[cfg(feature = "skills")]
+                        evidence_complete: true,
                     }),
                 );
                 protocol.on_send(&terminal).unwrap();

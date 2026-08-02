@@ -208,7 +208,7 @@ pub(crate) enum ParentFrame {
     Shutdown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     content = "data",
@@ -235,6 +235,46 @@ pub(crate) struct WorkerReady {}
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunStep {
     pub(crate) code: String,
+    pub(crate) model_grant_id: Option<GrantId>,
+    #[cfg(feature = "skills")]
+    pub(crate) artifacts: Vec<super::skills::SkillArtifact>,
+    #[cfg(feature = "skills")]
+    pub(crate) turn_id: String,
+    #[cfg(feature = "skills")]
+    pub(crate) tool_call_id: String,
+}
+
+impl RunStep {
+    pub(crate) fn new(code: String) -> Self {
+        Self {
+            code,
+            model_grant_id: None,
+            #[cfg(feature = "skills")]
+            artifacts: Vec::new(),
+            #[cfg(feature = "skills")]
+            turn_id: String::new(),
+            #[cfg(feature = "skills")]
+            tool_call_id: String::new(),
+        }
+    }
+
+    pub(crate) fn with_model_grant(mut self, grant_id: GrantId) -> Self {
+        self.model_grant_id = Some(grant_id);
+        self
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_skills(
+        mut self,
+        artifacts: Vec<super::skills::SkillArtifact>,
+        turn_id: String,
+        tool_call_id: String,
+    ) -> Self {
+        self.artifacts = artifacts;
+        self.turn_id = turn_id;
+        self.tool_call_id = tool_call_id;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -386,12 +426,16 @@ pub(crate) enum EffectErrorCode {
     OutcomeUnknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StepResult {
     pub(crate) outcome: StepOutcome,
     pub(crate) console: Vec<ConsoleRecord>,
     pub(crate) diagnostic: Option<Diagnostic>,
+    #[cfg(feature = "skills")]
+    pub(crate) skill_events: Vec<super::skills::telemetry::SkillEvent>,
+    #[cfg(feature = "skills")]
+    pub(crate) evidence_complete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

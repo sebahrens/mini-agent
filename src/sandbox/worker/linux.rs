@@ -958,9 +958,7 @@ fn complete_hello_ready_and_run_step(process: &mut WorkerProcess) -> io::Result<
         BuildIdentity::current(),
         invocation,
         2,
-        ParentFrame::RunStep(RunStep {
-            code: "21 * 2".into(),
-        }),
+        ParentFrame::RunStep(RunStep::new("21 * 2".into())),
     );
     protocol
         .on_send(&run_step)
