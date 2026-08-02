@@ -3,9 +3,11 @@ use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
+#[cfg(feature = "skills")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 

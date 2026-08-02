@@ -9,12 +9,14 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::process_creation::{StdCommandCreationExt, TokioCommandCreationExt};
+#[cfg(unix)]
+use crate::process_creation::StdCommandCreationExt;
+use crate::process_creation::TokioCommandCreationExt;
 
 #[cfg(feature = "js")]
 pub(crate) mod worker;
 
-#[cfg(feature = "js")]
+#[cfg(all(feature = "js", target_os = "linux"))]
 pub(crate) type SandboxCommand = Command;
 
 #[derive(Debug, Clone)]
@@ -1082,10 +1084,10 @@ pub(crate) fn configure_child_lifetime(cmd: &mut Command) {
     cmd.process_group(0);
 }
 
-pub(crate) fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(_pid: u32) {
     #[cfg(unix)]
     {
-        let group = format!("-{}", pid);
+        let group = format!("-{}", _pid);
         let _ = std::process::Command::new("kill")
             .args(["-TERM", "--", &group])
             .stdout(std::process::Stdio::null())

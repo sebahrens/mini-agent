@@ -45,7 +45,6 @@ pub(crate) fn windows_file_identity<T>(file: &T) -> std::io::Result<WindowsFileI
 where
     T: std::os::windows::io::AsRawHandle,
 {
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
     };
@@ -76,7 +75,6 @@ pub(crate) fn windows_file_link_count<T>(file: &T) -> std::io::Result<u32>
 where
     T: std::os::windows::io::AsRawHandle,
 {
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
     };
@@ -1418,7 +1416,7 @@ fn atomic_write_platform(
     }
 
     let target = parent.join(leaf);
-    let initial_target = match checked_path_metadata(&target) {
+    let initial_target: Option<CheckedMetadata> = match checked_path_metadata(&target) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(path_changed_error(&target));
         }

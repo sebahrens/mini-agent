@@ -398,12 +398,18 @@ mod feasibility {
     use std::ffi::{OsStr, c_void};
     use std::fmt;
     use std::fs::{File, OpenOptions};
-    use std::io::{self, BufRead, BufReader, Read, Write};
+    use std::io::{self, Read, Write};
+    #[cfg(test)]
+    use std::io::{BufRead, BufReader};
     use std::mem::{size_of, size_of_val};
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+    #[cfg(test)]
+    use std::net::TcpListener;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
-    use std::os::windows::io::{AsRawHandle, AsRawSocket};
+    use std::os::windows::io::AsRawHandle;
+    #[cfg(test)]
+    use std::os::windows::io::AsRawSocket;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus};
     use std::ptr::{null, null_mut};
@@ -444,14 +450,15 @@ mod feasibility {
         GetConsoleCP, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
         STD_OUTPUT_HANDLE,
     };
+    #[cfg(test)]
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
-        JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAndIoAccountingInformation,
-        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-        SetInformationJobObject,
+        CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAndIoAccountingInformation, JobObjectBasicUIRestrictions,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Memory::{
         GetProcessHeap, HEAP_ZERO_MEMORY, HeapAlloc, HeapFree,
@@ -2499,9 +2506,9 @@ mod feasibility {
         Ok(block)
     }
 
-    fn production_executable(hooks: &ProductionLaunchHooks) -> Result<PathBuf, GateError> {
+    fn production_executable(_hooks: &ProductionLaunchHooks) -> Result<PathBuf, GateError> {
         #[cfg(test)]
-        if let Some(executable) = &hooks.executable_override {
+        if let Some(executable) = &_hooks.executable_override {
             return Ok(executable.clone());
         }
         std::env::current_exe()
@@ -2518,8 +2525,10 @@ mod feasibility {
     }
 
     pub(super) fn launch_production(
-        mut hooks: ProductionLaunchHooks,
+        hooks: ProductionLaunchHooks,
     ) -> Result<WorkerProcess, GateError> {
+        #[cfg(test)]
+        let mut hooks = hooks;
         hooks.checkpoint(ProductionFailurePoint::CreateProfile)?;
         let profile = AppContainerProfile::production_zero_capability()?;
         hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
@@ -3805,8 +3814,7 @@ mod feasibility {
             return false;
         }
         // SAFETY: this is the documented Flags member of the initialized union returned above.
-        unsafe { policy.Anonymous.Flags }
-        &0b1 == 0b1
+        (unsafe { policy.Anonymous.Flags } & 0b1) == 0b1
     }
 
     pub(super) fn verify_runtime_controls(
