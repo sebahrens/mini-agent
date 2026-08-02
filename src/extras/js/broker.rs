@@ -7,10 +7,16 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::audit::{
+    AuditCapability, AuditDecision, AuditError, AuditResultCode, EffectAudit, EffectCompletion,
+    EffectIntent, SanitizedTarget,
+};
 use super::protocol::{
     AdvisoryAttribution, EffectError, EffectErrorCode, EffectRequest, GrantId, InvocationId,
 };
@@ -20,6 +26,7 @@ use super::types::EffectServiceError;
 use super::types::PermCancellation;
 
 pub(crate) type ParentEffectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type SharedEffectAudit = Arc<Mutex<EffectAudit>>;
 
 /// Closed coarse capabilities understood by the invocation broker.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -135,6 +142,8 @@ pub(crate) enum HostEffectError {
     OutputLimit,
     #[error("effect backend is unavailable")]
     BackendFailure,
+    #[error("effect audit is unavailable")]
+    AuditFailure,
     #[error("effect outcome is unknown after dispatch")]
     OutcomeUnknown,
 }
@@ -147,6 +156,7 @@ impl HostEffectError {
             Self::AskTimedOut | Self::EffectTimedOut => EffectErrorCode::TimedOut,
             Self::OutputLimit => EffectErrorCode::OutputLimit,
             Self::BackendFailure => EffectErrorCode::BackendFailure,
+            Self::AuditFailure => EffectErrorCode::AuditFailure,
             Self::OutcomeUnknown => EffectErrorCode::OutcomeUnknown,
             Self::UnknownGrant
             | Self::ReplayedGrant
@@ -165,6 +175,12 @@ impl HostEffectError {
         EffectResult::Error(EffectError {
             code: self.wire_code(),
         })
+    }
+}
+
+impl From<AuditError> for HostEffectError {
+    fn from(_error: AuditError) -> Self {
+        Self::AuditFailure
     }
 }
 
@@ -199,6 +215,26 @@ pub(crate) struct AuthorizedEffect {
     grant_id: GrantId,
     principal: GrantPrincipal,
     capability: HostCapability,
+}
+
+/// Exact parent-normalized target returned by authorization and consumed only to derive
+/// redacted audit metadata. Raw values never enter the persisted audit record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AuthorizedTarget {
+    ReadFile {
+        canonical_path: String,
+    },
+    WriteFile {
+        canonical_path: String,
+    },
+    Fetch {
+        normalized_url: String,
+        method: String,
+    },
+    Spawn {
+        resolved_executable: String,
+    },
+    ProposeSkill,
 }
 
 impl AuthorizedEffect {
@@ -238,7 +274,7 @@ pub(crate) trait ParentEffectService: Send {
         authorized: &'a AuthorizedEffect,
         operation: &'a EffectOperation,
         cancellation: PermCancellation,
-    ) -> ParentEffectFuture<'a, Result<(), HostEffectError>>;
+    ) -> ParentEffectFuture<'a, Result<AuthorizedTarget, HostEffectError>>;
 
     fn execute<'a>(
         &'a mut self,
@@ -270,6 +306,9 @@ pub(crate) struct InvocationBroker<S> {
     session_allowed: BTreeSet<HostCapability>,
     state: InvocationState,
     service: S,
+    audit: SharedEffectAudit,
+    #[cfg(test)]
+    fail_completion_durability: Option<super::audit::AuditFailurePoint>,
 }
 
 impl<S: ParentEffectService> InvocationBroker<S> {
@@ -278,6 +317,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         grants: Vec<InvocationGrant>,
         session_allowed: BTreeSet<HostCapability>,
         service: S,
+        audit: SharedEffectAudit,
     ) -> Result<Self, BrokerBuildError> {
         let mut grant_table = HashMap::with_capacity(grants.len());
         for grant in grants {
@@ -292,6 +332,9 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             session_allowed,
             state: InvocationState::Active,
             service,
+            audit,
+            #[cfg(test)]
+            fail_completion_durability: None,
         })
     }
 
@@ -368,7 +411,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         if authorization_result == Err(HostEffectError::InvocationCancelled) {
             self.cancel_invocation();
         }
-        authorization_result?;
+        let audit_target = authorization_result?;
 
         if cancellation.is_cancelled() {
             self.cancel_invocation();
@@ -376,10 +419,73 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         }
         self.ensure_grant_unexpired(&request.grant_id, grant.expires_at)?;
 
+        let effect_id = effect_id(&self.invocation_id, request.effect_ordinal);
+        let (artifact_id, export) = match &authorized.principal {
+            GrantPrincipal::ModelAuthored { .. } => (None, None),
+            GrantPrincipal::Skill {
+                artifact_id,
+                export,
+                ..
+            } => (Some(artifact_id.clone()), Some(export.clone())),
+        };
+        let timestamp_ms = match timestamp_ms() {
+            Ok(timestamp_ms) => timestamp_ms,
+            Err(error) => {
+                self.erase_authority(InvocationState::Terminal);
+                return Err(error);
+            }
+        };
+        let intent_result = self
+            .audit
+            .lock()
+            .map_err(|_| HostEffectError::AuditFailure)
+            .and_then(|mut audit| {
+                let normalized_target = sanitize_target(&audit, capability, audit_target)?;
+                audit
+                    .append_intent(EffectIntent {
+                        effect_id: effect_id.clone(),
+                        invocation_id: self.invocation_id.to_string(),
+                        grant_id: authorized.grant_id.get().to_string(),
+                        sequence: u64::from(request.effect_ordinal) + 1,
+                        timestamp_ms,
+                        artifact_id,
+                        export,
+                        capability: audit_capability(capability),
+                        normalized_target,
+                        decision: AuditDecision::Authorized,
+                    })
+                    .map_err(HostEffectError::from)
+            });
+        if intent_result.is_err() {
+            self.erase_authority(InvocationState::Terminal);
+            return Err(HostEffectError::AuditFailure);
+        }
+
         let execution_result = self
             .service
             .execute(&authorized, &request.operation, cancellation)
             .await;
+        let completion_code = audit_result_code(&execution_result);
+        let completion_result = self
+            .audit
+            .lock()
+            .map_err(|_| HostEffectError::AuditFailure)
+            .and_then(|mut audit| {
+                #[cfg(test)]
+                if let Some(failure) = self.fail_completion_durability.take() {
+                    audit.fail_next_durability_for_test(failure);
+                }
+                audit
+                    .append_completion(EffectCompletion {
+                        effect_id,
+                        result_code: completion_code,
+                    })
+                    .map_err(HostEffectError::from)
+            });
+        if completion_result.is_err() {
+            self.erase_authority(InvocationState::Terminal);
+            return Err(HostEffectError::AuditFailure);
+        }
         if matches!(execution_result, Err(HostEffectError::InvocationCancelled)) {
             self.cancel_invocation();
         }
@@ -411,6 +517,30 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         self.grants.len() + self.retired_grants.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn audit_records_for_test(&self) -> Vec<super::audit::EffectAuditRecord> {
+        self.audit.lock().unwrap().records().to_vec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_audit_durability_for_test(
+        &mut self,
+        failure: super::audit::AuditFailurePoint,
+    ) {
+        self.audit
+            .lock()
+            .unwrap()
+            .fail_next_durability_for_test(failure);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_completion_durability_for_test(
+        &mut self,
+        failure: super::audit::AuditFailurePoint,
+    ) {
+        self.fail_completion_durability = Some(failure);
+    }
+
     fn ensure_active(&self) -> Result<(), HostEffectError> {
         match self.state {
             InvocationState::Active => Ok(()),
@@ -438,6 +568,110 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         self.retired_grants.clear();
         self.state = state;
     }
+}
+
+fn sanitize_target(
+    audit: &EffectAudit,
+    capability: HostCapability,
+    target: AuthorizedTarget,
+) -> Result<SanitizedTarget, HostEffectError> {
+    match (capability, target) {
+        (HostCapability::ReadFile, AuthorizedTarget::ReadFile { canonical_path }) => {
+            Ok(audit.file_target(&canonical_path))
+        }
+        (HostCapability::WriteFile, AuthorizedTarget::WriteFile { canonical_path }) => {
+            Ok(audit.write_file_target(&canonical_path))
+        }
+        (
+            HostCapability::Fetch,
+            AuthorizedTarget::Fetch {
+                normalized_url,
+                method,
+            },
+        ) => audit
+            .fetch_target(&normalized_url, &method)
+            .map_err(HostEffectError::from),
+        (
+            HostCapability::Spawn,
+            AuthorizedTarget::Spawn {
+                resolved_executable,
+            },
+        ) => Ok(audit.spawn_target(&resolved_executable)),
+        (HostCapability::ProposeSkill, AuthorizedTarget::ProposeSkill) => {
+            Ok(audit.proposal_target())
+        }
+        _ => Err(HostEffectError::AuditFailure),
+    }
+}
+
+fn audit_capability(capability: HostCapability) -> AuditCapability {
+    match capability {
+        HostCapability::ReadFile => AuditCapability::ReadFile,
+        HostCapability::WriteFile => AuditCapability::WriteFile,
+        HostCapability::Fetch => AuditCapability::Fetch,
+        HostCapability::Spawn => AuditCapability::Spawn,
+        HostCapability::ProposeSkill => AuditCapability::ProposeSkill,
+    }
+}
+
+fn audit_result_code(result: &Result<EffectResult, HostEffectError>) -> AuditResultCode {
+    match result {
+        Ok(EffectResult::Spawn {
+            timed_out: true, ..
+        }) => AuditResultCode::TimedOut,
+        Ok(
+            EffectResult::Spawn {
+                stdout_truncated: true,
+                ..
+            }
+            | EffectResult::Spawn {
+                stderr_truncated: true,
+                ..
+            }
+            | EffectResult::Fetch {
+                truncated: true, ..
+            },
+        ) => AuditResultCode::OutputLimit,
+        Ok(EffectResult::Error(error)) => match error.code {
+            EffectErrorCode::Cancelled => AuditResultCode::Cancelled,
+            EffectErrorCode::TimedOut => AuditResultCode::TimedOut,
+            EffectErrorCode::OutputLimit => AuditResultCode::OutputLimit,
+            EffectErrorCode::OutcomeUnknown => AuditResultCode::OutcomeUnknown,
+            EffectErrorCode::BackendFailure | EffectErrorCode::AuditFailure => {
+                AuditResultCode::BackendFailure
+            }
+            EffectErrorCode::Denied | EffectErrorCode::InvalidTarget => AuditResultCode::Denied,
+        },
+        Ok(_) => AuditResultCode::Succeeded,
+        Err(HostEffectError::InvocationCancelled) => AuditResultCode::Cancelled,
+        Err(HostEffectError::AskTimedOut | HostEffectError::EffectTimedOut) => {
+            AuditResultCode::TimedOut
+        }
+        Err(HostEffectError::OutputLimit) => AuditResultCode::OutputLimit,
+        Err(HostEffectError::OutcomeUnknown) => AuditResultCode::OutcomeUnknown,
+        Err(HostEffectError::BackendFailure | HostEffectError::AuditFailure) => {
+            AuditResultCode::BackendFailure
+        }
+        Err(_) => AuditResultCode::Denied,
+    }
+}
+
+fn effect_id(invocation_id: &InvocationId, ordinal: u32) -> String {
+    let bytes = invocation_id.as_str().as_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"mini-agent-js-effect-id-v1\0");
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    digest.update(ordinal.to_be_bytes());
+    format!("effect-{:x}", digest.finalize())
+}
+
+fn timestamp_ms() -> Result<i64, HostEffectError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| HostEffectError::AuditFailure)?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| HostEffectError::AuditFailure)
 }
 
 impl<S: ParentEffectService> InvocationEffectHandler for InvocationBroker<S> {

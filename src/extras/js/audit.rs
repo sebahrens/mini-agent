@@ -1,7 +1,7 @@
 //! Private, append-only persistence for parent-authorized JavaScript effects.
 //!
-//! This module owns storage integrity only. A14 inserts it into broker ordering; keeping the writer
-//! independent here makes it impossible for A13 to accidentally execute or authorize an effect.
+//! This module owns storage integrity only. The broker owns effect ordering; keeping the writer
+//! independent here prevents persistence code from executing or authorizing an effect.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -76,6 +76,7 @@ pub(crate) enum AuditResultCode {
     TimedOut,
     OutputLimit,
     BackendFailure,
+    OutcomeUnknown,
 }
 
 impl AuditResultCode {
@@ -87,6 +88,7 @@ impl AuditResultCode {
             Self::TimedOut => "timed_out",
             Self::OutputLimit => "output_limit",
             Self::BackendFailure => "backend_failure",
+            Self::OutcomeUnknown => "outcome_unknown",
         }
     }
 }
@@ -231,6 +233,7 @@ pub(crate) struct EffectAuditRecord {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuditFailurePoint {
+    Append,
     FileSync,
     DirectorySync,
 }
@@ -562,11 +565,12 @@ impl EffectAudit {
                 Err(AuditError::UnknownEffect)
             };
         };
-        let body = body_from_record(
-            &intent,
-            AuditState::Completed,
-            Some(completion.result_code.as_str().into()),
-        );
+        let state = if completion.result_code == AuditResultCode::OutcomeUnknown {
+            AuditState::OutcomeUnknown
+        } else {
+            AuditState::Completed
+        };
+        let body = body_from_record(&intent, state, Some(completion.result_code.as_str().into()));
         let record = self.append_effect(body)?;
         self.active.remove(&completion.effect_id);
         self.terminal.insert(completion.effect_id);
@@ -836,6 +840,10 @@ impl EffectAudit {
     }
 
     fn append_encoded(&mut self, stored: &StoredRecord) -> Result<(), AuditError> {
+        if self.options.failure == Some(AuditFailurePoint::Append) {
+            self.options.failure = None;
+            return Err(AuditError::PathUnavailable);
+        }
         let encoded = encode_record(stored)?;
         self.current_file
             .write_all(&encoded)

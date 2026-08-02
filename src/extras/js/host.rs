@@ -24,7 +24,7 @@ use std::sync::{
 use std::time::Instant;
 
 use crate::extras::js::broker::{
-    AuthorizedEffect, HostEffectError, ParentEffectFuture, ParentEffectService,
+    AuthorizedEffect, AuthorizedTarget, HostEffectError, ParentEffectFuture, ParentEffectService,
 };
 use crate::extras::js::protocol::{EffectOperation, EffectResult};
 #[cfg(feature = "skills")]
@@ -2418,8 +2418,9 @@ impl SpawnEffectService {
             .check_structured_async("bash", &subject, policy_input)
             .await
             .map_err(permission_service_error)?;
+        let program = resolve_spawn_executable(program)?;
         Ok(PreparedSpawnEffect {
-            program: program.to_string(),
+            program,
             arguments: arguments.to_vec(),
         })
     }
@@ -2475,6 +2476,65 @@ impl SpawnEffectService {
             stdout_truncated,
             stderr_truncated,
         })
+    }
+}
+
+fn resolve_spawn_executable(program: &str) -> Result<String, EffectServiceError> {
+    let source = Path::new(program);
+    let candidates = if source.is_absolute() || source.components().count() > 1 {
+        spawn_executable_candidates(source.to_path_buf())
+    } else {
+        let path = std::env::var_os("PATH").ok_or(EffectServiceError::InvalidTarget)?;
+        std::env::split_paths(&path)
+            .flat_map(|directory| spawn_executable_candidates(directory.join(source)))
+            .collect()
+    };
+    for candidate in candidates {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        let canonical =
+            std::fs::canonicalize(candidate).map_err(|_| EffectServiceError::InvalidTarget)?;
+        return canonical
+            .to_str()
+            .map(str::to_string)
+            .ok_or(EffectServiceError::InvalidTarget);
+    }
+    Err(EffectServiceError::InvalidTarget)
+}
+
+fn spawn_executable_candidates(path: PathBuf) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        if path.extension().is_some() {
+            return vec![path];
+        }
+        let extensions = std::env::var_os("PATHEXT")
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+        return extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| {
+                let mut candidate = path.as_os_str().to_os_string();
+                candidate.push(extension.to_ascii_lowercase());
+                PathBuf::from(candidate)
+            })
+            .collect();
+    }
+    #[cfg(not(windows))]
+    {
+        vec![path]
     }
 }
 
@@ -2586,17 +2646,26 @@ impl ParentEffectService for ParentHostEffectService {
         _authorized: &'a AuthorizedEffect,
         operation: &'a EffectOperation,
         cancellation: PermCancellation,
-    ) -> ParentEffectFuture<'a, Result<(), HostEffectError>> {
+    ) -> ParentEffectFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
         Box::pin(async move {
             self.prepared = None;
-            let prepared = match operation {
+            let (prepared, audit_target) = match operation {
                 EffectOperation::ReadFile { path } => {
                     let bridge = self.file.permission_bridge.for_host_call(cancellation);
-                    PreparedParentEffect::Read(
-                        self.file
-                            .authorize_read(path, bridge)
-                            .await
-                            .map_err(HostEffectError::from)?,
+                    let prepared = self
+                        .file
+                        .authorize_read(path, bridge)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    let canonical_path = prepared
+                        .0
+                        .path
+                        .to_str()
+                        .ok_or(HostEffectError::InvalidTarget)?
+                        .to_string();
+                    (
+                        PreparedParentEffect::Read(prepared),
+                        AuthorizedTarget::ReadFile { canonical_path },
                     )
                 }
                 EffectOperation::WriteFile { path, content } => {
@@ -2606,18 +2675,33 @@ impl ParentEffectService for ParentHostEffectService {
                         .authorize_write(path, bridge)
                         .await
                         .map_err(HostEffectError::from)?;
-                    PreparedParentEffect::Write {
-                        target,
-                        content: content.clone(),
-                    }
+                    let canonical_path = target
+                        .0
+                        .path
+                        .to_str()
+                        .ok_or(HostEffectError::InvalidTarget)?
+                        .to_string();
+                    (
+                        PreparedParentEffect::Write {
+                            target,
+                            content: content.clone(),
+                        },
+                        AuthorizedTarget::WriteFile { canonical_path },
+                    )
                 }
                 EffectOperation::Spawn { program, arguments } => {
                     let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
-                    PreparedParentEffect::Spawn(
-                        self.spawn
-                            .authorize(program, arguments, bridge)
-                            .await
-                            .map_err(HostEffectError::from)?,
+                    let prepared = self
+                        .spawn
+                        .authorize(program, arguments, bridge)
+                        .await
+                        .map_err(HostEffectError::from)?;
+                    let resolved_executable = prepared.program.clone();
+                    (
+                        PreparedParentEffect::Spawn(prepared),
+                        AuthorizedTarget::Spawn {
+                            resolved_executable,
+                        },
                     )
                 }
                 #[cfg(feature = "sandbox")]
@@ -2639,11 +2723,17 @@ impl ParentEffectService for ParentHostEffectService {
                     let request = FetchRequest::try_new(method, &headers, body.clone())
                         .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
                     let control = Arc::new(FetchCallControl::new());
-                    PreparedParentEffect::Fetch(
-                        fetch
-                            .authorize(url.clone(), request, cancellation, control)
-                            .await
-                            .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?,
+                    let prepared = fetch
+                        .authorize(url.clone(), request, cancellation, control)
+                        .await
+                        .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
+                    let normalized_url = prepared.target.url.as_str().to_string();
+                    (
+                        PreparedParentEffect::Fetch(prepared),
+                        AuthorizedTarget::Fetch {
+                            normalized_url,
+                            method: method.to_string(),
+                        },
                     )
                 }
                 #[cfg(not(feature = "sandbox"))]
@@ -2653,7 +2743,7 @@ impl ParentEffectService for ParentHostEffectService {
                 }
             };
             self.prepared = Some(prepared);
-            Ok(())
+            Ok(audit_target)
         })
     }
 
