@@ -27,7 +27,9 @@ use crate::extras::js::protocol::{InvocationId, JsErrorCode, RunStep, StepOutcom
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::admission::AdmissionWorker;
 #[cfg(feature = "skills")]
-use crate::extras::js::skills::proposal::ProposalWorker;
+use crate::extras::js::skills::proposal::{
+    AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalEffectService, ProposalHost, ProposalWorker,
+};
 use crate::extras::js::supervisor::{JsWorkerSupervisor, WorkerError};
 use crate::extras::js::types::{
     PermCancellation, PermOutcome, PermRequest, PermRequestBuildError, PermResponse,
@@ -558,6 +560,8 @@ pub struct JsTool {
     #[cfg(feature = "skills")]
     _proposal_worker: Option<ProposalWorker>,
     #[cfg(feature = "skills")]
+    proposal_service: Option<ProposalEffectService>,
+    #[cfg(feature = "skills")]
     _admission_worker: Option<AdmissionWorker>,
     #[cfg(feature = "skills")]
     telemetry: Option<crate::extras::js::skills::telemetry::TelemetryDispatcher>,
@@ -591,6 +595,10 @@ impl JsTool {
         proposal_worker: ProposalWorker,
     ) -> Self {
         let mut tool = Self::new(sandbox, permission, ask_tx, allow_config);
+        tool.proposal_service = Some(ProposalEffectService::new(ProposalHost::new(
+            proposal_worker.sender(),
+            AttemptBudget::new(DEFAULT_SESSION_ATTEMPTS),
+        )));
         tool._proposal_worker = Some(proposal_worker);
         tool
     }
@@ -637,6 +645,8 @@ impl JsTool {
             )),
             #[cfg(feature = "skills")]
             _proposal_worker: None,
+            #[cfg(feature = "skills")]
+            proposal_service: None,
             #[cfg(feature = "skills")]
             _admission_worker: None,
             #[cfg(feature = "skills")]
@@ -729,6 +739,12 @@ impl Tool for JsTool {
             "read_file(path), write_file(path, content), spawn(cmd, args), console.log(...)"
                 .to_string()
         };
+        #[cfg(feature = "skills")]
+        let mut globals = globals;
+        #[cfg(feature = "skills")]
+        if self.proposal_service.is_some() {
+            globals.push_str(", propose_skill(draft)");
+        }
         format!(
             "Execute JavaScript code. Available globals: {globals}. Returns the last expression \
              value as a string. Runtime failures use closed, source-free error classes."
@@ -766,15 +782,49 @@ impl Tool for JsTool {
         let skill_tool_call_id = format!("js:{}", uuid::Uuid::new_v4());
         let invocation_id = InvocationId::new(format!("tool:{}", uuid::Uuid::new_v4()))
             .map_err(|_| ToolError::Msg("JS invocation identity unavailable".into()))?;
+        let model_capabilities = std::collections::BTreeSet::from([
+            HostCapability::ReadFile,
+            HostCapability::WriteFile,
+            HostCapability::Fetch,
+            HostCapability::Spawn,
+        ]);
         let grant = InvocationGrant::issue(
             invocation_id.clone(),
             GrantPrincipal::ModelAuthored {
                 tool_call_id: skill_tool_call_id.clone(),
             },
-            HostCapability::all(),
+            model_capabilities.clone(),
             Instant::now() + STEP_TIMEOUT,
         );
         let model_grant_id = grant.grant_id().clone();
+        let grants = vec![grant];
+        let session_capabilities = model_capabilities;
+        #[cfg(feature = "skills")]
+        let mut grants = grants;
+        #[cfg(feature = "skills")]
+        let mut session_capabilities = session_capabilities;
+        #[cfg(feature = "skills")]
+        let proposal_grant_id = self.proposal_service.as_ref().map(|_| {
+            let proposal_grant = InvocationGrant::issue(
+                invocation_id.clone(),
+                GrantPrincipal::ModelAuthored {
+                    tool_call_id: skill_tool_call_id.clone(),
+                },
+                std::collections::BTreeSet::from([HostCapability::ProposeSkill]),
+                Instant::now() + STEP_TIMEOUT,
+            );
+            let id = proposal_grant.grant_id().clone();
+            grants.push(proposal_grant);
+            session_capabilities.insert(HostCapability::ProposeSkill);
+            id
+        });
+        #[cfg(feature = "skills")]
+        let skill_invocations = issue_skill_invocations(
+            &skill_bundle,
+            &skill_tool_call_id,
+            &invocation_id,
+            &mut grants,
+        )?;
         let bridge = self
             .permission_bridge
             .bridge()
@@ -790,19 +840,31 @@ impl Tool for JsTool {
             self.allow_config.fetch_policy(),
             STEP_TIMEOUT,
         ));
+        #[cfg(feature = "skills")]
+        let service = if let Some(proposal) = self.proposal_service.clone() {
+            service.with_proposal(proposal)
+        } else {
+            service
+        };
         let audit = self
             .audit
             .clone()
             .map_err(|_| ToolError::Msg("JS effect audit unavailable".into()))?;
         let broker = InvocationBroker::new(
             invocation_id.clone(),
-            vec![grant],
-            HostCapability::all(),
+            grants,
+            session_capabilities,
             service,
             audit,
         )
         .map_err(|_| ToolError::Msg("JS invocation authority unavailable".into()))?;
         let run_step = RunStep::new(args.code).with_model_grant(model_grant_id);
+        #[cfg(feature = "skills")]
+        let run_step = if let Some(grant_id) = proposal_grant_id {
+            run_step.with_proposal_grant(grant_id)
+        } else {
+            run_step
+        };
         #[cfg(feature = "skills")]
         let run_step = run_step.with_skills(
             skill_bundle
@@ -820,6 +882,7 @@ impl Tool for JsTool {
                     capability: skill.capability.clone(),
                 })
                 .collect(),
+            skill_invocations,
             skill_bundle.turn_id.clone(),
             skill_tool_call_id.clone(),
         );
@@ -856,6 +919,63 @@ impl Tool for JsTool {
             }
         }
     }
+}
+
+#[cfg(feature = "skills")]
+fn issue_skill_invocations(
+    bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
+    tool_call_id: &str,
+    bound_invocation: &InvocationId,
+    grants: &mut Vec<InvocationGrant>,
+) -> Result<Vec<crate::extras::js::protocol::SkillInvocationGrant>, ToolError> {
+    let mut issued = Vec::new();
+    for skill in &bundle.skills {
+        for export in &skill.exports {
+            let invocation_id = crate::extras::js::skills::telemetry::stable_invocation_id(
+                &bundle.turn_id,
+                tool_call_id,
+                &skill.id,
+                &export.name,
+                0,
+            );
+            let wire_invocation_id = InvocationId::new(invocation_id.clone())
+                .map_err(|_| ToolError::Msg("skill invocation identity unavailable".into()))?;
+            let mut capability_grants = Vec::new();
+            for scope in &skill.capability.grants {
+                let skill_capability = scope.capability();
+                let capability = match skill_capability {
+                    crate::extras::js::skills::HostCapability::ReadFile => HostCapability::ReadFile,
+                    crate::extras::js::skills::HostCapability::WriteFile => {
+                        HostCapability::WriteFile
+                    }
+                    crate::extras::js::skills::HostCapability::Spawn => HostCapability::Spawn,
+                    crate::extras::js::skills::HostCapability::Fetch => HostCapability::Fetch,
+                };
+                let grant = InvocationGrant::issue(
+                    bound_invocation.clone(),
+                    GrantPrincipal::Skill {
+                        artifact_id: skill.id.clone(),
+                        export: export.name.clone(),
+                        invocation_id: invocation_id.clone(),
+                    },
+                    std::collections::BTreeSet::from([capability]),
+                    Instant::now() + STEP_TIMEOUT,
+                );
+                capability_grants.push(crate::extras::js::protocol::SkillCapabilityGrant {
+                    capability: skill_capability,
+                    grant_id: grant.grant_id().clone(),
+                });
+                grants.push(grant);
+            }
+            issued.push(crate::extras::js::protocol::SkillInvocationGrant {
+                artifact_id: skill.id.clone(),
+                export_name: export.name.clone(),
+                invocation_id: wire_invocation_id,
+                grants: capability_grants,
+            });
+        }
+    }
+    Ok(issued)
 }
 
 #[cfg(feature = "skills")]

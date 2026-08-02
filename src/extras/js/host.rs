@@ -28,11 +28,12 @@ use crate::extras::js::broker::{
     AuthorizedEffect, AuthorizedTarget, HostEffectError, ParentEffectFuture, ParentEffectService,
 };
 use crate::extras::js::protocol::{EffectOperation, EffectResult};
-#[cfg(all(feature = "skills", test))]
+#[cfg(feature = "skills")]
 use crate::extras::js::skills::proposal::{
-    JsProposal, PreparedProposalEffect, ProposalEffectService, ProposalError, ProposalHost,
-    proposal_service_error,
+    JsProposal, PreparedProposalEffect, ProposalEffectService, proposal_service_error,
 };
+#[cfg(all(feature = "skills", test))]
+use crate::extras::js::skills::proposal::{ProposalError, ProposalHost};
 use crate::extras::js::tool::{PermissionBridge, PermissionBridgeError};
 use crate::extras::js::types::PermCancellation;
 #[cfg(test)]
@@ -2590,9 +2591,10 @@ pub(crate) struct ParentHostEffectService {
     fetch: Option<FetchEffectService>,
     #[cfg(feature = "skills")]
     proposal: Option<ProposalEffectService>,
-    #[cfg(feature = "skills")]
-    prepared_proposal: Option<PreparedProposalEffect>,
-    prepared: Option<PreparedParentEffect>,
+    /// Target preparation produced by synchronous validation. This is kept separate from the
+    /// authorization result so proposal canonicalization and target normalization can coexist.
+    validated: Option<PreparedParentEffect>,
+    authorized: Option<PreparedParentEffect>,
 }
 
 impl ParentHostEffectService {
@@ -2604,9 +2606,8 @@ impl ParentHostEffectService {
             fetch: None,
             #[cfg(feature = "skills")]
             proposal: None,
-            #[cfg(feature = "skills")]
-            prepared_proposal: None,
-            prepared: None,
+            validated: None,
+            authorized: None,
         }
     }
 
@@ -2629,11 +2630,7 @@ impl ParentEffectService for ParentHostEffectService {
         _authorized: &AuthorizedEffect,
         operation: &EffectOperation,
     ) -> Result<(), HostEffectError> {
-        self.prepared = None;
-        #[cfg(feature = "skills")]
-        {
-            self.prepared_proposal = None;
-        }
+        self.validated = None;
         match operation {
             EffectOperation::ReadFile { path } if path.is_empty() || path.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
@@ -2663,13 +2660,13 @@ impl ParentEffectService for ParentHostEffectService {
                 proposal
                     .reserve_attempt()
                     .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
-                self.prepared_proposal = Some(
+                self.validated = Some(PreparedParentEffect::Proposal(
                     proposal
                         .authorize_reserved(JsProposal::try_from(draft.clone()).map_err(
                             |error| HostEffectError::from(proposal_service_error(error)),
                         )?)
                         .map_err(|error| HostEffectError::from(proposal_service_error(error)))?,
-                );
+                ));
                 Ok(())
             }
             #[cfg(not(feature = "skills"))]
@@ -2712,7 +2709,7 @@ impl ParentEffectService for ParentHostEffectService {
         cancellation: PermCancellation,
     ) -> ParentEffectFuture<'a, Result<AuthorizedTarget, HostEffectError>> {
         Box::pin(async move {
-            self.prepared = None;
+            self.authorized = None;
             let (prepared, audit_target) = match operation {
                 EffectOperation::ReadFile { path } => {
                     let bridge = self.file.permission_bridge.for_host_call(cancellation);
@@ -2809,20 +2806,22 @@ impl ParentEffectService for ParentHostEffectService {
                 #[cfg(feature = "skills")]
                 EffectOperation::ProposeSkill { .. } => {
                     let prepared = self
-                        .prepared_proposal
+                        .validated
                         .take()
                         .ok_or(HostEffectError::BackendFailure)?;
-                    (
-                        PreparedParentEffect::Proposal(prepared),
-                        AuthorizedTarget::ProposeSkill,
-                    )
+                    match prepared {
+                        PreparedParentEffect::Proposal(_) => {
+                            (prepared, AuthorizedTarget::ProposeSkill)
+                        }
+                        _ => return Err(HostEffectError::BackendFailure),
+                    }
                 }
                 #[cfg(not(feature = "skills"))]
                 EffectOperation::ProposeSkill { .. } => {
                     return Err(HostEffectError::BackendFailure);
                 }
             };
-            self.prepared = Some(prepared);
+            self.authorized = Some(prepared);
             Ok(audit_target)
         })
     }
@@ -2835,7 +2834,7 @@ impl ParentEffectService for ParentHostEffectService {
     ) -> ParentEffectFuture<'a, Result<EffectResult, HostEffectError>> {
         Box::pin(async move {
             let prepared = self
-                .prepared
+                .authorized
                 .take()
                 .ok_or(HostEffectError::BackendFailure)?;
             match prepared {

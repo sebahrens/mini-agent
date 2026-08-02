@@ -6,7 +6,7 @@
 //! JSON strings. Invocation capability construction is deliberately owned by Phase 6 A17.
 
 use rquickjs::context::EvalOptions;
-use rquickjs::function::IntoArgs;
+use rquickjs::function::{Args, IntoArgs, Rest};
 use rquickjs::object::Property;
 use rquickjs::{Context, Ctx, FromJs, Function, Object, Persistent, Runtime, Value};
 use std::collections::{HashMap, HashSet};
@@ -18,6 +18,17 @@ use super::skills::{
     HostCapability, SKILL_REALM_HARDENING_JS, SkillArtifact, private_skill_source,
 };
 use super::worker::STRICT_CLONE_SOURCE;
+
+type StartObservation = dyn Fn(String) -> Result<String, ()> + Send + Sync + 'static;
+type TerminalObservation = dyn Fn(String, bool) -> Result<(), ()> + Send + Sync + 'static;
+
+/// One model-visible export's exact parent-prepared call and observation hooks.
+#[derive(Clone)]
+pub(crate) struct BoundExportInvocation {
+    pub(crate) handle: PreparedInvocationHandle,
+    pub(crate) on_start: Arc<StartObservation>,
+    pub(crate) on_terminal: Arc<TerminalObservation>,
+}
 
 const BRIDGE_FACTORY_SOURCE: &str = r#"
 ((parse, apply) => (original, encode) => encodedArguments => {
@@ -62,6 +73,21 @@ const MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
         throw 0;
     }
 }))(Object.freeze, JSON.parse, Promise)
+"#;
+
+const TERMINAL_WRAPPER_SOURCE: &str = r#"
+((apply, promiseResolve, promiseThen, PromiseCtor) =>
+ (result, invocationId, onTerminal) => {
+    if (result && typeof result.then === "function") {
+        const promise = apply(promiseResolve, PromiseCtor, [result]);
+        return apply(promiseThen, promise, [
+            value => { onTerminal(invocationId, true); return value; },
+            error => { onTerminal(invocationId, false); throw error; }
+        ]);
+    }
+    onTerminal(invocationId, true);
+    return result;
+})(Reflect.apply, Promise.resolve, Promise.prototype.then, Promise)
 "#;
 
 const CAPABILITY_BRIDGE_FACTORY_SOURCE: &str = r#"
@@ -191,6 +217,7 @@ pub(crate) enum RealmError {
 pub(crate) struct LoadedArtifact {
     artifact_id: String,
     exports: Vec<String>,
+    dispatcher_resources: Vec<Arc<Mutex<Option<DispatcherResources>>>>,
 }
 
 impl LoadedArtifact {
@@ -203,6 +230,23 @@ impl LoadedArtifact {
     }
 }
 
+impl Drop for LoadedArtifact {
+    fn drop(&mut self) {
+        for resources in &self.dispatcher_resources {
+            if let Ok(mut resources) = resources.lock() {
+                resources.take();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DispatcherResources {
+    wrapper: Persistent<Function<'static>>,
+    terminal_host: Persistent<Function<'static>>,
+    terminal_wrapper: Persistent<Function<'static>>,
+}
+
 /// Load one identity-v2 artifact into a new private context and install exact frozen wrappers.
 ///
 /// The caller must invoke this before model source evaluation. Any error rejects the whole
@@ -213,7 +257,7 @@ pub(crate) fn load_artifact(
     model_context: &Context,
     artifact: &SkillArtifact,
 ) -> Result<LoadedArtifact, RealmError> {
-    load_artifact_internal(runtime, model_context, artifact, None)
+    load_artifact_internal(runtime, model_context, artifact, None, None)
 }
 
 /// Load an ABI-v2 artifact whose wrappers inject a fresh, revocable invocation capability.
@@ -228,6 +272,24 @@ pub(crate) fn load_artifact_with_capabilities(
         model_context,
         artifact,
         Some(Arc::new(capabilities)),
+        None,
+    )
+}
+
+/// Install Rust-owned model dispatchers that consume only their exact one-shot handles.
+pub(crate) fn load_artifact_with_bound_exports(
+    runtime: &Runtime,
+    model_context: &Context,
+    artifact: &SkillArtifact,
+    capabilities: InvocationCapabilityRuntime,
+    bindings: HashMap<String, BoundExportInvocation>,
+) -> Result<LoadedArtifact, RealmError> {
+    load_artifact_internal(
+        runtime,
+        model_context,
+        artifact,
+        Some(Arc::new(capabilities)),
+        Some(Arc::new(bindings)),
     )
 }
 
@@ -247,10 +309,40 @@ where
     R: FromJs<'js>,
 {
     let wrapper: Function = ctx.globals().get(export_name)?;
+    call_function_with_capability(&wrapper, capabilities, handle, arguments)
+}
+
+fn call_function_with_capability<'js, A, R>(
+    wrapper: &Function<'js>,
+    capabilities: &InvocationCapabilityRuntime,
+    handle: PreparedInvocationHandle,
+    arguments: A,
+) -> rquickjs::Result<R>
+where
+    A: IntoArgs<'js>,
+    R: FromJs<'js>,
+{
     let _binding = capabilities
         .bind(handle)
         .map_err(|_| rquickjs::Error::Unknown)?;
     wrapper.call(arguments)
+}
+
+fn call_function_with_capability_args<'js, R>(
+    wrapper: &Function<'js>,
+    capabilities: &InvocationCapabilityRuntime,
+    handle: PreparedInvocationHandle,
+    arguments: Vec<Value<'js>>,
+) -> rquickjs::Result<R>
+where
+    R: FromJs<'js>,
+{
+    let _binding = capabilities
+        .bind(handle)
+        .map_err(|_| rquickjs::Error::Unknown)?;
+    let mut args = Args::new(wrapper.ctx().clone(), arguments.len());
+    args.push_args(arguments)?;
+    wrapper.call_arg(args)
 }
 
 fn load_artifact_internal(
@@ -258,6 +350,7 @@ fn load_artifact_internal(
     model_context: &Context,
     artifact: &SkillArtifact,
     capabilities: Option<Arc<InvocationCapabilityRuntime>>,
+    bound_exports: Option<Arc<HashMap<String, BoundExportInvocation>>>,
 ) -> Result<LoadedArtifact, RealmError> {
     artifact
         .verify_identity()
@@ -386,8 +479,14 @@ fn load_artifact_internal(
         return Err(RealmError::PendingInitializationJobs);
     }
 
-    let wrappers =
-        build_model_wrappers(model_context, artifact, bridges, capabilities, settlements)?;
+    let (wrappers, dispatcher_resources) = build_model_wrappers(
+        model_context,
+        artifact,
+        bridges,
+        capabilities,
+        settlements,
+        bound_exports,
+    )?;
     if runtime.is_job_pending() {
         return Err(RealmError::PendingInitializationJobs);
     }
@@ -399,6 +498,7 @@ fn load_artifact_internal(
             .iter()
             .map(|export| export.name.clone())
             .collect(),
+        dispatcher_resources,
     })
 }
 
@@ -445,7 +545,14 @@ fn build_model_wrappers(
     bridges: Vec<Persistent<Function<'static>>>,
     capabilities: Option<Arc<InvocationCapabilityRuntime>>,
     settlements: Option<Arc<ModelSettlementRegistry>>,
-) -> Result<Vec<(String, Persistent<Function<'static>>)>, RealmError> {
+    bound_exports: Option<Arc<HashMap<String, BoundExportInvocation>>>,
+) -> Result<
+    (
+        Vec<(String, Persistent<Function<'static>>)>,
+        Vec<Arc<Mutex<Option<DispatcherResources>>>>,
+    ),
+    RealmError,
+> {
     model_context
         .with(|ctx| {
             // These closures are captured before model source runs, so model prototype/global
@@ -475,7 +582,18 @@ fn build_model_wrappers(
                 None
             };
 
-            artifact
+            if let Some(bindings) = bound_exports.as_ref()
+                && (bindings.len() != artifact.exports.len()
+                    || artifact
+                        .exports
+                        .iter()
+                        .any(|export| !bindings.contains_key(&export.name)))
+            {
+                return Err(rquickjs::Error::Unknown);
+            }
+
+            let mut dispatcher_resources = Vec::new();
+            let wrappers = artifact
                 .exports
                 .iter()
                 .zip(bridges)
@@ -514,11 +632,119 @@ fn build_model_wrappers(
                         // Pure A16 wrappers never accept promises and retain their smaller bridge.
                         wrapper_factory.call((invoke, model_encoder.clone().restore(&ctx)?))?
                     };
+                    let wrapper = if let Some(bindings) = bound_exports.as_ref() {
+                        let binding = bindings
+                            .get(&export.name)
+                            .ok_or(rquickjs::Error::Unknown)?
+                            .clone();
+                        let (dispatcher, resources) = build_bound_dispatcher(
+                            &ctx,
+                            wrapper,
+                            capabilities
+                                .as_ref()
+                                .ok_or(rquickjs::Error::Unknown)?
+                                .clone(),
+                            binding,
+                        )?;
+                        dispatcher_resources.push(resources);
+                        dispatcher
+                    } else {
+                        wrapper
+                    };
                     Ok((export.name.clone(), Persistent::save(&ctx, wrapper)))
                 })
-                .collect::<rquickjs::Result<Vec<_>>>()
+                .collect::<rquickjs::Result<Vec<_>>>()?;
+            Ok((wrappers, dispatcher_resources))
         })
         .map_err(|_| RealmError::WrapperInstallation)
+}
+
+fn build_bound_dispatcher<'js>(
+    ctx: &Ctx<'js>,
+    wrapper: Function<'js>,
+    capabilities: Arc<InvocationCapabilityRuntime>,
+    binding: BoundExportInvocation,
+) -> rquickjs::Result<(Function<'js>, Arc<Mutex<Option<DispatcherResources>>>)> {
+    let private_wrapper = Persistent::save(ctx, wrapper);
+    let remaining = Arc::new(Mutex::new(Some(binding.handle)));
+    let start = binding.on_start;
+    let terminal = binding.on_terminal;
+    let terminal_host = {
+        let terminal = terminal.clone();
+        Function::new(ctx.clone(), move |invocation_id: String, success: bool| {
+            terminal(invocation_id, success).map_err(|_| rquickjs::Error::Unknown)
+        })?
+    };
+    let terminal_host = Persistent::save(ctx, terminal_host);
+    let terminal_wrapper: Function = ctx.eval(TERMINAL_WRAPPER_SOURCE)?;
+    let terminal_wrapper = Persistent::save(ctx, terminal_wrapper);
+    let resources = Arc::new(Mutex::new(Some(DispatcherResources {
+        wrapper: private_wrapper,
+        terminal_host,
+        terminal_wrapper,
+    })));
+    let dispatch_resources = resources.clone();
+    let dispatcher = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>,
+              Rest(arguments): Rest<Value<'js>>|
+              -> rquickjs::Result<Persistent<Value<'static>>> {
+            // Taking the exact handle and minting the observation happen in this one Rust entry.
+            // A second call fails before `on_start` and cannot borrow another export's authority.
+            let handle = remaining
+                .lock()
+                .map_err(|_| rquickjs::Error::Unknown)?
+                .take()
+                .ok_or(rquickjs::Error::Unknown)?;
+            let invocation_id =
+                start(argument_shape(&arguments)).map_err(|_| rquickjs::Error::Unknown)?;
+            let resources = dispatch_resources
+                .lock()
+                .map_err(|_| rquickjs::Error::Unknown)?
+                .clone()
+                .ok_or(rquickjs::Error::Unknown)?;
+            let wrapper = resources.wrapper.restore(&ctx)?;
+            let result: Value = match call_function_with_capability_args(
+                &wrapper,
+                &capabilities,
+                handle,
+                arguments,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = terminal(invocation_id, false);
+                    return Err(error);
+                }
+            };
+            let observed: Value = resources.terminal_wrapper.restore(&ctx)?.call((
+                result,
+                invocation_id,
+                resources.terminal_host.restore(&ctx)?,
+            ))?;
+            Ok(Persistent::save(&ctx, observed))
+        },
+    )?;
+    Ok((dispatcher, resources))
+}
+
+fn argument_shape(arguments: &[Value<'_>]) -> String {
+    let types = arguments
+        .iter()
+        .map(|value| {
+            if value.is_null() {
+                "null"
+            } else if value.as_array().is_some() {
+                "array"
+            } else {
+                value.type_name()
+            }
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "argc": arguments.len(),
+        "types": types,
+    }))
+    .unwrap_or_else(|_| r#"{"truncated":true}"#.to_string())
 }
 
 fn publish_model_wrappers(

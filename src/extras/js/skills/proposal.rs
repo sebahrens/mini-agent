@@ -4,7 +4,6 @@
 //! construction, and a bounded request/response exchange. SQLite, verification,
 //! embeddings, held-out data, and lifecycle transitions remain on worker threads.
 
-#[cfg(test)]
 use rquickjs::{Array, Object, String as JsString};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -92,7 +91,6 @@ impl fmt::Debug for JsProposal {
 }
 
 impl JsProposal {
-    #[cfg(test)]
     pub(crate) fn from_object(object: &Object<'_>) -> Result<Self, ProposalError> {
         reject_unknown_keys(
             object,
@@ -274,6 +272,48 @@ impl JsProposal {
     }
 }
 
+impl From<JsProposal> for SkillProposalDraft {
+    fn from(proposal: JsProposal) -> Self {
+        Self {
+            source: proposal.source,
+            description: proposal.description,
+            exports: proposal
+                .exports
+                .into_iter()
+                .map(|export| crate::extras::js::protocol::SkillProposalExport {
+                    name: export.name,
+                    signature: export.signature,
+                })
+                .collect(),
+            tests: proposal.tests,
+            capability: crate::extras::js::protocol::SkillProposalCapability {
+                tier: proposal.capability.tier,
+                grants: proposal
+                    .capability
+                    .grants
+                    .into_iter()
+                    .map(|scope| match scope {
+                        JsCapabilityScope::ReadFile { workspace_prefixes } => {
+                            SkillProposalScope::ReadFile { workspace_prefixes }
+                        }
+                        JsCapabilityScope::WriteFile { workspace_prefixes } => {
+                            SkillProposalScope::WriteFile { workspace_prefixes }
+                        }
+                        JsCapabilityScope::Fetch { origins, methods } => {
+                            SkillProposalScope::Fetch { origins, methods }
+                        }
+                        JsCapabilityScope::Spawn { programs } => {
+                            SkillProposalScope::Spawn { programs }
+                        }
+                    })
+                    .collect(),
+            },
+            tags: proposal.tags,
+            predecessor_id: proposal.predecessor_id,
+        }
+    }
+}
+
 impl TryFrom<SkillProposalDraft> for JsProposal {
     type Error = ProposalError;
 
@@ -388,7 +428,6 @@ fn validate_entry_count(
     Ok(())
 }
 
-#[cfg(test)]
 fn parse_capability_scope(object: &Object<'_>) -> Result<JsCapabilityScope, ProposalError> {
     let kind = required_string(object, "kind", MAX_TAG_BYTES)?;
     match kind.as_str() {
@@ -461,7 +500,6 @@ fn parse_capability_scope(object: &Object<'_>) -> Result<JsCapabilityScope, Prop
     }
 }
 
-#[cfg(test)]
 fn required_string(
     object: &Object<'_>,
     key: &'static str,
@@ -476,7 +514,6 @@ fn required_string(
     js_string(value, key, max_bytes)
 }
 
-#[cfg(test)]
 fn js_string(
     value: JsString<'_>,
     field: &'static str,
@@ -497,7 +534,6 @@ fn js_string(
     Ok(value.as_str().to_string())
 }
 
-#[cfg(test)]
 fn required_array<'js>(
     object: &Object<'js>,
     key: &'static str,
@@ -519,7 +555,6 @@ fn required_array<'js>(
     Ok(array)
 }
 
-#[cfg(test)]
 fn required_string_array(
     object: &Object<'_>,
     key: &'static str,
@@ -540,7 +575,6 @@ fn required_string_array(
         .collect()
 }
 
-#[cfg(test)]
 fn optional_string_array(
     object: &Object<'_>,
     key: &'static str,
@@ -576,7 +610,6 @@ fn optional_string_array(
         .collect()
 }
 
-#[cfg(test)]
 fn reject_unknown_keys(
     object: &Object<'_>,
     allowed: &[&str],

@@ -182,10 +182,13 @@ optional predecessor identity. The parent converts that closed wire value into t
 proposal validator, canonicalizes the complete artifact, writes the durable proposal audit intent,
 and only then enqueues it. It never infers omitted scopes, signatures, tags, or identity fields.
 
-Model-authored step code retains bounded file, fetch, and spawn effect globals. The
-`propose_skill` global is intentionally unavailable and is not advertised until A18 supplies its
-full typed identity-v2 protocol; the parent-owned proposal and admission workers remain outside
-the worker authority boundary. Telemetry treats every structured worker field as an untrusted
+Model-authored step code retains bounded file, fetch, and spawn effect globals. When the parent
+provides a proposal service, it also issues a separate exact `ModelAuthored` proposal grant and the
+worker installs the bounded `propose_skill` global. Without that service the global is absent and
+unadvertised. The call sends only the full typed identity-v2 draft to the parent; validation,
+durable intent/completion audit, queueing, admission, and attempt-budget ownership remain outside
+the worker authority boundary. A proposal is never added to the current turn bundle, so its source
+cannot execute in the proposing step. Telemetry treats every structured worker field as an untrusted
 execution claim. The parent requires an exact match to the selected artifact/export and the
 parent-derived turn, tool-call, deterministic invocation, and step outcome before rebuilding a
 canonical event with its own retrieval metadata, index generation, production flag, timestamp,
@@ -203,8 +206,6 @@ Only a parent-issued `ModelAuthored` grant may authorize `ProposeSkill`; the bro
 stored-skill principal before target validation, audit, or enqueue. Direct, indirect, constructor,
 prototype, initialization, export-body, and promise-continuation lookups in a stored realm therefore
 have no writer binding and cannot create proposal traffic.
-The A15 cutover loads and executes pure artifacts only; an effectful stored export therefore fails
-closed until A18 wires the exact prepared invocation handle into that hidden capability object.
 
 `src/extras/js/skills/capability.rs` owns the worker-local binding from an explicit invocation ID
 and exact manifest to one opaque grant per declared method. `src/extras/js/realm.rs` constructs a
@@ -218,11 +219,12 @@ and captured grant; there is no ambient active-invocation map or map-order fallb
 
 Parent preparation also yields an opaque one-shot handle. The worker must bind that exact handle
 immediately around the intended wrapper `Function::call`; wrapper statement one consumes it before
-argument encoding or other model-controlled work. An unbound call denies, and there is no FIFO,
-metadata lookup, or ambient fallback from which an extra same-export call could borrow a later
-invocation's authority. Ordinary JavaScript calls made through `ctx.eval` are therefore
-unauthorized until A18 routes the selected export call through this Rust seam; A18/A21 production
-call wiring must use it, with no ambient fallback. Async results never expose a private-realm
+argument encoding or other model-controlled work. Production issues exactly one handle for each
+selected artifact/export pair and publishes a Rust-owned dispatcher that can consume only that
+handle. An unbound or second same-export call denies before emitting an invocation observation,
+and there is no FIFO, pool, metadata lookup, or ambient fallback from which it could borrow another
+export's authority. Pure and effectful exports use the same dispatcher seam; only methods present
+in the authoritative manifest are installed on the hidden capability object. Async results never expose a private-realm
 promise to the model realm. A Rust-owned settlement registry
 carries only the bounded encoded result string (or a closed rejection) into a promise created from
 the model realm's captured intrinsic, so its prototype and continuation ownership remain

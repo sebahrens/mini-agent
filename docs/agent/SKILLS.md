@@ -20,10 +20,15 @@ turn leases remain unchanged.
 
 At a JS call boundary, `JsTool` snapshots the current bundle. Each selected skill runs in a private
 lexical namespace, its full SHA-256 identity and exports are revalidated, and only declared,
-JSON-shaped function boundaries are published with the exact host-capability scope. Protected host
-globals cannot be replaced. Model-authored code then runs separately as `agent.js`, preserving its
-line numbers. Identity, collision, export, source, or capability errors fail before agent code
-executes.
+JSON-shaped function boundaries are published with the exact host-capability scope. Every selected
+artifact/export receives one parent-issued, one-shot invocation handle. Its Rust-owned dispatcher
+consumes that exact handle before the stored export runs; a second call fails closed, and no
+ambient, FIFO, or metadata fallback exists. Protected host globals cannot be replaced.
+Model-authored code then runs separately as `agent.js`, preserving its line numbers. Identity,
+collision, export, source, or capability errors fail before agent code executes. When proposal
+workers are configured, model code also receives bounded `propose_skill(draft)` access through a
+separate parent grant. Stored skill initialization and exports never receive proposal authority,
+and a newly proposed skill cannot run in the proposing step.
 
 Normal removal is optimistic, versioned retirement. Retirement and privacy purge publish an
 immediate immutable visibility mask without rebuilding the graph; purge also deletes persistent

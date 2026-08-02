@@ -237,7 +237,11 @@ pub(crate) struct RunStep {
     pub(crate) code: String,
     pub(crate) model_grant_id: Option<GrantId>,
     #[cfg(feature = "skills")]
+    pub(crate) proposal_grant_id: Option<GrantId>,
+    #[cfg(feature = "skills")]
     pub(crate) artifacts: Vec<super::skills::SkillArtifact>,
+    #[cfg(feature = "skills")]
+    pub(crate) skill_invocations: Vec<SkillInvocationGrant>,
     #[cfg(feature = "skills")]
     pub(crate) turn_id: String,
     #[cfg(feature = "skills")]
@@ -250,12 +254,22 @@ impl RunStep {
             code,
             model_grant_id: None,
             #[cfg(feature = "skills")]
+            proposal_grant_id: None,
+            #[cfg(feature = "skills")]
             artifacts: Vec::new(),
+            #[cfg(feature = "skills")]
+            skill_invocations: Vec::new(),
             #[cfg(feature = "skills")]
             turn_id: String::new(),
             #[cfg(feature = "skills")]
             tool_call_id: String::new(),
         }
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_proposal_grant(mut self, grant_id: GrantId) -> Self {
+        self.proposal_grant_id = Some(grant_id);
+        self
     }
 
     pub(crate) fn with_model_grant(mut self, grant_id: GrantId) -> Self {
@@ -267,14 +281,35 @@ impl RunStep {
     pub(crate) fn with_skills(
         mut self,
         artifacts: Vec<super::skills::SkillArtifact>,
+        skill_invocations: Vec<SkillInvocationGrant>,
         turn_id: String,
         tool_call_id: String,
     ) -> Self {
         self.artifacts = artifacts;
+        self.skill_invocations = skill_invocations;
         self.turn_id = turn_id;
         self.tool_call_id = tool_call_id;
         self
     }
+}
+
+/// Parent-issued authority for one exact selected ABI-v2 export call.
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillInvocationGrant {
+    pub(crate) artifact_id: String,
+    pub(crate) export_name: String,
+    pub(crate) invocation_id: InvocationId,
+    pub(crate) grants: Vec<SkillCapabilityGrant>,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillCapabilityGrant {
+    pub(crate) capability: super::skills::HostCapability,
+    pub(crate) grant_id: GrantId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

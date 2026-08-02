@@ -696,6 +696,35 @@ async fn proposal_host_wiring_enqueues_only_in_normal_skills_context() {
 }
 
 #[tokio::test]
+async fn model_cannot_execute_a_proposal_in_the_same_step() {
+    let (root, paths) = paths();
+    let store = SkillStore::open_at(&paths).expect("store");
+    let worker =
+        ProposalQueue::start_store_worker(store, 4, Duration::from_secs(1)).expect("worker");
+    let tool = JsTool::new_with_proposals(
+        Sandbox::new(false, "bwrap"),
+        None,
+        None,
+        AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        worker,
+    );
+
+    let output = tool
+        .call(JsArgs {
+            code: format!("propose_skill({}); trim('must-not-run')", js_payload()),
+        })
+        .await
+        .expect("closed execution result");
+    assert_eq!(output, "JS error: exception");
+    drop(tool);
+
+    let store = SkillStore::open_at(&paths).expect("reopen store");
+    assert_eq!(store.count_proposals().unwrap(), 1);
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn proposal_host_wiring_enforces_session_budget() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("store");
@@ -724,13 +753,13 @@ async fn proposal_host_wiring_enforces_session_budget() {
         })
         .await
         .expect("structured JS error");
-    assert!(exhausted.contains("proposal attempt budget exhausted"));
+    assert_eq!(exhausted, "JS error: exception");
     drop(tool);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn proposal_host_validation_budget_precedes_bounded_shape_parsing() {
+async fn proposal_host_validation_budget_precedes_canonical_validation() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("store");
     let worker =
@@ -746,11 +775,14 @@ async fn proposal_host_validation_budget_precedes_bounded_shape_parsing() {
     for _ in 0..3 {
         let output = tool
             .call(JsArgs {
-                code: "propose_skill({exports: Array(100000)})".to_string(),
+                code: format!(
+                    "propose_skill({{...{}, capability: {{tier: 'admin', grants: []}}}})",
+                    js_payload()
+                ),
             })
             .await
             .expect("structured validation error");
-        assert!(output.contains("invalid exports"));
+        assert_eq!(output, "JS error: exception");
     }
     let exhausted = tool
         .call(JsArgs {
@@ -758,7 +790,7 @@ async fn proposal_host_validation_budget_precedes_bounded_shape_parsing() {
         })
         .await
         .expect("structured budget error");
-    assert!(exhausted.contains("proposal attempt budget exhausted"));
+    assert_eq!(exhausted, "JS error: exception");
     drop(tool);
     let _ = std::fs::remove_dir_all(root);
 }
