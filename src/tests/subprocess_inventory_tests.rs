@@ -1170,6 +1170,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/sandbox/worker/windows.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/sandbox/worker/windows.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/worker/windows.rs",
         "Command::new(executable)",
         1,
         "TEST-ONLY",
@@ -2475,6 +2481,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "TC-BROKER-JS-WORKER",
     ),
     ("src/sandbox/worker/windows.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/sandbox/worker/windows.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/sandbox/worker/windows.rs",
         "Command::new(executable)",
