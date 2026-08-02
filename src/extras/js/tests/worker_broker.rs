@@ -1,9 +1,15 @@
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::extras::js::audit::{
+    AuditCapability, AuditDecision, AuditError, AuditFailurePoint, AuditOpenOptions,
+    AuditResultCode, AuditState, EffectAudit, EffectCompletion, EffectIntent, SanitizedTarget,
+};
 use crate::extras::js::broker::{
     AuthorizedEffect, EffectOperation, EffectResult, GrantPrincipal, HostCapability,
     HostEffectError, InvocationBroker, InvocationGrant, ParentEffectService,
@@ -14,6 +20,7 @@ use crate::extras::js::protocol::{
 };
 use crate::extras::js::supervisor::InvocationEffectHandler;
 use crate::extras::js::types::PermCancellation;
+use crate::paths::{AppPaths, EffectAuditPathOwner};
 
 type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -727,4 +734,510 @@ async fn worker_broker_grants_execute_cancellation_erases_authority_before_redis
     let record = record.lock().unwrap();
     assert_eq!(record.execute_calls, 1, "redispatch reached the service");
     assert_eq!(record.executions, 0);
+}
+
+struct AuditTempRoot(PathBuf);
+
+impl AuditTempRoot {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-js-effect-audit-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn owner(&self) -> EffectAuditPathOwner {
+        AppPaths {
+            config_dir: self.0.join("config"),
+            data_dir: self.0.join("data"),
+            local_data_dir: self.0.join("local"),
+            state_dir: self.0.join("state"),
+            cache_dir: self.0.join("cache"),
+            credentials_dir: self.0.join("credentials"),
+            project_dir: None,
+        }
+        .effect_audit()
+    }
+}
+
+impl Drop for AuditTempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn audit_intent(effect_id: &str, target: SanitizedTarget) -> EffectIntent {
+    EffectIntent {
+        effect_id: effect_id.into(),
+        invocation_id: "inv-audit".into(),
+        grant_id: "grant-audit".into(),
+        sequence: 1,
+        timestamp_ms: 1_800_000_000_000,
+        artifact_id: Some("artifact-audit".into()),
+        export: Some("run".into()),
+        capability: AuditCapability::ReadFile,
+        normalized_target: target,
+        decision: AuditDecision::Authorized,
+    }
+}
+
+fn audit_segments(owner: &EffectAuditPathOwner) -> Vec<PathBuf> {
+    let mut segments = std::fs::read_dir(owner.directory())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("segment-") && name.ends_with(".audit"))
+        })
+        .collect::<Vec<_>>();
+    segments.sort();
+    segments
+}
+
+fn audit_bytes(owner: &EffectAuditPathOwner) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for segment in audit_segments(owner) {
+        bytes.extend(std::fs::read(segment).unwrap());
+    }
+    bytes
+}
+
+#[test]
+fn js_effect_audit_storage_private_path_and_exclusive_writer_fail_closed() {
+    let root = AuditTempRoot::new("private-lock");
+    let owner = root.owner();
+    let audit = EffectAudit::open(owner.clone()).unwrap();
+
+    assert!(owner.directory().starts_with(&owner.state_root()));
+    assert!(owner.directory().is_dir());
+    assert!(owner.lock_file().is_file());
+    assert!(matches!(
+        EffectAudit::open(owner.clone()),
+        Err(AuditError::WriterLocked)
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(owner.directory())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(owner.lock_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(owner.target_key_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(owner.initialization_marker())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        for segment in audit_segments(&owner) {
+            assert_eq!(
+                std::fs::metadata(segment).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    drop(audit);
+    EffectAudit::open(owner).unwrap();
+}
+
+#[test]
+fn js_effect_audit_storage_hash_chain_privacy_and_crash_recovery_are_truthful() {
+    let root = AuditTempRoot::new("privacy-recovery");
+    let owner = root.owner();
+    let path_secret = "workspace/credential-super-secret.txt?token=path-secret";
+    let url_secret = "https://user:password@example.test/private?token=query-secret";
+    let argv_secret = "--password=argv-secret";
+    let file_target_tag;
+
+    {
+        let mut audit = EffectAudit::open(owner.clone()).unwrap();
+        let file_target = audit.file_target(path_secret);
+        file_target_tag = file_target.clone();
+        assert_ne!(file_target, audit.file_target("workspace/other.txt"));
+        audit
+            .append_intent(audit_intent("effect-file", file_target))
+            .unwrap();
+        audit
+            .append_completion(EffectCompletion {
+                effect_id: "effect-file".into(),
+                result_code: AuditResultCode::Succeeded,
+            })
+            .unwrap();
+        let write_target = audit.write_file_target(path_secret);
+        let mut write = audit_intent("effect-write", write_target);
+        write.capability = AuditCapability::WriteFile;
+        audit.append_intent(write).unwrap();
+        audit
+            .append_completion(EffectCompletion {
+                effect_id: "effect-write".into(),
+                result_code: AuditResultCode::Succeeded,
+            })
+            .unwrap();
+        let fetch_target = audit.fetch_target(url_secret, "post").unwrap();
+        let mut fetch = audit_intent("effect-fetch", fetch_target);
+        fetch.capability = AuditCapability::Fetch;
+        audit.append_intent(fetch).unwrap();
+        let spawn_target = audit.spawn_target("helper");
+        let mut spawn = audit_intent("effect-spawn", spawn_target);
+        spawn.capability = AuditCapability::Spawn;
+        audit.append_intent(spawn).unwrap();
+        let mut proposal = audit_intent("effect-proposal", audit.proposal_target());
+        proposal.capability = AuditCapability::ProposeSkill;
+        audit.append_intent(proposal).unwrap();
+        audit
+            .append_completion(EffectCompletion {
+                effect_id: "effect-proposal".into(),
+                result_code: AuditResultCode::Succeeded,
+            })
+            .unwrap();
+    }
+
+    let stored = audit_bytes(&owner);
+    for secret in [
+        path_secret,
+        url_secret,
+        "password",
+        "query-secret",
+        argv_secret,
+    ] {
+        assert!(
+            !stored
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "audit persisted secret fixture {secret:?}"
+        );
+    }
+
+    let recovered = EffectAudit::open(owner.clone()).unwrap();
+    assert_eq!(recovered.file_target(path_secret), file_target_tag);
+    for effect_id in ["effect-fetch", "effect-spawn"] {
+        assert!(recovered.records().iter().any(|record| {
+            record.effect_id == effect_id && record.state == AuditState::OutcomeUnknown
+        }));
+    }
+    let unknown_count = recovered
+        .records()
+        .iter()
+        .filter(|record| record.state == AuditState::OutcomeUnknown)
+        .count();
+    drop(recovered);
+    let reopened = EffectAudit::open(owner).unwrap();
+    assert_eq!(
+        reopened
+            .records()
+            .iter()
+            .filter(|record| record.state == AuditState::OutcomeUnknown)
+            .count(),
+        unknown_count,
+        "restart duplicated recovered unknown outcomes"
+    );
+}
+
+#[test]
+fn js_effect_audit_storage_truncated_tail_recovers_but_interior_corruption_fails() {
+    let root = AuditTempRoot::new("truncation");
+    let owner = root.owner();
+    {
+        let mut audit = EffectAudit::open(owner.clone()).unwrap();
+        let target = audit.file_target("safe/path");
+        audit
+            .append_intent(audit_intent("effect-tail", target))
+            .unwrap();
+    }
+    let segment = audit_segments(&owner).pop().unwrap();
+    let valid_length = std::fs::metadata(&segment).unwrap().len();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .unwrap();
+    file.write_all(&128_u32.to_be_bytes()).unwrap();
+    file.write_all(br#"{"partial":true"#).unwrap();
+    drop(file);
+
+    let recovered = EffectAudit::open(owner.clone()).unwrap();
+    assert!(std::fs::metadata(&segment).unwrap().len() >= valid_length);
+    assert!(recovered.records().iter().any(|record| {
+        record.effect_id == "effect-tail" && record.state == AuditState::OutcomeUnknown
+    }));
+    drop(recovered);
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&segment)
+        .unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    file.seek(SeekFrom::Current(-1)).unwrap();
+    byte[0] ^= 1;
+    file.write_all(&byte).unwrap();
+    file.sync_all().unwrap();
+    assert!(matches!(
+        EffectAudit::open(owner),
+        Err(AuditError::CorruptRecord) | Err(AuditError::HashMismatch)
+    ));
+}
+
+#[test]
+fn js_effect_audit_storage_final_prefix_corruption_is_not_truncated_as_a_crash_tail() {
+    let root = AuditTempRoot::new("prefix-corruption");
+    let owner = root.owner();
+    {
+        let mut audit = EffectAudit::open(owner.clone()).unwrap();
+        let target = audit.file_target("safe/path");
+        audit
+            .append_intent(audit_intent("effect-prefix", target))
+            .unwrap();
+    }
+    let segment = audit_segments(&owner).pop().unwrap();
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let mut offset = 0_usize;
+    let mut final_offset = 0_usize;
+    while offset < bytes.len() {
+        final_offset = offset;
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += length + 8;
+    }
+    let length = u32::from_be_bytes(bytes[final_offset..final_offset + 4].try_into().unwrap());
+    bytes[final_offset..final_offset + 4].copy_from_slice(&(length + 1).to_be_bytes());
+    std::fs::write(segment, bytes).unwrap();
+
+    assert!(matches!(
+        EffectAudit::open(owner),
+        Err(AuditError::CorruptRecord)
+    ));
+}
+
+#[test]
+fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fail_closed() {
+    let root = AuditTempRoot::new("rotation");
+    let owner = root.owner();
+    let options = AuditOpenOptions::for_test(1_024);
+    {
+        let mut audit = EffectAudit::open_with_options(owner.clone(), options.clone()).unwrap();
+        for index in 0..12 {
+            let effect_id = format!("effect-{index}");
+            let target = audit.file_target(&format!("safe/path/{index}"));
+            let mut intent = audit_intent(&effect_id, target);
+            intent.sequence = index + 1;
+            audit.append_intent(intent.clone()).unwrap();
+            assert!(matches!(
+                audit.append_intent(intent),
+                Err(AuditError::ReplayedEffect)
+            ));
+            let completion = EffectCompletion {
+                effect_id,
+                result_code: AuditResultCode::Succeeded,
+            };
+            audit.append_completion(completion.clone()).unwrap();
+            assert!(matches!(
+                audit.append_completion(completion),
+                Err(AuditError::ReplayedEffect)
+            ));
+        }
+        assert!(audit.rotation_anchor_count() >= 2);
+    }
+    let segments = audit_segments(&owner);
+    assert!(
+        segments.len() >= 3,
+        "rotation did not create linked segments"
+    );
+
+    let missing_root = AuditTempRoot::new("missing-segment");
+    let missing_owner = missing_root.owner();
+    std::fs::create_dir_all(missing_owner.directory()).unwrap();
+    std::fs::copy(owner.target_key_file(), missing_owner.target_key_file()).unwrap();
+    for segment in &segments {
+        std::fs::copy(
+            segment,
+            missing_owner.directory().join(segment.file_name().unwrap()),
+        )
+        .unwrap();
+    }
+    std::fs::remove_file(
+        missing_owner
+            .directory()
+            .join(segments[1].file_name().unwrap()),
+    )
+    .unwrap();
+    assert!(matches!(
+        EffectAudit::open_with_options(missing_owner, options.clone()),
+        Err(AuditError::MissingSegment)
+    ));
+
+    let hash_root = AuditTempRoot::new("hash-mismatch");
+    let hash_owner = hash_root.owner();
+    std::fs::create_dir_all(hash_owner.directory()).unwrap();
+    std::fs::copy(owner.target_key_file(), hash_owner.target_key_file()).unwrap();
+    for segment in &segments {
+        std::fs::copy(
+            segment,
+            hash_owner.directory().join(segment.file_name().unwrap()),
+        )
+        .unwrap();
+    }
+    let last = audit_segments(&hash_owner).pop().unwrap();
+    let mut bytes = std::fs::read(&last).unwrap();
+    let marker = b"record_hash";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap();
+    let hash_start = bytes[offset..]
+        .windows(2)
+        .position(|window| window == b":\"")
+        .unwrap()
+        + offset
+        + 2;
+    bytes[hash_start] = if bytes[hash_start] == b'a' {
+        b'b'
+    } else {
+        b'a'
+    };
+    std::fs::write(&last, bytes).unwrap();
+    assert!(matches!(
+        EffectAudit::open_with_options(hash_owner, options.clone()),
+        Err(AuditError::HashMismatch)
+    ));
+
+    let key = std::fs::read(owner.target_key_file()).unwrap();
+    let mut corrupted_key = key.clone();
+    corrupted_key[0] ^= 1;
+    std::fs::write(owner.target_key_file(), &corrupted_key).unwrap();
+    assert!(matches!(
+        EffectAudit::open_with_options(owner.clone(), options.clone()),
+        Err(AuditError::KeyUnavailable)
+    ));
+    std::fs::write(owner.target_key_file(), key).unwrap();
+    std::fs::remove_file(owner.target_key_file()).unwrap();
+    assert!(matches!(
+        EffectAudit::open(owner.clone()),
+        Err(AuditError::KeyUnavailable)
+    ));
+
+    let initialized_root = AuditTempRoot::new("initialized-missing-chain");
+    let initialized_owner = initialized_root.owner();
+    {
+        EffectAudit::open(initialized_owner.clone()).unwrap();
+    }
+    for segment in audit_segments(&initialized_owner) {
+        std::fs::remove_file(segment).unwrap();
+    }
+    assert!(matches!(
+        EffectAudit::open(initialized_owner),
+        Err(AuditError::MissingSegment)
+    ));
+}
+
+#[test]
+fn js_effect_audit_storage_retention_limit_poisoning_is_fail_closed() {
+    let root = AuditTempRoot::new("retention-limit");
+    let owner = root.owner();
+    let options = AuditOpenOptions::for_test(2_048).with_max_segments(1);
+    let mut audit = EffectAudit::open_with_options(owner, options).unwrap();
+
+    let first_target = audit.file_target("safe/first");
+    audit
+        .append_intent(audit_intent("effect-first", first_target))
+        .unwrap();
+    audit
+        .append_completion(EffectCompletion {
+            effect_id: "effect-first".into(),
+            result_code: AuditResultCode::Succeeded,
+        })
+        .unwrap();
+
+    let second_target = audit.file_target("safe/second");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-second", second_target)),
+        Err(AuditError::RetentionLimit)
+    ));
+    let later_target = audit.file_target("safe/later");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-later", later_target)),
+        Err(AuditError::Unavailable)
+    ));
+}
+
+#[test]
+fn js_effect_audit_storage_required_path_and_sync_failures_are_typed() {
+    for failure in [
+        AuditFailurePoint::FileSync,
+        AuditFailurePoint::DirectorySync,
+    ] {
+        let root = AuditTempRoot::new("sync-failure");
+        let owner = root.owner();
+        let options = AuditOpenOptions::for_test(4_096).with_failure(failure);
+        assert!(matches!(
+            EffectAudit::open_with_options(owner, options),
+            Err(AuditError::SyncFailed)
+        ));
+    }
+
+    let root = AuditTempRoot::new("bad-path");
+    let owner = root.owner();
+    std::fs::create_dir_all(owner.directory().parent().unwrap()).unwrap();
+    std::fs::write(owner.directory(), b"not a directory").unwrap();
+    assert!(matches!(
+        EffectAudit::open(owner),
+        Err(AuditError::PathUnavailable)
+    ));
+
+    let root = AuditTempRoot::new("poison-after-sync");
+    let owner = root.owner();
+    let mut audit = EffectAudit::open(owner).unwrap();
+    audit.fail_next_durability_for_test(AuditFailurePoint::FileSync);
+    let target = audit.file_target("safe/path");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-sync-failed", target)),
+        Err(AuditError::SyncFailed)
+    ));
+    let target = audit.file_target("safe/other");
+    assert!(matches!(
+        audit.append_intent(audit_intent("effect-after-failure", target)),
+        Err(AuditError::Unavailable)
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let root = AuditTempRoot::new("linked-component");
+        let owner = root.owner();
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(owner.state_root()).unwrap();
+        symlink(&outside, owner.state_root().join("audit")).unwrap();
+        assert!(matches!(
+            EffectAudit::open(owner),
+            Err(AuditError::PathUnavailable)
+        ));
+        assert!(!outside.join("js-effects").exists());
+    }
 }
