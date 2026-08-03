@@ -12,11 +12,16 @@ fn handler(command: &str) -> HookHandler {
         is_async: false,
         condition: None,
         once: false,
+        trust: crate::extras::hooks::settings::HookTrust::Trusted,
+        env: Default::default(),
     }
 }
 
 fn unique_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    root.join(format!(
         "zerostack-hooks-trust-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -24,6 +29,7 @@ fn unique_path(name: &str) -> std::path::PathBuf {
             .unwrap()
             .as_nanos()
     ))
+    .join("artifact.json")
 }
 
 fn write_settings(path: &std::path::Path, json: &str) {
@@ -93,6 +99,28 @@ fn hash_changes_when_project_root_changes() {
 }
 
 #[test]
+fn hash_changes_when_subprocess_trust_or_explicit_environment_changes() {
+    let root = std::path::Path::new("/repo/a");
+    let baseline = handler("echo one");
+    let mut sandboxed = baseline.clone();
+    sandboxed.trust = crate::extras::hooks::settings::HookTrust::Sandboxed;
+    let mut with_env = baseline.clone();
+    with_env
+        .env
+        .insert("TOKEN_FILE".into(), "/safe/path".into());
+
+    let baseline_hash = trust::hash_hook_binding(root, "PreToolUse", None, &baseline);
+    assert_ne!(
+        baseline_hash,
+        trust::hash_hook_binding(root, "PreToolUse", None, &sandboxed)
+    );
+    assert_ne!(
+        baseline_hash,
+        trust::hash_hook_binding(root, "PreToolUse", None, &with_env)
+    );
+}
+
+#[test]
 fn trust_store_round_trips_and_is_visible_to_a_fresh_load() {
     let path = unique_path("store");
     let _ = std::fs::remove_file(&path);
@@ -100,7 +128,7 @@ fn trust_store_round_trips_and_is_visible_to_a_fresh_load() {
     assert!(!trust::load_trust_store(&path).contains("abc123"));
     let mut store = trust::load_trust_store(&path);
     store.insert("abc123".to_string());
-    trust::save_trust_store(&path, &store);
+    trust::save_trust_store(&path, &store).unwrap();
 
     // Simulates a child process independently loading the same trust file.
     assert!(trust::load_trust_store(&path).contains("abc123"));
@@ -246,7 +274,7 @@ fn interactive_confirmation_exposes_args_and_condition_and_persists_binding() {
     let project = unique_path("project4");
     write_settings(
         &project,
-        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "sh", "args": ["-c", "echo ARG; touch /tmp/pwned && printf '%s' \"$TOKEN\""], "if": "test -f \"$HOME/.allow\" && echo CONDITION; false || true"}]}]}}"#,
+        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "sh", "args": ["-c", "echo ARG; touch /tmp/pwned && printf '%s' \"$TOKEN\""], "if": "test -f \"$HOME/.allow\" && echo CONDITION; false || true", "trust": "trusted", "env": {"TOKEN_FILE": "top-secret-value"}}]}]}}"#,
     );
     let managed = missing_path("m4");
     let trust_path = unique_path("trust4");
@@ -262,6 +290,10 @@ fn interactive_confirmation_exposes_args_and_condition_and_persists_binding() {
         is_async: false,
         condition: Some("test -f \"$HOME/.allow\" && echo CONDITION; false || true".to_string()),
         once: false,
+        trust: crate::extras::hooks::settings::HookTrust::Trusted,
+        env: [("TOKEN_FILE".to_string(), "top-secret-value".to_string())]
+            .into_iter()
+            .collect(),
     };
     let expected_hash = trust::hash_hook_binding(
         &project_root(),
@@ -279,10 +311,11 @@ fn interactive_confirmation_exposes_args_and_condition_and_persists_binding() {
         false,
         &trust_path,
         &|description| {
-            assert_eq!(
-                description,
-                "executable argv=[\"sh\",\"-c\",\"echo ARG; touch /tmp/pwned && printf '%s' \\\"$TOKEN\\\"\"]; shell condition=\"test -f \\\"$HOME/.allow\\\" && echo CONDITION; false || true\""
-            );
+            assert!(description.starts_with(
+                "executable argv=[\"sh\",\"-c\",\"echo ARG; touch /tmp/pwned && printf '%s' \\\"$TOKEN\\\"\"]; shell condition=\"test -f \\\"$HOME/.allow\\\" && echo CONDITION; false || true\"; subprocess trust=\"trusted\"; explicit env keys=[\"TOKEN_FILE\"]; env binding sha256=\""
+            ));
+            assert!(description.ends_with('"'));
+            assert!(!description.contains("top-secret-value"));
             true
         },
     );

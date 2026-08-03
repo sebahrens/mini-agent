@@ -467,7 +467,14 @@ zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
       {
         "matcher": "Bash|Write",
         "hooks": [
-          { "type": "command", "command": "./guard.sh", "args": [], "timeout": 30 }
+          {
+            "type": "command",
+            "command": "./guard.sh",
+            "args": [],
+            "timeout": 30,
+            "trust": "sandboxed",
+            "env": { "GUARD_MODE": "strict" }
+          }
         ]
       }
     ]
@@ -478,12 +485,44 @@ zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `type` | string | Only `"command"` is supported. |
-| `command` | string | Executable to run directly. Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set in its environment. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
+| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical project directory. Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
 | `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
 | `timeout` | integer (seconds) | Per-hook timeout; the whole process group is killed on expiry. Default: 60. |
-| `async` | boolean | When `true`, the hook runs in the background and its decision is ignored. Default: `false`. |
+| `async` | boolean | When `true`, the hook runs concurrently with other matching handlers and its decision is ignored. Cancellation remains scoped to the dispatch, so dropping the dispatch still terminates and reaps it. Default: `false`. |
 | `if` | string | A shell command evaluated (with the same stdin envelope) before the handler runs; the handler only runs if it exits `0`. Fails closed: a broken/unparseable/timed-out condition still runs the handler, with a warning. |
-| `once` | boolean | Runs the handler at most once per event per session; later matches are skipped. |
+| `once` | boolean | Runs the handler at most once per event per session. A false `if` condition or a policy/preflight/spawn denial does not consume the binding; a successfully started child does. |
+| `trust` | `"sandboxed"` or `"trusted"` | Subprocess authority. Default: `"sandboxed"`, which requires the configured general workspace sandbox and denies the hook and guarded action before child creation if the backend is unavailable. `"trusted"` is an explicit, audited containment bypass for reviewed automation; it does not restore the parent environment. |
+| `env` | object of string values | Explicit environment additions. Values are literal (no shell expansion). The reserved `ZEROSTACK_PROJECT_DIR` key cannot be overridden in any ASCII case. Invalid names, NUL values, or case-insensitively colliding keys deny launch for portable Windows semantics. |
+
+Conditions and handlers use the same immutable canonical startup project cwd,
+environment, trust, and sandbox policy. Changing the parent process cwd later
+cannot retarget a trusted relative hook. Before every launch zerostack clears
+the ambient environment, then
+restores only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`,
+`LC_ALL`, `COLORTERM`, `NO_COLOR`, `TMPDIR`, and the Windows runtime names
+`SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `TEMP`, `TMP`, `USERNAME`, and
+`USERPROFILE` when present, plus the handler's `env` values and
+`ZEROSTACK_PROJECT_DIR`. API keys and other ambient credentials are therefore
+absent unless the hook owner explicitly provides them in `env`.
+Sandbox backends override `TMPDIR` with their confined temporary directory.
+
+`"sandboxed"` selects the same backend named by `sandbox-backend`, independent
+of the model-action `sandbox` on/off switch. On Linux, `bwrap` exposes the
+workspace and application cache as writable, a minimal runtime filesystem,
+and no IP network. On macOS, Seatbelt allows host-readable files, limits writes
+to the workspace, application cache, temporary directory, and `/dev/null`, and
+denies network. Other backends have only their reported backend-defined
+guarantees. `"trusted"` has ambient filesystem and network access by explicit
+configuration consent, while retaining direct argv, canonical cwd, minimal
+environment, timeout/output bounds, cancellation, and tree cleanup. Audit logs
+name the event, executable, trust choice, containment request/availability,
+filesystem status, and network status; they never log argv, environment
+values, stdin, or hook output.
+Inside containment, a fixed trusted launcher verifies the executable is
+visible and emits a private readiness record immediately before direct `exec`.
+If the wrapper starts but never reaches readiness (setup or pre-exec failure),
+zerostack classifies the outcome as policy denial rather than as a non-blocking
+hook error; a `once` binding remains retryable.
 
 Hook subprocess output has non-configurable hard limits: 1 MiB for stdout,
 1 MiB for stderr, and 1.5 MiB combined. Stdout and stderr are drained
@@ -543,6 +582,11 @@ the state root at `hooks/trusted-hooks.json` (a user-level file, so child
 processes/orchestrated subagents sharing it inherit trust automatically). In
 headless contexts (`-p`, `--loop`) an unconfirmed project hook is skipped with
 a warning rather than prompting.
+
+Project confirmation and subprocess authority are separate decisions. The
+confirmation hash includes `trust` and `env`, so either change requires new
+consent. Global and managed provenance does not silently select the trusted
+bypass: omitted `trust` still means `"sandboxed"` for every source.
 
 ### Global switches
 

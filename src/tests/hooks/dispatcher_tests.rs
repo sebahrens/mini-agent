@@ -14,6 +14,8 @@ fn handler(command: &str) -> HookHandler {
         is_async: false,
         condition: None,
         once: false,
+        trust: crate::extras::hooks::settings::HookTrust::Trusted,
+        env: Default::default(),
     }
 }
 
@@ -31,6 +33,12 @@ fn handler_once(command: &str) -> HookHandler {
     }
 }
 
+fn handler_once_with_env(command: &str, key: &str, value: &str) -> HookHandler {
+    let mut configured = handler_once(command);
+    configured.env.insert(key.to_string(), value.to_string());
+    configured
+}
+
 fn async_handler(command: &str) -> HookHandler {
     HookHandler {
         is_async: true,
@@ -42,7 +50,7 @@ fn ctx() -> HookCtx {
     HookCtx {
         session_id: "sess-1".into(),
         session_path: "/tmp/sess.json".into(),
-        cwd: "/repo".into(),
+        cwd: env!("CARGO_MANIFEST_DIR").into(),
         permission_mode: "default".into(),
     }
 }
@@ -322,6 +330,69 @@ async fn dispatch_waits_for_async_handlers_but_ignores_their_decisions() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_dispatch_terminates_async_hook_descendants() {
+    let pid_file = std::env::temp_dir().join(format!(
+        "zerostack-hooks-async-cancel-descendant-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&pid_file);
+    let command = format!(
+        "sh -c 'echo $$ > \"{}\"; while :; do sleep 1; done' & wait",
+        pid_file.display()
+    );
+    let config = config_with("Stop", None, vec![async_handler(&command)]);
+    let dispatcher = std::sync::Arc::new(HookDispatcher::from_config(&config).unwrap());
+    let dispatch = tokio::spawn({
+        let dispatcher = std::sync::Arc::clone(&dispatcher);
+        async move {
+            dispatcher
+                .dispatch(
+                    "Stop",
+                    None,
+                    &ctx(),
+                    EventFields::Stop {
+                        stop_hook_active: false,
+                        loop_iteration: None,
+                        loop_active: None,
+                    },
+                )
+                .await
+        }
+    });
+
+    let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !pid_file.exists() && tokio::time::Instant::now() < ready_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let descendant_pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("async descendant should start before dispatch cancellation")
+        .trim()
+        .parse()
+        .unwrap();
+    dispatch.abort();
+    let _ = dispatch.await;
+
+    let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while process_is_alive(descendant_pid) && tokio::time::Instant::now() < cleanup_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!process_is_alive(descendant_pid));
+    let _ = std::fs::remove_file(pid_file);
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[tokio::test]
 async fn dispatch_post_tool_use_failure_runs_but_cannot_change_outcome() {
     let marker = std::env::temp_dir().join(format!(
@@ -389,6 +460,173 @@ async fn if_condition_broken_command_fails_closed_and_runs_anyway() {
         .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
         .await;
     assert_eq!(decision.verdict, Verdict::Deny);
+}
+
+#[tokio::test]
+async fn condition_and_handler_share_explicit_environment_and_project_cwd() {
+    let mut configured = handler_with_condition(
+        r#"test "$HOOK_POLICY" = expected && test "$PWD" = "$ZEROSTACK_PROJECT_DIR" && echo '{"permissionDecision":"deny"}'"#,
+        r#"test "$HOOK_POLICY" = expected && test "$PWD" = "$ZEROSTACK_PROJECT_DIR""#,
+    );
+    configured
+        .env
+        .insert("HOOK_POLICY".to_string(), "expected".to_string());
+    let config = config_with("PreToolUse", None, vec![configured]);
+    let dispatcher = HookDispatcher::from_config_with_backend(&config, "unused").unwrap();
+
+    let decision = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+        .await;
+
+    assert_eq!(decision.verdict, Verdict::Deny);
+}
+
+#[tokio::test]
+async fn unavailable_required_sandbox_denies_condition_and_handler_before_launch() {
+    let marker = std::env::temp_dir().join(format!(
+        "zerostack-hooks-policy-denied-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let mut configured = handler_with_condition(
+        &format!("touch {}", marker.display()),
+        &format!("touch {}", marker.display()),
+    );
+    configured.trust = crate::extras::hooks::settings::HookTrust::Sandboxed;
+    let config = config_with("PreToolUse", None, vec![configured]);
+    let dispatcher =
+        HookDispatcher::from_config_with_backend(&config, "__mini_agent_missing_hook_sandbox__")
+            .unwrap();
+
+    let decision = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+        .await;
+
+    assert_eq!(decision.verdict, Verdict::Deny);
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn once_policy_denial_is_retried_instead_of_consumed() {
+    let marker = std::env::temp_dir().join(format!(
+        "zerostack-hooks-once-policy-denied-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let mut configured = handler_once(&format!("touch {}", marker.display()));
+    configured.trust = crate::extras::hooks::settings::HookTrust::Sandboxed;
+    let config = config_with("PreToolUse", None, vec![configured]);
+    let dispatcher =
+        HookDispatcher::from_config_with_backend(&config, "__mini_agent_missing_hook_sandbox__")
+            .unwrap();
+
+    for _ in 0..2 {
+        let decision = dispatcher
+            .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+            .await;
+        assert_eq!(decision.verdict, Verdict::Deny);
+    }
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn false_condition_does_not_consume_once_binding() {
+    let condition_marker = std::env::temp_dir().join(format!(
+        "zerostack-hooks-once-condition-{}",
+        std::process::id()
+    ));
+    let output_marker = std::env::temp_dir().join(format!(
+        "zerostack-hooks-once-condition-output-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&condition_marker);
+    let _ = std::fs::remove_file(&output_marker);
+    let mut configured = handler_with_condition(
+        &format!("printf x >> {}", output_marker.display()),
+        &format!("test -f {}", condition_marker.display()),
+    );
+    configured.once = true;
+    let config = config_with("PreToolUse", None, vec![configured]);
+    let dispatcher = HookDispatcher::from_config_with_backend(&config, "unused").unwrap();
+
+    let first = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+        .await;
+    assert_eq!(first.verdict, Verdict::Defer);
+    std::fs::write(&condition_marker, b"ready").unwrap();
+    for _ in 0..2 {
+        let _ = dispatcher
+            .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+            .await;
+    }
+
+    assert_eq!(std::fs::read_to_string(&output_marker).unwrap(), "x");
+    let _ = std::fs::remove_file(condition_marker);
+    let _ = std::fs::remove_file(output_marker);
+}
+
+#[tokio::test]
+async fn immutable_policy_root_prevents_cwd_retargeting() {
+    let base =
+        std::env::temp_dir().join(format!("zerostack-hooks-bound-root-{}", std::process::id()));
+    let project_a = base.join("a");
+    let project_b = base.join("b");
+    std::fs::create_dir_all(&project_a).unwrap();
+    std::fs::create_dir_all(&project_b).unwrap();
+    let marker_a = project_a.join("ran");
+    let marker_b = project_b.join("ran");
+    let command = r#"test "$PWD" = "$ZEROSTACK_PROJECT_DIR" && touch ran"#;
+    let config = config_with("PreToolUse", None, vec![handler(command)]);
+    let dispatcher =
+        HookDispatcher::from_config_with_backend_and_root(&config, "unused", &project_a).unwrap();
+    let mut changed_ctx = ctx();
+    changed_ctx.cwd = project_b.to_string_lossy().into_owned();
+
+    let _ = dispatcher
+        .dispatch_pre_tool_use(&changed_ctx, "bash", serde_json::json!({}))
+        .await;
+
+    assert!(marker_a.exists());
+    assert!(!marker_b.exists());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn once_identity_keeps_distinct_argv_and_environment_bindings_independent() {
+    let marker = std::env::temp_dir().join(format!(
+        "zerostack-hooks-once-policy-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let command = format!("printf \"$VALUE\" >> {}", marker.display());
+    let config = config_with(
+        "Stop",
+        None,
+        vec![
+            handler_once_with_env(&command, "VALUE", "first"),
+            handler_once_with_env(&command, "VALUE", "second"),
+        ],
+    );
+    let dispatcher = HookDispatcher::from_config_with_backend(&config, "unused").unwrap();
+
+    for _ in 0..2 {
+        let _ = dispatcher
+            .dispatch(
+                "Stop",
+                None,
+                &ctx(),
+                EventFields::Stop {
+                    stop_hook_active: false,
+                    loop_iteration: None,
+                    loop_active: None,
+                },
+            )
+            .await;
+    }
+
+    let contents = std::fs::read_to_string(&marker).unwrap();
+    assert!(contents == "firstsecond" || contents == "secondfirst");
+    let _ = std::fs::remove_file(marker);
 }
 
 #[tokio::test]

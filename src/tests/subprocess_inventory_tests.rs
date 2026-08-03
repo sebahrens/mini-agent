@@ -868,19 +868,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/hooks/subprocess.rs",
+        "use tokio::process::Child;",
+        1,
+        "TC-PROJECT-AUTOMATION",
+    ),
+    (
+        "src/extras/hooks/subprocess.rs",
         "let mut child = match cmd.spawn() {",
-        1,
-        "TC-PROJECT-AUTOMATION",
-    ),
-    (
-        "src/extras/hooks/subprocess.rs",
-        "let mut cmd = Command::new(program);",
-        1,
-        "TC-PROJECT-AUTOMATION",
-    ),
-    (
-        "src/extras/hooks/subprocess.rs",
-        "use tokio::process::{Child, Command};",
         1,
         "TC-PROJECT-AUTOMATION",
     ),
@@ -889,6 +883,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         ".spawn(move || {",
         1,
         "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(\"zerobox\");",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(zerobox);",
+        1,
+        "TC-PROJECT-AUTOMATION",
     ),
     (
         "src/extras/js/host.rs",
@@ -1088,27 +1094,15 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(&self.shell);",
         1,
         "TC-MODEL-ACTION",
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(bwrap);",
+        "let mut cmd = Command::new(program);",
         1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(seatbelt);",
-        1,
-        "TC-MODEL-ACTION",
+        "TC-PROJECT-AUTOMATION",
     ),
     (
         "src/sandbox.rs",
@@ -2190,11 +2184,23 @@ fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
 
 /// Sites whose identical terminal expression inherits different classes from
 /// the surrounding constructor, in source order.
-const MIXED_SITES: &[(&str, &str, &[&str])] = &[(
-    "src/ui/app.rs",
-    ".output()",
-    &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
-)];
+const MIXED_SITES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(bwrap);",
+        &["TC-PROJECT-AUTOMATION", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(seatbelt);",
+        &["TC-PROJECT-AUTOMATION", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/ui/app.rs",
+        ".output()",
+        &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
+    ),
+];
 
 const ALLOWED_CURRENT_CLASSES: &[&str] = &[
     "NON-PROCESS",
@@ -2215,6 +2221,18 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(\"zerobox\");",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(zerobox);",
+        1,
+        "TC-PROJECT-AUTOMATION",
+    ),
     (
         "src/extras/js/host.rs",
         "assert_eq!(output.status, CommandStatus::Completed);",
@@ -2401,27 +2419,15 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(&self.shell);",
         1,
         "TC-MODEL-ACTION",
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(bwrap);",
+        "let mut cmd = Command::new(program);",
         1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(seatbelt);",
-        1,
-        "TC-MODEL-ACTION",
+        "TC-PROJECT-AUTOMATION",
     ),
     (
         "src/sandbox.rs",

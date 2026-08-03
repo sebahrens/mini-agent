@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use regex::Regex;
 
@@ -6,7 +8,9 @@ use super::channel::{ChannelResult, interpret_hook_output};
 use super::envelope::{EventFields, build_envelope};
 use super::normalize::canonical_tool_name;
 use super::settings::{HookHandler, HooksConfig};
-use super::subprocess::{HookOutput, HookStatus, run_hook, run_shell_condition};
+use super::subprocess::{
+    HookOutput, HookPolicy, HookStatus, run_hook_with_policy, run_shell_condition,
+};
 use super::{Decision, HookCtx, PreDecision, Verdict};
 
 /// Default per-hook timeout when a handler doesn't declare one.
@@ -60,14 +64,50 @@ struct MatcherEntry {
 /// "rig-free dispatcher seam" requirement.
 pub(crate) struct HookDispatcher {
     events: HashMap<String, Vec<MatcherEntry>>,
-    /// Handlers with `once: true` that have already run, keyed by
-    /// `(event, command)` so the same command declared under two different
-    /// events tracks independently.
-    once_ran: std::sync::Mutex<HashSet<(String, String)>>,
+    sandbox_backend: String,
+    /// Canonical startup project root. Production dispatch binds both the
+    /// hook envelope and subprocess policy to this immutable directory.
+    project_root: Option<String>,
+    /// Full handler bindings with `once: true` that have already run, keyed by
+    /// event so distinct argv, conditions, environments, and trust policies
+    /// never consume one another's once slot.
+    once_ran: Arc<Mutex<HashSet<(String, HookHandler)>>>,
 }
 
 impl HookDispatcher {
     pub(crate) fn from_config(config: &HooksConfig) -> Result<Self, String> {
+        let backend = if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else {
+            "bwrap"
+        };
+        Self::from_config_with_backend(config, backend)
+    }
+
+    pub(crate) fn from_config_with_backend(
+        config: &HooksConfig,
+        sandbox_backend: &str,
+    ) -> Result<Self, String> {
+        Self::from_config_with_backend_and_optional_root(config, sandbox_backend, None)
+    }
+
+    pub(crate) fn from_config_with_backend_and_root(
+        config: &HooksConfig,
+        sandbox_backend: &str,
+        project_root: &Path,
+    ) -> Result<Self, String> {
+        Self::from_config_with_backend_and_optional_root(
+            config,
+            sandbox_backend,
+            Some(project_root.to_string_lossy().into_owned()),
+        )
+    }
+
+    fn from_config_with_backend_and_optional_root(
+        config: &HooksConfig,
+        sandbox_backend: &str,
+        project_root: Option<String>,
+    ) -> Result<Self, String> {
         let mut events = HashMap::new();
         for (event, groups) in config {
             let mut entries = Vec::with_capacity(groups.len());
@@ -82,8 +122,18 @@ impl HookDispatcher {
         }
         Ok(Self {
             events,
-            once_ran: std::sync::Mutex::new(HashSet::new()),
+            sandbox_backend: sandbox_backend.to_string(),
+            project_root,
+            once_ran: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    fn policy_context(&self, ctx: &HookCtx) -> HookCtx {
+        let mut ctx = ctx.clone();
+        if let Some(project_root) = &self.project_root {
+            ctx.cwd.clone_from(project_root);
+        }
+        ctx
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -123,22 +173,22 @@ impl HookDispatcher {
         result
     }
 
-    /// Handlers matching `event`/`canonical_tool_name`, in declared order,
-    /// with identical commands deduplicated (first occurrence wins).
+    /// Handlers matching `event`/`canonical_tool_name`, in declared order.
+    /// Exact duplicate handler definitions within one matcher group are
+    /// deduplicated (first occurrence wins); separate policy sources/groups
+    /// remain independent guard rails.
     pub(crate) fn handlers_for(&self, event: &str, canonical_tool_name: &str) -> Vec<&HookHandler> {
         let Some(entries) = self.events.get(event) else {
             return Vec::new();
         };
-        let mut seen = HashSet::new();
         let mut result = Vec::new();
         for entry in entries {
             if !entry.matcher.matches(canonical_tool_name) {
                 continue;
             }
+            let mut seen = HashSet::new();
             for handler in &entry.handlers {
-                if let Some(cmd) = handler.command.as_deref()
-                    && !seen.insert(cmd)
-                {
+                if !seen.insert(handler) {
                     continue;
                 }
                 result.push(handler);
@@ -161,7 +211,8 @@ impl HookDispatcher {
         if handlers.is_empty() {
             return Decision::Continue;
         }
-        let envelope = build_envelope(ctx, event, fields);
+        let ctx = self.policy_context(ctx);
+        let envelope = build_envelope(&ctx, event, fields);
         let outputs = self
             .run_handlers(event, &handlers, &envelope, &ctx.cwd)
             .await;
@@ -184,8 +235,9 @@ impl HookDispatcher {
                 updated_input: None,
             };
         }
+        let ctx = self.policy_context(ctx);
         let envelope = build_envelope(
-            ctx,
+            &ctx,
             "PreToolUse",
             EventFields::PreToolUse {
                 tool_name: canonical,
@@ -213,8 +265,9 @@ impl HookDispatcher {
         if handlers.is_empty() {
             return Decision::Continue;
         }
+        let ctx = self.policy_context(ctx);
         let envelope = build_envelope(
-            ctx,
+            &ctx,
             "PostToolUse",
             EventFields::PostToolUse {
                 tool_name: canonical,
@@ -241,8 +294,9 @@ impl HookDispatcher {
         if handlers.is_empty() {
             return;
         }
+        let ctx = self.policy_context(ctx);
         let envelope = build_envelope(
-            ctx,
+            &ctx,
             "PostToolUseFailure",
             EventFields::PostToolUseFailure {
                 tool_name: canonical,
@@ -267,24 +321,21 @@ impl HookDispatcher {
     ) -> Vec<HookOutput> {
         let stdin = serde_json::to_vec(envelope).unwrap_or_default();
         let mut futures = Vec::new();
-        let mut async_handles = Vec::new();
+        let mut async_futures = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
                 continue;
             };
 
-            if handler.once {
-                let mut ran = self.once_ran.lock().unwrap_or_else(|e| e.into_inner());
-                if !ran.insert((event.to_string(), command.clone())) {
-                    continue;
-                }
-            }
-
             if let Some(condition) = &handler.condition {
+                let policy =
+                    HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone());
                 let cond_timeout =
                     std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
                 let cond_output =
-                    run_shell_condition(condition, &stdin, cond_timeout, project_dir).await;
+                    run_shell_condition(condition, &stdin, cond_timeout, project_dir, &policy)
+                        .await;
+                audit_hook_outcome(event, &command, "condition", handler.trust, &cond_output);
                 match cond_output.status {
                     HookStatus::TimedOut => {
                         tracing::warn!(
@@ -296,45 +347,147 @@ impl HookDispatcher {
                             "hooks: `if` condition for {command:?} exceeded its {limit:?} output limit; failing closed (running the handler)"
                         );
                     }
-                    HookStatus::Completed | HookStatus::Failed => match cond_output.exit_code {
-                        Some(0) => {}
-                        Some(_) => continue,
-                        None => {
-                            tracing::warn!(
-                                "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
-                            );
+                    HookStatus::Completed | HookStatus::Failed | HookStatus::PolicyDenied => {
+                        match cond_output.exit_code {
+                            Some(0) => {}
+                            Some(_) => continue,
+                            None => {
+                                tracing::warn!(
+                                    "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
+                                );
+                            }
                         }
-                    },
+                    }
                 }
             }
+
+            // A false condition never consumes `once`. Reserve immediately
+            // before launch so concurrent dispatches cannot run the binding
+            // twice, then release only if no child/wrapper was started.
+            let once_key = handler
+                .once
+                .then(|| (event.to_string(), (*handler).clone()));
+            let Some(mut once_reservation) =
+                OnceReservation::reserve(Arc::clone(&self.once_ran), once_key)
+            else {
+                continue;
+            };
 
             let timeout =
                 std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
             let stdin = stdin.clone();
             let project_dir = project_dir.to_string();
             let args = handler.args.clone();
+            let policy = HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone());
+            let diagnostics = policy.diagnostics();
+            let trust = handler.trust;
+            let audit_event = event.to_string();
+            tracing::info!(
+                event,
+                command = command.as_str(),
+                trust = ?handler.trust,
+                containment = diagnostics.containment,
+                filesystem = diagnostics.filesystem,
+                network = diagnostics.network,
+                "hooks: applying subprocess policy"
+            );
             if handler.is_async {
-                async_handles.push(tokio::spawn(async move {
-                    let _ =
-                        run_hook(&command, args.as_deref(), &stdin, timeout, &project_dir).await;
-                }));
+                async_futures.push(async move {
+                    let output = run_hook_with_policy(
+                        &command,
+                        args.as_deref(),
+                        &stdin,
+                        timeout,
+                        &project_dir,
+                        &policy,
+                    )
+                    .await;
+                    once_reservation.consume_if_started(&output);
+                    audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
+                });
             } else {
                 futures.push(async move {
-                    run_hook(&command, args.as_deref(), &stdin, timeout, &project_dir).await
+                    let output = run_hook_with_policy(
+                        &command,
+                        args.as_deref(),
+                        &stdin,
+                        timeout,
+                        &project_dir,
+                        &policy,
+                    )
+                    .await;
+                    once_reservation.consume_if_started(&output);
+                    audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
+                    output
                 });
             }
         }
-        let (outputs, async_results) = tokio::join!(
+        let (outputs, _) = tokio::join!(
             futures::future::join_all(futures),
-            futures::future::join_all(async_handles)
+            futures::future::join_all(async_futures)
         );
-        for result in async_results {
-            if let Err(error) = result {
-                tracing::warn!("hooks: async handler task failed: {error}");
-            }
-        }
         outputs
     }
+}
+
+struct OnceReservation {
+    once_ran: Arc<Mutex<HashSet<(String, HookHandler)>>>,
+    key: Option<(String, HookHandler)>,
+}
+
+impl OnceReservation {
+    fn reserve(
+        once_ran: Arc<Mutex<HashSet<(String, HookHandler)>>>,
+        key: Option<(String, HookHandler)>,
+    ) -> Option<Self> {
+        if let Some(key) = &key
+            && !once_ran
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key.clone())
+        {
+            return None;
+        }
+        Some(Self { once_ran, key })
+    }
+
+    fn consume_if_started(&mut self, output: &HookOutput) {
+        if output.started {
+            self.key = None;
+        }
+    }
+}
+
+impl Drop for OnceReservation {
+    fn drop(&mut self) {
+        if let Some(key) = &self.key {
+            self.once_ran
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(key);
+        }
+    }
+}
+
+fn audit_hook_outcome(
+    event: &str,
+    command: &str,
+    role: &str,
+    trust: super::settings::HookTrust,
+    output: &HookOutput,
+) {
+    tracing::info!(
+        event,
+        command,
+        role,
+        trust = ?trust,
+        status = ?output.status,
+        containment = output.diagnostics.containment,
+        environment = output.diagnostics.environment,
+        filesystem = output.diagnostics.filesystem,
+        network = output.diagnostics.network,
+        "hooks: subprocess policy outcome"
+    );
 }
 
 struct PreDecisionPart {
@@ -373,8 +526,11 @@ fn parse_pre_decision_part(output: &HookOutput) -> PreDecisionPart {
             reason: None,
             updated_input: None,
         },
-        ChannelResult::Error { exit_code, stderr } => {
-            tracing::warn!("hooks: hook exited {exit_code:?} (non-blocking): {stderr}");
+        ChannelResult::Error { exit_code, .. } => {
+            // Hook stderr is untrusted and may contain credentials or input
+            // data. The bounded bytes remain available to the channel
+            // contract, but audit logs record only the closed outcome.
+            tracing::warn!("hooks: hook exited {exit_code:?} (non-blocking)");
             PreDecisionPart {
                 verdict: Verdict::Defer,
                 reason: None,
@@ -397,6 +553,11 @@ fn parse_pre_decision_part(output: &HookOutput) -> PreDecisionPart {
                 updated_input: None,
             }
         }
+        ChannelResult::PolicyDenied { reason } => PreDecisionPart {
+            verdict: Verdict::Deny,
+            reason: Some(format!("hook subprocess policy denied launch: {reason}")),
+            updated_input: None,
+        },
     }
 }
 
@@ -473,6 +634,9 @@ fn parse_decision(event: &str, output: &HookOutput) -> Decision {
         ChannelResult::Error { .. }
         | ChannelResult::TimedOut
         | ChannelResult::OutputLimitExceeded => Decision::Continue,
+        ChannelResult::PolicyDenied { reason } => Decision::Block {
+            reason: format!("hook subprocess policy denied launch: {reason}"),
+        },
     }
 }
 

@@ -104,6 +104,8 @@ async fn resumed_session_history_survives_stop_hook_continuation() {
         is_async: false,
         condition: None,
         once: false,
+        trust: crate::extras::hooks::settings::HookTrust::Trusted,
+        env: Default::default(),
     };
     let mut config: HooksConfig = HashMap::new();
     config.insert(

@@ -162,6 +162,13 @@ const SEATBELT_REQUESTED_NETWORK_POLICY: &str =
 #[cfg(feature = "js")]
 const SNAPSHOT_EXECUTABLE_PATH: &str = "/run/mini-agent/spawn-executable";
 
+#[cfg(feature = "hooks")]
+pub(crate) const HOOK_SANDBOX_READY_MARKER: &[u8] = b"MINI_AGENT_HOOK_SANDBOX_READY/1\n";
+#[cfg(feature = "hooks")]
+const HOOK_SANDBOX_READY_SCRIPT: &str = r#"if [ ! -x "$0" ]; then exit 126; fi
+printf 'MINI_AGENT_HOOK_SANDBOX_READY/1\n' >&2
+exec "$0" "$@""#;
+
 fn zerobox_exists() -> bool {
     *ZEROBOX_AVAILABLE.get_or_init(|| which_cmd("zerobox"))
 }
@@ -206,13 +213,21 @@ fn which_cmd(name: &str) -> bool {
     std::env::split_paths(&path).any(|dir| is_executable(&dir.join(name)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "hooks")))]
 fn find_trusted_system_executable(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|directory| directory.join(name))
         .filter_map(|candidate| candidate.canonicalize().ok())
         .find(|candidate| is_trusted_system_path(candidate))
+}
+
+#[cfg(all(
+    feature = "hooks",
+    not(any(target_os = "linux", all(target_os = "macos", feature = "hooks")))
+))]
+fn find_trusted_system_executable(_name: &str) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -524,6 +539,159 @@ impl Sandbox {
                 .to_string()
         })?;
         Ok(self.build_bwrap_command(bwrap, command, &cwd, &cache_dir))
+    }
+
+    /// Builds a direct-exec command under the general workspace policy.
+    ///
+    /// Unlike [`Self::wrap_command`], no shell parses `program` or `args`.
+    /// The child always starts in `cwd` with a cleared environment containing
+    /// only the standard non-credential allow-list plus `explicit_env`.
+    #[cfg(feature = "hooks")]
+    pub(crate) fn wrap_direct_command(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        explicit_env: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Command, String> {
+        let cwd = canonical_non_root(cwd, "hook project directory")?;
+        match self.policy() {
+            SandboxPolicy::Disabled => {
+                let mut cmd = Command::new(program);
+                cmd.args(args).current_dir(&cwd).env_clear();
+                for (key, value) in essential_env() {
+                    cmd.env(key, value);
+                }
+                cmd.envs(explicit_env);
+                configure_child_lifetime(&mut cmd);
+                return Ok(cmd);
+            }
+            SandboxPolicy::RequiredButUnavailable => {
+                return Err(format!(
+                    "sandbox backend '{}' is not available — refusing to run hook unsandboxed (requested-but-unavailable)",
+                    self.backend
+                ));
+            }
+            SandboxPolicy::RequiredAndAvailable => {}
+        }
+
+        if self.backend == "zerobox" {
+            let zerobox = find_trusted_system_executable("zerobox").ok_or_else(|| {
+                "sandbox backend 'zerobox' is not a trusted system executable — refusing to run hook unsandboxed"
+                    .to_string()
+            })?;
+            let readiness_shell = hook_readiness_shell()?;
+            let mut cmd = Command::new(zerobox);
+            cmd.arg("--allow-write")
+                .arg(&cwd)
+                .arg("--")
+                .arg(readiness_shell)
+                .arg("-c")
+                .arg(HOOK_SANDBOX_READY_SCRIPT)
+                .arg(program)
+                .args(args)
+                .current_dir(&cwd)
+                .env_clear();
+            for (key, value) in essential_env() {
+                cmd.env(key, value);
+            }
+            cmd.envs(explicit_env);
+            configure_child_lifetime(&mut cmd);
+            return Ok(cmd);
+        }
+
+        let paths = crate::paths::process_paths()
+            .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
+        std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
+            format!(
+                "sandbox: failed to create application cache {}: {error}",
+                paths.cache_dir.display()
+            )
+        })?;
+        let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+
+        if self.backend == "seatbelt" {
+            let readiness_shell = hook_readiness_shell()?;
+            let seatbelt = seatbelt_path().ok_or_else(|| {
+                "sandbox backend 'seatbelt' is not a trusted system executable — refusing to run hook unsandboxed"
+                    .to_string()
+            })?;
+            let workspace = seatbelt_string_literal(&cwd, "hook project directory")?;
+            let cache = seatbelt_string_literal(&cache_dir, "application cache")?;
+            let profile = format!(
+                r#"(version 1)
+(deny default)
+(allow process*)
+(allow file-read*)
+(allow file-write*
+    (subpath "{workspace}")
+    (subpath "{cache}")
+    (subpath "/private/tmp")
+    (literal "/dev/null"))
+(deny network*)"#
+            );
+            let mut cmd = Command::new(seatbelt);
+            cmd.arg("-p")
+                .arg(profile)
+                .arg(readiness_shell)
+                .arg("-c")
+                .arg(HOOK_SANDBOX_READY_SCRIPT)
+                .arg(program)
+                .args(args);
+            cmd.current_dir(&cwd).env_clear();
+            for (key, value) in essential_env() {
+                cmd.env(key, value);
+            }
+            cmd.envs(explicit_env).env("TMPDIR", "/private/tmp");
+            configure_child_lifetime(&mut cmd);
+            return Ok(cmd);
+        }
+
+        let bwrap = bwrap_path().ok_or_else(|| {
+            "sandbox backend 'bwrap' is not a trusted system executable — refusing to run hook unsandboxed"
+                .to_string()
+        })?;
+        let readiness_shell = hook_readiness_shell()?;
+        let mut cmd = Command::new(bwrap);
+        cmd.current_dir(&cwd).env_clear();
+        for (key, value) in essential_env() {
+            cmd.env(key, value);
+        }
+        cmd.envs(explicit_env).env("TMPDIR", "/tmp");
+        for path in ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix"] {
+            cmd.args(["--ro-bind-try", path, path]);
+        }
+        cmd.args(["--dir", "/etc"]);
+        for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+            cmd.args(["--ro-bind-try", path, path]);
+        }
+        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+            .arg("--bind")
+            .arg(&cwd)
+            .arg(&cwd)
+            .arg("--bind")
+            .arg(&cache_dir)
+            .arg(&cache_dir)
+            .args([
+                "--unshare-user",
+                "--unshare-ipc",
+                "--unshare-pid",
+                "--unshare-net",
+                "--unshare-uts",
+                "--unshare-cgroup",
+                "--remount-ro",
+                "/",
+                "--chdir",
+            ])
+            .arg(&cwd)
+            .args(["--die-with-parent", "--"])
+            .arg(readiness_shell)
+            .arg("-c")
+            .arg(HOOK_SANDBOX_READY_SCRIPT)
+            .arg(program)
+            .args(args);
+        configure_child_lifetime(&mut cmd);
+        Ok(cmd)
     }
 
     fn build_seatbelt_command(
@@ -925,6 +1093,13 @@ impl Sandbox {
     }
 }
 
+#[cfg(feature = "hooks")]
+fn hook_readiness_shell() -> Result<PathBuf, String> {
+    find_trusted_system_executable("sh").ok_or_else(|| {
+        "sandbox: no trusted system `sh` is available for the hook readiness launcher".to_string()
+    })
+}
+
 async fn wait_for_command_cancellation(cancellation: Option<&mut watch::Receiver<bool>>) {
     let Some(cancellation) = cancellation else {
         std::future::pending::<()>().await;
@@ -1113,6 +1288,15 @@ fn essential_env() -> Vec<(&'static str, String)> {
         "LC_ALL",
         "COLORTERM",
         "NO_COLOR",
+        "TMPDIR",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERNAME",
+        "USERPROFILE",
     ];
     let mut vars = Vec::with_capacity(preserve.len());
     for name in &preserve {
