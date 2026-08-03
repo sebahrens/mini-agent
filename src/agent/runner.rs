@@ -253,6 +253,36 @@ impl UsageLedger {
     }
 }
 
+#[cfg(feature = "subagents")]
+#[derive(Clone, Default)]
+pub(crate) struct SharedUsageLedger {
+    inner: std::sync::Arc<std::sync::Mutex<UsageLedger>>,
+}
+
+#[cfg(feature = "subagents")]
+impl SharedUsageLedger {
+    pub(crate) fn record_completion(&self, usage: Usage) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(usage);
+    }
+
+    fn reconcile_terminal(&self, usage: Usage) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reconcile_terminal(usage);
+    }
+
+    pub(crate) fn total(&self) -> Usage {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .total
+    }
+}
+
 pub(crate) fn usage_saturating_add(left: Usage, right: Usage) -> Usage {
     Usage {
         input_tokens: left.input_tokens.saturating_add(right.input_tokens),
@@ -1527,6 +1557,7 @@ pub(crate) async fn run_subagent<M>(
     max_turns: usize,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     retry_config: &RetryConfig,
+    usage_ledger: SharedUsageLedger,
 ) -> SubagentRunOutput
 where
     M: CompletionModel + 'static,
@@ -1547,14 +1578,12 @@ where
         Err(error) => {
             return SubagentRunOutput {
                 response: Err(format!("subagent error: {error}")),
-                usage: Usage::new(),
+                usage: usage_ledger.total(),
             };
         }
     };
 
     let mut full_response = String::new();
-    let mut usage = Usage::new();
-
     while let Some(item) = stream.next().await {
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
@@ -1574,21 +1603,18 @@ where
                 }
             }
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
-                let final_usage = res.usage();
-                if final_usage.has_values() {
-                    usage = final_usage;
-                }
+                usage_ledger.reconcile_terminal(res.usage());
                 full_response = res.output.to_string();
                 break;
             }
             Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                usage = usage_saturating_add(usage, call.usage);
+                usage_ledger.record_completion(call.usage);
             }
             Ok(_) => {}
             Err(e) => {
                 return SubagentRunOutput {
                     response: Err(format!("subagent error: {e}")),
-                    usage,
+                    usage: usage_ledger.total(),
                 };
             }
         }
@@ -1597,13 +1623,13 @@ where
     if full_response.is_empty() {
         return SubagentRunOutput {
             response: Err("subagent returned empty response".to_string()),
-            usage,
+            usage: usage_ledger.total(),
         };
     }
 
     SubagentRunOutput {
         response: Ok(full_response),
-        usage,
+        usage: usage_ledger.total(),
     }
 }
 
@@ -3040,6 +3066,70 @@ mod tests {
             super::exhausted_token_budget(ledger.total, Some(u64::MAX - 1)),
             Some((u64::MAX, u64::MAX - 1))
         );
+    }
+
+    #[tokio::test]
+    async fn rig_multi_turn_run_usage_saturates_before_completion_delivery() {
+        let near_max = Usage {
+            input_tokens: u64::MAX - 1,
+            output_tokens: u64::MAX - 1,
+            total_tokens: u64::MAX - 1,
+            cached_input_tokens: u64::MAX - 1,
+            cache_creation_input_tokens: u64::MAX - 1,
+            tool_use_prompt_tokens: u64::MAX - 1,
+            reasoning_tokens: u64::MAX - 1,
+        };
+        let increment = Usage {
+            input_tokens: 10,
+            output_tokens: 10,
+            total_tokens: 10,
+            cached_input_tokens: 10,
+            cache_creation_input_tokens: 10,
+            tool_use_prompt_tokens: 10,
+            reasoning_tokens: 10,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "saturating-run-tool",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(near_max),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response(increment),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(2)
+            .build();
+
+        let (response, usage) = super::run_print(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("Rig run-level aggregation must saturate rather than panic or wrap");
+
+        assert_eq!(response, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.requests().len(), 2);
+        assert_eq!(usage.input_tokens, u64::MAX);
+        assert_eq!(usage.output_tokens, u64::MAX);
+        assert_eq!(usage.total_tokens, u64::MAX);
+        assert_eq!(usage.cached_input_tokens, u64::MAX);
+        assert_eq!(usage.cache_creation_input_tokens, u64::MAX);
+        assert_eq!(usage.tool_use_prompt_tokens, u64::MAX);
+        assert_eq!(usage.reasoning_tokens, u64::MAX);
     }
 
     #[tokio::test]

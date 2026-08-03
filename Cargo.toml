@@ -128,6 +128,11 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }
 
+# Rig 0.40 aggregates run-level Usage before yielding CompletionCall events.
+# Keep the dependency pinned locally until upstream Usage arithmetic saturates.
+[patch.crates-io]
+rig-core = { path = "vendor/rig-core-0.40.0" }
+
 [profile.dev]
 opt-level = 0
 debug = false
