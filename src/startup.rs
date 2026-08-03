@@ -6,11 +6,10 @@ use crate::config::{self, Config};
 use crate::context::{self, ContextFiles};
 use crate::extras::status_signals::StatusSignals;
 use crate::paths::AppPaths;
-use crate::permission::SecurityMode;
 use crate::permission::ask::{AskReceiver, AskSender};
-use crate::permission::checker::{PermCheck, PermissionChecker};
+use crate::permission::checker::PermCheck;
 use crate::provider::{self, AnyClient};
-use crate::sandbox::{DEFAULT_COMMAND_LIMITS, Sandbox, SandboxPolicy};
+use crate::sandbox::{DEFAULT_COMMAND_LIMITS, Sandbox};
 use crate::session::{self, MessageRole, Session};
 
 #[cfg(feature = "advisor")]
@@ -35,56 +34,6 @@ fn regen_resource(regen: fn() -> anyhow::Result<()>, what: &str, suffix: &str) -
             false
         }
     }
-}
-
-fn resolve_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
-    if cli.yolo || cfg.yolo.unwrap_or(false) {
-        SecurityMode::Yolo
-    } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
-        SecurityMode::Standard
-    } else if cli.read_only {
-        SecurityMode::ReadOnly
-    } else if cli.guarded {
-        SecurityMode::Guarded
-    } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
-        SecurityMode::Restrictive
-    } else if let Some(m) = &cfg.default_permission_mode {
-        match m.as_str() {
-            "yolo" => SecurityMode::Yolo,
-            "accept" => SecurityMode::Standard,
-            "standard" => SecurityMode::Standard,
-            "guarded" => SecurityMode::Guarded,
-            "readonly" => SecurityMode::ReadOnly,
-            "restrictive" => SecurityMode::Restrictive,
-            _ => SecurityMode::Standard,
-        }
-    } else {
-        SecurityMode::Standard
-    }
-}
-
-fn build_permission_checker(
-    cli: &Cli,
-    cfg: &Config,
-) -> (Option<PermCheck>, Option<AskSender>, Option<AskReceiver>) {
-    let no_tools = cli.resolve_no_tools(cfg);
-    if no_tools {
-        return (None, None, None);
-    }
-
-    if cli.dangerously_skip_permissions {
-        return (None, None, None);
-    }
-
-    let perm_config = cfg.build_permission_config();
-
-    let mode = resolve_mode(cli, cfg);
-    let permission_modes = cfg.permission_modes.clone();
-    let checker = PermissionChecker::new(&perm_config, mode, None, permission_modes);
-    let perm: PermCheck = std::sync::Arc::new(std::sync::Mutex::new(checker));
-
-    let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
-    (Some(perm), Some(ask_tx), Some(ask_rx))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -573,25 +522,9 @@ impl Startup {
         }
 
         // Sandbox, tools config, status signals, permission checker
-        self.sandbox = Sandbox::new(
-            self.cli.resolve_sandbox(&self.cfg),
-            &self.cli.resolve_sandbox_backend(&self.cfg),
-        )
-        .with_shell(&self.cli.resolve_shell(&self.cfg));
-        if self.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
-            let backend = self.cli.resolve_sandbox_backend(&self.cfg);
-            if self.cli.sandbox_explicitly_requested(&self.cfg) {
-                anyhow::bail!(
-                    "sandbox backend '{backend}' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
-                );
-            }
-            tracing::warn!(
-                "sandbox backend '{backend}' was not found — continuing UNSANDBOXED; pass --sandbox to fail closed instead"
-            );
-            self.sandbox = Sandbox::new(false, &backend)
-                .with_shell(&self.cli.resolve_shell(&self.cfg))
-                .with_unavailable_default_fallback();
-        }
+        let (authority, sandbox) =
+            crate::permission::resolve_configured_execution_authority(&self.cli, &self.cfg)?;
+        self.sandbox = sandbox;
         let edit_system = self.cli.resolve_edit_system(&self.cfg);
         tools::set_edit_system(edit_system);
         tools::set_deny_repeated_reads(self.cfg.deny_repeated_reads.unwrap_or(true));
@@ -601,7 +534,8 @@ impl Startup {
             self.status_signals = self.cli.status_socket.clone().map(StatusSignals::new);
         }
 
-        let (permission, ask_tx, ask_rx) = build_permission_checker(&self.cli, &self.cfg);
+        let (permission, ask_tx, ask_rx) =
+            crate::permission::build_interactive_permission(&self.cfg, authority);
         self.permission = permission;
         self.ask_tx = ask_tx;
         self.ask_rx = ask_rx;

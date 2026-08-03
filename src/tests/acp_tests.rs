@@ -3,7 +3,6 @@ mod tests {
     use crate::cli::Cli;
     use crate::config::Config;
     use crate::extras::acp::config::AcpServerConfig;
-    use crate::extras::acp::resolve_acp_mode;
     use crate::permission::SecurityMode;
 
     #[test]
@@ -69,87 +68,5 @@ mod tests {
         let modes = [Yolo, Standard, Guarded, ReadOnly, Restrictive];
         assert_eq!(modes.len(), 5);
         assert!(matches!(SecurityMode::Yolo, SecurityMode::Yolo));
-    }
-
-    // ── resolve_acp_mode tests ──────────────────────────────────────
-
-    #[test]
-    fn test_resolve_acp_mode_yolo_cli() {
-        let cli = Cli {
-            yolo: true,
-            ..Default::default()
-        };
-        let cfg = Config::default();
-        assert_eq!(resolve_acp_mode(&cli, &cfg), SecurityMode::Yolo);
-    }
-
-    #[test]
-    fn test_resolve_acp_mode_accept_all() {
-        let cli = Cli {
-            accept_all: true,
-            ..Default::default()
-        };
-        let cfg = Config::default();
-        assert_eq!(resolve_acp_mode(&cli, &cfg), SecurityMode::Standard);
-    }
-
-    #[test]
-    fn test_resolve_acp_mode_restrictive() {
-        let cli = Cli {
-            restrictive: true,
-            ..Default::default()
-        };
-        let cfg = Config::default();
-        assert_eq!(resolve_acp_mode(&cli, &cfg), SecurityMode::Restrictive);
-    }
-
-    #[test]
-    fn test_resolve_acp_mode_default_standard() {
-        let cli = Cli::default();
-        let cfg = Config::default();
-        assert_eq!(resolve_acp_mode(&cli, &cfg), SecurityMode::Standard);
-    }
-
-    #[test]
-    fn test_resolve_acp_mode_yolo_config() {
-        let cli = Cli::default();
-        let cfg = Config {
-            yolo: Some(true),
-            ..Default::default()
-        };
-        assert_eq!(resolve_acp_mode(&cli, &cfg), SecurityMode::Yolo);
-    }
-
-    #[test]
-    fn test_resolve_acp_mode_config_default_mode() {
-        let cli = Cli::default();
-        let cfg = Config {
-            default_permission_mode: Some("guarded".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(resolve_acp_mode(&cli, &cfg), SecurityMode::Guarded);
-    }
-
-    #[test]
-    fn test_resolve_acp_mode_skip_permissions() {
-        let cli = Cli {
-            dangerously_skip_permissions: true,
-            ..Default::default()
-        };
-        let cfg = Config::default();
-        assert_eq!(resolve_acp_mode(&cli, &cfg), SecurityMode::Standard);
-    }
-
-    #[test]
-    fn test_resolve_acp_mode_cli_overrides_config() {
-        let cli = Cli {
-            yolo: true,
-            ..Default::default()
-        };
-        let cfg = Config {
-            default_permission_mode: Some("restrictive".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(resolve_acp_mode(&cli, &cfg), SecurityMode::Yolo);
     }
 }

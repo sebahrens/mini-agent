@@ -61,37 +61,168 @@ impl From<PermissionConfig> for PermissionConfigs {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxResolution {
+    Disabled,
+    Enforced,
+    DegradedUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ResolvedExecutionAuthority {
+    pub mode: SecurityMode,
+    pub tools_enabled: bool,
+    pub permission_checks_enabled: bool,
+    pub sandbox: SandboxResolution,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "sandbox backend '{backend}' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
+)]
+pub(crate) struct ExecutionAuthorityError {
+    backend: String,
+}
+
+/// Resolve every user/config input that changes model execution authority.
+///
+/// The function is pure: callers supply the already-observed sandbox policy,
+/// and both startup and ACP consume the same value. Approval-channel wiring
+/// intentionally remains frontend-specific.
+pub(crate) fn resolve_execution_authority(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    sandbox_policy: crate::sandbox::SandboxPolicy,
+    sandbox_backend: &str,
+) -> Result<ResolvedExecutionAuthority, ExecutionAuthorityError> {
+    let mode = if cli.yolo || cfg.yolo.unwrap_or(false) {
+        SecurityMode::Yolo
+    } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
+        SecurityMode::Standard
+    } else if cli.read_only {
+        SecurityMode::ReadOnly
+    } else if cli.guarded {
+        SecurityMode::Guarded
+    } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
+        SecurityMode::Restrictive
+    } else {
+        match cfg.default_permission_mode.as_deref() {
+            Some("yolo") => SecurityMode::Yolo,
+            Some("accept" | "standard") => SecurityMode::Standard,
+            Some("guarded") => SecurityMode::Guarded,
+            Some("readonly") => SecurityMode::ReadOnly,
+            Some("restrictive") => SecurityMode::Restrictive,
+            _ => SecurityMode::Standard,
+        }
+    };
+
+    let tools_enabled = !cli.resolve_no_tools(cfg);
+    let permission_checks_enabled = tools_enabled && !cli.dangerously_skip_permissions;
+    let sandbox = match sandbox_policy {
+        crate::sandbox::SandboxPolicy::Disabled => SandboxResolution::Disabled,
+        crate::sandbox::SandboxPolicy::RequiredAndAvailable => SandboxResolution::Enforced,
+        crate::sandbox::SandboxPolicy::RequiredButUnavailable
+            if cli.sandbox_explicitly_requested(cfg) =>
+        {
+            return Err(ExecutionAuthorityError {
+                backend: sandbox_backend.to_string(),
+            });
+        }
+        crate::sandbox::SandboxPolicy::RequiredButUnavailable => {
+            SandboxResolution::DegradedUnavailable
+        }
+    };
+
+    Ok(ResolvedExecutionAuthority {
+        mode,
+        tools_enabled,
+        permission_checks_enabled,
+        sandbox,
+    })
+}
+
+/// Resolve authority against the configured sandbox and materialize the
+/// sandbox selected by that decision. Both interactive startup and ACP call
+/// this before constructing execution machinery.
+pub(crate) fn resolve_configured_execution_authority(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+) -> Result<(ResolvedExecutionAuthority, crate::sandbox::Sandbox), ExecutionAuthorityError> {
+    let backend = cli.resolve_sandbox_backend(cfg);
+    let shell = cli.resolve_shell(cfg);
+    let configured =
+        crate::sandbox::Sandbox::new(cli.resolve_sandbox(cfg), &backend).with_shell(&shell);
+    let authority = resolve_execution_authority(cli, cfg, configured.policy(), &backend)?;
+    let sandbox = if authority.sandbox == SandboxResolution::DegradedUnavailable {
+        tracing::warn!(
+            "sandbox backend '{backend}' was not found — continuing UNSANDBOXED; pass --sandbox to fail closed instead"
+        );
+        crate::sandbox::Sandbox::new(false, &backend)
+            .with_shell(&shell)
+            .with_unavailable_default_fallback()
+    } else {
+        configured
+    };
+
+    Ok((authority, sandbox))
+}
+
+/// Build a permission policy and approval channel for interactive startup.
+pub(crate) fn build_interactive_permission(
+    cfg: &crate::config::Config,
+    authority: ResolvedExecutionAuthority,
+) -> (
+    Option<checker::PermCheck>,
+    Option<ask::AskSender>,
+    Option<ask::AskReceiver>,
+) {
+    let Some(permission) = build_permission_checker_at(cfg, authority, None) else {
+        return (None, None, None);
+    };
+    let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
+    (Some(permission), Some(ask_tx), Some(ask_rx))
+}
+
 /// Build a permission policy for a frontend that cannot securely prompt.
 ///
 /// The checker still preserves explicit allow and deny rules, but `Ask` has
 /// no response channel and therefore fails closed in the shared tool gates.
 pub(crate) fn build_noninteractive_permission(
-    cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
-    mode: SecurityMode,
+    authority: ResolvedExecutionAuthority,
 ) -> (Option<checker::PermCheck>, Option<ask::AskSender>) {
-    build_noninteractive_permission_at(cli, cfg, mode, None)
+    build_noninteractive_permission_at(cfg, authority, None)
 }
 
 pub(crate) fn build_noninteractive_permission_at(
-    cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
-    mode: SecurityMode,
+    authority: ResolvedExecutionAuthority,
     working_dir: Option<std::path::PathBuf>,
 ) -> (Option<checker::PermCheck>, Option<ask::AskSender>) {
-    if cli.resolve_no_tools(cfg) || cli.dangerously_skip_permissions {
-        return (None, None);
+    (
+        build_permission_checker_at(cfg, authority, working_dir),
+        None,
+    )
+}
+
+fn build_permission_checker_at(
+    cfg: &crate::config::Config,
+    authority: ResolvedExecutionAuthority,
+    working_dir: Option<std::path::PathBuf>,
+) -> Option<checker::PermCheck> {
+    if !authority.tools_enabled || !authority.permission_checks_enabled {
+        return None;
     }
 
     let checker = checker::PermissionChecker::new(
         &cfg.build_permission_config(),
-        mode,
+        authority.mode,
         working_dir,
         cfg.permission_modes.clone(),
     );
     let permission = std::sync::Arc::new(std::sync::Mutex::new(checker));
 
-    (Some(permission), None)
+    Some(permission)
 }
 
 pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
@@ -104,7 +235,8 @@ pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
         permission_modes: Some(vec!["guarded".to_string()]),
         ..Default::default()
     };
-    let (permission, ask_tx) = build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded);
+    let (authority, _) = resolve_configured_execution_authority(&cli, &cfg)?;
+    let (permission, ask_tx) = build_noninteractive_permission(&cfg, authority);
 
     anyhow::ensure!(
         ask_tx.is_none(),
@@ -263,13 +395,362 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
 }
 
 #[cfg(test)]
+mod execution_authority_tests {
+    use super::{
+        SandboxResolution, SecurityMode, build_interactive_permission,
+        build_noninteractive_permission, resolve_configured_execution_authority,
+        resolve_execution_authority,
+    };
+    use crate::cli::Cli;
+    use crate::config::Config;
+    use crate::sandbox::SandboxPolicy;
+
+    struct Case {
+        name: &'static str,
+        cli: Cli,
+        cfg: Config,
+        sandbox_policy: SandboxPolicy,
+        expected_mode: SecurityMode,
+        tools_enabled: bool,
+        permission_checks_enabled: bool,
+        sandbox: Result<SandboxResolution, &'static str>,
+    }
+
+    #[test]
+    fn execution_authority_precedence_matrix_is_frontend_independent() {
+        let cases = vec![
+            Case {
+                name: "default",
+                cli: Cli::default(),
+                cfg: Config::default(),
+                sandbox_policy: SandboxPolicy::RequiredAndAvailable,
+                expected_mode: SecurityMode::Standard,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Enforced),
+            },
+            Case {
+                name: "cli yolo outranks every lower permission mode",
+                cli: Cli {
+                    yolo: true,
+                    accept_all: true,
+                    read_only: true,
+                    guarded: true,
+                    restrictive: true,
+                    ..Cli::default()
+                },
+                cfg: Config {
+                    default_permission_mode: Some("readonly".to_string()),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Yolo,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "config yolo outranks cli accept all",
+                cli: Cli {
+                    accept_all: true,
+                    ..Cli::default()
+                },
+                cfg: Config {
+                    yolo: Some(true),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Yolo,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "accept all outranks read only",
+                cli: Cli {
+                    accept_all: true,
+                    read_only: true,
+                    ..Cli::default()
+                },
+                cfg: Config::default(),
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Standard,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "config accept all outranks guarded",
+                cli: Cli {
+                    guarded: true,
+                    ..Cli::default()
+                },
+                cfg: Config {
+                    accept_all: Some(true),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Standard,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "read only outranks guarded and restrictive",
+                cli: Cli {
+                    read_only: true,
+                    guarded: true,
+                    restrictive: true,
+                    ..Cli::default()
+                },
+                cfg: Config::default(),
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::ReadOnly,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "guarded outranks restrictive",
+                cli: Cli {
+                    guarded: true,
+                    restrictive: true,
+                    ..Cli::default()
+                },
+                cfg: Config::default(),
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Guarded,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "config restrictive outranks default mode",
+                cli: Cli::default(),
+                cfg: Config {
+                    restrictive: Some(true),
+                    default_permission_mode: Some("guarded".to_string()),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Restrictive,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "configured default readonly",
+                cli: Cli::default(),
+                cfg: Config {
+                    default_permission_mode: Some("readonly".to_string()),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::ReadOnly,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "no tools disables tools and permission checks",
+                cli: Cli {
+                    no_tools: true,
+                    guarded: true,
+                    ..Cli::default()
+                },
+                cfg: Config::default(),
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Guarded,
+                tools_enabled: false,
+                permission_checks_enabled: false,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "config no tools disables tools and permission checks",
+                cli: Cli {
+                    guarded: true,
+                    ..Cli::default()
+                },
+                cfg: Config {
+                    no_tools: Some(true),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Guarded,
+                tools_enabled: false,
+                permission_checks_enabled: false,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "dangerous bypass disables checks but retains tools",
+                cli: Cli {
+                    dangerously_skip_permissions: true,
+                    guarded: true,
+                    ..Cli::default()
+                },
+                cfg: Config::default(),
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Guarded,
+                tools_enabled: true,
+                permission_checks_enabled: false,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "default unavailable sandbox degrades explicitly",
+                cli: Cli::default(),
+                cfg: Config::default(),
+                sandbox_policy: SandboxPolicy::RequiredButUnavailable,
+                expected_mode: SecurityMode::Standard,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::DegradedUnavailable),
+            },
+            Case {
+                name: "cli explicit unavailable sandbox rejects",
+                cli: Cli {
+                    sandbox: true,
+                    ..Cli::default()
+                },
+                cfg: Config::default(),
+                sandbox_policy: SandboxPolicy::RequiredButUnavailable,
+                expected_mode: SecurityMode::Standard,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Err(
+                    "sandbox backend 'missing' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)",
+                ),
+            },
+            Case {
+                name: "config explicit unavailable sandbox rejects",
+                cli: Cli::default(),
+                cfg: Config {
+                    sandbox: Some(true),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::RequiredButUnavailable,
+                expected_mode: SecurityMode::Standard,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Err(
+                    "sandbox backend 'missing' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)",
+                ),
+            },
+            Case {
+                name: "no sandbox outranks explicit config",
+                cli: Cli {
+                    no_sandbox: true,
+                    ..Cli::default()
+                },
+                cfg: Config {
+                    sandbox: Some(true),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::Standard,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+        ];
+
+        for case in cases {
+            let result =
+                resolve_execution_authority(&case.cli, &case.cfg, case.sandbox_policy, "missing");
+            match case.sandbox {
+                Ok(sandbox) => {
+                    let authority = result.unwrap_or_else(|error| {
+                        panic!("{} unexpectedly rejected: {error}", case.name)
+                    });
+                    assert_eq!(authority.mode, case.expected_mode, "{}", case.name);
+                    assert_eq!(authority.tools_enabled, case.tools_enabled, "{}", case.name);
+                    assert_eq!(
+                        authority.permission_checks_enabled, case.permission_checks_enabled,
+                        "{}",
+                        case.name
+                    );
+                    assert_eq!(authority.sandbox, sandbox, "{}", case.name);
+
+                    let (interactive, interactive_ask, interactive_receiver) =
+                        build_interactive_permission(&case.cfg, authority);
+                    assert_eq!(
+                        interactive.is_some(),
+                        case.permission_checks_enabled,
+                        "{} interactive checker",
+                        case.name
+                    );
+                    assert_eq!(
+                        interactive_ask.is_some(),
+                        case.permission_checks_enabled,
+                        "{} interactive approval sender",
+                        case.name
+                    );
+                    assert_eq!(
+                        interactive_receiver.is_some(),
+                        case.permission_checks_enabled,
+                        "{} interactive approval receiver",
+                        case.name
+                    );
+
+                    let (noninteractive, noninteractive_ask) =
+                        build_noninteractive_permission(&case.cfg, authority);
+                    assert_eq!(
+                        noninteractive.is_some(),
+                        case.permission_checks_enabled,
+                        "{} ACP checker",
+                        case.name
+                    );
+                    assert!(noninteractive_ask.is_none(), "{} ACP Ask", case.name);
+                }
+                Err(message) => assert_eq!(
+                    result.expect_err(case.name).to_string(),
+                    message,
+                    "{}",
+                    case.name
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn configured_authority_rejects_an_explicitly_unavailable_sandbox() {
+        let cli = Cli {
+            sandbox: true,
+            sandbox_backend: Some("definitely-not-a-real-backend".to_string()),
+            ..Cli::default()
+        };
+
+        let error = resolve_configured_execution_authority(&cli, &Config::default())
+            .expect_err("an explicit unavailable sandbox must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "sandbox backend 'definitely-not-a-real-backend' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
+        );
+    }
+
+    #[test]
+    fn configured_authority_materializes_default_unavailability_as_disabled() {
+        let cfg = Config {
+            sandbox_backend: Some("definitely-not-a-real-backend".to_string()),
+            ..Config::default()
+        };
+
+        let (authority, sandbox) =
+            resolve_configured_execution_authority(&Cli::default(), &cfg).unwrap();
+
+        assert_eq!(authority.sandbox, SandboxResolution::DegradedUnavailable);
+        assert_eq!(sandbox.policy(), SandboxPolicy::Disabled);
+    }
+}
+
+#[cfg(test)]
 mod acp_permission_policy_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rig::tool::Tool;
 
-    use super::{SecurityMode, build_noninteractive_permission};
+    use super::{SandboxResolution, build_noninteractive_permission, resolve_execution_authority};
     use crate::agent::tools::{ToolError, WriteArgs, WriteTool, check_perm};
     use crate::cli::Cli;
     use crate::config::Config;
@@ -315,7 +796,15 @@ mod acp_permission_policy_tests {
             permission_modes: Some(vec!["guarded".to_string()]),
             ..Default::default()
         };
-        build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded)
+        let authority = resolve_execution_authority(
+            &cli,
+            &cfg,
+            crate::sandbox::SandboxPolicy::Disabled,
+            "unused",
+        )
+        .unwrap();
+        assert_eq!(authority.sandbox, SandboxResolution::Disabled);
+        build_noninteractive_permission(&cfg, authority)
     }
 
     fn message(result: Result<Option<String>, ToolError>) -> Option<String> {
