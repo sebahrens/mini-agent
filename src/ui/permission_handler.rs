@@ -44,7 +44,9 @@ pub async fn handle_permission_request(
                     match key.code {
                         crossterm::event::KeyCode::Char('y') => break crate::permission::ask::UserDecision::AllowOnce,
                         crossterm::event::KeyCode::Char('a') => {
-                            let pattern = suggest_pattern(&ask_req.tool, &ask_req.input);
+                            let pattern = ask_req.suggested_pattern.clone().unwrap_or_else(|| {
+                                suggest_pattern(&ask_req.tool, &ask_req.input)
+                            });
                             renderer.write_line(
                                 &format!("  -> will allow: {}", pattern),
                                 Color::Green,
@@ -61,13 +63,17 @@ pub async fn handle_permission_request(
 
     renderer.permission_prompt = None;
 
-    let allow_pattern = match &decision {
-        crate::permission::ask::UserDecision::AllowAlways(p) => Some(p.clone()),
-        _ => None,
+    let allow_patterns = match &decision {
+        crate::permission::ask::UserDecision::AllowAlways(p) => {
+            let mut patterns = vec![p.clone()];
+            patterns.extend(ask_req.additional_allow_patterns.iter().cloned());
+            patterns
+        }
+        _ => Vec::new(),
     };
     let _ = ask_req.reply.send(decision);
 
-    if let Some(pattern) = allow_pattern {
+    for pattern in allow_patterns {
         renderer.write_line(
             &format!("  allowed {} {} for this session", ask_req.tool, pattern),
             Color::Green,

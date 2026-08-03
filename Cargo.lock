@@ -2783,6 +2783,7 @@ dependencies = [
  "unicase",
  "unicode-normalization",
  "unicode-width",
+ "url",
  "uuid",
  "which",
  "windows-sys 0.61.2",

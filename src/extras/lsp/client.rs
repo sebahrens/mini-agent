@@ -29,36 +29,66 @@ pub(crate) async fn read_stable_text(path: &Path) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// `file://` URI for a path, with minimal percent-encoding (anything outside
-/// RFC 3986 unreserved + `/` is hex-escaped). Relative paths resolve against
-/// the caller-provided workspace root.
+/// Standards-compliant `file:` URI for an absolute path. Relative paths first
+/// resolve against the process cwd. `url` handles platform-specific Windows
+/// drive and UNC forms as well as UTF-8 and percent escaping.
 pub(crate) fn file_uri(path: &Path) -> Option<String> {
-    let abs = path.is_absolute().then(|| path.to_path_buf())?;
-    let s = abs.to_str()?;
-    #[cfg(windows)]
-    let normalized = s.replace('\\', "/");
-    #[cfg(windows)]
-    let s = normalized.as_str();
-    let mut out = String::with_capacity(s.len() + 8);
-    #[cfg(not(windows))]
-    out.push_str("file://");
-    #[cfg(windows)]
-    if s.starts_with("//") {
-        out.push_str("file:");
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        out.push_str("file:///");
+        std::env::current_dir().ok()?.join(path)
+    };
+    #[cfg(windows)]
+    let abs = standard_windows_uri_path(&abs)?;
+    url::Url::from_file_path(abs).ok().map(Into::into)
+}
+
+#[cfg(windows)]
+fn standard_windows_uri_path(path: &Path) -> Option<PathBuf> {
+    let path = path.to_str()?;
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        Some(PathBuf::from(format!(r"\\{rest}")))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        Some(PathBuf::from(rest))
+    } else {
+        Some(PathBuf::from(path))
     }
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
+}
+
+/// Decode a standards-compliant file URI using platform-aware drive/UNC path
+/// handling. Query strings and fragments are rejected because they cannot be
+/// part of a filesystem permission key.
+pub(crate) fn file_path(uri: &str) -> Option<PathBuf> {
+    if !valid_percent_escapes(uri.as_bytes()) {
+        return None;
+    }
+    let uri = url::Url::parse(uri).ok()?;
+    if uri.scheme() != "file" || uri.query().is_some() || uri.fragment().is_some() {
+        return None;
+    }
+    let path = uri.to_file_path().ok()?;
+    if path.to_str().is_none() {
+        return None;
+    }
+    Some(path)
+}
+
+fn valid_percent_escapes(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if bytes
+                .get(index + 1..index + 3)
+                .is_none_or(|pair| !pair.iter().all(u8::is_ascii_hexdigit))
+            {
+                return false;
             }
-            #[cfg(windows)]
-            b':' => out.push(':'),
-            _ => out.push_str(&format!("%{byte:02X}")),
+            index += 3;
+        } else {
+            index += 1;
         }
     }
-    Some(out)
+    true
 }
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -67,9 +97,9 @@ const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const STDERR_LIMIT: usize = 64 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC_FILES_PER_SERVER: usize = 128;
-const MAX_DIAGNOSTICS_PER_FILE: usize = 50;
+pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 50;
 const MAX_DIAGNOSTIC_URI_BYTES: usize = 4 * 1024;
-const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 2 * 1024;
+pub(crate) const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1024;
 const MAX_DIAGNOSTIC_METADATA_BYTES: usize = 256;
 const LSP_WORKSPACE_FD: i32 = 198;
 
@@ -135,11 +165,29 @@ pub struct FileDiags {
     /// wait for the publish that follows their `didChange`.
     pub version: u64,
     pub diagnostics: Vec<lsp_types::Diagnostic>,
+    /// File identity at publication time. Aggregate and explicit reads drop
+    /// the entry if the path is later replaced or becomes a symlink.
+    pub identity: Option<std::fs::Metadata>,
+    /// Conservative retained-memory accounting used by the global cache cap.
+    pub cached_bytes: usize,
 }
 
 /// uri → latest diagnostics. Shared between the manager and every client's
 /// reader task.
 pub type DiagStore = Arc<Mutex<HashMap<String, FileDiags>>>;
+
+/// Hard ceiling for distinct files retained in the diagnostic cache. Updates
+/// to existing files remain allowed at the ceiling; new files are ignored.
+pub(crate) const MAX_DIAGNOSTIC_FILES: usize = MAX_DIAGNOSTIC_FILES_PER_SERVER;
+pub(crate) const MAX_DIAGNOSTIC_CACHE_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) struct SyncedDocument {
+    pub(crate) version: i64,
+    /// Versionless publishes are unambiguous only before the first change in
+    /// an epoch, or after an exact versioned publish anchors that epoch.
+    pub(crate) allow_versionless: bool,
+}
 
 pub struct LspClient {
     name: String,
@@ -150,7 +198,7 @@ pub struct LspClient {
     stopped: Arc<AtomicBool>,
     stopped_notify: Arc<Notify>,
     /// uri → last synced document version.
-    open: tokio::sync::Mutex<HashMap<String, i64>>,
+    open: Arc<Mutex<HashMap<String, SyncedDocument>>>,
 }
 
 impl LspClient {
@@ -244,6 +292,7 @@ impl LspClient {
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_notify = Arc::new(Notify::new());
+        let open = Arc::new(Mutex::new(HashMap::new()));
 
         // Reader task: routes responses to pending requests, stores
         // diagnostics, and answers server→client requests with null so a
@@ -251,6 +300,7 @@ impl LspClient {
         let reader_task = {
             let pending = pending.clone();
             let stdin = stdin.clone();
+            let open = open.clone();
             let server_name = name.to_string();
             let workspace_uri = root_uri.clone();
             let shutdown_tx = shutdown_tx.clone();
@@ -286,13 +336,17 @@ impl LspClient {
                             if m == "textDocument/publishDiagnostics"
                                 && let Some(params) = msg.get("params")
                             {
-                                match store_diagnostics(
-                                    &diags,
-                                    &server_name,
-                                    &workspace_uri,
-                                    params,
-                                ) {
-                                    DiagnosticStoreOutcome::Stored => diag_notify.notify_waiters(),
+                                match validate_diagnostic_envelope(&workspace_uri, params) {
+                                    DiagnosticStoreOutcome::Stored => {
+                                        if store_diagnostics(
+                                            &diags,
+                                            &server_name,
+                                            params,
+                                            Some(&open),
+                                        ) {
+                                            diag_notify.notify_waiters();
+                                        }
+                                    }
                                     DiagnosticStoreOutcome::Ignored => {}
                                     DiagnosticStoreOutcome::LimitExceeded => {
                                         tracing::debug!(
@@ -364,7 +418,7 @@ impl LspClient {
             shutdown_tx,
             stopped,
             stopped_notify,
-            open: tokio::sync::Mutex::new(HashMap::new()),
+            open,
         });
 
         let init_params = json!({
@@ -378,7 +432,7 @@ impl LspClient {
                         "willSaveWaitUntil": false,
                         "didSave": false
                     },
-                    "publishDiagnostics": {}
+                    "publishDiagnostics": { "versionSupport": true }
                 }
             },
             "initializationOptions": cfg.initialization.clone().unwrap_or(Value::Null),
@@ -465,11 +519,12 @@ impl LspClient {
         notified.await;
     }
 
-    /// Syncs a file's current disk content with the server: `didOpen` on
-    /// first touch, full-content `didChange` afterwards.
+    /// Sends caller-verified content to the server: `didOpen` on first touch,
+    /// full-content `didChange` afterwards. Disk access is deliberately owned
+    /// by `LspManager`, which binds a stable file handle after authorization.
     pub async fn sync_file(&self, path: &Path) {
         let Ok(text) = read_stable_text(path).await else {
-            return; // unreadable/binary file — skip silently
+            return;
         };
         self.sync_text(path, text).await;
     }
@@ -485,36 +540,60 @@ impl LspClient {
             );
             return;
         }
-        let mut open = self.open.lock().await;
-        let next_version = open.get(&uri).copied().unwrap_or(0) + 1;
-        let sent = if next_version == 1 {
-            self.notify(
-                "textDocument/didOpen",
-                json!({
-                    "textDocument": {
-                        "uri": &uri,
-                        "languageId": language_id(path),
-                        "version": 1,
-                        "text": &text
-                    }
-                }),
-            )
-            .await
-        } else {
-            self.notify(
-                "textDocument/didChange",
-                json!({
-                    "textDocument": { "uri": &uri, "version": next_version },
-                    "contentChanges": [{ "text": &text }]
-                }),
-            )
-            .await
+        let uri_str = uri.clone();
+        enum Sync {
+            Open,
+            Change(i64),
+        }
+        let action = {
+            let mut open = self.open.lock().unwrap();
+            match open.get_mut(&uri_str) {
+                Some(document) => {
+                    document.version += 1;
+                    document.allow_versionless = false;
+                    Sync::Change(document.version)
+                }
+                None => {
+                    open.insert(
+                        uri_str,
+                        SyncedDocument {
+                            version: 1,
+                            allow_versionless: true,
+                        },
+                    );
+                    Sync::Open
+                }
+            }
+        }; // lock released before any await
+        let sent = match action {
+            Sync::Open => {
+                self.notify(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": language_id(path),
+                            "version": 1,
+                            "text": text
+                        }
+                    }),
+                )
+                .await
+            }
+            Sync::Change(v) => {
+                self.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": uri, "version": v },
+                        "contentChanges": [{ "text": text }]
+                    }),
+                )
+                .await
+            }
         };
         if sent {
-            open.insert(uri, next_version);
             return;
         }
-        drop(open);
         // A failed protocol write makes the cached client unusable. Complete
         // process-tree cleanup so the next matching edit can start fresh.
         self.shutdown().await;
@@ -746,12 +825,7 @@ enum DiagnosticStoreOutcome {
     LimitExceeded,
 }
 
-fn store_diagnostics(
-    diags: &DiagStore,
-    server: &str,
-    workspace_uri: &str,
-    params: &Value,
-) -> DiagnosticStoreOutcome {
+fn validate_diagnostic_envelope(workspace_uri: &str, params: &Value) -> DiagnosticStoreOutcome {
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
         return DiagnosticStoreOutcome::LimitExceeded;
     };
@@ -761,52 +835,182 @@ fn store_diagnostics(
     if !uri_is_within_workspace(uri, workspace_uri) {
         return DiagnosticStoreOutcome::Ignored;
     }
-    let Some(raw_diagnostics) = params.get("diagnostics").and_then(Value::as_array) else {
+    let Some(diagnostics) = params.get("diagnostics").and_then(Value::as_array) else {
         return DiagnosticStoreOutcome::LimitExceeded;
     };
-    if raw_diagnostics.len() > MAX_DIAGNOSTICS_PER_FILE {
+    if diagnostics.len() > MAX_DIAGNOSTICS_PER_FILE {
         return DiagnosticStoreOutcome::LimitExceeded;
     }
-    let Ok(mut diagnostics) =
-        serde_json::from_value::<Vec<lsp_types::Diagnostic>>(Value::Array(raw_diagnostics.clone()))
-    else {
-        return DiagnosticStoreOutcome::LimitExceeded;
+    DiagnosticStoreOutcome::Stored
+}
+
+pub(crate) fn store_diagnostics(
+    diags: &DiagStore,
+    server: &str,
+    params: &Value,
+    synced_versions: Option<&Mutex<HashMap<String, SyncedDocument>>>,
+) -> bool {
+    let Some(raw_uri) = params.get("uri").and_then(Value::as_str) else {
+        return false;
     };
-    for diagnostic in &mut diagnostics {
-        truncate_utf8(&mut diagnostic.message, MAX_DIAGNOSTIC_MESSAGE_BYTES);
-        if let Some(source) = &mut diagnostic.source {
-            truncate_utf8(source, MAX_DIAGNOSTIC_METADATA_BYTES);
-        }
-        if let Some(lsp_types::NumberOrString::String(code)) = &mut diagnostic.code {
-            truncate_utf8(code, MAX_DIAGNOSTIC_METADATA_BYTES);
-        }
-        diagnostic.code_description = None;
-        diagnostic.related_information = None;
-        diagnostic.data = None;
-        if let Some(tags) = &mut diagnostic.tags {
-            tags.truncate(8);
-        }
+    let Ok(diagnostics) = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(
+        params.get("diagnostics").cloned().unwrap_or(Value::Null),
+    ) else {
+        return false;
+    };
+    let Some(path) = file_path(raw_uri) else {
+        return false;
+    };
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(identity) = std::fs::symlink_metadata(&canonical) else {
+        return false;
+    };
+    if !identity.is_file() || identity.file_type().is_symlink() {
+        return false;
     }
-    let mut store = diags.lock().unwrap();
-    if !store.contains_key(uri)
-        && store
-            .values()
-            .filter(|entry| entry.server == server)
-            .count()
-            >= MAX_DIAGNOSTIC_FILES_PER_SERVER
+    let Some(uri) = file_uri(&canonical) else {
+        return false;
+    };
+    if uri != raw_uri {
+        return false;
+    }
+
+    let mut synced_guard = synced_versions.map(|versions| versions.lock().unwrap());
+    let exact_version_anchor = if let Some(synced_versions) = synced_guard.as_mut() {
+        let Some(synced) = synced_versions.get_mut(&uri) else {
+            return false;
+        };
+        match params.get("version") {
+            Some(version) if !version.is_null() => {
+                let Some(published_version) = version.as_i64() else {
+                    return false;
+                };
+                if published_version != synced.version {
+                    return false;
+                }
+                true
+            }
+            None | Some(_) if synced.allow_versionless => false,
+            None | Some(_) => return false,
+        }
+    } else {
+        false
+    };
+
+    let stored = commit_diagnostics(diags, uri.clone(), server, diagnostics, Some(identity));
+    if stored
+        && exact_version_anchor
+        && let Some(synced_versions) = synced_guard.as_mut()
+        && let Some(synced) = synced_versions.get_mut(&uri)
     {
-        return DiagnosticStoreOutcome::LimitExceeded;
+        synced.allow_versionless = true;
     }
-    let entry = store.entry(uri.to_string()).or_insert_with(|| FileDiags {
+    stored
+}
+
+pub(crate) fn commit_diagnostics(
+    diags: &DiagStore,
+    uri: String,
+    server: &str,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    identity: Option<std::fs::Metadata>,
+) -> bool {
+    let diagnostics = sanitize_diagnostics(diagnostics);
+    let cached_bytes = retained_diagnostic_bytes(&uri, server, &diagnostics);
+    let mut store = diags.lock().unwrap();
+    if !store.contains_key(&uri)
+        && (store.len() >= MAX_DIAGNOSTIC_FILES
+            || store
+                .values()
+                .filter(|entry| entry.server == server)
+                .count()
+                >= MAX_DIAGNOSTIC_FILES_PER_SERVER)
+    {
+        return false;
+    }
+    let old_bytes = store.get(&uri).map(|entry| entry.cached_bytes).unwrap_or(0);
+    let current_bytes: usize = store.values().map(|entry| entry.cached_bytes).sum();
+    let replacement_bytes = current_bytes
+        .saturating_sub(old_bytes)
+        .saturating_add(cached_bytes);
+    if replacement_bytes > MAX_DIAGNOSTIC_CACHE_BYTES {
+        let Some(entry) = store.get_mut(&uri) else {
+            return false;
+        };
+        let mut tombstone_bytes = retained_diagnostic_bytes(&uri, server, &[]);
+        let retain_server = current_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(tombstone_bytes)
+            <= MAX_DIAGNOSTIC_CACHE_BYTES;
+        if !retain_server {
+            tombstone_bytes = retained_diagnostic_bytes(&uri, "", &[]);
+        }
+        entry.server.clear();
+        if retain_server {
+            entry.server.push_str(server);
+        }
+        entry.version = entry.version.saturating_add(1);
+        entry.diagnostics.clear();
+        entry.identity = identity;
+        entry.cached_bytes = tombstone_bytes;
+        return true;
+    }
+    let entry = store.entry(uri).or_insert_with(|| FileDiags {
         server: server.to_string(),
         version: 0,
         diagnostics: Vec::new(),
+        identity: None,
+        cached_bytes: 0,
     });
     entry.server.clear();
     entry.server.push_str(server);
     entry.version = entry.version.saturating_add(1);
     entry.diagnostics = diagnostics;
-    DiagnosticStoreOutcome::Stored
+    entry.identity = identity;
+    entry.cached_bytes = cached_bytes;
+    true
+}
+
+fn sanitize_diagnostics(diagnostics: Vec<lsp_types::Diagnostic>) -> Vec<lsp_types::Diagnostic> {
+    diagnostics
+        .into_iter()
+        .take(MAX_DIAGNOSTICS_PER_FILE)
+        .map(|diagnostic| lsp_types::Diagnostic {
+            range: diagnostic.range,
+            severity: diagnostic.severity,
+            message: truncate_utf8_bytes(&diagnostic.message, MAX_DIAGNOSTIC_MESSAGE_BYTES),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn retained_diagnostic_bytes(
+    uri: &str,
+    server: &str,
+    diagnostics: &[lsp_types::Diagnostic],
+) -> usize {
+    uri.len().saturating_add(server.len()).saturating_add(
+        diagnostics
+            .iter()
+            .map(|diagnostic| {
+                std::mem::size_of::<lsp_types::Diagnostic>()
+                    .saturating_add(diagnostic.message.len())
+            })
+            .sum::<usize>(),
+    )
 }
 
 fn uri_is_within_workspace(uri: &str, workspace_uri: &str) -> bool {
@@ -819,17 +1023,6 @@ fn uri_is_within_workspace(uri: &str, workspace_uri: &str) -> bool {
     workspace_uri.ends_with('/') || suffix.starts_with('/')
 }
 
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value.truncate(end);
-}
-
 #[cfg(test)]
 pub(crate) fn store_diagnostics_for_test(
     diags: &DiagStore,
@@ -837,8 +1030,28 @@ pub(crate) fn store_diagnostics_for_test(
     workspace_uri: &str,
     params: &Value,
 ) -> Option<bool> {
-    match store_diagnostics(diags, server, workspace_uri, params) {
-        DiagnosticStoreOutcome::Stored => Some(true),
+    match validate_diagnostic_envelope(workspace_uri, params) {
+        DiagnosticStoreOutcome::Stored => {
+            let uri = params.get("uri")?.as_str()?.to_string();
+            let diagnostics = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(
+                params.get("diagnostics")?.clone(),
+            )
+            .ok()?;
+            {
+                let store = diags.lock().unwrap();
+                if !store.contains_key(&uri)
+                    && (store.len() >= MAX_DIAGNOSTIC_FILES
+                        || store
+                            .values()
+                            .filter(|entry| entry.server == server)
+                            .count()
+                            >= MAX_DIAGNOSTIC_FILES_PER_SERVER)
+                {
+                    return None;
+                }
+            }
+            Some(commit_diagnostics(diags, uri, server, diagnostics, None))
+        }
         DiagnosticStoreOutcome::Ignored => Some(false),
         DiagnosticStoreOutcome::LimitExceeded => None,
     }

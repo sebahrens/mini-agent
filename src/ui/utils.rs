@@ -200,18 +200,24 @@ fn format_task_summary(obj: &serde_json::Map<String, serde_json::Value>) -> Stri
 pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
     match tool {
         "bash" => input.to_string(),
+        "lsp_diagnostics" => {
+            let expanded = crate::fs::expand_tilde(input);
+            let path = std::path::Path::new(&expanded);
+            // Aggregate LSP prompts carry the canonical project directory;
+            // scope AllowAlways to that tree, not its parent. Explicit LSP
+            // queries are regular files and retain the normal parent scope.
+            let scope = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            descendant_pattern(scope)
+        }
         "read" | "write" | "edit" | "list_dir" => {
             let expanded = crate::fs::expand_tilde(input);
             let path = std::path::Path::new(&expanded);
-            let parent = path
-                .parent()
-                .map(|p| p.to_string_lossy())
-                .unwrap_or(std::borrow::Cow::Borrowed("*"));
-            if parent.is_empty() {
-                "**".to_string()
-            } else {
-                format!("{}/**/*", parent)
-            }
+            let parent = path.parent().unwrap_or(path);
+            descendant_pattern(parent)
         }
         "grep" | "find_files" => {
             let first = input.split_whitespace().next().unwrap_or("*");
@@ -219,6 +225,10 @@ pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
         }
         _ => "*".to_string(),
     }
+}
+
+fn descendant_pattern(path: &std::path::Path) -> String {
+    crate::permission::pattern::descendant_path_pattern(path)
 }
 
 #[cfg(test)]
@@ -230,5 +240,37 @@ mod tests {
         let script = "echo  hello\nprintf 'done\\n'";
 
         assert_eq!(suggest_pattern("bash", script), script);
+    }
+
+    #[test]
+    fn lsp_suggestion_uses_canonical_path_tool_scope() {
+        let path = if cfg!(windows) {
+            r"C:\workspace\src\main.rs"
+        } else {
+            "/workspace/src/main.rs"
+        };
+        let pattern = suggest_pattern("lsp_diagnostics", path);
+        assert_ne!(pattern, "*");
+        assert!(
+            crate::permission::pattern::Pattern::new_generated_path_scope(&pattern).is_some(),
+            "{pattern}"
+        );
+    }
+
+    #[test]
+    fn lsp_project_suggestion_does_not_grant_sibling_tree() {
+        let parent = std::env::temp_dir().join(format!(
+            "mini-agent-lsp-pattern-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let project = parent.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let pattern = suggest_pattern("lsp_diagnostics", project.to_str().unwrap());
+        let matcher =
+            crate::permission::pattern::Pattern::new_generated_path_scope(&pattern).unwrap();
+        assert!(matcher.matches_path(project.join("src/main.rs").to_str().unwrap()));
+        assert!(!matcher.matches_path(parent.join("sibling/secret.rs").to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(parent);
     }
 }

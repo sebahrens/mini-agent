@@ -914,6 +914,9 @@ permission tool keys are `bash`, `js/fetch`, `read`, `write`, `edit`, `grep`,
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
 omitted, zerostack installs built-in exact-script allows (for commands such as
 `pwd`, `git status`, and `cargo test`) plus pattern-based deny rules.
+An `external_directory` deny is a security baseline: it takes precedence over
+matching tool-specific allows and prior session AllowAlways scopes, including
+inherited `read` access used by `lsp_diagnostics`.
 
 Bash uses a fail-closed, opaque full-script permission model. The exact string
 passed to `bash -c` is also the permission key. An `allow` entry authorizes Bash
@@ -1549,6 +1552,51 @@ diagnostics (errors/warnings) back into `edit`/`write` tool results — the
 agent sees type errors immediately instead of discovering them on the next
 build. An `lsp_diagnostics` tool also lets the agent query one file or the
 whole project on demand.
+
+`lsp_diagnostics` uses the existing `read` permission policy. A file query
+checks the canonical file path before synchronizing it or starting a language
+server. Canonical paths must be UTF-8 and regular files; other filesystem node
+types fail closed before permission evaluation or server access. A whole-project
+query checks the canonical project root before reading
+the diagnostic cache, then applies the same path policy to every cached file;
+denied files are omitted from the aggregate result. External files therefore
+also follow `permission.external_directory`. Aggregate checks keep each cached
+file's exact regular-file handle open across permission prompts and bind result
+formatting to that identity, so pathname swaps cannot change which diagnostic
+is authorized. Choosing AllowAlways for the project prompt grants only that
+project tree; path patterns use normalized separators on Windows.
+
+The root AllowAlways decision persists both the exact project root and its
+descendant scope, preventing repeat aggregate prompts without granting sibling
+trees. Generated scopes escape literal glob metacharacters in project directory
+names through a separate literal-path encoding, leaving user-authored glob and
+regex syntax unchanged. Windows external-directory policy evaluates both
+verbatim drive/UNC and prefix-stripped spellings, combining matches fail-closed,
+so anchored raw regexes written for either canonical form remain effective.
+Aggregate authorization binds and snapshots one relevant cached file at a time, formats
+only the remaining capped lines while the binding is live, and releases its
+descriptor before opening the next candidate. Large or high-volume workspaces
+therefore cannot cause unbounded diagnostic cloning or file-handle use.
+
+Cache entries are accepted only for canonical file URIs that still resolve to
+regular files; symlink aliases and alternate URI spellings are discarded. The
+client also accepts a publish only when its document version matches the most
+recent full-document sync, preventing delayed pre-edit results from satisfying
+a post-edit diagnostics wait. Versioned diagnostic support is advertised.
+Versionless initial publishes and clears (including an explicit JSON
+`version: null`) remain accepted while the sync epoch is unchanged; after an
+edit they fail closed until an exact versioned publish anchors the new epoch.
+The diagnostic cache retains at most 256 distinct file entries, at most 256
+diagnostics per entry, and at most 2 MiB of accounted retained diagnostic data
+in aggregate. Messages are truncated to 1,024 UTF-8 bytes and unused extension
+payloads such as arbitrary JSON `data` are discarded before cache commit.
+Updating an entry replaces its contribution to the aggregate byte budget.
+If a valid newer update cannot fit, its older cached diagnostics are replaced
+by an empty version tombstone so waits complete without exposing stale data.
+These limits also bound aggregate candidate allocation and sorting. Retained
+diagnostic message bodies are supplied by the configured language server and
+can mention other files, so language-server commands and configuration must
+still be treated as trusted project code.
 
 This integration is behind the non-default `lsp` Cargo feature — build with
 `--features lsp` to enable it.

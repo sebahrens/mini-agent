@@ -505,7 +505,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 
         #[cfg(feature = "lsp")]
         if let Some(lsp) = &lsp_manager {
-            all_tools.push(Box::new(tools::lsp::LspTool::new(lsp.clone())));
+            all_tools.push(Box::new(tools::lsp::LspTool::new(
+                lsp.clone(),
+                permission.clone(),
+                ask_tx.clone(),
+            )));
         }
 
         #[cfg(feature = "js")]

@@ -9,7 +9,9 @@ use std::time::Duration;
 use rig::tool::Tool;
 use serde::Deserialize;
 
-use crate::agent::tools::ToolError;
+use crate::agent::tools::{
+    AskSender, PermCheck, ToolError, check_perm_canonical_path, check_perm_path_with_suggestion,
+};
 use crate::extras::lsp::LspManager;
 
 /// Longer than the post-edit wait: an explicit query justifies giving the
@@ -18,6 +20,8 @@ const QUERY_WAIT: Duration = Duration::from_secs(3);
 
 pub struct LspTool {
     pub manager: LspManager,
+    pub permission: Option<PermCheck>,
+    pub ask_tx: Option<AskSender>,
 }
 
 #[derive(Deserialize)]
@@ -27,8 +31,16 @@ pub struct LspArgs {
 }
 
 impl LspTool {
-    pub fn new(manager: LspManager) -> Self {
-        Self { manager }
+    pub fn new(
+        manager: LspManager,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+    ) -> Self {
+        Self {
+            manager,
+            permission,
+            ask_tx,
+        }
     }
 }
 
@@ -65,6 +77,24 @@ impl Tool for LspTool {
                 }
                 let relative = Path::new(&expanded);
                 let bound_relative = !relative.is_absolute() && !expanded.starts_with('~');
+                let permission_path = canonical_permission_path(&path)?;
+                let external = !path.starts_with(self.manager.root());
+                if !tokio::fs::symlink_metadata(&path).await?.is_file() {
+                    return Err(ToolError::Msg(format!(
+                        "File '{expanded}' is not a regular file."
+                    )));
+                }
+                let coaching = check_perm_canonical_path(
+                    &self.permission,
+                    &self.ask_tx,
+                    Self::NAME,
+                    permission_path.as_ref(),
+                    external,
+                )
+                .await?;
+
+                // Manager access begins only after the capability-bound read
+                // path is authorized. Operational LSP failure remains open.
                 if bound_relative {
                     self.manager.notify_changed_relative(relative).await;
                 } else {
@@ -77,15 +107,86 @@ impl Tool for LspTool {
                 } else {
                     self.manager.diagnostics_block(&path, QUERY_WAIT).await
                 };
-                Ok(diagnostics
+                let output = diagnostics
                     .map(|block| block.trim_start().to_string())
-                    .unwrap_or_else(|| format!("No diagnostics for {expanded}.")))
+                    .unwrap_or_else(|| format!("No diagnostics for {expanded}."));
+                Ok(with_coaching(coaching, output))
             }
-            None => Ok(self
-                .manager
-                .all_diagnostics_block()
-                .map(|block| format!("Files with diagnostics:\n{block}"))
-                .unwrap_or_else(|| "No diagnostics.".to_string())),
+            None => {
+                let root = tokio::fs::canonicalize(self.manager.root()).await?;
+                let permission_root = canonical_permission_path(&root)?;
+                let root_pattern = crate::permission::pattern::descendant_path_pattern(&root);
+                let exact_root_pattern = crate::permission::pattern::exact_path_pattern(&root);
+                let coaching = check_perm_path_with_suggestion(
+                    &self.permission,
+                    &self.ask_tx,
+                    Self::NAME,
+                    permission_root.as_ref(),
+                    Some(root_pattern),
+                    vec![exact_root_pattern],
+                )
+                .await?;
+
+                // Root authorization precedes even enumerating cache keys.
+                // Each file then receives its own path check so an explicit
+                // deny rule cannot leak through the project-wide aggregate.
+                let mut snapshots = Vec::new();
+                let mut remaining_lines = crate::extras::lsp::MAX_DIAG_LINES;
+                for uri in self.manager.diagnostic_candidate_uris() {
+                    let Some(binding) = self.manager.bind_diagnostic_uri(&uri).await else {
+                        continue;
+                    };
+                    let Ok(permission_path) = canonical_permission_path(binding.path()) else {
+                        continue;
+                    };
+                    let external = !binding.path().starts_with(&root);
+                    if check_perm_canonical_path(
+                        &self.permission,
+                        &self.ask_tx,
+                        Self::NAME,
+                        permission_path.as_ref(),
+                        external,
+                    )
+                    .await
+                    .is_ok()
+                        && let Some(snapshot) = self
+                            .manager
+                            .snapshot_bound_diagnostics(&binding, remaining_lines)
+                    {
+                        remaining_lines =
+                            remaining_lines.saturating_sub(snapshot.retained_line_count());
+                        let truncated = snapshot.is_truncated();
+                        snapshots.push(snapshot);
+                        if truncated {
+                            break;
+                        }
+                    }
+                    // `binding` and its descriptor are released here before
+                    // the next cache candidate is opened.
+                }
+                let output = self
+                    .manager
+                    .all_diagnostics_block_for_snapshots(&snapshots)
+                    .map(|block| format!("Files with diagnostics:\n{block}"))
+                    .unwrap_or_else(|| "No diagnostics.".to_string());
+                Ok(with_coaching(coaching, output))
+            }
         }
+    }
+}
+
+pub(crate) fn canonical_permission_path(
+    path: &Path,
+) -> Result<std::borrow::Cow<'_, str>, ToolError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| ToolError::Msg("LSP diagnostics require a UTF-8 file path.".to_string()))?;
+    Ok(crate::permission::pattern::normalize_policy_path(path))
+}
+
+fn with_coaching(coaching: Option<String>, output: String) -> String {
+    match coaching {
+        Some(coaching) => format!("{coaching}\n\n{output}"),
+        None => output,
     }
 }

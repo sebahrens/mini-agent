@@ -553,6 +553,8 @@ async fn resolve_permission(
                 .send(AskRequest {
                     tool: CompactString::new(request.tool()),
                     input: request.key().to_string(),
+                    suggested_pattern: None,
+                    additional_allow_patterns: Vec::new(),
                     reply: reply_tx,
                 })
                 .await
