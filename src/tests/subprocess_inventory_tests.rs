@@ -1038,25 +1038,31 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/extras/lsp/client.rs", ".spawn()", 1, "TC-LSP-SERVICE"),
     (
         "src/extras/lsp/client.rs",
-        "child: tokio::process::Child,",
+        "fn lsp_command(cfg: &LspServerConfig, root: &Path) -> anyhow::Result<tokio::process::Command> {",
         1,
         "TC-LSP-SERVICE",
     ),
     (
         "src/extras/lsp/client.rs",
-        "let mut child = tokio::process::Command::new(cfg.command.as_str())",
+        "let mut command = tokio::process::Command::new(program);",
         1,
         "TC-LSP-SERVICE",
     ),
     (
         "src/extras/lsp/mod.rs",
-        "let spawned = LspClient::spawn(name, cfg, &self.inner.root, self.inner.diags.clone(), {",
+        "let spawned = LspClient::spawn(",
         1,
         "NON-PROCESS",
     ),
     (
         "src/extras/lsp/client.rs",
         "stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,",
+        1,
+        "TC-LSP-SERVICE",
+    ),
+    (
+        "src/extras/lsp/client.rs",
+        "stdin: &Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,",
         1,
         "TC-LSP-SERVICE",
     ),
@@ -1559,6 +1565,37 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    (
+        "src/extras/hooks/dispatcher.rs",
+        "status = ?output.status,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/hooks/dispatcher.rs",
+        "containment = output.diagnostics.containment,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/hooks/dispatcher.rs",
+        "environment = output.diagnostics.environment,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/hooks/dispatcher.rs",
+        "filesystem = output.diagnostics.filesystem,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/hooks/dispatcher.rs",
+        "network = output.diagnostics.network,",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/sandbox.rs", "status.success(),", 1, "NON-PROCESS"),
     (
         "src/extras/subagents/task_tool.rs",
         "output: Err(\"boom\".into()),",
@@ -2113,8 +2150,19 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         ],
     ),
     (
+        "src/extras/hooks/dispatcher.rs",
+        &[((
+            "4455fff110b3f344a84e2da4538deb7323313eafb4e100e51a659498ebf49077",
+            1,
+        ))],
+    ),
+    (
         "src/sandbox.rs",
         &[
+            (
+                "77288e0715e2e881aa2f70d0c79e2dc255ad6bb1cb187ddef46359df73a23762",
+                1,
+            ),
             (
                 "21bedd3fe703d7764c0026616b47d5daf97fbfa36447f47f26a10b5cfefd84b4",
                 1,
@@ -2416,7 +2464,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/lsp/mod.rs",
-        "let spawned = LspClient::spawn(name, cfg, &self.inner.root, self.inner.diags.clone(), {",
+        "let spawned = LspClient::spawn(",
         1,
         "NON-PROCESS",
     ),
@@ -2945,6 +2993,10 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
             1,
         ),
         ("spawn_guarded|TokioCommand::spawn(self)".to_string(), 1),
+        (
+            "spawn_guarded|process_wrap::tokio::CommandWrap::spawn(self)".to_string(),
+            1,
+        ),
         (
             "spawn_guarded|rmcp::transport::child_process::TokioChildProcessBuilder::spawn(self)"
                 .to_string(),

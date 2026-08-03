@@ -6,6 +6,12 @@ use std::process::Output;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
+use process_wrap::tokio::JobObject;
+#[cfg(all(unix, any(feature = "mcp", feature = "lsp")))]
+use process_wrap::tokio::ProcessGroup;
+#[cfg(any(feature = "mcp", feature = "lsp"))]
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -28,6 +34,20 @@ pub struct Sandbox {
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
     #[cfg(test)]
     complete_process_tree_for_test: bool,
+}
+
+/// Transfers a direct-exec workspace service and every descendant into one
+/// owned lifecycle boundary. Wrapper order is significant on Windows because
+/// `JobObject` observes the inner `KillOnDrop` marker.
+#[cfg(any(feature = "mcp", feature = "lsp"))]
+pub(crate) fn owned_workspace_service_tree(command: Command) -> CommandWrap {
+    let mut command = CommandWrap::from(command);
+    command.wrap(KillOnDrop);
+    #[cfg(unix)]
+    command.wrap(ProcessGroup::leader());
+    #[cfg(windows)]
+    command.wrap(JobObject);
+    command
 }
 
 /// Hard bounds for one captured subprocess.
@@ -698,7 +718,8 @@ impl Sandbox {
     /// Unlike [`Sandbox::wrap_command`], this profile never inserts a shell and
     /// accepts only an already-resolved executable plus an ordered argv. It is
     /// intended for human-configured, workspace-capable long-lived services
-    /// such as MCP stdio servers, not for the broker-only JS worker profile.
+    /// such as MCP stdio or LSP servers, not for the broker-only JS worker
+    /// profile.
     /// The supplied environment is the complete delegated environment.
     pub(crate) fn wrap_workspace_service(
         &self,
@@ -714,14 +735,14 @@ impl Sandbox {
             }
             SandboxPolicy::RequiredButUnavailable => {
                 return Err(format!(
-                    "sandbox backend '{}' is not available — refusing MCP stdio launch (requested-but-unavailable)",
+                    "sandbox backend '{}' is not available — refusing workspace-service launch (requested-but-unavailable)",
                     self.backend
                 ));
             }
             SandboxPolicy::RequiredAndAvailable => {}
         }
 
-        let cwd = canonical_non_root(cwd, "MCP stdio working directory")?;
+        let cwd = canonical_non_root(cwd, "workspace-service working directory")?;
         let paths = crate::paths::process_paths()
             .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
         std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
@@ -734,10 +755,10 @@ impl Sandbox {
 
         if self.backend == "seatbelt" {
             let seatbelt = seatbelt_path().ok_or_else(|| {
-                "sandbox backend 'seatbelt' is not a trusted system executable — refusing MCP stdio launch"
+                "sandbox backend 'seatbelt' is not a trusted system executable — refusing workspace-service launch"
                     .to_string()
             })?;
-            let workspace = seatbelt_string_literal(&cwd, "MCP stdio working directory")?;
+            let workspace = seatbelt_string_literal(&cwd, "workspace-service working directory")?;
             let cache = seatbelt_string_literal(&cache_dir, "application cache")?;
             let network_rule = if deny_network {
                 "(deny network*)"
@@ -761,10 +782,12 @@ impl Sandbox {
             cmd.arg("-p").arg(profile).arg("/usr/bin/env").arg("-i");
             for (key, value) in env {
                 let key = key.to_str().ok_or_else(|| {
-                    "MCP stdio environment name is not valid UTF-8 for Seatbelt".to_string()
+                    "workspace-service environment name is not valid UTF-8 for Seatbelt".to_string()
                 })?;
                 if key.contains('=') {
-                    return Err("MCP stdio environment name must not contain '='".to_string());
+                    return Err(
+                        "workspace-service environment name must not contain '='".to_string()
+                    );
                 }
                 let mut assignment = OsString::from(key);
                 assignment.push("=");
@@ -779,7 +802,7 @@ impl Sandbox {
         if self.backend == "zerobox" {
             if deny_network {
                 return Err(
-                    "sandbox backend 'zerobox' cannot truthfully enforce MCP stdio network denial"
+                    "sandbox backend 'zerobox' cannot truthfully enforce workspace-service network denial"
                         .to_string(),
                 );
             }
@@ -797,7 +820,7 @@ impl Sandbox {
         }
 
         let bwrap = bwrap_path().ok_or_else(|| {
-            "sandbox backend 'bwrap' is not a trusted system executable — refusing MCP stdio launch"
+            "sandbox backend 'bwrap' is not a trusted system executable — refusing workspace-service launch"
                 .to_string()
         })?;
         let mut cmd = Command::new(bwrap);

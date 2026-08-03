@@ -37,9 +37,9 @@ pub struct LspManager {
 struct Inner {
     root: PathBuf,
     servers: Vec<(String, crate::config::types::LspServerConfig)>,
-    /// server name → client, `None` caching a failed spawn so a missing
-    /// binary isn't retried on every edit.
-    clients: tokio::sync::Mutex<HashMap<String, Option<Arc<LspClient>>>>,
+    /// server name → currently live client. Failed or stopped clients are not
+    /// retained so a later edit can restart a repaired server.
+    clients: tokio::sync::Mutex<HashMap<String, Arc<LspClient>>>,
     diags: DiagStore,
     diag_notify: Arc<Notify>,
 }
@@ -69,19 +69,33 @@ impl LspManager {
     }
 
     /// Client for the server claiming `path`, spawning it on first use.
-    /// `None` when no server matches or the spawn failed (cached).
+    /// `None` when no server matches or the current spawn attempt failed.
     async fn client_for(&self, path: &Path) -> Option<Arc<LspClient>> {
         let (name, cfg) = registry::server_for_path(&self.inner.servers, path)?;
         let mut clients = self.inner.clients.lock().await;
-        if let Some(cached) = clients.get(name) {
-            return cached.clone();
+        if let Some(cached) = clients.get(name)
+            && !cached.is_stopped()
+        {
+            return Some(cached.clone());
         }
-        let spawned = LspClient::spawn(name, cfg, &self.inner.root, self.inner.diags.clone(), {
-            self.inner.diag_notify.clone()
-        })
-        .await;
+        if let Some(old) = clients.remove(name) {
+            old.shutdown().await;
+            self.inner
+                .diags
+                .lock()
+                .unwrap()
+                .retain(|_, diagnostics| diagnostics.server != name.as_str());
+        }
+        let spawned = LspClient::spawn(
+            name,
+            cfg,
+            &self.inner.root,
+            self.inner.diags.clone(),
+            self.inner.diag_notify.clone(),
+        )
+        .await?;
         clients.insert(name.clone(), spawned.clone());
-        spawned
+        Some(spawned)
     }
 
     /// Syncs a file's disk content with its language server (no-op when no
@@ -89,6 +103,22 @@ impl LspManager {
     pub async fn notify_changed(&self, path: &Path) {
         if let Some(client) = self.client_for(path).await {
             client.sync_file(path).await;
+        }
+    }
+
+    /// Stops and reaps every language-server process currently owned by this
+    /// manager. A later edit may start fresh servers again.
+    #[allow(dead_code)]
+    pub async fn shutdown(&self) {
+        let clients = {
+            let mut clients = self.inner.clients.lock().await;
+            clients
+                .drain()
+                .map(|(_, client)| client)
+                .collect::<Vec<_>>()
+        };
+        for client in clients {
+            client.shutdown().await;
         }
     }
 

@@ -77,6 +77,19 @@ impl TokioCommandCreationExt for TokioCommand {
     }
 }
 
+#[cfg(any(feature = "mcp", feature = "lsp"))]
+pub(crate) trait CommandWrapCreationExt {
+    fn spawn_guarded(&mut self) -> io::Result<Box<dyn process_wrap::tokio::ChildWrapper>>;
+}
+
+#[cfg(any(feature = "mcp", feature = "lsp"))]
+impl CommandWrapCreationExt for process_wrap::tokio::CommandWrap {
+    fn spawn_guarded(&mut self) -> io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+        let _guard = creation_guard()?;
+        process_wrap::tokio::CommandWrap::spawn(self)
+    }
+}
+
 #[cfg(feature = "mcp")]
 pub(crate) trait RmcpCommandCreationExt {
     fn spawn_guarded(

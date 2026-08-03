@@ -8,11 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use compact_str::CompactString;
-#[cfg(windows)]
-use process_wrap::tokio::JobObject;
-#[cfg(unix)]
-use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use rmcp::service::{RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage, serve_client};
 use rmcp::transport::{Transport, child_process::TokioChildProcess, which_command};
 use tokio::io::AsyncReadExt;
@@ -21,7 +16,7 @@ use tokio::task::JoinHandle;
 
 use super::config::{McpServerConfig, McpStdioNetwork, TrustedMcpServer};
 use crate::process_creation::RmcpCommandCreationExt;
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, owned_workspace_service_tree};
 
 const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
@@ -142,16 +137,17 @@ impl McpClientHandle {
                         "",
                     )
                 })?;
-                let (transport, stderr) = TokioChildProcess::builder(owned_process_tree(cmd))
-                    .stderr(Stdio::piped())
-                    .spawn_guarded()
-                    .map_err(|error| {
-                        bounded_stdio_error(
-                            &server_name,
-                            &format!("command spawn failed: {error}"),
-                            "",
-                        )
-                    })?;
+                let (transport, stderr) =
+                    TokioChildProcess::builder(owned_workspace_service_tree(cmd))
+                        .stderr(Stdio::piped())
+                        .spawn_guarded()
+                        .map_err(|error| {
+                            bounded_stdio_error(
+                                &server_name,
+                                &format!("command spawn failed: {error}"),
+                                "",
+                            )
+                        })?;
                 let transport = OwnedStdioTransport::new(transport);
                 let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
                 let stderr_task =
@@ -418,19 +414,6 @@ fn environment_identity(name: &str) -> String {
     {
         name.to_owned()
     }
-}
-
-/// Give rmcp ownership of the complete process tree, not only the direct
-/// child. `Transport::close`, initialization failure, task cancellation, and
-/// service drop all then converge on the same kill-and-reap implementation.
-fn owned_process_tree(command: Command) -> CommandWrap {
-    let mut command = CommandWrap::from(command);
-    command.wrap(KillOnDrop);
-    #[cfg(unix)]
-    command.wrap(ProcessGroup::leader());
-    #[cfg(windows)]
-    command.wrap(JobObject);
-    command
 }
 
 fn parse_headers(

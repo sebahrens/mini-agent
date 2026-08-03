@@ -46,7 +46,7 @@ multimodal = ["rig/image"]
 pdf = ["multimodal", "rig/pdf"]
 advisor = []
 hooks = []
-lsp = ["dep:lsp-types"]
+lsp = ["dep:lsp-types", "dep:process-wrap", "dep:which"]
 js = ["dep:rquickjs"]
 sandbox = []
 skills = ["js", "dep:rusqlite", "dep:matrixmultiply", "dep:hnsw_rs"]
@@ -70,7 +70,8 @@ rmcp = { version = "2.0", optional = true, default-features = false, features = 
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ] }
-process-wrap = { version = "9", optional = true, default-features = true }
+process-wrap = { version = "9", optional = true, default-features = true, features = ["tokio1"] }
+which = { version = "8", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
