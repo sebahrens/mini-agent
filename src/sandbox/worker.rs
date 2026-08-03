@@ -720,7 +720,9 @@ mod tests {
 
     #[test]
     fn windows_production_launcher_source_keeps_creation_time_authority_closed() {
-        let source = include_str!("worker/windows.rs");
+        // Hosted Windows checkouts use CRLF. Normalize before asserting a
+        // formatting-sensitive adjacency in the CreateProcessW call.
+        let source = include_str!("worker/windows.rs").replace("\r\n", "\n");
         let creation_source = include_str!("../process_creation.rs");
         for required in [
             "PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES",

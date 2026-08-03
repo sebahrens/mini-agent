@@ -1899,16 +1899,16 @@ mod tests {
     #[test]
     fn persistent_artifact_ownership_config_load_never_falls_back_to_data() {
         let (root, paths) = isolated_paths();
-        std::fs::create_dir_all(&paths.config_dir).unwrap();
-        std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::write(
-            paths.config_dir.join("config.toml"),
-            "provider = \"openai\"\n",
+        crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
+        crate::fs::ensure_private_directory(&paths.data_dir).unwrap();
+        crate::fs::private_atomic_create_sync(
+            &paths.config_dir.join("config.toml"),
+            b"provider = \"openai\"\n",
         )
         .unwrap();
-        std::fs::write(
-            paths.data_dir.join("config.toml"),
-            "provider = \"anthropic\"\n",
+        crate::fs::private_atomic_create_sync(
+            &paths.data_dir.join("config.toml"),
+            b"provider = \"anthropic\"\n",
         )
         .unwrap();
 

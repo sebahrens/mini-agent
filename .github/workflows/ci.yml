@@ -104,6 +104,10 @@ jobs:
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ${{ matrix.os }}
+    env:
+      # GitHub's macOS runner work-temp volume does not provide the durable
+      # directory-sync semantics required by private persistence tests.
+      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -167,6 +171,13 @@ jobs:
 
       - name: Install bubblewrap
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable the hosted runner's unprivileged namespace boundary
+        shell: bash
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
       - name: Test Linux sandbox capability policy
         run: cargo test --locked linux_sandbox_policy
@@ -332,6 +343,10 @@ jobs:
       matrix:
         os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
+    env:
+      # Use the native APFS temporary root: the runner work-temp volume rejects
+      # the directory fsync required by the effect-audit durability contract.
+      TMPDIR: /private/tmp
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -539,11 +554,14 @@ jobs:
         with:
           rustflags: ''
 
-      - name: Install the exact JS binary beneath a Unicode path with spaces
+      - name: Install the exact JS binary for Unicode-path containment cases
         shell: pwsh
         run: |
-          $installRoot = Join-Path $env:RUNNER_TEMP 'mini agent λ cargo install'
-          $env:CARGO_HOME = $installRoot
+          # Keep dependency sources beneath an ASCII Cargo home because aws-lc's
+          # NASM build cannot consume non-ASCII source paths. The native gate
+          # itself creates and executes the reviewed space/Unicode install and
+          # archive copies beneath this supported Cargo-install root.
+          $installRoot = Join-Path $env:RUNNER_TEMP 'phase6-cargo-home'
           cargo install --locked --path . --debug --no-default-features --features js --root $installRoot
           if ($LASTEXITCODE -ne 0) {
             throw "cargo install failed with exit code $LASTEXITCODE"
@@ -717,12 +735,14 @@ jobs:
             throw 'the Phase 6 probe account unexpectedly has administrator authority'
           }
 
-          $standardRoot = Join-Path $env:RUNNER_TEMP 'phase6 standard user λ'
+          # The native matrix creates Unicode install/archive children itself.
+          # Keep Cargo source and dependency paths ASCII for aws-lc/NASM.
+          $standardRoot = Join-Path $env:RUNNER_TEMP 'phase6-standard-user-build'
           $sourceArchive = Join-Path $standardRoot 'source.zip'
-          $sourceRoot = Join-Path $standardRoot 'source checkout'
-          $cargoHome = Join-Path $standardRoot 'cargo home'
-          $userHome = Join-Path $standardRoot 'user home'
-          $userTemp = Join-Path $standardRoot 'user temp'
+          $sourceRoot = Join-Path $standardRoot 'source-checkout'
+          $cargoHome = Join-Path $standardRoot 'cargo-home'
+          $userHome = Join-Path $standardRoot 'user-home'
+          $userTemp = Join-Path $standardRoot 'user-temp'
           $evidenceRoot = Join-Path $standardRoot 'evidence'
           $buildEnvironment = Join-Path $standardRoot 'build-environment.json'
           New-Item -ItemType Directory -Path $standardRoot, $sourceRoot, $cargoHome, $userHome, $userTemp, $evidenceRoot -Force | Out-Null
@@ -1206,6 +1226,8 @@ jobs:
             args: '--no-default-features --features mcp,js'
             mcp: true
     runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1330,6 +1352,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1433,6 +1457,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1455,6 +1481,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

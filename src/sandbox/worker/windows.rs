@@ -4428,6 +4428,16 @@ mod tests {
             launch_production,
         };
 
+        // The first AppContainer API call lazily initializes process-global
+        // Windows state that remains live for the process. Warm that stable
+        // production profile before measuring per-launch HANDLE ownership so
+        // the test detects launcher leaks rather than OS one-time caches.
+        let warmup = launch_production(ProductionLaunchHooks::fail_at(
+            ProductionFailurePoint::PrepareExecutableAcl,
+        ))
+        .expect_err("profile warmup must stop at the injected checkpoint");
+        assert!(warmup.to_string().contains("PrepareExecutableAcl"));
+
         let points = [
             ProductionFailurePoint::CreateProfile,
             ProductionFailurePoint::PrepareExecutableAcl,

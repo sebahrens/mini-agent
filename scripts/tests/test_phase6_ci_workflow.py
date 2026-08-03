@@ -284,6 +284,52 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn(full_path, isolated_step)
         self.assertIn("-- --exact --test-threads=1", isolated_step)
 
+    def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
+        linux = job_body(self.workflow, "linux-sandbox-policy")
+        self.assertIn("kernel.apparmor_restrict_unprivileged_userns", linux)
+        self.assertIn(
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+            linux,
+        )
+
+        macos = job_body(self.workflow, "macos-worker-containment-gate")
+        self.assertIn("TMPDIR: /private/tmp", macos)
+        for job in (
+            "test",
+            "platform-paths",
+            "platform-path-install-smoke",
+            "mcp-stdio",
+            "install",
+        ):
+            with self.subTest(job=job):
+                self.assertIn(
+                    "runner.os == 'macOS' && '/private/tmp' || runner.temp",
+                    job_body(self.workflow, job),
+                )
+
+        windows = job_body(self.workflow, "windows-worker-containment-gate")
+        install_step = windows.split(
+            "name: Install the exact JS binary for Unicode-path containment cases",
+            1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("phase6-cargo-home", install_step)
+        self.assertNotIn("$env:CARGO_HOME = $installRoot", install_step)
+        self.assertIn("MINI_AGENT_LPAC_CARGO_INSTALL_EXE", install_step)
+
+        standard_user_step = windows.split(
+            "name: Validate the complete gate from a separate standard-user installation",
+            1,
+        )[1].split("name: Run Phase 6 adversarial suites", 1)[0]
+        for path in (
+            "phase6-standard-user-build",
+            "source-checkout",
+            "cargo-home",
+            "user-home",
+            "user-temp",
+        ):
+            self.assertIn(path, standard_user_step)
+        self.assertNotIn("phase6 standard user λ", standard_user_step)
+
     def test_windows_installed_status_requires_the_runtime_preflight_claims(self) -> None:
         body = job_body(self.workflow, "windows-worker-containment-gate")
         status_step = body.split(
