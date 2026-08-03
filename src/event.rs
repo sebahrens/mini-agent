@@ -59,6 +59,10 @@ pub enum AgentEvent {
     },
     Done {
         response: CompactString,
+        /// Canonical Rig messages produced during this completed turn. Tool
+        /// call/result IDs come from the provider, so downstream history users
+        /// never need to reconstruct model interactions from display events.
+        interactions: Vec<rig::completion::Message>,
     },
 }
 

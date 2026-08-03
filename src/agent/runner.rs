@@ -330,6 +330,19 @@ fn usage_nonnegative_difference(
     }
 }
 
+fn completed_stream_delta(
+    messages: Option<Vec<Message>>,
+    current_prompt: &str,
+) -> Result<Vec<Message>, &'static str> {
+    let mut messages = messages.ok_or("Rig final response omitted completed messages")?;
+    let expected_prompt = Message::user(current_prompt.to_owned());
+    if messages.first() != Some(&expected_prompt) {
+        return Err("Rig final response did not begin with the current prompt");
+    }
+    messages.remove(0);
+    Ok(messages)
+}
+
 fn observed_tokens(usage: Usage) -> u64 {
     usage
         .input_tokens
@@ -697,9 +710,8 @@ fn document_media_type(mime: &str) -> DocumentMediaType {
 async fn continue_prompt_injector<M>(
     agent: &Agent<M>,
     original_prompt: &str,
-    continuation_instruction: &str,
     retry_history: &[Message],
-    new_interactions: &[Message],
+    continuation_bridge: &[Message],
     retry_config: &RetryConfig,
     max_turns: usize,
 ) -> StreamingResult<M::StreamingResponse>
@@ -707,22 +719,37 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let (current_prompt, bridge_history) = continuation_bridge
+        .split_last()
+        .expect("continuation bridge always ends with the continuation prompt");
+    debug_assert!(matches!(current_prompt, Message::User { .. }));
     let mut new_history = retry_history.to_vec();
     new_history.push(Message::user(original_prompt.to_string()));
-    new_history.extend_from_slice(new_interactions);
-    if matches!(new_history.last(), Some(Message::User { .. })) {
-        new_history.push(Message::assistant(String::new()));
-    }
+    new_history.extend_from_slice(bridge_history);
     match retry::retry_stream_chat(retry_config, || {
         let h = new_history.clone();
-        let instruction = continuation_instruction.to_string();
-        async move { agent.stream_chat(instruction, h).max_turns(max_turns).await }
+        let prompt = current_prompt.clone();
+        async move { agent.stream_chat(prompt, h).max_turns(max_turns).await }
     })
     .await
     {
         Ok(stream) => stream,
         Err(e) => Box::pin(futures::stream::once(async move { Err(e) })),
     }
+}
+
+fn normalized_continuation_bridge(
+    completed_interactions: &[Message],
+    uncommitted_interactions: &[Message],
+    continuation_instruction: &str,
+) -> Vec<Message> {
+    let mut bridge = completed_interactions.to_vec();
+    bridge.extend_from_slice(uncommitted_interactions);
+    if matches!(bridge.last(), Some(Message::User { .. })) {
+        bridge.push(Message::assistant(String::new()));
+    }
+    bridge.push(Message::user(continuation_instruction.to_string()));
+    bridge
 }
 
 fn take_new_interactions(interactions: &mut Vec<Message>) -> Vec<Message> {
@@ -818,6 +845,8 @@ where
         let mut tool_calls = ToolCallTracker::default();
         let mut completion_had_tool_call = false;
         let mut exhausted_budget_after_completion = None;
+        let mut completed_interactions: Vec<Message> = Vec::new();
+        let mut stream_prompt = prompt.clone();
         let mut empty_response_count: u32 = 0;
         const MAX_EMPTY_RESPONSES: u32 = 3;
         let max_turns = agent.default_max_turns.unwrap_or(1);
@@ -998,6 +1027,7 @@ where
                                 .await;
                             return;
                         }
+                        interactions.push(tool_result.clone().into());
                         let Some((tool_name, output)) = attributed_tool_result(
                             &mut tool_calls,
                             &internal_call_id,
@@ -1017,10 +1047,21 @@ where
                                 output: CompactString::from(output),
                             })
                             .await;
-                        interactions.push(tool_result.clone().into());
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                         terminal_response_seen = true;
+                        let completed_delta =
+                            match completed_stream_delta(res.messages.clone(), &stream_prompt) {
+                                Ok(messages) => messages,
+                                Err(error) => {
+                                    tracing::error!(error, "agent final history invariant failed");
+                                    let _ = event_tx
+                                        .send(AgentEvent::Error(CompactString::from(error)))
+                                        .await;
+                                    return;
+                                }
+                            };
+                        completed_interactions.extend(completed_delta);
                         let usage = res.usage();
                         let context_complete = !usage_ledger.stream_has_observed_usage();
                         let terminal_delta = usage_ledger.reconcile_terminal(usage);
@@ -1033,11 +1074,15 @@ where
                                 .await;
                         }
                         let response_text = res.output;
+                        let terminal_was_streamed = response.len() > response_len_at_stream_start;
                         reconcile_terminal_response(
                             &mut response,
                             response_len_at_stream_start,
                             &response_text,
                         );
+                        if !terminal_was_streamed && !response_text.is_empty() {
+                            append_streamed_text(&mut interactions, &response_text);
+                        }
                         tracing::info!(
                             "agent done: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}",
                             usage.input_tokens,
@@ -1072,6 +1117,7 @@ where
                             let _ = event_tx
                                 .send(AgentEvent::Done {
                                     response: CompactString::from(response.clone()),
+                                    interactions: completed_interactions,
                                 })
                                 .await;
                             tool_calls.finish_stream();
@@ -1189,13 +1235,27 @@ where
                 .take()
                 .unwrap_or_else(|| "Please continue.".to_string());
             let new_interactions = take_new_interactions(&mut interactions);
+            // A non-terminal EOF has no Rig FinalResponse to supply an
+            // authoritative delta. Preserve the replay payload only in that
+            // exceptional path; completed streams use Rig's grouped messages.
+            let uncommitted_interactions = if terminal_response_seen {
+                &[][..]
+            } else {
+                new_interactions.as_slice()
+            };
+            let continuation_bridge = normalized_continuation_bridge(
+                &completed_interactions,
+                uncommitted_interactions,
+                &continuation_instruction,
+            );
+            completed_interactions = continuation_bridge.clone();
+            stream_prompt = continuation_instruction.clone();
             stream = stream_policy.apply(
                 continue_prompt_injector(
                     &agent,
                     &retry_prompt,
-                    &continuation_instruction,
                     &retry_history,
-                    &new_interactions,
+                    &continuation_bridge,
                     &retry_config,
                     remaining_turns,
                 )
@@ -1288,6 +1348,7 @@ where
 
     let retry_history: Vec<Message> = history;
     let mut interactions: Vec<Message> = Vec::new();
+    let mut continuation_bridge: Vec<Message> = Vec::new();
     let mut full_response = String::new();
     let mut response_len_at_stream_start = full_response.len();
     let mut tool_calls = ToolCallTracker::default();
@@ -1477,6 +1538,11 @@ where
             #[cfg(not(feature = "hooks"))]
             let continuation_instruction = "Please continue.".to_string();
             let new_interactions = take_new_interactions(&mut interactions);
+            continuation_bridge = normalized_continuation_bridge(
+                &continuation_bridge,
+                &new_interactions,
+                &continuation_instruction,
+            );
             // Keep the text already streamed to stdout this turn: the caller
             // persists the returned string as the assistant message, so
             // clearing it here would drop turn-1 output the user already saw
@@ -1485,9 +1551,8 @@ where
                 continue_prompt_injector(
                     agent,
                     prompt,
-                    &continuation_instruction,
                     &retry_history,
-                    &new_interactions,
+                    &continuation_bridge,
                     retry_config,
                     remaining_turns,
                 )
@@ -1638,20 +1703,35 @@ mod tests {
     use super::{
         MAX_PENDING_TOOL_CALLS, NonTerminalStreamExhausted, RunnerStreamPolicy, ToolCallTracker,
         ToolCallTrackerError, UsageLedger, attributed_tool_result, charge_nonterminal_eof,
-        streamed_reasoning_text, warn_unknown_stream_item,
+        completed_stream_delta, streamed_reasoning_text, warn_unknown_stream_item,
     };
+    use futures::StreamExt;
     use rig::OneOrMany;
-    use rig::agent::{AgentBuilder, MultiTurnStreamItem};
-    use rig::completion::{Message, Usage};
+    use rig::agent::{
+        AgentBuilder, AgentHook, Flow, HookContext, MultiTurnStreamItem, OutputMode, StepEvent,
+    };
+    use rig::completion::{CompletionModel, Message, Usage};
     use rig::message::{
         AssistantContent, Image, Text, ToolCall, ToolFunction, ToolResult, ToolResultContent,
     };
-    use rig::streaming::StreamedAssistantContent;
+    use rig::streaming::{StreamedAssistantContent, StreamingChat};
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
     use rig::tool::Tool;
     use std::io::Write;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RetryInvalidTool;
+
+    impl<M: CompletionModel> AgentHook<M> for RetryInvalidTool {
+        async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+            if matches!(event, StepEvent::InvalidToolCall(_)) {
+                Flow::retry("normalized invalid-tool retry sentinel")
+            } else {
+                Flow::cont()
+            }
+        }
+    }
 
     #[cfg(feature = "subagents")]
     #[derive(Clone)]
@@ -1886,7 +1966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuations_include_only_tool_interactions_since_the_previous_injection() {
+    async fn later_continuations_preserve_each_prior_tool_interaction_once() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = MockCompletionModel::from_stream_turns(vec![
             vec![
@@ -1954,9 +2034,311 @@ mod tests {
         assert_eq!(request_tool_call_ids(2), ["tool-first"]);
         assert_eq!(
             request_tool_call_ids(4),
-            ["tool-second"],
-            "the second continuation must not replay interactions sent in the first"
+            ["tool-first", "tool-second"],
+            "the second continuation must preserve the full causal transcript without duplicates"
         );
+    }
+
+    #[tokio::test]
+    async fn done_exposes_batched_tool_interactions_with_provider_ids() {
+        let scripted_model = || {
+            MockCompletionModel::from_stream_turns(vec![
+                vec![
+                    MockStreamEvent::tool_call(
+                        "batch-first",
+                        CountingTool::NAME,
+                        serde_json::json!({}),
+                    ),
+                    MockStreamEvent::tool_call(
+                        "batch-second",
+                        CountingTool::NAME,
+                        serde_json::json!({}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+                vec![
+                    MockStreamEvent::text("finished"),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+            ])
+        };
+
+        let expected_agent = AgentBuilder::new(scripted_model())
+            .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+            .default_max_turns(3)
+            .build();
+        let mut expected_stream = expected_agent
+            .stream_chat("run both", Vec::<Message>::new())
+            .max_turns(3)
+            .await;
+        let expected_interactions = loop {
+            match expected_stream.next().await {
+                Some(Ok(MultiTurnStreamItem::FinalResponse(response))) => {
+                    break completed_stream_delta(response.messages, "run both").unwrap();
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Rig oracle failed: {error}"),
+                None => panic!("Rig oracle ended without FinalResponse"),
+            }
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = scripted_model();
+        let agent = AgentBuilder::new(model)
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "run both".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let interactions = loop {
+            match runner.event_rx.recv().await {
+                Some(crate::event::AgentEvent::Done { interactions, .. }) => break interactions,
+                Some(crate::event::AgentEvent::Error(error)) => {
+                    panic!("batched tool run failed: {error}")
+                }
+                Some(_) => {}
+                None => panic!("batched tool run ended without Done"),
+            }
+        };
+
+        let tool_call_ids = interactions
+            .iter()
+            .flat_map(|message| match message {
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .filter_map(|item| match item {
+                        AssistantContent::ToolCall(call) => Some(call.id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let tool_result_ids = interactions
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter_map(|item| match item {
+                        rig::message::UserContent::ToolResult(result) => Some(result.id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(interactions, expected_interactions);
+        assert_eq!(interactions.len(), 3, "parallel calls/results stay grouped");
+        assert_eq!(tool_call_ids, ["batch-first", "batch-second"]);
+        assert_eq!(tool_result_ids, tool_call_ids);
+        assert_eq!(interactions.last(), Some(&Message::assistant("finished")));
+    }
+
+    #[tokio::test]
+    async fn duplicate_provider_tool_ids_keep_distinct_lifecycle_ids() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "duplicate-provider-id",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::tool_call(
+                    "duplicate-provider-id",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("finished"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "run duplicates".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut call_lifecycle_ids = Vec::new();
+        let mut result_lifecycle_ids = Vec::new();
+        let interactions = loop {
+            match runner.event_rx.recv().await {
+                Some(crate::event::AgentEvent::ToolCall { id, .. }) => call_lifecycle_ids.push(id),
+                Some(crate::event::AgentEvent::ToolResult { id, .. }) => {
+                    result_lifecycle_ids.push(id)
+                }
+                Some(crate::event::AgentEvent::Done { interactions, .. }) => break interactions,
+                Some(crate::event::AgentEvent::Error(error)) => {
+                    panic!("duplicate-ID run failed: {error}")
+                }
+                Some(_) => {}
+                None => panic!("duplicate-ID run ended without Done"),
+            }
+        };
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(call_lifecycle_ids.len(), 2);
+        assert_ne!(call_lifecycle_ids[0], call_lifecycle_ids[1]);
+        assert_eq!(result_lifecycle_ids, call_lifecycle_ids);
+        let canonical_ids = interactions
+            .iter()
+            .flat_map(|message| match message {
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .filter_map(|item| match item {
+                        AssistantContent::ToolCall(call) => Some(call.id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical_ids,
+            ["duplicate-provider-id", "duplicate-provider-id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_delta_preserves_rig_invalid_tool_retry_feedback_exactly() {
+        let agent = AgentBuilder::new(MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("invalid-call", "missing_tool", serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]))
+        .build();
+        let mut stream = agent
+            .runner("recover invalid tool")
+            .max_turns(3)
+            .max_invalid_tool_call_retries(1)
+            .add_hook(RetryInvalidTool)
+            .stream()
+            .await;
+        let authoritative = loop {
+            match stream.next().await {
+                Some(Ok(MultiTurnStreamItem::FinalResponse(response))) => {
+                    break response.messages.expect("Rig final messages");
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("invalid-tool recovery failed: {error}"),
+                None => panic!("invalid-tool recovery ended without FinalResponse"),
+            }
+        };
+        let delta =
+            completed_stream_delta(Some(authoritative.clone()), "recover invalid tool").unwrap();
+
+        assert_eq!(delta, authoritative[1..]);
+        assert!(
+            serde_json::to_string(&delta)
+                .unwrap()
+                .contains("normalized invalid-tool retry sentinel"),
+            "Rig's normalized retry feedback must survive unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_matches_rig_output_retry_messages_exactly() {
+        let scripted_model = || {
+            MockCompletionModel::from_stream_turns(vec![
+                vec![
+                    MockStreamEvent::tool_call(
+                        "output-invalid",
+                        "final_result",
+                        serde_json::json!({}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+                vec![
+                    MockStreamEvent::tool_call(
+                        "output-valid",
+                        "final_result",
+                        serde_json::json!({"answer": "done"}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+            ])
+        };
+        let build_agent = |model| {
+            let output_schema: rig::schemars::Schema = serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "required": ["answer"],
+                "properties": {"answer": {"type": "string"}}
+            }))
+            .unwrap();
+            AgentBuilder::new(model)
+                .output_schema_raw(output_schema)
+                .output_mode(OutputMode::Tool)
+                .default_max_turns(3)
+                .build()
+        };
+
+        let expected_agent = build_agent(scripted_model());
+        let mut expected_stream = expected_agent
+            .stream_chat("structured answer", Vec::<Message>::new())
+            .max_turns(3)
+            .await;
+        let expected = loop {
+            match expected_stream.next().await {
+                Some(Ok(MultiTurnStreamItem::FinalResponse(response))) => {
+                    break completed_stream_delta(response.messages, "structured answer").unwrap();
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Rig output-retry oracle failed: {error}"),
+                None => panic!("Rig output-retry oracle ended without FinalResponse"),
+            }
+        };
+
+        let mut runner = super::spawn_agent(
+            build_agent(scripted_model()),
+            "structured answer".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let actual = loop {
+            match runner.event_rx.recv().await {
+                Some(crate::event::AgentEvent::Done { interactions, .. }) => break interactions,
+                Some(crate::event::AgentEvent::Error(error)) => {
+                    panic!("output-retry runner failed: {error}")
+                }
+                Some(_) => {}
+                None => panic!("output-retry runner ended without Done"),
+            }
+        };
+
+        assert_eq!(actual, expected);
+        assert!(actual.len() >= 3, "retry feedback must be retained");
     }
 
     #[tokio::test]
@@ -2424,10 +2806,16 @@ mod tests {
         );
 
         let mut done = None;
+        let mut done_interactions = None;
         while let Some(event) = runner.event_rx.recv().await {
             match event {
-                crate::event::AgentEvent::Done { response, .. } => {
+                crate::event::AgentEvent::Done {
+                    response,
+                    interactions,
+                    ..
+                } => {
                     done = Some(response.to_string());
+                    done_interactions = Some(interactions);
                     break;
                 }
                 crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
@@ -2456,6 +2844,13 @@ mod tests {
         ));
         assert_eq!(history.iter().nth(3), Some(&Message::assistant("")));
         assert_eq!(history.last_ref(), &Message::user("Please continue."));
+        let mut expected_interactions = history.iter().skip(1).cloned().collect::<Vec<_>>();
+        expected_interactions.push(Message::assistant("answer"));
+        assert_eq!(
+            done_interactions.as_deref(),
+            Some(expected_interactions.as_slice()),
+            "the committed turn delta must be the exact model-visible continuation transcript"
+        );
     }
 
     #[tokio::test]
@@ -3205,7 +3600,7 @@ mod tests {
         let interactive_error = loop {
             match runner.event_rx.recv().await {
                 Some(crate::event::AgentEvent::Error(error)) => break error.to_string(),
-                Some(crate::event::AgentEvent::Done { response }) => {
+                Some(crate::event::AgentEvent::Done { response, .. }) => {
                     panic!("over-budget tool completion unexpectedly finished: {response}")
                 }
                 Some(_) => {}
@@ -3273,7 +3668,9 @@ mod tests {
         );
         let interactive_response = loop {
             match runner.event_rx.recv().await {
-                Some(crate::event::AgentEvent::Done { response }) => break response.to_string(),
+                Some(crate::event::AgentEvent::Done { response, .. }) => {
+                    break response.to_string();
+                }
                 Some(crate::event::AgentEvent::Error(error)) => {
                     panic!("terminal text response must be preserved: {error}")
                 }
@@ -3349,7 +3746,7 @@ mod tests {
                     interactive_usage += Usage::from(delta);
                     delta_count += 1;
                 }
-                crate::event::AgentEvent::Done { response } => {
+                crate::event::AgentEvent::Done { response, .. } => {
                     assert_eq!(response, "done");
                     break;
                 }
@@ -3423,7 +3820,7 @@ mod tests {
                     );
                     deltas.push(Usage::from(delta));
                 }
-                crate::event::AgentEvent::Done { response } => {
+                crate::event::AgentEvent::Done { response, .. } => {
                     assert_eq!(response, "done");
                     break;
                 }

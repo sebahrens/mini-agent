@@ -210,7 +210,10 @@ pub async fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::Done { response } => {
+        AgentEvent::Done {
+            response,
+            interactions: _,
+        } => {
             handle_agent_done(
                 response,
                 renderer,
