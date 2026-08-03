@@ -55,6 +55,7 @@ enum PermissionCheckKind {
     Input,
     Path,
     StructuredInput { policy_input: String },
+    BoundPath,
 }
 
 enum PermissionReply {
@@ -138,6 +139,14 @@ impl PermissionBridge {
         self.check_sync(PermissionCheckKind::Path, tool, key)
     }
 
+    pub(crate) fn check_bound_path(
+        &self,
+        tool: &str,
+        key: &str,
+    ) -> Result<(), PermissionBridgeError> {
+        self.check_sync(PermissionCheckKind::BoundPath, tool, key)
+    }
+
     fn check_sync(
         &self,
         kind: PermissionCheckKind,
@@ -199,6 +208,15 @@ impl PermissionBridge {
         key: &str,
     ) -> Result<(), PermissionBridgeError> {
         self.check_async_kind(PermissionCheckKind::Path, tool, key)
+            .await
+    }
+
+    pub(crate) async fn check_bound_path_async(
+        &self,
+        tool: &str,
+        key: &str,
+    ) -> Result<(), PermissionBridgeError> {
+        self.check_async_kind(PermissionCheckKind::BoundPath, tool, key)
             .await
     }
 
@@ -516,6 +534,9 @@ async fn resolve_permission(
             PermissionCheckKind::Path => checker.check_path(request.tool(), request.key()),
             PermissionCheckKind::StructuredInput { policy_input } => {
                 checker.check_with_identity(request.tool(), &policy_input, request.key())
+            }
+            PermissionCheckKind::BoundPath => {
+                checker.check_bound_path(request.tool(), request.key())
             }
         }
     };

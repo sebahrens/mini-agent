@@ -13,6 +13,8 @@ pub(crate) mod write;
 
 pub(crate) use normalize::{levenshtein_similarity, normalize_whitespace};
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::config::types::EditSystem;
@@ -25,6 +27,38 @@ pub(crate) fn set_edit_system(es: EditSystem) {
 
 pub(crate) fn edit_system() -> EditSystem {
     *EDIT_SYSTEM.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Resolve a tool path against the immutable workspace selected when the
+/// agent was built. Absolute and home-relative paths retain their historical
+/// meaning; only relative paths are workspace-bound.
+pub(crate) fn resolve_tool_path(workspace_root: Option<&Path>, path: &str) -> PathBuf {
+    let expanded = PathBuf::from(crate::fs::expand_tilde(path));
+    if expanded.is_absolute() {
+        expanded
+    } else if let Some(root) = workspace_root {
+        root.join(expanded)
+    } else {
+        expanded
+    }
+}
+
+pub(crate) fn capture_workspace_binding(root: PathBuf) -> Arc<crate::paths::WorkspaceBinding> {
+    Arc::new(
+        crate::paths::WorkspaceBinding::capture(&root)
+            .expect("agent workspace must exist while tools are constructed"),
+    )
+}
+
+pub(crate) fn validate_workspace_binding(
+    workspace: Option<&Arc<crate::paths::WorkspaceBinding>>,
+) -> Result<Option<PathBuf>, ToolError> {
+    if let Some(workspace) = workspace {
+        workspace.validate().map_err(ToolError::Msg)?;
+        Ok(Some(workspace.root().to_path_buf()))
+    } else {
+        Ok(None)
+    }
 }
 
 static DENY_REPEATED_READS: Mutex<bool> = Mutex::new(true);
@@ -288,6 +322,42 @@ pub async fn check_perm_path(
                 ));
             };
             handle_ask_inner(tx, perm, tool, path).await?;
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) async fn check_perm_bound_path(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+) -> Result<Option<String>, ToolError> {
+    let logical = workspace.logical_relative_path(relative)?;
+    let logical = logical
+        .to_str()
+        .ok_or_else(|| ToolError::Msg("bound workspace path is not valid UTF-8".to_string()))?;
+    let Some(perm) = permission else {
+        return Ok(None);
+    };
+    let result = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        guard.check_bound_path(tool, logical)
+    };
+    match result {
+        CheckResult::Allowed => Ok(None),
+        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
+        CheckResult::Denied(reason) => {
+            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
+        }
+        CheckResult::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(
+                    "Permission denied (non-interactive mode)".to_string(),
+                ));
+            };
+            handle_ask_inner(tx, perm, tool, logical).await?;
             Ok(None)
         }
     }

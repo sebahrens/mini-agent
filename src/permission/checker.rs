@@ -355,6 +355,7 @@ impl PermissionChecker {
         tool: &str,
         matched: &SmallVec<[Action; 4]>,
         abs_path: &str,
+        capability_contained: bool,
     ) -> Action {
         let base = matched.last().copied();
         match self.mode {
@@ -386,13 +387,10 @@ impl PermissionChecker {
             }),
             SecurityMode::Standard => {
                 let a = base.unwrap_or(self.default_action);
-                if matched.is_empty() && self.is_path_tool(tool) && !self.is_external_path(abs_path)
-                {
+                let is_external = !capability_contained && self.is_external_path(abs_path);
+                if matched.is_empty() && self.is_path_tool(tool) && !is_external {
                     Action::Allow
-                } else if matched.is_empty()
-                    && a == Action::Allow
-                    && self.is_external_path(abs_path)
-                {
+                } else if matched.is_empty() && a == Action::Allow && is_external {
                     self.match_ext_dir(abs_path).unwrap_or(Action::Ask)
                 } else {
                     a
@@ -569,7 +567,7 @@ impl PermissionChecker {
             }
         }
 
-        let action = self.resolve_path_action(tool, &matched, &abs_path);
+        let action = self.resolve_path_action(tool, &matched, &abs_path, false);
         self.doom_loop_check(tool, &expanded, action)
     }
 
@@ -620,6 +618,57 @@ impl PermissionChecker {
         } else {
             PlanWritePathDecision::OutsideWorkspace
         }
+    }
+
+    /// Check a capability-contained path without consulting its mutable
+    /// ambient pathname. The caller must provide an absolute, lexically
+    /// normalized identity beneath this checker's immutable workspace root.
+    pub(crate) fn check_bound_path(&mut self, tool: &str, path: &str) -> CheckResult {
+        tracing::debug!("perm check bound path: tool={}, path={}", tool, path);
+        let path = Path::new(path);
+        let working_dir = normalize_path(Path::new(&self.working_dir));
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || !normalize_path(path).starts_with(&working_dir)
+        {
+            return CheckResult::Denied("Invalid bound workspace path".to_string());
+        }
+        let normalized = normalize_path(path);
+        let logical = normalized.to_string_lossy().into_owned();
+        let relative = normalized
+            .strip_prefix(&working_dir)
+            .ok()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_string_lossy()
+            .into_owned();
+
+        if self.matches_deny_rule(tool, &[&logical, &relative]) {
+            return CheckResult::Denied("Blocked by deny rule".to_string());
+        }
+        #[cfg(feature = "hooks")]
+        if let Some(result) = self.take_pending_one_shot(tool) {
+            return result;
+        }
+        if self.is_session_allowed(tool, &logical) || self.is_session_allowed(tool, &relative) {
+            return CheckResult::Allowed;
+        }
+
+        let mut matched: SmallVec<[Action; 4]> = SmallVec::new();
+        if self.apply_rules()
+            && let Some(rules) = self.rules.get(tool)
+        {
+            for (pattern, action) in rules {
+                if pattern.matches(&logical) || pattern.matches(&relative) {
+                    matched.push(*action);
+                }
+            }
+        }
+
+        let action = self.resolve_path_action(tool, &matched, &logical, true);
+        self.doom_loop_check(tool, &logical, action)
     }
 
     /// Check whether any deny rule matches the given inputs. Deny rules are
@@ -1131,6 +1180,112 @@ mod tests {
         assert!(
             matches!(result, CheckResult::Ask),
             "resolved external target must not match the workspace allow rule, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn bound_permission_identity_keeps_denied_root_during_pathname_swap() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let replacement = temp.0.join("replacement");
+        let retained = temp.0.join("workspace-retained");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(workspace.join("sentinel.txt"), "denied-original").unwrap();
+        std::fs::write(replacement.join("sentinel.txt"), "allowed-replacement").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let replacement = replacement.canonicalize().unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    (format!("{}/**", workspace.to_string_lossy()), Action::Deny),
+                    (
+                        format!("{}/**", replacement.to_string_lossy()),
+                        Action::Allow,
+                    ),
+                ]
+                .into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["standard".to_string()]),
+        );
+
+        std::fs::rename(&workspace, &retained).unwrap();
+        symlink(&replacement, &workspace).unwrap();
+        let relative = Path::new("sentinel.txt");
+        let logical = binding.logical_relative_path(relative).unwrap();
+        let ambient = std::fs::canonicalize(workspace.join(relative)).unwrap();
+        assert_eq!(
+            checker.check_path("read", &ambient.to_string_lossy()),
+            CheckResult::Allowed,
+            "the mutable ambient replacement is intentionally configured as allowed"
+        );
+        assert_eq!(
+            checker.check_bound_path("read", &logical.to_string_lossy()),
+            CheckResult::Denied("Blocked by deny rule".to_string()),
+            "the captured workspace's denied identity must not become the replacement identity"
+        );
+
+        std::fs::remove_file(&workspace).unwrap();
+        std::fs::rename(&retained, &workspace).unwrap();
+    }
+
+    #[test]
+    fn bound_permission_identity_matches_relative_path_rules() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        std::fs::create_dir_all(workspace.join("src/nested")).unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    ("secret.txt".to_string(), Action::Deny),
+                    ("src/**".to_string(), Action::Deny),
+                    ("allowed/**".to_string(), Action::Allow),
+                ]
+                .into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Restrictive,
+            Some(workspace.clone()),
+            Some(vec!["restrictive".to_string()]),
+        );
+
+        assert_eq!(
+            checker.check_bound_path("read", &workspace.join("secret.txt").to_string_lossy()),
+            CheckResult::Denied("Blocked by deny rule".to_string())
+        );
+        assert_eq!(
+            checker.check_bound_path(
+                "read",
+                &workspace.join("src/nested/value.rs").to_string_lossy()
+            ),
+            CheckResult::Denied("Blocked by deny rule".to_string())
+        );
+        assert_eq!(
+            checker.check_bound_path(
+                "read",
+                &workspace.join("allowed/value.txt").to_string_lossy()
+            ),
+            CheckResult::Allowed,
+            "a relative allow rule must match the capability-relative identity"
+        );
+        checker.add_session_allowlist("read".to_string(), "session/**");
+        assert_eq!(
+            checker.check_bound_path(
+                "read",
+                &workspace.join("session/value.txt").to_string_lossy()
+            ),
+            CheckResult::Allowed,
+            "a relative session allowlist must match the capability-relative identity"
         );
     }
 

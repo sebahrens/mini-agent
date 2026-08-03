@@ -1,9 +1,11 @@
+use std::path::Path;
+
 use rig::tool::Tool;
 use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::{
-    AskSender, PermCheck, ReadArgs, ToolError, check_perm_path, edit_system,
+    AskSender, PermCheck, ReadArgs, ToolError, check_perm_bound_path, check_perm_path, edit_system,
 };
 use crate::config::types::EditSystem;
 
@@ -14,7 +16,7 @@ pub struct ReadTool {
     pub ask_tx: Option<AskSender>,
     pub max_text_file_size: u64,
     pub max_lines: u64,
-    workspace: std::path::PathBuf,
+    workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
 }
 
 impl ReadTool {
@@ -29,12 +31,24 @@ impl ReadTool {
             ask_tx,
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
             max_lines,
-            workspace: std::env::current_dir().unwrap_or_default(),
+            workspace: None,
         }
     }
 
-    pub(crate) fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
-        self.workspace = workspace.into();
+    pub fn with_workspace_root(mut self, root: std::path::PathBuf) -> Self {
+        self.workspace = Some(crate::agent::tools::capture_workspace_binding(root));
+        self
+    }
+
+    pub(crate) fn with_workspace(self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.with_workspace_root(root.into())
+    }
+
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 }
@@ -72,23 +86,58 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
-        let path = crate::fs::resolve_workspace_path(&self.workspace, &args.path);
-        let resolved = tokio::fs::canonicalize(&path).await?;
-        let permission_path = resolved.to_string_lossy();
+        let workspace_root =
+            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let requested =
+            crate::agent::tools::resolve_tool_path(workspace_root.as_deref(), &args.path);
+        let path = requested.to_string_lossy().into_owned();
+        let relative = Path::new(&args.path);
+        let bound_workspace = if !relative.is_absolute() && !args.path.starts_with('~') {
+            self.workspace.as_ref()
+        } else {
+            None
+        };
+        let capability_file = bound_workspace
+            .map(|workspace| workspace.open_relative(relative))
+            .transpose()?;
         let offset = args.offset.unwrap_or(1).saturating_sub(1);
         let limit = args.limit.unwrap_or(self.max_lines as usize);
         tracing::debug!(
             "tool read start: path={}, offset={}, limit={}",
-            path.display(),
+            path,
             offset,
             limit,
         );
-        let coaching =
-            check_perm_path(&self.permission, &self.ask_tx, "read", &permission_path).await?;
-        let mut file = crate::fs::open_stable_file(&resolved).await?;
+        let (resolved, coaching) = if let Some(workspace) = bound_workspace {
+            (
+                None,
+                check_perm_bound_path(&self.permission, &self.ask_tx, "read", workspace, relative)
+                    .await?,
+            )
+        } else {
+            let resolved = tokio::fs::canonicalize(&requested).await?;
+            let coaching = check_perm_path(
+                &self.permission,
+                &self.ask_tx,
+                "read",
+                &resolved.to_string_lossy(),
+            )
+            .await?;
+            (Some(resolved), coaching)
+        };
+        let mut file = if let Some(file) = capability_file {
+            tokio::fs::File::from_std(file)
+        } else {
+            crate::fs::open_stable_file(
+                resolved
+                    .as_deref()
+                    .expect("ambient read must resolve an external path"),
+            )
+            .await?
+        };
 
-        if let Some(msg) = crate::agent::tools::track_read(&path.to_string_lossy(), offset, limit) {
-            tracing::debug!("tool read blocked (repeated): path={}", path.display());
+        if let Some(msg) = crate::agent::tools::track_read(&path, offset, limit) {
+            tracing::debug!("tool read blocked (repeated): path={}", path);
             return Err(ToolError::Msg(msg));
         }
 
@@ -97,7 +146,7 @@ impl Tool for ReadTool {
         if file_size > self.max_text_file_size {
             tracing::warn!(
                 "tool read file too large: path={}, size={}, max={}",
-                path.display(),
+                path,
                 file_size,
                 self.max_text_file_size,
             );
@@ -153,7 +202,7 @@ impl Tool for ReadTool {
                 let file_crc = crc32_hex(content.replace("\r\n", "\n").as_bytes());
                 format!(
                     "File: {} ({} lines total, lines {}-{}) [CRC: {}]\n\n{}",
-                    path.display(),
+                    path,
                     total_lines,
                     display_start(start, total_lines),
                     end,
@@ -164,7 +213,7 @@ impl Tool for ReadTool {
             EditSystem::Similarity => {
                 format!(
                     "File: {} ({} lines total, showing lines {}-{})\n\n{}",
-                    path.display(),
+                    path,
                     total_lines,
                     display_start(start, total_lines),
                     end,
@@ -194,7 +243,7 @@ impl Tool for ReadTool {
 
         tracing::debug!(
             "tool read done: path={}, total_lines={}, returned_lines={}",
-            path.display(),
+            path,
             total_lines,
             end - start,
         );

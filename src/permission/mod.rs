@@ -70,6 +70,15 @@ pub(crate) fn build_noninteractive_permission(
     cfg: &crate::config::Config,
     mode: SecurityMode,
 ) -> (Option<checker::PermCheck>, Option<ask::AskSender>) {
+    build_noninteractive_permission_at(cli, cfg, mode, None)
+}
+
+pub(crate) fn build_noninteractive_permission_at(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    mode: SecurityMode,
+    working_dir: Option<std::path::PathBuf>,
+) -> (Option<checker::PermCheck>, Option<ask::AskSender>) {
     if cli.resolve_no_tools(cfg) || cli.dangerously_skip_permissions {
         return (None, None);
     }
@@ -77,7 +86,7 @@ pub(crate) fn build_noninteractive_permission(
     let checker = checker::PermissionChecker::new(
         &cfg.build_permission_config(),
         mode,
-        None,
+        working_dir,
         cfg.permission_modes.clone(),
     );
     let permission = std::sync::Arc::new(std::sync::Mutex::new(checker));

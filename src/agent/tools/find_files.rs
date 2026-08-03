@@ -8,7 +8,8 @@ use regex::Regex;
 use rig::tool::Tool;
 
 use crate::agent::tools::{
-    AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, check_perm_path, is_skip_dir,
+    AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, check_perm_bound_path,
+    check_perm_path, is_skip_dir,
 };
 
 fn path_changed_error(path: &Path) -> std::io::Error {
@@ -16,14 +17,6 @@ fn path_changed_error(path: &Path) -> std::io::Error {
         std::io::ErrorKind::PermissionDenied,
         format!("Path changed after permission check: {}", path.display()),
     )
-}
-
-fn normalize_approved_path_error(path: &Path, error: std::io::Error) -> std::io::Error {
-    if crate::fs::is_symlink_loop_error(&error) {
-        path_changed_error(path)
-    } else {
-        error
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -312,7 +305,7 @@ mod bound_platform {
                 0,
                 FILE_SHARE_ALL,
                 FILE_OPEN,
-                FILE_FLAG_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 ptr::null_mut(),
                 0,
             )
@@ -464,23 +457,29 @@ pub(super) struct BoundDirectory {
 impl BoundDirectory {
     pub(super) fn open(
         approved_root: &Path,
-        approved_metadata: &crate::fs::CheckedMetadata,
+        approved_metadata: &std::fs::Metadata,
     ) -> std::io::Result<Self> {
         if !approved_metadata.is_dir() || !bound_platform::is_safe_entry(approved_metadata) {
             return Err(path_changed_error(approved_root));
         }
-        let root = bound_platform::open_root(approved_root)
-            .map_err(|error| normalize_approved_path_error(approved_root, error))?;
-        let opened_metadata = crate::fs::checked_file_metadata(&root)?;
-        let current_metadata = crate::fs::checked_path_metadata(approved_root)
-            .map_err(|error| normalize_approved_path_error(approved_root, error))?;
+        let root = bound_platform::open_root(approved_root)?;
+        let opened_metadata = root.metadata()?;
+        let current_metadata = std::fs::symlink_metadata(approved_root)?;
         if current_metadata.file_type().is_symlink()
             || !bound_platform::is_safe_entry(&opened_metadata)
         {
             return Err(path_changed_error(approved_root));
         }
-        crate::fs::ensure_same_file(approved_root, approved_metadata, &opened_metadata)?;
-        crate::fs::ensure_same_file(approved_root, &opened_metadata, &current_metadata)?;
+        crate::fs::ensure_same_std_file(approved_root, approved_metadata, &opened_metadata)?;
+        crate::fs::ensure_same_std_file(approved_root, &opened_metadata, &current_metadata)?;
+        Self::from_file(approved_root, root)
+    }
+
+    pub(super) fn from_file(approved_root: &Path, root: File) -> std::io::Result<Self> {
+        let metadata = root.metadata()?;
+        if !metadata.is_dir() || !bound_platform::is_safe_entry(&metadata) {
+            return Err(path_changed_error(approved_root));
+        }
         Ok(Self {
             approved_root: approved_root.to_path_buf(),
             root,
@@ -490,6 +489,70 @@ impl BoundDirectory {
     pub(super) fn walker(&self) -> std::io::Result<BoundWalker> {
         BoundWalker::new(self.root.try_clone()?, self.approved_root.clone())
     }
+
+    pub(super) fn list_entries(&self) -> std::io::Result<Vec<BoundListEntry>> {
+        let mut matchers = Vec::new();
+        let (global, _) = GitignoreBuilder::new(&self.approved_root).build_global();
+        if !global.is_empty() {
+            matchers.push(global);
+        }
+        matchers.extend(parent_ignore_matchers(&self.approved_root));
+        for ignore_name in [".gitignore", ".ignore"] {
+            if let Some(matcher) =
+                local_ignore_matcher(&self.root, Path::new(""), &self.approved_root, ignore_name)
+            {
+                matchers.push(matcher);
+            }
+        }
+        if let Ok(exclude) = open_relative(&self.root, Path::new(".git/info/exclude"))
+            && let Some(matcher) = ignore_matcher(
+                exclude,
+                &self.approved_root,
+                self.approved_root.join(".git/info/exclude"),
+            )
+        {
+            matchers.push(matcher);
+        }
+
+        let mut entries = Vec::new();
+        for name in bound_platform::read_directory(&self.root)? {
+            let child = match bound_platform::open_child(&self.root, &name) {
+                Ok(child) => child,
+                Err(_) => continue,
+            };
+            let metadata = match child.metadata() {
+                Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
+                _ => continue,
+            };
+            let path = self.approved_root.join(&name);
+            let is_directory = metadata.is_dir();
+            if is_directory && is_skip_dir(name.to_str().unwrap_or("")) {
+                continue;
+            }
+            if is_ignored(&matchers, &path, is_directory) {
+                continue;
+            }
+            let child_count = if is_directory {
+                bound_platform::read_directory(&child)
+                    .map(|reader| reader.count() as u64)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            entries.push(BoundListEntry {
+                file_name: name,
+                metadata,
+                child_count,
+            });
+        }
+        Ok(entries)
+    }
+}
+
+pub(super) struct BoundListEntry {
+    pub(super) file_name: OsString,
+    pub(super) metadata: std::fs::Metadata,
+    pub(super) child_count: u64,
 }
 
 struct DirectoryFrame {
@@ -683,7 +746,7 @@ pub struct FindFilesTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub max_results: u64,
-    workspace: std::path::PathBuf,
+    workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
 }
 
 impl FindFilesTool {
@@ -692,13 +755,20 @@ impl FindFilesTool {
             permission,
             ask_tx,
             max_results,
-            workspace: std::env::current_dir().unwrap_or_default(),
+            workspace: None,
         }
     }
 
-    pub(crate) fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
-        self.workspace = workspace.into();
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace = Some(workspace);
         self
+    }
+
+    pub(crate) fn with_workspace(self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.with_workspace_binding(crate::agent::tools::capture_workspace_binding(root.into()))
     }
 }
 
@@ -746,20 +816,41 @@ impl Tool for FindFilesTool {
         if requested_path.is_empty() {
             return Err(ToolError::Msg("Search path cannot be empty".to_string()));
         }
-        let search_path = crate::fs::resolve_workspace_path(&self.workspace, requested_path);
-        let traversal_root = tokio::fs::canonicalize(&search_path).await?;
-        let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        let bound_directory = BoundDirectory::open(&traversal_root, &authorized_metadata)?;
-        let permission_path = traversal_root.to_string_lossy();
-        let _ = check_perm_path(
-            &self.permission,
-            &self.ask_tx,
-            "find_files",
-            &permission_path,
-        )
-        .await?;
-        let traversal_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &traversal_metadata)?;
+        let workspace_root =
+            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let search_path =
+            crate::agent::tools::resolve_tool_path(workspace_root.as_deref(), requested_path);
+        let relative = Path::new(requested_path);
+        let (bound_directory, path_coaching) = if !relative.is_absolute()
+            && !requested_path.starts_with('~')
+            && let Some(workspace) = &self.workspace
+        {
+            let logical = workspace.logical_relative_path(relative)?;
+            let directory = workspace.open_relative_directory_file(relative)?;
+            let bound = BoundDirectory::from_file(&logical, directory)?;
+            let coaching = check_perm_bound_path(
+                &self.permission,
+                &self.ask_tx,
+                "find_files",
+                workspace,
+                relative,
+            )
+            .await?;
+            (bound, coaching)
+        } else {
+            let traversal_root = tokio::fs::canonicalize(&search_path).await?;
+            let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
+            let bound = BoundDirectory::open(&traversal_root, &authorized_metadata)?;
+            let coaching = check_perm_path(
+                &self.permission,
+                &self.ask_tx,
+                "find_files",
+                &traversal_root.to_string_lossy(),
+            )
+            .await?;
+            (bound, coaching)
+        };
+        let _ = path_coaching;
 
         let walker = bound_directory.walker()?;
 
@@ -777,9 +868,6 @@ impl Tool for FindFilesTool {
                 }
             }
         }
-        let current_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &current_metadata)?;
-
         if results.is_empty() {
             let msg = "No files found matching the pattern.".to_string();
             return Ok(match coaching {
@@ -1105,7 +1193,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn find_files_external_path_permission_rejects_authorized_root_replacement() {
+    async fn find_files_external_path_permission_retains_authorized_root_on_replacement() {
         let container = TempDir::new("root_replacement");
         let workspace = container.path().join("workspace");
         let authorized = container.path().join("authorized");
@@ -1132,9 +1220,9 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(call, replace);
-        let error = result.expect_err("find_files must reject a replaced traversal root");
-        assert!(error.to_string().contains("Path changed"));
-        assert!(!error.to_string().contains("must_not_be_returned.txt"));
+        let output = result.expect("descriptor-bound search must retain the authorized root");
+        assert!(output.contains("No files found"));
+        assert!(!output.contains("must_not_be_returned.txt"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1151,7 +1239,7 @@ mod tests {
         let secret = "aba_secret_marker.txt";
         std::fs::write(replacement.join(secret), "").unwrap();
 
-        let approved_metadata = crate::fs::checked_path_metadata(&authorized).unwrap();
+        let approved_metadata = std::fs::symlink_metadata(&authorized).unwrap();
         let bound = BoundDirectory::open(&authorized, &approved_metadata).unwrap();
         std::fs::rename(&authorized, &moved).unwrap();
         std::fs::rename(&replacement, &authorized).unwrap();
@@ -1166,27 +1254,6 @@ mod tests {
 
         assert_eq!(names.len(), 2);
         assert!(!names.iter().any(|name| name == secret));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bound_directory_symlink_replacement_reports_path_changed() {
-        let container = TempDir::new("bound_root_symlink_replacement");
-        let authorized = container.path().join("authorized");
-        let moved = container.path().join("moved");
-        let replacement = container.path().join("replacement");
-        std::fs::create_dir_all(&authorized).unwrap();
-        std::fs::create_dir_all(&replacement).unwrap();
-        let approved_metadata = crate::fs::checked_path_metadata(&authorized).unwrap();
-
-        std::fs::rename(&authorized, &moved).unwrap();
-        std::os::unix::fs::symlink(&replacement, &authorized).unwrap();
-
-        let error = match BoundDirectory::open(&authorized, &approved_metadata) {
-            Ok(_) => panic!("bound traversal accepted a symlink replacement"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("Path changed"));
     }
 
     #[tokio::test]

@@ -15,8 +15,6 @@ pub(crate) struct SubagentConfig {
     pub model_name: String,
     pub max_turns: usize,
     pub config: crate::config::Config,
-    #[cfg(feature = "archmd")]
-    pub architecture: Option<String>,
 }
 
 static CONFIG: Mutex<Option<SubagentConfig>> = Mutex::new(None);
@@ -54,7 +52,6 @@ pub fn init(
     model_name: String,
     max_turns: usize,
     config: crate::config::Config,
-    #[cfg(feature = "archmd")] architecture: Option<String>,
 ) {
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(SubagentConfig {
@@ -62,8 +59,6 @@ pub fn init(
         model_name,
         max_turns,
         config,
-        #[cfg(feature = "archmd")]
-        architecture,
     });
 }
 

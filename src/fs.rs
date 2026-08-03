@@ -480,6 +480,36 @@ pub(crate) fn ensure_same_file(
     }
 }
 
+/// Compare two already-open standard-library metadata snapshots.
+///
+/// Capability-backed callers retain their own live handles, so they need the
+/// platform identity comparison without manufacturing another pathname-based
+/// [`CheckedMetadata`] handle.
+pub(crate) fn ensure_same_std_file(
+    path: &Path,
+    checked: &std::fs::Metadata,
+    current: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        checked.dev() == current.dev() && checked.ino() == current.ino()
+    };
+    #[cfg(windows)]
+    let same = {
+        use std::os::windows::fs::MetadataExt;
+        checked.volume_serial_number() == current.volume_serial_number()
+            && checked.file_index() == current.file_index()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let same = false;
+    if same {
+        Ok(())
+    } else {
+        Err(path_changed_error(path))
+    }
+}
+
 /// Open a regular path after permission approval and verify that it was not
 /// replaced while the open was in progress.
 pub(crate) async fn open_stable_file(path: &Path) -> std::io::Result<tokio::fs::File> {

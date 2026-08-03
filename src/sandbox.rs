@@ -21,6 +21,8 @@ pub(crate) mod worker;
 
 #[cfg(all(feature = "js", target_os = "linux"))]
 pub(crate) type SandboxCommand = Command;
+#[cfg(unix)]
+const WORKSPACE_AUTHORITY_FD: i32 = 197;
 
 #[derive(Debug, Clone)]
 pub struct Sandbox {
@@ -30,6 +32,7 @@ pub struct Sandbox {
     shell_command_arg: String,
     disabled_reason: DisabledSandboxReason,
     working_dir: Option<PathBuf>,
+    workspace_binding: Option<Arc<crate::paths::WorkspaceBinding>>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
     #[cfg(test)]
@@ -548,6 +551,68 @@ impl Drop for ProcessGroupGuard {
 }
 
 impl Sandbox {
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn bind_workspace_cwd(&self, command: &mut Command) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let Some(workspace) = &self.workspace_binding else {
+            return Ok(());
+        };
+        let directory = workspace
+            .try_clone_directory_file()
+            .map_err(|error| format!("sandbox: failed to clone workspace handle: {error}"))?;
+        let fd = directory.as_raw_fd();
+        unsafe {
+            command.as_std_mut().pre_exec(move || {
+                let _keep_directory_alive = &directory;
+                if libc::dup2(fd, WORKSPACE_AUTHORITY_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // dup2 is a no-op when the source already equals the fixed
+                // descriptor, so explicitly clear CLOEXEC in both cases.
+                let descriptor_flags = libc::fcntl(WORKSPACE_AUTHORITY_FD, libc::F_GETFD);
+                if descriptor_flags == -1
+                    || libc::fcntl(
+                        WORKSPACE_AUTHORITY_FD,
+                        libc::F_SETFD,
+                        descriptor_flags & !libc::FD_CLOEXEC,
+                    ) == -1
+                    || libc::fchdir(WORKSPACE_AUTHORITY_FD) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    fn workspace_authority_path(&self) -> Option<PathBuf> {
+        self.workspace_binding
+            .as_ref()
+            .map(|_| PathBuf::from(format!("/proc/self/fd/{WORKSPACE_AUTHORITY_FD}")))
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn workspace_authority_path(&self) -> Option<PathBuf> {
+        self.workspace_binding
+            .as_ref()
+            .map(|_| PathBuf::from(format!("/dev/fd/{WORKSPACE_AUTHORITY_FD}")))
+    }
+
+    #[cfg(not(unix))]
+    fn workspace_authority_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    #[cfg(not(unix))]
+    fn bind_workspace_cwd(&self, _command: &mut Command) -> Result<(), String> {
+        Ok(())
+    }
+
     pub fn new(enabled: bool, backend: &str) -> Self {
         Sandbox {
             enabled,
@@ -556,6 +621,7 @@ impl Sandbox {
             shell_command_arg: "-c".to_string(),
             disabled_reason: DisabledSandboxReason::UserTrustedBypass,
             working_dir: None,
+            workspace_binding: None,
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
@@ -718,6 +784,16 @@ impl Sandbox {
             .unwrap_or_else(std::env::current_dir)
     }
 
+    /// Bind every command launched by this sandbox to an explicit immutable
+    /// workspace. This is per-sandbox state; it never mutates process CWD.
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.working_dir = Some(workspace.root().to_path_buf());
+        self.workspace_binding = Some(workspace);
+        self
+    }
     /// Selects a shell whose script flag differs from the POSIX `-c`
     /// contract. The flag is passed as one literal argument; it is never
     /// concatenated with the command text.
@@ -740,13 +816,19 @@ impl Sandbox {
         &self,
         arguments: &[String],
     ) -> Result<Command, String> {
+        if let Some(workspace) = &self.workspace_binding {
+            workspace.validate()?;
+        }
         if !self.supports_immutable_executable_snapshot() {
             return Err("sandbox backend cannot bind an immutable executable snapshot".to_string());
         }
         let cwd = self
             .working_dir()
             .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
-        let cwd = canonical_non_root(&cwd, "working directory")?;
+        let cwd = self
+            .workspace_authority_path()
+            .map(Ok)
+            .unwrap_or_else(|| canonical_non_root(&cwd, "working directory"))?;
         let paths = crate::paths::process_paths()
             .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
         std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
@@ -776,14 +858,22 @@ impl Sandbox {
     }
 
     fn wrap_command_inner(&self, command: &str) -> Result<Command, String> {
+        if let Some(workspace) = &self.workspace_binding {
+            workspace.validate()?;
+        }
+        let requested_cwd = self
+            .working_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| std::env::current_dir())
+            .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
         match self.policy() {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
                 cmd.arg(&self.shell_command_arg).arg(command);
-                if let Some(working_dir) = &self.working_dir {
-                    cmd.current_dir(working_dir);
-                }
+                cmd.current_dir(&requested_cwd);
                 configure_child_lifetime(&mut cmd);
+                self.bind_workspace_cwd(&mut cmd)?;
                 return Ok(cmd);
             }
             SandboxPolicy::RequiredButUnavailable => {
@@ -794,14 +884,17 @@ impl Sandbox {
             }
             SandboxPolicy::RequiredAndAvailable => {}
         }
-
-        let cwd = self.working_dir.clone().map(Ok).unwrap_or_else(|| {
-            std::env::current_dir()
-                .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))
-        })?;
-        let cwd = canonical_non_root(&cwd, "working directory")?;
+        let cwd = self
+            .workspace_authority_path()
+            .map(Ok)
+            .unwrap_or_else(|| canonical_non_root(&requested_cwd, "working directory"))?;
 
         if self.backend == "zerobox" {
+            if self.workspace_binding.is_some() && cfg!(unix) {
+                return Err(
+                    "sandbox backend 'zerobox' cannot consume an ACP workspace handle".to_string(),
+                );
+            }
             let mut cmd = Command::new("zerobox");
             cmd.arg("--allow-write");
             cmd.arg(cwd.as_os_str());
@@ -811,6 +904,7 @@ impl Sandbox {
             cmd.arg(command);
             cmd.current_dir(&cwd);
             configure_child_lifetime(&mut cmd);
+            self.bind_workspace_cwd(&mut cmd)?;
             return Ok(cmd);
         }
 
@@ -829,14 +923,21 @@ impl Sandbox {
                 "sandbox backend 'seatbelt' is not a trusted system executable — refusing to run unsandboxed"
                     .to_string()
             })?;
-            return self.build_seatbelt_command(seatbelt, command, &cwd, &cache_dir);
+            let mut command = self.build_seatbelt_command(seatbelt, command, &cwd, &cache_dir)?;
+            if self.workspace_binding.is_some() && cfg!(unix) {
+                command.current_dir("/");
+            }
+            self.bind_workspace_cwd(&mut command)?;
+            return Ok(command);
         }
 
         let bwrap = bwrap_path().ok_or_else(|| {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
-        Ok(self.build_bwrap_command(bwrap, command, &cwd, &cache_dir))
+        let mut command = self.build_bwrap_command(bwrap, command, &cwd, &cache_dir);
+        self.bind_workspace_cwd(&mut command)?;
+        Ok(command)
     }
 
     /// Builds a direct-exec command under the general workspace policy.
@@ -1189,7 +1290,8 @@ impl Sandbox {
         cache_dir: &Path,
     ) -> Command {
         let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir);
-        append_bwrap_isolation(&mut cmd, cwd);
+        let sandbox_cwd = self.sandbox_cwd(cwd);
+        append_bwrap_isolation(&mut cmd, &sandbox_cwd);
         cmd.args([
             "--die-with-parent",
             "--",
@@ -1221,7 +1323,8 @@ impl Sandbox {
             "3",
             SNAPSHOT_EXECUTABLE_PATH,
         ]);
-        append_bwrap_isolation(&mut cmd, cwd);
+        let sandbox_cwd = self.sandbox_cwd(cwd);
+        append_bwrap_isolation(&mut cmd, &sandbox_cwd);
         cmd.args(["--die-with-parent", "--", SNAPSHOT_EXECUTABLE_PATH]);
         cmd.args(arguments);
         configure_child_lifetime(&mut cmd);
@@ -1243,9 +1346,21 @@ impl Sandbox {
             cmd.args(["--ro-bind-try", path, path]);
         }
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
-        cmd.arg("--bind").arg(cwd).arg(cwd);
+        let sandbox_cwd = self.sandbox_cwd(cwd);
+        if sandbox_cwd != cwd {
+            cmd.args(["--dir", "/workspace"]);
+        }
+        cmd.arg("--bind").arg(cwd).arg(&sandbox_cwd);
         cmd.arg("--bind").arg(cache_dir).arg(cache_dir);
         cmd
+    }
+
+    fn sandbox_cwd(&self, cwd: &Path) -> PathBuf {
+        if self.workspace_binding.is_some() && cfg!(unix) {
+            PathBuf::from("/workspace")
+        } else {
+            cwd.to_path_buf()
+        }
     }
 
     /// Runs a command on a background task so dropping the receiver is an

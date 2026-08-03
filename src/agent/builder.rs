@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-#[cfg(feature = "skills")]
+use std::path::Path;
 use std::sync::Arc;
 
 use rig::agent::{Agent, AgentBuilder};
@@ -23,6 +23,15 @@ use crate::sandbox::Sandbox;
 /// `SUFFIX.md`. Extracted from [`build_agent_inner`] so its token cost can be
 /// estimated (see [`estimate_overhead`]) without building an `Agent`.
 pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String {
+    let workspace_root = std::env::current_dir().ok();
+    build_preamble_for_workspace(context, reasoning_enabled, workspace_root.as_deref())
+}
+
+pub(crate) fn build_preamble_for_workspace(
+    context: &ContextFiles,
+    reasoning_enabled: bool,
+    workspace_root: Option<&Path>,
+) -> String {
     let reasoning_prefix = if reasoning_enabled {
         "You reason carefully and think step-by-step.\n\n"
     } else {
@@ -33,7 +42,9 @@ pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String
     #[cfg(feature = "archmd")]
     let context_architecture = context.architecture.as_deref().unwrap_or("");
     let context_prompt = context.current_prompt.as_deref().unwrap_or("");
-    let cwd = context.workspace_root.display().to_string();
+    let cwd = workspace_root
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
 
     let total_len = reasoning_prefix.len()
         + SYSTEM_PROMPT.len()
@@ -172,7 +183,7 @@ fn register_js_tool(
     ask_tx: Option<AskSender>,
     cfg: &Config,
     containment_status: crate::sandbox::worker::WorkerContainmentStatus,
-    workspace: &std::path::Path,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
     #[cfg(feature = "skills")] skill_turn_context: Option<
         Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     >,
@@ -199,11 +210,12 @@ fn register_js_tool_with_status(
     ask_tx: Option<AskSender>,
     cfg: &Config,
     containment_status: crate::sandbox::worker::WorkerContainmentStatus,
-    workspace: &std::path::Path,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
     #[cfg(feature = "skills")] skill_turn_context: Option<
         Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     >,
 ) {
+    let workspace_root = workspace.root();
     use crate::extras::js::host::AllowConfig;
     use crate::extras::js::tool::JsTool;
     use crate::sandbox::worker::WorkerContainmentStatus;
@@ -216,7 +228,7 @@ fn register_js_tool_with_status(
         return;
     }
 
-    let startup_base = workspace.to_path_buf();
+    let startup_base = workspace_root.to_path_buf();
     let allow_config = AllowConfig::from_settings(
         &startup_base,
         cfg.js_file_base_dir.as_deref(),
@@ -225,6 +237,7 @@ fn register_js_tool_with_status(
         cfg.js_read_unrestricted.unwrap_or(false),
         cfg.js_write_unrestricted.unwrap_or(false),
     )
+    .with_workspace_binding(workspace.clone())
     .with_fetch_settings(
         cfg.js_fetch_origins.as_deref(),
         cfg.js_fetch_allow_http.unwrap_or(false),
@@ -238,11 +251,11 @@ fn register_js_tool_with_status(
             use crate::extras::js::skills::proposal::ProposalQueue;
             use crate::extras::js::skills::store::SkillStore;
             use crate::extras::js::skills::telemetry::TelemetryDispatcher;
-            use crate::paths::AppPaths;
             use std::time::Duration;
 
             let workers = (|| -> Result<_, String> {
-                let paths = AppPaths::from_process(Some(startup_base))
+                let paths = crate::paths::process_paths()
+                    .and_then(|paths| paths.with_workspace_root(&startup_base))
                     .map_err(|error| error.to_string())?;
                 let proposal_store =
                     SkillStore::open_at(&paths).map_err(|error| error.to_string())?;
@@ -318,6 +331,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
@@ -334,16 +348,19 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> Agent<M> {
+    let workspace_root = workspace.root();
+    let sandbox = sandbox.with_workspace_binding(workspace.clone());
     #[cfg(feature = "lsp")]
     let lsp_manager = if cli.resolve_no_tools(cfg) {
         None
     } else {
         cfg.resolve_lsp()
-            .map(|c| crate::extras::lsp::LspManager::new(c, context.workspace_root.clone()))
+            .map(|c| crate::extras::lsp::LspManager::new(c, workspace.clone()))
     };
 
     #[cfg_attr(not(feature = "lsp"), allow(unused_mut))]
-    let mut preamble = build_preamble(context, reasoning_enabled);
+    let mut preamble =
+        build_preamble_for_workspace(context, reasoning_enabled, Some(workspace_root));
     #[cfg(feature = "lsp")]
     if lsp_manager.is_some() {
         preamble.push_str(crate::agent::prompt::LSP_PROMPT);
@@ -376,11 +393,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
         let write_tool =
             tools::WriteTool::new(permission.clone(), ask_tx.clone(), max_text_file_size)
-                .with_workspace(context.workspace_root.clone());
+                .with_workspace_binding(workspace.clone());
         #[cfg(feature = "lsp")]
         let write_tool = write_tool.with_lsp(lsp_manager.clone());
         let edit_tool = tools::EditTool::new(permission.clone(), ask_tx.clone())
-            .with_workspace(context.workspace_root.clone());
+            .with_workspace_binding(workspace.clone());
         #[cfg(feature = "lsp")]
         let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
         let base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::from_buf([
@@ -391,7 +408,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     max_text_file_size,
                     max_read_lines,
                 )
-                .with_workspace(context.workspace_root.clone()),
+                .with_workspace_binding(workspace.clone()),
             ),
             Box::new(write_tool),
             Box::new(edit_tool),
@@ -405,15 +422,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             )),
             Box::new(
                 tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
-                    .with_workspace(context.workspace_root.clone()),
+                    .with_workspace_binding(workspace.clone()),
             ),
             Box::new(
                 tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
-                    .with_workspace(context.workspace_root.clone()),
+                    .with_workspace_binding(workspace.clone()),
             ),
             Box::new(
                 tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
-                    .with_workspace(context.workspace_root.clone()),
+                    .with_workspace_binding(workspace.clone()),
             ),
             Box::new(tools::WriteTodoList::new(
                 permission.clone(),
@@ -438,7 +455,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             use crate::extras::subagents::task_tool::TaskTool;
             all_tools.push(Box::new(
                 TaskTool::new(permission.clone(), ask_tx.clone())
-                    .with_workspace(context.workspace_root.clone()),
+                    .with_workspace_binding(workspace.clone())
+                    .with_architecture(context.architecture.clone()),
             ));
         }
 
@@ -498,7 +516,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             ask_tx.clone(),
             cfg,
             js_worker_containment_status,
-            &context.workspace_root,
+            workspace,
             #[cfg(feature = "skills")]
             skill_turn_context,
         );
@@ -550,9 +568,18 @@ mod js_tests {
         ]])
     }
 
+    fn workspace_binding() -> std::sync::Arc<crate::paths::WorkspaceBinding> {
+        std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn registers_and_executes_js_tool() {
         let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
         register_js_tool_with_status(
             &mut tools,
             Sandbox::new(false, "bwrap"),
@@ -563,7 +590,7 @@ mod js_tests {
                 backend: WorkerBackend::for_current_platform(),
                 assurance: WorkerContainmentAssurance::Enforced,
             },
-            std::path::Path::new("."),
+            workspace,
             #[cfg(feature = "skills")]
             None,
         );
@@ -593,7 +620,7 @@ mod js_tests {
                 assurance: WorkerContainmentAssurance::Enforced,
                 reason: "backend probe failed".into(),
             },
-            std::path::Path::new("."),
+            workspace_binding(),
             #[cfg(feature = "skills")]
             None,
         );
@@ -614,7 +641,7 @@ mod js_tests {
                 backend: WorkerBackend::for_current_platform(),
                 assurance: WorkerContainmentAssurance::Enforced,
             },
-            std::path::Path::new("."),
+            workspace_binding(),
             #[cfg(feature = "skills")]
             None,
         );
@@ -641,6 +668,7 @@ mod js_tests {
             &cli,
             &first_config,
             &context,
+            workspace_binding(),
             None,
             None,
             Sandbox::new(false, "bwrap"),
@@ -722,6 +750,7 @@ mod js_tests {
             &cli,
             &first_config,
             &context,
+            workspace_binding(),
             None,
             None,
             Sandbox::new(false, "bwrap"),

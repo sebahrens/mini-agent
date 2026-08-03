@@ -1,16 +1,19 @@
 use std::io::Read;
+use std::path::Path;
 
 use regex::Regex;
 use rig::tool::Tool;
 
 use super::find_files::BoundDirectory;
-use crate::agent::tools::{AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_path};
+use crate::agent::tools::{
+    AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_bound_path, check_perm_path,
+};
 
 pub struct GrepTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub max_results: u64,
-    workspace: std::path::PathBuf,
+    workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
 }
 
 impl GrepTool {
@@ -19,13 +22,20 @@ impl GrepTool {
             permission,
             ask_tx,
             max_results,
-            workspace: std::env::current_dir().unwrap_or_default(),
+            workspace: None,
         }
     }
 
-    pub(crate) fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
-        self.workspace = workspace.into();
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace = Some(workspace);
         self
+    }
+
+    pub(crate) fn with_workspace(self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.with_workspace_binding(crate::agent::tools::capture_workspace_binding(root.into()))
     }
 
     pub(crate) fn glob_to_regex(glob: &str) -> String {
@@ -105,14 +115,36 @@ impl Tool for GrepTool {
         if requested_path.is_empty() {
             return Err(ToolError::Msg("Search path cannot be empty".to_string()));
         }
-        let search_path = crate::fs::resolve_workspace_path(&self.workspace, requested_path);
-        let traversal_root = tokio::fs::canonicalize(&search_path).await?;
-        let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        let bound_directory = BoundDirectory::open(&traversal_root, &authorized_metadata)?;
-        let permission_path = traversal_root.to_string_lossy();
-        let _ = check_perm_path(&self.permission, &self.ask_tx, "grep", &permission_path).await?;
-        let traversal_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &traversal_metadata)?;
+        let workspace_root =
+            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let search_path =
+            crate::agent::tools::resolve_tool_path(workspace_root.as_deref(), requested_path);
+        let relative = Path::new(requested_path);
+        let (bound_directory, path_coaching) = if !relative.is_absolute()
+            && !requested_path.starts_with('~')
+            && let Some(workspace) = &self.workspace
+        {
+            let logical = workspace.logical_relative_path(relative)?;
+            let directory = workspace.open_relative_directory_file(relative)?;
+            let bound = BoundDirectory::from_file(&logical, directory)?;
+            let coaching =
+                check_perm_bound_path(&self.permission, &self.ask_tx, "grep", workspace, relative)
+                    .await?;
+            (bound, coaching)
+        } else {
+            let traversal_root = tokio::fs::canonicalize(&search_path).await?;
+            let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
+            let bound = BoundDirectory::open(&traversal_root, &authorized_metadata)?;
+            let coaching = check_perm_path(
+                &self.permission,
+                &self.ask_tx,
+                "grep",
+                &traversal_root.to_string_lossy(),
+            )
+            .await?;
+            (bound, coaching)
+        };
+        let _ = path_coaching;
         let context = args.context_lines.unwrap_or(0);
 
         let include_re = args.include.as_ref().map(|g| {
@@ -235,9 +267,6 @@ impl Tool for GrepTool {
                 break;
             }
         }
-        let current_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &current_metadata)?;
-
         if all_results.is_empty() {
             let msg = "No matches found.".to_string();
             return Ok(match coaching {
@@ -661,7 +690,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn grep_external_path_permission_rejects_authorized_root_replacement() {
+    async fn grep_external_path_permission_retains_authorized_root_on_replacement() {
         let container = TempDir::new("root-replacement");
         let workspace = container.path().join("workspace");
         let authorized = container.path().join("authorized");
@@ -690,9 +719,9 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(call, replace);
-        let error = result.expect_err("grep must reject a replaced traversal root");
-        assert!(error.to_string().contains("Path changed"));
-        assert!(!error.to_string().contains("must_not_be_returned"));
+        let output = result.expect("descriptor-bound grep must retain the authorized root");
+        assert!(output.contains("No matches found"));
+        assert!(!output.contains("must_not_be_returned"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -709,7 +738,7 @@ mod tests {
         let secret = "aba_unique_secret_marker";
         std::fs::write(replacement.join("secret.txt"), secret).unwrap();
 
-        let approved_metadata = crate::fs::checked_path_metadata(&authorized).unwrap();
+        let approved_metadata = std::fs::symlink_metadata(&authorized).unwrap();
         let bound = BoundDirectory::open(&authorized, &approved_metadata).unwrap();
         std::fs::rename(&authorized, &moved).unwrap();
         std::fs::rename(&replacement, &authorized).unwrap();

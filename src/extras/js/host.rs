@@ -227,6 +227,7 @@ enum PathPolicy {
 #[derive(Debug, Clone)]
 pub(crate) struct AllowConfig {
     base: PathBuf,
+    workspace_binding: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read: PathPolicy,
     write: PathPolicy,
     #[cfg(feature = "sandbox")]
@@ -251,6 +252,7 @@ impl AllowConfig {
         let Ok(base) = base else {
             return Self {
                 base: startup_base.to_path_buf(),
+                workspace_binding: None,
                 read: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Read)),
                 write: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Write)),
                 #[cfg(feature = "sandbox")]
@@ -262,9 +264,29 @@ impl AllowConfig {
             read: build_path_policy(&base, read_roots, read_unrestricted, FileAccess::Read),
             write: build_path_policy(&base, write_roots, write_unrestricted, FileAccess::Write),
             base,
+            workspace_binding: None,
             #[cfg(feature = "sandbox")]
             fetch: FetchPolicy::default(),
         }
+    }
+
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace_binding = Some(workspace);
+        self
+    }
+
+    fn effect_base(&self) -> PathBuf {
+        self.workspace_binding
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf())
+            .unwrap_or_else(|| self.base.clone())
+    }
+
+    fn workspace_binding(&self) -> Option<&std::sync::Arc<crate::paths::WorkspaceBinding>> {
+        self.workspace_binding.as_ref()
     }
 
     pub(crate) fn with_fetch_settings(self, origins: Option<&[String]>, allow_http: bool) -> Self {
@@ -300,6 +322,31 @@ impl AllowConfig {
             Err(reason) => return AuthorizationDecision::Denied(reason),
         };
         authorize_resolved(&self.write, resolved, FileAccess::Write)
+    }
+
+    fn authorize_bound(&self, relative: &Path, access: FileAccess) -> AuthorizationDecision {
+        let Some(workspace) = self.workspace_binding() else {
+            return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(access));
+        };
+        let target = match workspace.logical_relative_path(relative) {
+            Ok(target) => target,
+            Err(_) => {
+                return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(access));
+            }
+        };
+        let policy = match access {
+            FileAccess::Read => &self.read,
+            FileAccess::Write => &self.write,
+        };
+        authorize_resolved(policy, target, access)
+    }
+
+    fn authorize_bound_read(&self, relative: &Path) -> AuthorizationDecision {
+        self.authorize_bound(relative, FileAccess::Read)
+    }
+
+    fn authorize_bound_write(&self, relative: &Path) -> AuthorizationDecision {
+        self.authorize_bound(relative, FileAccess::Write)
     }
 }
 
@@ -2122,9 +2169,26 @@ pub(crate) struct FileEffectService {
     timeout: Duration,
 }
 
-struct PreparedReadEffect(ResolvedReadTarget);
+enum PreparedReadEffect {
+    Path(ResolvedReadTarget),
+    Bound {
+        relative: PathBuf,
+        file: std::fs::File,
+    },
+}
 
-struct PreparedWriteEffect(ResolvedWriteTarget);
+enum PreparedWriteEffect {
+    Path(ResolvedWriteTarget),
+    BoundCreate {
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+        relative: PathBuf,
+    },
+    BoundReplace {
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+        relative: PathBuf,
+        expected: std::fs::Metadata,
+    },
+}
 
 impl FileEffectService {
     pub(crate) fn new(
@@ -2155,7 +2219,37 @@ impl FileEffectService {
         bridge: PermissionBridge,
     ) -> Result<PreparedReadEffect, EffectServiceError> {
         let call = async {
-            let target = resolve_read_target(&self.allow_config.base, path).await?;
+            self.allow_config
+                .workspace_binding()
+                .map(|workspace| workspace.validate())
+                .transpose()
+                .map_err(|_| EffectServiceError::TargetChanged)?;
+            let relative = Path::new(path);
+            if !relative.is_absolute()
+                && !path.starts_with('~')
+                && let Some(workspace) = self.allow_config.workspace_binding()
+            {
+                let file = workspace.open_relative(relative).map_err(file_path_error)?;
+                if let AuthorizationDecision::Denied(reason) =
+                    self.allow_config.authorize_bound_read(relative)
+                {
+                    return Err(file_policy_service_error(reason));
+                }
+                let logical = workspace
+                    .logical_relative_path(relative)
+                    .map_err(file_path_error)?;
+                let permission_path = permission_path(&logical)?;
+                bridge
+                    .check_bound_path_async("js/read_file", &permission_path)
+                    .await
+                    .map_err(permission_service_error)?;
+                return Ok(PreparedReadEffect::Bound {
+                    relative: relative.to_path_buf(),
+                    file,
+                });
+            }
+            let effect_base = self.allow_config.effect_base();
+            let target = resolve_read_target(&effect_base, path).await?;
             if let AuthorizationDecision::Denied(reason) =
                 self.allow_config.authorize_read(&target.path)
             {
@@ -2166,7 +2260,7 @@ impl FileEffectService {
                 .check_path_async("js/read_file", &permission_path)
                 .await
                 .map_err(permission_service_error)?;
-            Ok(PreparedReadEffect(target))
+            Ok(PreparedReadEffect::Path(target))
         };
         tokio::select! {
             result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
@@ -2179,7 +2273,12 @@ impl FileEffectService {
         prepared: PreparedReadEffect,
         bridge: PermissionBridge,
     ) -> Result<String, EffectServiceError> {
-        let call = async { read_approved_file(prepared.0).await };
+        let call = async {
+            match prepared {
+                PreparedReadEffect::Path(target) => read_approved_file(target).await,
+                PreparedReadEffect::Bound { file, .. } => read_capability_file(file).await,
+            }
+        };
         tokio::select! {
             result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
             _ = bridge.cancelled() => Err(EffectServiceError::Cancelled),
@@ -2206,7 +2305,55 @@ impl FileEffectService {
         bridge: PermissionBridge,
     ) -> Result<PreparedWriteEffect, EffectServiceError> {
         let call = async {
-            let target = resolve_write_target(&self.allow_config.base, path).await?;
+            self.allow_config
+                .workspace_binding()
+                .map(|workspace| workspace.validate())
+                .transpose()
+                .map_err(|_| EffectServiceError::TargetChanged)?;
+            let relative = Path::new(path);
+            if !relative.is_absolute()
+                && !path.starts_with('~')
+                && let Some(workspace) = self.allow_config.workspace_binding()
+            {
+                if let AuthorizationDecision::Denied(reason) =
+                    self.allow_config.authorize_bound_write(relative)
+                {
+                    return Err(file_policy_service_error(reason));
+                }
+                let logical = workspace
+                    .logical_relative_path(relative)
+                    .map_err(file_path_error)?;
+                let permission_path = permission_path(&logical)?;
+                bridge
+                    .check_bound_path_async("js/write_file", &permission_path)
+                    .await
+                    .map_err(permission_service_error)?;
+                let workspace = workspace.clone();
+                let relative = relative.to_path_buf();
+                return match workspace.open_relative(&relative) {
+                    Ok(file) => Ok(PreparedWriteEffect::BoundReplace {
+                        workspace,
+                        relative,
+                        expected: file.metadata().map_err(file_path_error)?,
+                    }),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let parent = relative
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                            .unwrap_or_else(|| Path::new("."));
+                        workspace
+                            .open_dir_relative(parent)
+                            .map_err(file_path_error)?;
+                        Ok(PreparedWriteEffect::BoundCreate {
+                            workspace,
+                            relative,
+                        })
+                    }
+                    Err(error) => Err(file_path_error(error)),
+                };
+            }
+            let effect_base = self.allow_config.effect_base();
+            let target = resolve_write_target(&effect_base, path).await?;
             if let AuthorizationDecision::Denied(reason) =
                 self.allow_config.authorize_write(&target.path)
             {
@@ -2217,7 +2364,7 @@ impl FileEffectService {
                 .check_path_async("js/write_file", &permission_path)
                 .await
                 .map_err(permission_service_error)?;
-            Ok(PreparedWriteEffect(target))
+            Ok(PreparedWriteEffect::Path(target))
         };
         tokio::select! {
             result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
@@ -2231,14 +2378,63 @@ impl FileEffectService {
         content: String,
         bridge: PermissionBridge,
     ) -> Result<(), EffectServiceError> {
-        let write_cancellation = crate::fs::AtomicWriteCancellation::default();
-        let signal = write_cancellation.clone();
-        let call = async {
-            write_approved_file_cancellable(prepared.0, content, write_cancellation).await
-        };
-        await_mutating_effect_with_interrupt(&bridge, self.timeout, call, move || signal.cancel())
-            .await
+        match prepared {
+            PreparedWriteEffect::Path(target) => {
+                let write_cancellation = crate::fs::AtomicWriteCancellation::default();
+                let signal = write_cancellation.clone();
+                let call = async {
+                    write_approved_file_cancellable(target, content, write_cancellation).await
+                };
+                await_mutating_effect_with_interrupt(&bridge, self.timeout, call, move || {
+                    signal.cancel()
+                })
+                .await
+            }
+            PreparedWriteEffect::BoundCreate {
+                workspace,
+                relative,
+            } => {
+                let call = async move {
+                    workspace
+                        .create_relative_atomic(&relative, content.as_bytes())
+                        .map_err(file_path_error)
+                };
+                await_mutating_effect(&bridge, self.timeout, call).await
+            }
+            PreparedWriteEffect::BoundReplace {
+                workspace,
+                relative,
+                expected,
+            } => {
+                let call = async move {
+                    workspace
+                        .replace_relative_atomic(&relative, content.as_bytes(), &expected)
+                        .map_err(file_path_error)
+                };
+                await_mutating_effect(&bridge, self.timeout, call).await
+            }
+        }
     }
+}
+
+async fn read_capability_file(file: std::fs::File) -> Result<String, EffectServiceError> {
+    let metadata = file.metadata().map_err(file_path_error)?;
+    if !metadata.is_file() {
+        return Err(EffectServiceError::InvalidTarget);
+    }
+    if metadata.len() > READ_FILE_MAX_BYTES as u64 {
+        return Err(EffectServiceError::OutputLimit);
+    }
+    let file = tokio::fs::File::from_std(file);
+    let mut bytes = Vec::new();
+    file.take((READ_FILE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(file_path_error)?;
+    if bytes.len() > READ_FILE_MAX_BYTES {
+        return Err(EffectServiceError::OutputLimit);
+    }
+    String::from_utf8(bytes).map_err(|_| EffectServiceError::InvalidBody)
 }
 
 /// Waits for an operation whose first poll can cross a mutation boundary.
@@ -3292,10 +3488,35 @@ impl ParentEffectService for ParentHostEffectService {
             }
             match operation {
                 EffectOperation::ReadFile { path } => {
+                    self.file
+                        .allow_config
+                        .workspace_binding()
+                        .map(|workspace| workspace.validate())
+                        .transpose()
+                        .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
+                    let relative = Path::new(path);
+                    if !relative.is_absolute()
+                        && !path.starts_with('~')
+                        && let Some(workspace) = self.file.allow_config.workspace_binding()
+                    {
+                        let file = workspace.open_relative(relative).map_err(file_path_error)?;
+                        let logical = workspace
+                            .logical_relative_path(relative)
+                            .map_err(file_path_error)?;
+                        let workspace_relative =
+                            workspace_relative_path(workspace.root(), &logical)?;
+                        self.validated =
+                            Some(PreparedParentEffect::Read(PreparedReadEffect::Bound {
+                                relative: relative.to_path_buf(),
+                                file,
+                            }));
+                        return Ok(NormalizedTarget::ReadFile { workspace_relative });
+                    }
+                    let effect_base = self.file.allow_config.effect_base();
                     let target = tokio::select! {
                         result = timeout(
                             self.file.timeout,
-                            resolve_read_target(&self.file.allow_config.base, path),
+                            resolve_read_target(&effect_base, path),
                         ) => {
                             result.map_err(|_| HostEffectError::EffectTimedOut)?
                                 .map_err(HostEffectError::from)?
@@ -3304,16 +3525,64 @@ impl ParentEffectService for ParentHostEffectService {
                             return Err(HostEffectError::InvocationCancelled);
                         }
                     };
-                    let workspace_relative =
-                        workspace_relative_path(&self.file.allow_config.base, &target.path)?;
-                    self.validated = Some(PreparedParentEffect::Read(PreparedReadEffect(target)));
+                    let workspace_relative = workspace_relative_path(&effect_base, &target.path)?;
+                    self.validated =
+                        Some(PreparedParentEffect::Read(PreparedReadEffect::Path(target)));
                     Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
                 EffectOperation::WriteFile { path, content } => {
+                    self.file
+                        .allow_config
+                        .workspace_binding()
+                        .map(|workspace| workspace.validate())
+                        .transpose()
+                        .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
+                    let relative = Path::new(path);
+                    if !relative.is_absolute()
+                        && !path.starts_with('~')
+                        && let Some(workspace) = self.file.allow_config.workspace_binding()
+                    {
+                        let logical = workspace
+                            .logical_relative_path(relative)
+                            .map_err(file_path_error)?;
+                        let workspace_relative =
+                            workspace_relative_path(workspace.root(), &logical)?;
+                        let workspace = workspace.clone();
+                        let relative = relative.to_path_buf();
+                        let target = match workspace.open_relative(&relative) {
+                            Ok(file) => PreparedWriteEffect::BoundReplace {
+                                workspace,
+                                relative,
+                                expected: file.metadata().map_err(file_path_error)?,
+                            },
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                let parent = relative
+                                    .parent()
+                                    .filter(|parent| !parent.as_os_str().is_empty())
+                                    .unwrap_or_else(|| Path::new("."));
+                                workspace
+                                    .open_dir_relative(parent)
+                                    .map_err(file_path_error)?;
+                                PreparedWriteEffect::BoundCreate {
+                                    workspace,
+                                    relative,
+                                }
+                            }
+                            Err(error) => {
+                                return Err(HostEffectError::from(file_path_error(error)));
+                            }
+                        };
+                        self.validated = Some(PreparedParentEffect::Write {
+                            target,
+                            content: content.clone(),
+                        });
+                        return Ok(NormalizedTarget::WriteFile { workspace_relative });
+                    }
+                    let effect_base = self.file.allow_config.effect_base();
                     let target = tokio::select! {
                         result = timeout(
                             self.file.timeout,
-                            resolve_write_target(&self.file.allow_config.base, path),
+                            resolve_write_target(&effect_base, path),
                         ) => {
                             result.map_err(|_| HostEffectError::EffectTimedOut)?
                                 .map_err(HostEffectError::from)?
@@ -3322,10 +3591,9 @@ impl ParentEffectService for ParentHostEffectService {
                             return Err(HostEffectError::InvocationCancelled);
                         }
                     };
-                    let workspace_relative =
-                        workspace_relative_path(&self.file.allow_config.base, &target.path)?;
+                    let workspace_relative = workspace_relative_path(&effect_base, &target.path)?;
                     self.validated = Some(PreparedParentEffect::Write {
-                        target: PreparedWriteEffect(target),
+                        target: PreparedWriteEffect::Path(target),
                         content: content.clone(),
                     });
                     Ok(NormalizedTarget::WriteFile { workspace_relative })
@@ -3424,27 +3692,50 @@ impl ParentEffectService for ParentHostEffectService {
                 PreparedParentEffect::Read(target) => {
                     let bridge = self.file.permission_bridge.for_host_call(cancellation);
                     let call = async {
-                        if let AuthorizationDecision::Denied(reason) =
-                            self.file.allow_config.authorize_read(&target.0.path)
-                        {
-                            return Err(file_policy_service_error(reason));
+                        match &target {
+                            PreparedReadEffect::Path(target) => {
+                                if let AuthorizationDecision::Denied(reason) =
+                                    self.file.allow_config.authorize_read(&target.path)
+                                {
+                                    return Err(file_policy_service_error(reason));
+                                }
+                                let permission_path = permission_path(&target.path)?;
+                                bridge
+                                    .check_path_async("js/read_file", &permission_path)
+                                    .await
+                                    .map_err(permission_service_error)?;
+                                Ok::<_, EffectServiceError>(permission_path)
+                            }
+                            PreparedReadEffect::Bound { relative, .. } => {
+                                if let AuthorizationDecision::Denied(reason) =
+                                    self.file.allow_config.authorize_bound_read(relative)
+                                {
+                                    return Err(file_policy_service_error(reason));
+                                }
+                                let workspace = self
+                                    .file
+                                    .allow_config
+                                    .workspace_binding()
+                                    .ok_or(EffectServiceError::InvalidTarget)?;
+                                let logical = workspace
+                                    .logical_relative_path(relative)
+                                    .map_err(file_path_error)?;
+                                let permission_path = permission_path(&logical)?;
+                                bridge
+                                    .check_bound_path_async("js/read_file", &permission_path)
+                                    .await
+                                    .map_err(permission_service_error)?;
+                                Ok(permission_path)
+                            }
                         }
-                        let permission_path = permission_path(&target.0.path)?;
-                        bridge
-                            .check_path_async("js/read_file", &permission_path)
-                            .await
-                            .map_err(permission_service_error)?;
-                        Ok::<_, EffectServiceError>(())
                     };
-                    tokio::select! {
+                    let canonical_path = tokio::select! {
                         result = timeout(self.file.timeout, call) => {
                             result.map_err(|_| HostEffectError::EffectTimedOut)?
-                                .map_err(HostEffectError::from)?;
+                                .map_err(HostEffectError::from)?
                         }
                         _ = bridge.cancelled() => return Err(HostEffectError::InvocationCancelled),
-                    }
-                    let canonical_path =
-                        permission_path(&target.0.path).map_err(HostEffectError::from)?;
+                    };
                     (
                         PreparedParentEffect::Read(target),
                         AuthorizedTarget::ReadFile { canonical_path },
@@ -3453,27 +3744,51 @@ impl ParentEffectService for ParentHostEffectService {
                 PreparedParentEffect::Write { target, content } => {
                     let bridge = self.file.permission_bridge.for_host_call(cancellation);
                     let call = async {
-                        if let AuthorizationDecision::Denied(reason) =
-                            self.file.allow_config.authorize_write(&target.0.path)
-                        {
-                            return Err(file_policy_service_error(reason));
+                        match &target {
+                            PreparedWriteEffect::Path(target) => {
+                                if let AuthorizationDecision::Denied(reason) =
+                                    self.file.allow_config.authorize_write(&target.path)
+                                {
+                                    return Err(file_policy_service_error(reason));
+                                }
+                                let permission_path = permission_path(&target.path)?;
+                                bridge
+                                    .check_path_async("js/write_file", &permission_path)
+                                    .await
+                                    .map_err(permission_service_error)?;
+                                Ok::<_, EffectServiceError>(permission_path)
+                            }
+                            PreparedWriteEffect::BoundCreate { relative, .. }
+                            | PreparedWriteEffect::BoundReplace { relative, .. } => {
+                                if let AuthorizationDecision::Denied(reason) =
+                                    self.file.allow_config.authorize_bound_write(relative)
+                                {
+                                    return Err(file_policy_service_error(reason));
+                                }
+                                let workspace = self
+                                    .file
+                                    .allow_config
+                                    .workspace_binding()
+                                    .ok_or(EffectServiceError::InvalidTarget)?;
+                                let logical = workspace
+                                    .logical_relative_path(relative)
+                                    .map_err(file_path_error)?;
+                                let permission_path = permission_path(&logical)?;
+                                bridge
+                                    .check_bound_path_async("js/write_file", &permission_path)
+                                    .await
+                                    .map_err(permission_service_error)?;
+                                Ok(permission_path)
+                            }
                         }
-                        let permission_path = permission_path(&target.0.path)?;
-                        bridge
-                            .check_path_async("js/write_file", &permission_path)
-                            .await
-                            .map_err(permission_service_error)?;
-                        Ok::<_, EffectServiceError>(())
                     };
-                    tokio::select! {
+                    let canonical_path = tokio::select! {
                         result = timeout(self.file.timeout, call) => {
                             result.map_err(|_| HostEffectError::EffectTimedOut)?
-                                .map_err(HostEffectError::from)?;
+                                .map_err(HostEffectError::from)?
                         }
                         _ = bridge.cancelled() => return Err(HostEffectError::InvocationCancelled),
-                    }
-                    let canonical_path =
-                        permission_path(&target.0.path).map_err(HostEffectError::from)?;
+                    };
                     (
                         PreparedParentEffect::Write { target, content },
                         AuthorizedTarget::WriteFile { canonical_path },
@@ -6269,6 +6584,43 @@ mod tests {
             policy.authorize_read(&safe.join("..").join("safe-evil").join("secret.txt")),
             AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn js_bound_allow_identity_does_not_follow_a_swapped_workspace_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let workspace = temp.path().join("workspace");
+        let replacement = temp.path().join("replacement");
+        let retained = temp.path().join("workspace-retained");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(workspace.join("sentinel.txt"), "original").unwrap();
+        std::fs::write(replacement.join("sentinel.txt"), "replacement").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let replacement = replacement.canonicalize().unwrap();
+        let roots = vec![".".to_string()];
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
+        let policy =
+            AllowConfig::from_settings(&workspace, None, Some(&roots), Some(&roots), false, false)
+                .with_workspace_binding(binding);
+
+        std::fs::rename(&workspace, &retained).unwrap();
+        symlink(&replacement, &workspace).unwrap();
+        expect_denied(
+            policy.authorize_read(&workspace.join("sentinel.txt")),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+        assert_eq!(
+            expect_allowed(policy.authorize_bound_read(Path::new("sentinel.txt"))),
+            workspace.join("sentinel.txt"),
+            "capability-relative policy identity must remain the captured workspace"
+        );
+
+        std::fs::remove_file(&workspace).unwrap();
+        std::fs::rename(&retained, &workspace).unwrap();
     }
 
     #[test]
