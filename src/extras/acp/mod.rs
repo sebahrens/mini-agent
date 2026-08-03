@@ -20,7 +20,6 @@ use crate::cli::Cli;
 use crate::config::Config;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
-use crate::permission::SecurityMode;
 use crate::sandbox::Sandbox;
 
 const AGENT_VERSION: &str = "1.0.5";
@@ -429,6 +428,20 @@ async fn run_prompt(
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
+    workspace
+        .validate()
+        .map_err(|error| agent_client_protocol::Error::new(-32603, error))?;
+    let workspace_root = workspace.root();
+    let (authority, sandbox) =
+        crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg)
+            .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?;
+    let (permission, ask_tx) = crate::permission::build_noninteractive_permission_at(
+        &state.cfg,
+        authority,
+        Some(workspace_root.to_path_buf()),
+    );
+    let sandbox = sandbox.with_workspace_binding(workspace.clone());
+
     let provider_str = state.cli.resolve_provider(&state.cfg);
     let mut model_str = state.cli.resolve_model(&state.cfg);
 
@@ -456,24 +469,6 @@ async fn run_prompt(
     .map_err(|e| agent_client_protocol::Error::new(-32603, e.to_string()))?;
 
     let model = client.completion_model(model_str.to_string());
-
-    workspace
-        .validate()
-        .map_err(|error| agent_client_protocol::Error::new(-32603, error))?;
-    let workspace_root = workspace.root();
-    let mode = resolve_acp_mode(&state.cli, &state.cfg);
-    let (permission, ask_tx) = crate::permission::build_noninteractive_permission_at(
-        &state.cli,
-        &state.cfg,
-        mode,
-        Some(workspace_root.to_path_buf()),
-    );
-    let sandbox = Sandbox::new(
-        state.cli.resolve_sandbox(&state.cfg),
-        &state.cli.resolve_sandbox_backend(&state.cfg),
-    )
-    .with_shell(&state.cli.resolve_shell(&state.cfg))
-    .with_workspace_binding(workspace.clone());
 
     // Track session history for future context persistence
     let _extra_messages = {
@@ -638,29 +633,6 @@ async fn run_prompt(
 
     let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
     Ok(())
-}
-
-pub(crate) fn resolve_acp_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
-    if cli.dangerously_skip_permissions {
-        SecurityMode::Standard
-    } else if cli.yolo || cfg.yolo.unwrap_or(false) {
-        SecurityMode::Yolo
-    } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
-        SecurityMode::Standard
-    } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
-        SecurityMode::Restrictive
-    } else if let Some(m) = &cfg.default_permission_mode {
-        match m.as_str() {
-            "yolo" => SecurityMode::Yolo,
-            "accept" | "standard" => SecurityMode::Standard,
-            "guarded" => SecurityMode::Guarded,
-            "readonly" => SecurityMode::ReadOnly,
-            "restrictive" => SecurityMode::Restrictive,
-            _ => SecurityMode::Standard,
-        }
-    } else {
-        SecurityMode::Standard
-    }
 }
 
 #[cfg(test)]
@@ -925,10 +897,11 @@ mod workspace_tests {
         let (_container, first, second) = roots();
         let cli = Cli::default();
         let cfg = Config::default();
+        let (authority, _) =
+            crate::permission::resolve_configured_execution_authority(&cli, &cfg).unwrap();
         let (permission, ask_tx) = crate::permission::build_noninteractive_permission_at(
-            &cli,
             &cfg,
-            SecurityMode::Standard,
+            authority,
             Some(first.clone()),
         );
         let tool = ReadTool::new(permission, ask_tx, None, 100).with_workspace_root(first.clone());
