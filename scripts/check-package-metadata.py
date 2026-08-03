@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,105 @@ RELEASE_TAG_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+FULL_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+VERSION_COMMENT = re.compile(r"^v\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?$")
+# Remote actions may only bypass immutable pins after an explicit, reviewed entry here.
+RELEASE_ACTION_PIN_ALLOWLIST: frozenset[str] = frozenset()
+APPROVED_RELEASE_ACTIONS = {
+    ("actions/checkout", "v7.0.1"): "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    (
+        "actions-rust-lang/setup-rust-toolchain",
+        "v1.17.0",
+    ): "166cdcfd11aee3cb47222f9ddb555ce30ddb9659",
+    (
+        "taiki-e/install-action",
+        "v2.84.1",
+    ): "c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd",
+    (
+        "actions/upload-artifact",
+        "v4.6.2",
+    ): "ea165f8d65b6e75b540449e92b4886f43607fa02",
+    (
+        "actions/download-artifact",
+        "v4.3.0",
+    ): "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+}
+USES_ENTRY = re.compile(
+    r"(?P<quote>['\"]?)(?P<reference>[^\s#'\"]+)(?P=quote)"
+    r"(?:\s+#\s*(?P<version>\S+))?"
+)
+RUBY_YAML_TO_JSON = """
+require "json"
+require "yaml"
+document = YAML.safe_load(STDIN.read, aliases: false)
+STDOUT.write(JSON.generate(document))
+"""
+RUBY_YAML_USES_TO_JSON = """
+require "json"
+require "psych"
+entries = []
+errors = []
+walk = lambda do |node|
+  if node.is_a?(Psych::Nodes::Mapping)
+    node.children.each_slice(2) do |key, value|
+      if key.is_a?(Psych::Nodes::Scalar) && key.value == "uses"
+        if value.is_a?(Psych::Nodes::Scalar)
+          entries << {"reference" => value.value, "line" => key.start_line + 1}
+        else
+          errors << "release workflow has a non-string uses value"
+        end
+      end
+      walk.call(key)
+      walk.call(value)
+    end
+  elsif node.respond_to?(:children) && node.children
+    node.children.each { |child| walk.call(child) }
+  end
+end
+walk.call(Psych.parse_stream(STDIN.read))
+STDOUT.write(JSON.generate({"entries" => entries, "errors" => errors}))
+"""
+
+
+def parse_yaml_document(text: str) -> Any:
+    """Parse YAML with Ruby's standard Psych parser and return JSON-compatible data."""
+
+    result = subprocess.run(
+        ["ruby", "--disable-gems", "-e", RUBY_YAML_TO_JSON],
+        input=text,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()
+        message = detail[-1] if detail else "unknown parser failure"
+        raise ValueError(f"YAML parsing failed: {message}")
+    return json.loads(result.stdout)
+
+
+def parse_yaml_uses_entries(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Collect every uses node with its exact one-based YAML source line."""
+
+    result = subprocess.run(
+        ["ruby", "--disable-gems", "-e", RUBY_YAML_USES_TO_JSON],
+        input=text,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()
+        message = detail[-1] if detail else "unknown parser failure"
+        raise ValueError(f"YAML source parsing failed: {message}")
+    parsed = json.loads(result.stdout)
+    if not isinstance(parsed, dict):
+        raise ValueError("YAML source parser returned an invalid document")
+    entries = parsed.get("entries")
+    errors = parsed.get("errors")
+    if not isinstance(entries, list) or not isinstance(errors, list):
+        raise ValueError("YAML source parser returned invalid uses metadata")
+    return entries, errors
 
 
 def cargo_metadata(root: Path) -> dict[str, Any]:
@@ -168,6 +268,7 @@ def validate_workflow(text: str, binary: str) -> list[str]:
                 ".github/workflows/release.yml must not reference "
                 f"noncanonical binary path {fragment!r}"
             )
+    errors.extend(validate_release_action_pins(text))
     return errors
 
 
@@ -191,6 +292,148 @@ def validate_release_identity(
             f"{version!r} (expected {expected_tag!r})"
         )
     return errors
+
+
+def validate_release_action_pins(
+    text: str,
+    *,
+    allowlist: frozenset[str] = RELEASE_ACTION_PIN_ALLOWLIST,
+) -> list[str]:
+    """Require immutable SHAs and visible versions for release dependencies."""
+
+    try:
+        # Reject aliases and unsafe YAML types, then use the AST for exact source locations.
+        parse_yaml_document(text)
+        parsed_entries, errors = parse_yaml_uses_entries(text)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:
+        return [f"release workflow cannot be validated: {error}"]
+
+    canonical_entries: dict[int, str] = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        key_match = re.match(
+            r"^\s*(?:-\s+)?(?:uses|['\"]uses['\"])\s*:\s*(.*?)\s*$", line
+        )
+        if key_match is None:
+            continue
+
+        entry_match = USES_ENTRY.fullmatch(key_match.group(1))
+        if entry_match is None:
+            errors.append(
+                f"release workflow line {line_number} has malformed uses entry"
+            )
+            continue
+
+        reference = entry_match.group("reference")
+        version = entry_match.group("version")
+        canonical_entries[line_number] = reference
+        if reference in allowlist:
+            continue
+
+        action, separator, revision = reference.rpartition("@")
+        if not separator:
+            errors.append(
+                f"release workflow line {line_number} has malformed action reference "
+                f"{reference!r}"
+            )
+            continue
+        if action in allowlist:
+            continue
+        revision_is_sha = FULL_COMMIT_SHA.fullmatch(revision) is not None
+        if not revision_is_sha:
+            errors.append(
+                f"release workflow line {line_number} must pin {action!r} to a full "
+                "40-character lowercase commit SHA"
+            )
+        version_is_valid = (
+            version is not None and VERSION_COMMENT.fullmatch(version) is not None
+        )
+        if not version_is_valid:
+            errors.append(
+                f"release workflow line {line_number} must give {action!r} a version "
+                "comment such as '# v4.6.2'"
+            )
+        if revision_is_sha and version_is_valid:
+            approved = APPROVED_RELEASE_ACTIONS.get((action, version))
+            if approved is None:
+                errors.append(
+                    f"release workflow line {line_number} uses unapproved action/version "
+                    f"pair {action}@{version}"
+                )
+            elif revision != approved:
+                errors.append(
+                    f"release workflow line {line_number} SHA for {action}@{version} "
+                    "does not match the reviewed approval map"
+                )
+
+    parsed_lines: set[int] = set()
+    for entry in parsed_entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("reference"), str)
+            or type(entry.get("line")) is not int
+        ):
+            errors.append("release workflow parser returned invalid uses source metadata")
+            continue
+        reference = entry["reference"]
+        line_number = entry["line"]
+        parsed_lines.add(line_number)
+        if canonical_entries.get(line_number) != reference:
+            errors.append(
+                f"release workflow line {line_number} uses {reference!r} without a "
+                "canonical block-style source line and version comment"
+            )
+    for line_number, reference in canonical_entries.items():
+        if line_number not in parsed_lines:
+            errors.append(
+                f"release workflow line {line_number} text for {reference!r} is not an "
+                "executable YAML uses node"
+            )
+    return errors
+
+
+def validate_github_actions_updates(text: str) -> list[str]:
+    """Keep Dependabot able to move action SHAs and version comments together."""
+
+    try:
+        document = parse_yaml_document(text)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:
+        return [f".github/dependabot.yml cannot be validated: {error}"]
+    if not isinstance(document, dict) or not isinstance(document.get("updates"), list):
+        return [".github/dependabot.yml must contain an updates list"]
+
+    for entry in document["updates"]:
+        if not isinstance(entry, dict) or entry.get("package-ecosystem") != "github-actions":
+            continue
+        schedule = entry.get("schedule")
+        limit = entry.get("open-pull-requests-limit", 5)
+        ignores = entry.get("ignore", [])
+        approved_actions = {action for action, _version in APPROVED_RELEASE_ACTIONS}
+        ignored_actions: set[str] = set()
+        if isinstance(ignores, list):
+            for rule in ignores:
+                if not isinstance(rule, dict):
+                    continue
+                pattern = rule.get("dependency-name")
+                if isinstance(pattern, str):
+                    ignored_actions.update(
+                        action
+                        for action in approved_actions
+                        if fnmatchcase(action, pattern)
+                    )
+        ignores_all = approved_actions <= ignored_actions
+        if (
+            entry.get("directory") == "/"
+            and isinstance(schedule, dict)
+            and schedule.get("interval") in {"daily", "weekly", "monthly"}
+            and type(limit) is int
+            and limit > 0
+            and not ignores_all
+        ):
+            return []
+    return [
+        ".github/dependabot.yml must schedule nonzero, non-ignored github-actions "
+        "updates at repository directory /"
+    ]
 
 
 def validate_file_fragments(root: Path, binary: str) -> list[str]:
@@ -328,6 +571,15 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
     else:
         errors.extend(
             validate_workflow(workflow_path.read_text(encoding="utf-8"), binary)
+        )
+    dependabot_path = root / ".github/dependabot.yml"
+    if not dependabot_path.is_file():
+        errors.append(".github/dependabot.yml is missing")
+    else:
+        errors.extend(
+            validate_github_actions_updates(
+                dependabot_path.read_text(encoding="utf-8")
+            )
         )
     errors.extend(validate_file_fragments(root, binary))
 

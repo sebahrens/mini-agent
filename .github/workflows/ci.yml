@@ -47,6 +47,12 @@ jobs:
       - name: Test Phase 6 cross-platform CI gate
         run: python3 -m unittest scripts.tests.test_phase6_ci_workflow
 
+      - name: Test release workflow policy
+        run: python3 -m unittest scripts.tests.test_check_package_metadata
+
+      - name: Verify release workflow policy
+        run: python3 scripts/check-package-metadata.py
+
       - name: Verify Cargo feature graph
         run: python3 scripts/check_feature_graph.py
 

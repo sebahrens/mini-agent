@@ -20,6 +20,24 @@ named `mini-agent-<target>.tar.gz`; lite archives are named
 - `cargo publish` access — run `cargo login` once to authenticate with crates.io
 - `gh` CLI (only needed for `post-release` checksum downloads)
 - `makepkg` (only needed for AUR `.SRCINFO` regeneration)
+- Ruby with its standard Psych YAML parser (used by the release workflow policy check)
+
+## Release workflow dependency pins
+
+Every remote action in `.github/workflows/release.yml` is pinned to an immutable, reviewed
+40-character commit SHA and carries its human-readable version in a trailing comment. Dependabot's
+root `github-actions` updater advances the SHA and version comment together. The offline
+`APPROVED_RELEASE_ACTIONS` map in `scripts/check-package-metadata.py` then requires a maintainer to
+record the reviewed action, version, and SHA triple before the update can pass CI. Before changing
+an action manually, verify that the proposed version tag resolves to the pinned commit and review
+the upstream commit; never copy an unverified SHA from an issue or pull request.
+
+The package metadata policy enforces both the release pins and the Dependabot configuration:
+
+```bash
+python3 -m unittest scripts.tests.test_check_package_metadata
+python3 scripts/check-package-metadata.py
+```
 
 ## Quick start
 
