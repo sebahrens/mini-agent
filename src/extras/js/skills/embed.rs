@@ -946,15 +946,16 @@ impl Embedder {
         // join failures onto the cancellation/panic error classes.
         let backend = Arc::clone(&self.backend);
         let owned_query = normalized_query.to_string();
-        let embedding = tokio::task::spawn_blocking(move || backend.embed_query(&owned_query))
-            .await
-            .map_err(|join_error| {
-                if join_error.is_cancelled() {
-                    EmbeddingError::Cancelled
-                } else {
-                    EmbeddingError::WorkerPanic
-                }
-            })??;
+        let embedding =
+            crate::agent::runner::spawn_blocking_scoped(move || backend.embed_query(&owned_query))
+                .await
+                .map_err(|join_error| {
+                    if join_error.is_cancelled() {
+                        EmbeddingError::Cancelled
+                    } else {
+                        EmbeddingError::WorkerPanic
+                    }
+                })??;
 
         // Validate
         if embedding.len() != self.metadata.dimensions {

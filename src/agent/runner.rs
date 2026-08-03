@@ -8,6 +8,9 @@ use rig::completion::{CompletionModel, Message};
 use rig::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 use crate::event::{AgentEvent, BtwEvent};
@@ -22,6 +25,304 @@ pub struct AgentRunner {
     /// interrupted run keeps driving its stream — and therefore keeps executing
     /// tools (edit/write/bash) — invisibly. Aborting stops it for real.
     pub abort_handle: tokio::task::AbortHandle,
+}
+
+tokio::task_local! {
+    static AGENT_WORK_SCOPE: Arc<AgentWorkScope>;
+}
+
+/// Tracks child work which can outlive the future that started it (notably
+/// `spawn_blocking`). ACP cancellation signals the scope, drops provider/tool
+/// polling, and waits for every registered child before closing the event
+/// channel and returning `Cancelled`.
+pub(crate) struct AgentWorkScope {
+    cancelled: AtomicBool,
+    active_children: AtomicUsize,
+    cancellation: Notify,
+    idle: Notify,
+    #[cfg(test)]
+    blocking_gate: Option<Arc<BlockingTestGate>>,
+}
+
+impl AgentWorkScope {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            active_children: AtomicUsize::new(0),
+            cancellation: Notify::new(),
+            idle: Notify::new(),
+            #[cfg(test)]
+            blocking_gate: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_blocking_test_gate() -> (
+        Arc<Self>,
+        std::sync::mpsc::Receiver<()>,
+        BlockingTestRelease,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate = Arc::new(BlockingTestGate {
+            started_tx,
+            released: Arc::clone(&released),
+        });
+        (
+            Arc::new(Self {
+                cancelled: AtomicBool::new(false),
+                active_children: AtomicUsize::new(0),
+                cancellation: Notify::new(),
+                idle: Notify::new(),
+                blocking_gate: Some(gate),
+            }),
+            started_rx,
+            BlockingTestRelease(released),
+        )
+    }
+
+    pub(crate) async fn run<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
+        AGENT_WORK_SCOPE.scope(Arc::clone(self), future).await
+    }
+
+    pub(crate) fn cancellation_handle(self: &Arc<Self>) -> AgentWorkCancellation {
+        AgentWorkCancellation {
+            scope: Arc::clone(self),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.cancellation.notify_waiters();
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_children(&self) -> usize {
+        self.active_children.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.cancellation.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.active_children.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn register(self: &Arc<Self>) -> AgentWorkGuard {
+        self.active_children.fetch_add(1, Ordering::AcqRel);
+        AgentWorkGuard {
+            scope: Arc::clone(self),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentWorkCancellation {
+    scope: Arc<AgentWorkScope>,
+}
+
+impl AgentWorkCancellation {
+    pub(crate) fn cancel(&self) {
+        self.scope.cancel();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.scope.is_cancelled()
+    }
+}
+
+pub(crate) struct AgentWorkGuard {
+    scope: Arc<AgentWorkScope>,
+}
+
+/// Keeps the runner event channel open through hard task abortion. Dropping
+/// the outer Tokio future signals cancellation synchronously, then transfers
+/// scope settlement and the lifecycle sender to an independent waiter.
+pub(crate) struct AgentRunCleanupGuard {
+    scope: Arc<AgentWorkScope>,
+    lifecycle_tx: Option<mpsc::Sender<AgentEvent>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl AgentRunCleanupGuard {
+    pub(crate) fn new(scope: Arc<AgentWorkScope>, lifecycle_tx: mpsc::Sender<AgentEvent>) -> Self {
+        Self {
+            scope,
+            lifecycle_tx: Some(lifecycle_tx),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    pub(crate) async fn settle(mut self) {
+        self.scope.cancellation_handle().cancel();
+        self.scope.wait_idle().await;
+        self.lifecycle_tx.take();
+    }
+}
+
+impl Drop for AgentRunCleanupGuard {
+    fn drop(&mut self) {
+        let Some(lifecycle_tx) = self.lifecycle_tx.take() else {
+            return;
+        };
+        self.scope.cancellation_handle().cancel();
+        let scope = Arc::clone(&self.scope);
+        std::mem::drop(self.runtime.spawn(async move {
+            scope.wait_idle().await;
+            drop(lifecycle_tx);
+        }));
+    }
+}
+
+#[cfg(test)]
+struct BlockingTestGate {
+    started_tx: std::sync::mpsc::Sender<()>,
+    released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+pub(crate) struct BlockingTestRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+#[cfg(test)]
+impl BlockingTestRelease {
+    pub(crate) fn release(&self) {
+        let (released, wake) = &*self.0;
+        *released.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        wake.notify_all();
+    }
+}
+
+impl Drop for AgentWorkGuard {
+    fn drop(&mut self) {
+        if self.scope.active_children.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.scope.idle.notify_waiters();
+        }
+    }
+}
+
+pub(crate) fn spawn_blocking_scoped<F, R>(operation: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    spawn_blocking_scoped_on(&tokio::runtime::Handle::current(), operation)
+}
+
+/// Spawns asynchronous lifecycle work owned by the current agent turn. Outside
+/// an agent scope this preserves ordinary Tokio spawn semantics.
+pub(crate) fn spawn_async_scoped<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    if let Ok(scope) = AGENT_WORK_SCOPE.try_with(Arc::clone) {
+        let guard = scope.register();
+        tokio::spawn(async move {
+            let _guard = guard;
+            scope.run(future).await
+        })
+    } else {
+        tokio::spawn(future)
+    }
+}
+
+#[cfg(feature = "skills")]
+pub(crate) fn current_work_guard() -> Option<AgentWorkGuard> {
+    AGENT_WORK_SCOPE.try_with(|scope| scope.register()).ok()
+}
+
+pub(crate) fn spawn_blocking_scoped_on<F, R>(
+    runtime: &tokio::runtime::Handle,
+    operation: F,
+) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let scoped = AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            (
+                scope.register(),
+                #[cfg(test)]
+                scope.blocking_gate.clone(),
+            )
+        })
+        .ok();
+    runtime.spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some((_, Some(gate))) = &scoped {
+            let _ = gate.started_tx.send(());
+            let (released, wake) = &*gate.released;
+            let mut released = released.lock().unwrap_or_else(|error| error.into_inner());
+            while !*released {
+                released = wake
+                    .wait(released)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+        let _guard = scoped;
+        operation()
+    })
+}
+
+#[cfg(any(feature = "hooks", test))]
+pub(crate) async fn current_work_scope_cancelled() {
+    let scope = AGENT_WORK_SCOPE.try_with(Arc::clone).ok();
+    match scope {
+        Some(scope) => scope.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+pub(crate) struct PausedAgentRunner {
+    runner: AgentRunner,
+    start_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    work_scope: Arc<AgentWorkScope>,
+}
+
+impl PausedAgentRunner {
+    pub(crate) fn new(
+        runner: AgentRunner,
+        start_tx: tokio::sync::oneshot::Sender<()>,
+        work_scope: Arc<AgentWorkScope>,
+    ) -> Self {
+        Self {
+            runner,
+            start_tx: Some(start_tx),
+            work_scope,
+        }
+    }
+
+    /// The caller publishes this handle before releasing the start barrier.
+    pub(crate) fn cancellation_handle(&self) -> AgentWorkCancellation {
+        self.work_scope.cancellation_handle()
+    }
+
+    pub(crate) fn start(mut self) -> AgentRunner {
+        if let Some(start_tx) = self.start_tx.take() {
+            let _ = start_tx.send(());
+        }
+        self.runner
+    }
 }
 
 /// Handle to an in-flight `/btw` side-question task. The `abort_handle` lets the
@@ -521,6 +822,7 @@ only if the user's question is about what the main assistant is doing.)",
     snapshot
 }
 
+#[cfg(test)]
 pub fn spawn_agent<M>(
     agent: Agent<M>,
     prompt: String,
@@ -537,7 +839,8 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
-    spawn_agent_with_stream_policy(
+    let work_scope = AgentWorkScope::new();
+    spawn_agent_with_start_mode(
         agent,
         prompt,
         history,
@@ -547,9 +850,72 @@ where
         turn_guard,
         #[cfg(feature = "hooks")]
         loop_info,
+        false,
+        work_scope,
+    )
+    .0
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_agent_paused<M>(
+    agent: Agent<M>,
+    prompt: String,
+    history: Vec<Message>,
+    retry_config: RetryConfig,
+    #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+) -> PausedAgentRunner
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    spawn_agent_paused_in_scope(
+        agent,
+        prompt,
+        history,
+        retry_config,
+        #[cfg(feature = "skills")]
+        turn_guard,
+        #[cfg(feature = "hooks")]
+        loop_info,
+        AgentWorkScope::new(),
     )
 }
 
+pub(crate) fn spawn_agent_paused_in_scope<M>(
+    agent: Agent<M>,
+    prompt: String,
+    history: Vec<Message>,
+    retry_config: RetryConfig,
+    #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    work_scope: Arc<AgentWorkScope>,
+) -> PausedAgentRunner
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    let (runner, start_tx) = spawn_agent_with_start_mode(
+        agent,
+        prompt,
+        history,
+        retry_config,
+        RunnerStreamPolicy::default(),
+        #[cfg(feature = "skills")]
+        turn_guard,
+        #[cfg(feature = "hooks")]
+        loop_info,
+        true,
+        Arc::clone(&work_scope),
+    );
+    PausedAgentRunner::new(
+        runner,
+        start_tx.expect("paused agent runner must have a start sender"),
+        work_scope,
+    )
+}
+
+#[cfg(test)]
 fn spawn_agent_with_stream_policy<M>(
     agent: Agent<M>,
     prompt: String,
@@ -563,12 +929,56 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let work_scope = AgentWorkScope::new();
+    spawn_agent_with_start_mode(
+        agent,
+        prompt,
+        history,
+        retry_config,
+        stream_policy,
+        #[cfg(feature = "skills")]
+        turn_guard,
+        #[cfg(feature = "hooks")]
+        loop_info,
+        false,
+        work_scope,
+    )
+    .0
+}
+
+fn spawn_agent_with_start_mode<M>(
+    agent: Agent<M>,
+    prompt: String,
+    history: Vec<Message>,
+    retry_config: RetryConfig,
+    stream_policy: RunnerStreamPolicy,
+    #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    start_paused: bool,
+    work_scope: Arc<AgentWorkScope>,
+) -> (AgentRunner, Option<tokio::sync::oneshot::Sender<()>>)
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
+    let runner_lifecycle_tx = event_tx.clone();
+    let (start_tx, start_rx) = if start_paused {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
     #[cfg(feature = "subagents")]
     let subagent_event_tx = event_tx.clone();
 
     let agent_future = async move {
+        if let Some(start_rx) = start_rx
+            && start_rx.await.is_err()
+        {
+            return;
+        }
         #[cfg(feature = "skills")]
         let _turn_guard = turn_guard;
         tracing::debug!(
@@ -933,16 +1343,39 @@ where
         }
     };
 
+    let task_scope = Arc::clone(&work_scope);
+    // Construct before spawning so abort-before-first-poll still drops the
+    // guard and transfers cleanup ownership.
+    let cleanup = AgentRunCleanupGuard::new(Arc::clone(&task_scope), runner_lifecycle_tx);
+    let agent_future = async move {
+        let cancellation_scope = Arc::clone(&task_scope);
+        task_scope
+            .run(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancellation_scope.cancelled() => {}
+                    _ = agent_future => {}
+                }
+            })
+            .await;
+        // A successful terminal event is also a settlement boundary. This
+        // stops async:true hooks without waiting for their declared timeout.
+        cleanup.settle().await;
+    };
+
     #[cfg(feature = "subagents")]
     let agent_future =
         crate::extras::subagents::scope_subagent_event_tx(subagent_event_tx, agent_future);
 
     let join = tokio::spawn(agent_future);
 
-    AgentRunner {
-        event_rx,
-        abort_handle: join.abort_handle(),
-    }
+    (
+        AgentRunner {
+            event_rx,
+            abort_handle: join.abort_handle(),
+        },
+        start_tx,
+    )
 }
 
 /// Headless (`-p`, `--loop`) counterpart to [`spawn_agent`]'s turn loop.
@@ -1359,6 +1792,38 @@ mod tests {
 
     struct RetryInvalidTool;
 
+    #[tokio::test]
+    async fn paused_runner_publishes_abort_before_model_work_can_start() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let paused = super::spawn_agent_paused(
+            AgentBuilder::new(model.clone()).build(),
+            "start only after publication".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            model.requests().is_empty(),
+            "the model must remain unreachable behind the start barrier"
+        );
+
+        let cancellation = paused.cancellation_handle();
+        cancellation.cancel();
+        let mut runner = paused.start();
+        assert!(runner.event_rx.recv().await.is_none());
+        assert!(
+            model.requests().is_empty(),
+            "aborting before start must never enter provider work"
+        );
+    }
+
     impl<M: CompletionModel> AgentHook<M> for RetryInvalidTool {
         async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
             if matches!(event, StepEvent::InvalidToolCall(_)) {
@@ -1409,6 +1874,30 @@ mod tests {
     #[derive(Clone)]
     struct CountingTool(Arc<AtomicUsize>);
 
+    #[derive(Clone)]
+    struct ScopedBlockingTool;
+
+    impl Tool for ScopedBlockingTool {
+        const NAME: &'static str = "scoped_blocking";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Run owned blocking work".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            super::spawn_blocking_scoped(|| "blocking-complete".to_string())
+                .await
+                .map_err(|_| MockToolError)
+        }
+    }
+
     impl Tool for CountingTool {
         const NAME: &'static str = "count";
         type Error = MockToolError;
@@ -1427,6 +1916,187 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("counted".to_string())
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_reaps_actual_agent_builder_blocking_tool_before_channel_close() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::tool_call(
+                "blocking-call",
+                ScopedBlockingTool::NAME,
+                serde_json::json!({}),
+            ),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model)
+            .tool(ScopedBlockingTool)
+            .default_max_turns(2)
+            .build();
+        let (work_scope, started_rx, release) =
+            super::AgentWorkScope::new_with_blocking_test_gate();
+        let paused = super::spawn_agent_paused_in_scope(
+            agent,
+            "invoke the blocking tool".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+            work_scope,
+        );
+        let cancellation = paused.cancellation_handle();
+        let mut runner = paused.start();
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("the Rig tool should enter owned blocking work")
+        })
+        .await
+        .unwrap();
+
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), async {
+                while runner.event_rx.recv().await.is_some() {}
+            })
+            .await
+            .is_err(),
+            "the event channel must remain open while blocking tool work is live"
+        );
+
+        release.release();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while runner.event_rx.recv().await.is_some() {}
+        })
+        .await
+        .expect("the event channel should close after blocking tool work is reaped");
+    }
+
+    #[cfg(all(feature = "hooks", unix))]
+    #[tokio::test]
+    async fn abort_handle_reaps_configured_async_hook_before_channel_close() {
+        use crate::extras::hooks::dispatcher::HookDispatcher;
+        use crate::extras::hooks::settings::{HookGroup, HookHandler, HooksConfig};
+
+        let directory =
+            std::env::temp_dir().join(format!("mini-agent-abort-hook-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let pid_file = directory.join("hook.pid");
+        let mut config = HooksConfig::new();
+        config.insert(
+            "UserPromptSubmit".to_owned(),
+            vec![HookGroup {
+                matcher: None,
+                hooks: vec![HookHandler {
+                    kind: "command".to_owned(),
+                    command: Some("/bin/sh".to_owned()),
+                    args: Some(vec![
+                        "-c".to_owned(),
+                        "printf '%s' \"$$\" > \"$1\"; while :; do sleep 1; done".to_owned(),
+                        "abort-hook".to_owned(),
+                        pid_file.display().to_string(),
+                    ]),
+                    timeout: Some(60),
+                    is_async: true,
+                    condition: None,
+                    once: false,
+                }],
+            }],
+        );
+        let dispatcher = HookDispatcher::from_config(&config).unwrap();
+        let ctx = crate::extras::hooks::HookCtx {
+            session_id: "abort-handle-test".to_owned(),
+            session_path: String::new(),
+            cwd: directory.display().to_string(),
+            permission_mode: "deny".to_owned(),
+        };
+        let (work_scope, started_rx, release) =
+            super::AgentWorkScope::new_with_blocking_test_gate();
+        let gate = work_scope
+            .run(crate::extras::hooks::gate_user_prompt(
+                &dispatcher,
+                &ctx,
+                "run blocking tool".to_owned(),
+            ))
+            .await;
+        assert!(matches!(gate, crate::extras::hooks::PromptGate::Proceed(_)));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !pid_file.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("configured async hook should start");
+        let hook_pid = std::fs::read_to_string(&pid_file).unwrap();
+
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::tool_call(
+                "blocking-call",
+                ScopedBlockingTool::NAME,
+                serde_json::json!({}),
+            ),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model)
+            .tool(ScopedBlockingTool)
+            .default_max_turns(2)
+            .build();
+        let paused = super::spawn_agent_paused_in_scope(
+            agent,
+            "invoke blocking tool".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+            Arc::clone(&work_scope),
+        );
+        let mut runner = paused.start();
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("runner should enter scoped blocking tool work");
+        })
+        .await
+        .unwrap();
+
+        runner.abort_handle.abort();
+        let closed_early = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            while runner.event_rx.recv().await.is_some() {}
+        })
+        .await
+        .is_ok();
+        release.release();
+        if closed_early {
+            // Keep the regression failure hygienic under the old behavior.
+            work_scope.cancellation_handle().cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), work_scope.wait_idle())
+                .await;
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while runner.event_rx.recv().await.is_some() {}
+            })
+            .await
+            .expect("event channel should close after hard-abort cleanup");
+        }
+
+        let hook_is_live = std::process::Command::new("kill")
+            .args(["-0", hook_pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let _ = std::fs::remove_dir_all(directory);
+        assert!(
+            !closed_early,
+            "AbortHandle must keep the event channel open through owned cleanup"
+        );
+        assert!(
+            !hook_is_live,
+            "hard-abort settlement left the hook process live"
+        );
     }
 
     #[test]

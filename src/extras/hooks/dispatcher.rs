@@ -267,7 +267,6 @@ impl HookDispatcher {
     ) -> Vec<HookOutput> {
         let stdin = serde_json::to_vec(envelope).unwrap_or_default();
         let mut futures = Vec::new();
-        let mut async_handles = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
                 continue;
@@ -280,60 +279,82 @@ impl HookDispatcher {
                 }
             }
 
-            if let Some(condition) = &handler.condition {
-                let cond_timeout =
-                    std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
-                let cond_output =
-                    run_shell_condition(condition, &stdin, cond_timeout, project_dir).await;
-                match cond_output.status {
-                    HookStatus::TimedOut => {
-                        tracing::warn!(
-                            "hooks: `if` condition for {command:?} timed out; failing closed (running the handler)"
-                        );
-                    }
-                    HookStatus::OutputLimitExceeded(limit) => {
-                        tracing::warn!(
-                            "hooks: `if` condition for {command:?} exceeded its {limit:?} output limit; failing closed (running the handler)"
-                        );
-                    }
-                    HookStatus::Completed | HookStatus::Failed => match cond_output.exit_code {
-                        Some(0) => {}
-                        Some(_) => continue,
-                        None => {
-                            tracing::warn!(
-                                "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
-                            );
-                        }
-                    },
-                }
-            }
-
             let timeout =
                 std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
             let stdin = stdin.clone();
             let project_dir = project_dir.to_string();
             let args = handler.args.clone();
             if handler.is_async {
-                async_handles.push(tokio::spawn(async move {
-                    let _ =
-                        run_hook(&command, args.as_deref(), &stdin, timeout, &project_dir).await;
+                let condition = handler.condition.clone();
+                std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
+                    if condition_allows(
+                        &command,
+                        condition.as_deref(),
+                        &stdin,
+                        timeout,
+                        &project_dir,
+                    )
+                    .await
+                    {
+                        let _ = run_hook(&command, args.as_deref(), &stdin, timeout, &project_dir)
+                            .await;
+                    }
                 }));
             } else {
+                if !condition_allows(
+                    &command,
+                    handler.condition.as_deref(),
+                    &stdin,
+                    timeout,
+                    &project_dir,
+                )
+                .await
+                {
+                    continue;
+                }
                 futures.push(async move {
                     run_hook(&command, args.as_deref(), &stdin, timeout, &project_dir).await
                 });
             }
         }
-        let (outputs, async_results) = tokio::join!(
-            futures::future::join_all(futures),
-            futures::future::join_all(async_handles)
-        );
-        for result in async_results {
-            if let Err(error) = result {
-                tracing::warn!("hooks: async handler task failed: {error}");
-            }
+        futures::future::join_all(futures).await
+    }
+}
+
+async fn condition_allows(
+    command: &str,
+    condition: Option<&str>,
+    stdin: &[u8],
+    timeout: std::time::Duration,
+    project_dir: &str,
+) -> bool {
+    let Some(condition) = condition else {
+        return true;
+    };
+    let output = run_shell_condition(condition, stdin, timeout, project_dir).await;
+    match output.status {
+        HookStatus::TimedOut => {
+            tracing::warn!(
+                "hooks: `if` condition for {command:?} timed out; failing closed (running the handler)"
+            );
+            true
         }
-        outputs
+        HookStatus::OutputLimitExceeded(limit) => {
+            tracing::warn!(
+                "hooks: `if` condition for {command:?} exceeded its {limit:?} output limit; failing closed (running the handler)"
+            );
+            true
+        }
+        HookStatus::Completed | HookStatus::Failed => match output.exit_code {
+            Some(0) => true,
+            Some(_) => false,
+            None => {
+                tracing::warn!(
+                    "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
+                );
+                true
+            }
+        },
     }
 }
 

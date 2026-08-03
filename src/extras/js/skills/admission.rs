@@ -490,15 +490,18 @@ impl AdmissionEvaluator {
 pub(crate) struct AdmissionWorker {
     shutdown: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl AdmissionWorker {
     pub(crate) fn start(mut evaluator: AdmissionEvaluator) -> Result<Self, AdmissionError> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let work_guard = crate::agent::runner::current_work_guard();
         let join = std::thread::Builder::new()
             .name("skill-admission".to_string())
             .spawn(move || {
+                let _work_guard = work_guard;
                 while !worker_shutdown.load(Ordering::Acquire) {
                     let now = match super::store::current_timestamp() {
                         Ok(now) => now,
@@ -535,6 +538,7 @@ impl AdmissionWorker {
         Ok(Self {
             shutdown,
             join: Some(join),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
 }
@@ -545,10 +549,15 @@ impl Drop for AdmissionWorker {
         if let Some(join) = self.join.take() {
             if join.is_finished() {
                 let _ = join.join();
+            } else if let Some(runtime) = &self.runtime {
+                std::mem::drop(crate::agent::runner::spawn_blocking_scoped_on(
+                    runtime,
+                    move || {
+                        let _ = join.join();
+                    },
+                ));
             } else {
-                // Verification is independently bounded. Detach rather than block
-                // application shutdown while the current immutable proposal finishes.
-                drop(join);
+                let _ = join.join();
             }
         }
     }

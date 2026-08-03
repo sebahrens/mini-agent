@@ -289,19 +289,22 @@ async fn dispatch_generic_blocks_on_decision_block_json() {
 }
 
 #[tokio::test]
-async fn dispatch_waits_for_async_handlers_but_ignores_their_decisions() {
+async fn dispatch_starts_async_handlers_without_waiting_and_ignores_their_decisions() {
     let marker = std::env::temp_dir().join(format!(
         "zerostack-hooks-async-complete-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
     let command = format!(
-        "sleep 0.1; printf complete > {}; echo '{{\"decision\":\"block\"}}'",
+        "sleep 0.25; printf complete > {}; echo '{{\"decision\":\"block\"}}'",
         marker.display()
     );
-    let config = config_with("Stop", None, vec![async_handler(&command)]);
+    let mut background = async_handler(&command);
+    background.condition = Some("sleep 0.25".to_owned());
+    let config = config_with("Stop", None, vec![background]);
     let dispatcher = HookDispatcher::from_config(&config).unwrap();
 
+    let started = std::time::Instant::now();
     let decision = dispatcher
         .dispatch(
             "Stop",
@@ -316,10 +319,22 @@ async fn dispatch_waits_for_async_handlers_but_ignores_their_decisions() {
         .await;
 
     assert_eq!(decision, Decision::Continue);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(150),
+        "async:true dispatch must not wait for the handler"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while std::fs::read_to_string(&marker).unwrap_or_default() != "complete" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned background hook should still complete");
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap_or_default(),
         "complete"
     );
+    let _ = std::fs::remove_file(marker);
 }
 
 #[tokio::test]
