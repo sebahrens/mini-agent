@@ -204,6 +204,7 @@ enum PathPolicy {
 #[derive(Debug, Clone)]
 pub(crate) struct AllowConfig {
     base: PathBuf,
+    workspace_binding: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read: PathPolicy,
     write: PathPolicy,
     #[cfg(feature = "sandbox")]
@@ -223,6 +224,7 @@ impl AllowConfig {
         let Ok(base) = base else {
             return Self {
                 base: startup_base.to_path_buf(),
+                workspace_binding: None,
                 read: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Read)),
                 write: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Write)),
                 #[cfg(feature = "sandbox")]
@@ -234,9 +236,44 @@ impl AllowConfig {
             read: build_path_policy(&base, read_roots, read_unrestricted, FileAccess::Read),
             write: build_path_policy(&base, write_roots, write_unrestricted, FileAccess::Write),
             base,
+            workspace_binding: None,
             #[cfg(feature = "sandbox")]
             fetch: FetchPolicy::default(),
         }
+    }
+
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace_binding = Some(workspace);
+        self
+    }
+
+    fn validate_workspace(&self, tool: &'static str) -> rquickjs::Result<()> {
+        self.workspace_binding
+            .as_ref()
+            .map(|workspace| workspace.validate())
+            .transpose()
+            .map(|_| ())
+            .map_err(|_| {
+                file_error(
+                    tool,
+                    "workspace changed",
+                    "session workspace is unavailable",
+                )
+            })
+    }
+
+    fn effect_base(&self) -> PathBuf {
+        self.workspace_binding
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf())
+            .unwrap_or_else(|| self.base.clone())
+    }
+
+    fn workspace_binding(&self) -> Option<&std::sync::Arc<crate::paths::WorkspaceBinding>> {
+        self.workspace_binding.as_ref()
     }
 
     pub(crate) fn with_fetch_settings(self, origins: Option<&[String]>, allow_http: bool) -> Self {
@@ -272,6 +309,31 @@ impl AllowConfig {
             Err(reason) => return AuthorizationDecision::Denied(reason),
         };
         authorize_resolved(&self.write, resolved, FileAccess::Write)
+    }
+
+    fn authorize_bound(&self, relative: &Path, access: FileAccess) -> AuthorizationDecision {
+        let Some(workspace) = self.workspace_binding() else {
+            return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(access));
+        };
+        let target = match workspace.logical_relative_path(relative) {
+            Ok(target) => target,
+            Err(_) => {
+                return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(access));
+            }
+        };
+        let policy = match access {
+            FileAccess::Read => &self.read,
+            FileAccess::Write => &self.write,
+        };
+        authorize_resolved(policy, target, access)
+    }
+
+    fn authorize_bound_read(&self, relative: &Path) -> AuthorizationDecision {
+        self.authorize_bound(relative, FileAccess::Read)
+    }
+
+    fn authorize_bound_write(&self, relative: &Path) -> AuthorizationDecision {
+        self.authorize_bound(relative, FileAccess::Write)
     }
 }
 
@@ -1411,13 +1473,13 @@ struct ResolvedWriteTarget {
     mode: WriteMode,
 }
 
-fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
+fn absolute_lexical(base: &Path, path: &Path) -> PathBuf {
     use std::path::Component;
 
     let source = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()?.join(path)
+        base.join(path)
     };
     let mut normalized = PathBuf::new();
     for component in source.components() {
@@ -1431,7 +1493,7 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
             Component::Normal(part) => normalized.push(part),
         }
     }
-    Ok(normalized)
+    normalized
 }
 
 fn permission_path(tool: &'static str, path: &Path) -> rquickjs::Result<String> {
@@ -1440,9 +1502,9 @@ fn permission_path(tool: &'static str, path: &Path) -> rquickjs::Result<String> 
         .ok_or_else(|| file_error(tool, "invalid path", "resolved path is not valid UTF-8"))
 }
 
-async fn resolve_read_target(path: &str) -> rquickjs::Result<ResolvedReadTarget> {
+async fn resolve_read_target(base: &Path, path: &str) -> rquickjs::Result<ResolvedReadTarget> {
     let expanded = crate::fs::expand_tilde(path);
-    let absolute = absolute_lexical(Path::new(&expanded)).map_err(rquickjs::Error::Io)?;
+    let absolute = absolute_lexical(base, Path::new(&expanded));
     let canonical = tokio::fs::canonicalize(absolute)
         .await
         .map_err(rquickjs::Error::Io)?;
@@ -1513,11 +1575,41 @@ async fn read_approved_file(target: ResolvedReadTarget) -> rquickjs::Result<Stri
     })
 }
 
-async fn resolve_write_target(path: &str) -> rquickjs::Result<ResolvedWriteTarget> {
+fn read_capability_file(file: std::fs::File) -> rquickjs::Result<String> {
+    use std::io::Read as _;
+    let metadata = file.metadata().map_err(rquickjs::Error::Io)?;
+    if !metadata.is_file() || metadata.len() > READ_FILE_MAX_BYTES as u64 {
+        return Err(file_error(
+            "js/read_file",
+            "resource limit",
+            "file is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take((READ_FILE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(rquickjs::Error::Io)?;
+    if bytes.len() > READ_FILE_MAX_BYTES {
+        return Err(file_error(
+            "js/read_file",
+            "resource limit",
+            format!("file exceeds {READ_FILE_MAX_BYTES} byte read limit"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        file_error(
+            "js/read_file",
+            "invalid encoding",
+            "file content is not valid UTF-8",
+        )
+    })
+}
+
+async fn resolve_write_target(base: &Path, path: &str) -> rquickjs::Result<ResolvedWriteTarget> {
     use std::path::Component;
 
     let expanded = crate::fs::expand_tilde(path);
-    let absolute = absolute_lexical(Path::new(&expanded)).map_err(rquickjs::Error::Io)?;
+    let absolute = absolute_lexical(base, Path::new(&expanded));
     let (path, mode) = match tokio::fs::symlink_metadata(&absolute).await {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -1642,12 +1734,36 @@ pub(crate) fn make_read_file(
     allow_config: AllowConfig,
 ) -> impl Fn(String) -> rquickjs::Result<String> {
     move |path: String| {
+        allow_config.validate_workspace("js/read_file")?;
+        let relative = Path::new(&path);
+        if !relative.is_absolute()
+            && !path.starts_with('~')
+            && let Some(workspace) = allow_config.workspace_binding()
+        {
+            let file = workspace
+                .open_relative(relative)
+                .map_err(rquickjs::Error::Io)?;
+            if let AuthorizationDecision::Denied(reason) =
+                allow_config.authorize_bound_read(relative)
+            {
+                return Err(allow_policy_error("js/read_file", reason));
+            }
+            let logical = workspace
+                .logical_relative_path(relative)
+                .map_err(rquickjs::Error::Io)?;
+            let permission_path = permission_path("js/read_file", &logical)?;
+            permission_bridge
+                .check_bound_path("js/read_file", &permission_path)
+                .map_err(|error| permission_error("js/read_file", error))?;
+            return read_capability_file(file);
+        }
+        let effect_base = allow_config.effect_base();
         let target = block_on_host_call(
             &runtime,
             &permission_bridge,
             "js/read_file",
             STEP_TIMEOUT,
-            resolve_read_target(&path),
+            resolve_read_target(&effect_base, &path),
         )?;
         if let AuthorizationDecision::Denied(reason) = allow_config.authorize_read(&target.path) {
             return Err(allow_policy_error("js/read_file", reason));
@@ -1672,6 +1788,7 @@ pub(crate) fn make_write_file(
     allow_config: AllowConfig,
 ) -> impl Fn(String, String) -> rquickjs::Result<()> {
     move |path: String, content: String| {
+        allow_config.validate_workspace("js/write_file")?;
         if content.len() > WRITE_FILE_MAX_BYTES {
             return Err(file_error(
                 "js/write_file",
@@ -1679,12 +1796,53 @@ pub(crate) fn make_write_file(
                 format!("content exceeds {WRITE_FILE_MAX_BYTES} byte write limit"),
             ));
         }
+        let relative = Path::new(&path);
+        if !relative.is_absolute()
+            && !path.starts_with('~')
+            && let Some(workspace) = allow_config.workspace_binding()
+        {
+            if let AuthorizationDecision::Denied(reason) =
+                allow_config.authorize_bound_write(relative)
+            {
+                return Err(allow_policy_error("js/write_file", reason));
+            }
+            let logical = workspace
+                .logical_relative_path(relative)
+                .map_err(rquickjs::Error::Io)?;
+            let permission_path = permission_path("js/write_file", &logical)?;
+            permission_bridge
+                .check_bound_path("js/write_file", &permission_path)
+                .map_err(|error| permission_error("js/write_file", error))?;
+            match workspace.open_relative(relative) {
+                Ok(file) => {
+                    let expected = file.metadata().map_err(rquickjs::Error::Io)?;
+                    workspace
+                        .replace_relative_atomic(relative, content.as_bytes(), &expected)
+                        .map_err(rquickjs::Error::Io)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = relative
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    workspace
+                        .open_dir_relative(parent)
+                        .map_err(rquickjs::Error::Io)?;
+                    workspace
+                        .create_relative_atomic(relative, content.as_bytes())
+                        .map_err(rquickjs::Error::Io)?;
+                }
+                Err(error) => return Err(rquickjs::Error::Io(error)),
+            }
+            return Ok(());
+        }
+        let effect_base = allow_config.effect_base();
         let target = block_on_host_call(
             &runtime,
             &permission_bridge,
             "js/write_file",
             STEP_TIMEOUT,
-            resolve_write_target(&path),
+            resolve_write_target(&effect_base, &path),
         )?;
         if let AuthorizationDecision::Denied(reason) = allow_config.authorize_write(&target.path) {
             return Err(allow_policy_error("js/write_file", reason));
@@ -2952,6 +3110,43 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn js_bound_allow_identity_does_not_follow_a_swapped_workspace_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let workspace = temp.path().join("workspace");
+        let replacement = temp.path().join("replacement");
+        let retained = temp.path().join("workspace-retained");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(workspace.join("sentinel.txt"), "original").unwrap();
+        std::fs::write(replacement.join("sentinel.txt"), "replacement").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let replacement = replacement.canonicalize().unwrap();
+        let roots = vec![".".to_string()];
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
+        let policy =
+            AllowConfig::from_settings(&workspace, None, Some(&roots), Some(&roots), false, false)
+                .with_workspace_binding(binding);
+
+        std::fs::rename(&workspace, &retained).unwrap();
+        symlink(&replacement, &workspace).unwrap();
+        expect_denied(
+            policy.authorize_read(&workspace.join("sentinel.txt")),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+        assert_eq!(
+            expect_allowed(policy.authorize_bound_read(Path::new("sentinel.txt"))),
+            workspace.join("sentinel.txt"),
+            "capability-relative policy identity must remain the captured workspace"
+        );
+
+        std::fs::remove_file(&workspace).unwrap();
+        std::fs::rename(&retained, &workspace).unwrap();
+    }
+
     #[test]
     fn js_file_allow_policy_resolves_relative_roots_against_explicit_base() {
         let temp = TempDir::new();
@@ -4031,7 +4226,7 @@ mod tests {
         let source = workspace.join("source.txt");
         let original = workspace.join("original.txt");
         std::fs::write(&source, "approved identity").unwrap();
-        let approved_read = resolve_read_target(source.to_str().unwrap())
+        let approved_read = resolve_read_target(&workspace, source.to_str().unwrap())
             .await
             .expect("resolve read target");
         std::fs::rename(&source, &original).unwrap();
@@ -4048,7 +4243,7 @@ mod tests {
 
         let target = parent.join("created.txt");
         let external_target = external.join("created.txt");
-        let approved_write = resolve_write_target(target.to_str().unwrap())
+        let approved_write = resolve_write_target(&workspace, target.to_str().unwrap())
             .await
             .expect("resolve write target");
         let original_parent = workspace.join("original-parent");

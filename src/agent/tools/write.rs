@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use rig::tool::Tool;
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path};
+use crate::agent::tools::{
+    AskSender, PermCheck, ToolError, WriteArgs, check_perm_bound_path, check_perm_path,
+};
 #[cfg(feature = "lsp")]
 use crate::extras::lsp::LspManager;
 
@@ -12,6 +14,7 @@ pub struct WriteTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub max_text_file_size: u64,
+    workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     /// When `Some`, written files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -28,9 +31,23 @@ impl WriteTool {
             permission,
             ask_tx,
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
+            workspace: None,
             #[cfg(feature = "lsp")]
             lsp: None,
         }
+    }
+
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace = Some(crate::agent::tools::capture_workspace_binding(root));
+        self
+    }
+
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     #[cfg(feature = "lsp")]
@@ -94,29 +111,16 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
-        let expanded = crate::fs::expand_tilde(&args.path);
-        let resolved = resolve_write_path(Path::new(&expanded)).await?;
-        let path = resolved.as_path();
-        let permission_path = path.to_string_lossy();
+        let workspace_root =
+            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let requested =
+            crate::agent::tools::resolve_tool_path(workspace_root.as_deref(), &args.path);
+        let expanded = requested.to_string_lossy().into_owned();
         tracing::debug!(
             "tool write start: path={}, content_len={}",
             expanded,
             args.content.len(),
         );
-        // Check the path atomic_write will modify, not a symlink that points to it.
-        let coaching =
-            check_perm_path(&self.permission, &self.ask_tx, "write", &permission_path).await?;
-
-        if path.exists() {
-            tracing::warn!("tool write file exists: path={}", expanded);
-            return Err(ToolError::Msg(format!(
-                "File '{}' already exists. Use edit for targeted changes, or delete and recreate if a full rewrite is needed.",
-                expanded
-            )));
-        }
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let bytes = args.content.len();
         if bytes as u64 > self.max_text_file_size {
             tracing::warn!(
@@ -130,7 +134,52 @@ impl Tool for WriteTool {
                 bytes, self.max_text_file_size
             )));
         }
-        let current = resolve_write_path(Path::new(&expanded)).await?;
+        let relative = Path::new(&args.path);
+        if !relative.is_absolute()
+            && !args.path.starts_with('~')
+            && let Some(workspace) = &self.workspace
+        {
+            let coaching =
+                check_perm_bound_path(&self.permission, &self.ask_tx, "write", workspace, relative)
+                    .await?;
+            workspace.create_relative_atomic(relative, args.content.as_bytes())?;
+            crate::agent::tools::untrack_read_path(&expanded);
+            let mut result = format!("Written {} bytes to {}", bytes, expanded);
+            if let Some(msg) = coaching {
+                result = format!("{}\n\n{}", msg, result);
+            }
+            #[cfg(feature = "lsp")]
+            if let Some(lsp) = &self.lsp {
+                lsp.notify_changed_relative(relative).await;
+                if let Some(block) = lsp.diagnostics_block_for_relative_edit(relative).await {
+                    result.push_str(&block);
+                }
+            }
+            return Ok(result);
+        }
+
+        let resolved = resolve_write_path(&requested).await?;
+        let path = resolved.as_path();
+        // Check the path atomic_write will modify, not a symlink that points to it.
+        let coaching = check_perm_path(
+            &self.permission,
+            &self.ask_tx,
+            "write",
+            &path.to_string_lossy(),
+        )
+        .await?;
+
+        if path.exists() {
+            tracing::warn!("tool write file exists: path={}", expanded);
+            return Err(ToolError::Msg(format!(
+                "File '{}' already exists. Use edit for targeted changes, or delete and recreate if a full rewrite is needed.",
+                expanded
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let current = resolve_write_path(&requested).await?;
         if current != resolved {
             return Err(ToolError::Msg(format!(
                 "Path changed after permission check: {}",

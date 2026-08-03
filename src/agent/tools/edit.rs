@@ -3,8 +3,8 @@ use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::{
-    AskSender, EditArgs, EditBlock, EditOp, PermCheck, ToolError, check_perm_path, edit_system,
-    levenshtein_similarity, normalize_whitespace,
+    AskSender, EditArgs, EditBlock, EditOp, PermCheck, ToolError, check_perm_bound_path,
+    check_perm_path, edit_system, levenshtein_similarity, normalize_whitespace,
 };
 use crate::config::types::EditSystem;
 #[cfg(feature = "lsp")]
@@ -13,6 +13,7 @@ use crate::extras::lsp::LspManager;
 pub struct EditTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     /// When `Some`, edited files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -24,9 +25,18 @@ impl EditTool {
         EditTool {
             permission,
             ask_tx,
+            workspace: None,
             #[cfg(feature = "lsp")]
             lsp: None,
         }
+    }
+
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     #[cfg(feature = "lsp")]
@@ -555,17 +565,47 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {
-        let expanded = crate::fs::expand_tilde(&args.path);
-        let resolved = tokio::fs::canonicalize(&expanded).await?;
-        let path = resolved.to_string_lossy().into_owned();
-        let approved_parent =
-            crate::fs::stable_path_metadata(resolved.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "edit target has no parent directory",
-                )
-            })?)
-            .await?;
+        let workspace_root =
+            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let requested =
+            crate::agent::tools::resolve_tool_path(workspace_root.as_deref(), &args.path);
+        let expanded = requested.to_string_lossy().into_owned();
+        let relative = std::path::Path::new(&args.path);
+        let bound_workspace = if !relative.is_absolute() && !args.path.starts_with('~') {
+            self.workspace.as_ref()
+        } else {
+            None
+        };
+        let capability_file = bound_workspace
+            .map(|workspace| workspace.open_relative(relative))
+            .transpose()?;
+        let capability_metadata = capability_file
+            .as_ref()
+            .map(std::fs::File::metadata)
+            .transpose()?;
+        let resolved = if bound_workspace.is_none() {
+            Some(tokio::fs::canonicalize(&requested).await?)
+        } else {
+            None
+        };
+        let path = resolved
+            .as_deref()
+            .unwrap_or(requested.as_path())
+            .to_string_lossy()
+            .into_owned();
+        let approved_parent = if let Some(resolved) = &resolved {
+            Some(
+                crate::fs::stable_path_metadata(resolved.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "edit target has no parent directory",
+                    )
+                })?)
+                .await?,
+            )
+        } else {
+            None
+        };
         let es = edit_system();
         tracing::debug!(
             "tool edit start: path={}, mode={:?}, has_block={}, has_edits={}",
@@ -575,9 +615,23 @@ impl Tool for EditTool {
             args.edits.as_ref().map(|e| e.len()).unwrap_or(0),
         );
         // Check the path atomic_write will modify, not a symlink that points to it.
-        let coaching = check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await?;
+        let coaching = if let Some(workspace) = bound_workspace {
+            check_perm_bound_path(&self.permission, &self.ask_tx, "edit", workspace, relative)
+                .await?
+        } else {
+            check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await?
+        };
 
-        let mut file = crate::fs::open_stable_file(&resolved).await?;
+        let mut file = if let Some(file) = capability_file {
+            tokio::fs::File::from_std(file)
+        } else {
+            crate::fs::open_stable_file(
+                resolved
+                    .as_deref()
+                    .expect("ambient edit must resolve an external path"),
+            )
+            .await?
+        };
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
@@ -621,14 +675,24 @@ impl Tool for EditTool {
             modified
         };
 
-        let current = tokio::fs::canonicalize(&expanded).await?;
-        if current != resolved {
-            return Err(ToolError::Msg(format!(
-                "Path changed after permission check: {}",
-                expanded
-            )));
+        if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
+            workspace.replace_relative_atomic(relative, output.as_bytes(), expected)?;
+        } else {
+            let resolved = resolved.expect("external edit must resolve an ambient path");
+            let current = tokio::fs::canonicalize(&requested).await?;
+            if current != resolved {
+                return Err(ToolError::Msg(format!(
+                    "Path changed after permission check: {}",
+                    expanded
+                )));
+            }
+            crate::fs::atomic_write_resolved_checked(
+                &resolved,
+                &output,
+                approved_parent.expect("external edit must capture its parent"),
+            )
+            .await?;
         }
-        crate::fs::atomic_write_resolved_checked(&resolved, &output, approved_parent).await?;
         crate::agent::tools::untrack_read_path(&expanded);
 
         tracing::debug!(
@@ -648,8 +712,17 @@ impl Tool for EditTool {
         #[cfg(feature = "lsp")]
         if let Some(lsp) = &self.lsp {
             let file = std::path::Path::new(&path);
-            lsp.notify_changed(file).await;
-            if let Some(block) = lsp.diagnostics_block_for_edit(file).await {
+            if capability_metadata.is_some() {
+                lsp.notify_changed_relative(relative).await;
+            } else {
+                lsp.notify_changed(file).await;
+            }
+            let diagnostics = if capability_metadata.is_some() {
+                lsp.diagnostics_block_for_relative_edit(relative).await
+            } else {
+                lsp.diagnostics_block_for_edit(file).await
+            };
+            if let Some(block) = diagnostics {
                 result.push_str(&block);
             }
         }

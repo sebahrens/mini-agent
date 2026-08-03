@@ -71,12 +71,59 @@ pub struct ContextFiles {
 }
 
 impl ContextFiles {
-    #[cfg(feature = "git-worktree")]
-    pub fn reload(&mut self) {
-        self.agents = walk_context_files().0;
+    pub(crate) fn for_workspace_binding(
+        &self,
+        no_context_files: bool,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> Self {
+        let mut context = self.clone();
+        let (agents, architecture) = if no_context_files {
+            (None, None)
+        } else {
+            walk_bound_context_files(workspace)
+        };
+        context.agents = agents;
+        context.prompts = prompts::load_for_workspace_binding(workspace);
+        if let Some(name) = &context.current_prompt_name {
+            context.current_prompt = context.prompts.get(name).cloned();
+        }
         #[cfg(feature = "archmd")]
         {
-            self.architecture = walk_context_files().1;
+            context.architecture = architecture;
+        }
+        #[cfg(not(feature = "archmd"))]
+        let _ = architecture;
+        context
+    }
+
+    pub fn for_workspace(&self, no_context_files: bool, workspace_root: &Path) -> Self {
+        let mut context = self.clone();
+        let (agents, architecture) = if no_context_files {
+            (None, None)
+        } else {
+            walk_context_files(Some(workspace_root))
+        };
+        context.agents = agents;
+        context.prompts = prompts::load_for_workspace(workspace_root);
+        if let Some(name) = &context.current_prompt_name {
+            context.current_prompt = context.prompts.get(name).cloned();
+        }
+        #[cfg(feature = "archmd")]
+        {
+            context.architecture = architecture;
+        }
+        #[cfg(not(feature = "archmd"))]
+        let _ = architecture;
+        context
+    }
+
+    #[cfg(feature = "git-worktree")]
+    pub fn reload(&mut self) {
+        let workspace_root = std::env::current_dir().ok();
+        self.agents = walk_context_files(workspace_root.as_deref()).0;
+        #[cfg(feature = "archmd")]
+        {
+            self.architecture = walk_context_files(workspace_root.as_deref()).1;
         }
         self.prompts = prompts::load();
         if let Some(name) = &self.current_prompt_name {
@@ -91,7 +138,59 @@ impl ContextFiles {
     }
 }
 
+fn walk_bound_context_files(
+    workspace: &crate::paths::WorkspaceBinding,
+) -> (Option<String>, Option<String>) {
+    let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
+    #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
+    let mut arch_parts: SmallVec<[String; 4]> = SmallVec::new();
+    if let Some(content) = load_file(&storage::agents_path())
+        && !content.trim().is_empty()
+    {
+        agent_parts.push(format!("# Global AGENTS.md\n{content}"));
+    }
+    #[cfg(feature = "archmd")]
+    if let Some(content) = load_file(&storage::architecture_path())
+        && !content.trim().is_empty()
+    {
+        arch_parts.push(format!("# Global ARCHITECTURE.md\n{content}"));
+    }
+    let names = if cfg!(feature = "archmd") {
+        &["AGENTS.md", "CLAUDE.md", "ARCHITECTURE.md"][..]
+    } else {
+        &["AGENTS.md", "CLAUDE.md"][..]
+    };
+    let mut total = 0usize;
+    for (dir, name, content) in workspace.read_ancestor_files(names) {
+        if content.trim().is_empty() || total >= MAX_ANCESTOR_CONTEXT_BYTES {
+            continue;
+        }
+        total = total.saturating_add(content.len());
+        if name == "ARCHITECTURE.md" {
+            #[cfg(feature = "archmd")]
+            arch_parts.push(format!(
+                "# ARCHITECTURE.md ({})\n{}",
+                dir.display(),
+                content
+            ));
+        } else {
+            agent_parts.push(format!("# {} ({})\n{}", name, dir.display(), content));
+        }
+    }
+    let agents = (!agent_parts.is_empty()).then(|| agent_parts.join("\n\n"));
+    let architecture = (!arch_parts.is_empty()).then(|| arch_parts.join("\n\n"));
+    (agents, architecture)
+}
+
 pub fn load(no_context_files: bool) -> ContextFiles {
+    let workspace_root = std::env::current_dir().ok();
+    load_for_workspace(no_context_files, workspace_root.as_deref())
+}
+
+/// Load context for one explicitly selected workspace without changing the
+/// process working directory. ACP sessions use this entry point so concurrent
+/// roots cannot affect one another.
+pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>) -> ContextFiles {
     if let Err(e) = prompts::ensure_global() {
         tracing::warn!("failed to install default prompts: {e}");
     }
@@ -101,7 +200,7 @@ pub fn load(no_context_files: bool) -> ContextFiles {
     let (agents, arch_candidate) = if no_context_files {
         (None, None)
     } else {
-        walk_context_files()
+        walk_context_files(workspace_root)
     };
     #[cfg(feature = "archmd")]
     let architecture = arch_candidate;
@@ -145,7 +244,7 @@ const MAX_ANCESTOR_CONTEXT_BYTES: usize = 524_288;
 /// Walks from CWD up to root once, collecting AGENTS.md, CLAUDE.md, and
 /// ARCHITECTURE.md files. This avoids the duplicate traversal that the
 /// older separate load_agents / load_architecture performed.
-fn walk_context_files() -> (Option<String>, Option<String>) {
+fn walk_context_files(workspace_root: Option<&Path>) -> (Option<String>, Option<String>) {
     let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
     #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
     let mut arch_parts: SmallVec<[String; 4]> = SmallVec::new();
@@ -170,9 +269,8 @@ fn walk_context_files() -> (Option<String>, Option<String>) {
         }
     }
 
-    let cwd = std::env::current_dir().ok();
-    if let Some(cwd) = cwd {
-        let mut current = Some(cwd.as_path());
+    if let Some(cwd) = workspace_root {
+        let mut current = Some(cwd);
         while let Some(dir) = current {
             if total_bytes >= MAX_ANCESTOR_CONTEXT_BYTES {
                 tracing::warn!(
@@ -223,5 +321,5 @@ fn walk_context_files() -> (Option<String>, Option<String>) {
 
 #[cfg(feature = "archmd")]
 pub(crate) fn load_architecture() -> Option<String> {
-    walk_context_files().1
+    walk_context_files(std::env::current_dir().ok().as_deref()).1
 }

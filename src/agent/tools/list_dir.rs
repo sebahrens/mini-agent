@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use ignore::WalkBuilder;
 use rig::tool::Tool;
 
+use super::find_files::BoundDirectory;
 use crate::agent::tools::{
-    AskSender, ListDirArgs, PermCheck, ToolError, check_perm_path, is_skip_dir,
+    AskSender, ListDirArgs, PermCheck, ToolError, check_perm_bound_path, check_perm_path,
 };
 
 pub(crate) fn format_size(bytes: u64) -> String {
@@ -34,6 +34,7 @@ pub struct ListDirTool {
     /// `None` = no truncation (matches the historical behaviour).
     /// `Some(n)` = show the first `n` entries with a recovery hint.
     pub max_entries: Option<u64>,
+    workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
 }
 
 impl ListDirTool {
@@ -46,7 +47,16 @@ impl ListDirTool {
             permission,
             ask_tx,
             max_entries,
+            workspace: None,
         }
+    }
+
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 }
 
@@ -75,68 +85,70 @@ impl Tool for ListDirTool {
     }
 
     async fn call(&self, args: ListDirArgs) -> Result<String, ToolError> {
-        let path = crate::fs::expand_tilde(args.path.as_deref().unwrap_or("."));
-        let resolved = tokio::fs::canonicalize(&path).await?;
-        let permission_path = resolved.to_string_lossy();
+        let workspace_root =
+            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let requested = crate::agent::tools::resolve_tool_path(
+            workspace_root.as_deref(),
+            args.path.as_deref().unwrap_or("."),
+        );
+        let path = requested.to_string_lossy().into_owned();
+        let raw = args.path.as_deref().unwrap_or(".");
+        let relative = Path::new(raw);
+        let bound_workspace = if !relative.is_absolute() && !raw.starts_with('~') {
+            self.workspace.as_ref()
+        } else {
+            None
+        };
         tracing::debug!("tool list_dir start: path={}", path);
-        let coaching =
-            check_perm_path(&self.permission, &self.ask_tx, "list_dir", &permission_path).await?;
-        let checked_metadata = crate::fs::stable_path_metadata(&resolved).await?;
-
-        let walker = WalkBuilder::new(&resolved)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .require_git(false)
-            .hidden(false)
-            .max_depth(Some(1))
-            .filter_entry(|entry| {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    !is_skip_dir(entry.file_name().to_str().unwrap_or(""))
-                } else {
-                    true
-                }
-            })
-            .build();
+        let (bound_directory, coaching) = if let Some(workspace) = bound_workspace {
+            let logical = workspace.logical_relative_path(relative)?;
+            let directory = workspace.open_relative_directory_file(relative)?;
+            let bound = BoundDirectory::from_file(&logical, directory)?;
+            let coaching = check_perm_bound_path(
+                &self.permission,
+                &self.ask_tx,
+                "list_dir",
+                workspace,
+                relative,
+            )
+            .await?;
+            (bound, coaching)
+        } else {
+            let resolved = tokio::fs::canonicalize(&requested).await?;
+            let checked_metadata = crate::fs::stable_path_metadata(&resolved).await?;
+            // Pin the exact authorized directory before an interactive
+            // permission wait can race a pathname replacement.
+            let bound = BoundDirectory::open(&resolved, &checked_metadata)?;
+            let coaching = check_perm_path(
+                &self.permission,
+                &self.ask_tx,
+                "list_dir",
+                &resolved.to_string_lossy(),
+            )
+            .await?;
+            (bound, coaching)
+        };
 
         let mut entries: Vec<(String, String, String)> = Vec::new();
 
-        for result in walker {
-            let entry = match result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            if entry.depth() == 0 {
-                continue;
-            }
-
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let kind = if meta.is_dir() {
-                let count = count_dir_entries(entry.path());
-                format!("dir({})", count)
-            } else if meta.is_symlink() {
+        for entry in bound_directory.list_entries()? {
+            let name = entry.file_name.to_string_lossy().to_string();
+            let kind = if entry.metadata.is_dir() {
+                format!("dir({})", entry.child_count)
+            } else if entry.metadata.is_symlink() {
                 "link".to_string()
             } else {
                 "file".to_string()
             };
 
-            let size = if meta.is_file() {
-                format_size(meta.len())
+            let size = if entry.metadata.is_file() {
+                format_size(entry.metadata.len())
             } else {
                 String::new()
             };
 
             entries.push((name, kind, size));
         }
-        let current_metadata = crate::fs::stable_path_metadata(&resolved).await?;
-        crate::fs::ensure_same_file(&resolved, &checked_metadata, &current_metadata)?;
 
         entries.sort_by(|a, b| {
             let a_is_dir = a.1.starts_with("dir") || a.1 == "link";
@@ -210,7 +222,7 @@ mod tests {
     use crate::permission::{PermissionConfigs, SecurityMode};
 
     #[tokio::test]
-    async fn symlink_swap_after_permission_check_is_rejected() {
+    async fn descriptor_bound_listing_ignores_an_aba_swap_during_permission_wait() {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir().join(format!(
             "zerostack_list_dir_toctou_test_{}_{}",
@@ -225,6 +237,7 @@ mod tests {
         std::fs::write(checked_target.join("checked.txt"), "checked").unwrap();
         std::fs::write(swapped_target.join("swapped.txt"), "swapped").unwrap();
         std::os::unix::fs::symlink(&checked_target, &link).unwrap();
+        let original_target = temp.join("checked-original");
 
         let checker = PermissionChecker::new(
             &PermissionConfigs::default(),
@@ -244,14 +257,22 @@ mod tests {
                 PathBuf::from(&request.input),
                 std::fs::canonicalize(&checked_target).unwrap()
             );
-            std::fs::remove_dir_all(&checked_target).unwrap();
+            std::fs::rename(&checked_target, &original_target).unwrap();
             std::os::unix::fs::symlink(&swapped_target, &checked_target).unwrap();
             request.reply.send(UserDecision::AllowOnce).unwrap();
         };
 
         let (result, ()) = tokio::join!(call, swap);
-        let error = result.expect_err("list_dir must reject a swapped permission-checked target");
-        assert!(error.to_string().contains("Path changed"));
+        let listing = result.expect("descriptor-bound listing must retain the authorized target");
+        assert!(listing.contains("checked.txt"));
+        assert!(!listing.contains("swapped.txt"));
+
+        std::fs::remove_file(&checked_target).unwrap();
+        std::fs::rename(&original_target, &checked_target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checked_target.join("checked.txt")).unwrap(),
+            "checked"
+        );
 
         std::fs::remove_dir_all(temp).unwrap();
     }

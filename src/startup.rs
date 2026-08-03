@@ -542,8 +542,6 @@ impl Startup {
                 sub_model.to_string(),
                 task_max_turns,
                 self.cfg.clone(),
-                #[cfg(feature = "archmd")]
-                self.context.architecture.clone(),
             );
         }
 

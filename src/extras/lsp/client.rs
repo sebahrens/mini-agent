@@ -11,21 +11,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::{Notify, oneshot};
 
 use super::rpc;
 use crate::config::types::LspServerConfig;
 
+pub(crate) async fn read_stable_text(path: &Path) -> std::io::Result<String> {
+    let mut file = crate::fs::open_stable_file(path).await?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).await?;
+    Ok(text)
+}
+
 /// `file://` URI for a path, with minimal percent-encoding (anything outside
 /// RFC 3986 unreserved + `/` is hex-escaped). Relative paths resolve against
-/// the process cwd.
+/// the caller-provided workspace root.
 pub(crate) fn file_uri(path: &Path) -> Option<String> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
+    let abs = path.is_absolute().then(|| path.to_path_buf())?;
     let s = abs.to_str()?;
     let mut out = String::with_capacity(s.len() + 7);
     out.push_str("file://");
@@ -41,6 +44,62 @@ pub(crate) fn file_uri(path: &Path) -> Option<String> {
 }
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(15);
+const LSP_WORKSPACE_FD: i32 = 198;
+
+pub(crate) fn workspace_service_root(_fallback: &Path) -> std::path::PathBuf {
+    #[cfg(all(unix, target_os = "linux"))]
+    return std::path::PathBuf::from(format!("/proc/self/fd/{LSP_WORKSPACE_FD}"));
+    #[cfg(all(unix, not(target_os = "linux")))]
+    return std::path::PathBuf::from(format!("/dev/fd/{LSP_WORKSPACE_FD}"));
+    #[cfg(not(unix))]
+    return _fallback.to_path_buf();
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn bind_workspace_handle(
+    command: &mut tokio::process::Command,
+    workspace: Option<std::fs::File>,
+    fallback: &Path,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let Some(workspace) = workspace else {
+        return Ok(fallback.to_path_buf());
+    };
+    let source = workspace.as_raw_fd();
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            let _keep_workspace_alive = &workspace;
+            if libc::dup2(source, LSP_WORKSPACE_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // dup2 does not clear CLOEXEC when source == destination.
+            let descriptor_flags = libc::fcntl(LSP_WORKSPACE_FD, libc::F_GETFD);
+            if descriptor_flags == -1
+                || libc::fcntl(
+                    LSP_WORKSPACE_FD,
+                    libc::F_SETFD,
+                    descriptor_flags & !libc::FD_CLOEXEC,
+                ) == -1
+                || libc::fchdir(LSP_WORKSPACE_FD) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(workspace_service_root(fallback))
+}
+
+#[cfg(not(unix))]
+fn bind_workspace_handle(
+    _command: &mut tokio::process::Command,
+    _workspace: Option<std::fs::File>,
+    fallback: &Path,
+) -> std::io::Result<std::path::PathBuf> {
+    Ok(fallback.to_path_buf())
+}
 
 /// Diagnostics for one file, as last published by one server.
 pub struct FileDiags {
@@ -72,16 +131,21 @@ impl LspClient {
         name: &str,
         cfg: &LspServerConfig,
         root: &Path,
+        workspace_handle: Option<std::fs::File>,
         diags: DiagStore,
         diag_notify: Arc<Notify>,
     ) -> Option<Arc<Self>> {
-        let mut child = tokio::process::Command::new(cfg.command.as_str())
+        let mut command = tokio::process::Command::new(cfg.command.as_str());
+        command
             .args(cfg.args.iter().map(|a| a.as_str()))
             .envs(&cfg.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .current_dir(root)
+            .kill_on_drop(true);
+        let server_root = bind_workspace_handle(&mut command, workspace_handle, root).ok()?;
+        let mut child = command
             .spawn()
             .map_err(|e| {
                 tracing::debug!("lsp[{name}]: cannot spawn '{}': {e}", cfg.command);
@@ -172,7 +236,7 @@ impl LspClient {
             open: Mutex::new(HashMap::new()),
         });
 
-        let root_uri = file_uri(root)
+        let root_uri = file_uri(&server_root)
             .ok_or_else(|| {
                 tracing::debug!("lsp[{name}]: root '{}' is not a valid uri", root.display());
             })
@@ -233,11 +297,15 @@ impl LspClient {
     /// Syncs a file's current disk content with the server: `didOpen` on
     /// first touch, full-content `didChange` afterwards.
     pub async fn sync_file(&self, path: &Path) {
+        let Ok(text) = read_stable_text(path).await else {
+            return; // unreadable/binary file — skip silently
+        };
+        self.sync_text(path, text).await;
+    }
+
+    pub async fn sync_text(&self, path: &Path, text: String) {
         let Some(uri) = file_uri(path) else {
             return;
-        };
-        let Ok(text) = tokio::fs::read_to_string(path).await else {
-            return; // unreadable/binary file — skip silently
         };
         let uri_str = uri.clone();
         enum Sync {

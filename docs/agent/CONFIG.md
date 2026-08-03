@@ -1072,6 +1072,39 @@ When `--acp` is passed without `--acp-host`, zerostack runs in stdio mode
 host defaults to `127.0.0.1`. A non-loopback `acp_host` is an explicit remote
 exposure choice and emits a startup warning.
 
+Every `session/new` request must provide an existing directory as `cwd`.
+zerostack canonicalizes that directory before creating the session and binds
+the session to that directory's filesystem identity. The binding retains an
+open directory capability and opens relative context, prompt, read, write,
+edit, search, list, and JavaScript paths through it. Each operation first
+checks that the canonical pathname still names the captured directory. A
+rename, removal, or replacement visible before that check fails closed; a
+replacement racing after the check cannot redirect the operation because its
+filesystem access is already relative to the retained handle. Relative file
+operations walk held directory descriptors and reject symlink or reparse-point
+components and targets.
+
+ACP context includes managed global files and context files in the captured
+workspace root. It intentionally does not load `AGENTS.md`, `CLAUDE.md`, or
+`ARCHITECTURE.md` from ambient parent directories, because those parents are
+outside the session capability and can be reparented independently.
+
+On Unix, Bash/JavaScript children enter the retained directory with `fchdir`,
+and contained wrappers receive a fixed inherited descriptor instead of
+re-resolving the host pathname. LSP services likewise use a descriptor-backed
+root URI and stable, no-follow file reads. On Windows, the session holds a
+directory handle that deliberately excludes delete sharing, pinning the root
+name for the binding lifetime. A requested `zerobox` sandbox for an ACP
+workspace fails closed on Unix because that backend cannot consume the
+directory-handle authority.
+
+Permission containment, LSP services, and delegated read-only agents use the
+same binding. Concurrent ACP sessions may therefore use different roots
+without changing or inheriting the server process working directory. Missing
+paths and non-directories are rejected before an agent is built. LSP file
+requests are strictly contained; other absolute, `..`, symlink, and reparse-point
+escapes are rejected.
+
 ### ACP TCP peer authentication
 
 TCP mode always fails closed unless an authentication key is available. The

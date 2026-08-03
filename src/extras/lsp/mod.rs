@@ -35,7 +35,7 @@ pub struct LspManager {
 }
 
 struct Inner {
-    root: PathBuf,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
     servers: Vec<(String, crate::config::types::LspServerConfig)>,
     /// server name → client, `None` caching a failed spawn so a missing
     /// binary isn't retried on every edit.
@@ -45,7 +45,8 @@ struct Inner {
 }
 
 impl LspManager {
-    pub fn new(cfg: &LspConfig, root: PathBuf) -> Self {
+    pub fn new(cfg: &LspConfig, workspace: Arc<crate::paths::WorkspaceBinding>) -> Self {
+        let root = workspace.root();
         let servers = registry::resolve_servers(&cfg.servers);
         tracing::debug!(
             "lsp: {} server definitions resolved (root {})",
@@ -54,13 +55,29 @@ impl LspManager {
         );
         Self {
             inner: Arc::new(Inner {
-                root,
+                workspace,
                 servers,
                 clients: tokio::sync::Mutex::new(HashMap::new()),
                 diags: DiagStore::default(),
                 diag_notify: Arc::new(Notify::new()),
             }),
         }
+    }
+
+    pub fn resolve_path(&self, path: &Path) -> Result<PathBuf, String> {
+        self.inner.workspace.validate()?;
+        let requested = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.inner.workspace.root().join(path)
+        };
+        let resolved = std::fs::canonicalize(&requested).map_err(|error| {
+            format!("lsp: failed to resolve '{}': {error}", requested.display())
+        })?;
+        if !resolved.starts_with(self.inner.workspace.root()) {
+            return Err("lsp: file is outside the session workspace".to_string());
+        }
+        Ok(resolved)
     }
 
     /// Whether any configured server claims this path's extension.
@@ -71,14 +88,24 @@ impl LspManager {
     /// Client for the server claiming `path`, spawning it on first use.
     /// `None` when no server matches or the spawn failed (cached).
     async fn client_for(&self, path: &Path) -> Option<Arc<LspClient>> {
+        if self.inner.workspace.validate().is_err()
+            || !path.starts_with(self.inner.workspace.root())
+        {
+            return None;
+        }
         let (name, cfg) = registry::server_for_path(&self.inner.servers, path)?;
         let mut clients = self.inner.clients.lock().await;
         if let Some(cached) = clients.get(name) {
             return cached.clone();
         }
-        let spawned = LspClient::spawn(name, cfg, &self.inner.root, self.inner.diags.clone(), {
-            self.inner.diag_notify.clone()
-        })
+        let spawned = LspClient::spawn(
+            name,
+            cfg,
+            self.inner.workspace.root(),
+            self.inner.workspace.try_clone_directory_file().ok(),
+            self.inner.diags.clone(),
+            self.inner.diag_notify.clone(),
+        )
         .await;
         clients.insert(name.clone(), spawned.clone());
         spawned
@@ -89,6 +116,31 @@ impl LspManager {
     pub async fn notify_changed(&self, path: &Path) {
         if let Some(client) = self.client_for(path).await {
             client.sync_file(path).await;
+        }
+    }
+
+    pub async fn notify_changed_relative(&self, relative: &Path) {
+        if self.inner.workspace.validate().is_err() {
+            return;
+        }
+        let Ok(mut file) = self.inner.workspace.open_relative(relative) else {
+            return;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        if !metadata.is_file() {
+            return;
+        }
+        let mut text = String::new();
+        use std::io::Read as _;
+        if file.read_to_string(&mut text).is_err() {
+            return;
+        }
+        let logical = client::workspace_service_root(self.inner.workspace.root()).join(relative);
+        let lookup = self.inner.workspace.root().join(relative);
+        if let Some(client) = self.client_for(&lookup).await {
+            client.sync_text(&logical, text).await;
         }
     }
 
@@ -140,6 +192,19 @@ impl LspManager {
         self.diagnostics_block(path, DIAG_WAIT).await
     }
 
+    pub async fn diagnostics_block_relative(
+        &self,
+        relative: &Path,
+        wait: Duration,
+    ) -> Option<String> {
+        let service = client::workspace_service_root(self.inner.workspace.root()).join(relative);
+        self.diagnostics_block(&service, wait).await
+    }
+
+    pub async fn diagnostics_block_for_relative_edit(&self, relative: &Path) -> Option<String> {
+        self.diagnostics_block_relative(relative, DIAG_WAIT).await
+    }
+
     /// All files that currently have diagnostics, formatted for the
     /// `lsp_diagnostics` tool. `None` when everything is clean.
     pub fn all_diagnostics_block(&self) -> Option<String> {
@@ -159,7 +224,7 @@ impl LspManager {
             }
             let display = uri
                 .strip_prefix("file://")
-                .and_then(|p| p.strip_prefix(self.inner.root.to_str()?))
+                .and_then(|p| p.strip_prefix(self.inner.workspace.root().to_str()?))
                 .map(|p| p.trim_start_matches('/').to_string())
                 .unwrap_or_else(|| uri.clone());
             for d in interesting {

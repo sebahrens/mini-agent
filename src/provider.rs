@@ -1130,6 +1130,7 @@ async fn build_openai_agent(
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
+    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
@@ -1148,6 +1149,7 @@ async fn build_openai_agent(
                 cli,
                 cfg,
                 context,
+                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox,
@@ -1167,6 +1169,7 @@ async fn build_openai_agent(
                 cli,
                 cfg,
                 context,
+                workspace,
                 permission,
                 ask_tx,
                 sandbox,
@@ -1197,9 +1200,49 @@ pub async fn build_agent(
     extra_body: Option<serde_json::Value>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
+    let workspace_root = std::env::current_dir().unwrap_or_default();
+    let workspace = std::sync::Arc::new(
+        crate::paths::WorkspaceBinding::capture(&workspace_root)
+            .expect("current working directory must remain available while building an agent"),
+    );
+    build_agent_in_workspace(
+        model,
+        cli,
+        cfg,
+        context,
+        workspace,
+        permission,
+        ask_tx,
+        sandbox,
+        reasoning_enabled,
+        temperature,
+        extra_body,
+        #[cfg(feature = "mcp")]
+        mcp_manager,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn build_agent_in_workspace(
+    model: AnyModel,
+    cli: &Cli,
+    cfg: &Config,
+    context: &ContextFiles,
+    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    sandbox: Sandbox,
+    reasoning_enabled: bool,
+    temperature: Option<f64>,
+    extra_body: Option<serde_json::Value>,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+) -> AnyAgent {
     #[cfg(feature = "skills")]
     let skills = {
-        let paths = crate::paths::process_paths();
+        let workspace_root = workspace.root();
+        let paths = crate::paths::process_paths()
+            .and_then(|paths| paths.with_workspace_root(workspace_root));
         let embedding = cfg.embedding.clone();
         match paths {
             Ok(paths) => match tokio::task::spawn_blocking(move || {
@@ -1233,6 +1276,7 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
+                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox.clone(),
@@ -1252,6 +1296,7 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
+                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox.clone(),
@@ -1271,6 +1316,7 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
+                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox.clone(),
@@ -1290,6 +1336,7 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
+                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox.clone(),
@@ -1309,6 +1356,7 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
+                workspace,
                 permission,
                 ask_tx,
                 sandbox,

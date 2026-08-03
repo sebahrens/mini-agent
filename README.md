@@ -69,8 +69,12 @@ default `bwrap` backend on Linux, mini-agent applies this capability matrix:
 | Environment | Cleared and rebuilt from `PATH`, identity, shell, terminal, locale, and color variables; credential, agent-socket, display, and API-key variables are not forwarded |
 | Network | Separate IP network namespace with no host or external IP connectivity, including no access to host loopback listeners; filesystem Unix-domain sockets placed in the workspace or application cache remain reachable |
 
-Only the workspace path selected by the process working directory is exposed; running mini-agent
-from a broad or sensitive directory broadens that boundary. The sandbox does not provide seccomp,
+For interactive and headless sessions, the workspace path is selected by the process working
+directory. Each ACP session instead uses its canonical `session/new` cwd, including when multiple
+ACP workspaces run concurrently. ACP keeps a directory handle for the session and resolves relative
+file, process, JavaScript, and LSP effects from that handle. File effects reject symlink/reparse-point
+components, and changing the pathname cannot redirect an already-authorized effect into a replacement directory. Selecting a broad or sensitive directory
+broadens that session's boundary. The sandbox does not provide seccomp,
 CPU/memory quotas, filtering of Unix-domain sockets inside writable bind mounts, or confidentiality
 from host kernel metadata. Only a root-owned, non-group/world-writable `bwrap` executable beneath
 equally protected parent directories is trusted. If it is missing or any namespace or mount setup

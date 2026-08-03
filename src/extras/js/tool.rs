@@ -38,6 +38,7 @@ const PERMISSION_WAIT_POLL: Duration = Duration::from_millis(10);
 enum PermissionCheckKind {
     Input,
     Path,
+    BoundPath,
 }
 
 enum PermissionReply {
@@ -109,6 +110,14 @@ impl PermissionBridge {
 
     pub(crate) fn check_path(&self, tool: &str, key: &str) -> Result<(), PermissionBridgeError> {
         self.check_sync(PermissionCheckKind::Path, tool, key)
+    }
+
+    pub(crate) fn check_bound_path(
+        &self,
+        tool: &str,
+        key: &str,
+    ) -> Result<(), PermissionBridgeError> {
+        self.check_sync(PermissionCheckKind::BoundPath, tool, key)
     }
 
     fn check_sync(
@@ -447,6 +456,9 @@ async fn resolve_permission(
         match kind {
             PermissionCheckKind::Input => checker.check(request.tool(), request.key()),
             PermissionCheckKind::Path => checker.check_path(request.tool(), request.key()),
+            PermissionCheckKind::BoundPath => {
+                checker.check_bound_path(request.tool(), request.key())
+            }
         }
     };
 

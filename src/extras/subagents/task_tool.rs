@@ -136,11 +136,31 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
 pub struct TaskTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    architecture: Option<String>,
 }
 
 impl TaskTool {
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self { permission, ask_tx }
+        Self {
+            permission,
+            ask_tx,
+            workspace: None,
+            architecture: None,
+        }
+    }
+
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_architecture(mut self, architecture: Option<String>) -> Self {
+        self.architecture = architecture;
+        self
     }
 }
 
@@ -183,6 +203,9 @@ editing in a known location, grepping for a literal you will act on immediately.
     }
 
     async fn call(&self, args: TaskArgs) -> Result<String, ToolError> {
+        if let Some(workspace) = &self.workspace {
+            workspace.validate().map_err(ToolError::Msg)?;
+        }
         let (client, model_name, max_turns, config, limits) = with_config(|cfg| {
             (
                 cfg.client.clone(),
@@ -207,13 +230,13 @@ editing in a known location, grepping for a literal you will act on immediately.
         let subagent_event_tx = clone_subagent_event_tx();
 
         #[cfg(feature = "archmd")]
-        let architecture = with_config(|cfg| cfg.architecture.clone())
-            .map_err(|err| ToolError::Msg(err.to_string()))?;
+        let architecture = self.architecture.clone();
         #[cfg(not(feature = "archmd"))]
         let architecture: Option<String> = None;
 
         let authorization =
-            SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone());
+            SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone())
+                .with_workspace_binding(self.workspace.clone());
         let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
             let client = client.clone();
             let model_name = model_name.clone();
