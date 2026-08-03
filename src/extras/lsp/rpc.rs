@@ -4,11 +4,17 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const MAX_HEADER_BYTES: usize = 8 * 1024;
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_HEADER_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Writes one framed JSON-RPC message.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, body: &[u8]) -> std::io::Result<()> {
+    if body.len() > MAX_BODY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "LSP message body too large",
+        ));
+    }
     let header = format!("Content-Length: {}\r\n\r\n", body.len());
     w.write_all(header.as_bytes()).await?;
     w.write_all(body).await?;
@@ -32,31 +38,50 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opti
             ));
         }
         headers.push(byte[0]);
-        if headers.ends_with(b"\r\n\r\n") {
-            break;
-        }
         if headers.len() > MAX_HEADER_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "LSP header block too large",
             ));
         }
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
     }
 
-    let headers = String::from_utf8_lossy(&headers);
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("Content-Length")
-                .then(|| value.trim().parse::<usize>().ok())?
-        })
-        .ok_or_else(|| {
+    let headers = std::str::from_utf8(&headers).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "LSP headers are not valid UTF-8",
+        )
+    })?;
+    let mut content_length = None;
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("Content-Length") {
+            continue;
+        }
+        if content_length.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "multiple Content-Length headers in LSP frame",
+            ));
+        }
+        content_length = Some(value.trim().parse::<usize>().map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "missing Content-Length in LSP frame",
+                "invalid Content-Length in LSP frame",
             )
-        })?;
+        })?);
+    }
+    let content_length = content_length.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing Content-Length in LSP frame",
+        )
+    })?;
     if content_length > MAX_BODY_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

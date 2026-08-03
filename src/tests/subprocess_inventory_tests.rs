@@ -210,13 +210,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/extras/lsp/client.rs", ".spawn()", 1, "TC-LSP-SERVICE"),
     (
         "src/extras/lsp/client.rs",
-        "child: tokio::process::Child,",
+        "fn lsp_command(cfg: &LspServerConfig, root: &Path) -> anyhow::Result<tokio::process::Command> {",
         1,
         "TC-LSP-SERVICE",
     ),
     (
         "src/extras/lsp/client.rs",
-        "let mut child = tokio::process::Command::new(cfg.command.as_str())",
+        "let mut command = tokio::process::Command::new(program);",
         1,
         "TC-LSP-SERVICE",
     ),

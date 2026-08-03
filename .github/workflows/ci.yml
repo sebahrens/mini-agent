@@ -408,6 +408,22 @@ jobs:
       - name: Test MCP stdio failure cleanup
         run: cargo test --locked --no-default-features --features mcp mcp_stdio_failure_cleanup
 
+  lsp-lifecycle:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Test LSP process lifecycle
+        run: cargo test --locked --no-default-features --features lsp lsp_process
+
   install:
     if: github.event_name != 'schedule'
     strategy:

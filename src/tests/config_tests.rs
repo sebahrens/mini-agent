@@ -420,6 +420,8 @@ command = "rust-analyzer"
 args = []
 extensions = [".rs"]
 env = {}
+inherit_env = []
+network = "inherit"
 disabled = false
 
 [advisor]

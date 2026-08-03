@@ -276,9 +276,26 @@ pub struct LspServerConfig {
     /// File extensions this server handles, e.g. [".rs"].
     pub extensions: Vec<CompactString>,
     pub env: HashMap<String, String>,
+    /// Parent environment names deliberately delegated after clearing the
+    /// ambient process environment. Explicit `env` values always win.
+    pub inherit_env: Vec<String>,
+    /// Optional workspace-service sandbox backend. Omission is an explicit
+    /// trusted-service bypass, not a claim that containment is active.
+    pub sandbox: Option<CompactString>,
+    /// Network authority requested for the server process.
+    pub network: LspNetwork,
     /// Server-specific `initializationOptions` sent during `initialize`.
     pub initialization: Option<serde_json::Value>,
     pub disabled: bool,
+}
+
+#[cfg(feature = "lsp")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LspNetwork {
+    #[default]
+    Inherit,
+    Deny,
 }
 
 #[cfg(feature = "advisor")]

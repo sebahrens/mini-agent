@@ -2723,6 +2723,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-width",
  "uuid",
+ "which",
  "windows-sys 0.61.2",
  "zip",
 ]

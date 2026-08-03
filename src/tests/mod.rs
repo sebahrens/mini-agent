@@ -47,6 +47,8 @@ mod logging_tests;
 #[cfg(all(test, feature = "loop"))]
 mod loop_tests;
 #[cfg(all(test, feature = "lsp"))]
+mod lsp_process_tests;
+#[cfg(all(test, feature = "lsp"))]
 mod lsp_tests;
 #[cfg(test)]
 mod markdown_tests;

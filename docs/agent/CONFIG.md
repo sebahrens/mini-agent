@@ -1420,12 +1420,15 @@ enabled = true
 [lsp.servers.rust]          # override a built-in default
 command = "rust-analyzer"
 extensions = [".rs"]
+inherit_env = ["PATH"]      # named parent values only
 
 [lsp.servers.myserver]      # fully custom server
 command = "my-ls"
 args = ["--stdio"]
 extensions = [".my"]
-# env = { RUST_LOG = "debug" }
+# env = { TOOLCHAIN_HOME = "/opt/toolchain" } # explicit values win
+# sandbox = "bwrap"          # or "seatbelt" / "zerobox"
+# network = "deny"           # requires a sandbox that enforces denial
 # initialization = { ... }   # server-specific initializationOptions
 # disabled = false           # true removes a same-named built-in
 ```
@@ -1439,6 +1442,7 @@ lsp:
     rust:
       command: rust-analyzer
       extensions: [".rs"]
+      inherit_env: [PATH]
 ```
 
 Built-in server defaults (used only when the binary is on PATH):
@@ -1447,10 +1451,28 @@ clangd, bash-language-server, lua-language-server.
 
 Behavior notes:
 
-- Servers are **PATH binaries only** — zerostack never auto-installs a
-  language server. A missing binary is skipped with a debug log.
+- Executables are resolved once through the launcher's PATH (or an absolute
+  configured path); zerostack never auto-installs a language server. A missing
+  binary is skipped with a debug log.
 - Servers start lazily on the first edit touching one of their extensions
-  (workspace root = session cwd) and stop when zerostack exits.
+  using the canonical session cwd for both process cwd and `rootUri`.
+- The child environment is cleared. `inherit_env` delegates named parent
+  values and `env` supplies explicit values; explicit values win. Built-ins
+  delegate only `PATH` so they can find project toolchains.
+- Omitting `sandbox` explicitly trusts the configured workspace service. A
+  requested backend fails closed when unavailable. `network = "deny"` starts
+  only when that backend can enforce network denial; it never falls back to an
+  uncontained launch.
+- Initialization is bounded to 15 seconds. Malformed/oversized protocol input,
+  server exit, and shutdown terminate and reap the complete Unix process group
+  or Windows Job Object. Stderr is drained in fixed-size chunks, never logged,
+  and terminates the server after 64 KiB of cumulative output.
+  A stopped server is replaced on the next matching edit.
+- Document synchronization skips files larger than 4 MiB without advancing
+  protocol state. Published diagnostics are accepted only for workspace URIs,
+  capped at 50 entries for each of at most 128 files per server, and stripped
+  of unneeded related/data payloads before retention; exceeding a storage cap
+  terminates that server.
 - Everything is fail-open: a hung or crashed server only means "no
   diagnostics", never a failed edit.
 - Post-edit diagnostics are capped (errors first, ~20 lines); nothing is

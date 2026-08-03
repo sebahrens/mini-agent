@@ -14,6 +14,9 @@ fn server(command: &str, args: &[&str], extensions: &[&str]) -> LspServerConfig 
         args: args.iter().map(|s| CompactString::from(*s)).collect(),
         extensions: extensions.iter().map(|s| CompactString::from(*s)).collect(),
         env: HashMap::new(),
+        inherit_env: vec!["PATH".to_string()],
+        sandbox: None,
+        network: Default::default(),
         initialization: None,
         disabled: false,
     }
