@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use rig::tool::Tool;
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path};
+use crate::agent::tools::{
+    AskSender, PermCheck, ReadTracker, ToolError, WriteArgs, check_perm_path,
+};
 #[cfg(feature = "lsp")]
 use crate::extras::lsp::LspManager;
 
@@ -12,6 +14,7 @@ pub struct WriteTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub max_text_file_size: u64,
+    read_tracker: ReadTracker,
     /// When `Some`, written files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -19,15 +22,31 @@ pub struct WriteTool {
 }
 
 impl WriteTool {
+    #[cfg(test)]
     pub fn new(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
         max_text_file_size: Option<u64>,
     ) -> Self {
+        Self::new_with_tracker(
+            permission,
+            ask_tx,
+            max_text_file_size,
+            ReadTracker::new(true),
+        )
+    }
+
+    pub(crate) fn new_with_tracker(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        max_text_file_size: Option<u64>,
+        read_tracker: ReadTracker,
+    ) -> Self {
         WriteTool {
             permission,
             ask_tx,
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
+            read_tracker,
             #[cfg(feature = "lsp")]
             lsp: None,
         }
@@ -145,7 +164,7 @@ impl Tool for WriteTool {
         })?)
         .await?;
         crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent).await?;
-        crate::agent::tools::untrack_read_path(&expanded);
+        self.read_tracker.untrack_read_path(&path.to_string_lossy());
         tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
         let mut result = format!("Written {} bytes to {}", bytes, expanded);
         if let Some(msg) = coaching {

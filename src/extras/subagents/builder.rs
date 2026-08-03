@@ -17,11 +17,20 @@ use rig::completion::CompletionModel;
 pub(crate) struct SubagentAuthorization {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    deny_repeated_reads: bool,
 }
 
 impl SubagentAuthorization {
-    pub(crate) fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self { permission, ask_tx }
+    pub(crate) fn new(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        deny_repeated_reads: bool,
+    ) -> Self {
+        Self {
+            permission,
+            ask_tx,
+            deny_repeated_reads,
+        }
     }
 
     fn filesystem_tools(
@@ -32,12 +41,14 @@ impl SubagentAuthorization {
         max_find_results: u64,
         max_list_dir_entries: Option<u64>,
     ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+        let read_tracker = tools::ReadTracker::new(self.deny_repeated_reads);
         vec![
-            Box::new(tools::ReadTool::new(
+            Box::new(tools::ReadTool::new_with_tracker(
                 self.permission.clone(),
                 self.ask_tx.clone(),
                 Some(max_text_file_size),
                 max_read_lines,
+                read_tracker,
             )),
             Box::new(tools::GrepTool::new(
                 self.permission.clone(),
@@ -285,7 +296,7 @@ mod tests {
             Some(vec!["standard".to_string()]),
         )
         .expect("valid permission test configuration");
-        SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), ask_tx)
+        SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), ask_tx, true)
     }
 
     fn filesystem_tools(authorization: &SubagentAuthorization) -> Vec<Box<dyn rig::tool::ToolDyn>> {

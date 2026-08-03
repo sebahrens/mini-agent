@@ -131,7 +131,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         write_error(ctx.renderer, format!("failed to save session: {}", e));
         return Ok(());
     }
-    *ctx.session = session;
+    ctx.replace_session(session).await?;
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     write_ok(
         ctx.renderer,
@@ -237,7 +237,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         } else if sessions.len() == 1 {
             if let Some(s) = sessions.into_iter().next() {
                 let msg_count = s.messages.len();
-                *ctx.session = s;
+                ctx.replace_session(s).await?;
                 render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
                 write_ok(ctx.renderer, format!("loaded session ({} msgs)", msg_count));
             }

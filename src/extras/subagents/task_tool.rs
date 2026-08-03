@@ -136,11 +136,25 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
 pub struct TaskTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    deny_repeated_reads: bool,
 }
 
 impl TaskTool {
-    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self { permission, ask_tx }
+    pub fn new(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        deny_repeated_reads: bool,
+    ) -> Self {
+        Self {
+            permission,
+            ask_tx,
+            deny_repeated_reads,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repeated_read_policy_for_test(&self) -> bool {
+        self.deny_repeated_reads
     }
 }
 
@@ -212,8 +226,11 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(not(feature = "archmd"))]
         let architecture: Option<String> = None;
 
-        let authorization =
-            SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone());
+        let authorization = SubagentAuthorization::new(
+            self.permission.clone(),
+            self.ask_tx.clone(),
+            self.deny_repeated_reads,
+        );
         let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
             let client = client.clone();
             let model_name = model_name.clone();

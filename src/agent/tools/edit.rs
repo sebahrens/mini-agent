@@ -3,8 +3,8 @@ use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::{
-    AskSender, EditArgs, EditBlock, EditOp, PermCheck, ToolError, check_perm_path, edit_system,
-    levenshtein_similarity, normalize_whitespace,
+    AskSender, EditArgs, EditBlock, EditOp, PermCheck, ReadTracker, ToolError, check_perm_path,
+    edit_system, levenshtein_similarity, normalize_whitespace,
 };
 use crate::config::types::EditSystem;
 #[cfg(feature = "lsp")]
@@ -13,6 +13,7 @@ use crate::extras::lsp::LspManager;
 pub struct EditTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    read_tracker: ReadTracker,
     /// When `Some`, edited files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -20,10 +21,20 @@ pub struct EditTool {
 }
 
 impl EditTool {
+    #[cfg(test)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
+        Self::new_with_tracker(permission, ask_tx, ReadTracker::new(true))
+    }
+
+    pub(crate) fn new_with_tracker(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        read_tracker: ReadTracker,
+    ) -> Self {
         EditTool {
             permission,
             ask_tx,
+            read_tracker,
             #[cfg(feature = "lsp")]
             lsp: None,
         }
@@ -629,7 +640,7 @@ impl Tool for EditTool {
             )));
         }
         crate::fs::atomic_write_resolved_checked(&resolved, &output, approved_parent).await?;
-        crate::agent::tools::untrack_read_path(&expanded);
+        self.read_tracker.untrack_read_path(&path);
 
         tracing::debug!(
             "tool edit done: path={}, edit_count={}, notes={}",

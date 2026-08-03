@@ -27,44 +27,53 @@ pub(crate) fn edit_system() -> EditSystem {
     *EDIT_SYSTEM.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-static DENY_REPEATED_READS: Mutex<bool> = Mutex::new(true);
-
-pub(crate) fn set_deny_repeated_reads(v: bool) {
-    *DENY_REPEATED_READS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = v;
+/// Repeated-read policy and history owned by one built agent/session.
+///
+/// Clones share history only when deliberately injected into tools belonging
+/// to the same build. Constructing another tracker creates an independent
+/// policy boundary, even within the same process.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadTracker {
+    deny_repeated_reads: bool,
+    tracked: std::sync::Arc<Mutex<Vec<(String, usize, usize)>>>,
 }
 
-pub(crate) fn deny_repeated_reads() -> bool {
-    *DENY_REPEATED_READS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
-static READ_TRACKER: Mutex<Vec<(String, usize, usize)>> = Mutex::new(Vec::new());
-
-pub(crate) fn track_read(path: &str, offset: usize, limit: usize) -> Option<String> {
-    if !deny_repeated_reads() {
-        return None;
+impl Default for ReadTracker {
+    fn default() -> Self {
+        Self::new(true)
     }
-    let mut tracker = READ_TRACKER.lock().unwrap_or_else(|e| e.into_inner());
-    let key = (path.to_string(), offset, limit);
-    if tracker.contains(&key) {
+}
+
+impl ReadTracker {
+    pub(crate) fn new(deny_repeated_reads: bool) -> Self {
+        Self {
+            deny_repeated_reads,
+            tracked: std::sync::Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(crate) fn track_read(&self, path: &str, offset: usize, limit: usize) -> Option<String> {
+        if !self.deny_repeated_reads {
+            return None;
+        }
+        let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (path.to_string(), offset, limit);
+        if !tracked.contains(&key) {
+            tracked.push(key);
+            return None;
+        }
         let end = offset + limit;
         Some(format!(
             "read blocked: {path} (lines {}-{}) was already read and has not been modified since. Use the previous result or read a different section.",
             offset + 1,
             if end > 0 { end } else { offset + 1 }
         ))
-    } else {
-        tracker.push(key);
-        None
     }
-}
 
-pub(crate) fn untrack_read_path(path: &str) {
-    let mut tracker = READ_TRACKER.lock().unwrap_or_else(|e| e.into_inner());
-    tracker.retain(|(p, _, _)| p != path);
+    pub(crate) fn untrack_read_path(&self, path: &str) {
+        let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        tracked.retain(|(tracked_path, _, _)| tracked_path != path);
+    }
 }
 
 pub use bash::BashTool;

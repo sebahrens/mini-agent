@@ -562,6 +562,7 @@ async fn model_for_subagent(
         crate::extras::subagents::builder::SubagentAuthorization::new(
             ctx.permission.clone(),
             ctx.ask_tx.clone(),
+            ctx.cfg.deny_repeated_reads.unwrap_or(true),
         ),
         #[cfg(feature = "archmd")]
         None,

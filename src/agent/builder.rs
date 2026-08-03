@@ -286,6 +286,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
+    read_tracker: tools::ReadTracker,
     reasoning_enabled: bool,
     temperature: Option<f64>,
     // Provider-specific extra body params (e.g. OpenRouter `provider.order` to
@@ -338,19 +339,28 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let max_grep_results = cfg.resolve_max_grep_results();
         let max_find_results = cfg.resolve_max_find_results();
         let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
-        let write_tool =
-            tools::WriteTool::new(permission.clone(), ask_tx.clone(), max_text_file_size);
+        let write_tool = tools::WriteTool::new_with_tracker(
+            permission.clone(),
+            ask_tx.clone(),
+            max_text_file_size,
+            read_tracker.clone(),
+        );
         #[cfg(feature = "lsp")]
         let write_tool = write_tool.with_lsp(lsp_manager.clone());
-        let edit_tool = tools::EditTool::new(permission.clone(), ask_tx.clone());
+        let edit_tool = tools::EditTool::new_with_tracker(
+            permission.clone(),
+            ask_tx.clone(),
+            read_tracker.clone(),
+        );
         #[cfg(feature = "lsp")]
         let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
         let base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::from_buf([
-            Box::new(tools::ReadTool::new(
+            Box::new(tools::ReadTool::new_with_tracker(
                 permission.clone(),
                 ask_tx.clone(),
                 max_text_file_size,
                 max_read_lines,
+                read_tracker,
             )),
             Box::new(write_tool),
             Box::new(edit_tool),
@@ -396,7 +406,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         #[cfg(feature = "subagents")]
         if cfg.task_enabled.unwrap_or(true) {
             use crate::extras::subagents::task_tool::TaskTool;
-            all_tools.push(Box::new(TaskTool::new(permission.clone(), ask_tx.clone())));
+            all_tools.push(Box::new(TaskTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                cfg.deny_repeated_reads.unwrap_or(true),
+            )));
         }
 
         #[cfg(feature = "memory")]
@@ -618,12 +632,14 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     let max_grep_results = cfg.resolve_max_grep_results();
     let max_find_results = cfg.resolve_max_find_results();
     let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
+    let read_tracker = tools::ReadTracker::new(cfg.deny_repeated_reads.unwrap_or(true));
     let read_tools: Vec<Box<dyn rig::tool::ToolDyn>> = vec![
-        Box::new(tools::ReadTool::new(
+        Box::new(tools::ReadTool::new_with_tracker(
             permission.clone(),
             ask_tx.clone(),
             max_text_file_size,
             max_read_lines,
+            read_tracker,
         )),
         Box::new(tools::GrepTool::new(
             permission.clone(),

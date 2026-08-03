@@ -476,6 +476,11 @@ impl Startup {
             .as_ref()
             .is_some_and(|decision| decision.override_identities().is_some());
 
+        // Rebuilds of this logical session share one process-local read
+        // history, while a new/resumed process session starts from the active
+        // configuration rather than any serialized state.
+        session.initialize_read_tracker(cfg.deny_repeated_reads.unwrap_or(true));
+
         Ok(Self {
             cli,
             cfg,
@@ -610,7 +615,6 @@ impl Startup {
         }
         let edit_system = self.cli.resolve_edit_system(&self.cfg);
         tools::set_edit_system(edit_system);
-        tools::set_deny_repeated_reads(self.cfg.deny_repeated_reads.unwrap_or(true));
 
         #[cfg(feature = "status-signals")]
         {
@@ -1028,6 +1032,7 @@ impl Startup {
             let completion_model = self.client.completion_model(self.model.to_string());
             #[cfg(feature = "mcp")]
             let mcp_manager = connect_headless_mcp(&self.cfg).await;
+            let read_tracker = self.session.read_tracker.clone();
             let agent = provider::build_agent(
                 completion_model,
                 &self.cli,
@@ -1039,6 +1044,7 @@ impl Startup {
                 // denial rather than block forever. See `handle_ask_inner`.
                 None,
                 self.sandbox.clone(),
+                read_tracker,
                 true,
                 temperature,
                 extra_body,
@@ -1123,6 +1129,7 @@ impl Startup {
         let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
         #[cfg(feature = "mcp")]
         let mcp_manager = connect_headless_mcp(&self.cfg).await;
+        let read_tracker = self.session.read_tracker.clone();
         let agent = provider::build_agent(
             model_completion,
             &self.cli,
@@ -1133,6 +1140,7 @@ impl Startup {
             // matching note in `dispatch_print`.
             None,
             self.sandbox.clone(),
+            read_tracker,
             true,
             temperature,
             extra_body,

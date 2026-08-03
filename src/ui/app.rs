@@ -315,6 +315,7 @@ impl<'a> App<'a> {
             let permission_clone = ui.permission.clone();
             let ask_tx_clone = ui.ask_tx.clone();
             let sandbox_clone = ui.sandbox.clone();
+            let read_tracker_clone = ui.session.read_tracker.clone();
             let reasoning_enabled = slash.reasoning_enabled;
             tokio::spawn(async move {
                 #[cfg(feature = "mcp")]
@@ -336,6 +337,7 @@ impl<'a> App<'a> {
                     permission: &permission_clone,
                     ask_tx: &ask_tx_clone,
                     sandbox: &sandbox_clone,
+                    read_tracker: &read_tracker_clone,
                     #[cfg(feature = "mcp")]
                     mcp_manager: mcp.as_ref(),
                 }

@@ -105,6 +105,10 @@ pub struct Session {
     pub working_dir: CompactString,
     #[serde(default)]
     pub permission_allowlist: Vec<PermissionAllowEntry>,
+    /// Process-local repeated-read state for this logical session. It is never
+    /// persisted; startup recreates it from the active configuration.
+    #[serde(skip)]
+    pub(crate) read_tracker: crate::agent::tools::ReadTracker,
     #[cfg(feature = "multimodal")]
     #[serde(skip)]
     pub pending_media: Vec<crate::extras::multimodal::MediaAttachment>,
@@ -157,6 +161,13 @@ impl GitStatus {
 }
 
 impl Session {
+    /// Start a fresh process-local read history for a newly entered logical
+    /// session. Ordinary agent rebuilds must keep cloning the existing tracker;
+    /// only startup and explicit session replacement call this initializer.
+    pub(crate) fn initialize_read_tracker(&mut self, deny_repeated_reads: bool) {
+        self.read_tracker = crate::agent::tools::ReadTracker::new(deny_repeated_reads);
+    }
+
     pub fn estimate_tokens(text: &str) -> u64 {
         let mut wide: u64 = 0;
         let mut narrow: u64 = 0;
@@ -210,6 +221,7 @@ impl Session {
                 .map(|p| CompactString::new(p.to_string_lossy()))
                 .unwrap_or_default(),
             permission_allowlist: Vec::new(),
+            read_tracker: crate::agent::tools::ReadTracker::default(),
             #[cfg(feature = "multimodal")]
             pending_media: Vec::new(),
             show_cost_always: false,

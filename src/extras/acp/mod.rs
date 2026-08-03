@@ -29,6 +29,7 @@ const MAX_PENDING_AUTHENTICATIONS: usize = 16;
 
 struct SessionState {
     messages: Vec<(String, String)>,
+    read_tracker: crate::agent::tools::ReadTracker,
 }
 
 struct AcpState {
@@ -340,6 +341,9 @@ async fn handle_new_session(
         session_id.clone(),
         SessionState {
             messages: Vec::new(),
+            read_tracker: crate::agent::tools::ReadTracker::new(
+                state.cfg.deny_repeated_reads.unwrap_or(true),
+            ),
         },
     );
 
@@ -431,12 +435,19 @@ async fn run_prompt(
     .with_shell(&state.cli.resolve_shell(&state.cfg));
 
     // Track session history for future context persistence
-    let _extra_messages = {
+    let (_extra_messages, read_tracker) = {
         let sessions = state.sessions.lock().await;
         sessions
             .get(&session_id)
-            .map(|s| s.messages.clone())
-            .unwrap_or_default()
+            .map(|session| (session.messages.clone(), session.read_tracker.clone()))
+            .unwrap_or_else(|| {
+                (
+                    Vec::new(),
+                    crate::agent::tools::ReadTracker::new(
+                        state.cfg.deny_repeated_reads.unwrap_or(true),
+                    ),
+                )
+            })
     };
 
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
@@ -449,6 +460,7 @@ async fn run_prompt(
         permission,
         ask_tx,
         sandbox,
+        read_tracker,
         false,
         temperature,
         extra_body,

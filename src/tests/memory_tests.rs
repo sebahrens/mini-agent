@@ -942,7 +942,7 @@ fn subagent_memory_tool_set_excludes_memory_edit() {
     // hand-copied list: build_explore_agent_inner grants exactly what this
     // function returns, so if memory_edit (or any mutating tool) ever leaks into
     // it, this fails.
-    let authorization = SubagentAuthorization::new(None, None);
+    let authorization = SubagentAuthorization::new(None, None, true);
     let names: Vec<String> = subagent_memory_tools(&authorization)
         .iter()
         .map(|t| t.name())
@@ -977,7 +977,7 @@ async fn subagent_filesystem_permissions_memory_tools_inherit_parent_denial() {
         Some(vec!["standard".to_string()]),
     )
     .expect("valid permission test configuration");
-    let authorization = SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), None);
+    let authorization = SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), None, true);
 
     for tool in subagent_memory_tools(&authorization) {
         let input = match tool.name().as_str() {

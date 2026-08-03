@@ -3,7 +3,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::{
-    AskSender, PermCheck, ReadArgs, ToolError, check_perm_path, edit_system,
+    AskSender, PermCheck, ReadArgs, ReadTracker, ToolError, check_perm_path, edit_system,
 };
 use crate::config::types::EditSystem;
 
@@ -14,20 +14,39 @@ pub struct ReadTool {
     pub ask_tx: Option<AskSender>,
     pub max_text_file_size: u64,
     pub max_lines: u64,
+    read_tracker: ReadTracker,
 }
 
 impl ReadTool {
+    #[cfg(test)]
     pub fn new(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
         max_text_file_size: Option<u64>,
         max_lines: u64,
     ) -> Self {
+        Self::new_with_tracker(
+            permission,
+            ask_tx,
+            max_text_file_size,
+            max_lines,
+            ReadTracker::new(true),
+        )
+    }
+
+    pub(crate) fn new_with_tracker(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        max_text_file_size: Option<u64>,
+        max_lines: u64,
+        read_tracker: ReadTracker,
+    ) -> Self {
         ReadTool {
             permission,
             ask_tx,
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
             max_lines,
+            read_tracker,
         }
     }
 }
@@ -80,7 +99,10 @@ impl Tool for ReadTool {
             check_perm_path(&self.permission, &self.ask_tx, "read", &permission_path).await?;
         let mut file = crate::fs::open_stable_file(&resolved).await?;
 
-        if let Some(msg) = crate::agent::tools::track_read(&path, offset, limit) {
+        if let Some(msg) = self
+            .read_tracker
+            .track_read(permission_path.as_ref(), offset, limit)
+        {
             tracing::debug!("tool read blocked (repeated): path={}", path);
             return Err(ToolError::Msg(msg));
         }
