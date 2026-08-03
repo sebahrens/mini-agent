@@ -36,6 +36,12 @@ jobs:
       - name: Test Cargo feature graph gate
         run: python3 -m unittest scripts.tests.test_check_feature_graph
 
+      - name: Test release workflow policy
+        run: python3 -m unittest scripts.tests.test_check_package_metadata
+
+      - name: Verify release workflow policy
+        run: python3 scripts/check-package-metadata.py
+
       - name: Verify Cargo feature graph
         run: python3 scripts/check_feature_graph.py
 
