@@ -28,12 +28,10 @@ fn make_context(prompts: &[(&str, &str)]) -> ContextFiles {
 }
 
 fn make_perm(mode: SecurityMode) -> PermCheck {
-    Arc::new(Mutex::new(PermissionChecker::new(
-        &PermissionConfigs::default(),
-        mode,
-        None,
-        None,
-    )))
+    Arc::new(Mutex::new(
+        PermissionChecker::new(&PermissionConfigs::default(), mode, None, None)
+            .expect("valid permission test configuration"),
+    ))
 }
 
 fn current_mode(perm: &PermCheck) -> SecurityMode {

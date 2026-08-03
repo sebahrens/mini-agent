@@ -69,20 +69,21 @@ pub(crate) fn build_noninteractive_permission(
     cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
     mode: SecurityMode,
-) -> (Option<checker::PermCheck>, Option<ask::AskSender>) {
-    if cli.resolve_no_tools(cfg) || cli.dangerously_skip_permissions {
-        return (None, None);
-    }
-
+) -> anyhow::Result<(Option<checker::PermCheck>, Option<ask::AskSender>)> {
     let checker = checker::PermissionChecker::new(
-        &cfg.build_permission_config(),
+        &cfg.build_permission_config()?,
         mode,
         None,
         cfg.permission_modes.clone(),
-    );
+    )?;
+
+    if cli.resolve_no_tools(cfg) || cli.dangerously_skip_permissions {
+        return Ok((None, None));
+    }
+
     let permission = std::sync::Arc::new(std::sync::Mutex::new(checker));
 
-    (Some(permission), None)
+    Ok((Some(permission), None))
 }
 
 pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
@@ -95,7 +96,7 @@ pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
         permission_modes: Some(vec!["guarded".to_string()]),
         ..Default::default()
     };
-    let (permission, ask_tx) = build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded);
+    let (permission, ask_tx) = build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded)?;
 
     anyhow::ensure!(
         ask_tx.is_none(),
@@ -306,7 +307,37 @@ mod acp_permission_policy_tests {
             permission_modes: Some(vec!["guarded".to_string()]),
             ..Default::default()
         };
-        build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded)
+        build_noninteractive_permission(&cli, &cfg, SecurityMode::Guarded).unwrap()
+    }
+
+    #[test]
+    fn acp_policy_construction_rejects_invalid_regex_before_tools_exist() {
+        let cfg = Config {
+            permission_regex: Some(serde_json::json!({
+                "write": {"[unterminated": "allow"}
+            })),
+            ..Default::default()
+        };
+
+        for cli in [
+            Cli::default(),
+            Cli {
+                no_tools: true,
+                ..Cli::default()
+            },
+            Cli {
+                dangerously_skip_permissions: true,
+                ..Cli::default()
+            },
+        ] {
+            let error = build_noninteractive_permission(&cli, &cfg, SecurityMode::Standard)
+                .err()
+                .expect("invalid regex must fail ACP policy construction")
+                .to_string();
+            assert!(error.contains("permission-regex"), "{error}");
+            assert!(error.contains("write"), "{error}");
+            assert!(error.contains("[unterminated"), "{error}");
+        }
     }
 
     fn message(result: Result<Option<String>, ToolError>) -> Option<String> {

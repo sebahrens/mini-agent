@@ -66,25 +66,39 @@ fn resolve_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
 fn build_permission_checker(
     cli: &Cli,
     cfg: &Config,
-) -> (Option<PermCheck>, Option<AskSender>, Option<AskReceiver>) {
+) -> anyhow::Result<(Option<PermCheck>, Option<AskSender>, Option<AskReceiver>)> {
     let no_tools = cli.resolve_no_tools(cfg);
     if no_tools {
-        return (None, None, None);
+        return Ok((None, None, None));
     }
 
     if cli.dangerously_skip_permissions {
-        return (None, None, None);
+        return Ok((None, None, None));
     }
 
-    let perm_config = cfg.build_permission_config();
+    let perm_config = cfg.build_permission_config()?;
 
     let mode = resolve_mode(cli, cfg);
     let permission_modes = cfg.permission_modes.clone();
-    let checker = PermissionChecker::new(&perm_config, mode, None, permission_modes);
+    let checker = PermissionChecker::new(&perm_config, mode, None, permission_modes)?;
     let perm: PermCheck = std::sync::Arc::new(std::sync::Mutex::new(checker));
 
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
-    (Some(perm), Some(ask_tx), Some(ask_rx))
+    Ok((Some(perm), Some(ask_tx), Some(ask_rx)))
+}
+
+/// Validate the complete configured policy before any provider, model, tool,
+/// transport, or UI construction. All execution modes share `Startup::init`,
+/// including ACP, headless print, loop, and interactive startup.
+fn validate_startup_permission_policy(cli: &Cli, cfg: &Config) -> anyhow::Result<()> {
+    let configs = cfg.build_permission_config()?;
+    PermissionChecker::new(
+        &configs,
+        resolve_mode(cli, cfg),
+        None,
+        cfg.permission_modes.clone(),
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +327,8 @@ impl Startup {
         version_changed: bool,
         is_interactive: bool,
     ) -> anyhow::Result<Self> {
+        validate_startup_permission_policy(&cli, &cfg)?;
+
         // Load context first so prompts/themes are available early.
         let context = context::load(cli.resolve_no_context_files(&cfg));
 
@@ -601,7 +617,7 @@ impl Startup {
             self.status_signals = self.cli.status_socket.clone().map(StatusSignals::new);
         }
 
-        let (permission, ask_tx, ask_rx) = build_permission_checker(&self.cli, &self.cfg);
+        let (permission, ask_tx, ask_rx) = build_permission_checker(&self.cli, &self.cfg)?;
         self.permission = permission;
         self.ask_tx = ask_tx;
         self.ask_rx = ask_rx;
@@ -1192,11 +1208,66 @@ impl Startup {
 mod tests {
     use super::{
         ResumeProviderDecision, apply_resume_provider_decision, resolve_resume_provider_decision,
+        validate_startup_permission_policy,
     };
     use crate::cli::Cli;
     use crate::config::Config;
     use crate::sandbox::{Sandbox, SandboxPolicy};
     use crate::session::Session;
+
+    #[test]
+    fn every_execution_mode_rejects_invalid_permissions_before_startup() {
+        let invalid = Config {
+            permission_regex: Some(serde_json::json!({
+                "read": {"[unterminated": "allow"}
+            })),
+            ..Config::default()
+        };
+        let modes = [
+            Cli::default(),
+            Cli {
+                print: true,
+                ..Cli::default()
+            },
+            Cli {
+                #[cfg(feature = "loop")]
+                loop_mode: true,
+                ..Cli::default()
+            },
+            Cli {
+                #[cfg(feature = "acp")]
+                acp_enabled: true,
+                ..Cli::default()
+            },
+        ];
+
+        for cli in modes {
+            let error = validate_startup_permission_policy(&cli, &invalid)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("permission-regex"), "{error}");
+            assert!(error.contains("read"), "{error}");
+            assert!(error.contains("[unterminated"), "{error}");
+        }
+
+        for cli in [
+            Cli {
+                no_tools: true,
+                ..Cli::default()
+            },
+            Cli {
+                dangerously_skip_permissions: true,
+                ..Cli::default()
+            },
+        ] {
+            let error = validate_startup_permission_policy(&cli, &invalid)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("permission-regex"), "{error}");
+            assert!(error.contains("read"), "{error}");
+            assert!(error.contains("[unterminated"), "{error}");
+        }
+    }
 
     /// Pins the two inputs that decide whether a missing backend bails or
     /// degrades. An unknown backend is never "available" on any platform, so

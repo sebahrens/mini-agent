@@ -975,7 +975,8 @@ async fn subagent_filesystem_permissions_memory_tools_inherit_parent_denial() {
         SecurityMode::Standard,
         std::env::current_dir().ok(),
         Some(vec!["standard".to_string()]),
-    );
+    )
+    .expect("valid permission test configuration");
     let authorization = SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), None);
 
     for tool in subagent_memory_tools(&authorization) {

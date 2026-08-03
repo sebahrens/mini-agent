@@ -259,7 +259,8 @@ mod tests {
             SecurityMode::Restrictive,
             Some(PathBuf::from(&temp)),
             Some(vec!["restrictive".to_string()]),
-        );
+        )
+        .expect("valid permission test configuration");
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
         let tool = ReadTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None, 100);
 

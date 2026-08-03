@@ -827,12 +827,15 @@ mod js_permission_bridge {
             read: Some(ToolPerm::Simple(action)),
             ..PermissionConfig::default()
         };
-        Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::from(config),
-            SecurityMode::Restrictive,
-            std::env::current_dir().ok(),
-            Some(vec!["restrictive".to_string()]),
-        )))
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Restrictive,
+                std::env::current_dir().ok(),
+                Some(vec!["restrictive".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ))
     }
 
     fn raw_bridge(

@@ -17,7 +17,8 @@ fn bash_tool_with_rules(rules: impl IntoIterator<Item = (String, Action)>) -> Ba
         SecurityMode::Standard,
         None,
         Some(vec!["standard".to_string()]),
-    );
+    )
+    .expect("valid permission test configuration");
     BashTool::new(
         Some(Arc::new(Mutex::new(permission))),
         None,

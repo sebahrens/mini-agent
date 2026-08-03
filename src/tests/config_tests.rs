@@ -348,6 +348,56 @@ fn yaml_round_trips_serde_json_value_fields() {
 }
 
 #[test]
+fn malformed_permission_objects_report_the_field_and_tool_path() {
+    let cfg = Config {
+        permission: Some(serde_json::json!({
+            "read": {"src/**": ["allow"]}
+        })),
+        ..Config::default()
+    };
+
+    let error = cfg.build_permission_config().unwrap_err().to_string();
+    assert!(error.contains("permission"), "{error}");
+    assert!(error.contains("read"), "{error}");
+    assert!(error.contains("src/**"), "{error}");
+}
+
+#[test]
+fn malformed_external_directory_objects_report_the_pattern_path() {
+    let cfg = Config {
+        permission: Some(serde_json::json!({
+            "external_directory": {"/private/**": ["allow"]}
+        })),
+        ..Config::default()
+    };
+
+    let error = cfg.build_permission_config().unwrap_err().to_string();
+    assert!(error.contains("permission"), "{error}");
+    assert!(error.contains("external_directory"), "{error}");
+    assert!(error.contains("/private/**"), "{error}");
+}
+
+#[test]
+fn unknown_permission_tool_is_rejected_instead_of_discarded() {
+    for field in ["permission", "permission-regex"] {
+        let mut cfg = Config::default();
+        let malformed = serde_json::json!({
+            "writ": {"secrets/**": "deny"}
+        });
+        if field == "permission" {
+            cfg.permission = Some(malformed);
+        } else {
+            cfg.permission_regex = Some(malformed);
+        }
+
+        let error = cfg.build_permission_config().unwrap_err().to_string();
+        assert!(error.contains(field), "{error}");
+        assert!(error.contains("writ"), "{error}");
+        assert!(error.contains("unsupported permission tool"), "{error}");
+    }
+}
+
+#[test]
 fn yaml_round_trips_scalar_and_nested_fields() {
     let cfg = Config {
         provider: Some(CompactString::new("openrouter")),

@@ -327,12 +327,15 @@ fn permission_for(action: Action) -> Arc<Mutex<PermissionChecker>> {
         )]))),
         ..PermissionConfig::default()
     };
-    Arc::new(Mutex::new(PermissionChecker::new(
-        &PermissionConfigs::from(permission),
-        SecurityMode::Standard,
-        None,
-        Some(vec!["standard".to_string()]),
-    )))
+    Arc::new(Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::from(permission),
+            SecurityMode::Standard,
+            None,
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid permission test configuration"),
+    ))
 }
 
 async fn call_fixture_tool(manager: &McpClientManager) -> serde_json::Value {

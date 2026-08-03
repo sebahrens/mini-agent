@@ -220,6 +220,11 @@ fn is_loopback_host(host: &str) -> bool {
 // --- Server Entry Point ---
 
 pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
+    // Keep direct callers fail-closed too. The normal binary path has already
+    // validated in `Startup::init`, before provider/client construction.
+    let mode = resolve_acp_mode(&cli, &cfg);
+    crate::permission::build_noninteractive_permission(&cli, &cfg, mode)?;
+
     let tcp_settings = resolve_tcp_settings(&cli, &cfg)?;
     let transport_mode = if tcp_settings.is_some() {
         "tcp"
@@ -386,6 +391,11 @@ async fn run_prompt(
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
+    let mode = resolve_acp_mode(&state.cli, &state.cfg);
+    let (permission, ask_tx) =
+        crate::permission::build_noninteractive_permission(&state.cli, &state.cfg, mode)
+            .map_err(|e| agent_client_protocol::Error::new(-32602, e.to_string()))?;
+
     let provider_str = state.cli.resolve_provider(&state.cfg);
     let mut model_str = state.cli.resolve_model(&state.cfg);
 
@@ -414,9 +424,6 @@ async fn run_prompt(
 
     let model = client.completion_model(model_str.to_string());
 
-    let mode = resolve_acp_mode(&state.cli, &state.cfg);
-    let (permission, ask_tx) =
-        crate::permission::build_noninteractive_permission(&state.cli, &state.cfg, mode);
     let sandbox = Sandbox::new(
         state.cli.resolve_sandbox(&state.cfg),
         &state.cli.resolve_sandbox_backend(&state.cfg),

@@ -283,7 +283,8 @@ mod tests {
             SecurityMode::Standard,
             Some(working_dir.to_path_buf()),
             Some(vec!["standard".to_string()]),
-        );
+        )
+        .expect("valid permission test configuration");
         SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), ask_tx)
     }
 

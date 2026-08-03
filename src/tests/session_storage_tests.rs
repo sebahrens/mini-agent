@@ -166,7 +166,8 @@ fn resumed_bash_allow_always_is_exact_and_does_not_widen_nested_execution() {
         SecurityMode::Restrictive,
         None,
         None,
-    );
+    )
+    .expect("valid permission test configuration");
     checker.load_session_allowlist(&entries);
 
     assert_eq!(checker.check("bash", script), CheckResult::Allowed);
