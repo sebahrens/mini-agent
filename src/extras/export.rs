@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use compact_str::CompactString;
+use pulldown_cmark::{Event, Options, Tag, TagEnd};
 use serde::Deserialize;
 
 use crate::session::{MessageRole, Session, SessionMessage};
@@ -82,20 +83,22 @@ pub fn parse_jsonl_import(content: &str) -> Result<Vec<SessionMessage>> {
 const TEMPLATE: &str = include_str!("../../data/session_export.html");
 
 /// Export a session as a standalone, self-contained HTML page. Assistant
-/// messages are rendered from markdown; all other roles are shown verbatim.
+/// messages are rendered from a safe Markdown subset; all other roles are
+/// escaped and shown verbatim.
 pub fn session_to_html(session: &Session) -> String {
     let mut messages = String::new();
     for msg in &session.messages {
         let (class, label) = role_class_label(msg, session);
         messages.push_str(&format!(
-            "<section class=\"msg {}\">\n<p class=\"role\">{}</p>\n",
-            class, label
+            "<section class=\"msg {}\">\n<p class=\"role\">",
+            class
         ));
+        escape_html_into(&mut messages, &label);
+        messages.push_str("</p>\n");
         match msg.role {
             MessageRole::Assistant => {
                 messages.push_str("<div class=\"markdown\">");
-                let parser = pulldown_cmark::Parser::new(&msg.content);
-                pulldown_cmark::html::push_html(&mut messages, parser);
+                push_safe_markdown(&mut messages, &msg.content);
                 messages.push_str("</div>\n");
             }
             _ => {
@@ -122,6 +125,149 @@ pub fn session_to_html(session: &Session) -> String {
         .replace("{{title}}", &title)
         .replace("{{meta}}", &meta)
         .replace("{{messages}}", &messages)
+}
+
+/// Render Markdown without ever passing attacker-authored HTML through to the
+/// exported document. Unsafe links and images lose their wrapper but retain
+/// their readable label/alt text.
+fn push_safe_markdown(out: &mut String, markdown: &str) {
+    let parser = pulldown_cmark::Parser::new_ext(
+        markdown,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+    );
+    let mut parser = parser.into_iter();
+    let mut suppressed_ends = Vec::new();
+    let safe_events = std::iter::from_fn(move || {
+        loop {
+            let event = parser.next()?;
+            match event {
+                Event::Html(raw) | Event::InlineHtml(raw) => return Some(Event::Text(raw)),
+                Event::Start(Tag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }) => {
+                    if export_url_is_safe(&dest_url, false) {
+                        return Some(Event::Start(Tag::Link {
+                            link_type,
+                            dest_url,
+                            title,
+                            id,
+                        }));
+                    } else {
+                        suppressed_ends.push(TagEnd::Link);
+                    }
+                }
+                Event::Start(Tag::Image {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }) => {
+                    if export_url_is_safe(&dest_url, true) {
+                        return Some(Event::Start(Tag::Image {
+                            link_type,
+                            dest_url,
+                            title,
+                            id,
+                        }));
+                    } else {
+                        suppressed_ends.push(TagEnd::Image);
+                    }
+                }
+                Event::End(end) if suppressed_ends.last() == Some(&end) => {
+                    suppressed_ends.pop();
+                }
+                other => return Some(other),
+            }
+        }
+    });
+
+    pulldown_cmark::html::push_html(out, safe_events);
+}
+
+/// Allow only navigation schemes that cannot execute document script. Images
+/// are stricter than links and must use HTTPS. Relative links remain usable in
+/// a locally saved export, except protocol-relative URLs.
+fn export_url_is_safe(raw: &str, image: bool) -> bool {
+    let mut decoded = raw.to_string();
+    for _ in 0..4 {
+        let next = percent_decode_once(&decoded);
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+
+    let candidate = decoded.trim_matches(|character: char| {
+        character.is_ascii_whitespace() || character.is_ascii_control()
+    });
+    if candidate.is_empty() || candidate.starts_with("//") {
+        return false;
+    }
+
+    let boundary = candidate
+        .char_indices()
+        .find(|(_, character)| matches!(character, ':' | '/' | '?' | '#'));
+    let Some((index, delimiter)) = boundary else {
+        return !image && !candidate.contains('%');
+    };
+
+    if candidate[..index].contains('%') {
+        return false;
+    }
+    if delimiter != ':' {
+        return !image;
+    }
+
+    let scheme: String = candidate[..index]
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace() && !character.is_ascii_control())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    if scheme.is_empty()
+        || !scheme.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+    {
+        return false;
+    }
+
+    if image {
+        scheme == "https"
+    } else {
+        matches!(scheme.as_str(), "http" | "https" | "mailto")
+    }
+}
+
+fn percent_decode_once(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn session_title(session: &Session) -> String {
