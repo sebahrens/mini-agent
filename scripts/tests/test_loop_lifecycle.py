@@ -21,6 +21,12 @@ def extract_function(source: str, name: str, next_name: str) -> str:
 
 
 class LoopLifecycleTests(unittest.TestCase):
+    def test_production_verifier_never_selects_the_research_spike(self) -> None:
+        source = LOOP_SCRIPT.read_text()
+
+        self.assertIn("standalone spike/", source)
+        self.assertNotIn('existing_crates+="spike"', source)
+
     def test_verification_errors_are_appended_with_real_newlines(self) -> None:
         source = LOOP_SCRIPT.read_text()
         append_function = extract_function(

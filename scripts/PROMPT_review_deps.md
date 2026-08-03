@@ -80,10 +80,11 @@ mcp__narsil-mcp__get_import_graph()
 
 ### 6. Workspace dependency consistency
 
-The workspace has two members: root (`mini-agent`) and `spike/`. Check:
-- Does `spike/Cargo.toml` declare `rquickjs` independently from the workspace?
-- Could `rquickjs` be a workspace-level dependency to unify versions?
-- Are there version mismatches between spike/ and root for shared deps?
+The production workspace contains only root (`mini-agent`); `spike/` is a standalone research
+workspace. Check:
+- Does root metadata remain free of the spike package and its research-only dependencies?
+- Does `spike/Cargo.toml` remain independently runnable with its own lockfile?
+- Has any production source started importing the standalone research crate?
 
 ## Deduplication protocol
 
