@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::process::Output;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -16,8 +14,15 @@ pub struct Sandbox {
     backend: String,
     shell: String,
     shell_command_arg: String,
+    disabled_reason: DisabledSandboxReason,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisabledSandboxReason {
+    UserTrustedBypass,
+    UnavailableDefaultFallback,
 }
 
 /// Hard bounds for one captured subprocess.
@@ -68,12 +73,10 @@ pub(crate) struct CommandOutput {
 /// observes the signal, kills that child's process group, and reaps it before
 /// reporting [`CommandStatus::Cancelled`].
 #[derive(Debug, Clone)]
-#[cfg(feature = "loop")]
 pub(crate) struct CommandCancellation {
     sender: watch::Sender<bool>,
 }
 
-#[cfg(feature = "loop")]
 impl CommandCancellation {
     pub(crate) fn new() -> Self {
         let (sender, _) = watch::channel(false);
@@ -90,6 +93,160 @@ impl CommandCancellation {
 
     fn subscribe(&self) -> watch::Receiver<bool> {
         self.sender.subscribe()
+    }
+}
+
+/// Trust boundary selected for a human-authored `!` shell command.
+///
+/// This is deliberately separate from model permission policy: typing `!` is
+/// the authorization event. The command still uses the configured general
+/// sandbox when one was selected, and names the uncontained alternative
+/// explicitly when sandboxing was disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExplicitShellBoundary {
+    UserTrustedBypass,
+    UnavailableDefaultFallback { backend: String },
+    GeneralSandbox { backend: String },
+    RequestedButUnavailable { backend: String },
+}
+
+impl ExplicitShellBoundary {
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::UserTrustedBypass => "user-trusted-bypass".to_string(),
+            Self::UnavailableDefaultFallback { backend } => {
+                format!("unsandboxed-unavailable-default-fallback:{backend}")
+            }
+            Self::GeneralSandbox { backend } => format!("general-sandbox:{backend}"),
+            Self::RequestedButUnavailable { backend } => {
+                format!("requested-but-unavailable:{backend}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExplicitShellAudit {
+    /// Exact opaque script after the leading `!`, including whitespace.
+    pub command: String,
+    /// Process working directory captured immediately before construction.
+    pub cwd: PathBuf,
+    pub boundary: ExplicitShellBoundary,
+}
+
+struct OwnedExplicitShellAudit {
+    metadata: ExplicitShellAudit,
+    dispatch: tracing::Dispatch,
+}
+
+impl OwnedExplicitShellAudit {
+    fn capture(metadata: ExplicitShellAudit) -> Self {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        Self { metadata, dispatch }
+    }
+
+    fn emit(&self, output: &CommandOutput) {
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            audit_explicit_shell(&self.metadata, output);
+        });
+    }
+}
+
+pub(crate) struct ExplicitShellRun {
+    pub audit: ExplicitShellAudit,
+    pub output: CommandOutput,
+}
+
+impl ExplicitShellRun {
+    pub(crate) fn succeeded(&self) -> bool {
+        self.output.status == CommandStatus::Completed
+            && self
+                .output
+                .exit_status
+                .as_ref()
+                .is_some_and(ExitStatus::success)
+    }
+
+    /// One rendering policy shared by headless and TUI callers.
+    pub(crate) fn rendered_output(&self) -> String {
+        let mut rendered = String::new();
+        if !self.output.stdout.is_empty() {
+            rendered.push_str(&String::from_utf8_lossy(&self.output.stdout));
+        }
+        if !self.output.stderr.is_empty() {
+            if !rendered.is_empty() && !rendered.ends_with('\n') {
+                rendered.push('\n');
+            }
+            rendered.push_str(&String::from_utf8_lossy(&self.output.stderr));
+        }
+        let rendered = rendered.trim().to_string();
+        let boundary = self.audit.boundary.label();
+        let status = match self.output.status {
+            CommandStatus::Completed if self.succeeded() => None,
+            CommandStatus::Completed => Some(match self.output.exit_status.as_ref() {
+                Some(status) => match status.code() {
+                    Some(code) => {
+                        format!("explicit shell exited with status {code}; boundary={boundary}")
+                    }
+                    None => format!("explicit shell exited by signal; boundary={boundary}"),
+                },
+                None => format!("explicit shell failed; boundary={boundary}"),
+            }),
+            CommandStatus::TimedOut => {
+                Some(format!("explicit shell timed out; boundary={boundary}"))
+            }
+            CommandStatus::Cancelled => {
+                Some(format!("explicit shell cancelled; boundary={boundary}"))
+            }
+            CommandStatus::OutputLimitExceeded(limit) => Some(format!(
+                "explicit shell exceeded {} output limit; boundary={boundary}",
+                match limit {
+                    CommandOutputLimit::Stdout => "stdout",
+                    CommandOutputLimit::Stderr => "stderr",
+                    CommandOutputLimit::Combined => "combined",
+                }
+            )),
+            CommandStatus::Failed => Some(format!("explicit shell failed; boundary={boundary}")),
+        };
+        match (rendered.is_empty(), status) {
+            (true, Some(status)) => format!("[{status}]"),
+            (false, Some(status)) => format!("{rendered}\n[{status}]"),
+            (_, None) => rendered,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SupportCommandLimits {
+    pub timeout: std::time::Duration,
+}
+
+/// Source-free metadata that the owned support-command worker carries until
+/// after terminal process-tree cleanup. Keeping this outside the awaiting
+/// caller makes caller-drop cancellation auditable.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SupportCommandAudit {
+    utility: &'static str,
+    boundary: &'static str,
+}
+
+impl SupportCommandAudit {
+    pub(crate) const fn new(utility: &'static str, boundary: &'static str) -> Self {
+        Self { utility, boundary }
+    }
+}
+
+struct OwnedSupportCommandAudit {
+    metadata: SupportCommandAudit,
+    cwd: PathBuf,
+    dispatch: tracing::Dispatch,
+}
+
+impl OwnedSupportCommandAudit {
+    fn emit(&self, output: &CommandOutput) {
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            audit_support_command(self, output);
+        });
     }
 }
 
@@ -245,6 +402,70 @@ pub(crate) struct ProcessGroupGuard {
     active_groups: Arc<Mutex<HashSet<u32>>>,
 }
 
+/// Gives an interactive child process group foreground terminal ownership and
+/// restores mini-agent's group before the TUI resumes drawing.
+#[cfg(unix)]
+struct ForegroundProcessGroupGuard {
+    original: nix::unistd::Pid,
+}
+
+#[cfg(unix)]
+impl ForegroundProcessGroupGuard {
+    fn acquire(pid: Option<u32>) -> Result<Option<Self>, String> {
+        use std::io::IsTerminal;
+
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            return Ok(None);
+        }
+        let pid =
+            i32::try_from(pid.ok_or_else(|| {
+                "interactive support child did not expose a process ID".to_string()
+            })?)
+            .map_err(|_| "interactive support child process ID exceeded pid_t".to_string())?;
+        let original = nix::unistd::tcgetpgrp(&stdin)
+            .map_err(|error| format!("failed to read terminal process group: {error}"))?;
+        if original != nix::unistd::getpgrp() {
+            return Err(
+                "mini-agent does not own the foreground terminal process group".to_string(),
+            );
+        }
+        set_terminal_foreground_group(&stdin, nix::unistd::Pid::from_raw(pid))
+            .map_err(|error| format!("failed to hand terminal to support child: {error}"))?;
+        Ok(Some(Self { original }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForegroundProcessGroupGuard {
+    fn drop(&mut self) {
+        let stdin = std::io::stdin();
+        if let Err(error) = set_terminal_foreground_group(&stdin, self.original) {
+            tracing::warn!("support command: failed to restore terminal process group: {error}");
+        }
+    }
+}
+
+/// `tcsetpgrp` from a background group would normally stop the caller with
+/// SIGTTOU. Ignore that signal only around the atomic handoff, then restore
+/// the prior disposition immediately.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn set_terminal_foreground_group(
+    terminal: &std::io::Stdin,
+    group: nix::unistd::Pid,
+) -> nix::Result<()> {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+
+    // SAFETY: SIGTTOU is changed process-wide for only the two synchronous
+    // operations below and the previous disposition is restored before return.
+    let previous = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn)? };
+    let result = nix::unistd::tcsetpgrp(terminal, group);
+    // SAFETY: `previous` came directly from the successful signal call above.
+    let restore = unsafe { signal(Signal::SIGTTOU, previous) };
+    result.and(restore.map(|_| ()))
+}
+
 impl ProcessGroupGuard {
     pub(crate) fn new(pid: Option<u32>, active_groups: Arc<Mutex<HashSet<u32>>>) -> Self {
         if let Some(pid) = pid {
@@ -285,6 +506,7 @@ impl Sandbox {
             backend: backend.to_string(),
             shell: "bash".to_string(),
             shell_command_arg: "-c".to_string(),
+            disabled_reason: DisabledSandboxReason::UserTrustedBypass,
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -377,8 +599,41 @@ impl Sandbox {
         }
     }
 
+    pub(crate) fn explicit_shell_boundary(&self) -> ExplicitShellBoundary {
+        match self.policy() {
+            SandboxPolicy::Disabled => match self.disabled_reason {
+                DisabledSandboxReason::UserTrustedBypass => {
+                    ExplicitShellBoundary::UserTrustedBypass
+                }
+                DisabledSandboxReason::UnavailableDefaultFallback => {
+                    ExplicitShellBoundary::UnavailableDefaultFallback {
+                        backend: self.backend.clone(),
+                    }
+                }
+            },
+            SandboxPolicy::RequiredAndAvailable => ExplicitShellBoundary::GeneralSandbox {
+                backend: self.backend.clone(),
+            },
+            SandboxPolicy::RequiredButUnavailable => {
+                ExplicitShellBoundary::RequestedButUnavailable {
+                    backend: self.backend.clone(),
+                }
+            }
+        }
+    }
+
     pub fn with_shell(self, shell: &str) -> Self {
         self.with_shell_command_arg(shell, "-c")
+    }
+
+    /// Preserve why startup disabled sandboxing after an unavailable backend
+    /// was inherited from defaults. This is unsandboxed, but it is not the
+    /// operator's explicit `--no-sandbox` trusted bypass.
+    pub(crate) fn with_unavailable_default_fallback(mut self) -> Self {
+        if !self.enabled {
+            self.disabled_reason = DisabledSandboxReason::UnavailableDefaultFallback;
+        }
+        self
     }
 
     /// Selects a shell whose script flag differs from the POSIX `-c`
@@ -687,27 +942,6 @@ impl Sandbox {
         cmd
     }
 
-    #[cfg(test)]
-    pub async fn output_command(&self, command: &str) -> std::io::Result<Output> {
-        let output = self
-            .output_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
-            .await?;
-        if output.status != CommandStatus::Completed {
-            return Err(std::io::Error::other(format!(
-                "command did not complete: {:?}",
-                output.status
-            )));
-        }
-        let status = output
-            .exit_status
-            .ok_or_else(|| std::io::Error::other("completed command had no exit status"))?;
-        Ok(Output {
-            status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
-    }
-
     /// Runs a command on a background task so dropping the receiver is an
     /// observable cancellation event. The worker owns the child until it has
     /// killed the process group and reaped the direct child.
@@ -718,6 +952,109 @@ impl Sandbox {
     ) -> std::io::Result<CommandOutput> {
         self.output_command_with_limits_scoped(command, limits, None)
             .await
+    }
+
+    /// Run one human-authored explicit shell interaction through the selected
+    /// general process boundary and the common bounded output worker.
+    ///
+    /// `interaction` includes the leading `!`; everything after it is passed
+    /// to the configured shell exactly as authored. Whitespace is inspected
+    /// only to reject an empty command and is never normalized for execution.
+    pub(crate) async fn run_explicit_shell(
+        &self,
+        interaction: &str,
+        limits: CommandLimits,
+        cancellation: Option<&CommandCancellation>,
+    ) -> std::io::Result<ExplicitShellRun> {
+        let command = interaction.strip_prefix('!').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "explicit shell interaction must start with '!'",
+            )
+        })?;
+        if command.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty command after '!'",
+            ));
+        }
+
+        let cwd = std::env::current_dir()?;
+        let boundary = self.explicit_shell_boundary();
+        let audit = ExplicitShellAudit {
+            command: command.to_string(),
+            cwd: cwd.clone(),
+            boundary,
+        };
+        let mut cmd = match self.wrap_command(command) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                let output = CommandOutput {
+                    exit_status: None,
+                    stdout: Vec::new(),
+                    stderr: error.into_bytes(),
+                    status: CommandStatus::Failed,
+                };
+                audit_explicit_shell(&audit, &output);
+                let run = ExplicitShellRun { audit, output };
+                return Ok(run);
+            }
+        };
+        // Apply an explicit snapshot even for the intentional uncontained
+        // branch, which would otherwise inherit cwd only at the later spawn.
+        cmd.current_dir(&cwd);
+        let cancellation = cancellation.map(CommandCancellation::subscribe);
+        let output = self
+            .output_built_command_with_limits_scoped(
+                cmd,
+                limits,
+                cancellation,
+                Some(OwnedExplicitShellAudit::capture(audit.clone())),
+            )
+            .await?;
+        Ok(ExplicitShellRun { audit, output })
+    }
+
+    /// Run an interactive support utility with inherited stdio but the same
+    /// process-group ownership and finite-lifetime guarantees as captured
+    /// commands. This is not a shell and does not use model permissions.
+    pub(crate) async fn status_support_command(
+        &self,
+        mut cmd: Command,
+        limits: SupportCommandLimits,
+        audit: SupportCommandAudit,
+    ) -> std::io::Result<CommandOutput> {
+        let cwd = std::env::current_dir()?;
+        cmd.current_dir(&cwd);
+        configure_child_lifetime(&mut cmd);
+        let (response_tx, response_rx) = oneshot::channel();
+        let sandbox = self.clone();
+        let audit = OwnedSupportCommandAudit {
+            metadata: audit,
+            cwd,
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+        };
+        tokio::spawn(async move {
+            sandbox
+                .run_built_status_command(cmd, limits, audit, response_tx)
+                .await;
+        });
+        response_rx.await.map_err(|_| {
+            std::io::Error::other("support command worker stopped before returning a result")
+        })
+    }
+
+    /// Captured companion for short support-utility probes such as
+    /// `lazygit --version`.
+    pub(crate) async fn output_support_command(
+        &self,
+        mut cmd: Command,
+        limits: CommandLimits,
+    ) -> std::io::Result<CommandOutput> {
+        let cwd = std::env::current_dir()?;
+        cmd.current_dir(cwd);
+        configure_child_lifetime(&mut cmd);
+        self.output_built_command_with_limits(cmd, limits).await
     }
 
     #[cfg(feature = "loop")]
@@ -756,7 +1093,7 @@ impl Sandbox {
                 });
             }
         };
-        self.output_built_command_with_limits_scoped(cmd, limits, cancellation)
+        self.output_built_command_with_limits_scoped(cmd, limits, cancellation, None)
             .await
     }
 
@@ -765,7 +1102,7 @@ impl Sandbox {
         cmd: Command,
         limits: CommandLimits,
     ) -> std::io::Result<CommandOutput> {
-        self.output_built_command_with_limits_scoped(cmd, limits, None)
+        self.output_built_command_with_limits_scoped(cmd, limits, None, None)
             .await
     }
 
@@ -774,12 +1111,13 @@ impl Sandbox {
         cmd: Command,
         limits: CommandLimits,
         cancellation: Option<watch::Receiver<bool>>,
+        audit: Option<OwnedExplicitShellAudit>,
     ) -> std::io::Result<CommandOutput> {
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
         tokio::spawn(async move {
             sandbox
-                .run_built_output_command(cmd, limits, cancellation, response_tx)
+                .run_built_output_command(cmd, limits, cancellation, audit, response_tx)
                 .await;
         });
         response_rx.await.map_err(|_| {
@@ -792,30 +1130,39 @@ impl Sandbox {
         mut cmd: Command,
         limits: CommandLimits,
         mut cancellation: Option<watch::Receiver<bool>>,
+        audit: Option<OwnedExplicitShellAudit>,
         mut response_tx: oneshot::Sender<CommandOutput>,
     ) {
         if cancellation
             .as_ref()
             .is_some_and(|receiver| *receiver.borrow())
         {
-            let _ = response_tx.send(CommandOutput {
+            let output = CommandOutput {
                 exit_status: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 status: CommandStatus::Cancelled,
-            });
+            };
+            if let Some(audit) = &audit {
+                audit.emit(&output);
+            }
+            let _ = response_tx.send(output);
             return;
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
-                let _ = response_tx.send(CommandOutput {
+                let output = CommandOutput {
                     exit_status: None,
                     stdout: Vec::new(),
                     stderr: format!("failed to spawn command: {error}").into_bytes(),
                     status: CommandStatus::Failed,
-                });
+                };
+                if let Some(audit) = &audit {
+                    audit.emit(&output);
+                }
+                let _ = response_tx.send(output);
                 return;
             }
         };
@@ -922,6 +1269,96 @@ impl Sandbox {
             status: command_status,
         };
         drop(captured);
+        if let Some(audit) = &audit {
+            audit.emit(&output);
+        }
+        let _ = response_tx.send(output);
+    }
+
+    async fn run_built_status_command(
+        &self,
+        mut cmd: Command,
+        limits: SupportCommandLimits,
+        audit: OwnedSupportCommandAudit,
+        mut response_tx: oneshot::Sender<CommandOutput>,
+    ) {
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let output = CommandOutput {
+                    exit_status: None,
+                    stdout: Vec::new(),
+                    stderr: format!("failed to spawn support command: {error}").into_bytes(),
+                    status: CommandStatus::Failed,
+                };
+                audit.emit(&output);
+                let _ = response_tx.send(output);
+                return;
+            }
+        };
+        let pid = child.id();
+        let mut guard = ProcessGroupGuard::new(pid, self.active_groups.clone());
+        #[cfg(unix)]
+        let foreground = match ForegroundProcessGroupGuard::acquire(pid) {
+            Ok(foreground) => foreground,
+            Err(error) => {
+                terminate_and_reap(&mut child, pid).await;
+                guard.disarm();
+                let output = CommandOutput {
+                    exit_status: None,
+                    stdout: Vec::new(),
+                    stderr: error.into_bytes(),
+                    status: CommandStatus::Failed,
+                };
+                audit.emit(&output);
+                let _ = response_tx.send(output);
+                return;
+            }
+        };
+        let termination = tokio::select! {
+            biased;
+            status = child.wait() => CommandTermination::Exited(status),
+            _ = tokio::time::sleep(limits.timeout) => CommandTermination::TimedOut,
+            _ = response_tx.closed() => CommandTermination::Cancelled,
+        };
+        let (exit_status, status) = match termination {
+            CommandTermination::Exited(Ok(status)) => {
+                if let Some(pid) = pid {
+                    kill_process_group(pid);
+                }
+                let command_status = if self.take_cancelled(pid) {
+                    CommandStatus::Cancelled
+                } else {
+                    CommandStatus::Completed
+                };
+                (Some(status), command_status)
+            }
+            CommandTermination::Exited(Err(error)) => {
+                tracing::warn!("support command: failed to wait: {error}");
+                terminate_and_reap(&mut child, pid).await;
+                (None, CommandStatus::Failed)
+            }
+            CommandTermination::TimedOut => {
+                terminate_and_reap(&mut child, pid).await;
+                (None, CommandStatus::TimedOut)
+            }
+            CommandTermination::Cancelled => {
+                terminate_and_reap(&mut child, pid).await;
+                (None, CommandStatus::Cancelled)
+            }
+            CommandTermination::ReaderError(_) => unreachable!("support commands have no readers"),
+        };
+        guard.disarm();
+        self.take_cancelled(pid);
+        #[cfg(unix)]
+        drop(foreground);
+        let output = CommandOutput {
+            exit_status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status,
+        };
+        audit.emit(&output);
         let _ = response_tx.send(output);
     }
 
@@ -971,6 +1408,74 @@ async fn wait_for_command_cancellation(cancellation: Option<&mut watch::Receiver
         if cancellation.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
+    }
+}
+
+fn audit_explicit_shell(audit: &ExplicitShellAudit, output: &CommandOutput) {
+    let succeeded = output.status == CommandStatus::Completed
+        && output.exit_status.as_ref().is_some_and(ExitStatus::success);
+    let outcome = match output.status {
+        CommandStatus::Completed if succeeded => "success",
+        CommandStatus::Completed => "nonzero",
+        CommandStatus::TimedOut => "timeout",
+        CommandStatus::Cancelled => "cancelled",
+        CommandStatus::OutputLimitExceeded(_) => "output-limit",
+        CommandStatus::Failed => "failed",
+    };
+    if succeeded {
+        tracing::info!(
+            target: "zerostack::audit::explicit_shell",
+            trust_class = "TC-EXPLICIT-USER-SHELL",
+            command = audit.command,
+            cwd = %audit.cwd.display(),
+            boundary = audit.boundary.label(),
+            outcome,
+            "explicit user shell ended after process cleanup"
+        );
+    } else {
+        tracing::warn!(
+            target: "zerostack::audit::explicit_shell",
+            trust_class = "TC-EXPLICIT-USER-SHELL",
+            command = audit.command,
+            cwd = %audit.cwd.display(),
+            boundary = audit.boundary.label(),
+            outcome,
+            "explicit user shell ended after process cleanup"
+        );
+    }
+}
+
+fn audit_support_command(audit: &OwnedSupportCommandAudit, output: &CommandOutput) {
+    let succeeded = output.status == CommandStatus::Completed
+        && output.exit_status.as_ref().is_some_and(ExitStatus::success);
+    let outcome = match output.status {
+        CommandStatus::Completed if succeeded => "success",
+        CommandStatus::Completed => "nonzero",
+        CommandStatus::TimedOut => "timeout",
+        CommandStatus::Cancelled => "cancelled",
+        CommandStatus::OutputLimitExceeded(_) => "output-limit",
+        CommandStatus::Failed => "failed",
+    };
+    if succeeded {
+        tracing::info!(
+            target: "zerostack::audit::support_utility",
+            trust_class = "TC-SUPPORT-UTILITY",
+            utility = audit.metadata.utility,
+            cwd = %audit.cwd.display(),
+            boundary = audit.metadata.boundary,
+            outcome,
+            "support utility completed after process cleanup"
+        );
+    } else {
+        tracing::warn!(
+            target: "zerostack::audit::support_utility",
+            trust_class = "TC-SUPPORT-UTILITY",
+            utility = audit.metadata.utility,
+            cwd = %audit.cwd.display(),
+            boundary = audit.metadata.boundary,
+            outcome,
+            "support utility ended after process cleanup"
+        );
     }
 }
 

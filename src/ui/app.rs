@@ -14,6 +14,10 @@ use crate::event::{AgentEvent, BtwEvent, UserEvent};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::provider::AnyAgent;
+use crate::sandbox::CommandCancellation;
+use crate::sandbox::{
+    CommandLimits, CommandStatus, DEFAULT_COMMAND_LIMITS, SupportCommandAudit, SupportCommandLimits,
+};
 use crate::session::MessageRole;
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
@@ -92,6 +96,7 @@ pub(crate) struct App<'a> {
 
     user_tx: mpsc::Sender<UserEvent>,
     user_rx: mpsc::Receiver<UserEvent>,
+    deferred_user_events: std::collections::VecDeque<UserEvent>,
     running: Arc<AtomicBool>,
     event_handle: Option<std::thread::JoinHandle<()>>,
     prebuild_rx: Option<mpsc::Receiver<PrebuildPayload>>,
@@ -372,6 +377,7 @@ impl<'a> App<'a> {
             btw_total_out: 0,
             user_tx,
             user_rx,
+            deferred_user_events: std::collections::VecDeque::new(),
             running,
             event_handle,
             prebuild_rx,
@@ -381,6 +387,12 @@ impl<'a> App<'a> {
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         loop {
+            if let Some(event) = self.deferred_user_events.pop_front() {
+                match self.handle_user_event(event).await? {
+                    ControlFlow::Break(()) => break,
+                    ControlFlow::Continue(()) => continue,
+                }
+            }
             self.ui.session.reasoning_enabled = self.slash.reasoning_enabled;
             if self.last_branch_check.elapsed() >= Duration::from_secs(1) {
                 self.ui.session.refresh_git_branch();
@@ -690,7 +702,7 @@ impl<'a> App<'a> {
         }
 
         if key.code == KeyCode::Char('h') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.run_lazygit()?;
+            self.run_lazygit().await?;
             return Ok(());
         }
 
@@ -1636,8 +1648,10 @@ impl<'a> App<'a> {
     }
 
     async fn run_bang_command(&mut self, text: &str) -> anyhow::Result<()> {
-        let cmd = text.strip_prefix('!').map(|s| s.trim()).unwrap_or("");
-        if cmd.is_empty() {
+        if !text
+            .strip_prefix('!')
+            .is_some_and(|command| !command.trim().is_empty())
+        {
             self.renderer
                 .write_line("error: empty command after '!'", C_ERROR)?;
             return Ok(());
@@ -1649,39 +1663,39 @@ impl<'a> App<'a> {
         }
         self.renderer.write_line("", Color::White)?;
 
-        let cmd_owned = cmd.to_string();
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("bash")
-                .arg("-c")
-                .arg(&cmd_owned)
-                .output()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn error: {}", e))?
-        .map_err(|e| anyhow::anyhow!("command error: {}", e))?;
-
-        let mut result = String::new();
-        if !output.stdout.is_empty() {
-            result.push_str(&String::from_utf8_lossy(&output.stdout));
-        }
-        if !output.stderr.is_empty() {
-            if !result.is_empty() {
-                result.push('\n');
+        let cancellation = CommandCancellation::new();
+        let sandbox = self.ui.sandbox.clone();
+        let operation =
+            sandbox.run_explicit_shell(text, DEFAULT_COMMAND_LIMITS, Some(&cancellation));
+        tokio::pin!(operation);
+        let run = loop {
+            tokio::select! {
+                result = &mut operation => break result?,
+                event = self.user_rx.recv() => {
+                    let Some(event) = event else {
+                        cancellation.cancel();
+                        break operation.await?;
+                    };
+                    let interrupt = matches!(
+                        &event,
+                        UserEvent::Key(key)
+                            if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                    );
+                    if interrupt {
+                        cancellation.cancel();
+                    } else {
+                        self.deferred_user_events.push_back(event);
+                    }
+                }
             }
-            result.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
-        let result = result.trim().to_string();
+        };
+        let result = run.rendered_output();
 
         for line in result.lines() {
             let safe_line = sanitize_output(line);
-            self.renderer.write_line(
-                &safe_line,
-                if output.status.success() {
-                    C_AGENT
-                } else {
-                    C_ERROR
-                },
-            )?;
+            self.renderer
+                .write_line(&safe_line, if run.succeeded() { C_AGENT } else { C_ERROR })?;
         }
         self.renderer.write_line("", Color::White)?;
 
@@ -1848,14 +1862,71 @@ impl<'a> App<'a> {
         ));
     }
 
-    fn run_lazygit(&mut self) -> anyhow::Result<()> {
-        if std::process::Command::new("lazygit")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+    async fn run_lazygit(&mut self) -> anyhow::Result<()> {
+        const PROBE_LIMITS: CommandLimits = CommandLimits {
+            timeout: Duration::from_secs(5),
+            stdout_bytes: 64 * 1024,
+            stderr_bytes: 64 * 1024,
+            combined_bytes: 64 * 1024,
+        };
+        const INTERACTIVE_LIMITS: SupportCommandLimits = SupportCommandLimits {
+            timeout: Duration::from_secs(24 * 60 * 60),
+        };
+        let cwd = std::env::current_dir()?;
+
+        let mut probe = tokio::process::Command::new("lazygit");
+        probe.arg("--version");
+        let probe_result = self
+            .ui
+            .sandbox
+            .output_support_command(probe, PROBE_LIMITS)
+            .await;
+        let available = probe_result.as_ref().is_ok_and(|output| {
+            output.status == CommandStatus::Completed
+                && output
+                    .exit_status
+                    .as_ref()
+                    .is_some_and(|status| status.success())
+        });
+        match &probe_result {
+            Ok(_) if available => {
+                tracing::info!(
+                    target: "zerostack::audit::support_utility",
+                    trust_class = "TC-SUPPORT-UTILITY",
+                    utility = "lazygit-version-probe",
+                    cwd = %cwd.display(),
+                    boundary = "user-trusted-bypass",
+                    outcome = "success",
+                    "support utility probe completed"
+                );
+            }
+            Ok(output) => {
+                tracing::warn!(
+                    target: "zerostack::audit::support_utility",
+                    trust_class = "TC-SUPPORT-UTILITY",
+                    utility = "lazygit-version-probe",
+                    cwd = %cwd.display(),
+                    boundary = "user-trusted-bypass",
+                    outcome = ?output.status,
+                    "support utility probe did not complete successfully"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zerostack::audit::support_utility",
+                    trust_class = "TC-SUPPORT-UTILITY",
+                    utility = "lazygit-version-probe",
+                    cwd = %cwd.display(),
+                    boundary = "user-trusted-bypass",
+                    outcome = "runner-error",
+                    error = %error,
+                    "support utility probe failed"
+                );
+            }
+        }
+        if !available {
             self.renderer.write_line(
-                "warning: lazygit not found — install it (https://github.com/jesseduffield/lazygit)",
+                "warning: lazygit unavailable or version probe failed — install it (https://github.com/jesseduffield/lazygit)",
                 C_ERROR,
             )?;
             return Ok(());
@@ -1869,7 +1940,16 @@ impl<'a> App<'a> {
         let _ = stdout.execute(crossterm::event::DisableMouseCapture);
         let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
         let _ = stdout.flush();
-        let _ = std::process::Command::new("lazygit").status();
+        let command = tokio::process::Command::new("lazygit");
+        let result = self
+            .ui
+            .sandbox
+            .status_support_command(
+                command,
+                INTERACTIVE_LIMITS,
+                SupportCommandAudit::new("lazygit", "user-trusted-bypass"),
+            )
+            .await;
         let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
         let _ = stdout.execute(crossterm::terminal::Clear(
             crossterm::terminal::ClearType::All,
@@ -1877,6 +1957,31 @@ impl<'a> App<'a> {
         let _ = stdout.execute(crossterm::event::EnableMouseCapture);
         let _ = crossterm::terminal::enable_raw_mode();
         self.rebind_event_thread();
+        match result {
+            Ok(output)
+                if output.status == CommandStatus::Completed
+                    && output.exit_status.is_some_and(|status| status.success()) => {}
+            Ok(output) => {
+                self.renderer.write_line(
+                    &format!("warning: lazygit ended with {:?}", output.status),
+                    C_ERROR,
+                )?;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zerostack::audit::support_utility",
+                    trust_class = "TC-SUPPORT-UTILITY",
+                    utility = "lazygit",
+                    cwd = %cwd.display(),
+                    boundary = "user-trusted-bypass",
+                    outcome = "runner-error",
+                    error = %error,
+                    "support utility failed"
+                );
+                self.renderer
+                    .write_line(&format!("warning: lazygit failed: {error}"), C_ERROR)?;
+            }
+        }
         Ok(())
     }
 

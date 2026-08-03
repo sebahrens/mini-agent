@@ -238,6 +238,16 @@ Prefix a message with `!` to run it as a shell command instead of sending it to
 the agent. The command's output is captured and stored in the session history as
 an Assistant message. Works in both TUI and `--print` mode.
 
+Shell commands use the configured general sandbox when it is enabled. Running
+with `--no-sandbox` is an explicit user-trusted bypass that inherits the parent
+environment. If a sandbox enabled only by defaults is unavailable, startup may
+continue unsandboxed after warning, but audit and failures label that condition
+`unsandboxed-unavailable-default-fallback:<backend>` rather than claiming the
+operator chose the bypass. An explicitly requested unavailable sandbox still
+fails closed. Output is capped (1 MiB per stream, 1.5 MiB combined), commands
+time out after 30 seconds, and TUI `Ctrl+C`/`Ctrl+D` cancels the whole process
+tree before accepting the next command.
+
 | Example | Description |
 | ------- | ----------- |
 | `!ls -la` | List files in the current directory. |
@@ -276,7 +286,7 @@ message, and after the response restores the previous prompt and
 | -------- | ------ |
 | `Enter` | Send message. |
 | `Shift+Enter` | Insert newline. |
-| `Ctrl+C` | Cancel current agent response or quit. |
+| `Ctrl+C` | Cancel the current agent response, validation, or shell command; quit when idle. |
 | `Ctrl+D` | Send message (alternative). |
 | `Ctrl+W` | Delete word backwards. |
 | `Ctrl+U` | Delete to beginning of line. |

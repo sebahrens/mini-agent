@@ -10,7 +10,7 @@ use crate::permission::SecurityMode;
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::provider::{self, AnyClient};
-use crate::sandbox::{Sandbox, SandboxPolicy};
+use crate::sandbox::{DEFAULT_COMMAND_LIMITS, Sandbox, SandboxPolicy};
 use crate::session::{self, MessageRole, Session};
 
 #[cfg(feature = "advisor")]
@@ -589,8 +589,9 @@ impl Startup {
             tracing::warn!(
                 "sandbox backend '{backend}' was not found — continuing UNSANDBOXED; pass --sandbox to fail closed instead"
             );
-            self.sandbox =
-                Sandbox::new(false, &backend).with_shell(&self.cli.resolve_shell(&self.cfg));
+            self.sandbox = Sandbox::new(false, &backend)
+                .with_shell(&self.cli.resolve_shell(&self.cfg))
+                .with_unavailable_default_fallback();
         }
         let edit_system = self.cli.resolve_edit_system(&self.cfg);
         tools::set_edit_system(edit_system);
@@ -971,23 +972,15 @@ impl Startup {
     async fn dispatch_print(self) -> anyhow::Result<()> {
         let msg = self.cli.message.join(" ");
         if msg.starts_with('!') {
-            let cmd = msg.strip_prefix('!').map(|s| s.trim()).unwrap_or("");
-            if !cmd.is_empty() {
-                let output = std::process::Command::new("bash")
-                    .arg("-c")
-                    .arg(cmd)
-                    .output()?;
-                let mut result = String::new();
-                if !output.stdout.is_empty() {
-                    result.push_str(&String::from_utf8_lossy(&output.stdout));
-                }
-                if !output.stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
-                let result = result.trim().to_string();
+            if msg
+                .strip_prefix('!')
+                .is_some_and(|command| !command.trim().is_empty())
+            {
+                let run = self
+                    .sandbox
+                    .run_explicit_shell(&msg, DEFAULT_COMMAND_LIMITS, None)
+                    .await?;
+                let result = run.rendered_output();
                 println!("{}", result);
                 if !self.cli.no_session {
                     let mut session = self.session;
