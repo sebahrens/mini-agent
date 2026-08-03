@@ -228,28 +228,28 @@ impl From<UsageDelta> for Usage {
 #[derive(Default)]
 struct UsageLedger {
     total: Usage,
-    stream_start: Usage,
+    stream_observed: Usage,
 }
 
 impl UsageLedger {
     fn record(&mut self, usage: Usage) -> UsageDelta {
         self.total = usage_saturating_add(self.total, usage);
+        self.stream_observed = usage_saturating_add(self.stream_observed, usage);
         usage.into()
     }
 
     fn start_stream(&mut self) {
-        self.stream_start = self.total;
+        self.stream_observed = Usage::new();
     }
 
     fn reconcile_terminal(&mut self, aggregate: Usage) -> UsageDelta {
-        let observed = usage_nonnegative_difference(self.total, self.stream_start, false);
-        let delta = usage_nonnegative_difference(aggregate, observed, true);
+        let delta = usage_nonnegative_difference(aggregate, self.stream_observed, true);
         self.total = usage_saturating_add(self.total, delta);
         delta.into()
     }
 
     fn stream_has_observed_usage(&self) -> bool {
-        usage_nonnegative_difference(self.total, self.stream_start, false).has_values()
+        self.stream_observed.has_values()
     }
 }
 
@@ -3024,6 +3024,43 @@ mod tests {
         ledger.record(second);
         assert!(!ledger.reconcile_terminal(second).has_values());
         assert_eq!(ledger.total, first + second);
+    }
+
+    #[test]
+    fn usage_reconciliation_is_exact_once_across_stream_saturation() {
+        let prior = Usage {
+            input_tokens: 10,
+            output_tokens: 10,
+            total_tokens: 10,
+            cached_input_tokens: 10,
+            cache_creation_input_tokens: 10,
+            tool_use_prompt_tokens: 10,
+            reasoning_tokens: 10,
+        };
+        let saturated = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            total_tokens: u64::MAX,
+            cached_input_tokens: u64::MAX,
+            cache_creation_input_tokens: u64::MAX,
+            tool_use_prompt_tokens: u64::MAX,
+            reasoning_tokens: u64::MAX,
+        };
+        let mut ledger = UsageLedger::default();
+
+        ledger.start_stream();
+        ledger.record(prior);
+        assert!(!ledger.reconcile_terminal(prior).has_values());
+
+        ledger.start_stream();
+        assert_eq!(Usage::from(ledger.record(saturated)), saturated);
+        assert!(ledger.stream_has_observed_usage());
+        assert_eq!(
+            Usage::from(ledger.reconcile_terminal(saturated)),
+            Usage::new(),
+            "saturation must not turn the prior stream's usage into a duplicate terminal charge"
+        );
+        assert_eq!(ledger.total, saturated);
     }
 
     #[test]

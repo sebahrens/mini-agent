@@ -443,6 +443,8 @@ jobs:
           trap 'rm -rf "$tmpdir"' EXIT
           tar xzf "$crate" -C "$tmpdir"
           pkgdir=$(ls -d "$tmpdir"/mini-agent-*)
+          cargo test --locked --manifest-path "$pkgdir/Cargo.toml" \
+            rig_multi_turn_run_usage_saturates_before_completion_delivery
           cargo install --locked --path "$pkgdir" --debug --root "$tmpdir/install"
           "$tmpdir/install/bin/mini-agent" --version | grep -Fq "mini-agent "
 
