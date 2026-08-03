@@ -134,6 +134,130 @@ pub(super) struct ActiveValidation {
     cancellation: crate::extras::r#loop::validation::ValidationCancellation,
 }
 
+/// Transaction snapshot for one user-authored main turn. No in-progress turn
+/// is authoritative on disk: success commits the live session, while failure
+/// or cancellation restores its pre-turn transcript state before saving while
+/// retaining independently authoritative usage and explicit permission grants.
+pub(crate) struct PendingMainTurn {
+    prompt: String,
+    session_id: compact_str::CompactString,
+    session_before: SessionRollback,
+    started_at: Option<compact_str::CompactString>,
+    tool_output_paths: Vec<std::path::PathBuf>,
+    #[cfg(feature = "memory")]
+    memory_summaries: Vec<(String, Option<usize>)>,
+}
+
+struct SessionRollback {
+    messages: Vec<crate::session::SessionMessage>,
+    compactions: Vec<crate::session::Compaction>,
+    updated_at: compact_str::CompactString,
+    total_estimated_tokens: u64,
+    calibrated_tokens: u64,
+    calibrated_msg_count: usize,
+    rewind_undo: Option<crate::session::RewindUndo>,
+    #[cfg(feature = "multimodal")]
+    pending_media: Vec<crate::extras::multimodal::MediaAttachment>,
+}
+
+impl PendingMainTurn {
+    pub(crate) fn capture(session: &Session, prompt: &str) -> Self {
+        Self {
+            prompt: prompt.to_string(),
+            session_id: session.id.clone(),
+            session_before: SessionRollback {
+                messages: session.messages.clone(),
+                compactions: session.compactions.clone(),
+                updated_at: session.updated_at.clone(),
+                total_estimated_tokens: session.total_estimated_tokens,
+                calibrated_tokens: session.calibrated_tokens,
+                calibrated_msg_count: session.calibrated_msg_count,
+                rewind_undo: session.rewind_undo.clone(),
+                #[cfg(feature = "multimodal")]
+                pending_media: Vec::new(),
+            },
+            started_at: None,
+            tool_output_paths: Vec::new(),
+            #[cfg(feature = "memory")]
+            memory_summaries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub(crate) fn record_started(&mut self, timestamp: compact_str::CompactString) {
+        self.started_at = Some(timestamp);
+    }
+
+    pub(crate) fn record_tool_output(&mut self, path: std::path::PathBuf) {
+        self.tool_output_paths.push(path);
+    }
+
+    #[cfg(feature = "multimodal")]
+    pub(crate) fn take_pending_media(
+        &mut self,
+        session: &mut Session,
+    ) -> &[crate::extras::multimodal::MediaAttachment] {
+        self.session_before.pending_media = session.drain_media();
+        &self.session_before.pending_media
+    }
+
+    #[cfg(feature = "memory")]
+    pub(crate) fn stage_memory_summary(&mut self, summary: String, count: Option<usize>) {
+        self.memory_summaries.push((summary, count));
+    }
+
+    pub(crate) fn commit_side_effects(self, persist_chat_history: bool) -> Vec<anyhow::Error> {
+        let mut errors = Vec::new();
+        if persist_chat_history && let Some(timestamp) = self.started_at {
+            let entry = crate::session::chat_history::ChatHistoryEntry {
+                content: self.prompt,
+                timestamp,
+            };
+            if let Err(error) = crate::session::chat_history::append_entry(&entry) {
+                errors.push(error);
+            }
+        }
+        #[cfg(feature = "memory")]
+        for (summary, count) in self.memory_summaries {
+            crate::extras::memory::flush_compaction_summary(
+                &crate::extras::memory::Mem::open(),
+                &summary,
+                count,
+            );
+        }
+        errors
+    }
+
+    pub(crate) fn rollback(self, session: &mut Session) -> String {
+        // Provider usage was actually incurred and an explicit AllowAlways
+        // decision remains authoritative even when the transcript fails. Keep
+        // those orthogonal durable facts while restoring every turn-owned
+        // message, compaction, calibration, estimate, and rewind field.
+        for path in &self.tool_output_paths {
+            if let Err(error) =
+                crate::session::storage::delete_uncommitted_tool_output(&self.session_id, path)
+            {
+                tracing::warn!("failed to remove uncommitted tool output: {error}");
+            }
+        }
+        session.messages = self.session_before.messages;
+        session.compactions = self.session_before.compactions;
+        session.updated_at = self.session_before.updated_at;
+        session.total_estimated_tokens = self.session_before.total_estimated_tokens;
+        session.calibrated_tokens = self.session_before.calibrated_tokens;
+        session.calibrated_msg_count = self.session_before.calibrated_msg_count;
+        session.rewind_undo = self.session_before.rewind_undo;
+        #[cfg(feature = "multimodal")]
+        {
+            session.pending_media = self.session_before.pending_media;
+        }
+        self.prompt
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct AgentRunState {
     pub agent: Option<AnyAgent>,
@@ -148,7 +272,7 @@ pub(crate) struct AgentRunState {
     pub agent_line_started: bool,
     pub response_buf: String,
     pub response_start_block: Option<usize>,
-    pub pending_send: Option<String>,
+    pub pending_turn: Option<PendingMainTurn>,
     pub was_reasoning: bool,
     pub turn_trace: Vec<compact_str::CompactString>,
     pub awaiting_compaction_relief: bool,

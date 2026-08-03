@@ -69,7 +69,7 @@ pub async fn handle_permission_request(
 
     if let Some(pattern) = allow_pattern {
         renderer.write_line(
-            &format!("  allowed {} {} (saved to session)", ask_req.tool, pattern),
+            &format!("  allowed {} {} for this session", ask_req.tool, pattern),
             Color::Green,
         )?;
         ui.session
@@ -78,9 +78,7 @@ pub async fn handle_permission_request(
                 tool: ask_req.tool.clone(),
                 pattern: pattern.into(),
             });
-        if !ui.cli.no_session
-            && let Err(e) = crate::session::storage::save_session(ui.session)
-        {
+        if let Err(e) = crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run) {
             renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
         }
     }

@@ -379,14 +379,32 @@ impl Session {
         );
     }
 
+    #[allow(dead_code)]
+    pub fn add_tool_call(&mut self, name: &str, args: &serde_json::Value) {
+        self.add_tool_call_with_id("", name, args);
+    }
+
     pub fn add_tool_result_with_id(&mut self, id: &str, name: &str, output: &str) -> String {
-        let content = self.tool_result_content(name, output);
+        self.add_tool_result_with_id_and_artifact(id, name, output)
+            .0
+    }
+
+    /// Add a correlated tool result and return the separately persisted
+    /// artifact, when the long-output path was used. The interactive UI tracks
+    /// that artifact in its pending-turn transaction for rollback.
+    pub(crate) fn add_tool_result_with_id_and_artifact(
+        &mut self,
+        id: &str,
+        name: &str,
+        output: &str,
+    ) -> (String, Option<std::path::PathBuf>) {
+        let (content, artifact) = self.tool_result_content(name, output);
         self.add_message_with_tool_call_id(
             MessageRole::ToolResult,
             &content,
             (!id.is_empty()).then_some(id),
         );
-        content
+        (content, artifact)
     }
 
     /// Apply one reconciled provider-usage delta to every persisted accounting
@@ -414,16 +432,44 @@ impl Session {
         );
     }
 
-    fn tool_result_content(&self, name: &str, output: &str) -> String {
+    #[allow(dead_code)]
+    pub fn add_tool_result(&mut self, name: &str, output: &str) -> String {
+        self.add_tool_result_with_artifact(name, output).0
+    }
+
+    /// Add a tool result and return the separately persisted artifact, when
+    /// the long-output path was used. The interactive UI records that path in
+    /// its pending-turn transaction so a later failure can remove it.
+    pub(crate) fn add_tool_result_with_artifact(
+        &mut self,
+        name: &str,
+        output: &str,
+    ) -> (String, Option<std::path::PathBuf>) {
+        let (content, artifact) = self.tool_result_content(name, output);
+        self.add_message(MessageRole::ToolResult, &content);
+        (content, artifact)
+    }
+
+    fn tool_result_content(
+        &self,
+        name: &str,
+        output: &str,
+    ) -> (String, Option<std::path::PathBuf>) {
         let output_chars = output.chars().count();
         if output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
-            return format!("{name}:\n{output}");
+            return (format!("{name}:\n{output}"), None);
         }
 
         match storage::save_tool_output(&self.id, name, output) {
-            Ok(path) => format_truncated_tool_result(name, output, output_chars, &path),
-            Err(err) => format!(
-                "{name}:\n{output}\n\n[failed to save long tool output separately; kept full output in session to avoid data loss: {err}]"
+            Ok(path) => (
+                format_truncated_tool_result(name, output, output_chars, &path),
+                Some(path),
+            ),
+            Err(err) => (
+                format!(
+                    "{name}:\n{output}\n\n[failed to save long tool output separately; kept full output in session to avoid data loss: {err}]"
+                ),
+                None,
             ),
         }
     }

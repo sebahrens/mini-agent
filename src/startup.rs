@@ -1129,10 +1129,7 @@ impl Startup {
             ..
         } = self;
 
-        let initial_msg = cli.message.join(" ");
-        if !initial_msg.is_empty() {
-            session.add_message(MessageRole::User, &initial_msg);
-        }
+        let auto_trigger_msg = select_interactive_auto_trigger(&cli, arch_msg);
 
         crate::ui::run_interactive(
             crate::ui::state::UiContext::new(
@@ -1148,7 +1145,7 @@ impl Startup {
             ),
             None,
             ask_rx,
-            arch_msg,
+            auto_trigger_msg,
             #[cfg(feature = "advisor")]
             handoff_rx,
         )
@@ -1161,15 +1158,84 @@ impl Startup {
     }
 }
 
+fn interactive_initial_message(cli: &Cli) -> Option<String> {
+    if cli.print {
+        return None;
+    }
+    let message = cli.message.join(" ");
+    (!message.trim().is_empty()).then_some(message)
+}
+
+fn select_interactive_auto_trigger(cli: &Cli, fallback: Option<String>) -> Option<String> {
+    interactive_initial_message(cli).or(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ResumeProviderDecision, apply_resume_provider_decision, resolve_resume_provider_decision,
+        ResumeProviderDecision, apply_resume_provider_decision, interactive_initial_message,
+        resolve_resume_provider_decision, select_interactive_auto_trigger,
     };
     use crate::cli::Cli;
     use crate::config::Config;
     use crate::sandbox::{Sandbox, SandboxPolicy};
     use crate::session::Session;
+
+    #[test]
+    fn positional_interactive_input_becomes_one_auto_trigger_message() {
+        let cli = Cli {
+            message: vec!["review".into(), "this change".into()],
+            ..Cli::default()
+        };
+
+        assert_eq!(
+            interactive_initial_message(&cli),
+            Some("review this change".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_interactive_startup_remains_idle() {
+        assert_eq!(interactive_initial_message(&Cli::default()), None);
+        let whitespace = Cli {
+            message: vec!["   ".into()],
+            ..Cli::default()
+        };
+        assert_eq!(interactive_initial_message(&whitespace), None);
+    }
+
+    #[test]
+    fn print_mode_keeps_positional_input_out_of_the_tui_auto_trigger() {
+        let cli = Cli {
+            print: true,
+            message: vec!["headless prompt".into()],
+            ..Cli::default()
+        };
+
+        assert_eq!(interactive_initial_message(&cli), None);
+        assert_eq!(cli.message.join(" "), "headless prompt");
+    }
+
+    #[test]
+    fn positional_input_precedes_the_existing_interactive_fallback() {
+        let cli = Cli {
+            message: vec!["user prompt".into()],
+            ..Cli::default()
+        };
+
+        assert_eq!(
+            select_interactive_auto_trigger(&cli, Some("fallback".into())),
+            Some("user prompt".into())
+        );
+    }
+
+    #[test]
+    fn empty_interactive_startup_preserves_the_existing_fallback() {
+        assert_eq!(
+            select_interactive_auto_trigger(&Cli::default(), Some("fallback".into())),
+            Some("fallback".into())
+        );
+    }
 
     /// Pins the two inputs that decide whether a missing backend bails or
     /// degrades. An unknown backend is never "available" on any platform, so

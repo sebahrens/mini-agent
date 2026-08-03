@@ -120,6 +120,30 @@ pub fn save_tool_output(
     Ok(path)
 }
 
+/// Remove a tool-output artifact created by an uncommitted UI turn. The path
+/// is accepted only when it is an immediate child of this session's private,
+/// opaque output directory; callers cannot use rollback bookkeeping as an
+/// arbitrary-file deletion primitive.
+pub(crate) fn delete_uncommitted_tool_output(session_id: &str, path: &Path) -> anyhow::Result<()> {
+    let expected_dir = tool_output_dir(session_id);
+    if path.parent() != Some(expected_dir.as_path()) {
+        anyhow::bail!("refusing tool-output rollback outside the session directory");
+    }
+    crate::paths::ensure_private_directory(&expected_dir)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!("refusing non-regular tool-output rollback target");
+            }
+            drop(crate::fs::open_private_file(path)?);
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 pub fn delete_session(id: &str) -> anyhow::Result<()> {
     if disabled("sessions") {
         return Ok(());
