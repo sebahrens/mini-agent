@@ -118,7 +118,7 @@ impl ToolCallTracker {
             );
             return None;
         }
-        let Some(call) = self.pending.remove(internal_call_id) else {
+        let Some(call) = self.pending.get(internal_call_id) else {
             tracing::error!(
                 internal_call_id,
                 provider_tool_result_id = %tool_result.id,
@@ -127,14 +127,15 @@ impl ToolCallTracker {
             return None;
         };
         if call.provider_id != tool_result.id {
-            tracing::warn!(
+            tracing::error!(
                 internal_call_id,
                 provider_tool_call_id = %call.provider_id,
                 provider_tool_result_id = %tool_result.id,
-                "provider tool IDs differ for an internally correlated call/result pair"
+                "provider tool IDs differ for an internally correlated call/result pair; preserving the pending call"
             );
+            return None;
         }
-        Some(call)
+        self.pending.remove(internal_call_id)
     }
 
     fn finish_stream(&mut self) {
@@ -232,7 +233,7 @@ struct UsageLedger {
 
 impl UsageLedger {
     fn record(&mut self, usage: Usage) -> UsageDelta {
-        self.total += usage;
+        self.total = usage_saturating_add(self.total, usage);
         usage.into()
     }
 
@@ -243,12 +244,30 @@ impl UsageLedger {
     fn reconcile_terminal(&mut self, aggregate: Usage) -> UsageDelta {
         let observed = usage_nonnegative_difference(self.total, self.stream_start, false);
         let delta = usage_nonnegative_difference(aggregate, observed, true);
-        self.total += delta;
+        self.total = usage_saturating_add(self.total, delta);
         delta.into()
     }
 
     fn stream_has_observed_usage(&self) -> bool {
         usage_nonnegative_difference(self.total, self.stream_start, false).has_values()
+    }
+}
+
+fn usage_saturating_add(left: Usage, right: Usage) -> Usage {
+    Usage {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        total_tokens: left.total_tokens.saturating_add(right.total_tokens),
+        cached_input_tokens: left
+            .cached_input_tokens
+            .saturating_add(right.cached_input_tokens),
+        cache_creation_input_tokens: left
+            .cache_creation_input_tokens
+            .saturating_add(right.cache_creation_input_tokens),
+        tool_use_prompt_tokens: left
+            .tool_use_prompt_tokens
+            .saturating_add(right.tool_use_prompt_tokens),
+        reasoning_tokens: left.reasoning_tokens.saturating_add(right.reasoning_tokens),
     }
 }
 
@@ -292,6 +311,13 @@ fn exhausted_token_budget(usage: Usage, budget: Option<u64>) -> Option<(u64, u64
     let budget = budget?;
     let used = observed_tokens(usage);
     (used >= budget).then_some((used, budget))
+}
+
+fn token_budget_exhaustion_message(used: u64, budget: u64) -> String {
+    format!(
+        "Agent exhausted its cumulative token budget ({used}/{budget}) before completing. \
+         Compact the session or increase max_tokens before retrying."
+    )
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -760,6 +786,8 @@ where
         let retry_history: Vec<Message> = history.clone();
         let mut interactions: Vec<Message> = Vec::new();
         let mut tool_calls = ToolCallTracker::default();
+        let mut completion_had_tool_call = false;
+        let mut exhausted_budget_after_completion = None;
         let mut empty_response_count: u32 = 0;
         const MAX_EMPTY_RESPONSES: u32 = 3;
         let max_turns = agent.default_max_turns.unwrap_or(1);
@@ -858,6 +886,14 @@ where
                                 tool_call,
                                 internal_call_id,
                             } => {
+                                if let Some((used, budget)) = exhausted_budget_after_completion {
+                                    let _ = event_tx
+                                        .send(AgentEvent::Error(CompactString::from(
+                                            token_budget_exhaustion_message(used, budget),
+                                        )))
+                                        .await;
+                                    return;
+                                }
                                 let tool_name = &tool_call.function.name;
                                 tracing::debug!(
                                     "agent tool start: name={}, internal_call_id={}, args_len={}",
@@ -875,6 +911,7 @@ where
                                         .await;
                                     return;
                                 }
+                                completion_had_tool_call = true;
                                 response.clear();
                                 response_len_at_stream_start = 0;
                                 append_tool_call(&mut interactions, &tool_call);
@@ -903,6 +940,15 @@ where
                         tool_call,
                         internal_call_id,
                     }) => {
+                        if let Some((used, budget)) = exhausted_budget_after_completion {
+                            tool_calls.finish_stream();
+                            let _ = event_tx
+                                .send(AgentEvent::Error(CompactString::from(
+                                    token_budget_exhaustion_message(used, budget),
+                                )))
+                                .await;
+                            return;
+                        }
                         tracing::debug!(
                             tool_name = %tool_call.function.name,
                             internal_call_id,
@@ -913,6 +959,15 @@ where
                         tool_result,
                         internal_call_id,
                     })) => {
+                        if let Some((used, budget)) = exhausted_budget_after_completion {
+                            tool_calls.finish_stream();
+                            let _ = event_tx
+                                .send(AgentEvent::Error(CompactString::from(
+                                    token_budget_exhaustion_message(used, budget),
+                                )))
+                                .await;
+                            return;
+                        }
                         let Some((tool_name, output)) = attributed_tool_result(
                             &mut tool_calls,
                             &internal_call_id,
@@ -1024,6 +1079,26 @@ where
                                 })
                                 .await;
                         }
+                        if let Some((used, budget)) =
+                            exhausted_token_budget(usage_ledger.total, agent.max_tokens)
+                        {
+                            if completion_had_tool_call {
+                                tracing::warn!(
+                                    used,
+                                    budget,
+                                    "agent cumulative token budget exhausted before the next provider call"
+                                );
+                                tool_calls.finish_stream();
+                                let _ = event_tx
+                                    .send(AgentEvent::Error(CompactString::from(
+                                        token_budget_exhaustion_message(used, budget),
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            exhausted_budget_after_completion = Some((used, budget));
+                        }
+                        completion_had_tool_call = false;
                     }
                     Err(e) => {
                         tracing::error!("agent stream error: {e}");
@@ -1186,6 +1261,8 @@ where
     let mut full_response = String::new();
     let mut response_len_at_stream_start = full_response.len();
     let mut tool_calls = ToolCallTracker::default();
+    let mut completion_had_tool_call = false;
+    let mut exhausted_budget_after_completion = None;
     let mut usage_ledger = UsageLedger::default();
     usage_ledger.start_stream();
     let mut turns_used = 0usize;
@@ -1227,10 +1304,14 @@ where
                         internal_call_id,
                     },
                 )) => {
+                    if let Some((used, budget)) = exhausted_budget_after_completion {
+                        anyhow::bail!(token_budget_exhaustion_message(used, budget));
+                    }
                     let name = &tool_call.function.name;
                     tool_calls
                         .record(&internal_call_id, &tool_call)
                         .map_err(|error| anyhow::anyhow!(error))?;
+                    completion_had_tool_call = true;
                     if pure_stdout {
                         let summary = format_tool_args_summary(&tool_call.function.arguments);
                         println!("\n◈ {} {}", name, summary);
@@ -1238,10 +1319,20 @@ where
                     }
                     append_tool_call(&mut interactions, &tool_call);
                 }
+                Ok(MultiTurnStreamItem::ToolExecutionStart { .. }) => {
+                    if let Some((used, budget)) = exhausted_budget_after_completion {
+                        tool_calls.finish_stream();
+                        anyhow::bail!(token_budget_exhaustion_message(used, budget));
+                    }
+                }
                 Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
                     tool_result,
                     internal_call_id,
                 })) => {
+                    if let Some((used, budget)) = exhausted_budget_after_completion {
+                        tool_calls.finish_stream();
+                        anyhow::bail!(token_budget_exhaustion_message(used, budget));
+                    }
                     let Some((name, output)) =
                         attributed_tool_result(&mut tool_calls, &internal_call_id, &tool_result)
                     else {
@@ -1270,6 +1361,16 @@ where
                         call.usage.output_tokens,
                         observed_tokens(usage_ledger.total),
                     );
+                    if let Some((used, budget)) =
+                        exhausted_token_budget(usage_ledger.total, agent.max_tokens)
+                    {
+                        if completion_had_tool_call {
+                            tool_calls.finish_stream();
+                            anyhow::bail!(token_budget_exhaustion_message(used, budget));
+                        }
+                        exhausted_budget_after_completion = Some((used, budget));
+                    }
+                    completion_had_tool_call = false;
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                     terminal_response_seen = true;
@@ -1481,7 +1582,7 @@ where
                 break;
             }
             Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                usage += call.usage;
+                usage = usage_saturating_add(usage, call.usage);
             }
             Ok(_) => {}
             Err(e) => {
@@ -2738,6 +2839,32 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_provider_result_id_preserves_the_valid_pending_call() {
+        let mut tracker = ToolCallTracker::default();
+        tracker
+            .record("stable-internal", &tool_call("expected-provider", "read"))
+            .unwrap();
+
+        assert!(
+            attributed_tool_result(
+                &mut tracker,
+                "stable-internal",
+                &text_result("wrong-provider", "malformed"),
+            )
+            .is_none()
+        );
+        assert_eq!(tracker.pending.len(), 1);
+
+        let valid = attributed_tool_result(
+            &mut tracker,
+            "stable-internal",
+            &text_result("expected-provider", "valid"),
+        )
+        .expect("a malformed result must not consume the valid correlation");
+        assert_eq!((valid.0.as_str(), valid.1.as_str()), ("read", "valid"));
+    }
+
+    #[test]
     fn runner_duplicate_internal_tool_call_id_fails_without_replacing_the_original() {
         let mut tracker = ToolCallTracker::default();
         tracker
@@ -2871,6 +2998,183 @@ mod tests {
         ledger.record(second);
         assert!(!ledger.reconcile_terminal(second).has_values());
         assert_eq!(ledger.total, first + second);
+    }
+
+    #[test]
+    fn usage_ledger_saturates_every_field_and_budget_observation_at_u64_max() {
+        let near_max = Usage {
+            input_tokens: u64::MAX - 1,
+            output_tokens: u64::MAX - 1,
+            total_tokens: u64::MAX - 1,
+            cached_input_tokens: u64::MAX - 1,
+            cache_creation_input_tokens: u64::MAX - 1,
+            tool_use_prompt_tokens: u64::MAX - 1,
+            reasoning_tokens: u64::MAX - 1,
+        };
+        let increment = Usage {
+            input_tokens: 10,
+            output_tokens: 10,
+            total_tokens: 10,
+            cached_input_tokens: 10,
+            cache_creation_input_tokens: 10,
+            tool_use_prompt_tokens: 10,
+            reasoning_tokens: 10,
+        };
+        let saturated = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            total_tokens: u64::MAX,
+            cached_input_tokens: u64::MAX,
+            cache_creation_input_tokens: u64::MAX,
+            tool_use_prompt_tokens: u64::MAX,
+            reasoning_tokens: u64::MAX,
+        };
+        let mut ledger = UsageLedger::default();
+        ledger.start_stream();
+
+        ledger.record(near_max);
+        ledger.record(increment);
+
+        assert_eq!(ledger.total, saturated);
+        assert_eq!(
+            super::exhausted_token_budget(ledger.total, Some(u64::MAX - 1)),
+            Some((u64::MAX, u64::MAX - 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn over_budget_tool_completion_stops_before_next_provider_call_on_both_surfaces() {
+        let over_budget = usage(40, 15, 0, 0);
+        let interactive_calls = Arc::new(AtomicUsize::new(0));
+        let interactive_model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "over-budget-tool",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(over_budget),
+            ],
+            vec![
+                MockStreamEvent::text("must not run"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let interactive_agent = AgentBuilder::new(interactive_model.clone())
+            .tool(CountingTool(interactive_calls.clone()))
+            .max_tokens(50)
+            .default_max_turns(2)
+            .build();
+        let mut runner = super::spawn_agent(
+            interactive_agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let interactive_error = loop {
+            match runner.event_rx.recv().await {
+                Some(crate::event::AgentEvent::Error(error)) => break error.to_string(),
+                Some(crate::event::AgentEvent::Done { response }) => {
+                    panic!("over-budget tool completion unexpectedly finished: {response}")
+                }
+                Some(_) => {}
+                None => panic!("interactive runner ended without a budget diagnostic"),
+            }
+        };
+
+        let headless_calls = Arc::new(AtomicUsize::new(0));
+        let headless_model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "over-budget-tool",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(over_budget),
+            ],
+            vec![
+                MockStreamEvent::text("must not run"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let headless_agent = AgentBuilder::new(headless_model.clone())
+            .tool(CountingTool(headless_calls.clone()))
+            .max_tokens(50)
+            .default_max_turns(2)
+            .build();
+        let headless_error = super::run_print(
+            &headless_agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect_err("headless over-budget tool completion must fail before another provider call");
+
+        assert!(interactive_error.contains("55/50"));
+        assert_eq!(headless_error.to_string(), interactive_error);
+        assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(headless_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(interactive_model.requests().len(), 1);
+        assert_eq!(headless_model.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn over_budget_text_completion_preserves_terminal_response() {
+        let over_budget = usage(40, 15, 0, 0);
+        let interactive_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response(over_budget),
+        ]]);
+        let interactive_agent = AgentBuilder::new(interactive_model).max_tokens(50).build();
+        let mut runner = super::spawn_agent(
+            interactive_agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let interactive_response = loop {
+            match runner.event_rx.recv().await {
+                Some(crate::event::AgentEvent::Done { response }) => break response.to_string(),
+                Some(crate::event::AgentEvent::Error(error)) => {
+                    panic!("terminal text response must be preserved: {error}")
+                }
+                Some(_) => {}
+                None => panic!("interactive runner ended without a terminal response"),
+            }
+        };
+
+        let headless_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response(over_budget),
+        ]]);
+        let headless_agent = AgentBuilder::new(headless_model).max_tokens(50).build();
+        let (headless_response, headless_usage) = super::run_print(
+            &headless_agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("headless terminal text response must be preserved");
+
+        assert_eq!(interactive_response, "done");
+        assert_eq!(headless_response, "done");
+        assert_eq!(headless_usage, over_budget);
     }
 
     #[tokio::test]

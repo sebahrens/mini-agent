@@ -639,4 +639,33 @@ mod tests {
             "a field-wise terminal reconciliation must not replace the last complete context snapshot"
         );
     }
+
+    #[test]
+    fn ui_usage_delta_saturates_context_and_persisted_totals() {
+        let mut session = Session::new("anthropic", "claude-sonnet", u64::MAX, "");
+        session.total_input_tokens = u64::MAX - 1;
+        session.total_output_tokens = u64::MAX - 1;
+        session.total_cached_input_tokens = u64::MAX - 1;
+        session.total_cache_creation_input_tokens = u64::MAX - 1;
+
+        apply_usage_delta(
+            &mut session,
+            UsageDelta {
+                input_tokens: u64::MAX,
+                output_tokens: 10,
+                cached_input_tokens: 10,
+                cache_creation_input_tokens: 10,
+                ..UsageDelta::default()
+            },
+            true,
+            true,
+        );
+
+        assert_eq!(session.total_input_tokens, u64::MAX);
+        assert_eq!(session.total_output_tokens, u64::MAX);
+        assert_eq!(session.total_cached_input_tokens, u64::MAX);
+        assert_eq!(session.total_cache_creation_input_tokens, u64::MAX);
+        assert_eq!(session.total_estimated_tokens, u64::MAX);
+        assert_eq!(session.effective_context_tokens(), u64::MAX);
+    }
 }

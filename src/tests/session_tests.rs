@@ -189,6 +189,31 @@ fn charge_usage_delta_is_additive_without_hidden_terminal_charge() {
     );
 }
 
+#[test]
+fn charge_usage_delta_saturates_persisted_token_totals() {
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.total_input_tokens = u64::MAX - 1;
+    session.total_output_tokens = u64::MAX - 1;
+    session.total_cached_input_tokens = u64::MAX - 1;
+    session.total_cache_creation_input_tokens = u64::MAX - 1;
+
+    session.charge_usage_delta(
+        crate::event::UsageDelta {
+            input_tokens: 10,
+            output_tokens: 10,
+            cached_input_tokens: 10,
+            cache_creation_input_tokens: 10,
+            ..crate::event::UsageDelta::default()
+        },
+        false,
+    );
+
+    assert_eq!(session.total_input_tokens, u64::MAX);
+    assert_eq!(session.total_output_tokens, u64::MAX);
+    assert_eq!(session.total_cached_input_tokens, u64::MAX);
+    assert_eq!(session.total_cache_creation_input_tokens, u64::MAX);
+}
+
 // Helper: a session with `n` ASCII messages of `len` chars each, so every
 // message has a predictable estimated_tokens == len/4.
 fn session_with_messages(n: usize, len: usize) -> Session {
