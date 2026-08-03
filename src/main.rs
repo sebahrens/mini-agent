@@ -157,6 +157,7 @@ async fn run() -> anyhow::Result<()> {
             &app_paths,
             cli.no_hooks,
             !is_interactive,
+            &cli.resolve_sandbox_backend(&cfg),
         ));
 
         if let Some(tool_name) = &cli.hooks_test {

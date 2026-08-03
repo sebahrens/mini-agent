@@ -100,13 +100,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/hooks/subprocess.rs",
-        "let mut cmd = Command::new(program);",
-        1,
-        "TC-PROJECT-AUTOMATION",
-    ),
-    (
-        "src/extras/hooks/subprocess.rs",
-        "use tokio::process::{Child, Command};",
+        "use tokio::process::Child;",
         1,
         "TC-PROJECT-AUTOMATION",
     ),
@@ -176,17 +170,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
-        "src/extras/loop/headless.rs",
-        ".output()",
+        "src/extras/loop/validation.rs",
+        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
         1,
-        "TC-LOOP-VALIDATION",
+        "NON-PROCESS",
     ),
     (
-        "src/extras/loop/headless.rs",
-        "match tokio::process::Command::new(shell)",
+        "src/extras/loop/validation.rs",
+        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
         1,
-        "TC-LOOP-VALIDATION",
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "std::process::Command::new(\"/bin/kill\")",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/extras/loop/mod.rs",
@@ -247,27 +248,27 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(&self.shell);",
         1,
         "TC-MODEL-ACTION",
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(bwrap);",
+        "let mut cmd = Command::new(program);",
+        1,
+        "TC-PROJECT-AUTOMATION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(\"zerobox\");",
         1,
         "TC-MODEL-ACTION",
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(seatbelt);",
+        "let mut cmd = Command::new(zerobox);",
         1,
-        "TC-MODEL-ACTION",
+        "TC-PROJECT-AUTOMATION",
     ),
     (
         "src/sandbox.rs",
@@ -307,18 +308,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-EXPLICIT-USER-SHELL",
     ),
-    (
-        "src/ui/event_handler.rs",
-        ".output()",
-        1,
-        "TC-LOOP-VALIDATION",
-    ),
-    (
-        "src/ui/event_handler.rs",
-        "match tokio::process::Command::new(shell)",
-        1,
-        "TC-LOOP-VALIDATION",
-    ),
     ("src/ui/input/mod.rs", ".status();", 1, "TC-SUPPORT-UTILITY"),
     (
         "src/ui/input/mod.rs",
@@ -355,11 +344,23 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 
 /// Sites whose identical terminal expression inherits different classes from
 /// the surrounding constructor, in source order.
-const MIXED_SITES: &[(&str, &str, &[&str])] = &[(
-    "src/ui/app.rs",
-    ".output()",
-    &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
-)];
+const MIXED_SITES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(bwrap);",
+        &["TC-PROJECT-AUTOMATION", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(seatbelt);",
+        &["TC-PROJECT-AUTOMATION", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/ui/app.rs",
+        ".output()",
+        &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
+    ),
+];
 
 const ALLOWED_CURRENT_CLASSES: &[&str] = &[
     "NON-PROCESS",
@@ -379,6 +380,18 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(\"zerobox\");",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(zerobox);",
+        1,
+        "TC-PROJECT-AUTOMATION",
+    ),
     ("src/agent/tools/bash.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/agent/tools/bash.rs",
@@ -483,6 +496,25 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/extras/loop/validation.rs",
+        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "std::process::Command::new(\"/bin/kill\")",
+        1,
+        "TEST-ONLY",
+    ),
     ("src/sandbox.rs", ".status();", 2, "TC-LIFECYCLE-HELPER"),
     (
         "src/sandbox.rs",
@@ -498,27 +530,15 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(&self.shell);",
         1,
         "TC-MODEL-ACTION",
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(bwrap);",
+        "let mut cmd = Command::new(program);",
         1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(seatbelt);",
-        1,
-        "TC-MODEL-ACTION",
+        "TC-PROJECT-AUTOMATION",
     ),
     (
         "src/sandbox.rs",
@@ -546,24 +566,18 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
 ];
 
-const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[(
-    "src/ui/app.rs",
-    ".output()",
-    &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
-)];
+const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = MIXED_SITES;
 
 /// Files whose non-disposition launch expressions all have one owner.
 const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/docs.rs", "TC-SUPPORT-UTILITY"),
     ("src/extras/git_worktree/mod.rs", "TC-INTERNAL-GIT"),
     ("src/extras/hooks/subprocess.rs", "TC-PROJECT-AUTOMATION"),
-    ("src/extras/loop/headless.rs", "TC-LOOP-VALIDATION"),
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
     ("src/session/mod.rs", "TC-INTERNAL-GIT"),
     ("src/startup.rs", "TC-EXPLICIT-USER-SHELL"),
-    ("src/ui/event_handler.rs", "TC-LOOP-VALIDATION"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/slash/memory.rs", "TC-SUPPORT-UTILITY"),

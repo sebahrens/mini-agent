@@ -3,9 +3,156 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
-use crate::sandbox::{ProcessGroupGuard, configure_child_lifetime, kill_process_group};
+use crate::sandbox::{
+    HOOK_SANDBOX_READY_MARKER, ProcessGroupGuard, Sandbox, SandboxPolicy, kill_process_group,
+};
+
+use super::settings::HookTrust;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HookDiagnostics {
+    pub containment: &'static str,
+    pub environment: &'static str,
+    pub filesystem: &'static str,
+    pub network: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HookPolicy {
+    trust: HookTrust,
+    sandbox: Sandbox,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+impl HookPolicy {
+    pub(crate) fn new(
+        trust: HookTrust,
+        sandbox_backend: &str,
+        env: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            trust,
+            sandbox: Sandbox::new(trust == HookTrust::Sandboxed, sandbox_backend),
+            env,
+        }
+    }
+
+    pub(crate) fn diagnostics(&self) -> HookDiagnostics {
+        match (self.trust, self.sandbox.policy()) {
+            (HookTrust::Trusted, _) => HookDiagnostics {
+                containment: "trusted-bypass; sandbox-not-requested",
+                environment: "minimal-explicit",
+                filesystem: "ambient-trusted-bypass",
+                network: "ambient-trusted-bypass",
+            },
+            (_, SandboxPolicy::RequiredButUnavailable) => HookDiagnostics {
+                containment: "requested-but-unavailable; launch-denied",
+                environment: "none; launch-denied",
+                filesystem: "none; launch-denied",
+                network: "none; launch-denied",
+            },
+            (_, SandboxPolicy::RequiredAndAvailable) => {
+                let capabilities = self.sandbox.capability_matrix();
+                HookDiagnostics {
+                    containment: "required-and-available",
+                    environment: "minimal-explicit",
+                    filesystem: capabilities.filesystem_writes,
+                    network: capabilities.network,
+                }
+            }
+            (_, SandboxPolicy::Disabled) => HookDiagnostics {
+                containment: "invalid-policy; launch-denied",
+                environment: "none; launch-denied",
+                filesystem: "none; launch-denied",
+                network: "none; launch-denied",
+            },
+        }
+    }
+
+    fn launch_denied_diagnostics(&self) -> HookDiagnostics {
+        HookDiagnostics {
+            containment: match (self.trust, self.sandbox.policy()) {
+                (HookTrust::Sandboxed, SandboxPolicy::RequiredButUnavailable) => {
+                    "requested-but-unavailable; launch-denied"
+                }
+                (HookTrust::Sandboxed, _) => "required-policy; launch-denied",
+                (HookTrust::Trusted, _) => "trusted-bypass-not-entered; launch-denied",
+            },
+            environment: "none; launch-denied",
+            filesystem: "none; launch-denied",
+            network: "none; launch-denied",
+        }
+    }
+
+    fn spawn_failure_status(&self) -> HookStatus {
+        if self.trust == HookTrust::Sandboxed {
+            HookStatus::PolicyDenied
+        } else {
+            HookStatus::Failed
+        }
+    }
+
+    /// A sandboxed command becomes "started" only after the trusted inner
+    /// launcher has entered containment, verified the target executable is
+    /// visible, and emitted its readiness record immediately before `exec`.
+    fn classify_spawned_output(&self, mut output: HookOutput) -> HookOutput {
+        if self.trust == HookTrust::Trusted {
+            return output;
+        }
+        if let Some(offset) = output
+            .stderr
+            .windows(HOOK_SANDBOX_READY_MARKER.len())
+            .position(|window| window == HOOK_SANDBOX_READY_MARKER)
+        {
+            output
+                .stderr
+                .drain(offset..offset + HOOK_SANDBOX_READY_MARKER.len());
+            output.started = true;
+            return output;
+        }
+        output.started = false;
+        output.exit_code = None;
+        output.stdout.clear();
+        output.stderr = b"sandbox wrapper failed before hook launch readiness".to_vec();
+        output.status = HookStatus::PolicyDenied;
+        output.diagnostics = self.launch_denied_diagnostics();
+        output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn classify_completed_output_for_test(&self, output: HookOutput) -> HookOutput {
+        self.classify_spawned_output(output)
+    }
+
+    fn explicit_env(
+        &self,
+        project_dir: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, String> {
+        let mut env = self.env.clone();
+        let mut portable_keys = std::collections::HashSet::new();
+        for key in env.keys() {
+            if key.is_empty()
+                || key.contains('=')
+                || key.contains('\0')
+                || key.eq_ignore_ascii_case("ZEROSTACK_PROJECT_DIR")
+            {
+                return Err(format!("invalid or reserved environment key {key:?}"));
+            }
+            if !portable_keys.insert(key.to_ascii_uppercase()) {
+                return Err(format!(
+                    "hook environment keys collide case-insensitively: {key:?}"
+                ));
+            }
+        }
+        if env.values().any(|value| value.contains('\0')) {
+            return Err("hook environment values cannot contain NUL".to_string());
+        }
+        env.insert("ZEROSTACK_PROJECT_DIR".to_string(), project_dir.to_string());
+        Ok(env)
+    }
+}
 
 /// Hard output limits for one hook subprocess.
 #[derive(Debug, Clone, Copy)]
@@ -37,14 +184,19 @@ pub(crate) enum HookStatus {
     TimedOut,
     OutputLimitExceeded(OutputLimit),
     Failed,
+    PolicyDenied,
 }
 
 /// Result of running a hook subprocess.
 pub(crate) struct HookOutput {
+    /// True only after the OS accepted creation of the direct child or
+    /// containment wrapper. Preflight/policy/spawn failures remain false.
+    pub started: bool,
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub status: HookStatus,
+    pub diagnostics: HookDiagnostics,
 }
 
 const MISSING_ARGS_ERROR: &str =
@@ -120,6 +272,7 @@ pub(crate) fn build_hook_invocation(
 /// `project_dir` is exposed to the hook as `$ZEROSTACK_PROJECT_DIR`. `args`
 /// is required so the command always uses direct exec form (see
 /// [`build_hook_invocation`]).
+#[cfg(test)]
 pub(crate) async fn run_hook(
     command: &str,
     args: Option<&[String]>,
@@ -127,52 +280,142 @@ pub(crate) async fn run_hook(
     timeout: std::time::Duration,
     project_dir: &str,
 ) -> HookOutput {
-    run_hook_with_limits(
+    let policy = HookPolicy::new(
+        HookTrust::Trusted,
+        "unused",
+        std::collections::BTreeMap::new(),
+    );
+    run_hook_with_policy_and_limits(
         command,
         args,
         stdin_json,
         timeout,
         project_dir,
+        &policy,
         DEFAULT_HOOK_LIMITS,
     )
     .await
 }
 
-pub(crate) async fn run_hook_with_limits(
+async fn run_hook_with_policy_and_limits(
     command: &str,
     args: Option<&[String]>,
     stdin_json: &[u8],
     timeout: std::time::Duration,
     project_dir: &str,
+    policy: &HookPolicy,
     limits: HookLimits,
 ) -> HookOutput {
     let (program, args) = match build_hook_invocation(command, args) {
         Ok(invocation) => invocation,
         Err(message) => {
             return HookOutput {
+                started: false,
                 exit_code: None,
                 stdout: Vec::new(),
                 stderr: message.as_bytes().to_vec(),
-                status: HookStatus::Failed,
+                status: HookStatus::PolicyDenied,
+                diagnostics: policy.launch_denied_diagnostics(),
             };
         }
     };
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    cmd.env("ZEROSTACK_PROJECT_DIR", project_dir);
+    let project_dir = match std::fs::canonicalize(project_dir) {
+        Ok(path) if path.parent().is_some() => path,
+        Ok(_) => {
+            return HookOutput {
+                started: false,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: b"hook project directory cannot be the filesystem root".to_vec(),
+                status: HookStatus::PolicyDenied,
+                diagnostics: policy.launch_denied_diagnostics(),
+            };
+        }
+        Err(error) => {
+            return HookOutput {
+                started: false,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: format!("failed to resolve hook project directory: {error}").into_bytes(),
+                status: HookStatus::PolicyDenied,
+                diagnostics: policy.launch_denied_diagnostics(),
+            };
+        }
+    };
+    let project_dir_text = project_dir.to_string_lossy();
+    let program_path = std::path::Path::new(&program);
+    let program = if program_path.is_relative() && program_path.components().count() > 1 {
+        let resolved = match project_dir.join(program_path).canonicalize() {
+            Ok(path) if path.starts_with(&project_dir) => path,
+            Ok(_) => {
+                return HookOutput {
+                    started: false,
+                    exit_code: None,
+                    stdout: Vec::new(),
+                    stderr: b"relative hook executable escapes the project directory".to_vec(),
+                    status: HookStatus::PolicyDenied,
+                    diagnostics: policy.launch_denied_diagnostics(),
+                };
+            }
+            Err(error) => {
+                return HookOutput {
+                    started: false,
+                    exit_code: None,
+                    stdout: Vec::new(),
+                    stderr: format!("failed to resolve relative hook executable: {error}")
+                        .into_bytes(),
+                    status: HookStatus::PolicyDenied,
+                    diagnostics: policy.launch_denied_diagnostics(),
+                };
+            }
+        };
+        resolved.to_string_lossy().into_owned()
+    } else {
+        program
+    };
+    let explicit_env = match policy.explicit_env(&project_dir_text) {
+        Ok(env) => env,
+        Err(message) => {
+            return HookOutput {
+                started: false,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: message.into_bytes(),
+                status: HookStatus::PolicyDenied,
+                diagnostics: policy.launch_denied_diagnostics(),
+            };
+        }
+    };
+    let mut cmd =
+        match policy
+            .sandbox
+            .wrap_direct_command(&program, &args, &project_dir, &explicit_env)
+        {
+            Ok(command) => command,
+            Err(message) => {
+                return HookOutput {
+                    started: false,
+                    exit_code: None,
+                    stdout: Vec::new(),
+                    stderr: message.into_bytes(),
+                    status: HookStatus::PolicyDenied,
+                    diagnostics: policy.launch_denied_diagnostics(),
+                };
+            }
+        };
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    configure_child_lifetime(&mut cmd);
-
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             return HookOutput {
+                started: false,
                 exit_code: None,
                 stdout: Vec::new(),
                 stderr: format!("failed to spawn hook: {e}").into_bytes(),
-                status: HookStatus::Failed,
+                status: policy.spawn_failure_status(),
+                diagnostics: policy.launch_denied_diagnostics(),
             };
         }
     };
@@ -212,7 +455,12 @@ pub(crate) async fn run_hook_with_limits(
                 kill_process_group(pid);
             }
             guard.disarm();
-            output_from_capture(&captured, status.code(), HookStatus::Completed)
+            policy.classify_spawned_output(output_from_capture(
+                &captured,
+                status.code(),
+                HookStatus::Completed,
+                policy.diagnostics(),
+            ))
         }
         Ok(Err(error)) => {
             terminate_and_reap(&mut child, pid).await;
@@ -228,12 +476,22 @@ pub(crate) async fn run_hook_with_limits(
                     HookStatus::Failed
                 }
             };
-            output_from_capture(&captured, None, status)
+            policy.classify_spawned_output(output_from_capture(
+                &captured,
+                None,
+                status,
+                policy.diagnostics(),
+            ))
         }
         Err(_) => {
             terminate_and_reap(&mut child, pid).await;
             guard.disarm();
-            output_from_capture(&captured, None, HookStatus::TimedOut)
+            policy.classify_spawned_output(output_from_capture(
+                &captured,
+                None,
+                HookStatus::TimedOut,
+                policy.diagnostics(),
+            ))
         }
     }
 }
@@ -278,14 +536,63 @@ fn output_from_capture(
     captured: &Arc<Mutex<CapturedOutput>>,
     exit_code: Option<i32>,
     status: HookStatus,
+    diagnostics: HookDiagnostics,
 ) -> HookOutput {
     let mut captured = captured.lock().unwrap_or_else(|e| e.into_inner());
     HookOutput {
+        started: true,
         exit_code,
         stdout: std::mem::take(&mut captured.stdout),
         stderr: std::mem::take(&mut captured.stderr),
         status,
+        diagnostics,
     }
+}
+
+pub(crate) async fn run_hook_with_policy(
+    command: &str,
+    args: Option<&[String]>,
+    stdin_json: &[u8],
+    timeout: std::time::Duration,
+    project_dir: &str,
+    policy: &HookPolicy,
+) -> HookOutput {
+    run_hook_with_policy_and_limits(
+        command,
+        args,
+        stdin_json,
+        timeout,
+        project_dir,
+        policy,
+        DEFAULT_HOOK_LIMITS,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_hook_with_limits(
+    command: &str,
+    args: Option<&[String]>,
+    stdin_json: &[u8],
+    timeout: std::time::Duration,
+    project_dir: &str,
+    limits: HookLimits,
+) -> HookOutput {
+    let policy = HookPolicy::new(
+        HookTrust::Trusted,
+        "unused",
+        std::collections::BTreeMap::new(),
+    );
+    run_hook_with_policy_and_limits(
+        command,
+        args,
+        stdin_json,
+        timeout,
+        project_dir,
+        &policy,
+        limits,
+    )
+    .await
 }
 
 /// Runs an `if` condition using its documented shell-command semantics.
@@ -294,6 +601,7 @@ pub(crate) async fn run_shell_condition(
     stdin_json: &[u8],
     timeout: std::time::Duration,
     project_dir: &str,
+    policy: &HookPolicy,
 ) -> HookOutput {
     let (shell, flag) = if cfg!(windows) {
         ("powershell", "-Command")
@@ -301,5 +609,5 @@ pub(crate) async fn run_shell_condition(
         ("sh", "-c")
     };
     let args = vec![flag.to_string(), condition.to_string()];
-    run_hook(shell, Some(&args), stdin_json, timeout, project_dir).await
+    run_hook_with_policy(shell, Some(&args), stdin_json, timeout, project_dir, policy).await
 }

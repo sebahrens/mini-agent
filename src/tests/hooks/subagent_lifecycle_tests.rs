@@ -14,6 +14,8 @@ fn handler(command: &str) -> HookHandler {
         is_async: false,
         condition: None,
         once: false,
+        trust: crate::extras::hooks::settings::HookTrust::Trusted,
+        env: Default::default(),
     }
 }
 
@@ -37,7 +39,7 @@ fn ctx() -> HookCtx {
     HookCtx {
         session_id: "sess".into(),
         session_path: "".into(),
-        cwd: "/repo".into(),
+        cwd: env!("CARGO_MANIFEST_DIR").into(),
         permission_mode: "standard".into(),
     }
 }

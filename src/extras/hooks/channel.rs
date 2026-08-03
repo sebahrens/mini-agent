@@ -20,12 +20,20 @@ pub(crate) enum ChannelResult {
     /// The hook exceeded a hard output cap and was killed. Its bounded output
     /// prefix must not be interpreted as a complete hook response.
     OutputLimitExceeded,
+    /// The configured trust/containment policy denied launch before a child
+    /// was created.
+    PolicyDenied { reason: String },
 }
 
 pub(crate) fn interpret_hook_output(output: &HookOutput) -> ChannelResult {
     match output.status {
         HookStatus::TimedOut => return ChannelResult::TimedOut,
         HookStatus::OutputLimitExceeded(_) => return ChannelResult::OutputLimitExceeded,
+        HookStatus::PolicyDenied => {
+            return ChannelResult::PolicyDenied {
+                reason: String::from_utf8_lossy(&output.stderr).into_owned(),
+            };
+        }
         HookStatus::Completed | HookStatus::Failed => {}
     }
     match output.exit_code {

@@ -24,7 +24,7 @@ fn ctx() -> HookCtx {
     HookCtx {
         session_id: "corpus-sess".into(),
         session_path: "".into(),
-        cwd: "/repo".into(),
+        cwd: env!("CARGO_MANIFEST_DIR").into(),
         permission_mode: "standard".into(),
     }
 }
@@ -38,6 +38,8 @@ fn dispatcher_for(event: &str, hook_path: &Path) -> HookDispatcher {
         is_async: false,
         condition: None,
         once: false,
+        trust: crate::extras::hooks::settings::HookTrust::Trusted,
+        env: Default::default(),
     };
     let mut config: HooksConfig = HashMap::new();
     config.insert(

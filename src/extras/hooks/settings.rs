@@ -1,4 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum HookTrust {
+    /// Require the configured general workspace sandbox. Missing or invalid
+    /// containment denies the launch.
+    #[default]
+    Sandboxed,
+    /// Explicit configuration-author consent to run without OS containment.
+    /// The hook still receives a cleared, minimal environment and project cwd.
+    Trusted,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
 pub(crate) struct HookHandler {
@@ -13,6 +25,10 @@ pub(crate) struct HookHandler {
     pub condition: Option<String>,
     #[serde(default)]
     pub once: bool,
+    #[serde(default)]
+    pub trust: HookTrust,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

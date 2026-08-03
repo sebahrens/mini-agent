@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use super::dispatcher::HookDispatcher;
 use super::settings::{HookGroup, HookHandler, HooksConfig, parse_hooks_config};
 
@@ -37,22 +39,22 @@ pub(crate) fn load_trust_store(path: &Path) -> HashSet<String> {
     serde_json::from_str::<HashSet<String>>(&content).unwrap_or_default()
 }
 
-pub(crate) fn save_trust_store(path: &Path, trusted: &HashSet<String>) {
+pub(crate) fn save_trust_store(path: &Path, trusted: &HashSet<String>) -> Result<(), String> {
     if crate::paths::artifact_disabled("hook trust") {
-        return;
+        return Ok(());
     }
-    let Ok(json) = serde_json::to_string_pretty(trusted) else {
-        return;
-    };
+    let json = serde_json::to_string_pretty(trusted)
+        .map_err(|error| format!("failed to serialize hook trust store: {error}"))?;
     if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(error) = std::fs::create_dir_all(parent)
     {
-        tracing::warn!("hooks: failed to create trust store directory: {e}");
-        return;
+        return Err(format!(
+            "failed to create hook trust store directory: {error}"
+        ));
     }
-    if let Err(e) = crate::session::storage::atomic_write(path, &json) {
-        tracing::warn!("hooks: failed to save trust store (trust decisions won't persist): {e}");
-    }
+    crate::session::storage::atomic_write(path, &json)
+        .map_err(|error| format!("failed to save hook trust store: {error}"))?;
+    Ok(())
 }
 
 fn global_settings_path(paths: &crate::paths::AppPaths) -> PathBuf {
@@ -103,13 +105,26 @@ fn hook_confirmation_description(handler: &HookHandler) -> String {
         .collect::<Vec<_>>();
     let argv = serde_json::to_string(&argv).expect("serializing hook argv strings cannot fail");
 
+    let trust = match handler.trust {
+        super::settings::HookTrust::Sandboxed => "sandboxed",
+        super::settings::HookTrust::Trusted => "trusted",
+    };
+    let env_keys = serde_json::to_string(&handler.env.keys().collect::<Vec<_>>())
+        .expect("serializing hook environment key strings cannot fail");
+    let env_binding = serde_json::to_vec(&handler.env)
+        .expect("serializing hook environment bindings cannot fail");
+    let env_binding_sha256 = format!("{:x}", Sha256::digest(env_binding));
+    let policy = format!(
+        "subprocess trust={trust:?}; explicit env keys={env_keys}; env binding sha256={env_binding_sha256:?}"
+    );
+
     match handler.condition.as_deref() {
         Some(condition) => {
             let condition = serde_json::to_string(condition)
                 .expect("serializing a hook condition string cannot fail");
-            format!("executable argv={argv}; shell condition={condition}")
+            format!("executable argv={argv}; shell condition={condition}; {policy}")
         }
-        None => format!("executable argv={argv}"),
+        None => format!("executable argv={argv}; {policy}"),
     }
 }
 
@@ -199,7 +214,9 @@ fn filter_trusted_project_hooks(
             result.insert(event, kept_groups);
         }
     }
-    save_trust_store(trust_store_path, &trusted_hashes);
+    if let Err(error) = save_trust_store(trust_store_path, &trusted_hashes) {
+        tracing::warn!("hooks: {error} (trust decisions won't persist)");
+    }
     result
 }
 
@@ -217,6 +234,36 @@ pub(crate) fn build_dispatcher_from_paths(
     headless: bool,
     trust_store_path: &Path,
     confirm: &dyn Fn(&str) -> bool,
+) -> HookDispatcher {
+    let backend = if cfg!(target_os = "macos") {
+        "seatbelt"
+    } else {
+        "bwrap"
+    };
+    build_dispatcher_from_paths_with_backend(
+        global_path,
+        project_path,
+        managed_path,
+        project_root,
+        no_hooks_flag,
+        headless,
+        trust_store_path,
+        confirm,
+        backend,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dispatcher_from_paths_with_backend(
+    global_path: &Path,
+    project_path: &Path,
+    managed_path: &Path,
+    project_root: &Path,
+    no_hooks_flag: bool,
+    headless: bool,
+    trust_store_path: &Path,
+    confirm: &dyn Fn(&str) -> bool,
+    sandbox_backend: &str,
 ) -> HookDispatcher {
     let global = load_settings_file(global_path);
     let project = load_settings_file(project_path);
@@ -248,10 +295,16 @@ pub(crate) fn build_dispatcher_from_paths(
 
     merge_into(&mut merged, managed.hooks);
 
-    HookDispatcher::from_config(&merged).unwrap_or_else(|e| {
-        tracing::warn!("hooks: invalid merged config, disabling hooks: {e}");
-        HookDispatcher::from_config(&HashMap::new()).expect("empty config is always valid")
-    })
+    HookDispatcher::from_config_with_backend_and_root(&merged, sandbox_backend, project_root)
+        .unwrap_or_else(|e| {
+            tracing::warn!("hooks: invalid merged config, disabling hooks: {e}");
+            HookDispatcher::from_config_with_backend_and_root(
+                &HashMap::new(),
+                sandbox_backend,
+                project_root,
+            )
+            .expect("empty config is always valid")
+        })
 }
 
 fn current_project_root(paths: &crate::paths::AppPaths) -> PathBuf {
@@ -272,9 +325,10 @@ pub(crate) fn load_dispatcher(
     paths: &crate::paths::AppPaths,
     no_hooks_flag: bool,
     headless: bool,
+    sandbox_backend: &str,
 ) -> HookDispatcher {
     let trust_unavailable = crate::paths::artifact_disabled("hook trust");
-    build_dispatcher_from_paths(
+    build_dispatcher_from_paths_with_backend(
         &global_settings_path(paths),
         &project_settings_path(paths),
         &managed_settings_path(),
@@ -283,5 +337,6 @@ pub(crate) fn load_dispatcher(
         headless || trust_unavailable,
         &default_trust_store_path(paths),
         &confirm_untrusted_hook,
+        sandbox_backend,
     )
 }

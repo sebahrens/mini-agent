@@ -135,6 +135,8 @@ fn handler(command: &str) -> HookHandler {
         is_async: false,
         condition: None,
         once: false,
+        trust: crate::extras::hooks::settings::HookTrust::Trusted,
+        env: Default::default(),
     }
 }
 
