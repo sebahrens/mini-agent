@@ -171,16 +171,16 @@ pub(crate) fn resolve_configured_execution_authority(
 pub(crate) fn build_interactive_permission(
     cfg: &crate::config::Config,
     authority: ResolvedExecutionAuthority,
-) -> (
+) -> anyhow::Result<(
     Option<checker::PermCheck>,
     Option<ask::AskSender>,
     Option<ask::AskReceiver>,
-) {
-    let Some(permission) = build_permission_checker_at(cfg, authority, None) else {
-        return (None, None, None);
+)> {
+    let Some(permission) = build_permission_checker_at(cfg, authority, None)? else {
+        return Ok((None, None, None));
     };
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
-    (Some(permission), Some(ask_tx), Some(ask_rx))
+    Ok((Some(permission), Some(ask_tx), Some(ask_rx)))
 }
 
 /// Build a permission policy for a frontend that cannot securely prompt.
@@ -190,7 +190,7 @@ pub(crate) fn build_interactive_permission(
 pub(crate) fn build_noninteractive_permission(
     cfg: &crate::config::Config,
     authority: ResolvedExecutionAuthority,
-) -> (Option<checker::PermCheck>, Option<ask::AskSender>) {
+) -> anyhow::Result<(Option<checker::PermCheck>, Option<ask::AskSender>)> {
     build_noninteractive_permission_at(cfg, authority, None)
 }
 
@@ -198,31 +198,34 @@ pub(crate) fn build_noninteractive_permission_at(
     cfg: &crate::config::Config,
     authority: ResolvedExecutionAuthority,
     working_dir: Option<std::path::PathBuf>,
-) -> (Option<checker::PermCheck>, Option<ask::AskSender>) {
-    (
-        build_permission_checker_at(cfg, authority, working_dir),
+) -> anyhow::Result<(Option<checker::PermCheck>, Option<ask::AskSender>)> {
+    Ok((
+        build_permission_checker_at(cfg, authority, working_dir)?,
         None,
-    )
+    ))
 }
 
 fn build_permission_checker_at(
     cfg: &crate::config::Config,
     authority: ResolvedExecutionAuthority,
     working_dir: Option<std::path::PathBuf>,
-) -> Option<checker::PermCheck> {
-    if !authority.tools_enabled || !authority.permission_checks_enabled {
-        return None;
-    }
-
+) -> anyhow::Result<Option<checker::PermCheck>> {
+    // Parse and compile the complete policy before honoring flags that disable
+    // tools or checks. Invalid configuration must fail closed in every mode.
+    let configs = cfg.build_permission_config()?;
     let checker = checker::PermissionChecker::new(
-        &cfg.build_permission_config(),
+        &configs,
         authority.mode,
         working_dir,
         cfg.permission_modes.clone(),
-    );
-    let permission = std::sync::Arc::new(std::sync::Mutex::new(checker));
+    )?;
 
-    Some(permission)
+    if !authority.tools_enabled || !authority.permission_checks_enabled {
+        return Ok(None);
+    }
+
+    let permission = std::sync::Arc::new(std::sync::Mutex::new(checker));
+    Ok(Some(permission))
 }
 
 pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
@@ -236,7 +239,7 @@ pub(crate) async fn verify_acp_permission_policy() -> anyhow::Result<()> {
         ..Default::default()
     };
     let (authority, _) = resolve_configured_execution_authority(&cli, &cfg)?;
-    let (permission, ask_tx) = build_noninteractive_permission(&cfg, authority);
+    let (permission, ask_tx) = build_noninteractive_permission(&cfg, authority)?;
 
     anyhow::ensure!(
         ask_tx.is_none(),
@@ -671,7 +674,7 @@ mod execution_authority_tests {
                     assert_eq!(authority.sandbox, sandbox, "{}", case.name);
 
                     let (interactive, interactive_ask, interactive_receiver) =
-                        build_interactive_permission(&case.cfg, authority);
+                        build_interactive_permission(&case.cfg, authority).unwrap();
                     assert_eq!(
                         interactive.is_some(),
                         case.permission_checks_enabled,
@@ -692,7 +695,7 @@ mod execution_authority_tests {
                     );
 
                     let (noninteractive, noninteractive_ask) =
-                        build_noninteractive_permission(&case.cfg, authority);
+                        build_noninteractive_permission(&case.cfg, authority).unwrap();
                     assert_eq!(
                         noninteractive.is_some(),
                         case.permission_checks_enabled,
@@ -804,7 +807,44 @@ mod acp_permission_policy_tests {
         )
         .unwrap();
         assert_eq!(authority.sandbox, SandboxResolution::Disabled);
-        build_noninteractive_permission(&cfg, authority)
+        build_noninteractive_permission(&cfg, authority).unwrap()
+    }
+
+    #[test]
+    fn acp_policy_construction_rejects_invalid_regex_before_tools_exist() {
+        let cfg = Config {
+            permission_regex: Some(serde_json::json!({
+                "write": {"[unterminated": "allow"}
+            })),
+            ..Default::default()
+        };
+
+        for cli in [
+            Cli::default(),
+            Cli {
+                no_tools: true,
+                ..Cli::default()
+            },
+            Cli {
+                dangerously_skip_permissions: true,
+                ..Cli::default()
+            },
+        ] {
+            let authority = resolve_execution_authority(
+                &cli,
+                &cfg,
+                crate::sandbox::SandboxPolicy::Disabled,
+                "unused",
+            )
+            .unwrap();
+            let error = build_noninteractive_permission(&cfg, authority)
+                .err()
+                .expect("invalid regex must fail ACP policy construction")
+                .to_string();
+            assert!(error.contains("permission-regex"), "{error}");
+            assert!(error.contains("write"), "{error}");
+            assert!(error.contains("[unterminated"), "{error}");
+        }
     }
 
     fn message(result: Result<Option<String>, ToolError>) -> Option<String> {

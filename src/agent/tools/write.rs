@@ -272,7 +272,8 @@ mod tests {
             SecurityMode::Standard,
             Some(allowed_dir),
             Some(vec!["standard".to_string()]),
-        );
+        )
+        .expect("valid permission test configuration");
         let tool = WriteTool::new(Some(Arc::new(Mutex::new(checker))), None, None);
 
         let error = tool
@@ -312,7 +313,8 @@ mod tests {
             SecurityMode::Standard,
             Some(allowed_dir),
             Some(vec!["standard".to_string()]),
-        );
+        )
+        .expect("valid permission test configuration");
         let tool = WriteTool::new(Some(Arc::new(Mutex::new(checker))), None, None);
 
         let error = tool
@@ -353,7 +355,8 @@ mod tests {
             SecurityMode::Guarded,
             Some(temp.path().to_path_buf()),
             Some(vec!["guarded".to_string()]),
-        );
+        )
+        .expect("valid permission test configuration");
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
         let tool = WriteTool::new(Some(Arc::new(Mutex::new(checker))), Some(ask_tx), None);
 

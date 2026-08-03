@@ -373,21 +373,27 @@ mod tests {
             )),
             ..PermissionConfig::default()
         };
-        Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::from(config),
-            SecurityMode::Restrictive,
-            Some(std::path::PathBuf::from("/workspace")),
-            Some(vec!["restrictive".to_string()]),
-        )))
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Restrictive,
+                Some(std::path::PathBuf::from("/workspace")),
+                Some(vec!["restrictive".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ))
     }
 
     fn standard_permission(working_dir: &Path) -> PermCheck {
-        Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::default(),
-            SecurityMode::Standard,
-            Some(working_dir.to_path_buf()),
-            Some(vec!["standard".to_string()]),
-        )))
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::default(),
+                SecurityMode::Standard,
+                Some(working_dir.to_path_buf()),
+                Some(vec!["standard".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ))
     }
 
     #[tokio::test]
@@ -599,12 +605,15 @@ mod tests {
             )),
             ..PermissionConfig::default()
         };
-        let permission = Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::from(config),
-            SecurityMode::Standard,
-            Some(workspace),
-            Some(vec!["standard".to_string()]),
-        )));
+        let permission = Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(workspace),
+                Some(vec!["standard".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ));
 
         let result = GrepTool::new(Some(permission), None, 10)
             .call(GrepArgs {

@@ -956,21 +956,27 @@ mod tests {
             )),
             ..PermissionConfig::default()
         };
-        Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::from(config),
-            SecurityMode::Restrictive,
-            Some(std::path::PathBuf::from("/workspace")),
-            Some(vec!["restrictive".to_string()]),
-        )))
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Restrictive,
+                Some(std::path::PathBuf::from("/workspace")),
+                Some(vec!["restrictive".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ))
     }
 
     fn standard_permission(working_dir: &Path) -> PermCheck {
-        Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::default(),
-            SecurityMode::Standard,
-            Some(working_dir.to_path_buf()),
-            None,
-        )))
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::default(),
+                SecurityMode::Standard,
+                Some(working_dir.to_path_buf()),
+                None,
+            )
+            .expect("valid permission test configuration"),
+        ))
     }
 
     async fn call_answering_path_permission(

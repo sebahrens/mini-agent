@@ -127,12 +127,15 @@ fn restrictive_permission_allowing_js_entrypoint() -> PermCheck {
         ),
         ..PermissionConfig::default()
     };
-    std::sync::Arc::new(std::sync::Mutex::new(PermissionChecker::new(
-        &PermissionConfigs::from(config),
-        SecurityMode::Restrictive,
-        std::env::current_dir().ok(),
-        Some(vec!["restrictive".to_string()]),
-    )))
+    std::sync::Arc::new(std::sync::Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Restrictive,
+            std::env::current_dir().ok(),
+            Some(vec!["restrictive".to_string()]),
+        )
+        .expect("valid permission test configuration"),
+    ))
 }
 
 fn restrictive_permission_denying_js_entrypoint() -> PermCheck {
@@ -144,12 +147,15 @@ fn restrictive_permission_denying_js_entrypoint() -> PermCheck {
         ),
         ..PermissionConfig::default()
     };
-    std::sync::Arc::new(std::sync::Mutex::new(PermissionChecker::new(
-        &PermissionConfigs::from(config),
-        SecurityMode::Restrictive,
-        std::env::current_dir().ok(),
-        Some(vec!["restrictive".to_string()]),
-    )))
+    std::sync::Arc::new(std::sync::Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Restrictive,
+            std::env::current_dir().ok(),
+            Some(vec!["restrictive".to_string()]),
+        )
+        .expect("valid permission test configuration"),
+    ))
 }
 
 #[tokio::test]

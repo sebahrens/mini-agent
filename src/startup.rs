@@ -36,6 +36,19 @@ fn regen_resource(regen: fn() -> anyhow::Result<()>, what: &str, suffix: &str) -
     }
 }
 
+/// Validate the complete configured policy before any provider, model, tool,
+/// transport, or UI construction. All execution modes share `Startup::init`,
+/// including ACP, headless print, loop, and interactive startup.
+fn validate_startup_permission_policy(cli: &Cli, cfg: &Config) -> anyhow::Result<()> {
+    let authority = crate::permission::resolve_execution_authority(
+        cli,
+        cfg,
+        crate::sandbox::SandboxPolicy::Disabled,
+        "disabled",
+    )?;
+    crate::permission::build_noninteractive_permission(cfg, authority)?;
+    Ok(())
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderIdentity {
     provider: CompactString,
@@ -263,6 +276,8 @@ impl Startup {
         version_changed: bool,
         is_interactive: bool,
     ) -> anyhow::Result<Self> {
+        validate_startup_permission_policy(&cli, &cfg)?;
+
         // Load context first so prompts/themes are available early.
         let context = context::load(cli.resolve_no_context_files(&cfg));
 
@@ -535,7 +550,7 @@ impl Startup {
         }
 
         let (permission, ask_tx, ask_rx) =
-            crate::permission::build_interactive_permission(&self.cfg, authority);
+            crate::permission::build_interactive_permission(&self.cfg, authority)?;
         self.permission = permission;
         self.ask_tx = ask_tx;
         self.ask_rx = ask_rx;
@@ -1124,6 +1139,7 @@ mod tests {
     use super::{
         ResumeProviderDecision, apply_resume_provider_decision, interactive_initial_message,
         resolve_resume_provider_decision, select_interactive_auto_trigger,
+        validate_startup_permission_policy,
     };
     use crate::cli::Cli;
     use crate::config::Config;
@@ -1184,6 +1200,60 @@ mod tests {
             select_interactive_auto_trigger(&Cli::default(), Some("fallback".into())),
             Some("fallback".into())
         );
+    }
+
+    #[test]
+    fn every_execution_mode_rejects_invalid_permissions_before_startup() {
+        let invalid = Config {
+            permission_regex: Some(serde_json::json!({
+                "read": {"[unterminated": "allow"}
+            })),
+            ..Config::default()
+        };
+        let modes = [
+            Cli::default(),
+            Cli {
+                print: true,
+                ..Cli::default()
+            },
+            Cli {
+                #[cfg(feature = "loop")]
+                loop_mode: true,
+                ..Cli::default()
+            },
+            Cli {
+                #[cfg(feature = "acp")]
+                acp_enabled: true,
+                ..Cli::default()
+            },
+        ];
+
+        for cli in modes {
+            let error = validate_startup_permission_policy(&cli, &invalid)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("permission-regex"), "{error}");
+            assert!(error.contains("read"), "{error}");
+            assert!(error.contains("[unterminated"), "{error}");
+        }
+
+        for cli in [
+            Cli {
+                no_tools: true,
+                ..Cli::default()
+            },
+            Cli {
+                dangerously_skip_permissions: true,
+                ..Cli::default()
+            },
+        ] {
+            let error = validate_startup_permission_policy(&cli, &invalid)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("permission-regex"), "{error}");
+            assert!(error.contains("read"), "{error}");
+            assert!(error.contains("[unterminated"), "{error}");
+        }
     }
 
     /// Pins the two inputs that decide whether a missing backend bails or

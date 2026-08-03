@@ -485,6 +485,11 @@ fn is_loopback_host(host: &str) -> bool {
 // --- Server Entry Point ---
 
 pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
+    // Keep direct callers fail-closed too. The normal binary path has already
+    // validated in `Startup::init`, before provider/client construction.
+    let (authority, _) = crate::permission::resolve_configured_execution_authority(&cli, &cfg)?;
+    crate::permission::build_noninteractive_permission(&cfg, authority)?;
+
     let tcp_settings = resolve_tcp_settings(&cli, &cfg)?;
     let transport_mode = if tcp_settings.is_some() {
         "tcp"
@@ -924,7 +929,8 @@ async fn run_prompt(
         &state.cfg,
         authority,
         Some(workspace_root.to_path_buf()),
-    );
+    )
+    .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
     let sandbox = sandbox.with_workspace_binding(workspace.clone());
 
     let provider_str = state.cli.resolve_provider(&state.cfg);
@@ -3206,7 +3212,8 @@ mod workspace_tests {
             &cfg,
             authority,
             Some(first.clone()),
-        );
+        )
+        .unwrap();
         let tool = ReadTool::new(permission, ask_tx, None, 100).with_workspace_root(first.clone());
         let relative_escape = PathBuf::from("..")
             .join(second.file_name().unwrap())

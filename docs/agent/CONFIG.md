@@ -953,6 +953,12 @@ There are two config fields for controlling permissions by pattern:
   treated as regular expressions (e.g. `.*\.rs$`, `^src/`). Regex patterns are
   unanchored — use `^` and `$` to match the full input.
 
+Permission policy configuration is validated before any provider, model,
+tool, UI, loop runner, or ACP server is constructed. Malformed permission
+objects and invalid `permission-regex` expressions stop startup with the
+configuration field, tool, and pattern path in the error. Invalid expressions
+never degrade to a match-all rule.
+
 Both fields can be used together; rules from both are merged. If both define a
 default action (`"*"`), the glob default takes precedence.
 

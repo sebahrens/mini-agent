@@ -112,8 +112,9 @@ impl PermissionChecker {
 
     fn compile_config(
         config: &PermissionConfig,
+        config_field: &str,
         is_regex: bool,
-    ) -> HashMap<String, Vec<(Pattern, Action)>> {
+    ) -> anyhow::Result<HashMap<String, Vec<(Pattern, Action)>>> {
         let mut rules: HashMap<String, Vec<(Pattern, Action)>> = HashMap::new();
         for (tool_name, tool_perm) in [
             ("bash", &config.bash),
@@ -132,7 +133,7 @@ impl PermissionChecker {
             match tp {
                 ToolPerm::Simple(action) => {
                     let pat = if is_regex {
-                        Pattern::new_regex(".*")
+                        Pattern::new_regex(".*").expect("trusted match-all regex must compile")
                     } else {
                         // A simple permission applies to every input, including
                         // file paths whose components are separated by `/`.
@@ -143,7 +144,11 @@ impl PermissionChecker {
                 ToolPerm::Granular(map) => {
                     for (pat, action) in map {
                         let pat = if is_regex {
-                            Pattern::new_regex(pat)
+                            Pattern::new_regex(pat).map_err(|error| {
+                                anyhow::anyhow!(
+                                    "invalid `{config_field}` rule for tool `{tool_name}` pattern `{pat}`: {error}"
+                                )
+                            })?
                         } else {
                             Pattern::new(pat)
                         };
@@ -156,7 +161,7 @@ impl PermissionChecker {
                 rules.insert(alias.to_string(), entries);
             }
         }
-        rules
+        Ok(rules)
     }
 
     pub fn new(
@@ -164,7 +169,7 @@ impl PermissionChecker {
         mode: SecurityMode,
         working_dir: Option<std::path::PathBuf>,
         permission_modes: Option<Vec<String>>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let default_action = configs
             .glob
             .default
@@ -176,8 +181,8 @@ impl PermissionChecker {
             .or(configs.regex.doom_loop)
             .unwrap_or(Action::Ask);
 
-        let mut rules = Self::compile_config(&configs.glob, false);
-        let regex_rules = Self::compile_config(&configs.regex, true);
+        let mut rules = Self::compile_config(&configs.glob, "permission", false)?;
+        let regex_rules = Self::compile_config(&configs.regex, "permission-regex", true)?;
         for (tool, entries) in regex_rules {
             let entry = rules.entry(tool).or_default();
             entry.extend(entries);
@@ -214,13 +219,13 @@ impl PermissionChecker {
         }
 
         for (tool, regex) in crate::permission::default_deny_regex_rules() {
-            rules
-                .entry(tool.to_string())
-                .or_default()
-                .push((Pattern::new_regex(regex), Action::Deny));
+            rules.entry(tool.to_string()).or_default().push((
+                Pattern::new_regex(regex).expect("trusted built-in deny regex must compile"),
+                Action::Deny,
+            ));
         }
 
-        let ext_dir_rules = configs
+        let mut ext_dir_rules: Vec<(Pattern, Action)> = configs
             .glob
             .external_directory
             .as_ref()
@@ -230,6 +235,16 @@ impl PermissionChecker {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(map) = &configs.regex.external_directory {
+            for (pattern, action) in map {
+                let compiled = Pattern::new_regex(pattern).map_err(|error| {
+                    anyhow::anyhow!(
+                        "invalid `permission-regex` rule for tool `external_directory` pattern `{pattern}`: {error}"
+                    )
+                })?;
+                ext_dir_rules.push((compiled, *action));
+            }
+        }
 
         let working_dir =
             working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -266,7 +281,7 @@ impl PermissionChecker {
                 .collect()
         };
 
-        PermissionChecker {
+        Ok(PermissionChecker {
             rules,
             default_action,
             ext_dir_rules,
@@ -284,7 +299,7 @@ impl PermissionChecker {
             pending_forced_ask: None,
             #[cfg(feature = "hooks")]
             pending_one_shot_allow: None,
-        }
+        })
     }
 
     /// Forces the next `check`/`check_path` call for `tool` to `Ask`,
@@ -982,6 +997,7 @@ mod tests {
             Some(workspace.to_path_buf()),
             apply_rules.then(|| vec!["planwrite".to_string()]),
         )
+        .expect("valid plan-write permission fixture")
     }
 
     #[test]
@@ -1170,7 +1186,8 @@ mod tests {
             SecurityMode::Standard,
             Some(workspace.clone()),
             Some(vec!["standard".to_string()]),
-        );
+        )
+        .expect("valid permission test configuration");
 
         let result = checker.check_path(
             "write",
@@ -1214,7 +1231,8 @@ mod tests {
             SecurityMode::Standard,
             Some(workspace.clone()),
             Some(vec!["standard".to_string()]),
-        );
+        )
+        .expect("valid bound-workspace permission fixture");
 
         std::fs::rename(&workspace, &retained).unwrap();
         symlink(&replacement, &workspace).unwrap();
@@ -1257,7 +1275,8 @@ mod tests {
             SecurityMode::Restrictive,
             Some(workspace.clone()),
             Some(vec!["restrictive".to_string()]),
-        );
+        )
+        .expect("valid relative-path permission fixture");
 
         assert_eq!(
             checker.check_bound_path("read", &workspace.join("secret.txt").to_string_lossy()),
@@ -1306,7 +1325,8 @@ mod tests {
             SecurityMode::Standard,
             Some(workspace.clone()),
             Some(vec!["standard".to_string()]),
-        );
+        )
+        .expect("valid permission test configuration");
 
         assert_eq!(
             checker.check_path(
@@ -1328,7 +1348,8 @@ mod tests {
             SecurityMode::Standard,
             Some(workspace),
             Some(vec!["standard".to_string()]),
-        );
+        )
+        .expect("valid permission test configuration");
         assert!(
             default_checker.is_external_path(&sibling.join("outside.txt").to_string_lossy()),
             "sibling-prefix path must remain outside the workspace"
@@ -1351,6 +1372,7 @@ mod tests {
                     "yolo".to_string(),
                 ]),
             )
+            .expect("valid permission test configuration")
         };
         for mode in [
             SecurityMode::Standard,

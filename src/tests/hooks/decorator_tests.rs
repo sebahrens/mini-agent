@@ -153,24 +153,30 @@ fn dispatcher_with(event: &str, handlers: Vec<HookHandler>) -> Arc<HookDispatche
 }
 
 fn permission() -> Option<crate::permission::checker::PermCheck> {
-    Some(Arc::new(std::sync::Mutex::new(PermissionChecker::new(
-        &PermissionConfigs::default(),
-        SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/repo")),
-        None,
-    ))))
+    Some(Arc::new(std::sync::Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/repo")),
+            None,
+        )
+        .expect("valid permission test configuration"),
+    )))
 }
 
 /// Restrictive mode asks for everything by default, so ask/allow one-shot
 /// routing has an observable effect to test against (Standard would allow
 /// bash unconditionally, masking the difference).
 fn permission_restrictive() -> Option<crate::permission::checker::PermCheck> {
-    Some(Arc::new(std::sync::Mutex::new(PermissionChecker::new(
-        &PermissionConfigs::default(),
-        SecurityMode::Restrictive,
-        Some(std::path::PathBuf::from("/repo")),
-        None,
-    ))))
+    Some(Arc::new(std::sync::Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Restrictive,
+            Some(std::path::PathBuf::from("/repo")),
+            None,
+        )
+        .expect("valid permission test configuration"),
+    )))
 }
 
 #[tokio::test]
@@ -257,12 +263,15 @@ async fn pre_tool_use_rewrite_cannot_bypass_a_permission_deny_rule() {
         deny_entries: Some(deny_entries),
         ..Default::default()
     };
-    let perm = Some(Arc::new(std::sync::Mutex::new(PermissionChecker::new(
-        &config.into(),
-        SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/repo")),
-        None,
-    ))));
+    let perm = Some(Arc::new(std::sync::Mutex::new(
+        PermissionChecker::new(
+            &config.into(),
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/repo")),
+            None,
+        )
+        .expect("valid permission test configuration"),
+    )));
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(JsonCommandPermCheckingTool {
         permission: perm.clone(),
     })];

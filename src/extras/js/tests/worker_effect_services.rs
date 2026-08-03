@@ -64,12 +64,15 @@ fn permission(base: PathBuf, action: Action) -> PermCheck {
         doom_loop: Some(Action::Allow),
         ..PermissionConfig::default()
     };
-    Arc::new(Mutex::new(PermissionChecker::new(
-        &PermissionConfigs::from(config),
-        SecurityMode::Standard,
-        Some(base),
-        Some(vec!["standard".to_string()]),
-    )))
+    Arc::new(Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(base),
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid worker effect permission fixture"),
+    ))
 }
 
 fn granular_permission(
@@ -82,12 +85,15 @@ fn granular_permission(
         doom_loop: Some(Action::Allow),
         ..PermissionConfig::default()
     };
-    Arc::new(Mutex::new(PermissionChecker::new(
-        &PermissionConfigs::from(config),
-        mode,
-        Some(base),
-        Some(vec![mode.to_string()]),
-    )))
+    Arc::new(Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            mode,
+            Some(base),
+            Some(vec![mode.to_string()]),
+        )
+        .expect("valid granular worker effect permission fixture"),
+    ))
 }
 
 #[test]

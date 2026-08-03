@@ -2770,6 +2770,7 @@ dependencies = [
  "security-framework-sys",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "serde_yaml_ng",
  "sha2",
  "smallvec",

@@ -564,18 +564,90 @@ impl Config {
         self.enable_grepapp_mcp.unwrap_or(false)
     }
 
-    pub fn build_permission_config(&self) -> PermissionConfigs {
-        let glob: PermissionConfig = self
-            .permission
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+    pub fn build_permission_config(&self) -> anyhow::Result<PermissionConfigs> {
+        fn parse_field(
+            field: &str,
+            value: Option<&serde_json::Value>,
+        ) -> anyhow::Result<PermissionConfig> {
+            let Some(value) = value else {
+                return Ok(PermissionConfig::default());
+            };
 
-        let regex: PermissionConfig = self
-            .permission_regex
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+            fn validate_action(
+                field: &str,
+                path: &str,
+                value: &serde_json::Value,
+            ) -> anyhow::Result<()> {
+                match value.as_str() {
+                    Some("allow" | "ask" | "deny") => Ok(()),
+                    _ => anyhow::bail!(
+                        "invalid `{field}` configuration at `{path}`: expected `allow`, `ask`, or `deny`"
+                    ),
+                }
+            }
+
+            let object = value.as_object().ok_or_else(|| {
+                anyhow::anyhow!("invalid `{field}` configuration: expected an object")
+            })?;
+            for (tool, configured) in object {
+                if matches!(tool.as_str(), "*" | "doom_loop") {
+                    validate_action(field, tool, configured)?;
+                } else if tool == "external_directory" {
+                    let patterns = configured.as_object().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid `{field}` configuration at `external_directory`: expected a pattern object"
+                        )
+                    })?;
+                    for (pattern, action) in patterns {
+                        validate_action(field, &format!("external_directory.{pattern}"), action)?;
+                    }
+                } else if matches!(
+                    tool.as_str(),
+                    "bash"
+                        | "js/fetch"
+                        | "fetch"
+                        | "read"
+                        | "write"
+                        | "edit"
+                        | "grep"
+                        | "find_files"
+                        | "list_dir"
+                        | "todo_write"
+                        | "write_todo_list"
+                        | "mcp_tool"
+                ) {
+                    if configured.is_string() {
+                        validate_action(field, tool, configured)?;
+                    } else {
+                        let patterns = configured.as_object().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "invalid `{field}` configuration at `{tool}`: expected an action or pattern object"
+                            )
+                        })?;
+                        for (pattern, action) in patterns {
+                            validate_action(field, &format!("{tool}.{pattern}"), action)?;
+                        }
+                    }
+                } else {
+                    anyhow::bail!(
+                        "invalid `{field}` configuration at `{tool}`: unsupported permission tool"
+                    );
+                }
+            }
+
+            let encoded = serde_json::to_vec(value)?;
+            let mut deserializer = serde_json::Deserializer::from_slice(&encoded);
+            serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid `{field}` configuration at `{}`: {}",
+                    error.path(),
+                    error.inner()
+                )
+            })
+        }
+
+        let glob = parse_field("permission", self.permission.as_ref())?;
+        let regex = parse_field("permission-regex", self.permission_regex.as_ref())?;
 
         let mut perm_configs = PermissionConfigs { glob, regex };
 
@@ -589,7 +661,7 @@ impl Config {
             perm_configs.glob.deny_entries = Some(deny.clone());
         }
 
-        perm_configs
+        Ok(perm_configs)
     }
 }
 

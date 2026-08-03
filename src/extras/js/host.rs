@@ -4883,12 +4883,15 @@ mod tests {
             doom_loop: Some(Action::Allow),
             ..PermissionConfig::default()
         };
-        Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::from(config),
-            SecurityMode::Standard,
-            Some(std::env::current_dir().unwrap()),
-            Some(vec!["standard".to_string()]),
-        )))
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(std::env::current_dir().unwrap()),
+                Some(vec!["standard".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ))
     }
 
     #[cfg(feature = "sandbox")]
@@ -6810,12 +6813,15 @@ mod tests {
     }
 
     fn standard_permission(working_dir: PathBuf) -> PermCheck {
-        Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::default(),
-            SecurityMode::Standard,
-            Some(working_dir),
-            Some(vec!["standard".to_string()]),
-        )))
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::default(),
+                SecurityMode::Standard,
+                Some(working_dir),
+                Some(vec!["standard".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ))
     }
 
     fn host_permission(working_dir: PathBuf, action: Action, doom_loop: Action) -> PermCheck {
@@ -6826,12 +6832,15 @@ mod tests {
             doom_loop: Some(doom_loop),
             ..PermissionConfig::default()
         };
-        Arc::new(Mutex::new(PermissionChecker::new(
-            &PermissionConfigs::from(config),
-            SecurityMode::Standard,
-            Some(working_dir),
-            Some(vec!["standard".to_string()]),
-        )))
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(working_dir),
+                Some(vec!["standard".to_string()]),
+            )
+            .expect("valid permission test configuration"),
+        ))
     }
 
     #[tokio::test]

@@ -45,6 +45,7 @@ fn guarded_checker() -> PermissionChecker {
             "yolo".to_string(),
         ]),
     )
+    .expect("valid permission test configuration")
 }
 
 // The model calls `write` on turn 0, then (given the tool's denial fed back
