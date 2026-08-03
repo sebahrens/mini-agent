@@ -39,6 +39,31 @@ def cargo_metadata(root: Path) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
+def validate_clean_tracked_worktree(root: Path) -> list[str]:
+    """Require tracked index and worktree content to match the tagged commit."""
+    errors: list[str] = []
+    for command, label in (
+        (["git", "diff", "--quiet", "--"], "working tree"),
+        (["git", "diff", "--cached", "--quiet", "--"], "index"),
+    ):
+        try:
+            result = subprocess.run(command, cwd=root, check=False)
+        except OSError as error:
+            errors.append(f"could not inspect tracked release {label}: {error}")
+            continue
+        if result.returncode == 1:
+            errors.append(
+                f"tracked release {label} is dirty; commit or restore changes "
+                "before creating a tag"
+            )
+        elif result.returncode != 0:
+            errors.append(
+                f"could not inspect tracked release {label}: git exited "
+                f"with status {result.returncode}"
+            )
+    return errors
+
+
 def canonical_binary(metadata: dict[str, Any], root: Path) -> tuple[str | None, list[str]]:
     manifest = (root / "Cargo.toml").resolve()
     package = next(
@@ -212,6 +237,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
             '--release-tag "v${VERSION}"',
             '--release-tag "v${NEW_VERSION}"',
+            "--require-clean",
             "cargo metadata --format-version 1 --no-deps >/dev/null",
         ),
         "README.md": (
@@ -324,6 +350,11 @@ def parse_args() -> argparse.Namespace:
         "--ref-type",
         help="GitHub ref type; must be 'tag' when --release-tag is supplied",
     )
+    parser.add_argument(
+        "--require-clean",
+        action="store_true",
+        help="require tracked worktree and index content to match HEAD",
+    )
     return parser.parse_args()
 
 
@@ -344,6 +375,8 @@ def main() -> int:
         return 1
 
     errors = validate(ROOT, metadata)
+    if args.require_clean:
+        errors.extend(validate_clean_tracked_worktree(ROOT))
     version = cargo_version(metadata, ROOT)
     if args.release_tag and args.ref_type and version:
         errors.extend(

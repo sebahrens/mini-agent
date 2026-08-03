@@ -1,4 +1,6 @@
 import importlib.util
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -64,6 +66,18 @@ steps:
 
         self.assertTrue(any("release identity" in error for error in errors))
 
+    def test_tag_recipes_require_committed_metadata_before_tagging(self) -> None:
+        justfile = (SCRIPT.parents[1] / "justfile").read_text(encoding="utf-8")
+        add_tag = justfile[justfile.index("add-tag:") : justfile.index("remove-tag")]
+        release = justfile[
+            justfile.index("release BUMP:") : justfile.index("pre-release:")
+        ]
+
+        self.assertLess(add_tag.index("--require-clean"), add_tag.index("git tag -a"))
+        committed_guard = release.rindex("--require-clean")
+        self.assertLess(release.index('git commit -am "bump'), committed_guard)
+        self.assertLess(committed_guard, release.index("git tag -a"))
+
 
 class ReleaseIdentityValidationTests(unittest.TestCase):
     def test_matching_stable_tag_is_accepted(self) -> None:
@@ -105,6 +119,49 @@ class ReleaseIdentityValidationTests(unittest.TestCase):
                     version="1.7.2", ref_type="tag", release_tag=release_tag
                 )
                 self.assertTrue(any("valid release tag" in error for error in errors))
+
+
+class CleanTrackedWorktreeValidationTests(unittest.TestCase):
+    def test_modified_or_staged_release_metadata_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "release-test@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Release Test"],
+                cwd=root,
+                check=True,
+            )
+            metadata = root / "Cargo.toml"
+            metadata.write_text('version = "1.7.2"\n', encoding="utf-8")
+            subprocess.run(["git", "add", "Cargo.toml"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "--quiet", "-m", "baseline"],
+                cwd=root,
+                check=True,
+            )
+
+            self.assertEqual(
+                [], CHECK_PACKAGE_METADATA.validate_clean_tracked_worktree(root)
+            )
+
+            metadata.write_text('version = "1.7.3"\n', encoding="utf-8")
+            unstaged_errors = (
+                CHECK_PACKAGE_METADATA.validate_clean_tracked_worktree(root)
+            )
+            self.assertTrue(
+                any("working tree is dirty" in error for error in unstaged_errors)
+            )
+
+            subprocess.run(["git", "add", "Cargo.toml"], cwd=root, check=True)
+            staged_errors = (
+                CHECK_PACKAGE_METADATA.validate_clean_tracked_worktree(root)
+            )
+            self.assertTrue(any("index is dirty" in error for error in staged_errors))
 
 
 if __name__ == "__main__":

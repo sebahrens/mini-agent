@@ -41,6 +41,9 @@ This single command handles everything up to crates.io publication. After CI fin
 6. Creates and pushes an annotated tag — this triggers the [GitHub Actions release workflow](../../.github/workflows/release.yml), which builds binaries for all targets
 7. Runs `cargo publish` to publish the crate to crates.io
 
+Both local tag commands require all tracked working-tree and staged changes to be committed, so
+the metadata they validate is the metadata in the commit they tag.
+
 The release workflow accepts only pushed `v*` tags. Its first job rejects a non-tag ref,
 a malformed tag, or a tag whose version differs from the root Cargo package version before any
 release binary is built. Manual branch dispatch is intentionally disabled, so a branch name can

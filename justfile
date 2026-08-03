@@ -53,6 +53,7 @@ add-tag:
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
     python3 scripts/check-package-metadata.py \
+        --require-clean \
         --ref-type tag \
         --release-tag "v${VERSION}"
     git push origin HEAD
@@ -192,6 +193,10 @@ release BUMP:
         --release-tag "v${NEW_VERSION}"
 
     git commit -am "bump to v${NEW_VERSION}"
+    python3 scripts/check-package-metadata.py \
+        --require-clean \
+        --ref-type tag \
+        --release-tag "v${NEW_VERSION}"
     git push origin HEAD
 
     git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
