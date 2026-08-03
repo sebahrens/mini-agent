@@ -9,13 +9,23 @@ JavaScript engine.
 |------|---------|
 | `src/` | Production mini-agent source |
 | `src/extras/js/` | Phase 1 JS engine integration |
-| `spike/` | QuickJS proof-of-concept research |
+| `spike/` | Standalone QuickJS proof-of-concept research crate |
 | `docs/specs/` | Normative phased JS specifications and superseded research |
 | `ARCHITECTURE.md` | Non-normative architecture overview |
 | `SPEC.md` | Non-normative implementation overview |
 
 The old nested `zerostack/` layout was flattened. Production source and the workspace
 `Cargo.toml` are at the repository root.
+
+The root Cargo workspace intentionally contains only the shipped `mini-agent` package.
+`spike/` has its own workspace and lockfile so research dependencies cannot change production
+metadata or verification. Preserve and run the harness independently:
+
+```bash
+cd spike
+cargo test --locked
+cargo run --locked
+```
 
 ## Canonical executable
 

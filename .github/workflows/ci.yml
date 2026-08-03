@@ -39,6 +39,11 @@ jobs:
       - name: Verify Cargo feature graph
         run: python3 scripts/check_feature_graph.py
 
+      - name: Verify production and research workspace boundaries
+        run: |
+          python3 -m unittest scripts.tests.test_check_workspace_boundaries
+          python3 scripts/check_workspace_boundaries.py
+
   clippy:
     if: github.event_name != 'schedule'
     strategy:

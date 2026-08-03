@@ -4564,14 +4564,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spike"
-version = "0.1.0"
-dependencies = [
- "rquickjs",
- "ureq",
-]
-
-[[package]]
 name = "spm_precompiled"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -957,18 +957,12 @@ run_verification() {
         append_verification_error "relevance allowlist" "No ${profile} production implementation file changed for declared surfaces: ${surfaces}"
     fi
 
-    # mini-agent workspace: root package (mini-agent) and spike/.
-    # Determine which packages were touched so we scope clippy/test tightly.
+    # The production workspace contains only mini-agent. The standalone spike/
+    # research harness is intentionally outside this acceptance loop.
     local existing_crates=""
     if git diff --name-only "$range_base" "$range_head" 2>/dev/null \
             | grep -vE '^spike/' | grep -qE '\.(rs|toml)$|^Cargo\.lock$'; then
         existing_crates+="mini-agent"$'\n'
-    fi
-    if git diff --name-only "$range_base" "$range_head" 2>/dev/null \
-            | grep -qE '^spike/.*\.(rs|toml)$'; then
-        if [ -f "spike/Cargo.toml" ]; then
-            existing_crates+="spike"$'\n'
-        fi
     fi
     existing_crates=$(printf '%s' "$existing_crates" | sed '/^$/d')
 
@@ -1026,7 +1020,7 @@ run_verification() {
 
     # Every accepted Rust iteration executes all unit and integration tests for
     # the affected package. Acceptance never uses a type-check-only tier.
-    # Both workspace packages are binary-only, so requesting --lib makes Cargo
+    # The production package is binary-only, so requesting --lib makes Cargo
     # fail with "no library targets found" before it can build any tests.
     local test_tier="full"
     if [ "${LOOP_TEST_TIER:-full}" != full ]; then

@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "spike"]
+members = ["."]
+exclude = ["spike"]
 resolver = "2"
 
 [workspace.metadata.dependency-policy]

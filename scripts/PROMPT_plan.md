@@ -11,7 +11,7 @@ You do **not** write Rust code and you do **not** create beads in this pass.
 - `CLAUDE.md` has the mandatory build rules (never `cargo build`, never `cargo check`).
 - `AGENTS.md` lists invariants that must never be broken.
 - Bead prefix is `mini-agent-`. Beads are created in decompose mode, not here.
-- Workspace: root package (`mini-agent`) + `spike/` crate. JS engine is feature-gated: `--features js`.
+- Production workspace: root package (`mini-agent`) only. `spike/` is a standalone research crate and never a production target. JS engine is feature-gated: `--features js`.
 
 ## Step 1 — Read the project
 
