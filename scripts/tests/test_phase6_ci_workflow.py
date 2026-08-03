@@ -302,10 +302,13 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "install",
         ):
             with self.subTest(job=job):
+                body = job_body(self.workflow, job)
+                self.assertIn("name: Use the durable macOS temporary root", body)
+                self.assertIn("if: matrix.os == 'macos-latest'", body)
                 self.assertIn(
-                    "runner.os == 'macOS' && '/private/tmp' || runner.temp",
-                    job_body(self.workflow, job),
+                    "echo 'TMPDIR=/private/tmp' >> \"$GITHUB_ENV\"", body
                 )
+                self.assertNotIn("runner.os", body)
 
         windows = job_body(self.workflow, "windows-worker-containment-gate")
         install_step = windows.split(

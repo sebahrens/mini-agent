@@ -104,12 +104,15 @@ jobs:
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ${{ matrix.os }}
-    env:
-      # GitHub's macOS runner work-temp volume does not provide the durable
-      # directory-sync semantics required by private persistence tests.
-      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # GitHub's macOS runner work-temp volume does not provide the durable
+      # directory-sync semantics required by private persistence tests.
+      - name: Use the durable macOS temporary root
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -1226,10 +1229,13 @@ jobs:
             args: '--no-default-features --features mcp,js'
             mcp: true
     runs-on: ${{ matrix.os }}
-    env:
-      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use the durable macOS temporary root
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -1352,10 +1358,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use the durable macOS temporary root
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -1457,10 +1466,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use the durable macOS temporary root
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -1481,10 +1493,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      TMPDIR: ${{ runner.os == 'macOS' && '/private/tmp' || runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use the durable macOS temporary root
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
