@@ -35,7 +35,7 @@ pub struct LspManager {
 }
 
 struct Inner {
-    root: PathBuf,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
     servers: Vec<(String, crate::config::types::LspServerConfig)>,
     /// server name → currently live client. Failed or stopped clients are not
     /// retained so a later edit can restart a repaired server.
@@ -45,7 +45,8 @@ struct Inner {
 }
 
 impl LspManager {
-    pub fn new(cfg: &LspConfig, root: PathBuf) -> Self {
+    pub fn new(cfg: &LspConfig, workspace: Arc<crate::paths::WorkspaceBinding>) -> Self {
+        let root = workspace.root();
         let servers = registry::resolve_servers(&cfg.servers);
         tracing::debug!(
             "lsp: {} server definitions resolved (root {})",
@@ -54,13 +55,29 @@ impl LspManager {
         );
         Self {
             inner: Arc::new(Inner {
-                root,
+                workspace,
                 servers,
                 clients: tokio::sync::Mutex::new(HashMap::new()),
                 diags: DiagStore::default(),
                 diag_notify: Arc::new(Notify::new()),
             }),
         }
+    }
+
+    pub fn resolve_path(&self, path: &Path) -> Result<PathBuf, String> {
+        self.inner.workspace.validate()?;
+        let requested = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.inner.workspace.root().join(path)
+        };
+        let resolved = std::fs::canonicalize(&requested).map_err(|error| {
+            format!("lsp: failed to resolve '{}': {error}", requested.display())
+        })?;
+        if !resolved.starts_with(self.inner.workspace.root()) {
+            return Err("lsp: file is outside the session workspace".to_string());
+        }
+        Ok(resolved)
     }
 
     /// Whether any configured server claims this path's extension.
@@ -71,6 +88,11 @@ impl LspManager {
     /// Client for the server claiming `path`, spawning it on first use.
     /// `None` when no server matches or the current spawn attempt failed.
     async fn client_for(&self, path: &Path) -> Option<Arc<LspClient>> {
+        if self.inner.workspace.validate().is_err()
+            || !path.starts_with(self.inner.workspace.root())
+        {
+            return None;
+        }
         let (name, cfg) = registry::server_for_path(&self.inner.servers, path)?;
         let mut clients = self.inner.clients.lock().await;
         if let Some(cached) = clients.get(name)
@@ -170,6 +192,19 @@ impl LspManager {
         self.diagnostics_block(path, DIAG_WAIT).await
     }
 
+    pub async fn diagnostics_block_relative(
+        &self,
+        relative: &Path,
+        wait: Duration,
+    ) -> Option<String> {
+        let service = client::workspace_service_root(self.inner.workspace.root()).join(relative);
+        self.diagnostics_block(&service, wait).await
+    }
+
+    pub async fn diagnostics_block_for_relative_edit(&self, relative: &Path) -> Option<String> {
+        self.diagnostics_block_relative(relative, DIAG_WAIT).await
+    }
+
     /// All files that currently have diagnostics, formatted for the
     /// `lsp_diagnostics` tool. `None` when everything is clean.
     pub fn all_diagnostics_block(&self) -> Option<String> {
@@ -189,7 +224,7 @@ impl LspManager {
             }
             let display = uri
                 .strip_prefix("file://")
-                .and_then(|p| p.strip_prefix(self.inner.root.to_str()?))
+                .and_then(|p| p.strip_prefix(self.inner.workspace.root().to_str()?))
                 .map(|p| p.trim_start_matches('/').to_string())
                 .unwrap_or_else(|| uri.clone());
             for d in interesting {

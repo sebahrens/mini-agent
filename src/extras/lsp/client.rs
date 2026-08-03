@@ -22,15 +22,18 @@ use crate::config::types::{LspNetwork, LspServerConfig};
 use crate::process_creation::CommandWrapCreationExt;
 use crate::sandbox::{Sandbox, owned_workspace_service_tree};
 
+pub(crate) async fn read_stable_text(path: &Path) -> std::io::Result<String> {
+    let mut file = crate::fs::open_stable_file(path).await?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).await?;
+    Ok(text)
+}
+
 /// `file://` URI for a path, with minimal percent-encoding (anything outside
 /// RFC 3986 unreserved + `/` is hex-escaped). Relative paths resolve against
-/// the process cwd.
+/// the caller-provided workspace root.
 pub(crate) fn file_uri(path: &Path) -> Option<String> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
+    let abs = path.is_absolute().then(|| path.to_path_buf())?;
     let s = abs.to_str()?;
     #[cfg(windows)]
     let normalized = s.replace('\\', "/");
@@ -101,6 +104,7 @@ impl LspClient {
         name: &str,
         cfg: &LspServerConfig,
         root: &Path,
+        workspace_handle: Option<std::fs::File>,
         diags: DiagStore,
         diag_notify: Arc<Notify>,
     ) -> Option<Arc<Self>> {
@@ -375,6 +379,13 @@ impl LspClient {
     /// Syncs a file's current disk content with the server: `didOpen` on
     /// first touch, full-content `didChange` afterwards.
     pub async fn sync_file(&self, path: &Path) {
+        let Ok(text) = read_stable_text(path).await else {
+            return; // unreadable/binary file — skip silently
+        };
+        self.sync_text(path, text).await;
+    }
+
+    pub async fn sync_text(&self, path: &Path, text: String) {
         let Some(uri) = file_uri(path) else {
             return;
         };

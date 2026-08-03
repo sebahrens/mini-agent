@@ -227,6 +227,7 @@ enum PathPolicy {
 #[derive(Debug, Clone)]
 pub(crate) struct AllowConfig {
     base: PathBuf,
+    workspace_binding: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read: PathPolicy,
     write: PathPolicy,
     #[cfg(feature = "sandbox")]
@@ -251,6 +252,7 @@ impl AllowConfig {
         let Ok(base) = base else {
             return Self {
                 base: startup_base.to_path_buf(),
+                workspace_binding: None,
                 read: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Read)),
                 write: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Write)),
                 #[cfg(feature = "sandbox")]
@@ -262,9 +264,44 @@ impl AllowConfig {
             read: build_path_policy(&base, read_roots, read_unrestricted, FileAccess::Read),
             write: build_path_policy(&base, write_roots, write_unrestricted, FileAccess::Write),
             base,
+            workspace_binding: None,
             #[cfg(feature = "sandbox")]
             fetch: FetchPolicy::default(),
         }
+    }
+
+    pub(crate) fn with_workspace_binding(
+        mut self,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        self.workspace_binding = Some(workspace);
+        self
+    }
+
+    fn validate_workspace(&self, tool: &'static str) -> rquickjs::Result<()> {
+        self.workspace_binding
+            .as_ref()
+            .map(|workspace| workspace.validate())
+            .transpose()
+            .map(|_| ())
+            .map_err(|_| {
+                file_error(
+                    tool,
+                    "workspace changed",
+                    "session workspace is unavailable",
+                )
+            })
+    }
+
+    fn effect_base(&self) -> PathBuf {
+        self.workspace_binding
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf())
+            .unwrap_or_else(|| self.base.clone())
+    }
+
+    fn workspace_binding(&self) -> Option<&std::sync::Arc<crate::paths::WorkspaceBinding>> {
+        self.workspace_binding.as_ref()
     }
 
     pub(crate) fn with_fetch_settings(self, origins: Option<&[String]>, allow_http: bool) -> Self {
@@ -300,6 +337,31 @@ impl AllowConfig {
             Err(reason) => return AuthorizationDecision::Denied(reason),
         };
         authorize_resolved(&self.write, resolved, FileAccess::Write)
+    }
+
+    fn authorize_bound(&self, relative: &Path, access: FileAccess) -> AuthorizationDecision {
+        let Some(workspace) = self.workspace_binding() else {
+            return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(access));
+        };
+        let target = match workspace.logical_relative_path(relative) {
+            Ok(target) => target,
+            Err(_) => {
+                return AuthorizationDecision::Denied(AllowPolicyReason::InvalidTarget(access));
+            }
+        };
+        let policy = match access {
+            FileAccess::Read => &self.read,
+            FileAccess::Write => &self.write,
+        };
+        authorize_resolved(policy, target, access)
+    }
+
+    fn authorize_bound_read(&self, relative: &Path) -> AuthorizationDecision {
+        self.authorize_bound(relative, FileAccess::Read)
+    }
+
+    fn authorize_bound_write(&self, relative: &Path) -> AuthorizationDecision {
+        self.authorize_bound(relative, FileAccess::Write)
     }
 }
 
@@ -6269,6 +6331,43 @@ mod tests {
             policy.authorize_read(&safe.join("..").join("safe-evil").join("secret.txt")),
             AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn js_bound_allow_identity_does_not_follow_a_swapped_workspace_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let workspace = temp.path().join("workspace");
+        let replacement = temp.path().join("replacement");
+        let retained = temp.path().join("workspace-retained");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(workspace.join("sentinel.txt"), "original").unwrap();
+        std::fs::write(replacement.join("sentinel.txt"), "replacement").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let replacement = replacement.canonicalize().unwrap();
+        let roots = vec![".".to_string()];
+        let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
+        let policy =
+            AllowConfig::from_settings(&workspace, None, Some(&roots), Some(&roots), false, false)
+                .with_workspace_binding(binding);
+
+        std::fs::rename(&workspace, &retained).unwrap();
+        symlink(&replacement, &workspace).unwrap();
+        expect_denied(
+            policy.authorize_read(&workspace.join("sentinel.txt")),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+        assert_eq!(
+            expect_allowed(policy.authorize_bound_read(Path::new("sentinel.txt"))),
+            workspace.join("sentinel.txt"),
+            "capability-relative policy identity must remain the captured workspace"
+        );
+
+        std::fs::remove_file(&workspace).unwrap();
+        std::fs::rename(&retained, &workspace).unwrap();
     }
 
     #[test]

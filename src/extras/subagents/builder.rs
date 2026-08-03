@@ -42,6 +42,37 @@ impl SubagentAuthorization {
         max_find_results: u64,
         max_list_dir_entries: Option<u64>,
     ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+        let read = tools::ReadTool::new(
+            self.permission.clone(),
+            self.ask_tx.clone(),
+            Some(max_text_file_size),
+            max_read_lines,
+        );
+        let grep = tools::GrepTool::new(
+            self.permission.clone(),
+            self.ask_tx.clone(),
+            max_grep_results,
+        );
+        let find = tools::FindFilesTool::new(
+            self.permission.clone(),
+            self.ask_tx.clone(),
+            max_find_results,
+        );
+        let list = tools::ListDirTool::new(
+            self.permission.clone(),
+            self.ask_tx.clone(),
+            max_list_dir_entries,
+        );
+        let (read, grep, find, list) = if let Some(workspace) = &self.workspace {
+            (
+                read.with_workspace_binding(workspace.clone()),
+                grep.with_workspace_binding(workspace.clone()),
+                find.with_workspace_binding(workspace.clone()),
+                list.with_workspace_binding(workspace.clone()),
+            )
+        } else {
+            (read, grep, find, list)
+        };
         vec![
             Box::new(
                 tools::ReadTool::new(
@@ -116,15 +147,10 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     additional_params: Option<serde_json::Value>,
     #[cfg(feature = "archmd")] architecture: Option<&str>,
 ) -> Agent<M> {
-    let mut preamble = prompt::explore_prompt();
-
-    #[cfg(feature = "archmd")]
-    if let Some(arch) = architecture
-        && !arch.is_empty()
-    {
-        preamble.push_str("\n\n");
-        preamble.push_str(arch);
-    }
+    let mut preamble = build_explore_preamble(
+        #[cfg(feature = "archmd")]
+        architecture,
+    );
 
     if let Some(s) = crate::session::storage::load_suffix() {
         preamble.push_str("\n\n---\n\n");
@@ -158,6 +184,18 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     }
 
     builder.build()
+}
+
+fn build_explore_preamble(#[cfg(feature = "archmd")] architecture: Option<&str>) -> String {
+    let mut preamble = prompt::explore_prompt();
+    #[cfg(feature = "archmd")]
+    if let Some(arch) = architecture
+        && !arch.is_empty()
+    {
+        preamble.push_str("\n\n");
+        preamble.push_str(arch);
+    }
+    preamble
 }
 
 pub(crate) async fn build_explore_agent(
@@ -306,7 +344,18 @@ mod tests {
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{PermissionConfigs, SecurityMode};
 
-    use super::SubagentAuthorization;
+    use super::{SubagentAuthorization, build_explore_preamble};
+
+    #[cfg(feature = "archmd")]
+    #[test]
+    fn explore_preamble_uses_only_the_supplied_session_architecture() {
+        let first = build_explore_preamble(Some("FIRST_SESSION_ARCHITECTURE"));
+        let second = build_explore_preamble(Some("SECOND_SESSION_ARCHITECTURE"));
+        assert!(first.contains("FIRST_SESSION_ARCHITECTURE"));
+        assert!(!first.contains("SECOND_SESSION_ARCHITECTURE"));
+        assert!(second.contains("SECOND_SESSION_ARCHITECTURE"));
+        assert!(!second.contains("FIRST_SESSION_ARCHITECTURE"));
+    }
 
     struct TempDir(PathBuf);
 

@@ -1,9 +1,11 @@
+use std::path::Path;
+
 use rig::tool::Tool;
 use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::{
-    AskSender, PermCheck, ReadArgs, ToolError, check_perm_path, edit_system,
+    AskSender, PermCheck, ReadArgs, ToolError, check_perm_bound_path, check_perm_path, edit_system,
 };
 use crate::config::types::EditSystem;
 
@@ -83,9 +85,33 @@ impl Tool for ReadTool {
             offset,
             limit,
         );
-        let coaching =
-            check_perm_path(&self.permission, &self.ask_tx, "read", &permission_path).await?;
-        let mut file = crate::fs::open_stable_file(&resolved).await?;
+        let (resolved, coaching) = if let Some(workspace) = bound_workspace {
+            (
+                None,
+                check_perm_bound_path(&self.permission, &self.ask_tx, "read", workspace, relative)
+                    .await?,
+            )
+        } else {
+            let resolved = tokio::fs::canonicalize(&requested).await?;
+            let coaching = check_perm_path(
+                &self.permission,
+                &self.ask_tx,
+                "read",
+                &resolved.to_string_lossy(),
+            )
+            .await?;
+            (Some(resolved), coaching)
+        };
+        let mut file = if let Some(file) = capability_file {
+            tokio::fs::File::from_std(file)
+        } else {
+            crate::fs::open_stable_file(
+                resolved
+                    .as_deref()
+                    .expect("ambient read must resolve an external path"),
+            )
+            .await?
+        };
 
         if let Some(msg) = crate::agent::tools::track_read(&path.to_string_lossy(), offset, limit) {
             tracing::debug!("tool read blocked (repeated): path={}", path.display());

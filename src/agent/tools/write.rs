@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use rig::tool::Tool;
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path};
+use crate::agent::tools::{
+    AskSender, PermCheck, ToolError, WriteArgs, check_perm_bound_path, check_perm_path,
+};
 #[cfg(feature = "lsp")]
 use crate::extras::lsp::LspManager;
 

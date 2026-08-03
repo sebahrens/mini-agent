@@ -1,10 +1,13 @@
 use std::io::Read;
+use std::path::Path;
 
 use regex::Regex;
 use rig::tool::Tool;
 
 use super::find_files::BoundDirectory;
-use crate::agent::tools::{AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_path};
+use crate::agent::tools::{
+    AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_bound_path, check_perm_path,
+};
 
 pub struct GrepTool {
     pub permission: Option<PermCheck>,
@@ -235,9 +238,6 @@ impl Tool for GrepTool {
                 break;
             }
         }
-        let current_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-        crate::fs::ensure_same_file(&traversal_root, &authorized_metadata, &current_metadata)?;
-
         if all_results.is_empty() {
             let msg = "No matches found.".to_string();
             return Ok(match coaching {
@@ -661,7 +661,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn grep_external_path_permission_rejects_authorized_root_replacement() {
+    async fn grep_external_path_permission_retains_authorized_root_on_replacement() {
         let container = TempDir::new("root-replacement");
         let workspace = container.path().join("workspace");
         let authorized = container.path().join("authorized");
@@ -690,9 +690,9 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(call, replace);
-        let error = result.expect_err("grep must reject a replaced traversal root");
-        assert!(error.to_string().contains("Path changed"));
-        assert!(!error.to_string().contains("must_not_be_returned"));
+        let output = result.expect("descriptor-bound grep must retain the authorized root");
+        assert!(output.contains("No matches found"));
+        assert!(!output.contains("must_not_be_returned"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

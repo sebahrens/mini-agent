@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use ignore::WalkBuilder;
 use rig::tool::Tool;
 
+use super::find_files::BoundDirectory;
 use crate::agent::tools::{
-    AskSender, ListDirArgs, PermCheck, ToolError, check_perm_path, is_skip_dir,
+    AskSender, ListDirArgs, PermCheck, ToolError, check_perm_bound_path, check_perm_path,
 };
 
 pub(crate) fn format_size(bytes: u64) -> String {
@@ -109,42 +109,24 @@ impl Tool for ListDirTool {
 
         let mut entries: Vec<(String, String, String)> = Vec::new();
 
-        for result in walker {
-            let entry = match result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            if entry.depth() == 0 {
-                continue;
-            }
-
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let kind = if meta.is_dir() {
-                let count = count_dir_entries(entry.path());
-                format!("dir({})", count)
-            } else if meta.is_symlink() {
+        for entry in bound_directory.list_entries()? {
+            let name = entry.file_name.to_string_lossy().to_string();
+            let kind = if entry.metadata.is_dir() {
+                format!("dir({})", entry.child_count)
+            } else if entry.metadata.is_symlink() {
                 "link".to_string()
             } else {
                 "file".to_string()
             };
 
-            let size = if meta.is_file() {
-                format_size(meta.len())
+            let size = if entry.metadata.is_file() {
+                format_size(entry.metadata.len())
             } else {
                 String::new()
             };
 
             entries.push((name, kind, size));
         }
-        let current_metadata = crate::fs::stable_path_metadata(&resolved).await?;
-        crate::fs::ensure_same_file(&resolved, &checked_metadata, &current_metadata)?;
 
         entries.sort_by(|a, b| {
             let a_is_dir = a.1.starts_with("dir") || a.1 == "link";
@@ -218,7 +200,7 @@ mod tests {
     use crate::permission::{PermissionConfigs, SecurityMode};
 
     #[tokio::test]
-    async fn symlink_swap_after_permission_check_is_rejected() {
+    async fn descriptor_bound_listing_ignores_an_aba_swap_during_permission_wait() {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir().join(format!(
             "zerostack_list_dir_toctou_test_{}_{}",
@@ -233,6 +215,7 @@ mod tests {
         std::fs::write(checked_target.join("checked.txt"), "checked").unwrap();
         std::fs::write(swapped_target.join("swapped.txt"), "swapped").unwrap();
         std::os::unix::fs::symlink(&checked_target, &link).unwrap();
+        let original_target = temp.join("checked-original");
 
         let checker = PermissionChecker::new(
             &PermissionConfigs::default(),
@@ -252,14 +235,22 @@ mod tests {
                 PathBuf::from(&request.input),
                 std::fs::canonicalize(&checked_target).unwrap()
             );
-            std::fs::remove_dir_all(&checked_target).unwrap();
+            std::fs::rename(&checked_target, &original_target).unwrap();
             std::os::unix::fs::symlink(&swapped_target, &checked_target).unwrap();
             request.reply.send(UserDecision::AllowOnce).unwrap();
         };
 
         let (result, ()) = tokio::join!(call, swap);
-        let error = result.expect_err("list_dir must reject a swapped permission-checked target");
-        assert!(error.to_string().contains("Path changed"));
+        let listing = result.expect("descriptor-bound listing must retain the authorized target");
+        assert!(listing.contains("checked.txt"));
+        assert!(!listing.contains("swapped.txt"));
+
+        std::fs::remove_file(&checked_target).unwrap();
+        std::fs::rename(&original_target, &checked_target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checked_target.join("checked.txt")).unwrap(),
+            "checked"
+        );
 
         std::fs::remove_dir_all(temp).unwrap();
     }
