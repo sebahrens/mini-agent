@@ -2,6 +2,10 @@ use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "sandbox")]
+use std::pin::Pin;
+#[cfg(feature = "sandbox")]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "sandbox", test))]
@@ -45,7 +49,7 @@ use reqwest::Url;
 #[cfg(feature = "sandbox")]
 use std::io::Read;
 #[cfg(feature = "sandbox")]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 #[cfg(feature = "sandbox")]
 use std::sync::{
     Arc,
@@ -528,6 +532,8 @@ impl<'js> IntoJs<'js> for SpawnResult {
 #[cfg(feature = "sandbox")]
 const FETCH_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "sandbox")]
+const FETCH_DNS_MAX_IN_FLIGHT: usize = 4;
+#[cfg(feature = "sandbox")]
 const FETCH_MAX_REDIRECTS: usize = 5;
 #[cfg(feature = "sandbox")]
 const FETCH_MAX_DESTINATION_ADDRESSES: usize = 32;
@@ -667,8 +673,94 @@ trait FetchResolver: Send + Sync {
 }
 
 #[cfg(feature = "sandbox")]
+type DnsLookupFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, FetchError>> + Send + 'static>>;
+
+#[cfg(feature = "sandbox")]
+trait DnsLookup: Send + Sync {
+    fn lookup(
+        self: Arc<Self>,
+        host: String,
+        port: u16,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> DnsLookupFuture;
+}
+
+#[cfg(feature = "sandbox")]
+struct SystemDnsLookup;
+
+#[cfg(feature = "sandbox")]
+impl DnsLookup for SystemDnsLookup {
+    fn lookup(
+        self: Arc<Self>,
+        host: String,
+        port: u16,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> DnsLookupFuture {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                // `ToSocketAddrs` may remain live after the awaiting Tokio
+                // runtime begins shutdown. The actual non-abortable blocking
+                // closure therefore owns the process-wide permit.
+                let _permit = permit;
+                let addresses = (host.as_str(), port)
+                    .to_socket_addrs()
+                    .map_err(|_| FetchError::DnsResolutionFailed)?
+                    .take(FETCH_MAX_DESTINATION_ADDRESSES + 1)
+                    .collect::<Vec<_>>();
+                if addresses.is_empty() {
+                    Err(FetchError::DnsResolutionFailed)
+                } else {
+                    Ok(addresses)
+                }
+            })
+            .await
+            .unwrap_or(Err(FetchError::DnsResolutionFailed))
+        })
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn process_dns_budget() -> Arc<tokio::sync::Semaphore> {
+    static BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(FETCH_DNS_MAX_IN_FLIGHT)))
+        .clone()
+}
+
+#[cfg(feature = "sandbox")]
 struct RuntimeFetchResolver {
     runtime: tokio::runtime::Handle,
+    budget: Arc<tokio::sync::Semaphore>,
+    lookup: Arc<dyn DnsLookup>,
+    timeout: Duration,
+}
+
+#[cfg(feature = "sandbox")]
+impl RuntimeFetchResolver {
+    fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            runtime,
+            budget: process_dns_budget(),
+            lookup: Arc::new(SystemDnsLookup),
+            timeout: FETCH_DNS_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_lookup_for_test(
+        runtime: tokio::runtime::Handle,
+        budget: Arc<tokio::sync::Semaphore>,
+        lookup: Arc<dyn DnsLookup>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            runtime,
+            budget,
+            lookup,
+            timeout,
+        }
+    }
 }
 
 #[cfg(feature = "sandbox")]
@@ -686,28 +778,46 @@ impl FetchResolver for RuntimeFetchResolver {
             return Ok(vec![SocketAddr::new(address, port)]);
         }
         let bridge = permission_bridge.clone();
+        let task_bridge = permission_bridge.clone();
+        let host = host.to_string();
+        let budget = self.budget.clone();
+        let lookup = self.lookup.clone();
+        let timeout_duration = self.timeout;
         self.runtime.block_on(async move {
+            let lookup_call = async move {
+                let permit = tokio::select! {
+                    biased;
+                    _ = task_bridge.cancelled() => return Err(FetchError::Cancelled),
+                    permit = budget.acquire_owned() => {
+                        permit.map_err(|_| FetchError::DnsResolutionFailed)?
+                    }
+                };
+                if task_bridge.is_cancelled() {
+                    return Err(FetchError::Cancelled);
+                }
+
+                // Dropping the caller's timeout/cancellation wait cannot abort
+                // the lookup. `SystemDnsLookup` moves the permit into the
+                // actual blocking OS resolver closure so runtime shutdown also
+                // cannot release capacity early.
+                let lookup_task = tokio::spawn(lookup.lookup(host, port, permit));
+                tokio::select! {
+                    biased;
+                    _ = task_bridge.cancelled() => Err(FetchError::Cancelled),
+                    result = lookup_task => {
+                        result.unwrap_or(Err(FetchError::DnsResolutionFailed))
+                    }
+                }
+            };
             tokio::select! {
-                result = tokio::time::timeout(
-                    FETCH_DNS_TIMEOUT,
-                    tokio::net::lookup_host((host, port)),
-                ) => {
+                biased;
+                _ = bridge.cancelled() => Err(FetchError::Cancelled),
+                result = tokio::time::timeout(timeout_duration, lookup_call) => {
                     match result {
-                        Ok(Ok(addresses)) => {
-                            let addresses = addresses
-                                .take(FETCH_MAX_DESTINATION_ADDRESSES + 1)
-                                .collect::<Vec<_>>();
-                            if addresses.is_empty() {
-                                Err(FetchError::DnsResolutionFailed)
-                            } else {
-                                Ok(addresses)
-                            }
-                        }
-                        Ok(Err(_)) => Err(FetchError::DnsResolutionFailed),
+                        Ok(result) => result,
                         Err(_) => Err(FetchError::TimedOut),
                     }
                 }
-                _ = bridge.cancelled() => Err(FetchError::Cancelled),
             }
         })
     }
@@ -2244,9 +2354,7 @@ impl FetchEffectService {
         policy: FetchPolicy,
         timeout: Duration,
     ) -> Self {
-        let resolver = Arc::new(RuntimeFetchResolver {
-            runtime: runtime.clone(),
-        });
+        let resolver = Arc::new(RuntimeFetchResolver::new(runtime.clone()));
         let executor = Arc::new(FetchExecutor {
             policy,
             resolver,
@@ -4079,6 +4187,302 @@ mod tests {
                 .pop_front()
                 .expect("fake resolver response exhausted")
         }
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[derive(Default)]
+    struct BlockingDnsLookup {
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+        released: Mutex<bool>,
+        wake: Condvar,
+    }
+
+    #[cfg(feature = "sandbox")]
+    impl BlockingDnsLookup {
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+
+        fn active(&self) -> usize {
+            self.active.load(Ordering::Acquire)
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(Ordering::Acquire)
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    impl DnsLookup for BlockingDnsLookup {
+        fn lookup(
+            self: Arc<Self>,
+            _host: String,
+            _port: u16,
+            permit: tokio::sync::OwnedSemaphorePermit,
+        ) -> DnsLookupFuture {
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    struct ActiveLookup(Arc<BlockingDnsLookup>);
+
+                    impl Drop for ActiveLookup {
+                        fn drop(&mut self) {
+                            self.0.active.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+
+                    let _permit = permit;
+                    let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+                    self.max_active.fetch_max(active, Ordering::AcqRel);
+                    let _active = ActiveLookup(self.clone());
+                    let mut released = self.released.lock().unwrap();
+                    while !*released {
+                        released = self.wake.wait(released).unwrap();
+                    }
+                    Ok(vec![public_address()])
+                })
+                .await
+                .unwrap_or(Err(FetchError::DnsResolutionFailed))
+            })
+        }
+    }
+
+    #[cfg(feature = "sandbox")]
+    async fn wait_for_dns_activity(lookup: &BlockingDnsLookup, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lookup.active() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DNS activity did not reach the expected count");
+    }
+
+    #[cfg(all(feature = "sandbox", feature = "multithread"))]
+    fn wait_for_dns_activity_blocking(lookup: &BlockingDnsLookup, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while lookup.active() != expected && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(lookup.active(), expected);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_dns_budget_is_shared_across_resolver_instances() {
+        let first = RuntimeFetchResolver::new(tokio::runtime::Handle::current());
+        let second = RuntimeFetchResolver::new(tokio::runtime::Handle::current());
+
+        assert!(Arc::ptr_eq(&first.budget, &second.budget));
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_dns_timeout_has_a_process_wide_live_lookup_bound_and_recovers() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(2));
+        let lookup = Arc::new(BlockingDnsLookup::default());
+        let resolver = Arc::new(RuntimeFetchResolver::with_lookup_for_test(
+            tokio::runtime::Handle::current(),
+            budget.clone(),
+            lookup.clone(),
+            Duration::from_millis(50),
+        ));
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+
+        let calls = (0..6)
+            .map(|_| {
+                let resolver = resolver.clone();
+                let bridge = owner.bridge();
+                tokio::task::spawn_blocking(move || resolver.resolve("example.com", 443, &bridge))
+            })
+            .collect::<Vec<_>>();
+
+        wait_for_dns_activity(&lookup, 2).await;
+        for call in calls {
+            assert_eq!(
+                call.await.expect("DNS resolve task panicked"),
+                Err(FetchError::TimedOut)
+            );
+        }
+        assert_eq!(lookup.active(), 2);
+        assert_eq!(lookup.max_active(), 2);
+        assert_eq!(budget.available_permits(), 0);
+
+        lookup.release();
+        wait_for_dns_activity(&lookup, 0).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DNS permits were not released after lookup completion");
+        assert_eq!(budget.available_permits(), 2);
+
+        let bridge = owner.bridge();
+        let recovered =
+            tokio::task::spawn_blocking(move || resolver.resolve("example.com", 443, &bridge))
+                .await
+                .expect("recovery resolve task panicked");
+        assert_eq!(recovered, Ok(vec![public_address()]));
+    }
+
+    #[cfg(all(feature = "sandbox", feature = "multithread"))]
+    #[test]
+    fn js_fetch_dns_runtime_shutdown_does_not_release_live_os_lookup_capacity() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let lookup = Arc::new(BlockingDnsLookup::default());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let resolver = Arc::new(RuntimeFetchResolver::with_lookup_for_test(
+            runtime.handle().clone(),
+            budget.clone(),
+            lookup.clone(),
+            Duration::from_secs(1),
+        ));
+        let runtime_context = runtime.enter();
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        drop(runtime_context);
+        let bridge = owner.bridge();
+        let first = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resolver.resolve("first.example", 443, &bridge)
+            }))
+        });
+
+        wait_for_dns_activity_blocking(&lookup, 1);
+        runtime.shutdown_timeout(Duration::from_millis(10));
+        assert_eq!(lookup.active(), 1);
+        assert_eq!(budget.available_permits(), 0);
+
+        let replacement = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let replacement_resolver = Arc::new(RuntimeFetchResolver::with_lookup_for_test(
+            replacement.handle().clone(),
+            budget.clone(),
+            lookup.clone(),
+            Duration::from_millis(50),
+        ));
+        let bridge = owner.bridge();
+        let blocked_resolver = replacement_resolver.clone();
+        let blocked =
+            std::thread::spawn(move || blocked_resolver.resolve("second.example", 443, &bridge));
+        assert_eq!(blocked.join().unwrap(), Err(FetchError::TimedOut));
+        assert_eq!(lookup.active(), 1);
+        assert_eq!(lookup.max_active(), 1);
+        assert_eq!(budget.available_permits(), 0);
+
+        lookup.release();
+        wait_for_dns_activity_blocking(&lookup, 0);
+        let _ = first.join();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while budget.available_permits() != 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(budget.available_permits(), 1);
+
+        let bridge = owner.bridge();
+        let recovered =
+            std::thread::spawn(move || replacement_resolver.resolve("third.example", 443, &bridge))
+                .join()
+                .unwrap();
+        assert_eq!(recovered, Ok(vec![public_address()]));
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_dns_timeout_prevents_destination_io_until_late_lookup_finishes() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let lookup = Arc::new(BlockingDnsLookup::default());
+        let resolver = Arc::new(RuntimeFetchResolver::with_lookup_for_test(
+            tokio::runtime::Handle::current(),
+            budget.clone(),
+            lookup.clone(),
+            Duration::from_millis(50),
+        ));
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let sender = Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())]));
+        let executor = FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver,
+            sender: sender.clone(),
+            permission_bridge: owner.bridge(),
+        };
+        let call = tokio::task::spawn_blocking(move || {
+            executor.execute("https://example.com/", &FetchRequest::get())
+        });
+
+        wait_for_dns_activity(&lookup, 1).await;
+        assert_eq!(
+            call.await.expect("timed-out fetch task panicked"),
+            Err(FetchError::TimedOut)
+        );
+        assert_eq!(sender.call_count(), 0);
+        assert_eq!(lookup.active(), 1);
+        assert_eq!(budget.available_permits(), 0);
+
+        lookup.release();
+        wait_for_dns_activity(&lookup, 0).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out DNS lookup did not release its permit after completion");
+        assert_eq!(sender.call_count(), 0);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[tokio::test]
+    async fn js_fetch_dns_cancellation_keeps_lookup_budgeted_and_prevents_destination_io() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let lookup = Arc::new(BlockingDnsLookup::default());
+        let resolver = Arc::new(RuntimeFetchResolver::with_lookup_for_test(
+            tokio::runtime::Handle::current(),
+            budget.clone(),
+            lookup.clone(),
+            Duration::from_secs(1),
+        ));
+        let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
+        let sender = Arc::new(FakeFetchSender::new(vec![Ok(completed_fetch())]));
+        let executor = FetchExecutor {
+            policy: FetchPolicy::from_settings(None, false),
+            resolver,
+            sender: sender.clone(),
+            permission_bridge: owner.bridge(),
+        };
+        let call = tokio::task::spawn_blocking(move || {
+            executor.execute("https://example.com/", &FetchRequest::get())
+        });
+
+        wait_for_dns_activity(&lookup, 1).await;
+        owner.shutdown();
+        assert_eq!(
+            call.await.expect("cancelled fetch task panicked"),
+            Err(FetchError::Cancelled)
+        );
+        assert_eq!(sender.call_count(), 0);
+        assert_eq!(lookup.active(), 1);
+        assert_eq!(budget.available_permits(), 0);
+
+        lookup.release();
+        wait_for_dns_activity(&lookup, 0).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled DNS lookup did not release its permit after completion");
+        assert_eq!(budget.available_permits(), 1);
     }
 
     #[cfg(feature = "sandbox")]

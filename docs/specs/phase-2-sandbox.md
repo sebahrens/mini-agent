@@ -109,6 +109,14 @@ Cancellation is checked before the request, after response headers, and between 
 The host never exposes ambient `fetch`, a general socket API, or an authorization path independent
 of the existing permission service.
 
+System DNS resolution has a process-wide four-lookup concurrency budget. A timed-out or cancelled
+caller returns promptly, but its lookup retains that budget slot until the operating-system
+resolver actually finishes. Waiting callers share the same three-second deadline and cannot start
+additional operating-system resolver work. A late DNS result is discarded and can never advance
+to permission or destination I/O. The blocking resolver operation itself owns the slot, so Tokio
+runtime shutdown cannot release capacity early. Capacity becomes reusable only when the underlying
+lookup completes.
+
 ## File allow-list
 
 Configuration supplies separate directory roots through `js-read-roots` and `js-write-roots`.
