@@ -72,9 +72,11 @@ fn tool_payload() -> String {
         .join(",");
     let configured = env::var("MCP_FIXTURE_CONFIGURED").unwrap_or_default();
     let inherited = env::var_os("PATH").is_some();
+    let cwd = env::current_dir().unwrap_or_default();
     format!(
-        "{{\"args\":[{args}],\"configured_env\":\"{}\",\"inherited_env\":{inherited},\"pid\":{}}}",
+        "{{\"args\":[{args}],\"configured_env\":\"{}\",\"inherited_env\":{inherited},\"cwd\":\"{}\",\"pid\":{}}}",
         escape(&configured),
+        escape(&cwd.to_string_lossy()),
         std::process::id(),
     )
 }
@@ -373,7 +375,7 @@ async fn mcp_stdio_config_global_and_project_entries_reach_headless_and_tui_wiri
     })
     .unwrap();
     let global: Config = toml::from_str(&serialized_global).unwrap();
-    let headless = crate::startup::connect_headless_mcp(&global)
+    let headless = crate::startup::connect_headless_mcp(&global, std::path::Path::new("."))
         .await
         .expect("global command entry must connect in headless wiring");
     assert_eq!(call_fixture_tool(&headless).await["args"][0], "global");
@@ -397,9 +399,10 @@ async fn mcp_stdio_config_global_and_project_entries_reach_headless_and_tui_wiri
     .unwrap();
     let local = merge_config_override(&Config::default(), &local_fragment).unwrap();
     let mut tui_manager = None;
-    let manager = crate::ui::ensure_mcp_manager(&mut tui_manager, &local)
-        .await
-        .expect("project command entry must connect in TUI wiring");
+    let manager =
+        crate::ui::ensure_mcp_manager(&mut tui_manager, &local, std::path::Path::new("."))
+            .await
+            .expect("project command entry must connect in TUI wiring");
     assert_eq!(call_fixture_tool(manager).await["args"][0], "project");
     let local_address = wait_for_lease(&local_lease).await;
     shutdown(tui_manager.take().unwrap()).await;
@@ -499,6 +502,32 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
     shutdown(denied_manager).await;
     assert_lease_released(denied_address).await;
 
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_command_transport_uses_the_explicit_workspace() {
+    let fixture = FixtureBuild::compile();
+    let workspace = fixture.root.join("selected workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = McpServerConfig::Command {
+        command: fixture.executable.display().to_string(),
+        args: Vec::new(),
+        env: HashMap::from([("MCP_FIXTURE_MODE".to_string(), "normal".to_string())]),
+    };
+    let handle = McpClientHandle::connect_in(CompactString::new("fixture"), &config, &workspace)
+        .await
+        .unwrap();
+    let manager = McpClientManager {
+        handles: vec![handle],
+        notices: Vec::new(),
+    };
+
+    assert_eq!(
+        call_fixture_tool(&manager).await["cwd"],
+        workspace.canonicalize().unwrap().display().to_string()
+    );
+    shutdown(manager).await;
     fixture.cleanup();
 }
 

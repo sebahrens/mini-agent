@@ -55,6 +55,9 @@ pub(crate) fn copy_embedded_to(embedded: &Dir, dest: &Path) -> anyhow::Result<()
 
 #[derive(Clone)]
 pub struct ContextFiles {
+    /// Workspace used for project context and relative agent tool paths.
+    /// This is explicit so switching worktrees never changes process-global CWD.
+    pub workspace_root: PathBuf,
     pub agents: Option<String>,
     pub prompts: HashMap<String, String>,
     pub current_prompt: Option<String>,
@@ -72,11 +75,12 @@ pub struct ContextFiles {
 
 impl ContextFiles {
     #[cfg(feature = "git-worktree")]
-    pub fn reload(&mut self) {
-        self.agents = walk_context_files().0;
+    pub fn reload_from(&mut self, workspace_root: &Path) {
+        self.workspace_root = workspace_root.to_path_buf();
+        self.agents = walk_context_files_from(workspace_root).0;
         #[cfg(feature = "archmd")]
         {
-            self.architecture = walk_context_files().1;
+            self.architecture = walk_context_files_from(workspace_root).1;
         }
         self.prompts = prompts::load();
         if let Some(name) = &self.current_prompt_name {
@@ -98,10 +102,11 @@ pub fn load(no_context_files: bool) -> ContextFiles {
     if let Err(e) = themes::ensure_global() {
         tracing::warn!("failed to install default themes: {e}");
     }
+    let workspace_root = std::env::current_dir().unwrap_or_default();
     let (agents, arch_candidate) = if no_context_files {
         (None, None)
     } else {
-        walk_context_files()
+        walk_context_files_from(&workspace_root)
     };
     #[cfg(feature = "archmd")]
     let architecture = arch_candidate;
@@ -113,6 +118,7 @@ pub fn load(no_context_files: bool) -> ContextFiles {
     #[cfg(feature = "memory")]
     let memory = crate::extras::memory::Mem::open().context_block();
     ContextFiles {
+        workspace_root,
         agents,
         prompts: prompt_map,
         current_prompt: None,
@@ -145,7 +151,7 @@ const MAX_ANCESTOR_CONTEXT_BYTES: usize = 524_288;
 /// Walks from CWD up to root once, collecting AGENTS.md, CLAUDE.md, and
 /// ARCHITECTURE.md files. This avoids the duplicate traversal that the
 /// older separate load_agents / load_architecture performed.
-fn walk_context_files() -> (Option<String>, Option<String>) {
+fn walk_context_files_from(workspace_root: &Path) -> (Option<String>, Option<String>) {
     let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
     #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
     let mut arch_parts: SmallVec<[String; 4]> = SmallVec::new();
@@ -170,9 +176,8 @@ fn walk_context_files() -> (Option<String>, Option<String>) {
         }
     }
 
-    let cwd = std::env::current_dir().ok();
-    if let Some(cwd) = cwd {
-        let mut current = Some(cwd.as_path());
+    if !workspace_root.as_os_str().is_empty() {
+        let mut current = Some(workspace_root);
         while let Some(dir) = current {
             if total_bytes >= MAX_ANCESTOR_CONTEXT_BYTES {
                 tracing::warn!(
@@ -222,6 +227,6 @@ fn walk_context_files() -> (Option<String>, Option<String>) {
 }
 
 #[cfg(feature = "archmd")]
-pub(crate) fn load_architecture() -> Option<String> {
-    walk_context_files().1
+pub(crate) fn load_architecture_from(workspace_root: &Path) -> Option<String> {
+    walk_context_files_from(workspace_root).1
 }

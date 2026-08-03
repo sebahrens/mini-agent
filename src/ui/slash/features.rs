@@ -1,10 +1,8 @@
-#[cfg(feature = "git-worktree")]
-use crate::ui::apply_current_prompt_mode;
-#[cfg(feature = "git-worktree")]
-use crate::ui::events::render_session;
-use crate::ui::slash::{SlashCtx, write_error};
+#[cfg(any(feature = "loop", feature = "git-worktree"))]
+use crate::ui::slash::write_ok;
 #[cfg(feature = "loop")]
-use crate::ui::slash::{write_ok, write_result};
+use crate::ui::slash::write_result;
+use crate::ui::slash::{SlashCtx, write_error};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
@@ -94,19 +92,20 @@ async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     }
 
     let wt_base_dir = ctx.cli.resolve_wt_base_dir(ctx.cfg);
-    match crate::extras::git_worktree::create(name, wt_base_dir.as_deref()) {
-        Ok((path, _info)) => {
-            std::env::set_current_dir(&path)
-                .map_err(|e| anyhow::anyhow!("failed to change directory: {}", e))?;
-            ctx.session.working_dir = compact_str::CompactString::new(path.to_string_lossy());
-            ctx.context.reload();
-            apply_current_prompt_mode(ctx.context, ctx.permission);
-            ctx.rebuild_agent().await;
-            render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
-            write_ok(
-                ctx.renderer,
-                format!("worktree created: branch '{}' at {}", name, path.display()),
-            );
+    match crate::extras::git_worktree::create(
+        std::path::Path::new(ctx.session.working_dir.as_str()),
+        name,
+        wt_base_dir.as_deref(),
+    )
+    .await
+    {
+        Ok((path, info)) => {
+            return Err(anyhow::Error::new(
+                crate::extras::git_worktree::DeferredWorktreeAction::Switch {
+                    path,
+                    branch: info.branch,
+                },
+            ));
         }
         Err(e) => {
             write_error(ctx.renderer, format!("failed: {}", e));
@@ -122,7 +121,11 @@ async fn handle_worktree(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Re
 
 #[cfg(feature = "git-worktree")]
 async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let info = match crate::extras::git_worktree::detect() {
+    let info = match crate::extras::git_worktree::detect(std::path::Path::new(
+        ctx.session.working_dir.as_str(),
+    ))
+    .await
+    {
         Some(i) => i,
         None => {
             write_error(ctx.renderer, "not in a git worktree");
@@ -132,7 +135,7 @@ async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     let target = if parts.len() >= 2 {
         parts[1].trim().to_string()
     } else {
-        match crate::extras::git_worktree::default_branch(&info.main_repo_path) {
+        match crate::extras::git_worktree::default_branch(&info.main_repo_path).await {
             Some(b) => b,
             None => {
                 write_error(
@@ -144,8 +147,6 @@ async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         }
     };
     let repo_name = crate::extras::git_worktree::repo_name(&info.main_repo_path);
-    let main_path = info.main_repo_path.display().to_string();
-    let wt_path = info.worktree_path.display().to_string();
     write_ok(
         ctx.renderer,
         format!(
@@ -154,12 +155,7 @@ async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         ),
     );
     Err(anyhow::Error::new(
-        crate::extras::git_worktree::DeferredWorktreeAction::Merge {
-            branch: info.branch,
-            target,
-            main_path,
-            wt_path,
-        },
+        crate::extras::git_worktree::DeferredWorktreeAction::Merge { info, target },
     ))
 }
 
@@ -170,17 +166,21 @@ async fn handle_wt_merge(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Re
 
 #[cfg(feature = "git-worktree")]
 async fn handle_wt_exit(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let info = match crate::extras::git_worktree::detect() {
+    let info = match crate::extras::git_worktree::detect(std::path::Path::new(
+        ctx.session.working_dir.as_str(),
+    ))
+    .await
+    {
         Some(i) => i,
         None => {
             write_error(ctx.renderer, "not in a git worktree");
             return Ok(());
         }
     };
-    let main_path = info.main_repo_path.display().to_string();
+    let main_path = info.main_repo_path;
     write_ok(
         ctx.renderer,
-        format!("returning to main repo at {}", main_path),
+        format!("returning to main repo at {}", main_path.display()),
     );
     Err(anyhow::Error::new(
         crate::extras::git_worktree::DeferredWorktreeAction::Exit { main_path },

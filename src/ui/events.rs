@@ -90,12 +90,8 @@ pub fn render_session(
         feed.push_line(BlockStyle::Plain, "");
     }
     if session.messages.is_empty() {
-        let cwd = std::env::current_dir().ok();
-        let cwd_str = cwd
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or(".");
+        let cwd = std::path::Path::new(session.working_dir.as_str());
+        let cwd_str = cwd.file_name().and_then(|n| n.to_str()).unwrap_or(".");
         feed.push_line(
             BlockStyle::Welcome,
             format!(

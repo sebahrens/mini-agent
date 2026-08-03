@@ -1411,13 +1411,13 @@ struct ResolvedWriteTarget {
     mode: WriteMode,
 }
 
-fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
+fn absolute_lexical(base: &Path, path: &Path) -> PathBuf {
     use std::path::Component;
 
     let source = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()?.join(path)
+        base.join(path)
     };
     let mut normalized = PathBuf::new();
     for component in source.components() {
@@ -1431,7 +1431,7 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
             Component::Normal(part) => normalized.push(part),
         }
     }
-    Ok(normalized)
+    normalized
 }
 
 fn permission_path(tool: &'static str, path: &Path) -> rquickjs::Result<String> {
@@ -1440,9 +1440,9 @@ fn permission_path(tool: &'static str, path: &Path) -> rquickjs::Result<String> 
         .ok_or_else(|| file_error(tool, "invalid path", "resolved path is not valid UTF-8"))
 }
 
-async fn resolve_read_target(path: &str) -> rquickjs::Result<ResolvedReadTarget> {
+async fn resolve_read_target(base: &Path, path: &str) -> rquickjs::Result<ResolvedReadTarget> {
     let expanded = crate::fs::expand_tilde(path);
-    let absolute = absolute_lexical(Path::new(&expanded)).map_err(rquickjs::Error::Io)?;
+    let absolute = absolute_lexical(base, Path::new(&expanded));
     let canonical = tokio::fs::canonicalize(absolute)
         .await
         .map_err(rquickjs::Error::Io)?;
@@ -1513,11 +1513,11 @@ async fn read_approved_file(target: ResolvedReadTarget) -> rquickjs::Result<Stri
     })
 }
 
-async fn resolve_write_target(path: &str) -> rquickjs::Result<ResolvedWriteTarget> {
+async fn resolve_write_target(base: &Path, path: &str) -> rquickjs::Result<ResolvedWriteTarget> {
     use std::path::Component;
 
     let expanded = crate::fs::expand_tilde(path);
-    let absolute = absolute_lexical(Path::new(&expanded)).map_err(rquickjs::Error::Io)?;
+    let absolute = absolute_lexical(base, Path::new(&expanded));
     let (path, mode) = match tokio::fs::symlink_metadata(&absolute).await {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -1647,7 +1647,7 @@ pub(crate) fn make_read_file(
             &permission_bridge,
             "js/read_file",
             STEP_TIMEOUT,
-            resolve_read_target(&path),
+            resolve_read_target(&allow_config.base, &path),
         )?;
         if let AuthorizationDecision::Denied(reason) = allow_config.authorize_read(&target.path) {
             return Err(allow_policy_error("js/read_file", reason));
@@ -1684,7 +1684,7 @@ pub(crate) fn make_write_file(
             &permission_bridge,
             "js/write_file",
             STEP_TIMEOUT,
-            resolve_write_target(&path),
+            resolve_write_target(&allow_config.base, &path),
         )?;
         if let AuthorizationDecision::Denied(reason) = allow_config.authorize_write(&target.path) {
             return Err(allow_policy_error("js/write_file", reason));
@@ -3474,6 +3474,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn js_file_hosts_resolve_relative_paths_against_the_selected_workspace() {
+        let temp = TempDir::new();
+        let workspace = temp.path().join("selected-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("source.txt"), "selected").unwrap();
+        let policy = AllowConfig::unrestricted(&workspace);
+
+        let contents = call_read_file_with_policy(
+            standard_permission(workspace.clone()),
+            None,
+            PathBuf::from("source.txt"),
+            policy.clone(),
+        )
+        .await
+        .expect("relative read should use the selected workspace");
+        assert_eq!(contents, "selected");
+
+        call_write_file_with_policy(
+            standard_permission(workspace.clone()),
+            None,
+            PathBuf::from("created.txt"),
+            "created",
+            policy,
+        )
+        .await
+        .expect("relative write should use the selected workspace");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("created.txt")).unwrap(),
+            "created"
+        );
+    }
+
+    #[tokio::test]
     async fn js_file_host_permissions_read_ask_uses_exact_canonical_permission_key() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
@@ -4031,7 +4064,7 @@ mod tests {
         let source = workspace.join("source.txt");
         let original = workspace.join("original.txt");
         std::fs::write(&source, "approved identity").unwrap();
-        let approved_read = resolve_read_target(source.to_str().unwrap())
+        let approved_read = resolve_read_target(&workspace, source.to_str().unwrap())
             .await
             .expect("resolve read target");
         std::fs::rename(&source, &original).unwrap();
@@ -4048,7 +4081,7 @@ mod tests {
 
         let target = parent.join("created.txt");
         let external_target = external.join("created.txt");
-        let approved_write = resolve_write_target(target.to_str().unwrap())
+        let approved_write = resolve_write_target(&workspace, target.to_str().unwrap())
             .await
             .expect("resolve write target");
         let original_parent = workspace.join("original-parent");

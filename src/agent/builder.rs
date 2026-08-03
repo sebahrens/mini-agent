@@ -33,10 +33,7 @@ pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String
     #[cfg(feature = "archmd")]
     let context_architecture = context.architecture.as_deref().unwrap_or("");
     let context_prompt = context.current_prompt.as_deref().unwrap_or("");
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    let cwd = context.workspace_root.display().to_string();
 
     let total_len = reasoning_prefix.len()
         + SYSTEM_PROMPT.len()
@@ -174,6 +171,7 @@ fn register_js_tool(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     cfg: &Config,
+    workspace: &std::path::Path,
     #[cfg(feature = "skills")] skill_turn_context: Option<
         Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     >,
@@ -181,7 +179,7 @@ fn register_js_tool(
     use crate::extras::js::host::AllowConfig;
     use crate::extras::js::tool::JsTool;
 
-    let startup_base = std::env::current_dir().unwrap_or_default();
+    let startup_base = workspace.to_path_buf();
     let allow_config = AllowConfig::from_settings(
         &startup_base,
         cfg.js_file_base_dir.as_deref(),
@@ -301,9 +299,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     let lsp_manager = if cli.resolve_no_tools(cfg) {
         None
     } else {
-        cfg.resolve_lsp().map(|c| {
-            crate::extras::lsp::LspManager::new(c, std::env::current_dir().unwrap_or_default())
-        })
+        cfg.resolve_lsp()
+            .map(|c| crate::extras::lsp::LspManager::new(c, context.workspace_root.clone()))
     };
 
     #[cfg_attr(not(feature = "lsp"), allow(unused_mut))]
@@ -339,42 +336,46 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let max_find_results = cfg.resolve_max_find_results();
         let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
         let write_tool =
-            tools::WriteTool::new(permission.clone(), ask_tx.clone(), max_text_file_size);
+            tools::WriteTool::new(permission.clone(), ask_tx.clone(), max_text_file_size)
+                .with_workspace(context.workspace_root.clone());
         #[cfg(feature = "lsp")]
         let write_tool = write_tool.with_lsp(lsp_manager.clone());
-        let edit_tool = tools::EditTool::new(permission.clone(), ask_tx.clone());
+        let edit_tool = tools::EditTool::new(permission.clone(), ask_tx.clone())
+            .with_workspace(context.workspace_root.clone());
         #[cfg(feature = "lsp")]
         let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
         let base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::from_buf([
-            Box::new(tools::ReadTool::new(
-                permission.clone(),
-                ask_tx.clone(),
-                max_text_file_size,
-                max_read_lines,
-            )),
+            Box::new(
+                tools::ReadTool::new(
+                    permission.clone(),
+                    ask_tx.clone(),
+                    max_text_file_size,
+                    max_read_lines,
+                )
+                .with_workspace(context.workspace_root.clone()),
+            ),
             Box::new(write_tool),
             Box::new(edit_tool),
             Box::new(tools::BashTool::new(
                 permission.clone(),
                 ask_tx.clone(),
-                sandbox.clone(),
+                sandbox
+                    .clone()
+                    .with_working_dir(context.workspace_root.clone()),
                 max_bash_output_lines,
             )),
-            Box::new(tools::GrepTool::new(
-                permission.clone(),
-                ask_tx.clone(),
-                max_grep_results,
-            )),
-            Box::new(tools::FindFilesTool::new(
-                permission.clone(),
-                ask_tx.clone(),
-                max_find_results,
-            )),
-            Box::new(tools::ListDirTool::new(
-                permission.clone(),
-                ask_tx.clone(),
-                max_list_dir_entries,
-            )),
+            Box::new(
+                tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
+                    .with_workspace(context.workspace_root.clone()),
+            ),
+            Box::new(
+                tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
+                    .with_workspace(context.workspace_root.clone()),
+            ),
+            Box::new(
+                tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
+                    .with_workspace(context.workspace_root.clone()),
+            ),
             Box::new(tools::WriteTodoList::new(
                 permission.clone(),
                 ask_tx.clone(),
@@ -396,7 +397,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         #[cfg(feature = "subagents")]
         if cfg.task_enabled.unwrap_or(true) {
             use crate::extras::subagents::task_tool::TaskTool;
-            all_tools.push(Box::new(TaskTool::new(permission.clone(), ask_tx.clone())));
+            all_tools.push(Box::new(
+                TaskTool::new(permission.clone(), ask_tx.clone())
+                    .with_workspace(context.workspace_root.clone()),
+            ));
         }
 
         #[cfg(feature = "memory")]
@@ -450,10 +454,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         #[cfg(feature = "js")]
         register_js_tool(
             &mut all_tools,
-            sandbox,
+            sandbox.with_working_dir(context.workspace_root.clone()),
             permission.clone(),
             ask_tx.clone(),
             cfg,
+            &context.workspace_root,
             #[cfg(feature = "skills")]
             skill_turn_context,
         );
@@ -481,6 +486,7 @@ mod js_tests {
             None,
             None,
             &crate::config::Config::default(),
+            std::path::Path::new("."),
             #[cfg(feature = "skills")]
             None,
         );
@@ -544,10 +550,7 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     // See `build_agent_inner`: OpenRouter `provider.order` pin for `anthropic/*`.
     additional_params: Option<serde_json::Value>,
 ) -> Agent<M> {
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    let cwd = context.workspace_root.display().to_string();
 
     let mut preamble = String::new();
     preamble.push_str(BTW_SYSTEM_PROMPT);
@@ -615,27 +618,27 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     let max_find_results = cfg.resolve_max_find_results();
     let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
     let read_tools: Vec<Box<dyn rig::tool::ToolDyn>> = vec![
-        Box::new(tools::ReadTool::new(
-            permission.clone(),
-            ask_tx.clone(),
-            max_text_file_size,
-            max_read_lines,
-        )),
-        Box::new(tools::GrepTool::new(
-            permission.clone(),
-            ask_tx.clone(),
-            max_grep_results,
-        )),
-        Box::new(tools::FindFilesTool::new(
-            permission.clone(),
-            ask_tx.clone(),
-            max_find_results,
-        )),
-        Box::new(tools::ListDirTool::new(
-            permission.clone(),
-            ask_tx.clone(),
-            max_list_dir_entries,
-        )),
+        Box::new(
+            tools::ReadTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                max_text_file_size,
+                max_read_lines,
+            )
+            .with_workspace(context.workspace_root.clone()),
+        ),
+        Box::new(
+            tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
+                .with_workspace(context.workspace_root.clone()),
+        ),
+        Box::new(
+            tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
+                .with_workspace(context.workspace_root.clone()),
+        ),
+        Box::new(
+            tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
+                .with_workspace(context.workspace_root.clone()),
+        ),
     ];
 
     let mut builder = AgentBuilder::new(model)

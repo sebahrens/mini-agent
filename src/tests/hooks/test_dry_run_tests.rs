@@ -32,7 +32,7 @@ fn ctx() -> HookCtx {
     HookCtx {
         session_id: "sess".into(),
         session_path: "".into(),
-        cwd: "/repo".into(),
+        cwd: super::TEST_WORKING_DIR.into(),
         permission_mode: "standard".into(),
     }
 }

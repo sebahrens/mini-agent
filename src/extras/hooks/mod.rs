@@ -65,6 +65,21 @@ pub struct LoopInfo {
 }
 
 static PROCESS_SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ACTIVE_WORKSPACE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_active_workspace(path: &std::path::Path) {
+    *ACTIVE_WORKSPACE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_path_buf());
+}
+
+pub(crate) fn active_workspace() -> std::path::PathBuf {
+    ACTIVE_WORKSPACE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
 
 /// Best-effort session identity for `HookCtx` until the session-lifecycle
 /// seam supplies zerostack's real session id/path.
@@ -148,9 +163,7 @@ pub(crate) async fn gate_user_prompt(
 /// the real mode via `HookedTool` instead).
 pub(crate) fn best_effort_ctx() -> HookCtx {
     let (session_id, session_path) = session_context();
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    let cwd = active_workspace().display().to_string();
     HookCtx {
         session_id,
         session_path,

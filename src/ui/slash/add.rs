@@ -3,13 +3,18 @@ use std::path::PathBuf;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 pub(crate) fn resolve_path(s: &str) -> PathBuf {
+    resolve_path_from(
+        &std::env::current_dir().expect("the startup workspace must remain accessible"),
+        s,
+    )
+}
+
+fn resolve_path_from(workspace: &std::path::Path, s: &str) -> PathBuf {
     let p = PathBuf::from(s);
     if p.is_absolute() {
         p
     } else {
-        std::env::current_dir()
-            .expect("the active workspace must remain accessible")
-            .join(p)
+        workspace.join(p)
     }
 }
 
@@ -64,7 +69,10 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         return Ok(());
     }
 
-    let path = resolve_path(parts[1]);
+    let path = resolve_path_from(
+        std::path::Path::new(ctx.session.working_dir.as_str()),
+        parts[1],
+    );
 
     if !path.exists() {
         write_error(ctx.renderer, format!("file not found: {}", path.display()));
@@ -126,7 +134,10 @@ async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         return Ok(());
     }
 
-    let path = resolve_path(parts[1]);
+    let path = resolve_path_from(
+        std::path::Path::new(ctx.session.working_dir.as_str()),
+        parts[1],
+    );
     let canonical = path.canonicalize().unwrap_or(path);
 
     // Try extra_files first.

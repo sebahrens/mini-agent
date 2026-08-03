@@ -46,49 +46,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/git_worktree/mod.rs",
-        ".output()",
-        12,
-        "TC-INTERNAL-GIT",
-    ),
-    (
-        "src/extras/git_worktree/mod.rs",
-        ".output();",
-        4,
-        "TC-INTERNAL-GIT",
-    ),
-    (
-        "src/extras/git_worktree/mod.rs",
-        "// freezes the TUI during worktree merges. Migrate to tokio::process::Command",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/git_worktree/mod.rs",
-        "Command::new(\"git\")",
-        2,
-        "TC-INTERNAL-GIT",
-    ),
-    (
-        "src/extras/git_worktree/mod.rs",
-        "let branch_output = Command::new(\"git\")",
+        "let mut command = Command::new(&self.program);",
         1,
         "TC-INTERNAL-GIT",
     ),
     (
         "src/extras/git_worktree/mod.rs",
-        "let output = Command::new(\"git\")",
-        13,
-        "TC-INTERNAL-GIT",
-    ),
-    (
-        "src/extras/git_worktree/mod.rs",
-        "let output = Command::new(\"git\").args([\"status\", \"--porcelain\"]).output();",
-        1,
-        "TC-INTERNAL-GIT",
-    ),
-    (
-        "src/extras/git_worktree/mod.rs",
-        "let output = Command::new(\"git\").args(args).output().ok()?;",
+        "use tokio::process::Command;",
         1,
         "TC-INTERNAL-GIT",
     ),
@@ -176,17 +140,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
-        "src/extras/loop/headless.rs",
-        ".output()",
+        "src/extras/loop/validation.rs",
+        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
         1,
-        "TC-LOOP-VALIDATION",
+        "TEST-ONLY",
     ),
     (
-        "src/extras/loop/headless.rs",
-        "match tokio::process::Command::new(shell)",
+        "src/extras/loop/validation.rs",
+        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
         1,
-        "TC-LOOP-VALIDATION",
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "std::process::Command::new(\"/bin/kill\")",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/extras/loop/mod.rs",
@@ -282,43 +253,14 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-INTERNAL-GIT",
     ),
-    ("src/startup.rs", ".output()?;", 1, "TC-EXPLICIT-USER-SHELL"),
-    (
-        "src/startup.rs",
-        "let output = std::process::Command::new(\"bash\")",
-        1,
-        "TC-EXPLICIT-USER-SHELL",
-    ),
     (
         "src/ui/app.rs",
         "if std::process::Command::new(\"lazygit\")",
         1,
         "TC-SUPPORT-UTILITY",
     ),
-    (
-        "src/ui/app.rs",
-        "let _ = std::process::Command::new(\"lazygit\").status();",
-        1,
-        "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/ui/app.rs",
-        "std::process::Command::new(\"bash\")",
-        1,
-        "TC-EXPLICIT-USER-SHELL",
-    ),
-    (
-        "src/ui/event_handler.rs",
-        ".output()",
-        1,
-        "TC-LOOP-VALIDATION",
-    ),
-    (
-        "src/ui/event_handler.rs",
-        "match tokio::process::Command::new(shell)",
-        1,
-        "TC-LOOP-VALIDATION",
-    ),
+    ("src/ui/app.rs", ".output()", 1, "TC-SUPPORT-UTILITY"),
+    ("src/ui/app.rs", ".status();", 1, "TC-SUPPORT-UTILITY"),
     ("src/ui/input/mod.rs", ".status();", 1, "TC-SUPPORT-UTILITY"),
     (
         "src/ui/input/mod.rs",
@@ -346,19 +288,31 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TC-SUPPORT-UTILITY",
     ),
     (
-        "src/ui/slash/session.rs",
-        "match std::process::Command::new(\"git\").args([\"stash\"]).output() {",
+        "src/ui/mod.rs",
+        "let mut command = std::process::Command::new(\"lazygit\");",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/mod.rs",
+        "std::process::Command::new(\"git\")",
         1,
         "TC-INTERNAL-GIT",
+    ),
+    (
+        "src/ui/mod.rs",
+        "std::process::Command::new(shell)",
+        1,
+        "TC-EXPLICIT-USER-SHELL",
     ),
 ];
 
 /// Sites whose identical terminal expression inherits different classes from
 /// the surrounding constructor, in source order.
 const MIXED_SITES: &[(&str, &str, &[&str])] = &[(
-    "src/ui/app.rs",
+    "src/ui/mod.rs",
     ".output()",
-    &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
+    &["TC-EXPLICIT-USER-SHELL", "TC-INTERNAL-GIT"],
 )];
 
 const ALLOWED_CURRENT_CLASSES: &[&str] = &[
@@ -411,11 +365,24 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
-        "src/extras/git_worktree/mod.rs",
-        "// freezes the TUI during worktree merges. Migrate to tokio::process::Command",
+        "src/extras/loop/validation.rs",
+        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
         1,
-        "NON-PROCESS",
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "std::process::Command::new(\"/bin/kill\")",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/extras/js/engine.rs",
@@ -527,29 +494,29 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "TC-MODEL-ACTION",
     ),
     (
-        "src/ui/app.rs",
-        "if std::process::Command::new(\"lazygit\")",
+        "src/ui/mod.rs",
+        "let mut command = std::process::Command::new(\"lazygit\");",
         1,
         "TC-SUPPORT-UTILITY",
     ),
     (
-        "src/ui/app.rs",
-        "let _ = std::process::Command::new(\"lazygit\").status();",
+        "src/ui/mod.rs",
+        "std::process::Command::new(\"git\")",
         1,
-        "TC-SUPPORT-UTILITY",
+        "TC-INTERNAL-GIT",
     ),
     (
-        "src/ui/app.rs",
-        "std::process::Command::new(\"bash\")",
+        "src/ui/mod.rs",
+        "std::process::Command::new(shell)",
         1,
         "TC-EXPLICIT-USER-SHELL",
     ),
 ];
 
 const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[(
-    "src/ui/app.rs",
+    "src/ui/mod.rs",
     ".output()",
-    &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
+    &["TC-EXPLICIT-USER-SHELL", "TC-INTERNAL-GIT"],
 )];
 
 /// Files whose non-disposition launch expressions all have one owner.
@@ -557,17 +524,14 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/docs.rs", "TC-SUPPORT-UTILITY"),
     ("src/extras/git_worktree/mod.rs", "TC-INTERNAL-GIT"),
     ("src/extras/hooks/subprocess.rs", "TC-PROJECT-AUTOMATION"),
-    ("src/extras/loop/headless.rs", "TC-LOOP-VALIDATION"),
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
     ("src/session/mod.rs", "TC-INTERNAL-GIT"),
-    ("src/startup.rs", "TC-EXPLICIT-USER-SHELL"),
-    ("src/ui/event_handler.rs", "TC-LOOP-VALIDATION"),
+    ("src/ui/app.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/slash/memory.rs", "TC-SUPPORT-UTILITY"),
-    ("src/ui/slash/session.rs", "TC-INTERNAL-GIT"),
 ];
 
 fn checked_inventory() -> BTreeMap<(String, String, usize), &'static str> {
@@ -801,20 +765,6 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
             "an exact TEST-ONLY fingerprint",
         ),
         (
-            "src/extras/git_worktree/mod.rs",
-            "// freezes the TUI during worktree merges. Migrate to tokio::process::Command",
-            1,
-            "TC-INTERNAL-GIT",
-            "an exact NON-PROCESS fingerprint in a production family",
-        ),
-        (
-            "src/extras/git_worktree/mod.rs",
-            ".output()",
-            1,
-            "NON-PROCESS",
-            "a production launch in a family with a NON-PROCESS comment",
-        ),
-        (
             "src/sandbox.rs",
             "let mut cmd = Command::new(\"zerobox\");",
             1,
@@ -829,18 +779,18 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
             "a lifecycle helper in the mixed sandbox family",
         ),
         (
-            "src/ui/app.rs",
+            "src/ui/mod.rs",
             ".output()",
             1,
             "TC-SUPPORT-UTILITY",
             "the explicit shell output occurrence in the mixed UI family",
         ),
         (
-            "src/ui/app.rs",
-            "if std::process::Command::new(\"lazygit\")",
+            "src/ui/mod.rs",
+            "std::process::Command::new(\"git\")",
             1,
             "TC-EXPLICIT-USER-SHELL",
-            "the lazygit utility in the mixed UI family",
+            "the internal Git launch in the mixed UI family",
         ),
     ];
 

@@ -94,6 +94,22 @@ pub struct PermissionChecker {
 }
 
 impl PermissionChecker {
+    /// Rebind relative path authorization to an explicitly selected workspace.
+    /// Worktree switching uses this instead of mutating process-global CWD.
+    pub(crate) fn rebind_working_dir(&mut self, working_dir: &Path) {
+        self.plan_write_root = std::fs::canonicalize(working_dir)
+            .ok()
+            .and_then(|canonical| {
+                let identity = std::fs::metadata(&canonical).ok()?;
+                identity.is_dir().then_some(PlanWriteRoot {
+                    configured: working_dir.to_path_buf(),
+                    canonical,
+                    identity,
+                })
+            });
+        self.working_dir = working_dir.to_string_lossy().into_owned();
+    }
+
     fn compile_config(
         config: &PermissionConfig,
         is_regex: bool,

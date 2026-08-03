@@ -42,8 +42,6 @@ use crate::ui::events::sanitize_output;
 use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
 use crate::ui::slash::handle_compress;
-#[cfg(feature = "git-worktree")]
-use crate::ui::state::MergeRequest;
 use crate::ui::state::{AgentRunState, BtwStats, ChainState, SlashState, UiContext};
 
 /// What [`apply_prompt_mode`] did with the prompt's `%%mode=` directive, so
@@ -332,13 +330,28 @@ pub(crate) fn spawn_event_thread(
 pub(crate) async fn ensure_mcp_manager<'a>(
     mcp: &'a mut Option<McpClientManager>,
     cfg: &'a Config,
+    workspace: &std::path::Path,
 ) -> Option<&'a McpClientManager> {
     if mcp.is_none()
         && let Some(servers) = &cfg.mcp_servers
     {
-        *mcp = Some(McpClientManager::connect_all(servers).await);
+        *mcp = Some(McpClientManager::connect_all_in(servers, workspace).await);
     }
     mcp.as_ref()
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) async fn rebind_mcp_manager(
+    mcp: &mut Option<McpClientManager>,
+    cfg: &Config,
+    workspace: &std::path::Path,
+) {
+    if let Some(previous) = mcp.take() {
+        previous.shutdown().await;
+    }
+    if let Some(servers) = &cfg.mcp_servers {
+        *mcp = Some(McpClientManager::connect_all_in(servers, workspace).await);
+    }
 }
 
 /// What to do with a submitted line, given whether a main run is already active.
@@ -398,77 +411,51 @@ pub(crate) fn classify_submission(is_running: bool, text: &str) -> SubmitAction 
 }
 
 #[cfg(feature = "git-worktree")]
-pub(crate) async fn spawn_merge_agent(
-    req: MergeRequest<'_>,
-    run: &mut AgentRunState,
-    ui: &mut UiContext<'_>,
-    chain: &mut ChainState,
+pub(crate) fn rebind_worktree_workspace(
+    session: &mut Session,
+    context: &mut ContextFiles,
+    permission: &Option<crate::permission::checker::PermCheck>,
+    workspace: &std::path::Path,
 ) {
-    let wt_remove_flag = if req.force { "--force" } else { "" };
-    let branch_delete_flag = if req.force { "-D" } else { "-d" };
-    let prompt = format!(
-        "I'm in a git worktree on branch '{branch}' at '{wt_path}'. \
-         Merge it into '{target}' in the main repo at '{main_path}'.\n\n\
-         Follow these steps:\n\
-         1. cd {main_path}\n\
-         2. git fetch --all\n\
-         3. git checkout {target}\n\
-         4. git pull --no-edit\n\
-         5. git merge --squash {branch}\n\
-         6. git commit --no-edit\n\n\
-         After step 5, CHECK THE EXIT CODE and output.\n\
-         - If the merge Succeeded (no conflicts), continue to step 6.\n\
-         - If there is a MERGE CONFLICT:\n\
-           a. Run: git diff --name-only --diff-filter=U\n\
-           b. Tell the user WHICH FILES have conflicts. Show them the list.\n\
-           c. Ask the user what to do. Give them these options:\n\
-              - 'abort': run `git merge --abort`, do NOT push, do NOT delete anything, stop here.\n\
-              - 'resolve <file>': you help them fix the conflict in that file.\n\
-              - 'leave': leave the conflict state as-is for manual resolution.\n\
-           d. WAIT for the user's response before continuing.\n\
-           e. Follow their instruction.\n\n\
-         7. If the merge succeeded (or conflicts were resolved):\n\
-           - git worktree remove {wt_remove_flag} {wt_path}\n\
-           - git branch {branch_delete_flag} {branch}\n\n\
-         8. cd {main_path} and report completion.\n\n\
-         Important: Do NOT skip any step. Always check for conflicts after merge.",
-        branch = req.branch,
-        wt_path = req.wt_path,
-        target = req.target,
-        main_path = req.main_path,
-        wt_remove_flag = wt_remove_flag,
-        branch_delete_flag = branch_delete_flag
-    );
-    ui.session.add_message(MessageRole::User, &prompt);
-    let history = crate::agent::runner::convert_history(ui.session);
-    let reasoning_enabled = ui.session.reasoning_enabled;
-    ensure_agent(&mut run.agent, ui, reasoning_enabled).await;
-    let runner = run
-        .agent
-        .as_ref()
-        .unwrap()
-        .clone()
-        .spawn_runner(
-            prompt,
-            history,
-            ui.cfg.retry.clone(),
-            #[cfg(feature = "hooks")]
-            None,
-        )
-        .await;
-    run.agent_rx = Some(runner.event_rx);
-    run.main_abort = Some(runner.abort_handle);
-    run.is_running = true;
-    if let Some(ss) = ui.status_signals.as_ref() {
-        ss.send_start();
+    session.working_dir = compact_str::CompactString::new(workspace.to_string_lossy());
+    context.reload_from(workspace);
+    #[cfg(feature = "hooks")]
+    crate::extras::hooks::set_active_workspace(workspace);
+    if let Some(permission) = permission {
+        permission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .rebind_working_dir(workspace);
     }
-    chain.wt_return_path = Some((
-        req.main_path.to_string(),
-        req.wt_path.to_string(),
-        req.branch.to_string(),
-        req.force,
-    ));
 }
+
+pub(crate) fn run_shell_in_workspace(
+    shell: &str,
+    command: &str,
+    workspace: &std::path::Path,
+) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(shell)
+        .arg("-c")
+        .arg(command)
+        .current_dir(workspace)
+        .output()
+}
+
+pub(crate) fn git_stash_in_workspace(
+    workspace: &std::path::Path,
+) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("git")
+        .arg("stash")
+        .current_dir(workspace)
+        .output()
+}
+
+pub(crate) fn lazygit_in_workspace(workspace: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new("lazygit");
+    command.current_dir(workspace);
+    command
+}
+
 /// Result of a background agent prebuild.
 #[cfg(feature = "mcp")]
 pub(crate) type PrebuildPayload = (AnyAgent, Option<McpClientManager>);

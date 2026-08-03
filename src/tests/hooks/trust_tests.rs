@@ -16,14 +16,18 @@ fn handler(command: &str) -> HookHandler {
 }
 
 fn unique_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "zerostack-hooks-trust-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+    std::env::temp_dir()
+        .canonicalize()
+        .expect("temporary directory must be canonicalizable")
+        .join(format!(
+            "zerostack-hooks-trust-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+        .join("artifact.json")
 }
 
 fn write_settings(path: &std::path::Path, json: &str) {
@@ -164,7 +168,7 @@ fn project_config_trust_project_disable_all_hooks_cannot_disable_global_or_manag
     let managed = unique_path("managed2");
     write_settings(
         &managed,
-        r#"{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "true"}]}]}}"#,
+        r#"{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "echo", "args": ["managed"]}]}]}}"#,
     );
     let trust_path = unique_path("trust2");
 

@@ -16,3 +16,6 @@ mod subagent_lifecycle_tests;
 mod subprocess_tests;
 mod test_dry_run_tests;
 mod trust_tests;
+
+/// Existing directory used by tests that execute hook subprocesses.
+const TEST_WORKING_DIR: &str = env!("CARGO_MANIFEST_DIR");

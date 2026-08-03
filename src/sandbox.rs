@@ -5,7 +5,7 @@ use std::process::Output;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -15,6 +15,7 @@ pub struct Sandbox {
     backend: String,
     shell: String,
     shell_command_arg: String,
+    working_dir: Option<PathBuf>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
 }
@@ -284,6 +285,7 @@ impl Sandbox {
             backend: backend.to_string(),
             shell: "bash".to_string(),
             shell_command_arg: "-c".to_string(),
+            working_dir: None,
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -380,6 +382,12 @@ impl Sandbox {
         self.with_shell_command_arg(shell, "-c")
     }
 
+    /// Set the workspace used as the child CWD and sandbox write root.
+    pub(crate) fn with_working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
     /// Selects a shell whose script flag differs from the POSIX `-c`
     /// contract. The flag is passed as one literal argument; it is never
     /// concatenated with the command text.
@@ -398,6 +406,9 @@ impl Sandbox {
             SandboxPolicy::Disabled => {
                 let mut cmd = Command::new(&self.shell);
                 cmd.arg(&self.shell_command_arg).arg(command);
+                if let Some(working_dir) = &self.working_dir {
+                    cmd.current_dir(working_dir);
+                }
                 configure_child_lifetime(&mut cmd);
                 return Ok(cmd);
             }
@@ -410,8 +421,10 @@ impl Sandbox {
             SandboxPolicy::RequiredAndAvailable => {}
         }
 
-        let cwd = std::env::current_dir()
-            .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
+        let cwd = self.working_dir.clone().map(Ok).unwrap_or_else(|| {
+            std::env::current_dir()
+                .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))
+        })?;
         let cwd = canonical_non_root(&cwd, "working directory")?;
 
         if self.backend == "zerobox" {
@@ -422,6 +435,7 @@ impl Sandbox {
             cmd.arg(&self.shell);
             cmd.arg(&self.shell_command_arg);
             cmd.arg(command);
+            cmd.current_dir(&cwd);
             configure_child_lifetime(&mut cmd);
             return Ok(cmd);
         }
@@ -485,6 +499,7 @@ impl Sandbox {
         cmd.arg(&self.shell)
             .arg(&self.shell_command_arg)
             .arg(command);
+        cmd.current_dir(cwd);
         configure_child_lifetime(&mut cmd);
         Ok(cmd)
     }
@@ -608,7 +623,7 @@ impl Sandbox {
                 });
             }
         };
-        self.output_built_command_with_limits_scoped(cmd, limits, cancellation)
+        self.output_built_command_with_limits_scoped(cmd, limits, cancellation, None)
             .await
     }
 
@@ -617,7 +632,17 @@ impl Sandbox {
         cmd: Command,
         limits: CommandLimits,
     ) -> std::io::Result<CommandOutput> {
-        self.output_built_command_with_limits_scoped(cmd, limits, None)
+        self.output_built_command_with_limits_scoped(cmd, limits, None, None)
+            .await
+    }
+
+    pub(crate) async fn output_built_command_with_input_and_limits(
+        &self,
+        cmd: Command,
+        input: Vec<u8>,
+        limits: CommandLimits,
+    ) -> std::io::Result<CommandOutput> {
+        self.output_built_command_with_limits_scoped(cmd, limits, None, Some(input))
             .await
     }
 
@@ -626,12 +651,13 @@ impl Sandbox {
         cmd: Command,
         limits: CommandLimits,
         cancellation: Option<watch::Receiver<bool>>,
+        input: Option<Vec<u8>>,
     ) -> std::io::Result<CommandOutput> {
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
         tokio::spawn(async move {
             sandbox
-                .run_built_output_command(cmd, limits, cancellation, response_tx)
+                .run_built_output_command(cmd, limits, cancellation, input, response_tx)
                 .await;
         });
         response_rx.await.map_err(|_| {
@@ -644,6 +670,7 @@ impl Sandbox {
         mut cmd: Command,
         limits: CommandLimits,
         mut cancellation: Option<watch::Receiver<bool>>,
+        input: Option<Vec<u8>>,
         mut response_tx: oneshot::Sender<CommandOutput>,
     ) {
         if cancellation
@@ -659,6 +686,9 @@ impl Sandbox {
             return;
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -672,6 +702,13 @@ impl Sandbox {
             }
         };
         let pid = child.id();
+        if let Some(input) = input
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            tokio::spawn(async move {
+                let _ = stdin.write_all(&input).await;
+            });
+        }
         let mut guard = ProcessGroupGuard::new(child.id(), self.active_groups.clone());
         let captured = Arc::new(Mutex::new(CapturedCommandOutput::default()));
         let (reader_error_tx, mut reader_error_rx) = mpsc::unbounded_channel();

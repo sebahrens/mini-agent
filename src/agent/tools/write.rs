@@ -12,6 +12,7 @@ pub struct WriteTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub max_text_file_size: u64,
+    workspace: PathBuf,
     /// When `Some`, written files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -28,9 +29,15 @@ impl WriteTool {
             permission,
             ask_tx,
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
+            workspace: std::env::current_dir().unwrap_or_default(),
             #[cfg(feature = "lsp")]
             lsp: None,
         }
+    }
+
+    pub(crate) fn with_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        self.workspace = workspace.into();
+        self
     }
 
     #[cfg(feature = "lsp")]
@@ -94,13 +101,13 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
-        let expanded = crate::fs::expand_tilde(&args.path);
-        let resolved = resolve_write_path(Path::new(&expanded)).await?;
+        let expanded = crate::fs::resolve_workspace_path(&self.workspace, &args.path);
+        let resolved = resolve_write_path(&expanded).await?;
         let path = resolved.as_path();
         let permission_path = path.to_string_lossy();
         tracing::debug!(
             "tool write start: path={}, content_len={}",
-            expanded,
+            expanded.display(),
             args.content.len(),
         );
         // A PlanWrite allow is a narrow workspace capability. Capture the
@@ -139,10 +146,10 @@ impl Tool for WriteTool {
             check_perm_path(&self.permission, &self.ask_tx, "write", &permission_path).await?;
 
         if path.exists() {
-            tracing::warn!("tool write file exists: path={}", expanded);
+            tracing::warn!("tool write file exists: path={}", expanded.display());
             return Err(ToolError::Msg(format!(
                 "File '{}' already exists. Use edit for targeted changes, or delete and recreate if a full rewrite is needed.",
-                expanded
+                expanded.display()
             )));
         }
         if plan_write_guard.is_none()
@@ -154,7 +161,7 @@ impl Tool for WriteTool {
         if bytes as u64 > self.max_text_file_size {
             tracing::warn!(
                 "tool write file too large: path={}, size={}, max={}",
-                expanded,
+                expanded.display(),
                 bytes,
                 self.max_text_file_size,
             );
@@ -163,11 +170,11 @@ impl Tool for WriteTool {
                 bytes, self.max_text_file_size
             )));
         }
-        let current = resolve_write_path(Path::new(&expanded)).await?;
+        let current = resolve_write_path(&expanded).await?;
         if current != resolved {
             return Err(ToolError::Msg(format!(
                 "Path changed after permission check: {}",
-                expanded
+                expanded.display()
             )));
         }
         let approved_parent = match plan_write_guard {
@@ -188,9 +195,13 @@ impl Tool for WriteTool {
             }
         };
         crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent).await?;
-        crate::agent::tools::untrack_read_path(&expanded);
-        tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
-        let mut result = format!("Written {} bytes to {}", bytes, expanded);
+        crate::agent::tools::untrack_read_path(&expanded.to_string_lossy());
+        tracing::debug!(
+            "tool write done: path={}, bytes={}",
+            expanded.display(),
+            bytes
+        );
+        let mut result = format!("Written {} bytes to {}", bytes, expanded.display());
         if let Some(msg) = coaching {
             result = format!("{}\n\n{}", msg, result);
         }

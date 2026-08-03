@@ -124,7 +124,7 @@ impl HookDispatcher {
     }
 
     /// Handlers matching `event`/`canonical_tool_name`, in declared order,
-    /// with identical commands deduplicated (first occurrence wins).
+    /// with identical handler bindings deduplicated (first occurrence wins).
     pub(crate) fn handlers_for(&self, event: &str, canonical_tool_name: &str) -> Vec<&HookHandler> {
         let Some(entries) = self.events.get(event) else {
             return Vec::new();
@@ -136,9 +136,7 @@ impl HookDispatcher {
                 continue;
             }
             for handler in &entry.handlers {
-                if let Some(cmd) = handler.command.as_deref()
-                    && !seen.insert(cmd)
-                {
+                if !seen.insert(handler) {
                     continue;
                 }
                 result.push(handler);

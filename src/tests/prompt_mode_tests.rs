@@ -8,6 +8,7 @@ use crate::ui::{PromptModeOutcome, apply_prompt_mode};
 
 fn make_context(prompts: &[(&str, &str)]) -> ContextFiles {
     ContextFiles {
+        workspace_root: std::env::current_dir().unwrap(),
         agents: None,
         prompts: prompts
             .iter()

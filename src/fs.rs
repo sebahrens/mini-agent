@@ -917,6 +917,16 @@ pub fn expand_tilde(s: &str) -> String {
     s.to_string()
 }
 
+/// Expand `~` and resolve a relative path against an explicit workspace.
+pub(crate) fn resolve_workspace_path(workspace: &Path, value: &str) -> PathBuf {
+    let expanded = PathBuf::from(expand_tilde(value));
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        workspace.join(expanded)
+    }
+}
+
 /// Resolve a path relative to `home` without allowing parent components to
 /// traverse above it.
 fn expand_home_relative(home: &Path, relative: &str) -> PathBuf {

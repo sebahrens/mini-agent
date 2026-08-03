@@ -159,6 +159,7 @@ pub(crate) async fn run_hook_with_limits(
     };
     let mut cmd = Command::new(program);
     cmd.args(args);
+    cmd.current_dir(project_dir);
     cmd.env("ZEROSTACK_PROJECT_DIR", project_dir);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());

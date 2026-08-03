@@ -78,6 +78,7 @@ impl LspClient {
         let mut child = tokio::process::Command::new(cfg.command.as_str())
             .args(cfg.args.iter().map(|a| a.as_str()))
             .envs(&cfg.env)
+            .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

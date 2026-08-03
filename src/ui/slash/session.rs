@@ -285,7 +285,9 @@ async fn handle_undo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         std::io::stdin().read_exact(&mut buf).is_ok() && (buf[0] == b'y' || buf[0] == b'Y');
 
     if do_stash {
-        match std::process::Command::new("git").args(["stash"]).output() {
+        match crate::ui::git_stash_in_workspace(std::path::Path::new(
+            ctx.session.working_dir.as_str(),
+        )) {
             Ok(out) if out.status.success() => {
                 write_ok(ctx.renderer, "git stash done");
             }

@@ -58,7 +58,7 @@ async fn hook_subprocess_limits_normal_hook_preserves_stdin_and_exit_code() {
         Some(&args),
         b"hello",
         Duration::from_secs(2),
-        "/repo",
+        super::TEST_WORKING_DIR,
         limits(64, 64, 128),
     )
     .await;
@@ -70,7 +70,14 @@ async fn hook_subprocess_limits_normal_hook_preserves_stdin_and_exit_code() {
 #[tokio::test]
 async fn run_hook_reports_nonzero_exit_code() {
     let args = shell_args("exit 7");
-    let output = run_hook("sh", Some(&args), b"", Duration::from_secs(2), "/repo").await;
+    let output = run_hook(
+        "sh",
+        Some(&args),
+        b"",
+        Duration::from_secs(2),
+        super::TEST_WORKING_DIR,
+    )
+    .await;
     assert_eq!(output.exit_code, Some(7));
     assert_eq!(output.status, HookStatus::Completed);
 }
@@ -84,7 +91,7 @@ async fn hook_subprocess_limits_stdout_fill_does_not_deadlock() {
         Some(&args),
         b"",
         Duration::from_secs(2),
-        "/repo",
+        super::TEST_WORKING_DIR,
         limits(256 * 1024, 256 * 1024, 300 * 1024),
     )
     .await;
@@ -104,7 +111,7 @@ async fn hook_subprocess_limits_stderr_fill_does_not_deadlock() {
         Some(&args),
         b"",
         Duration::from_secs(2),
-        "/repo",
+        super::TEST_WORKING_DIR,
         limits(256 * 1024, 256 * 1024, 300 * 1024),
     )
     .await;
@@ -124,7 +131,7 @@ async fn hook_subprocess_limits_stdout_cap_is_a_hard_failure() {
         Some(&args),
         b"",
         Duration::from_secs(2),
-        "/repo",
+        super::TEST_WORKING_DIR,
         limits(256, 1024, 2048),
     )
     .await;
@@ -147,7 +154,7 @@ async fn hook_subprocess_limits_stderr_cap_is_a_hard_failure() {
         Some(&args),
         b"",
         Duration::from_secs(2),
-        "/repo",
+        super::TEST_WORKING_DIR,
         limits(1024, 256, 2048),
     )
     .await;
@@ -172,7 +179,7 @@ async fn hook_subprocess_limits_mixed_fill_enforces_combined_cap() {
         Some(&args),
         b"",
         Duration::from_secs(2),
-        "/repo",
+        super::TEST_WORKING_DIR,
         limits(1024, 1024, 512),
     )
     .await;
@@ -195,7 +202,7 @@ async fn hook_subprocess_limits_infinite_process_times_out_promptly() {
         Some(&args),
         b"",
         Duration::from_millis(100),
-        "/repo",
+        super::TEST_WORKING_DIR,
         limits(64, 64, 128),
     )
     .await;
@@ -219,7 +226,7 @@ async fn hook_subprocess_limits_forked_descendant_is_terminated() {
         Some(&args),
         b"",
         Duration::from_millis(250),
-        "/repo",
+        super::TEST_WORKING_DIR,
         limits(64, 64, 128),
     )
     .await;
@@ -254,23 +261,32 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[tokio::test]
 async fn run_hook_exposes_zerostack_project_dir_env_var() {
+    let project = std::env::temp_dir().join(format!(
+        "mini-agent-hook-workspace-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&project).unwrap();
     let args = vec![
         "-c".to_string(),
-        "echo \"$ZEROSTACK_PROJECT_DIR\"".to_string(),
+        "printf '%s\\n%s' \"$ZEROSTACK_PROJECT_DIR\" \"$PWD\"".to_string(),
     ];
     let output = run_hook(
         "sh",
         Some(&args),
         b"",
         Duration::from_secs(2),
-        "/repo/project",
+        project.to_str().unwrap(),
     )
     .await;
     assert_eq!(output.exit_code, Some(0));
+    let lines = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = lines.lines().collect();
+    assert_eq!(lines[0], project.to_str().unwrap());
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "/repo/project"
+        std::path::Path::new(lines[1]).canonicalize().unwrap(),
+        project.canonicalize().unwrap()
     );
+    let _ = std::fs::remove_dir_all(project);
 }
 
 #[tokio::test]
@@ -282,7 +298,14 @@ async fn run_hook_rejects_shell_metacharacters_without_args() {
     let _ = std::fs::remove_file(&marker);
     let command = format!("echo safe; touch {}", marker.display());
 
-    let output = run_hook(&command, None, b"", Duration::from_secs(2), "/repo").await;
+    let output = run_hook(
+        &command,
+        None,
+        b"",
+        Duration::from_secs(2),
+        super::TEST_WORKING_DIR,
+    )
+    .await;
 
     assert_eq!(output.exit_code, None);
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires an `args` field"));
@@ -294,7 +317,14 @@ async fn run_hook_exec_form_bypasses_the_shell() {
     // In exec form the arg is passed literally to the program, with no shell
     // metacharacter expansion (a shell would expand "$HOME" or "*").
     let args = vec!["$HOME literally".to_string()];
-    let output = run_hook("echo", Some(&args), b"", Duration::from_secs(2), "/repo").await;
+    let output = run_hook(
+        "echo",
+        Some(&args),
+        b"",
+        Duration::from_secs(2),
+        super::TEST_WORKING_DIR,
+    )
+    .await;
     assert_eq!(output.exit_code, Some(0));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),

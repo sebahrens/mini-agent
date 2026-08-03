@@ -13,6 +13,7 @@ use crate::extras::lsp::LspManager;
 pub struct EditTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    workspace: std::path::PathBuf,
     /// When `Some`, edited files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -24,9 +25,15 @@ impl EditTool {
         EditTool {
             permission,
             ask_tx,
+            workspace: std::env::current_dir().unwrap_or_default(),
             #[cfg(feature = "lsp")]
             lsp: None,
         }
+    }
+
+    pub(crate) fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = workspace.into();
+        self
     }
 
     #[cfg(feature = "lsp")]
@@ -555,7 +562,7 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {
-        let expanded = crate::fs::expand_tilde(&args.path);
+        let expanded = crate::fs::resolve_workspace_path(&self.workspace, &args.path);
         let resolved = tokio::fs::canonicalize(&expanded).await?;
         let path = resolved.to_string_lossy().into_owned();
         let approved_parent =
@@ -569,7 +576,7 @@ impl Tool for EditTool {
         let es = edit_system();
         tracing::debug!(
             "tool edit start: path={}, mode={:?}, has_block={}, has_edits={}",
-            expanded,
+            expanded.display(),
             es,
             args.block.is_some(),
             args.edits.as_ref().map(|e| e.len()).unwrap_or(0),
@@ -625,19 +632,19 @@ impl Tool for EditTool {
         if current != resolved {
             return Err(ToolError::Msg(format!(
                 "Path changed after permission check: {}",
-                expanded
+                expanded.display()
             )));
         }
         crate::fs::atomic_write_resolved_checked(&resolved, &output, approved_parent).await?;
-        crate::agent::tools::untrack_read_path(&expanded);
+        crate::agent::tools::untrack_read_path(&expanded.to_string_lossy());
 
         tracing::debug!(
             "tool edit done: path={}, edit_count={}, notes={}",
-            expanded,
+            expanded.display(),
             edit_count,
             notes.len(),
         );
-        let mut result = format!("Applied {} edit(s) to {}", edit_count, expanded);
+        let mut result = format!("Applied {} edit(s) to {}", edit_count, expanded.display());
         for note in &notes {
             result.push_str(&format!("\n  Note: {}", note));
         }

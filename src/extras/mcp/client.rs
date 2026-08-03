@@ -28,13 +28,32 @@ impl McpClientHandle {
         server_name: CompactString,
         config: &McpServerConfig,
     ) -> anyhow::Result<Self> {
-        Self::connect_with_timeout(server_name, config, MCP_INITIALIZE_TIMEOUT).await
+        let workspace = std::env::current_dir().unwrap_or_default();
+        Self::connect_in(server_name, config, &workspace).await
+    }
+
+    pub(crate) async fn connect_in(
+        server_name: CompactString,
+        config: &McpServerConfig,
+        workspace: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_timeout_in(server_name, config, MCP_INITIALIZE_TIMEOUT, workspace).await
     }
 
     pub(crate) async fn connect_with_timeout(
         server_name: CompactString,
         config: &McpServerConfig,
         initialize_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        let workspace = std::env::current_dir().unwrap_or_default();
+        Self::connect_with_timeout_in(server_name, config, initialize_timeout, &workspace).await
+    }
+
+    pub(crate) async fn connect_with_timeout_in(
+        server_name: CompactString,
+        config: &McpServerConfig,
+        initialize_timeout: Duration,
+        workspace: &std::path::Path,
     ) -> anyhow::Result<Self> {
         match config {
             McpServerConfig::Command { command, args, env } => {
@@ -44,11 +63,12 @@ impl McpClientHandle {
                     args,
                     env.len(),
                 );
-                let cmd = stdio_command(command, args, env).map_err(|error| {
+                let mut cmd = stdio_command(command, args, env).map_err(|error| {
                     anyhow::anyhow!(
                         "MCP command resolution failed for '{server_name}' ({command}): {error}"
                     )
                 })?;
+                cmd.current_dir(workspace);
                 let (transport, stderr) = TokioChildProcess::builder(cmd)
                     .stderr(Stdio::piped())
                     .spawn()

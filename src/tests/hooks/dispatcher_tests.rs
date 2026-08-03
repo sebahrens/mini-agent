@@ -42,7 +42,7 @@ fn ctx() -> HookCtx {
     HookCtx {
         session_id: "sess-1".into(),
         session_path: "/tmp/sess.json".into(),
-        cwd: "/repo".into(),
+        cwd: super::TEST_WORKING_DIR.into(),
         permission_mode: "default".into(),
     }
 }
@@ -138,6 +138,17 @@ fn identical_commands_are_deduplicated() {
     );
     let dispatcher = HookDispatcher::from_config(&config).unwrap();
     assert_eq!(dispatcher.handlers_for("PreToolUse", "bash").len(), 1);
+}
+
+#[test]
+fn same_executable_with_distinct_arguments_is_not_deduplicated() {
+    let config = config_with(
+        "PreToolUse",
+        None,
+        vec![handler("echo first"), handler("echo second")],
+    );
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    assert_eq!(dispatcher.handlers_for("PreToolUse", "bash").len(), 2);
 }
 
 #[tokio::test]
