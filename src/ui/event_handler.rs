@@ -8,7 +8,6 @@ use crate::event::AgentEvent;
 #[cfg(feature = "loop")]
 use crate::event::{LoopValidationEvent, UserEvent};
 use crate::provider::AnyAgent;
-use crate::session::storage::save_session;
 use crate::session::{MessageRole, Session};
 use crate::ui::events::sanitize_output;
 use crate::ui::feed::BlockStyle;
@@ -115,7 +114,7 @@ pub async fn handle_agent_event(
             run.response_buf.clear();
             run.response_start_block = None;
             ui.session.add_tool_call(&name, &args);
-            save_session_if_enabled(ui.session, ui.cli, renderer)?;
+            save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             let line = format!(
                 "◈ {}",
                 crate::ui::utils::format_tool_call_summary(&name, &args)
@@ -125,7 +124,7 @@ pub async fn handle_agent_event(
         #[cfg(any(feature = "subagents", feature = "acp"))]
         AgentEvent::SubagentToolCall { name, args } => {
             ui.session.add_subagent_tool_call(&name, &args);
-            save_session_if_enabled(ui.session, ui.cli, renderer)?;
+            save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             let line = format!(
                 "⌥ {}",
                 crate::ui::utils::format_tool_call_summary(&name, &args)
@@ -133,8 +132,11 @@ pub async fn handle_agent_event(
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
         AgentEvent::ToolResult { name, output } => {
-            ui.session.add_tool_result(&name, &output);
-            save_session_if_enabled(ui.session, ui.cli, renderer)?;
+            let (_, artifact) = ui.session.add_tool_result_with_artifact(&name, &output);
+            if let (Some(pending), Some(path)) = (run.pending_turn.as_mut(), artifact) {
+                pending.record_tool_output(path);
+            }
+            save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             if name == "todo_write" {
                 let list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
                 if list.is_empty() {
@@ -285,8 +287,6 @@ pub async fn handle_agent_event(
         }
         AgentEvent::Error(e) => {
             run.was_reasoning = false;
-            let safe = sanitize_output(&e);
-            renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
             run.is_running = false;
             if let Some(ss) = ui.status_signals.as_ref() {
                 ss.send_stop();
@@ -295,20 +295,21 @@ pub async fn handle_agent_event(
             run.agent_line_started = false;
             run.response_buf.clear();
             run.response_start_block = None;
-            save_session_if_enabled(ui.session, ui.cli, renderer)?;
+            save_session_if_settled(ui.session, ui.cli, run, renderer)?;
+            let safe = sanitize_output(&e);
+            renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
         }
     }
     Ok(())
 }
 
-fn save_session_if_enabled(
+fn save_session_if_settled(
     session: &Session,
     cli: &Cli,
+    run: &AgentRunState,
     renderer: &mut Renderer,
 ) -> anyhow::Result<()> {
-    if !cli.no_session
-        && let Err(e) = save_session(session)
-    {
+    if let Err(e) = crate::ui::persist_session_if_settled(session, !cli.no_session, run) {
         renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
     }
     Ok(())
@@ -328,18 +329,11 @@ async fn handle_agent_done(
     let _ = &chain;
     run.was_reasoning = false;
 
-    finalize_response_segment(renderer, run)?;
-    if run.response_buf.is_empty() && !run.agent_line_started {
-        renderer.feed_mut().push_line(BlockStyle::Agent, "< ");
-    }
-
-    renderer.write_line("", Color::White)?;
-    renderer.write_line("", Color::White)?;
+    // Commit the provider's completed response and accounting before any
+    // fallible presentation or post-processing. The App wrapper can then
+    // persist this valid success even if rendering, compaction, validation
+    // startup, or worktree-return presentation fails afterward.
     ui.session.add_message(MessageRole::Assistant, &response);
-    // `total_input_tokens`/`total_output_tokens` keep the raw provider-reported
-    // counts (that's what those fields mean), but cost prices the *billable*
-    // input — for Anthropic that folds in cache reads/writes, which the raw
-    // `input_tokens` excludes yet are still billed (see `billable_input_tokens`).
     ui.session.total_input_tokens = ui
         .session
         .total_input_tokens
@@ -359,11 +353,6 @@ async fn handle_agent_done(
         ui.session.input_token_cost,
         ui.session.output_token_cost,
     );
-    // Anchor context-size accounting to the provider's real usage. Context
-    // measurement needs the full prompt size, so use the cache-inclusive count
-    // (Anthropic reports input_tokens excluding cached/cache-creation tokens,
-    // which would otherwise collapse the context meter to ~0 on cache hits).
-    // Must come after add_message so the anchor includes the just-appended response.
     let context_input_tokens = Session::real_input_tokens(
         ui.cfg.is_anthropic_native(&ui.session.provider),
         usage.input_tokens,
@@ -372,6 +361,14 @@ async fn handle_agent_done(
     );
     ui.session
         .set_calibration(context_input_tokens, usage.output_tokens);
+
+    finalize_response_segment(renderer, run)?;
+    if run.response_buf.is_empty() && !run.agent_line_started {
+        renderer.feed_mut().push_line(BlockStyle::Agent, "< ");
+    }
+
+    renderer.write_line("", Color::White)?;
+    renderer.write_line("", Color::White)?;
     run.agent_line_started = false;
     run.response_buf.clear();
     run.response_start_block = None;
@@ -396,15 +393,16 @@ async fn handle_agent_done(
         && ui.session.needs_compaction(reserve)
         && !ui.cli.no_session
     {
-        let compress_result = handle_compress(None, true, &mut run.agent, renderer, ui, true).await;
+        let compress_result = handle_compress(None, true, run, renderer, ui, true).await;
         if let Err(e) = compress_result {
             renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;
         }
     }
 
-    if !ui.cli.no_session
-        && let Err(e) = save_session(ui.session)
-    {
+    // `Done` can still be an intermediate state for a loop validation or a
+    // following loop iteration. Keep the pre-turn disk snapshot authoritative
+    // until App::finalize_turn observes that the whole user turn has settled.
+    if let Err(e) = crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run) {
         renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
     }
     run.is_running = false;

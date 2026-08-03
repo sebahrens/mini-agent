@@ -3,13 +3,15 @@ use crate::permission::{PermissionConfigs, SecurityMode};
 use crate::session::MessageRole;
 use crate::session::storage::{
     atomic_write, delete_session, find_sessions_by_prefix, load_suffix, save_session,
-    save_tool_output, suffix_path,
+    save_tool_output, suffix_path, tool_output_dir,
 };
 use crate::session::{
     PermissionAllowEntry, Session, TOOL_RESULT_HEAD_CHARS, TOOL_RESULT_SAVE_THRESHOLD,
     TOOL_RESULT_TAIL_CHARS,
 };
+use crate::ui::state::{AgentRunState, PendingMainTurn};
 use crate::ui::utils::suggest_pattern;
+use crate::ui::{mark_main_turn_started, persist_session_if_settled, rollback_pending_main_turn};
 use std::env;
 use std::path::Path;
 use std::sync::Mutex;
@@ -137,6 +139,245 @@ fn save_session_preserves_messages() {
     assert_eq!(found[0].messages.len(), 2);
     assert_eq!(found[0].messages[0].content, "question");
     assert_eq!(found[0].messages[1].content, "answer");
+    drop(env);
+}
+
+#[test]
+fn failed_turn_persistence_rollback_keeps_partial_events_off_disk() {
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    session.add_message(MessageRole::User, "prior question");
+    session.add_message(MessageRole::Assistant, "prior answer");
+    save_session(&session).unwrap();
+    let expected_before = serde_json::to_value(&session).unwrap();
+
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "failed prompt");
+    mark_main_turn_started(&mut session, &mut run, pending);
+    session.add_message(MessageRole::Assistant, "partial response");
+    session.add_tool_call("read", &serde_json::json!({"path": "partial.txt"}));
+    session.add_tool_result("read", "partial result");
+    session.total_input_tokens = 41;
+    session.total_output_tokens = 7;
+    session.total_cached_input_tokens = 13;
+    session.total_cache_creation_input_tokens = 3;
+    session.total_cost = 0.75;
+    session.permission_allowlist.push(PermissionAllowEntry {
+        tool: "read".into(),
+        pattern: "partial.txt".into(),
+    });
+
+    assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+    let on_disk_during_turn = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(on_disk_during_turn.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&on_disk_during_turn[0]).unwrap(),
+        expected_before
+    );
+
+    assert_eq!(
+        rollback_pending_main_turn(&mut run, &mut session).as_deref(),
+        Some("failed prompt")
+    );
+    assert!(persist_session_if_settled(&session, true, &run).unwrap());
+    let expected_after = serde_json::to_value(&session).unwrap();
+    let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(serde_json::to_value(&reloaded[0]).unwrap(), expected_after);
+    assert_eq!(reloaded[0].messages.len(), 2);
+    assert_eq!(reloaded[0].total_input_tokens, 41);
+    assert_eq!(reloaded[0].total_output_tokens, 7);
+    assert_eq!(reloaded[0].permission_allowlist.len(), 1);
+    drop(env);
+}
+
+#[test]
+fn failed_turn_rollback_removes_long_tool_output_and_defers_chat_history() {
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "private failed prompt");
+    mark_main_turn_started(&mut session, &mut run, pending);
+
+    let long_output = "sensitive-tool-output".repeat(TOOL_RESULT_SAVE_THRESHOLD + 1);
+    let (_, artifact) = session.add_tool_result_with_artifact("read", &long_output);
+    let artifact = artifact.expect("long output should be externalized");
+    assert!(artifact.exists());
+    run.pending_turn
+        .as_mut()
+        .unwrap()
+        .record_tool_output(artifact.clone());
+    assert!(
+        crate::session::chat_history::load_history()
+            .unwrap()
+            .is_empty()
+    );
+
+    rollback_pending_main_turn(&mut run, &mut session).unwrap();
+
+    assert!(!artifact.exists());
+    assert!(
+        std::fs::read_dir(tool_output_dir(&session.id))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(
+        crate::session::chat_history::load_history()
+            .unwrap()
+            .is_empty()
+    );
+    drop(env);
+}
+
+#[test]
+fn successful_turn_appends_deferred_chat_history_once() {
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "successful prompt");
+    mark_main_turn_started(&mut session, &mut run, pending);
+    run.pending_turn
+        .as_mut()
+        .unwrap()
+        .record_started(session.updated_at.clone());
+    session.add_message(MessageRole::Assistant, "successful response");
+    save_session(&session).unwrap();
+
+    let errors = run.pending_turn.take().unwrap().commit_side_effects(true);
+    assert!(errors.is_empty());
+    let history = crate::session::chat_history::load_history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].content, "successful prompt");
+    drop(env);
+}
+
+#[test]
+fn internal_main_turn_never_enters_user_chat_history() {
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "internal merge controller prompt");
+    mark_main_turn_started(&mut session, &mut run, pending);
+    session.add_message(MessageRole::Assistant, "merge complete");
+    save_session(&session).unwrap();
+
+    let errors = run.pending_turn.take().unwrap().commit_side_effects(true);
+
+    assert!(errors.is_empty());
+    assert!(
+        crate::session::chat_history::load_history()
+            .unwrap()
+            .is_empty()
+    );
+    drop(env);
+}
+
+#[test]
+fn successful_turn_persistence_still_commits_the_complete_turn() {
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    session.add_message(MessageRole::User, "prior question");
+    session.add_message(MessageRole::Assistant, "prior answer");
+    save_session(&session).unwrap();
+
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "successful prompt");
+    mark_main_turn_started(&mut session, &mut run, pending);
+    session.add_message(MessageRole::Assistant, "successful response");
+
+    // Finalization writes the complete live transaction only after no loop,
+    // validation, or other continuation remains active, then drops the
+    // rollback snapshot. Intermediate Done/event persistence remains off.
+    save_session(&session).unwrap();
+    run.pending_turn = None;
+
+    let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(
+        reloaded[0]
+            .messages
+            .iter()
+            .map(|message| (message.role, message.content.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (MessageRole::User, "prior question"),
+            (MessageRole::Assistant, "prior answer"),
+            (MessageRole::User, "successful prompt"),
+            (MessageRole::Assistant, "successful response"),
+        ]
+    );
+    drop(env);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_turn_persistence_rollback_save_failure_keeps_prior_snapshot() {
+    use std::os::unix::fs::symlink;
+
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    session.add_message(MessageRole::User, "prior question");
+    session.add_message(MessageRole::Assistant, "prior answer");
+    save_session(&session).unwrap();
+    let expected = serde_json::to_value(&session).unwrap();
+
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "failed prompt");
+    mark_main_turn_started(&mut session, &mut run, pending);
+    session.add_message(MessageRole::Assistant, "partial response");
+    assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+    rollback_pending_main_turn(&mut run, &mut session).unwrap();
+
+    let sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions");
+    let saved_sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions.saved");
+    std::fs::rename(&sessions_dir, &saved_sessions_dir).unwrap();
+    symlink(&saved_sessions_dir, &sessions_dir).unwrap();
+    let failed_save = persist_session_if_settled(&session, true, &run);
+    std::fs::remove_file(&sessions_dir).unwrap();
+    std::fs::rename(&saved_sessions_dir, &sessions_dir).unwrap();
+    assert!(failed_save.is_err());
+
+    let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(serde_json::to_value(&reloaded[0]).unwrap(), expected);
+    drop(env);
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_turn_persistence_failure_keeps_live_success_and_prior_disk_snapshot() {
+    use std::os::unix::fs::symlink;
+
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    session.add_message(MessageRole::User, "prior question");
+    session.add_message(MessageRole::Assistant, "prior answer");
+    save_session(&session).unwrap();
+    let expected_disk = serde_json::to_value(&session).unwrap();
+
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "successful prompt");
+    mark_main_turn_started(&mut session, &mut run, pending);
+    session.add_message(MessageRole::Assistant, "successful response");
+    assert!(!persist_session_if_settled(&session, true, &run).unwrap());
+
+    let sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions");
+    let saved_sessions_dir = std::path::PathBuf::from(&env.data_dir).join("sessions.saved");
+    std::fs::rename(&sessions_dir, &saved_sessions_dir).unwrap();
+    symlink(&saved_sessions_dir, &sessions_dir).unwrap();
+    let failed_save = save_session(&session);
+    std::fs::remove_file(&sessions_dir).unwrap();
+    std::fs::rename(&saved_sessions_dir, &sessions_dir).unwrap();
+    assert!(failed_save.is_err());
+
+    // The successful response remains live for the user; finalization discards
+    // only its rollback snapshot. The last valid disk file remains pre-turn.
+    run.pending_turn = None;
+    assert_eq!(session.messages.len(), 4);
+    let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(serde_json::to_value(&reloaded[0]).unwrap(), expected_disk);
     drop(env);
 }
 

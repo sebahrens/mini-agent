@@ -44,7 +44,9 @@ use crate::ui::renderer::Renderer;
 use crate::ui::slash::handle_compress;
 #[cfg(feature = "git-worktree")]
 use crate::ui::state::MergeRequest;
-use crate::ui::state::{AgentRunState, BtwStats, ChainState, SlashState, UiContext};
+use crate::ui::state::{
+    AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
+};
 
 /// What [`apply_prompt_mode`] did with the prompt's `%%mode=` directive, so
 /// callers can report the change without re-parsing the prompt.
@@ -439,7 +441,7 @@ pub(crate) async fn spawn_merge_agent(
         wt_remove_flag = wt_remove_flag,
         branch_delete_flag = branch_delete_flag
     );
-    ui.session.add_message(MessageRole::User, &prompt);
+    let pending_turn = PendingMainTurn::capture(ui.session, &prompt);
     let history = crate::agent::runner::convert_history(ui.session);
     let reasoning_enabled = ui.session.reasoning_enabled;
     ensure_agent(&mut run.agent, ui, reasoning_enabled).await;
@@ -462,6 +464,7 @@ pub(crate) async fn spawn_merge_agent(
     if let Some(ss) = ui.status_signals.as_ref() {
         ss.send_start();
     }
+    mark_main_turn_started(ui.session, run, pending_turn);
     chain.wt_return_path = Some((
         req.main_path.to_string(),
         req.wt_path.to_string(),
@@ -516,11 +519,14 @@ pub(crate) async fn resolve_prebuild<'a>(
 /// no run is already active (otherwise the previous one would be orphaned).
 pub(crate) async fn start_main_run(
     text: &str,
+    record_chat_history: bool,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
     slash: &SlashState,
     prebuild_rx: &mut Option<mpsc::Receiver<PrebuildPayload>>,
 ) {
+    #[allow(unused_mut)]
+    let mut pending_turn = PendingMainTurn::capture(ui.session, text);
     // Wait for the background prebuild if it hasn't completed yet.
     #[cfg(feature = "mcp")]
     resolve_prebuild(&mut run.agent, &mut ui.mcp_manager, prebuild_rx).await;
@@ -531,12 +537,12 @@ pub(crate) async fn start_main_run(
     let history = crate::agent::runner::convert_history(ui.session);
     #[cfg(feature = "multimodal")]
     let history = {
-        let media = ui.session.drain_media();
+        let media = pending_turn.take_pending_media(ui.session);
         if media.is_empty() {
             history
         } else {
             let mut h = history;
-            h.extend(crate::agent::runner::media_to_messages(&media));
+            h.extend(crate::agent::runner::media_to_messages(media));
             h
         }
     };
@@ -559,37 +565,69 @@ pub(crate) async fn start_main_run(
     if let Some(ss) = ui.status_signals.as_ref() {
         ss.send_start();
     }
-    record_started_main_turn(text, run, ui);
+    if record_chat_history {
+        record_started_main_turn(pending_turn, run, ui);
+    } else {
+        mark_main_turn_started(ui.session, run, pending_turn);
+        #[cfg(feature = "advisor")]
+        crate::extras::advisor::set_session_messages(ui.session.messages.clone());
+    }
 }
 
-pub(crate) fn mark_main_turn_started(session: &mut Session, run: &mut AgentRunState, text: &str) {
-    session.add_message(MessageRole::User, text);
-    // Mark this message as the rollback target if the turn fails (see the
-    // failed-send handling in the main event loop).
-    run.pending_send = Some(text.to_string());
+pub(crate) fn mark_main_turn_started(
+    session: &mut Session,
+    run: &mut AgentRunState,
+    pending_turn: PendingMainTurn,
+) {
+    session.add_message(MessageRole::User, pending_turn.prompt());
+    run.pending_turn = Some(pending_turn);
 }
 
 /// Records the common bookkeeping for a main turn only after its runner has
 /// started. Startup auto-triggers and editor-submitted turns must use the same
 /// path so rollback, advisor context, and chat history cannot drift apart.
 pub(crate) fn record_started_main_turn(
-    text: &str,
+    pending_turn: PendingMainTurn,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
 ) {
-    mark_main_turn_started(ui.session, run, text);
+    // Only user-authored starts enter global input history. Internal main-run
+    // prompts (such as the worktree merge controller) call
+    // mark_main_turn_started directly and deliberately remain ineligible.
+    mark_main_turn_started(ui.session, run, pending_turn);
+    run.pending_turn
+        .as_mut()
+        .expect("main turn was just recorded")
+        .record_started(ui.session.updated_at.clone());
     #[cfg(feature = "advisor")]
     crate::extras::advisor::set_session_messages(ui.session.messages.clone());
-    if !ui.cli.no_session
-        && let Err(e) = crate::session::chat_history::append_entry(
-            &crate::session::chat_history::ChatHistoryEntry {
-                content: text.to_string(),
-                timestamp: ui.session.updated_at.clone(),
-            },
-        )
-    {
-        tracing::warn!("failed to append chat history entry: {e}");
+}
+
+pub(crate) fn rollback_pending_main_turn(
+    run: &mut AgentRunState,
+    session: &mut Session,
+) -> Option<String> {
+    let prompt = run.pending_turn.take().map(|turn| turn.rollback(session));
+    #[cfg(feature = "advisor")]
+    if prompt.is_some() {
+        crate::extras::advisor::set_session_messages(session.messages.clone());
     }
+    prompt
+}
+
+/// Persist only a settled session. Tool events mutate the live transaction,
+/// but the disk snapshot remains at the pre-turn state until the turn reaches
+/// one terminal success/failure/cancellation transition.
+pub(crate) fn persist_session_if_settled(
+    session: &Session,
+    persistence_enabled: bool,
+    run: &AgentRunState,
+) -> anyhow::Result<bool> {
+    if !persistence_enabled || run.pending_turn.is_some() {
+        return Ok(false);
+    }
+    crate::session::storage::save_session(session)?;
+    Ok(true)
 }
 
 /// Continuation prompt injected after a mid-turn compaction. Hardcoded as a
@@ -671,15 +709,8 @@ pub(crate) async fn mid_turn_compact_and_respawn(
     )?;
 
     // 3. Compact the session (no-op if its text history is under the limit).
-    let compress_result = handle_compress(
-        None,
-        true,
-        &mut run.agent,
-        renderer,
-        ui,
-        slash.reasoning_enabled,
-    )
-    .await;
+    let compress_result =
+        handle_compress(None, true, run, renderer, ui, slash.reasoning_enabled).await;
     if let Err(e) = compress_result {
         renderer.write_line(&format!("mid-turn compact error: {}", e), C_ERROR)?;
     }

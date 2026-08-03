@@ -305,7 +305,7 @@ pub fn undo_last(session: &mut Session) -> usize {
 pub async fn handle_compress(
     instructions: Option<&str>,
     auto: bool,
-    agent: &mut Option<AnyAgent>,
+    run: &mut AgentRunState,
     renderer: &mut Renderer,
     ui: &mut UiContext<'_>,
     reasoning_enabled: bool,
@@ -371,14 +371,18 @@ pub async fn handle_compress(
         .sum();
 
     #[cfg(feature = "memory")]
-    crate::extras::memory::flush_compaction_summary(
-        &crate::extras::memory::Mem::open(),
-        &summary,
-        Some(cut_idx), // = first_kept_index: how many messages were summarized
-    );
+    if let Some(pending) = run.pending_turn.as_mut() {
+        pending.stage_memory_summary(summary.clone(), Some(cut_idx));
+    } else {
+        crate::extras::memory::flush_compaction_summary(
+            &crate::extras::memory::Mem::open(),
+            &summary,
+            Some(cut_idx), // = first_kept_index: how many messages were summarized
+        );
+    }
     ui.session.compress(summary, cut_idx, tokens_before);
 
-    *agent = Some(
+    run.agent = Some(
         ui.agent_build_ctx()
             .rebuild_agent(&ui.session.model, reasoning_enabled)
             .await,

@@ -24,7 +24,9 @@ use crate::ui::renderer::{self as renderer_mod, ChainPrompt, Renderer, copy_to_c
 use crate::ui::slash::{apply_prompt_model, handle_compress, handle_slash};
 #[cfg(feature = "git-worktree")]
 use crate::ui::state::MergeRequest;
-use crate::ui::state::{AgentRunState, BtwStats, ChainState, SlashState, UiContext};
+use crate::ui::state::{
+    AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
+};
 use crate::ui::terminal::TerminalGuard;
 use crate::ui::utils::{parse_color, to_ansi_256};
 
@@ -36,8 +38,8 @@ use super::handle_human_handoff;
 use super::spawn_merge_agent;
 use super::{
     C_AGENT, C_BTW, C_ERROR, C_TOOL, PrebuildPayload, apply_prompt_mode, classify_submission,
-    mid_turn_compact_and_respawn, record_started_main_turn, refresh_display, spawn_event_thread,
-    start_main_run, stop_turn_context_exhausted,
+    mid_turn_compact_and_respawn, record_started_main_turn, refresh_display,
+    rollback_pending_main_turn, spawn_event_thread, start_main_run, stop_turn_context_exhausted,
 };
 #[cfg(feature = "git-worktree")]
 use super::{C_PERM, apply_current_prompt_mode};
@@ -276,7 +278,7 @@ impl<'a> App<'a> {
 
             event_handler::ensure_agent(&mut run.agent, &mut ui, slash.reasoning_enabled).await;
             let initial_turn = AutoTriggerTurn::prepare(ui.session, trigger_msg);
-            let (prompt, history, pending_record) = initial_turn.into_runner_inputs();
+            let (prompt, history, pending_turn) = initial_turn.into_runner_inputs();
             let runner = run
                 .agent
                 .as_ref()
@@ -296,7 +298,7 @@ impl<'a> App<'a> {
             if let Some(ss) = ui.status_signals.as_ref() {
                 ss.send_start();
             }
-            pending_record.record_started(&mut run, &mut ui);
+            record_started_main_turn(pending_turn, &mut run, &mut ui);
         }
 
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
@@ -379,6 +381,14 @@ impl<'a> App<'a> {
     }
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
+        let result = self.run_inner().await;
+        if result.is_err() && self.run.pending_turn.is_some() {
+            self.fail_pending_main_turn();
+        }
+        result
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             self.ui.session.reasoning_enabled = self.slash.reasoning_enabled;
             if self.last_branch_check.elapsed() >= Duration::from_secs(1) {
@@ -660,14 +670,7 @@ impl<'a> App<'a> {
                     if let Some(text) = text {
                         self.input.load_text(&text);
                     }
-                    if !self.ui.cli.no_session
-                        && let Err(e) = crate::session::storage::save_session(self.ui.session)
-                    {
-                        self.renderer.write_line(
-                            &format!("warning: failed to save session: {}", e),
-                            C_ERROR,
-                        )?;
-                    }
+                    self.save_session()?;
                     render_session(
                         &mut self.renderer,
                         self.ui.session,
@@ -892,18 +895,30 @@ impl<'a> App<'a> {
                     self.stop_context_exhausted(real_input_tokens, threshold)?;
                     self.run.awaiting_compaction_relief = false;
                 } else {
-                    self.mid_turn_compact(pressure).await?;
+                    if let Err(error) = self.mid_turn_compact(pressure).await {
+                        self.fail_pending_main_turn();
+                        return Err(error);
+                    }
                     self.run.awaiting_compaction_relief = true;
                 }
-                self.refresh()?;
+                if let Err(error) = self.refresh() {
+                    self.fail_pending_main_turn();
+                    return Err(error.into());
+                }
                 return Ok(());
             } else {
                 self.run.awaiting_compaction_relief = false;
             }
         }
 
-        let turn_errored = matches!(&event, AgentEvent::Error(_));
-        event_handler::handle_agent_event(
+        // A failed turn is never an authoritative session state. Restore the
+        // pre-turn transcript before the error handler performs its one
+        // terminal save, so disk cannot observe a ghost prompt/tool tail.
+        let terminal_success = matches!(&event, AgentEvent::Done { .. });
+        let failed_prompt = matches!(&event, AgentEvent::Error(_))
+            .then(|| rollback_pending_main_turn(&mut self.run, self.ui.session))
+            .flatten();
+        let handled = event_handler::handle_agent_event(
             event,
             &mut self.renderer,
             &mut self.run,
@@ -913,9 +928,44 @@ impl<'a> App<'a> {
             #[cfg(feature = "loop")]
             &self.user_tx,
         )
-        .await?;
+        .await;
 
-        self.finalize_turn(turn_errored).await?;
+        if let Err(error) = handled {
+            if let Some(text) = failed_prompt {
+                self.input.load_text(&text);
+            }
+            if terminal_success {
+                // The completed response/accounting is installed before
+                // fallible presentation. Make that valid success durable even
+                // when rendering or terminal post-processing fails.
+                #[cfg(feature = "loop")]
+                self.run.cancel_validation();
+                if let Some(handle) = self.run.main_abort.take() {
+                    handle.abort();
+                }
+                self.ui.sandbox.kill_active();
+                self.run.is_running = false;
+                self.run.agent_rx = None;
+                self.run.agent_line_started = false;
+                self.run.response_buf.clear();
+                self.run.response_start_block = None;
+                if let Some(signals) = self.ui.status_signals.as_ref() {
+                    signals.send_stop();
+                }
+                self.settle_success_transaction();
+            } else if self.run.pending_turn.is_some() {
+                // Presentation is part of the event handler and can fail after
+                // a tool/stream event mutated live state. App unwind ends the
+                // turn, so apply the same rollback policy as cancellation.
+                self.fail_pending_main_turn();
+            }
+            return Err(error);
+        }
+
+        if let Some(text) = failed_prompt {
+            self.input.load_text(&text);
+        }
+        self.finalize_turn().await?;
         Ok(())
     }
 
@@ -933,19 +983,14 @@ impl<'a> App<'a> {
         )
         .await?;
         if current {
-            self.finalize_turn(false).await?;
+            self.finalize_turn().await?;
         }
         Ok(())
     }
 
-    async fn finalize_turn(&mut self, turn_errored: bool) -> anyhow::Result<()> {
-        if turn_errored {
-            if let Some(text) = rollback_failed_send(&mut self.run, self.ui.session) {
-                self.input.buffer = text.into();
-                self.input.cursor = self.input.buffer.len();
-            }
-        } else if !self.run.is_running {
-            self.run.pending_send = None;
+    async fn finalize_turn(&mut self) -> anyhow::Result<()> {
+        if !self.run.is_running {
+            self.settle_success_transaction();
         }
 
         if !self.run.is_running
@@ -998,6 +1043,55 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    fn settle_success_transaction(&mut self) {
+        if self.run.pending_turn.is_some() {
+            // A `Done` event is terminal only once no validation, loop
+            // iteration, or other continuation remains active. Commit the
+            // complete transaction at that boundary, then discard rollback
+            // state even when persistence warned and retained the prior file.
+            let persisted = self.save_session_with_status();
+            let pending = self
+                .run
+                .pending_turn
+                .take()
+                .expect("pending turn checked above");
+            if persisted {
+                for error in pending.commit_side_effects(!self.ui.cli.no_session) {
+                    let _ = self.renderer.write_line(
+                        &format!("warning: failed to append chat history entry: {error}"),
+                        C_ERROR,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exception-safe failure transition with no required presentation. Used
+    /// when rendering or mid-turn post-processing itself is what failed.
+    fn fail_pending_main_turn(&mut self) {
+        #[cfg(feature = "loop")]
+        self.run.cancel_validation();
+        if let Some(handle) = self.run.main_abort.take() {
+            handle.abort();
+        }
+        self.ui.sandbox.kill_active();
+        self.run.is_running = false;
+        self.run.agent_rx = None;
+        self.run.turn_trace.clear();
+        self.run.awaiting_compaction_relief = false;
+        self.run.pending_inputs.clear();
+        self.run.agent_line_started = false;
+        self.run.response_buf.clear();
+        self.run.response_start_block = None;
+        if let Some(signals) = self.ui.status_signals.as_ref() {
+            signals.send_stop();
+        }
+        if let Some(text) = rollback_pending_main_turn(&mut self.run, self.ui.session) {
+            self.input.load_text(&text);
+        }
+        let _ = self.save_session();
+    }
+
     fn abort_main_run(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "loop")]
         let validation_active = self.run.cancel_validation();
@@ -1018,6 +1112,7 @@ impl<'a> App<'a> {
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
         self.run.pending_inputs.clear();
+        let failed_prompt = rollback_pending_main_turn(&mut self.run, self.ui.session);
         #[cfg(feature = "loop")]
         if let Some(ref mut ls) = self.chain.loop_state {
             ls.active = false;
@@ -1025,6 +1120,9 @@ impl<'a> App<'a> {
         }
         if !self.input.buffer.is_empty() {
             self.input.clear_buffer();
+        }
+        if let Some(text) = failed_prompt {
+            self.input.load_text(&text);
         }
         if let Some(restore_name) = self.chain.dot_prompt_restore.take() {
             self.ui.context.current_prompt = self.ui.context.prompts.get(&restore_name).cloned();
@@ -1038,6 +1136,7 @@ impl<'a> App<'a> {
                 guard.restore_user_mode();
             }
         }
+        self.save_session()?;
         self.renderer.write_line(
             "interrupted (changes may be partial; review with git diff)",
             C_ERROR,
@@ -1048,6 +1147,19 @@ impl<'a> App<'a> {
     async fn start_main_run(&mut self, text: &str) {
         start_main_run(
             text,
+            true,
+            &mut self.run,
+            &mut self.ui,
+            &self.slash,
+            &mut self.prebuild_rx,
+        )
+        .await;
+    }
+
+    async fn start_internal_main_run(&mut self, text: &str) {
+        start_main_run(
+            text,
+            false,
             &mut self.run,
             &mut self.ui,
             &self.slash,
@@ -1091,7 +1203,6 @@ impl<'a> App<'a> {
                 .write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
         }
         self.renderer.write_line("", Color::White)?;
-        self.ui.session.add_message(MessageRole::User, &msg);
         self.run.agent = None;
         self.start_main_run(&msg).await;
         Ok(())
@@ -1309,7 +1420,7 @@ impl<'a> App<'a> {
                 let compress_result = handle_compress(
                     instructions.as_deref(),
                     false,
-                    &mut self.run.agent,
+                    &mut self.run,
                     &mut self.renderer,
                     &mut self.ui,
                     self.slash.reasoning_enabled,
@@ -1319,7 +1430,7 @@ impl<'a> App<'a> {
                     self.renderer
                         .write_line(&format!("compress error: {}", e), C_ERROR)?;
                 }
-                let _ = crate::session::storage::save_session(self.ui.session);
+                let _ = self.save_session();
             }
             #[cfg(feature = "mcp")]
             Err(e)
@@ -1506,29 +1617,7 @@ impl<'a> App<'a> {
                     .unwrap_or("")
                     .to_string();
                 self.chain.dot_prompt_restore = self.ui.context.one_shot_restore.take();
-                self.ui.session.add_message(MessageRole::User, &msg);
-                self.ensure_agent().await;
-                let history = crate::agent::runner::convert_history(self.ui.session);
-                let runner = self
-                    .run
-                    .agent
-                    .as_ref()
-                    .unwrap()
-                    .clone()
-                    .spawn_runner(
-                        msg,
-                        history,
-                        self.ui.cfg.retry.clone(),
-                        #[cfg(feature = "hooks")]
-                        None,
-                    )
-                    .await;
-                self.run.agent_rx = Some(runner.event_rx);
-                self.run.main_abort = Some(runner.abort_handle);
-                self.run.is_running = true;
-                if let Some(ss) = self.ui.status_signals.as_ref() {
-                    ss.send_start();
-                }
+                self.start_internal_main_run(&msg).await;
             }
             #[cfg(feature = "memory")]
             Err(e) if e.to_string().starts_with("DEFER_EDITOR:") => {
@@ -1705,13 +1794,18 @@ impl<'a> App<'a> {
     }
 
     fn stop_context_exhausted(&mut self, prompt_tokens: u64, threshold: f64) -> anyhow::Result<()> {
-        stop_turn_context_exhausted(
+        let rendered = stop_turn_context_exhausted(
             prompt_tokens,
             threshold,
             &mut self.renderer,
             &self.ui,
             &mut self.run,
-        )
+        );
+        if let Some(text) = rollback_pending_main_turn(&mut self.run, self.ui.session) {
+            self.input.load_text(&text);
+        }
+        self.save_session()?;
+        rendered
     }
 
     fn handle_btw_event(&mut self, bev: BtwEvent) -> anyhow::Result<()> {
@@ -1876,13 +1970,30 @@ impl<'a> App<'a> {
     }
 
     fn save_session(&mut self) -> anyhow::Result<()> {
-        if !self.ui.cli.no_session
-            && let Err(e) = crate::session::storage::save_session(self.ui.session)
-        {
-            self.renderer
-                .write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
+        if self.run.pending_turn.is_some() {
+            return Ok(());
         }
+        self.save_session_with_status();
         Ok(())
+    }
+
+    /// Save without letting a presentation failure interrupt a terminal state
+    /// transition. `true` means the transaction has an authoritative backing
+    /// snapshot (or persistence was explicitly disabled).
+    fn save_session_with_status(&mut self) -> bool {
+        if self.ui.cli.no_session {
+            return true;
+        }
+        match crate::session::storage::save_session(self.ui.session) {
+            Ok(()) => true,
+            Err(error) => {
+                let _ = self.renderer.write_line(
+                    &format!("warning: failed to save session: {error}"),
+                    C_ERROR,
+                );
+                false
+            }
+        }
     }
 
     #[cfg(feature = "git-worktree")]
@@ -2080,15 +2191,7 @@ impl<'a> App<'a> {
                                                 let is_ctrl_c = key.code == KeyCode::Char('c')
                                                     && key.modifiers.contains(KeyModifiers::CONTROL);
                                                 if is_ctrl_c {
-                                                    if let Some(h) = self.run.main_abort.take() {
-                                                        h.abort();
-                                                    }
-                                                    self.ui.sandbox.kill_active();
-                                                    self.run.is_running = false;
-                                                    if let Some(ss) = self.ui.status_signals.as_ref() {
-                                                        ss.send_stop();
-                                                    }
-                                                    self.run.agent_rx = None;
+                                                    self.abort_main_run()?;
                                                 }
                                             }
                                             None
@@ -2111,20 +2214,24 @@ impl<'a> App<'a> {
                                         }
                                     }
                                 }
-                                None => break,
+                                None => {
+                                    if let Some(replacement) = self.run.agent_rx.take() {
+                                        merge_rx = Some(replacement);
+                                        continue;
+                                    }
+                                    break;
+                                }
                             };
                             if let Some(ev) = ev {
-                                event_handler::handle_agent_event(
-                                    ev,
-                                    &mut self.renderer,
-                                    &mut self.run,
-                                    &mut self.ui,
-                                    &self.slash,
-                                    &mut self.chain,
-                                    #[cfg(feature = "loop")]
-                                    &self.user_tx,
-                                )
-                                .await?;
+                                self.handle_agent_event(ev).await?;
+                                // Mid-turn compaction aborts the current runner
+                                // and installs a replacement receiver. This
+                                // nested driver owns the receiver while the
+                                // auto-merge agent runs, so adopt that handoff
+                                // before polling again.
+                                if let Some(replacement) = self.run.agent_rx.take() {
+                                    merge_rx = Some(replacement);
+                                }
                             }
                         }
                     }
@@ -2149,6 +2256,7 @@ impl<'a> App<'a> {
 struct AutoTriggerTurn {
     prompt: String,
     history: Vec<rig::completion::Message>,
+    pending_turn: PendingMainTurn,
 }
 
 impl AutoTriggerTurn {
@@ -2156,62 +2264,42 @@ impl AutoTriggerTurn {
         Self {
             prompt: prompt.to_string(),
             history: crate::agent::runner::convert_history(session),
+            pending_turn: PendingMainTurn::capture(session, prompt),
         }
     }
 
-    fn into_runner_inputs(
-        self,
-    ) -> (
-        String,
-        Vec<rig::completion::Message>,
-        PendingAutoTriggerPrompt,
-    ) {
-        let pending_record = PendingAutoTriggerPrompt(self.prompt.clone());
-        (self.prompt, self.history, pending_record)
+    fn into_runner_inputs(self) -> (String, Vec<rig::completion::Message>, PendingMainTurn) {
+        (self.prompt, self.history, self.pending_turn)
     }
-}
-
-struct PendingAutoTriggerPrompt(String);
-
-impl PendingAutoTriggerPrompt {
-    fn record_started(self, run: &mut AgentRunState, ui: &mut UiContext<'_>) {
-        record_started_main_turn(&self.0, run, ui);
-    }
-}
-
-fn rollback_failed_send(run: &mut AgentRunState, session: &mut Session) -> Option<String> {
-    let text = run.pending_send.take()?;
-    let len = session.messages.len();
-    if len > 0 && session.messages[len - 1].role == MessageRole::User {
-        session.truncate_to(len - 1);
-    }
-    Some(text)
 }
 
 #[cfg(test)]
 mod initial_turn_tests {
     use rig::completion::Message;
 
-    use super::{AutoTriggerTurn, rollback_failed_send};
+    use super::AutoTriggerTurn;
     use crate::session::{MessageRole, Session};
-    use crate::ui::state::AgentRunState;
+    use crate::ui::state::{AgentRunState, PendingMainTurn};
 
     #[test]
     fn initial_turn_keeps_current_prompt_separate_until_runner_starts() {
         let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
         let turn = AutoTriggerTurn::prepare(&session, "current prompt");
-        let (prompt, history, pending_record) = turn.into_runner_inputs();
+        let (prompt, history, pending_turn) = turn.into_runner_inputs();
 
         assert_eq!(prompt, "current prompt");
         assert!(history.is_empty());
         assert!(session.messages.is_empty());
 
         let mut run = AgentRunState::default();
-        crate::ui::mark_main_turn_started(&mut session, &mut run, &pending_record.0);
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].role, MessageRole::User);
         assert_eq!(session.messages[0].content, "current prompt");
-        assert_eq!(run.pending_send.as_deref(), Some("current prompt"));
+        assert_eq!(
+            run.pending_turn.as_ref().map(PendingMainTurn::prompt),
+            Some("current prompt")
+        );
     }
 
     #[test]
@@ -2221,7 +2309,7 @@ mod initial_turn_tests {
         session.add_message(MessageRole::Assistant, "prior answer");
 
         let turn = AutoTriggerTurn::prepare(&session, "new question");
-        let (prompt, history, pending_record) = turn.into_runner_inputs();
+        let (prompt, history, pending_turn) = turn.into_runner_inputs();
 
         assert_eq!(prompt, "new question");
         assert_eq!(
@@ -2234,7 +2322,7 @@ mod initial_turn_tests {
         assert_eq!(session.messages.len(), 2);
 
         let mut run = AgentRunState::default();
-        crate::ui::mark_main_turn_started(&mut session, &mut run, &pending_record.0);
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
         assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[2].role, MessageRole::User);
         assert_eq!(session.messages[2].content, "new question");
@@ -2249,19 +2337,90 @@ mod initial_turn_tests {
     }
 
     #[test]
-    fn failed_initial_turn_restores_prompt_and_removes_unmatched_history() {
+    fn failed_turn_rollback_restores_prompt_partial_state_and_undo() {
         let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
         session.add_message(MessageRole::User, "prior question");
         session.add_message(MessageRole::Assistant, "prior answer");
+        session.add_message(MessageRole::User, "rewound question");
+        assert_eq!(session.rewind_to(2), 1);
+        session.set_calibration(800, 40);
+        let mut expected = session.clone();
         let mut run = AgentRunState::default();
 
-        crate::ui::mark_main_turn_started(&mut session, &mut run, "retry me");
-        let restored = rollback_failed_send(&mut run, &mut session);
+        let pending_turn = PendingMainTurn::capture(&session, "retry me");
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+        session.add_message(MessageRole::Assistant, "partial response");
+        session.add_tool_call("read", &serde_json::json!({"path": "secret.txt"}));
+        session.add_tool_result("read", "partial tool output");
+        session.total_input_tokens = 99;
+        session.total_output_tokens = 17;
+        session.total_cached_input_tokens = 23;
+        session.total_cache_creation_input_tokens = 5;
+        session.total_cost = 1.25;
+        session
+            .permission_allowlist
+            .push(crate::session::PermissionAllowEntry {
+                tool: "read".into(),
+                pattern: "secret.txt".into(),
+            });
+        expected.total_input_tokens = 99;
+        expected.total_output_tokens = 17;
+        expected.total_cached_input_tokens = 23;
+        expected.total_cache_creation_input_tokens = 5;
+        expected.total_cost = 1.25;
+        expected.permission_allowlist = session.permission_allowlist.clone();
+        let restored = crate::ui::rollback_pending_main_turn(&mut run, &mut session);
 
         assert_eq!(restored.as_deref(), Some("retry me"));
-        assert_eq!(run.pending_send, None);
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].content, "prior question");
-        assert_eq!(session.messages[1].content, "prior answer");
+        assert!(run.pending_turn.is_none());
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(session.redo(), expected.redo());
+        assert_eq!(
+            serde_json::to_value(&session).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn cancelled_turn_restores_the_prompt_and_pre_turn_transcript() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        session.add_message(MessageRole::User, "prior question");
+        session.add_message(MessageRole::Assistant, "prior answer");
+        let expected = serde_json::to_value(&session).unwrap();
+        let mut run = AgentRunState::default();
+        let pending_turn = PendingMainTurn::capture(&session, "cancel me");
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+
+        let restored = crate::ui::rollback_pending_main_turn(&mut run, &mut session);
+
+        assert_eq!(restored.as_deref(), Some("cancel me"));
+        assert_eq!(serde_json::to_value(&session).unwrap(), expected);
+        assert!(run.pending_turn.is_none());
+    }
+
+    #[cfg(feature = "multimodal")]
+    #[test]
+    fn failed_turn_restores_moved_pending_media_without_snapshot_clone() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        session
+            .pending_media
+            .push(crate::extras::multimodal::MediaAttachment::Image {
+                path: std::path::PathBuf::from("attachment.png"),
+                data: vec![1, 2, 3, 4],
+                mime: "image/png".into(),
+            });
+        let mut pending = PendingMainTurn::capture(&session, "describe attachment");
+        assert_eq!(pending.take_pending_media(&mut session).len(), 1);
+        assert!(session.pending_media.is_empty());
+        let mut run = AgentRunState::default();
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending);
+
+        crate::ui::rollback_pending_main_turn(&mut run, &mut session).unwrap();
+
+        assert_eq!(session.pending_media.len(), 1);
+        assert_eq!(session.pending_media[0].size(), 4);
     }
 }
