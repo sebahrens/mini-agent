@@ -848,7 +848,7 @@ impl<'a> App<'a> {
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
         match &event {
-            AgentEvent::ToolCall { name, args } => {
+            AgentEvent::ToolCall { name, args, .. } => {
                 if self.run.turn_trace.len() < TURN_TRACE_MAX {
                     self.run
                         .turn_trace
@@ -880,11 +880,10 @@ impl<'a> App<'a> {
         #[cfg(not(feature = "loop"))]
         let loop_running = false;
 
-        if let AgentEvent::CompletionCall {
-            input_tokens,
-            cached_input_tokens,
-            cache_creation_input_tokens,
-            ..
+        let is_usage_delta = matches!(&event, AgentEvent::UsageDelta { .. });
+        let mid_turn_pressure = if let AgentEvent::UsageDelta {
+            usage,
+            context_complete: true,
         } = &event
             && self.run.is_running
             && !loop_running
@@ -895,25 +894,15 @@ impl<'a> App<'a> {
         {
             let real_input_tokens = crate::session::Session::real_input_tokens(
                 self.ui.cfg.is_anthropic_native(&self.ui.session.provider),
-                *input_tokens,
-                *cached_input_tokens,
-                *cache_creation_input_tokens,
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_input_tokens,
             );
             let pressure = real_input_tokens as f64 / self.ui.session.context_window as f64;
-            if pressure > threshold {
-                if self.run.awaiting_compaction_relief {
-                    self.stop_context_exhausted(real_input_tokens, threshold)?;
-                    self.run.awaiting_compaction_relief = false;
-                } else {
-                    self.mid_turn_compact(pressure).await?;
-                    self.run.awaiting_compaction_relief = true;
-                }
-                self.refresh()?;
-                return Ok(());
-            } else {
-                self.run.awaiting_compaction_relief = false;
-            }
-        }
+            (pressure > threshold).then_some((real_input_tokens, threshold, pressure))
+        } else {
+            None
+        };
 
         let turn_errored = matches!(&event, AgentEvent::Error(_));
         event_handler::handle_agent_event(
@@ -927,6 +916,21 @@ impl<'a> App<'a> {
             &self.user_tx,
         )
         .await?;
+
+        if let Some((real_input_tokens, threshold, pressure)) = mid_turn_pressure {
+            if self.run.awaiting_compaction_relief {
+                self.stop_context_exhausted(real_input_tokens, threshold)?;
+                self.run.awaiting_compaction_relief = false;
+            } else {
+                self.mid_turn_compact(pressure).await?;
+                self.run.awaiting_compaction_relief = true;
+            }
+            self.refresh()?;
+            return Ok(());
+        }
+        if is_usage_delta {
+            self.run.awaiting_compaction_relief = false;
+        }
 
         self.finalize_turn(turn_errored).await?;
         Ok(())

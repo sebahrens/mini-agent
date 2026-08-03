@@ -14,7 +14,7 @@ use crate::ui::events::sanitize_output;
 use crate::ui::feed::BlockStyle;
 use crate::ui::renderer::Renderer;
 use crate::ui::slash::handle_compress;
-use crate::ui::state::{AgentRunState, ChainState, SlashState, TurnUsage, UiContext};
+use crate::ui::state::{AgentRunState, ChainState, SlashState, UiContext};
 
 #[cfg(any(feature = "git-worktree", feature = "loop"))]
 use super::C_AGENT;
@@ -101,7 +101,7 @@ pub async fn handle_agent_event(
             renderer.render_viewport()?;
             run.agent_line_started = true;
         }
-        AgentEvent::ToolCall { name, args } => {
+        AgentEvent::ToolCall { id, name, args } => {
             run.was_reasoning = false;
             finalize_response_segment(renderer, run)?;
             if run.agent_line_started {
@@ -114,7 +114,7 @@ pub async fn handle_agent_event(
             }
             run.response_buf.clear();
             run.response_start_block = None;
-            ui.session.add_tool_call(&name, &args);
+            ui.session.add_tool_call_with_id(&id, &name, &args);
             save_session_if_enabled(ui.session, ui.cli, renderer)?;
             let line = format!(
                 "◈ {}",
@@ -132,8 +132,8 @@ pub async fn handle_agent_event(
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
-        AgentEvent::ToolResult { name, output } => {
-            ui.session.add_tool_result(&name, &output);
+        AgentEvent::ToolResult { id, name, output } => {
+            ui.session.add_tool_result_with_id(&id, &name, &output);
             save_session_if_enabled(ui.session, ui.cli, renderer)?;
             if name == "todo_write" {
                 let list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
@@ -208,21 +208,9 @@ pub async fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::Done {
-            response,
-            input_tokens,
-            output_tokens,
-            cached_input_tokens,
-            cache_creation_input_tokens,
-        } => {
+        AgentEvent::Done { response } => {
             handle_agent_done(
                 response,
-                TurnUsage {
-                    input_tokens,
-                    output_tokens,
-                    cached_input_tokens,
-                    cache_creation_input_tokens,
-                },
                 renderer,
                 run,
                 ui,
@@ -232,46 +220,12 @@ pub async fn handle_agent_event(
             )
             .await?;
         }
-        AgentEvent::CompletionCall {
-            input_tokens,
-            output_tokens,
-            cached_input_tokens,
-            cache_creation_input_tokens,
+        AgentEvent::UsageDelta {
+            usage,
+            context_complete,
         } => {
-            // Real provider-reported usage for the call that just finished.
-            // The local len()/4 heuristic in session.total_estimated_tokens
-            // undercounts code-heavy turns; trust the real number as a floor
-            // so the status bar's x/y/% reflects what the provider actually saw.
-            // Use the cache-inclusive prompt size so Anthropic cache hits (which
-            // report input_tokens excluding cached tokens) don't deflate it.
-            let real = Session::real_input_tokens(
-                ui.cfg.is_anthropic_native(&ui.session.provider),
-                input_tokens,
-                cached_input_tokens,
-                cache_creation_input_tokens,
-            )
-            .saturating_add(output_tokens);
-            if real > ui.session.total_estimated_tokens {
-                ui.session.total_estimated_tokens = real;
-            }
-            // Accumulate cost for intermediate calls (tool-use turns). The Done
-            // event only carries the final call's usage, so without this every
-            // tool-call round-trip would go uncosted.
-            ui.session.total_input_tokens =
-                ui.session.total_input_tokens.saturating_add(input_tokens);
-            ui.session.total_output_tokens =
-                ui.session.total_output_tokens.saturating_add(output_tokens);
-            ui.session.total_cost += crate::pricing::estimate_cost(
-                crate::pricing::billable_input_tokens(
-                    ui.cfg.is_anthropic_native(&ui.session.provider),
-                    input_tokens,
-                    cached_input_tokens,
-                    cache_creation_input_tokens,
-                ),
-                output_tokens,
-                ui.session.input_token_cost,
-                ui.session.output_token_cost,
-            );
+            let anthropic_native = ui.cfg.is_anthropic_native(&ui.session.provider);
+            apply_usage_delta(ui.session, usage, anthropic_native, context_complete);
         }
         AgentEvent::Retrying { attempt, max } => {
             run.was_reasoning = false;
@@ -301,6 +255,30 @@ pub async fn handle_agent_event(
     Ok(())
 }
 
+fn apply_usage_delta(
+    session: &mut Session,
+    usage: crate::event::UsageDelta,
+    anthropic_native: bool,
+    context_complete: bool,
+) {
+    // Real provider-reported usage is the status/context source of truth. Use
+    // the cache-inclusive prompt size for native Anthropic cache hits.
+    let context_input_tokens = Session::real_input_tokens(
+        anthropic_native,
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_creation_input_tokens,
+    );
+    session.charge_usage_delta(usage, anthropic_native);
+    if context_complete {
+        let real = context_input_tokens.saturating_add(usage.output_tokens);
+        if real > session.total_estimated_tokens {
+            session.total_estimated_tokens = real;
+        }
+        session.set_calibration(context_input_tokens, usage.output_tokens);
+    }
+}
+
 fn save_session_if_enabled(
     session: &Session,
     cli: &Cli,
@@ -316,7 +294,6 @@ fn save_session_if_enabled(
 
 async fn handle_agent_done(
     response: CompactString,
-    usage: TurnUsage,
     renderer: &mut Renderer,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
@@ -336,42 +313,7 @@ async fn handle_agent_done(
     renderer.write_line("", Color::White)?;
     renderer.write_line("", Color::White)?;
     ui.session.add_message(MessageRole::Assistant, &response);
-    // `total_input_tokens`/`total_output_tokens` keep the raw provider-reported
-    // counts (that's what those fields mean), but cost prices the *billable*
-    // input — for Anthropic that folds in cache reads/writes, which the raw
-    // `input_tokens` excludes yet are still billed (see `billable_input_tokens`).
-    ui.session.total_input_tokens = ui
-        .session
-        .total_input_tokens
-        .saturating_add(usage.input_tokens);
-    ui.session.total_output_tokens = ui
-        .session
-        .total_output_tokens
-        .saturating_add(usage.output_tokens);
-    ui.session.total_cost += crate::pricing::estimate_cost(
-        crate::pricing::billable_input_tokens(
-            ui.cfg.is_anthropic_native(&ui.session.provider),
-            usage.input_tokens,
-            usage.cached_input_tokens,
-            usage.cache_creation_input_tokens,
-        ),
-        usage.output_tokens,
-        ui.session.input_token_cost,
-        ui.session.output_token_cost,
-    );
-    // Anchor context-size accounting to the provider's real usage. Context
-    // measurement needs the full prompt size, so use the cache-inclusive count
-    // (Anthropic reports input_tokens excluding cached/cache-creation tokens,
-    // which would otherwise collapse the context meter to ~0 on cache hits).
-    // Must come after add_message so the anchor includes the just-appended response.
-    let context_input_tokens = Session::real_input_tokens(
-        ui.cfg.is_anthropic_native(&ui.session.provider),
-        usage.input_tokens,
-        usage.cached_input_tokens,
-        usage.cache_creation_input_tokens,
-    );
-    ui.session
-        .set_calibration(context_input_tokens, usage.output_tokens);
+    ui.session.reanchor_calibration_to_current_messages();
     run.agent_line_started = false;
     run.response_buf.clear();
     run.response_start_block = None;
@@ -627,4 +569,103 @@ fn finalize_response_segment(
     }
     renderer.render_viewport()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_usage_delta;
+    use crate::event::UsageDelta;
+    use crate::session::Session;
+
+    #[test]
+    fn ui_usage_delta_accounting_updates_status_cost_and_persisted_totals_once() {
+        let mut session = Session::new("anthropic", "claude-sonnet", 200_000, "");
+        session.input_token_cost = 2.0;
+        session.output_token_cost = 10.0;
+        let first = UsageDelta {
+            input_tokens: 10,
+            output_tokens: 2,
+            cached_input_tokens: 7,
+            cache_creation_input_tokens: 3,
+            ..UsageDelta::default()
+        };
+        let second = UsageDelta {
+            input_tokens: 20,
+            output_tokens: 4,
+            cached_input_tokens: 5,
+            cache_creation_input_tokens: 1,
+            ..UsageDelta::default()
+        };
+
+        apply_usage_delta(&mut session, first, true, true);
+        apply_usage_delta(&mut session, second, true, true);
+
+        assert_eq!(session.total_input_tokens, 30);
+        assert_eq!(session.total_output_tokens, 6);
+        assert_eq!(session.total_cached_input_tokens, 12);
+        assert_eq!(session.total_cache_creation_input_tokens, 4);
+        let expected_cost = [first, second]
+            .into_iter()
+            .map(|usage| {
+                crate::pricing::estimate_cost(
+                    crate::pricing::billable_input_tokens(
+                        true,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.cache_creation_input_tokens,
+                    ),
+                    usage.output_tokens,
+                    session.input_token_cost,
+                    session.output_token_cost,
+                )
+            })
+            .sum::<f64>();
+        assert!((session.total_cost - expected_cost).abs() < f64::EPSILON);
+        assert_eq!(session.effective_context_tokens(), 30);
+
+        apply_usage_delta(
+            &mut session,
+            UsageDelta {
+                output_tokens: 2,
+                ..UsageDelta::default()
+            },
+            true,
+            false,
+        );
+        assert_eq!(session.total_output_tokens, 8);
+        assert_eq!(
+            session.effective_context_tokens(),
+            30,
+            "a field-wise terminal reconciliation must not replace the last complete context snapshot"
+        );
+    }
+
+    #[test]
+    fn ui_usage_delta_saturates_context_and_persisted_totals() {
+        let mut session = Session::new("anthropic", "claude-sonnet", u64::MAX, "");
+        session.total_input_tokens = u64::MAX - 1;
+        session.total_output_tokens = u64::MAX - 1;
+        session.total_cached_input_tokens = u64::MAX - 1;
+        session.total_cache_creation_input_tokens = u64::MAX - 1;
+
+        apply_usage_delta(
+            &mut session,
+            UsageDelta {
+                input_tokens: u64::MAX,
+                output_tokens: 10,
+                cached_input_tokens: 10,
+                cache_creation_input_tokens: 10,
+                ..UsageDelta::default()
+            },
+            true,
+            true,
+        );
+
+        assert_eq!(session.total_input_tokens, u64::MAX);
+        assert_eq!(session.total_output_tokens, u64::MAX);
+        assert_eq!(session.total_cached_input_tokens, u64::MAX);
+        assert_eq!(session.total_cache_creation_input_tokens, u64::MAX);
+        assert_eq!(session.total_estimated_tokens, u64::MAX);
+        assert_eq!(session.effective_context_tokens(), u64::MAX);
+    }
 }

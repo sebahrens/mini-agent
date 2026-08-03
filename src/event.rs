@@ -1,14 +1,38 @@
 use compact_str::CompactString;
 
+/// A chargeable, provider-reported usage increment.
+///
+/// Runners reconcile a terminal aggregate against usage already observed for
+/// the stream before constructing this value. Consumers can therefore add each
+/// delta exactly once; terminal events never carry a second copy of usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageDelta {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub tool_use_prompt_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+impl UsageDelta {
+    pub fn has_values(self) -> bool {
+        self != Self::default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Token(CompactString),
     Reasoning(CompactString),
     ToolCall {
+        id: CompactString,
         name: CompactString,
         args: serde_json::Value,
     },
     ToolResult {
+        id: CompactString,
         name: CompactString,
         output: CompactString,
     },
@@ -22,22 +46,19 @@ pub enum AgentEvent {
         attempt: usize,
         max: usize,
     },
-    /// Provider call finished mid-stream. Carries the real provider-reported
-    /// token usage for that call (when available). Used to update the
-    /// status-bar estimate and to drive mid-turn compaction decisions
-    /// independently of the local `len()/4` heuristic.
-    CompletionCall {
-        input_tokens: u64,
-        output_tokens: u64,
-        cached_input_tokens: u64,
-        cache_creation_input_tokens: u64,
+    /// The sole chargeable usage stream. A delta usually represents one
+    /// provider completion call; it can also be a terminal reconciliation when
+    /// an adapter reports only an aggregate.
+    UsageDelta {
+        usage: UsageDelta,
+        /// True when this delta is also a complete single-call usage snapshot
+        /// suitable for context pressure/calibration. A partial terminal
+        /// reconciliation remains chargeable but must not replace the last
+        /// complete context observation.
+        context_complete: bool,
     },
     Done {
         response: CompactString,
-        input_tokens: u64,
-        output_tokens: u64,
-        cached_input_tokens: u64,
-        cache_creation_input_tokens: u64,
     },
 }
 

@@ -737,6 +737,7 @@ impl AnyAgent {
         max_turns: usize,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
         retry_config: &RetryConfig,
+        usage_ledger: runner::SharedUsageLedger,
     ) -> runner::SubagentRunOutput {
         #[cfg(feature = "skills")]
         let _turn_guard = if self.skills.is_some() {
@@ -754,24 +755,44 @@ impl AnyAgent {
         let prompt = prompt.to_string();
         match &self.inner {
             AnyAgentInner::OpenRouter(a) => {
-                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
+                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config, usage_ledger)
+                    .await
             }
             AnyAgentInner::OpenAI(a) => match a {
                 OpenAiAgent::Responses(a) => {
-                    runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
+                    runner::run_subagent(
+                        a,
+                        &prompt,
+                        max_turns,
+                        event_tx,
+                        retry_config,
+                        usage_ledger,
+                    )
+                    .await
                 }
                 OpenAiAgent::Completions(a) => {
-                    runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
+                    runner::run_subagent(
+                        a,
+                        &prompt,
+                        max_turns,
+                        event_tx,
+                        retry_config,
+                        usage_ledger,
+                    )
+                    .await
                 }
             },
             AnyAgentInner::Anthropic(a) => {
-                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
+                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config, usage_ledger)
+                    .await
             }
             AnyAgentInner::Gemini(a) => {
-                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
+                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config, usage_ledger)
+                    .await
             }
             AnyAgentInner::Ollama(a) => {
-                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config).await
+                runner::run_subagent(a, &prompt, max_turns, event_tx, retry_config, usage_ledger)
+                    .await
             }
         }
     }

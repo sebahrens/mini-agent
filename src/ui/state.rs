@@ -215,15 +215,6 @@ pub(crate) struct SlashState {
     pub todo_tools_enabled: bool,
 }
 
-/// Provider-reported token usage for one finished turn.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct TurnUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-}
-
 /// /btw aggregate stats shown in the statusline.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct BtwStats {

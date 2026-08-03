@@ -8,8 +8,12 @@ fn sample_session() -> Session {
     let mut session = Session::new("openrouter", "test-model", 128_000, "demo session");
     session.add_message(MessageRole::User, "hello there");
     session.add_message(MessageRole::Assistant, "hi! **how** can I help?");
-    session.add_message(MessageRole::ToolCall, "bash: ls -la");
-    session.add_message(MessageRole::ToolResult, "bash:\ntotal 0");
+    session.add_tool_call_with_id(
+        "call-export",
+        "bash",
+        &serde_json::json!({"command": "ls -la"}),
+    );
+    session.add_tool_result_with_id("call-export", "bash", "total 0");
     session
 }
 
@@ -22,6 +26,7 @@ fn jsonl_round_trip_preserves_messages() {
     for (imported, original) in messages.iter().zip(session.messages.iter()) {
         assert_eq!(imported.role, original.role);
         assert_eq!(imported.content, original.content);
+        assert_eq!(imported.tool_call_id, original.tool_call_id);
     }
 }
 

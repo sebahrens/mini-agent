@@ -11,6 +11,9 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use tokio::time::Instant;
 
+use crate::agent::runner::SharedUsageLedger;
+#[cfg(feature = "hooks")]
+use crate::agent::runner::{SubagentRunOutput, usage_saturating_add};
 use crate::agent::tools::{ToolError, check_perm};
 use crate::extras::subagents::builder::{self, SubagentAuthorization};
 use crate::extras::subagents::{clone_subagent_event_tx, with_config};
@@ -241,26 +244,31 @@ editing in a known location, grepping for a literal you will act on immediately.
                     architecture,
                 )
                 .await;
-                let result = tokio::time::timeout(
+                let initial_usage = SharedUsageLedger::default();
+                let result = await_subagent_run(
                     SUBAGENT_TIMEOUT,
+                    initial_usage.clone(),
                     agent.run_subagent(
                         &execution_prompt,
                         max_turns,
                         event_tx.as_ref(),
                         &config.retry,
+                        initial_usage,
                     ),
                 )
                 .await;
                 let run = match result {
                     Ok(run) => run,
-                    Err(_) => {
+                    Err(observed_usage) => {
                         let output = Err("timeout: subagent exceeded 300s".to_string());
                         return ChildExecution {
-                            cost_units: usage_cost_units(&Usage::new(), &display_prompt, &output),
+                            cost_units: usage_cost_units(&observed_usage, &display_prompt, &output),
                             output,
                         };
                     }
                 };
+                #[cfg(feature = "hooks")]
+                let mut run = run;
 
                 #[cfg(feature = "hooks")]
                 let mut run = run;
@@ -272,22 +280,27 @@ editing in a known location, grepping for a literal you will act on immediately.
                 {
                     tracing::info!("hooks: SubagentStop forced continuation: {reason}");
                     let continuation = format!("{response}\n\n{reason}");
-                    if let Ok(mut retried) = tokio::time::timeout(
+                    let retry_usage = SharedUsageLedger::default();
+                    match await_subagent_run(
                         SUBAGENT_TIMEOUT,
+                        retry_usage.clone(),
                         agent.run_subagent(
                             &continuation,
                             max_turns,
                             event_tx.as_ref(),
                             &config.retry,
+                            retry_usage,
                         ),
                     )
                     .await
                     {
-                        retried.usage += run.usage;
-                        if retried.response.is_ok() {
-                            run = retried;
-                        } else {
-                            run.usage = retried.usage;
+                        Ok(retried) => run = merge_forced_continuation_run(run, retried),
+                        Err(observed_retry_usage) => {
+                            return forced_continuation_timeout_child(
+                                run.usage,
+                                observed_retry_usage,
+                                &display_prompt,
+                            );
                         }
                     }
                 }
@@ -302,6 +315,49 @@ editing in a known location, grepping for a literal you will act on immediately.
 
         let report = execute_tasks(args.prompts, limits, executor).await;
         Ok(report.render())
+    }
+}
+
+async fn await_subagent_run<F>(
+    timeout: Duration,
+    usage_ledger: SharedUsageLedger,
+    future: F,
+) -> Result<crate::agent::runner::SubagentRunOutput, Usage>
+where
+    F: Future<Output = crate::agent::runner::SubagentRunOutput>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(run) => Ok(run),
+        Err(_) => Err(usage_ledger.total()),
+    }
+}
+
+#[cfg(feature = "hooks")]
+fn merge_forced_continuation_run(
+    mut original: SubagentRunOutput,
+    mut retried: SubagentRunOutput,
+) -> SubagentRunOutput {
+    let combined_usage = usage_saturating_add(original.usage, retried.usage);
+    if retried.response.is_ok() {
+        retried.usage = combined_usage;
+        retried
+    } else {
+        original.usage = combined_usage;
+        original
+    }
+}
+
+#[cfg(feature = "hooks")]
+fn forced_continuation_timeout_child(
+    original_usage: Usage,
+    observed_retry_usage: Usage,
+    prompt: &str,
+) -> ChildExecution {
+    let combined_usage = usage_saturating_add(original_usage, observed_retry_usage);
+    let output = Err("timeout: forced subagent continuation exceeded 300s".to_string());
+    ChildExecution {
+        cost_units: usage_cost_units(&combined_usage, prompt, &output),
+        output,
     }
 }
 
@@ -648,6 +704,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    #[cfg(feature = "hooks")]
+    use rig::agent::AgentBuilder;
+    #[cfg(feature = "hooks")]
+    use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
 
     #[derive(Clone)]
     struct FakeStep {
@@ -1018,6 +1078,148 @@ mod tests {
         assert_eq!(
             usage_cost_units(&Usage::new(), "1234", &Ok("5678".into())),
             2
+        );
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn hooks_forced_subagent_continuation_saturates_usage_and_budget_cost() {
+        let near_max = Usage {
+            input_tokens: u64::MAX - 1,
+            output_tokens: u64::MAX - 1,
+            total_tokens: u64::MAX - 1,
+            cached_input_tokens: u64::MAX - 1,
+            cache_creation_input_tokens: u64::MAX - 1,
+            tool_use_prompt_tokens: u64::MAX - 1,
+            reasoning_tokens: u64::MAX - 1,
+        };
+        let increment = Usage {
+            input_tokens: 10,
+            output_tokens: 10,
+            total_tokens: 10,
+            cached_input_tokens: 10,
+            cache_creation_input_tokens: 10,
+            tool_use_prompt_tokens: 10,
+            reasoning_tokens: 10,
+        };
+        let merged = merge_forced_continuation_run(
+            SubagentRunOutput {
+                response: Ok("original".to_string()),
+                usage: near_max,
+            },
+            SubagentRunOutput {
+                response: Ok("continued".to_string()),
+                usage: increment,
+            },
+        );
+
+        assert_eq!(merged.response.as_deref(), Ok("continued"));
+        assert_eq!(merged.usage.input_tokens, u64::MAX);
+        assert_eq!(merged.usage.output_tokens, u64::MAX);
+        assert_eq!(merged.usage.total_tokens, u64::MAX);
+        assert_eq!(merged.usage.cached_input_tokens, u64::MAX);
+        assert_eq!(merged.usage.cache_creation_input_tokens, u64::MAX);
+        assert_eq!(merged.usage.tool_use_prompt_tokens, u64::MAX);
+        assert_eq!(merged.usage.reasoning_tokens, u64::MAX);
+        assert_eq!(
+            usage_cost_units(&merged.usage, "prompt", &merged.response),
+            u64::MAX,
+            "aggregate task budgeting must fail closed at the saturated maximum"
+        );
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn hooks_forced_continuation_timeout_retains_observed_completion_usage() {
+        #[derive(Clone)]
+        struct NeverCompletingTool(Arc<AtomicUsize>);
+
+        impl Tool for NeverCompletingTool {
+            const NAME: &'static str = "never_complete";
+            type Error = MockToolError;
+            type Args = serde_json::Value;
+            type Output = String;
+
+            fn description(&self) -> String {
+                "Block after the provider completion has been accounted".to_string()
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+
+            async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+
+        let near_max = Usage {
+            input_tokens: u64::MAX - 1,
+            output_tokens: u64::MAX - 1,
+            total_tokens: u64::MAX - 1,
+            cached_input_tokens: u64::MAX - 1,
+            cache_creation_input_tokens: u64::MAX - 1,
+            tool_use_prompt_tokens: u64::MAX - 1,
+            reasoning_tokens: u64::MAX - 1,
+        };
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::tool_call(
+                "blocking-tool-call",
+                NeverCompletingTool::NAME,
+                serde_json::json!({}),
+            ),
+            MockStreamEvent::final_response(near_max),
+        ]]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(NeverCompletingTool(tool_calls.clone()))
+            .default_max_turns(2)
+            .build();
+        let retry_config = crate::retry::RetryConfig::default();
+        let retry_usage = SharedUsageLedger::default();
+        let timeout_result = await_subagent_run(
+            Duration::from_millis(50),
+            retry_usage.clone(),
+            crate::agent::runner::run_subagent(
+                &agent,
+                "continue",
+                2,
+                None,
+                &retry_config,
+                retry_usage,
+            ),
+        )
+        .await;
+        let observed = match timeout_result {
+            Err(usage) => usage,
+            Ok(_) => panic!("the forced continuation fixture must time out"),
+        };
+
+        assert_eq!(model.requests().len(), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observed, near_max);
+        let child = forced_continuation_timeout_child(
+            Usage {
+                input_tokens: 10,
+                output_tokens: 10,
+                total_tokens: 10,
+                cached_input_tokens: 10,
+                cache_creation_input_tokens: 10,
+                tool_use_prompt_tokens: 10,
+                reasoning_tokens: 10,
+            },
+            observed,
+            "prompt",
+        );
+        assert_eq!(
+            child.output.as_ref().err().map(String::as_str),
+            Some("timeout: forced subagent continuation exceeded 300s")
+        );
+        assert_eq!(
+            child.cost_units,
+            u64::MAX,
+            "retained retry usage must fail the aggregate budget closed"
         );
     }
 

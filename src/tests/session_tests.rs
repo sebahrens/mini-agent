@@ -85,6 +85,20 @@ fn calibration_ignores_zero_usage() {
 }
 
 #[test]
+fn terminal_message_can_be_reanchored_without_double_counting_reported_output() {
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.add_message(MessageRole::User, "prompt");
+    session.set_calibration(100, 20);
+    session.add_message(MessageRole::Assistant, "reported output");
+    assert!(session.effective_context_tokens() > 120);
+
+    session.reanchor_calibration_to_current_messages();
+
+    assert_eq!(session.effective_context_tokens(), 120);
+    assert_eq!(session.calibrated_msg_count, session.messages.len());
+}
+
+#[test]
 fn real_input_tokens_native_route_adds_cache_fields() {
     // The Anthropic-native route reports input_tokens excluding cached/
     // cache-creation tokens, so the real prompt size is the sum of all three.
@@ -120,6 +134,84 @@ fn billable_input_tokens_non_native_uses_input_only() {
     // Non-Anthropic providers have no separate cache tiers to price — input_tokens
     // is already the full billable amount, so the cache fields are ignored.
     assert_eq!(billable_input_tokens(false, 7000, 5600, 4000), 7000);
+}
+
+#[test]
+fn charge_usage_delta_updates_persisted_token_cache_and_cost_totals_together() {
+    let mut session = Session::new("anthropic", "claude-sonnet", 200_000, "");
+    session.input_token_cost = 2.0;
+    session.output_token_cost = 10.0;
+    let delta = crate::event::UsageDelta {
+        input_tokens: 100,
+        output_tokens: 25,
+        cached_input_tokens: 700,
+        cache_creation_input_tokens: 80,
+        ..crate::event::UsageDelta::default()
+    };
+
+    session.charge_usage_delta(delta, true);
+
+    assert_eq!(session.total_input_tokens, 100);
+    assert_eq!(session.total_output_tokens, 25);
+    assert_eq!(session.total_cached_input_tokens, 700);
+    assert_eq!(session.total_cache_creation_input_tokens, 80);
+    let billable_input = crate::pricing::billable_input_tokens(true, 100, 700, 80);
+    let expected = crate::pricing::estimate_cost(billable_input, 25, 2.0, 10.0);
+    assert!((session.total_cost - expected).abs() < f64::EPSILON);
+}
+
+#[test]
+fn charge_usage_delta_is_additive_without_hidden_terminal_charge() {
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.input_token_cost = 1.0;
+    session.output_token_cost = 2.0;
+
+    for delta in [
+        crate::event::UsageDelta {
+            input_tokens: 10,
+            output_tokens: 2,
+            ..crate::event::UsageDelta::default()
+        },
+        crate::event::UsageDelta {
+            input_tokens: 20,
+            output_tokens: 4,
+            ..crate::event::UsageDelta::default()
+        },
+    ] {
+        session.charge_usage_delta(delta, false);
+    }
+
+    assert_eq!(session.total_input_tokens, 30);
+    assert_eq!(session.total_output_tokens, 6);
+    assert_eq!(
+        session.total_cost,
+        crate::pricing::estimate_cost(30, 6, 1.0, 2.0)
+    );
+}
+
+#[test]
+fn charge_usage_delta_saturates_persisted_token_totals() {
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.total_input_tokens = u64::MAX - 1;
+    session.total_output_tokens = u64::MAX - 1;
+    session.total_cached_input_tokens = u64::MAX - 1;
+    session.total_cache_creation_input_tokens = u64::MAX - 1;
+
+    session.charge_usage_delta(
+        crate::event::UsageDelta {
+            input_tokens: 10,
+            output_tokens: 10,
+            cached_input_tokens: 10,
+            cache_creation_input_tokens: 10,
+            ..crate::event::UsageDelta::default()
+        },
+        false,
+    );
+
+    assert_eq!(session.total_input_tokens, u64::MAX);
+    assert_eq!(session.total_output_tokens, u64::MAX);
+    assert_eq!(session.total_cached_input_tokens, u64::MAX);
+    assert_eq!(session.total_cache_creation_input_tokens, u64::MAX);
 }
 
 // Helper: a session with `n` ASCII messages of `len` chars each, so every
@@ -220,6 +312,22 @@ fn add_message_increments_estimated_tokens() {
     let before = s.total_estimated_tokens;
     s.add_message(MessageRole::Assistant, "hello world, this is a test");
     assert!(s.total_estimated_tokens > before);
+}
+
+#[test]
+fn tool_history_preserves_matching_internal_call_identity() {
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.add_tool_call_with_id(
+        "call-42",
+        "read",
+        &serde_json::json!({"path": "src/main.rs"}),
+    );
+    session.add_tool_result_with_id("call-42", "read", "contents");
+
+    assert_eq!(session.messages[0].tool_call_id.as_deref(), Some("call-42"));
+    assert_eq!(session.messages[1].tool_call_id.as_deref(), Some("call-42"));
+    assert_eq!(session.messages[0].role, MessageRole::ToolCall);
+    assert_eq!(session.messages[1].role, MessageRole::ToolResult);
 }
 
 #[test]

@@ -219,8 +219,8 @@ fn save_session_preserves_tool_messages() {
     let env = setup_test_env();
     let mut s = Session::new("anthropic", "claude", 200000, "");
     s.add_message(MessageRole::User, "question");
-    s.add_tool_call("read", &serde_json::json!({ "path": "src/main.rs" }));
-    s.add_tool_result("read", "file contents");
+    s.add_tool_call_with_id("", "read", &serde_json::json!({ "path": "src/main.rs" }));
+    s.add_tool_result_with_id("", "read", "file contents");
     s.add_subagent_tool_call("task", &serde_json::json!({ "prompts": ["find x"] }));
     s.add_message(MessageRole::Assistant, "answer");
     save_session(&s).unwrap();
@@ -246,7 +246,7 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
     let tail = "T".repeat(TOOL_RESULT_TAIL_CHARS);
     let output = format!("{head}{omitted}{tail}");
 
-    let returned = s.add_tool_result("bash/unsafe", &output);
+    let returned = s.add_tool_result_with_id("", "bash/unsafe", &output);
 
     let content = s.messages[0].content.as_str();
     assert_eq!(returned, content);
@@ -284,7 +284,7 @@ fn long_tool_result_save_failure_keeps_full_output() {
 
     let mut s = Session::new("anthropic", "claude", 200000, "");
     let output = "x".repeat(TOOL_RESULT_SAVE_THRESHOLD + 1);
-    s.add_tool_result("bash", &output);
+    s.add_tool_result_with_id("", "bash", &output);
 
     let content = s.messages[0].content.to_string();
     unsafe {
