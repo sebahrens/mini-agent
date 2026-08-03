@@ -11,6 +11,15 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CANONICAL_REPOSITORY = "sebahrens/mini-agent"
+CANONICAL_REPOSITORY_URL = f"https://github.com/{CANONICAL_REPOSITORY}"
+LEGACY_COORDINATES = (
+    ("gi-" + "dellav/zerostack").casefold(),
+    ("gi-" + "dellav.github.io/zerostack").casefold(),
+)
+HISTORICAL_COORDINATE_ALLOWLIST = (
+    "docs/specs/superseded/",
+)
 
 
 def cargo_metadata(root: Path) -> dict[str, Any]:
@@ -106,13 +115,20 @@ def validate_workflow(text: str, binary: str) -> list[str]:
 
 def validate_file_fragments(root: Path, binary: str) -> list[str]:
     required: dict[str, tuple[str, ...]] = {
+        "Cargo.toml": (
+            f'name = "{binary}"',
+            f'repository = "{CANONICAL_REPOSITORY_URL}"',
+            f'homepage = "{CANONICAL_REPOSITORY_URL}"',
+        ),
         "src/cli.rs": (f'#[command(name = "{binary}"',),
         "install.sh": (
             f'BINARY_NAME="{binary}"',
+            f'REPO="{CANONICAL_REPOSITORY}"',
             'if [[ ! -f "${TMPDIR}/${BINARY_NAME}" ]]',
             'cp "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"',
         ),
         "packaging/homebrew/zerostack.rb": (
+            f'homepage "{CANONICAL_REPOSITORY_URL}"',
             f"{binary}-x86_64-apple-darwin.tar.gz",
             f"{binary}-aarch64-apple-darwin.tar.gz",
             f"{binary}-x86_64-unknown-linux-musl.tar.gz",
@@ -121,27 +137,42 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f'shell_output("#{{bin}}/{binary} --version")',
         ),
         "packaging/aur/PKGBUILD": (
+            f'url="{CANONICAL_REPOSITORY_URL}"',
             f"{binary}-x86_64-unknown-linux-musl.tar.gz",
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
             f"provides=('{binary}')",
             f'"${{pkgdir}}/usr/bin/{binary}"',
+        ),
+        "packaging/aur/.SRCINFO": (
+            f"url = {CANONICAL_REPOSITORY_URL}",
+            f"provides = {binary}",
+            f"/{binary}-x86_64-unknown-linux-musl.tar.gz",
+            f"/{binary}-aarch64-unknown-linux-musl.tar.gz",
         ),
         "packaging/conda/zerostack-bin/build.sh": (
             f'"${{SRC_DIR}}/{binary}"',
             f'"${{PREFIX}}/bin/{binary}"',
         ),
         "packaging/conda/zerostack-bin/meta.yaml": (
+            f"home: {CANONICAL_REPOSITORY_URL}",
             f"{binary}-x86_64-unknown-linux-musl.tar.gz",
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
             f"- {binary} --help",
             f"- {binary} --version",
         ),
         "packaging/conda/zerostack/meta.yaml": (
+            f"repository: {CANONICAL_REPOSITORY_URL}",
             f"- {binary} --help",
             f"- {binary} --version",
         ),
         "nix/package/zerostack.nix": (f'mainProgram = "{binary}";',),
         "justfile": (
+            "bash scripts/update-release-checksums.sh all",
+            "bash scripts/smoke-canonical-installer.sh",
+        ),
+        "scripts/update-release-checksums.sh": (
+            CANONICAL_REPOSITORY_URL,
+            "curl -fsSL",
             f"{binary}-x86_64-apple-darwin.tar.gz",
             f"{binary}-aarch64-apple-darwin.tar.gz",
             f"{binary}-x86_64-unknown-linux-musl.tar.gz",
@@ -152,7 +183,49 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         ),
         "docs/agent/PUBLISHING_RELEASES.md": (
             f"Cargo and every package channel install the public executable as `{binary}`.",
+            f"`{CANONICAL_REPOSITORY}`",
+            "`.zerostack`",
+            "`ZEROSTACK_*`",
         ),
+        "docs/agent/GET_STARTED.md": (
+            f"https://raw.githubusercontent.com/{CANONICAL_REPOSITORY}/main/install.sh",
+            f"https://github.com/{CANONICAL_REPOSITORY}",
+        ),
+        "scripts/smoke-canonical-installer.sh": (
+            'bash "${ROOT_DIR}/install.sh" --release "$VERSION" --dir "${INSTALL_ROOT}/bin"',
+            '"${INSTALL_ROOT}/bin/mini-agent" --version',
+            'EXPECTED_OUTPUT="mini-agent ${VERSION}"',
+        ),
+        ".github/workflows/pages.yml": ("https://sebahrens.github.io/mini-agent",),
+        "src/product.rs": (
+            f'pub const PUBLIC_NAME: &str = "{binary}";',
+            f'pub const REPOSITORY_SLUG: &str = "{CANONICAL_REPOSITORY}";',
+            f'pub const REPOSITORY_URL: &str = "{CANONICAL_REPOSITORY_URL}";',
+            'pub const LEGACY_APP_COMPONENT: &str = "zerostack";',
+            'pub const LEGACY_PROJECT_DIRECTORY: &str = ".zerostack";',
+            'pub const LEGACY_ENV_PREFIX: &str = "ZEROSTACK_";',
+        ),
+        "src/provider.rs": (
+            ".with_app_identity(crate::product::PUBLIC_NAME, crate::product::REPOSITORY_URL)",
+        ),
+        "src/extras/acp/mod.rs": (
+            ".agent_info(Implementation::new(",
+            "crate::product::PUBLIC_NAME",
+        ),
+        "src/extras/lsp/client.rs": ('"name": crate::product::PUBLIC_NAME',),
+        "src/extras/mcp/oauth.rs": (
+            "const CLIENT_NAME: &str = crate::product::PUBLIC_NAME;",
+            '"<html><body><h3>{}: authorization complete.',
+        ),
+        "src/extras/export.rs": (
+            ".header(reqwest::header::USER_AGENT, crate::product::PUBLIC_NAME)",
+        ),
+        "src/ui/events.rs": (
+            'format!("  Website: {}", crate::product::REPOSITORY_URL)',
+            "crate::product::PUBLIC_NAME",
+        ),
+        "src/setup/mod.rs": ("crate::product::PUBLIC_NAME.to_uppercase()",),
+        "src/docs.rs": ("crate::product::PUBLIC_NAME",),
     }
     errors: list[str] = []
     for relative_path, fragments in required.items():
@@ -182,6 +255,41 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
     return errors
 
 
+def tracked_files(root: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return [entry.decode("utf-8") for entry in result.stdout.split(b"\0") if entry]
+
+
+def validate_stale_coordinates(
+    root: Path, relative_paths: list[str] | None = None
+) -> list[str]:
+    """Reject old active repository coordinates outside historical specs."""
+    paths = tracked_files(root) if relative_paths is None else relative_paths
+    errors: list[str] = []
+    for relative_path in paths:
+        if relative_path.startswith(HISTORICAL_COORDINATE_ALLOWLIST):
+            continue
+        path = root / relative_path
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        folded_text = text.casefold()
+        for coordinate in LEGACY_COORDINATES:
+            if coordinate in folded_text:
+                errors.append(
+                    f"{relative_path} contains stale active coordinate {coordinate!r}"
+                )
+    return errors
+
+
 def cargo_version(metadata: dict[str, Any], root: Path) -> str | None:
     manifest = (root / "Cargo.toml").resolve()
     package = next(
@@ -203,6 +311,7 @@ def validate_versions(root: Path, version: str) -> list[str]:
 
     checks: list[tuple[str, str]] = [
         ("packaging/aur/PKGBUILD", rf"^pkgver={re.escape(version)}$"),
+        ("packaging/aur/.SRCINFO", rf"^\s*pkgver = {re.escape(version)}$"),
         ("packaging/conda/zerostack/meta.yaml", rf"^\s+version: {re.escape(version)}$"),
         ("packaging/conda/zerostack-bin/meta.yaml", rf"^\s+version: {re.escape(version)}$"),
         ("packaging/homebrew/zerostack.rb", rf'^\s+version "{re.escape(version)}"$'),
@@ -236,6 +345,7 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
             validate_workflow(workflow_path.read_text(encoding="utf-8"), binary)
         )
     errors.extend(validate_file_fragments(root, binary))
+    errors.extend(validate_stale_coordinates(root))
 
     version = cargo_version(metadata, root)
     if version:

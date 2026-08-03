@@ -19,7 +19,7 @@ use rmcp::transport::auth::{
 
 use super::config::OAuthSettings;
 
-const CLIENT_NAME: &str = "zerostack";
+const CLIENT_NAME: &str = crate::product::PUBLIC_NAME;
 const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
 const MIGRATION_MARKER_VERSION: u8 = 1;
 
@@ -1483,6 +1483,13 @@ struct CapturedCode {
     state: String,
 }
 
+fn authorization_complete_body() -> String {
+    format!(
+        "<html><body><h3>{}: authorization complete.</h3>You can close this tab and return to the terminal.</body></html>",
+        crate::product::PUBLIC_NAME
+    )
+}
+
 /// Blocking single-request loopback HTTP listener for the OAuth redirect.
 fn listen_for_callback(port: u16, timeout: Duration) -> anyhow::Result<CapturedCode> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
@@ -1504,7 +1511,7 @@ fn listen_for_callback(port: u16, timeout: Duration) -> anyhow::Result<CapturedC
                 stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 let request_line = read_request_line(&mut stream)?;
                 let (code, state) = parse_callback(&request_line)?;
-                let body = "<html><body><h3>zerostack: authorization complete.</h3>You can close this tab and return to the terminal.</body></html>";
+                let body = authorization_complete_body();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -1519,6 +1526,16 @@ fn listen_for_callback(port: u16, timeout: Duration) -> anyhow::Result<CapturedC
             }
             Err(e) => return Err(anyhow::anyhow!("accept failed: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod product_identity_tests {
+    #[test]
+    fn oauth_completion_uses_public_product_name() {
+        let body = super::authorization_complete_body();
+        assert!(body.contains(crate::product::PUBLIC_NAME));
+        assert!(!body.contains(crate::product::LEGACY_APP_COMPONENT));
     }
 }
 

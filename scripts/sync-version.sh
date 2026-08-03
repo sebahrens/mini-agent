@@ -5,6 +5,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
+sed_in_place() {
+    local expression="$1"
+    local path="$2"
+    sed -i.bak "$expression" "$path"
+    rm -f "${path}.bak"
+}
+
 VERSION=$(grep '^version' "${ROOT_DIR}/Cargo.toml" | head -1 | cut -d'"' -f2)
 
 if [ -z "$VERSION" ]; then
@@ -15,26 +22,33 @@ fi
 echo "Syncing version ${VERSION} across packaging files..."
 
 # PKGBUILD
-sed -i "s/^pkgver=.*/pkgver=${VERSION}/" "${ROOT_DIR}/packaging/aur/PKGBUILD"
+sed_in_place "s/^pkgver=.*/pkgver=${VERSION}/" "${ROOT_DIR}/packaging/aur/PKGBUILD"
+
+# Checked-in AUR metadata (regenerated with makepkg after release checksums land)
+SRCINFO="${ROOT_DIR}/packaging/aur/.SRCINFO"
+sed_in_place "s/^[[:space:]]*pkgver = .*/	pkgver = ${VERSION}/" "$SRCINFO"
+sed_in_place "s|/download/v[^/]*/|/download/v${VERSION}/|g" "$SRCINFO"
+sed_in_place "s|/mini-agent/v[^/]*/LICENSE|/mini-agent/v${VERSION}/LICENSE|g" "$SRCINFO"
+sed_in_place "s/zerostack-bin-[0-9][^-]*-/zerostack-bin-${VERSION}-/g" "$SRCINFO"
 
 # conda meta.yaml files (plain YAML format: "version: X.Y.Z")
 for meta in "${ROOT_DIR}/packaging/conda/"*/meta.yaml; do
-    sed -i "s/^  version: .*/  version: ${VERSION}/" "$meta"
+    sed_in_place "s/^  version: .*/  version: ${VERSION}/" "$meta"
 done
 
 # conda source URLs
-sed -i "s|/tags/v[0-9][^/]*/|/tags/v${VERSION}/|" \
+sed_in_place "s|/tags/v[0-9][^/]*/|/tags/v${VERSION}/|" \
     "${ROOT_DIR}/packaging/conda/zerostack/meta.yaml"
-sed -i "s|/download/v[0-9][^/]*/|/download/v${VERSION}/|g" \
+sed_in_place "s|/download/v[0-9][^/]*/|/download/v${VERSION}/|g" \
     "${ROOT_DIR}/packaging/conda/zerostack-bin/meta.yaml"
-sed -i "s|/zerostack/v[0-9][^/]*/LICENSE|/zerostack/v${VERSION}/LICENSE|g" \
+sed_in_place "s|/mini-agent/v[0-9][^/]*/LICENSE|/mini-agent/v${VERSION}/LICENSE|g" \
     "${ROOT_DIR}/packaging/conda/zerostack-bin/meta.yaml"
 
 # Homebrew formula
 HB_FORMULA="${ROOT_DIR}/packaging/homebrew/zerostack.rb"
 if [ -f "$HB_FORMULA" ]; then
-    sed -i "s/^  version \".*\"/  version \"${VERSION}\"/" "$HB_FORMULA"
-    sed -i "s|/download/v[^/]*/|/download/v${VERSION}/|g" "$HB_FORMULA"
+    sed_in_place "s/^  version \".*\"/  version \"${VERSION}\"/" "$HB_FORMULA"
+    sed_in_place "s|/download/v[^/]*/|/download/v${VERSION}/|g" "$HB_FORMULA"
 fi
 
 echo ""

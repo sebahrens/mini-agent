@@ -14,6 +14,8 @@ edition = "2024"
 description = "Minimalistic coding agent with built-in JS engine"
 license = "GPL-3.0-only"
 readme = "README.md"
+repository = "https://github.com/sebahrens/mini-agent"
+homepage = "https://github.com/sebahrens/mini-agent"
 keywords = ["ai", "cli", "dev"]
 
 [package.metadata.release]

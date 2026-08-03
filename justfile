@@ -85,64 +85,19 @@ sync-version:
 
 # Download release artifacts and update AUR PKGBUILD checksums
 aur-checksums:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-    echo "Computing SHA256 sums for v${VERSION}..."
-
-    SHA_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_AARCH64=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_LICENSE=$(curl -sL "https://raw.githubusercontent.com/gi-dellav/zerostack/v${VERSION}/LICENSE" | sha256sum | cut -d' ' -f1)
-
-    sed -i "s/sha256sums_x86_64=('.*' '.*')/sha256sums_x86_64=('${SHA_X86}' '${SHA_LICENSE}')/" packaging/aur/PKGBUILD
-    sed -i "s/sha256sums_aarch64=('.*' '.*')/sha256sums_aarch64=('${SHA_AARCH64}' '${SHA_LICENSE}')/" packaging/aur/PKGBUILD
-
-    echo "Updated sha256sums in packaging/aur/PKGBUILD"
+    bash scripts/update-release-checksums.sh aur
 
 # Update the source tarball SHA256 in conda/zerostack/meta.yaml
 conda-source-sha256:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-    SHA=$(curl -sL "https://github.com/gi-dellav/zerostack/archive/refs/tags/v${VERSION}.tar.gz" | sha256sum | cut -d' ' -f1)
-    sed -i "/^  url:.*archive\/refs\/tags/{n;s/sha256: .*/sha256: ${SHA}/}" packaging/conda/zerostack/meta.yaml
-    echo "Updated source SHA256 in packaging/conda/zerostack/meta.yaml"
+    bash scripts/update-release-checksums.sh conda-source
 
 # Download release artifacts and update conda/zerostack-bin/meta.yaml checksums
 conda-bin-checksums:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-    echo "Computing SHA256 sums for v${VERSION}..."
-
-    SHA_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_AARCH64=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_LICENSE=$(curl -sL "https://raw.githubusercontent.com/gi-dellav/zerostack/v${VERSION}/LICENSE" | sha256sum | cut -d' ' -f1)
-
-    sed -i "/mini-agent-x86_64-unknown-linux-musl.tar.gz/{n;s/sha256: .*/sha256: ${SHA_X86}/}" packaging/conda/zerostack-bin/meta.yaml
-    sed -i "/mini-agent-aarch64-unknown-linux-musl.tar.gz/{n;s/sha256: .*/sha256: ${SHA_AARCH64}/}" packaging/conda/zerostack-bin/meta.yaml
-    sed -i "/raw.githubusercontent.com.*LICENSE/{n;s/sha256: .*/sha256: ${SHA_LICENSE}/}" packaging/conda/zerostack-bin/meta.yaml
-
-    echo "Updated SHA256 sums in packaging/conda/zerostack-bin/meta.yaml"
+    bash scripts/update-release-checksums.sh conda-bin
 
 # Download release artifacts and update packaging/homebrew/zerostack.rb checksums
 homebrew-checksums:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-    echo "Computing SHA256 sums for v${VERSION}..."
-
-    SHA_DARWIN_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-x86_64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_DARWIN_ARM=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_LINUX_X86=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-x86_64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-    SHA_LINUX_ARM=$(curl -sL "https://github.com/gi-dellav/zerostack/releases/download/v${VERSION}/mini-agent-aarch64-unknown-linux-musl.tar.gz" | sha256sum | cut -d' ' -f1)
-
-    sed -i "/mini-agent-x86_64-apple-darwin.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_DARWIN_X86}\"/}" packaging/homebrew/zerostack.rb
-    sed -i "/mini-agent-aarch64-apple-darwin.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_DARWIN_ARM}\"/}" packaging/homebrew/zerostack.rb
-    sed -i "/mini-agent-x86_64-unknown-linux-musl.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_LINUX_X86}\"/}" packaging/homebrew/zerostack.rb
-    sed -i "/mini-agent-aarch64-unknown-linux-musl.tar.gz/{n;s/sha256 \".*\"/sha256 \"${SHA_LINUX_ARM}\"/}" packaging/homebrew/zerostack.rb
-
-    echo "Updated SHA256 sums in packaging/homebrew/zerostack.rb"
+    bash scripts/update-release-checksums.sh homebrew
 
 # ---- Packaging: AUR metadata ----
 
@@ -151,7 +106,10 @@ aur-regen-srcinfo:
     #!/usr/bin/env bash
     set -euo pipefail
     cd packaging/aur
-    makepkg --printsrcinfo > .SRCINFO
+    SRCINFO_TMP=$(mktemp)
+    trap 'rm -f "$SRCINFO_TMP"' EXIT
+    makepkg --printsrcinfo > "$SRCINFO_TMP"
+    mv "$SRCINFO_TMP" .SRCINFO
     echo "Regenerated packaging/aur/.SRCINFO"
 
 # ---- Packaging: release workflow ----
@@ -178,7 +136,8 @@ release BUMP:
 
     NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
     echo "Bumping version: ${VERSION} -> ${NEW_VERSION}"
-    sed -i "s/^version = \"${VERSION}\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+    sed -i.bak "s/^version = \"${VERSION}\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+    rm -f Cargo.toml.bak
 
     just pre-release
 
@@ -200,7 +159,13 @@ pre-release: sync-version
     @echo "Next: just add-tag, wait for GitHub release, then: just post-release"
 
 # Run after the GitHub release has been published (needs tag archive + binaries to be available)
-post-release: conda-source-sha256 aur-checksums conda-bin-checksums homebrew-checksums aur-regen-srcinfo
+release-checksums:
+    bash scripts/update-release-checksums.sh all
+
+canonical-installer-smoke:
+    bash scripts/smoke-canonical-installer.sh
+
+post-release: canonical-installer-smoke release-checksums aur-regen-srcinfo
     @echo "=== post-release done: all checksums updated + .SRCINFO regenerated ==="
     @echo "Ready for:"
     @echo "  AUR: cd packaging/aur && pkgctl aur publish zerostack-bin"

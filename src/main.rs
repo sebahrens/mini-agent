@@ -16,6 +16,7 @@ mod paths;
 mod permission;
 mod pricing;
 mod print;
+mod product;
 mod provider;
 mod retry;
 mod sandbox;

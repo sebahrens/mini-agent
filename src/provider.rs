@@ -1111,14 +1111,14 @@ fn build_ollama_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyC
 fn build_openrouter_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyClient> {
     // Expanded from `build_provider_client!` so we can chain OpenRouter's
     // builder-only app-identity calls: these set `X-OpenRouter-Title` /
-    // `HTTP-Referer` / `X-OpenRouter-Categories` so zerostack's traffic is
+    // `HTTP-Referer` / `X-OpenRouter-Categories` so mini-agent's traffic is
     // attributed in OpenRouter's dashboards instead of showing up anonymously.
     let builder = match base_url {
         Some(u) => openrouter::Client::builder().api_key(key).base_url(u),
         None => openrouter::Client::builder().api_key(key),
     };
     let builder = builder
-        .with_app_identity("zerostack", "https://github.com/gi-dellav/zerostack")
+        .with_app_identity(crate::product::PUBLIC_NAME, crate::product::REPOSITORY_URL)
         .with_app_categories(&["cli-agent", "coding"]);
     Ok(AnyClient::OpenRouter(builder.build()?))
 }

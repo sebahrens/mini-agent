@@ -235,7 +235,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         sessions: Mutex::new(HashMap::new()),
     });
 
-    let builder = Agent.builder().name("zerostack");
+    let builder = Agent.builder().name(crate::product::PUBLIC_NAME);
 
     let builder = builder
         .on_receive_request(
@@ -312,7 +312,10 @@ async fn handle_initialize(
 
     let resp = InitializeResponse::new(req.protocol_version)
         .agent_capabilities(caps)
-        .agent_info(Implementation::new("zerostack", AGENT_VERSION));
+        .agent_info(Implementation::new(
+            crate::product::PUBLIC_NAME,
+            AGENT_VERSION,
+        ));
 
     responder.respond(resp)
 }

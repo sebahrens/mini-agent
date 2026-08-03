@@ -15,8 +15,9 @@ pub fn show_get_started() -> anyhow::Result<()> {
     let doc_path = global_docs_dir().join("GET_STARTED.md");
     if !doc_path.exists() {
         anyhow::bail!(
-            "GET_STARTED.md not found at {}. Try reinstalling zerostack.",
-            doc_path.display()
+            "GET_STARTED.md not found at {}. Try reinstalling {}.",
+            doc_path.display(),
+            crate::product::PUBLIC_NAME
         );
     }
     let status = std::process::Command::new("less").arg(&doc_path).status()?;

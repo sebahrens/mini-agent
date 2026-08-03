@@ -3,23 +3,25 @@
 # Install mini-agent from GitHub Releases.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/gi-dellav/zerostack/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 #
 #   # Custom install directory:
-#   curl -fsSL https://raw.githubusercontent.com/gi-dellav/zerostack/main/install.sh | bash -s -- --dir /usr/local/bin
+#   curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash -s -- --dir /usr/local/bin
 #
 set -euo pipefail
 
-REPO="gi-dellav/zerostack"
+REPO="sebahrens/mini-agent"
 BINARY_NAME="mini-agent"
 DEFAULT_DIR="${HOME}/.local/bin"
 
 usage() {
     cat <<EOF
-Usage: install.sh [--dir <path>]
+Usage: install.sh [--dir <path>] [--release <version>]
 
 Options:
   --dir <path>   Install directory (default: ~/.local/bin)
+  --release <version>
+                 Install an exact release (for example, 1.7.2). Defaults to latest.
   --help         Show this message
 EOF
     exit 0
@@ -27,10 +29,23 @@ EOF
 
 # ---- parse args ----
 INSTALL_DIR=""
+RELEASE_VERSION=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dir)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --dir" >&2
+                exit 2
+            fi
             INSTALL_DIR="$2"
+            shift 2
+            ;;
+        --release)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --release" >&2
+                exit 2
+            fi
+            RELEASE_VERSION="$2"
             shift 2
             ;;
         --help|-h)
@@ -77,9 +92,19 @@ ASSET_NAME="${BINARY_NAME}-${ARCH}-${OS}"
 ARCHIVE_FILE="${ASSET_NAME}.tar.gz"
 
 # ---- download ----
-BASE_URL="https://github.com/${REPO}/releases/latest/download"
+if [[ -n "$RELEASE_VERSION" ]]; then
+    if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+        echo "Invalid release version: ${RELEASE_VERSION}" >&2
+        exit 1
+    fi
+    BASE_URL="https://github.com/${REPO}/releases/download/v${RELEASE_VERSION}"
+    RELEASE_LABEL="v${RELEASE_VERSION}"
+else
+    BASE_URL="https://github.com/${REPO}/releases/latest/download"
+    RELEASE_LABEL="latest"
+fi
 
-echo "Downloading ${BINARY_NAME} latest (${ASSET_NAME})..."
+echo "Downloading ${BINARY_NAME} ${RELEASE_LABEL} (${ASSET_NAME})..."
 echo "  -> ${BASE_URL}/${ARCHIVE_FILE}"
 
 TMPDIR="$(mktemp -d)"
