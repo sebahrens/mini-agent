@@ -216,5 +216,83 @@ printf '%s' "${!#}" > "$out"
             self.assertIn("stale active coordinate", errors[0])
 
 
+class SupportedPackageSurfaceTests(unittest.TestCase):
+    def test_supported_channels_are_explicit_and_exclude_nix(self) -> None:
+        self.assertEqual(
+            ("cargo", "aur", "conda", "homebrew"),
+            CHECK_PACKAGE_METADATA.SUPPORTED_PACKAGE_CHANNELS,
+        )
+        self.assertNotIn("nix", CHECK_PACKAGE_METADATA.SUPPORTED_PACKAGE_CHANNELS)
+
+    def test_checked_in_nix_entry_points_are_removed(self) -> None:
+        self.assertEqual(
+            [], CHECK_PACKAGE_METADATA.validate_removed_nix_surface(SCRIPT.parents[1])
+        )
+
+    def test_reintroduced_nix_entry_point_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entrypoint = root / CHECK_PACKAGE_METADATA.REMOVED_NIX_ENTRYPOINTS[0]
+            entrypoint.write_text("{}", encoding="utf-8")
+
+            errors = CHECK_PACKAGE_METADATA.validate_removed_nix_surface(
+                root, [entrypoint.name]
+            )
+
+            self.assertEqual(1, len(errors))
+            self.assertIn("must remain removed", errors[0])
+
+    def test_new_nix_surface_names_cannot_bypass_removal_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reintroduced = (
+                "flake.nix",
+                "flake.lock",
+                "nix/package/mini-agent.nix",
+                "packaging/nix/sources.json",
+            )
+            for relative in reintroduced:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+
+            errors = CHECK_PACKAGE_METADATA.validate_removed_nix_surface(
+                root, list(reintroduced)
+            )
+
+            self.assertEqual(4, len(errors))
+            for relative in reintroduced:
+                self.assertTrue(any(relative in error for error in errors))
+
+    def test_nix_restoration_policy_pins_every_required_gate(self) -> None:
+        publishing = (
+            SCRIPT.parents[1] / "docs/agent/PUBLISHING_RELEASES.md"
+        ).read_text(encoding="utf-8")
+
+        for requirement in (
+            "pinned inputs",
+            "Linux and macOS CI",
+            "default-feature parity",
+            "exact store output",
+        ):
+            self.assertIn(requirement, publishing)
+
+    def test_untracked_local_nix_file_is_not_a_release_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            local_shell = root / "shell.nix"
+            local_shell.write_text("{}", encoding="utf-8")
+
+            self.assertEqual(
+                [], CHECK_PACKAGE_METADATA.validate_removed_nix_surface(root)
+            )
+
+            subprocess.run(["git", "add", "shell.nix"], cwd=root, check=True)
+            errors = CHECK_PACKAGE_METADATA.validate_removed_nix_surface(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("shell.nix", errors[0])
+
+
 if __name__ == "__main__":
     unittest.main()

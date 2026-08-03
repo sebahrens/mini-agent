@@ -24,6 +24,23 @@ named `mini-agent-<target>.tar.gz`; lite archives are named
 | AUR, Conda, and Homebrew recipe names | `zerostack-bin`, `zerostack`, and `zerostack.rb` | Retained only as package-channel compatibility names; each installs `mini-agent`. |
 | Persisted data, project policy, and hook environment | `zerostack`, `.zerostack`, and `ZEROSTACK_*` | Stable user-data compatibility contract; release-coordinate changes must not migrate or rename it. |
 
+## Supported distribution surfaces
+
+Supported package channels are Cargo/crates.io, AUR, Conda, and Homebrew. Their status is
+deliberately explicit:
+
+| Surface | Support status |
+|---|---|
+| Cargo/crates.io | Published package and canonical `mini-agent` executable. |
+| GitHub release archives and shell installer | Supported only after the exact-version archive and `SHA256SUMS` smoke passes against the public canonical repository. |
+| AUR and Conda | Repository-maintained recipes; publication remains the manual downstream step described below. |
+| Homebrew | Compatibility formula retained, but no end-user install command is supported until a canonical tap exists and its archive smoke passes. |
+
+Nix packaging is intentionally unsupported. The former impure, unpinned package, overlay, and
+development-shell entry points were removed rather than presented as a working install channel.
+Restoring Nix support requires pinned inputs, Linux and macOS CI, default-feature parity, and a
+smoke test of the exact store output before any install claim returns.
+
 ## Prerequisites
 
 - [just](https://github.com/casey/just) command runner

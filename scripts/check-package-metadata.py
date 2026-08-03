@@ -20,6 +20,16 @@ LEGACY_COORDINATES = (
 HISTORICAL_COORDINATE_ALLOWLIST = (
     "docs/specs/superseded/",
 )
+SUPPORTED_PACKAGE_CHANNELS = ("cargo", "aur", "conda", "homebrew")
+REMOVED_NIX_ENTRYPOINTS = (
+    "default.nix",
+    "release.nix",
+    "shell.nix",
+    "nix/overlay/default.nix",
+    "nix/overlay/development.nix",
+    "nix/package/dev-shell.nix",
+    "nix/package/zerostack.nix",
+)
 
 
 def cargo_metadata(root: Path) -> dict[str, Any]:
@@ -165,7 +175,6 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"- {binary} --help",
             f"- {binary} --version",
         ),
-        "nix/package/zerostack.nix": (f'mainProgram = "{binary}";',),
         "justfile": (
             "bash scripts/update-release-checksums.sh all",
             "bash scripts/smoke-canonical-installer.sh",
@@ -186,6 +195,11 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"`{CANONICAL_REPOSITORY}`",
             "`.zerostack`",
             "`ZEROSTACK_*`",
+            "Supported package channels are Cargo/crates.io, AUR, Conda, and Homebrew",
+            "Nix packaging is intentionally unsupported",
+            "pinned inputs, Linux and macOS CI",
+            "default-feature parity",
+            "exact store output",
         ),
         "docs/agent/GET_STARTED.md": (
             f"https://raw.githubusercontent.com/{CANONICAL_REPOSITORY}/main/install.sh",
@@ -265,6 +279,17 @@ def tracked_files(root: Path) -> list[str]:
     return [entry.decode("utf-8") for entry in result.stdout.split(b"\0") if entry]
 
 
+def indexed_files(root: Path) -> list[str]:
+    """Return only files in Git's release index, excluding developer-local files."""
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--cached"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return [entry.decode("utf-8") for entry in result.stdout.split(b"\0") if entry]
+
+
 def validate_stale_coordinates(
     root: Path, relative_paths: list[str] | None = None
 ) -> list[str]:
@@ -287,6 +312,30 @@ def validate_stale_coordinates(
                 errors.append(
                     f"{relative_path} contains stale active coordinate {coordinate!r}"
                 )
+    return errors
+
+
+def validate_removed_nix_surface(
+    root: Path, relative_paths: list[str] | None = None
+) -> list[str]:
+    """Keep the unsupported, unverified Nix entry points out of the release surface."""
+    paths = indexed_files(root) if relative_paths is None else relative_paths
+    errors: list[str] = []
+    for relative_path in paths:
+        path = root / relative_path
+        if not path.exists():
+            continue
+        parts = Path(relative_path).parts
+        is_nix_surface = (
+            path.suffix == ".nix"
+            or path.name == "flake.lock"
+            or "nix" in parts[:-1]
+        )
+        if is_nix_surface:
+            errors.append(
+                "unsupported Nix packaging surface must remain removed: "
+                f"{relative_path}"
+            )
     return errors
 
 
@@ -346,6 +395,7 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
         )
     errors.extend(validate_file_fragments(root, binary))
     errors.extend(validate_stale_coordinates(root))
+    errors.extend(validate_removed_nix_surface(root))
 
     version = cargo_version(metadata, root)
     if version:
