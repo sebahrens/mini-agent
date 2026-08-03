@@ -180,7 +180,7 @@ impl Tool for GrepTool {
             let path_str = entry.path.to_string_lossy().to_string();
             let capacity = entry.metadata.len() as usize;
             let mut file = entry.file;
-            let read_result = tokio::task::spawn_blocking(move || {
+            let read_result = crate::agent::runner::spawn_blocking_scoped(move || {
                 let mut data = Vec::with_capacity(capacity);
                 file.read_to_end(&mut data).map(|_| data)
             })
@@ -388,6 +388,58 @@ mod tests {
             Some(working_dir.to_path_buf()),
             Some(vec!["standard".to_string()]),
         )))
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_keeps_real_grep_read_owned_until_it_finishes() {
+        let directory = TempDir::new("owned-read");
+        std::fs::write(directory.path().join("match.txt"), "needle\n")
+            .expect("failed to create grep fixture");
+        let path = directory.path().to_string_lossy().into_owned();
+        let (scope, read_started, release_read) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        let cancellation = scope.cancellation_handle();
+
+        let call = tokio::spawn({
+            let scope = Arc::clone(&scope);
+            async move {
+                scope
+                    .run(async move {
+                        GrepTool::new(None, None, 10)
+                            .call(GrepArgs {
+                                pattern: "needle".to_owned(),
+                                path: Some(path),
+                                include: None,
+                                context_lines: None,
+                            })
+                            .await
+                    })
+                    .await
+            }
+        });
+
+        tokio::task::spawn_blocking(move || {
+            read_started
+                .recv_timeout(Duration::from_secs(1))
+                .expect("real GrepTool file read should enter the scoped blocking pool");
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), scope.wait_idle())
+                .await
+                .is_err(),
+            "turn settlement must not detach an in-flight GrepTool file read"
+        );
+
+        release_read.release();
+        tokio::time::timeout(Duration::from_secs(1), scope.wait_idle())
+            .await
+            .expect("GrepTool read should release its turn ownership after completion");
+        assert_eq!(scope.active_children(), 0);
     }
 
     #[test]

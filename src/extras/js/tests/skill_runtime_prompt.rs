@@ -240,6 +240,55 @@ async fn prepared_prompt_places_trusted_manifest_before_the_user_prompt() {
 }
 
 #[tokio::test]
+async fn configured_skill_blocking_discovery_remains_owned_after_cancellation() {
+    let temp = TempPaths::new();
+    let learned = learned_skill();
+    SkillStore::open_at(&temp.paths)
+        .and_then(|mut store| store.insert_verified(&learned))
+        .unwrap();
+    let runtime = std::sync::Arc::new(
+        SkillRuntime::open(&temp.paths, None)
+            .unwrap()
+            .with_test_policies(
+                RetrievalPolicy {
+                    dense_score_floor: -1.0,
+                    ..RetrievalPolicy::default()
+                },
+                AgentSkillSearchPolicy::default(),
+            ),
+    );
+    let prompt = retrieval_document(&learned);
+    let (work_scope, started_rx, release) =
+        crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+    let cancellation = work_scope.cancellation_handle();
+    let mut task = tokio::spawn({
+        let work_scope = std::sync::Arc::clone(&work_scope);
+        async move { work_scope.run(runtime.prepare_prompt(&prompt)).await }
+    });
+    tokio::task::spawn_blocking(move || {
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("configured skill discovery should enter spawn_blocking")
+    })
+    .await
+    .unwrap();
+
+    cancellation.cancel();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
+            .await
+            .is_err(),
+        "cancellation must not detach already-running skill discovery"
+    );
+    release.release();
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("owned skill discovery should finish after its blocking child completes")
+        .unwrap();
+    assert!(prepared.contains(&learned.id));
+}
+
+#[tokio::test]
 async fn trusted_skill_context_neutralizes_closing_tags_in_markdown_and_resources() {
     let temp = TempPaths::new();
     let agent_source = temp.root.join("hostile-instruction-skill");

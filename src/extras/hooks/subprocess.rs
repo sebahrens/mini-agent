@@ -453,26 +453,39 @@ async fn run_hook_with_policy_and_limits(
     let stderr_pipe = child.stderr.take();
     let captured = Arc::new(Mutex::new(CapturedOutput::default()));
 
-    let run = async {
-        let write_stdin = async move {
-            if let Some(mut stdin) = stdin_pipe {
-                if let Err(e) = stdin.write_all(stdin_json).await {
-                    // Preserve the existing best-effort stdin semantics: a hook
-                    // that closes stdin may still produce a valid result.
-                    tracing::warn!("hooks: failed to write hook stdin: {e}");
+    enum RunOutcome {
+        Finished(Result<Result<std::process::ExitStatus, RunError>, tokio::time::error::Elapsed>),
+        Cancelled,
+    }
+    let outcome = {
+        let run = async {
+            let write_stdin = async move {
+                if let Some(mut stdin) = stdin_pipe {
+                    if let Err(e) = stdin.write_all(stdin_json).await {
+                        // Preserve the existing best-effort stdin semantics: a hook
+                        // that closes stdin may still produce a valid result.
+                        tracing::warn!("hooks: failed to write hook stdin: {e}");
+                    }
                 }
-            }
-            Ok::<(), RunError>(())
+                Ok::<(), RunError>(())
+            };
+            let read_stdout =
+                capture_pipe(stdout_pipe, OutputStream::Stdout, captured.clone(), limits);
+            let read_stderr =
+                capture_pipe(stderr_pipe, OutputStream::Stderr, captured.clone(), limits);
+            let wait = async { child.wait().await.map_err(RunError::Wait) };
+            let (_, _, _, status) = tokio::try_join!(write_stdin, read_stdout, read_stderr, wait)?;
+            Ok::<_, RunError>(status)
         };
-        let read_stdout = capture_pipe(stdout_pipe, OutputStream::Stdout, captured.clone(), limits);
-        let read_stderr = capture_pipe(stderr_pipe, OutputStream::Stderr, captured.clone(), limits);
-        let wait = async { child.wait().await.map_err(RunError::Wait) };
-        let (_, _, _, status) = tokio::try_join!(write_stdin, read_stdout, read_stderr, wait)?;
-        Ok::<_, RunError>(status)
+        tokio::select! {
+            biased;
+            _ = crate::agent::runner::current_work_scope_cancelled() => RunOutcome::Cancelled,
+            result = tokio::time::timeout(timeout, run) => RunOutcome::Finished(result),
+        }
     };
 
-    match tokio::time::timeout(timeout, run).await {
-        Ok(Ok(status)) => {
+    match outcome {
+        RunOutcome::Finished(Ok(Ok(status))) => {
             // The direct child has exited and been reaped. Kill any descendants
             // that deliberately closed their inherited pipes before outliving
             // the hook.
@@ -487,7 +500,7 @@ async fn run_hook_with_policy_and_limits(
                 policy.diagnostics(),
             ))
         }
-        Ok(Err(error)) => {
+        RunOutcome::Finished(Ok(Err(error))) => {
             terminate_and_reap(&mut child, pid).await;
             guard.disarm();
             let status = match error {
@@ -508,7 +521,7 @@ async fn run_hook_with_policy_and_limits(
                 policy.diagnostics(),
             ))
         }
-        Err(_) => {
+        RunOutcome::Finished(Err(_)) => {
             terminate_and_reap(&mut child, pid).await;
             guard.disarm();
             policy.classify_spawned_output(output_from_capture(
@@ -517,6 +530,11 @@ async fn run_hook_with_policy_and_limits(
                 HookStatus::TimedOut,
                 policy.diagnostics(),
             ))
+        }
+        RunOutcome::Cancelled => {
+            terminate_and_reap(&mut child, pid).await;
+            guard.disarm();
+            output_from_capture(&captured, None, HookStatus::Failed)
         }
     }
 }

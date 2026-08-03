@@ -613,7 +613,7 @@ async fn atomic_write_resolved_inner(
     };
     let path = path.to_path_buf();
     let contents = contents.to_vec();
-    tokio::task::spawn_blocking(move || {
+    crate::agent::runner::spawn_blocking_scoped(move || {
         atomic_write_within_sync_impl(
             &root,
             &path,
@@ -658,7 +658,7 @@ pub(crate) async fn atomic_create_resolved_checked_cancellable(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    crate::agent::runner::spawn_blocking_scoped(move || {
         atomic_write_within_sync_impl(
             &root,
             &path,

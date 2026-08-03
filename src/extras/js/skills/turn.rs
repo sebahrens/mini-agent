@@ -147,25 +147,19 @@ impl SkillRuntime {
                     } else {
                         match coordinator.active_count() {
                             Ok(count) if count >= BACKGROUND_REBUILD_ROWS => {
-                                tracing::info!(
-                                    count,
-                                    "building learned-skill index in the background"
-                                );
-                                let worker = Arc::clone(&coordinator);
-                                match std::thread::Builder::new()
-                        .name("skill-index-rebuild".to_string())
-                        .spawn(move || {
-                            if let Err(error) = worker.rebuild_and_publish() {
-                                tracing::warn!(%error, "background learned-skill index rebuild failed");
-                            }
-                        })
-                    {
-                        Ok(_) => Some(coordinator),
-                        Err(error) => {
-                            diagnostics.push(format!("learned_js_index_worker_unavailable:{error}"));
-                            None
-                        }
-                    }
+                                // `SkillRuntime::open` is already run inside the
+                                // turn's owned blocking scope. A nested raw thread
+                                // would escape ACP cancellation, so complete the
+                                // rebuild on that tracked worker instead.
+                                tracing::info!(count, "building learned-skill index");
+                                if let Err(error) = coordinator.rebuild_and_publish() {
+                                    diagnostics.push(format!(
+                                        "learned_js_index_worker_unavailable:{error}"
+                                    ));
+                                    None
+                                } else {
+                                    Some(coordinator)
+                                }
                             }
                             Ok(_) => {
                                 if let Err(error) = coordinator.rebuild_and_publish() {
@@ -232,8 +226,10 @@ impl SkillRuntime {
             match coordinator.needs_refresh() {
                 Ok(true) => {
                     let coordinator = Arc::clone(coordinator);
-                    match tokio::task::spawn_blocking(move || coordinator.rebuild_and_publish())
-                        .await
+                    match crate::agent::runner::spawn_blocking_scoped(move || {
+                        coordinator.rebuild_and_publish()
+                    })
+                    .await
                     {
                         Ok(Ok(_)) => {}
                         Ok(Err(error)) => {
@@ -274,7 +270,7 @@ impl SkillRuntime {
                     let query = query.clone();
                     let vector = vector.clone();
                     let policy = self.learned_policy.clone();
-                    match tokio::task::spawn_blocking(move || {
+                    match crate::agent::runner::spawn_blocking_scoped(move || {
                         index.search(&query, &vector, &policy)
                     })
                     .await
@@ -345,7 +341,7 @@ impl SkillRuntime {
             let index = Arc::clone(index);
             let vector = vector.clone();
             let policy = self.agent_policy.clone();
-            match tokio::task::spawn_blocking(move || {
+            match crate::agent::runner::spawn_blocking_scoped(move || {
                 index.search(&vector, &policy).map(|skills| {
                     let mut remaining = MAX_AGENT_RESOURCE_CONTEXT_BYTES;
                     skills

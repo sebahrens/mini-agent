@@ -9,6 +9,7 @@ use crate::extras::js::skills::held_out::{
 };
 use crate::extras::js::skills::proposal::ProposalQueue;
 use crate::extras::js::skills::store::{AdminIdentity, ProposalStatus, SkillStore};
+use crate::extras::js::skills::telemetry::TelemetryDispatcher;
 use crate::extras::js::skills::visibility::SkillIndex;
 use crate::extras::js::tool::{JsArgs, JsTool};
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
@@ -92,6 +93,38 @@ impl HumanReviewer for Approver {
             30,
         ))
     }
+}
+
+#[tokio::test]
+async fn turn_scope_joins_real_admission_and_telemetry_workers() {
+    let (root, paths) = paths();
+    let store = SkillStore::open_at(&paths).expect("admission store");
+    let evaluator =
+        AdmissionEvaluator::new(store, Embedder::new().expect("embedder"), "scope-worker")
+            .expect("evaluator");
+    let work_scope = crate::agent::runner::AgentWorkScope::new();
+    let (admission, telemetry) = work_scope
+        .run(async {
+            (
+                AdmissionWorker::start(evaluator).expect("admission worker"),
+                TelemetryDispatcher::spawn(&paths).expect("telemetry worker"),
+            )
+        })
+        .await;
+    assert_eq!(
+        work_scope.active_children(),
+        2,
+        "both production worker threads must register with the turn scope"
+    );
+
+    work_scope.cancellation_handle().cancel();
+    drop(admission);
+    drop(telemetry);
+    tokio::time::timeout(Duration::from_secs(1), work_scope.wait_idle())
+        .await
+        .expect("cancelled turn must fully join admission and telemetry workers");
+    assert_eq!(work_scope.active_children(), 0);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

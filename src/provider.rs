@@ -612,17 +612,32 @@ impl AnyAgent {
 /// hook: no model call happens, the block feedback surfaces through the same
 /// `AgentEvent::Error` path a real run-time error would use.
 #[cfg(feature = "hooks")]
-fn spawn_blocked_runner(feedback: String) -> AgentRunner {
+fn spawn_blocked_runner(
+    feedback: String,
+    work_scope: std::sync::Arc<runner::AgentWorkScope>,
+) -> runner::PausedAgentRunner {
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(1);
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let cleanup_scope = std::sync::Arc::clone(&work_scope);
+    let lifecycle_tx = event_tx.clone();
+    let cleanup = runner::AgentRunCleanupGuard::new(cleanup_scope, lifecycle_tx);
     let join = tokio::spawn(async move {
-        let _ = event_tx
-            .send(AgentEvent::Error(CompactString::from(feedback)))
-            .await;
+        if start_rx.await.is_ok() {
+            let _ = event_tx
+                .send(AgentEvent::Error(CompactString::from(feedback)))
+                .await;
+        }
+        drop(event_tx);
+        cleanup.settle().await;
     });
-    AgentRunner {
-        event_rx,
-        abort_handle: join.abort_handle(),
-    }
+    runner::PausedAgentRunner::new(
+        AgentRunner {
+            event_rx,
+            abort_handle: join.abort_handle(),
+        },
+        start_tx,
+        work_scope,
+    )
 }
 
 impl AnyAgent {
@@ -806,14 +821,56 @@ impl AnyAgent {
         prompt: String,
         history: Vec<Message>,
         retry_config: RetryConfig,
+        #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    ) -> AgentRunner {
+        self.spawn_runner_paused(
+            prompt,
+            history,
+            retry_config,
+            #[cfg(feature = "hooks")]
+            loop_info,
+        )
+        .await
+        .start()
+    }
+
+    /// Builds an agent runner behind a start barrier. ACP uses this to publish
+    /// cancellation ownership and the abort handle before model/tool execution.
+    pub(crate) async fn spawn_runner_paused(
+        self,
+        prompt: String,
+        history: Vec<Message>,
+        retry_config: RetryConfig,
         // `--loop` iteration/active state; see `runner::spawn_agent`. `None`
         // outside loop mode.
         #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-    ) -> AgentRunner {
+    ) -> runner::PausedAgentRunner {
+        self.spawn_runner_paused_in_scope(
+            prompt,
+            history,
+            retry_config,
+            #[cfg(feature = "hooks")]
+            loop_info,
+            runner::AgentWorkScope::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn spawn_runner_paused_in_scope(
+        self,
+        prompt: String,
+        history: Vec<Message>,
+        retry_config: RetryConfig,
+        #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+        work_scope: std::sync::Arc<runner::AgentWorkScope>,
+    ) -> runner::PausedAgentRunner {
         #[cfg(feature = "hooks")]
-        let prompt = match crate::extras::hooks::dispatch_user_prompt_submit(prompt).await {
+        let prompt = match work_scope
+            .run(crate::extras::hooks::dispatch_user_prompt_submit(prompt))
+            .await
+        {
             crate::extras::hooks::PromptGate::Blocked(feedback) => {
-                return spawn_blocked_runner(feedback);
+                return spawn_blocked_runner(feedback, work_scope);
             }
             crate::extras::hooks::PromptGate::Proceed(prompt) => prompt,
         };
@@ -825,12 +882,12 @@ impl AnyAgent {
         };
         #[cfg(feature = "skills")]
         let prompt = if let Some(skills) = &self.skills {
-            skills.prepare_prompt(&prompt).await
+            work_scope.run(skills.prepare_prompt(&prompt)).await
         } else {
             prompt
         };
         match self.inner {
-            AnyAgentInner::OpenRouter(a) => runner::spawn_agent(
+            AnyAgentInner::OpenRouter(a) => runner::spawn_agent_paused_in_scope(
                 a,
                 prompt,
                 history,
@@ -839,9 +896,10 @@ impl AnyAgent {
                 turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
+                work_scope,
             ),
             AnyAgentInner::OpenAI(a) => match a {
-                OpenAiAgent::Responses(a) => runner::spawn_agent(
+                OpenAiAgent::Responses(a) => runner::spawn_agent_paused_in_scope(
                     a,
                     prompt,
                     history,
@@ -850,8 +908,9 @@ impl AnyAgent {
                     turn_guard,
                     #[cfg(feature = "hooks")]
                     loop_info,
+                    work_scope,
                 ),
-                OpenAiAgent::Completions(a) => runner::spawn_agent(
+                OpenAiAgent::Completions(a) => runner::spawn_agent_paused_in_scope(
                     a,
                     prompt,
                     history,
@@ -860,9 +919,10 @@ impl AnyAgent {
                     turn_guard,
                     #[cfg(feature = "hooks")]
                     loop_info,
+                    work_scope,
                 ),
             },
-            AnyAgentInner::Anthropic(a) => runner::spawn_agent(
+            AnyAgentInner::Anthropic(a) => runner::spawn_agent_paused_in_scope(
                 a,
                 prompt,
                 history,
@@ -871,8 +931,9 @@ impl AnyAgent {
                 turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
+                work_scope,
             ),
-            AnyAgentInner::Gemini(a) => runner::spawn_agent(
+            AnyAgentInner::Gemini(a) => runner::spawn_agent_paused_in_scope(
                 a,
                 prompt,
                 history,
@@ -881,8 +942,9 @@ impl AnyAgent {
                 turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
+                work_scope,
             ),
-            AnyAgentInner::Ollama(a) => runner::spawn_agent(
+            AnyAgentInner::Ollama(a) => runner::spawn_agent_paused_in_scope(
                 a,
                 prompt,
                 history,
@@ -891,6 +953,7 @@ impl AnyAgent {
                 turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
+                work_scope,
             ),
         }
     }
@@ -1280,7 +1343,7 @@ pub async fn build_agent_in_workspace(
             crate::sandbox::worker::WorkerContainmentStatus::Available { .. }
         );
         match paths {
-            Ok(paths) => match tokio::task::spawn_blocking(move || {
+            Ok(paths) => match crate::agent::runner::spawn_blocking_scoped(move || {
                 crate::extras::js::skills::turn::SkillRuntime::open_with_learned_js(
                     &paths,
                     embedding.as_ref(),

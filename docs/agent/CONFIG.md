@@ -1195,10 +1195,20 @@ History is bounded to 128 complete turns and 2 MiB of serialized Rig messages;
 the oldest complete turns are evicted first. The process retains at most 64 ACP
 sessions. Because ACP exposes no session-close notification, creating a 65th
 session is rejected rather than silently invalidating any live session. Each
-session accepts at most eight pending turns and runs them in request order,
-without blocking protocol dispatch or work in other sessions. History is not
-persisted across server restarts, and the agent therefore neither advertises nor
-handles ACP `session/load`.
+session accepts one active prompt; a concurrent prompt for the same session is
+rejected instead of queued. Protocol dispatch and work in other sessions remain
+independent. History is not persisted across server restarts, and the agent
+therefore neither advertises nor handles ACP `session/load`.
+
+ACP `session/cancel` stops the active turn for that session and
+returns `cancelled` from its original `session/prompt` request. Cancellation is
+generation-tagged: duplicate notifications are idempotent, a notification after
+completion cannot abort a later prompt, and a runner attached after an early
+cancellation is aborted immediately. Cancelled turns commit no user, tool, or
+assistant history. Dropping the original prompt request has the same effect.
+Concurrent prompts for one session are rejected while its turn is active, so an
+untagged duplicate cancellation cannot be redirected to queued work. Other
+sessions remain independent and continue normally.
 
 ACP context includes managed global files and context files in the captured
 workspace root. It intentionally does not load `AGENTS.md`, `CLAUDE.md`, or

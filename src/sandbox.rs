@@ -1594,11 +1594,11 @@ impl Sandbox {
     ) -> std::io::Result<CommandOutput> {
         let (response_tx, response_rx) = oneshot::channel();
         let sandbox = self.clone();
-        tokio::spawn(async move {
+        std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
             sandbox
                 .run_built_output_command(cmd, limits, cancellation, audit, input, response_tx)
                 .await;
-        });
+        }));
         response_rx.await.map_err(|_| {
             std::io::Error::other("command output worker stopped before returning a result")
         })

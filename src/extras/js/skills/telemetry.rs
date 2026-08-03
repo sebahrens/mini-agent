@@ -575,10 +575,11 @@ pub struct TelemetryIngestor<'a> {
     store: &'a mut SkillStore,
 }
 
-#[derive(Clone)]
 pub struct TelemetryDispatcher {
-    tx: SyncSender<EventBatch>,
+    tx: Option<SyncSender<EventBatch>>,
     observability_lost: Arc<AtomicU64>,
+    join: Option<std::thread::JoinHandle<()>>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -612,9 +613,11 @@ impl TelemetryDispatcher {
         let (tx, rx) = std::sync::mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
         let observability_lost = Arc::new(AtomicU64::new(0));
         let worker_observability_lost = Arc::clone(&observability_lost);
-        std::thread::Builder::new()
+        let work_guard = crate::agent::runner::current_work_guard();
+        let join = std::thread::Builder::new()
             .name("skill-telemetry".into())
             .spawn(move || {
+                let _work_guard = work_guard;
                 while let Ok(batch) = rx.recv() {
                     match TelemetryIngestor::new(&mut store).ingest(&batch) {
                         Ok(report) if report.evidence_complete => {
@@ -637,18 +640,46 @@ impl TelemetryDispatcher {
             })
             .map_err(|_| DispatchError::Disconnected)?;
         Ok(Self {
-            tx,
+            tx: Some(tx),
             observability_lost,
+            join: Some(join),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
 
     pub fn try_dispatch(&self, batch: EventBatch) -> Result<(), DispatchError> {
-        self.tx.try_send(batch).map_err(|error| match error {
-            TrySendError::Full(_) => DispatchError::Saturated,
-            TrySendError::Disconnected(_) => DispatchError::Disconnected,
-        })
+        self.tx
+            .as_ref()
+            .ok_or(DispatchError::Disconnected)?
+            .try_send(batch)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => DispatchError::Saturated,
+                TrySendError::Disconnected(_) => DispatchError::Disconnected,
+            })
     }
+}
 
+impl Drop for TelemetryDispatcher {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(join) = self.join.take() {
+            if join.is_finished() {
+                let _ = join.join();
+            } else if let Some(runtime) = &self.runtime {
+                std::mem::drop(crate::agent::runner::spawn_blocking_scoped_on(
+                    runtime,
+                    move || {
+                        let _ = join.join();
+                    },
+                ));
+            } else {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+impl TelemetryDispatcher {
     /// Record a parent-owned signal even when the bounded telemetry queue is
     /// saturated or disconnected and therefore cannot persist an event.
     pub(crate) fn record_observability_lost(&self, reason: &'static str) {
@@ -663,8 +694,10 @@ impl TelemetryDispatcher {
     #[cfg(test)]
     pub(crate) fn from_sender_for_test(tx: SyncSender<EventBatch>) -> Self {
         Self {
-            tx,
+            tx: Some(tx),
             observability_lost: Arc::new(AtomicU64::new(0)),
+            join: None,
+            runtime: None,
         }
     }
 
