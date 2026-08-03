@@ -97,6 +97,7 @@ struct SessionState {
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
     turns: Arc<StdMutex<SessionTurns>>,
+    read_tracker: crate::agent::tools::ReadTracker,
 }
 
 const TURN_ACTIVE: u8 = 0;
@@ -688,6 +689,9 @@ async fn handle_new_session(
             workspace,
             context: Arc::new(context),
             turns: turns.clone(),
+            read_tracker: crate::agent::tools::ReadTracker::new(
+                state.cfg.deny_repeated_reads.unwrap_or(true),
+            ),
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id.clone(), turns);
@@ -728,7 +732,7 @@ async fn handle_prompt(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (history, workspace, context, control, registration) = {
+    let (history, workspace, context, read_tracker, control, registration) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
@@ -754,6 +758,7 @@ async fn handle_prompt(
             sess.history.clone(),
             sess.workspace.clone(),
             sess.context.clone(),
+            sess.read_tracker.clone(),
             control.clone(),
             TurnRegistration {
                 generation,
@@ -794,6 +799,7 @@ async fn handle_prompt(
                     history,
                     workspace,
                     context,
+                    read_tracker,
                     responder,
                     cx,
                     control,
@@ -838,6 +844,7 @@ async fn run_prompt(
     history: tokio::sync::OwnedMutexGuard<SessionHistory>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
+    read_tracker: crate::agent::tools::ReadTracker,
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
@@ -986,6 +993,7 @@ async fn run_prompt(
             permission,
             ask_tx,
             sandbox,
+            read_tracker,
             false,
             temperature,
             extra_body,

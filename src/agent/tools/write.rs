@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rig::tool::Tool;
 
 use crate::agent::tools::{
-    AskSender, PermCheck, ToolError, WriteArgs, check_perm_bound_path, check_perm_path,
+    AskSender, PermCheck, ReadTracker, ToolError, WriteArgs, check_perm_bound_path, check_perm_path,
 };
 #[cfg(feature = "lsp")]
 use crate::extras::lsp::LspManager;
@@ -15,6 +15,7 @@ pub struct WriteTool {
     pub ask_tx: Option<AskSender>,
     pub max_text_file_size: u64,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
+    read_tracker: ReadTracker,
     /// When `Some`, written files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -22,16 +23,32 @@ pub struct WriteTool {
 }
 
 impl WriteTool {
+    #[cfg(test)]
     pub fn new(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
         max_text_file_size: Option<u64>,
+    ) -> Self {
+        Self::new_with_tracker(
+            permission,
+            ask_tx,
+            max_text_file_size,
+            ReadTracker::new(true),
+        )
+    }
+
+    pub(crate) fn new_with_tracker(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        max_text_file_size: Option<u64>,
+        read_tracker: ReadTracker,
     ) -> Self {
         WriteTool {
             permission,
             ask_tx,
             max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
             workspace: None,
+            read_tracker,
             #[cfg(feature = "lsp")]
             lsp: None,
         }
@@ -147,7 +164,7 @@ impl Tool for WriteTool {
                 check_perm_bound_path(&self.permission, &self.ask_tx, "write", workspace, relative)
                     .await?;
             workspace.create_relative_atomic(relative, args.content.as_bytes())?;
-            crate::agent::tools::untrack_read_path(&expanded);
+            self.read_tracker.untrack_read_path(&expanded);
             let mut result = format!("Written {} bytes to {}", bytes, expanded);
             if let Some(msg) = coaching {
                 result = format!("{}\n\n{}", msg, result);
@@ -198,7 +215,7 @@ impl Tool for WriteTool {
         })?)
         .await?;
         crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent).await?;
-        crate::agent::tools::untrack_read_path(&expanded);
+        self.read_tracker.untrack_read_path(&path.to_string_lossy());
         tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
         let mut result = format!("Written {} bytes to {}", bytes, expanded);
         if let Some(msg) = coaching {

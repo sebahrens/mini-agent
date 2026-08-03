@@ -70,12 +70,18 @@ impl SlashCtx<'_> {
             permission: self.permission,
             ask_tx: self.ask_tx,
             sandbox: self.sandbox,
+            read_tracker: &self.session.read_tracker,
             #[cfg(feature = "mcp")]
             mcp_manager: self.mcp_manager,
         }
     }
 
-    async fn build_agent_for_client(&self, client: &AnyClient, model_id: &str) -> AnyAgent {
+    async fn build_agent_for_client(
+        &self,
+        client: &AnyClient,
+        model_id: &str,
+        read_tracker: &crate::agent::tools::ReadTracker,
+    ) -> AnyAgent {
         AgentBuildCtx {
             cli: self.cli,
             cfg: self.cfg,
@@ -84,6 +90,7 @@ impl SlashCtx<'_> {
             permission: self.permission,
             ask_tx: self.ask_tx,
             sandbox: self.sandbox,
+            read_tracker,
             #[cfg(feature = "mcp")]
             mcp_manager: self.mcp_manager,
         }
@@ -102,6 +109,28 @@ impl SlashCtx<'_> {
             .rebuild_agent(&self.session.model, *self.reasoning_enabled)
             .await;
         *self.agent = Some(new_agent);
+    }
+
+    /// Enter a different logical session and rebuild every agent-owned tool
+    /// against that session's fresh, configuration-scoped runtime state.
+    pub async fn replace_session(&mut self, mut session: Session) -> anyhow::Result<()> {
+        let provider_changed = session.provider != self.session.provider;
+        session.initialize_read_tracker(self.cfg.deny_repeated_reads.unwrap_or(true));
+        let previous_session = std::mem::replace(self.session, session);
+
+        if provider_changed {
+            let provider = self.session.provider.to_string();
+            if let Err(error) = self
+                .rebuild_agent_with_client(&provider, *self.reasoning_enabled)
+                .await
+            {
+                *self.session = previous_session;
+                return Err(error);
+            }
+        } else {
+            self.rebuild_agent().await;
+        }
+        Ok(())
     }
 
     pub async fn rebuild_agent_with_client(

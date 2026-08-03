@@ -104,6 +104,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     if session.name.is_empty() {
         session.name = CompactString::new("imported");
     }
+    session.initialize_read_tracker(ctx.cfg.deny_repeated_reads.unwrap_or(true));
     session.overhead_tokens =
         crate::agent::builder::estimate_overhead(ctx.context, *ctx.reasoning_enabled);
     let new_client = match crate::provider::create_client(
@@ -122,7 +123,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     };
     let new_agent = ctx
-        .build_agent_for_client(&new_client, &session.model)
+        .build_agent_for_client(&new_client, &session.model, &session.read_tracker)
         .await;
     let msg_count = session.messages.len();
     if let Err(e) = commit_staged_import(
@@ -332,7 +333,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         } else if sessions.len() == 1 {
             if let Some(s) = sessions.into_iter().next() {
                 let msg_count = s.messages.len();
-                *ctx.session = s;
+                ctx.replace_session(s).await?;
                 render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
                 write_ok(ctx.renderer, format!("loaded session ({} msgs)", msg_count));
             }

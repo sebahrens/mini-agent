@@ -18,14 +18,20 @@ pub(crate) struct SubagentAuthorization {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
+    deny_repeated_reads: bool,
 }
 
 impl SubagentAuthorization {
-    pub(crate) fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
+    pub(crate) fn new(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        deny_repeated_reads: bool,
+    ) -> Self {
         Self {
             permission,
             ask_tx,
             workspace: None,
+            deny_repeated_reads,
         }
     }
 
@@ -45,11 +51,13 @@ impl SubagentAuthorization {
         max_find_results: u64,
         max_list_dir_entries: Option<u64>,
     ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
-        let read = tools::ReadTool::new(
+        let read_tracker = tools::ReadTracker::new(self.deny_repeated_reads);
+        let read = tools::ReadTool::new_with_tracker(
             self.permission.clone(),
             self.ask_tx.clone(),
             Some(max_text_file_size),
             max_read_lines,
+            read_tracker,
         );
         let grep = tools::GrepTool::new(
             self.permission.clone(),
@@ -290,7 +298,7 @@ mod js_isolation_tests {
             1_000,
             1_000,
             Some(1_000),
-            &SubagentAuthorization::new(None, None),
+            &SubagentAuthorization::new(None, None, true),
             None,
             #[cfg(feature = "archmd")]
             None,
@@ -371,7 +379,7 @@ mod tests {
             crate::paths::WorkspaceBinding::capture(working_dir)
                 .expect("capture subagent test workspace"),
         );
-        SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), ask_tx)
+        SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), ask_tx, true)
             .with_workspace_binding(Some(workspace))
     }
 

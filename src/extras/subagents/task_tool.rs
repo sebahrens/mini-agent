@@ -141,15 +141,21 @@ pub struct TaskTool {
     ask_tx: Option<AskSender>,
     workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
     architecture: Option<String>,
+    deny_repeated_reads: bool,
 }
 
 impl TaskTool {
-    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
+    pub fn new(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        deny_repeated_reads: bool,
+    ) -> Self {
         Self {
             permission,
             ask_tx,
             workspace: None,
             architecture: None,
+            deny_repeated_reads,
         }
     }
 
@@ -164,6 +170,11 @@ impl TaskTool {
     pub fn with_architecture(mut self, architecture: Option<String>) -> Self {
         self.architecture = architecture;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repeated_read_policy_for_test(&self) -> bool {
+        self.deny_repeated_reads
     }
 }
 
@@ -237,9 +248,12 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(not(feature = "archmd"))]
         let architecture: Option<String> = None;
 
-        let authorization =
-            SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone())
-                .with_workspace_binding(self.workspace.clone());
+        let authorization = SubagentAuthorization::new(
+            self.permission.clone(),
+            self.ask_tx.clone(),
+            self.deny_repeated_reads,
+        )
+        .with_workspace_binding(self.workspace.clone());
         let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
             let client = client.clone();
             let model_name = model_name.clone();

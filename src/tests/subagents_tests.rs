@@ -8,6 +8,15 @@
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_tools_capture_each_agent_builds_repeated_read_policy() {
+        let denying_agent = crate::extras::subagents::task_tool::TaskTool::new(None, None, true);
+        let allowing_agent = crate::extras::subagents::task_tool::TaskTool::new(None, None, false);
+
+        assert!(denying_agent.repeated_read_policy_for_test());
+        assert!(!allowing_agent.repeated_read_policy_for_test());
+    }
+
     // -----------------------------------------------------------------------
     // TaskArgs deserialization
     // -----------------------------------------------------------------------

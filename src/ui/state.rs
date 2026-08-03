@@ -49,6 +49,7 @@ impl<'a> UiContext<'a> {
             permission: &self.permission,
             ask_tx: &self.ask_tx,
             sandbox: &self.sandbox,
+            read_tracker: &self.session.read_tracker,
             #[cfg(feature = "mcp")]
             mcp_manager: self.mcp_manager.as_ref(),
         }
@@ -97,6 +98,7 @@ pub(crate) struct AgentBuildCtx<'a> {
     pub permission: &'a Option<PermCheck>,
     pub ask_tx: &'a Option<AskSender>,
     pub sandbox: &'a Sandbox,
+    pub read_tracker: &'a crate::agent::tools::ReadTracker,
     #[cfg(feature = "mcp")]
     pub mcp_manager: Option<&'a McpClientManager>,
 }
@@ -116,6 +118,7 @@ impl AgentBuildCtx<'_> {
             self.permission.clone(),
             self.ask_tx.clone(),
             self.sandbox.clone(),
+            self.read_tracker.clone(),
             reasoning_enabled,
             temperature,
             extra_body,
