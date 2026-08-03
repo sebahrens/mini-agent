@@ -253,7 +253,7 @@ impl UsageLedger {
     }
 }
 
-fn usage_saturating_add(left: Usage, right: Usage) -> Usage {
+pub(crate) fn usage_saturating_add(left: Usage, right: Usage) -> Usage {
     Usage {
         input_tokens: left.input_tokens.saturating_add(right.input_tokens),
         output_tokens: left.output_tokens.saturating_add(right.output_tokens),

@@ -11,6 +11,8 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use tokio::time::Instant;
 
+#[cfg(feature = "hooks")]
+use crate::agent::runner::{SubagentRunOutput, usage_saturating_add};
 use crate::agent::tools::{ToolError, check_perm};
 use crate::extras::subagents::builder::{self, SubagentAuthorization};
 use crate::extras::subagents::{clone_subagent_event_tx, with_config};
@@ -209,8 +211,6 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(feature = "archmd")]
         let architecture = with_config(|cfg| cfg.architecture.clone())
             .map_err(|err| ToolError::Msg(err.to_string()))?;
-        #[cfg(not(feature = "archmd"))]
-        let architecture: Option<String> = None;
 
         let authorization =
             SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone());
@@ -218,6 +218,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let client = client.clone();
             let model_name = model_name.clone();
             let event_tx = subagent_event_tx.clone();
+            #[cfg(feature = "archmd")]
             let architecture = architecture.clone();
             let config = config.clone();
             let authorization = authorization.clone();
@@ -238,6 +239,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     max_turns,
                     &config,
                     authorization,
+                    #[cfg(feature = "archmd")]
                     architecture,
                 )
                 .await;
@@ -261,6 +263,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                         };
                     }
                 };
+                #[cfg(feature = "hooks")]
+                let mut run = run;
 
                 #[cfg(feature = "hooks")]
                 if let Ok(response) = run.response.as_ref()
@@ -269,7 +273,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 {
                     tracing::info!("hooks: SubagentStop forced continuation: {reason}");
                     let continuation = format!("{response}\n\n{reason}");
-                    if let Ok(mut retried) = tokio::time::timeout(
+                    if let Ok(retried) = tokio::time::timeout(
                         SUBAGENT_TIMEOUT,
                         agent.run_subagent(
                             &continuation,
@@ -280,12 +284,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     )
                     .await
                     {
-                        retried.usage += run.usage;
-                        if retried.response.is_ok() {
-                            run = retried;
-                        } else {
-                            run.usage = retried.usage;
-                        }
+                        run = merge_forced_continuation_run(run, retried);
                     }
                 }
 
@@ -299,6 +298,21 @@ editing in a known location, grepping for a literal you will act on immediately.
 
         let report = execute_tasks(args.prompts, limits, executor).await;
         Ok(report.render())
+    }
+}
+
+#[cfg(feature = "hooks")]
+fn merge_forced_continuation_run(
+    mut original: SubagentRunOutput,
+    mut retried: SubagentRunOutput,
+) -> SubagentRunOutput {
+    let combined_usage = usage_saturating_add(original.usage, retried.usage);
+    if retried.response.is_ok() {
+        retried.usage = combined_usage;
+        retried
+    } else {
+        original.usage = combined_usage;
+        original
     }
 }
 
@@ -1015,6 +1029,53 @@ mod tests {
         assert_eq!(
             usage_cost_units(&Usage::new(), "1234", &Ok("5678".into())),
             2
+        );
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn hooks_forced_subagent_continuation_saturates_usage_and_budget_cost() {
+        let near_max = Usage {
+            input_tokens: u64::MAX - 1,
+            output_tokens: u64::MAX - 1,
+            total_tokens: u64::MAX - 1,
+            cached_input_tokens: u64::MAX - 1,
+            cache_creation_input_tokens: u64::MAX - 1,
+            tool_use_prompt_tokens: u64::MAX - 1,
+            reasoning_tokens: u64::MAX - 1,
+        };
+        let increment = Usage {
+            input_tokens: 10,
+            output_tokens: 10,
+            total_tokens: 10,
+            cached_input_tokens: 10,
+            cache_creation_input_tokens: 10,
+            tool_use_prompt_tokens: 10,
+            reasoning_tokens: 10,
+        };
+        let merged = merge_forced_continuation_run(
+            SubagentRunOutput {
+                response: Ok("original".to_string()),
+                usage: near_max,
+            },
+            SubagentRunOutput {
+                response: Ok("continued".to_string()),
+                usage: increment,
+            },
+        );
+
+        assert_eq!(merged.response.as_deref(), Ok("continued"));
+        assert_eq!(merged.usage.input_tokens, u64::MAX);
+        assert_eq!(merged.usage.output_tokens, u64::MAX);
+        assert_eq!(merged.usage.total_tokens, u64::MAX);
+        assert_eq!(merged.usage.cached_input_tokens, u64::MAX);
+        assert_eq!(merged.usage.cache_creation_input_tokens, u64::MAX);
+        assert_eq!(merged.usage.tool_use_prompt_tokens, u64::MAX);
+        assert_eq!(merged.usage.reasoning_tokens, u64::MAX);
+        assert_eq!(
+            usage_cost_units(&merged.usage, "prompt", &merged.response),
+            u64::MAX,
+            "aggregate task budgeting must fail closed at the saturated maximum"
         );
     }
 
