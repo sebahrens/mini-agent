@@ -27,11 +27,14 @@ pub fn session_to_jsonl(session: &Session) -> String {
     out.push_str(&header.to_string());
     for msg in &session.messages {
         out.push('\n');
-        let line = serde_json::json!({
+        let mut line = serde_json::json!({
             "role": msg.role,
             "content": msg.content.as_str(),
             "estimated_tokens": msg.estimated_tokens,
         });
+        if let Some(id) = &msg.tool_call_id {
+            line["tool_call_id"] = serde_json::Value::String(id.to_string());
+        }
         out.push_str(&line.to_string());
     }
     out.push('\n');
@@ -46,6 +49,8 @@ struct ImportMessage {
     content: CompactString,
     #[serde(default)]
     estimated_tokens: u64,
+    #[serde(default)]
+    tool_call_id: Option<CompactString>,
 }
 
 /// Parse a JSONL session export back into messages. The metadata header line
@@ -68,6 +73,7 @@ pub fn parse_jsonl_import(content: &str) -> Result<Vec<SessionMessage>> {
             role: msg.role,
             content: msg.content,
             estimated_tokens: msg.estimated_tokens,
+            tool_call_id: msg.tool_call_id,
         });
     }
     if messages.is_empty() {

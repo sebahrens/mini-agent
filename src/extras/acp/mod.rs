@@ -461,7 +461,6 @@ async fn run_prompt(
         .await;
     let mut rx = runner.event_rx;
 
-    let mut tool_call_id: Option<ToolCallId> = None;
     let mut final_response = String::new();
 
     while let Some(event) = rx.recv().await {
@@ -489,9 +488,8 @@ async fn run_prompt(
                     tracing::warn!("ACP failed to send reasoning notification: {}", e);
                 }
             }
-            AgentEvent::ToolCall { name, args } => {
-                let id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
-                tool_call_id = Some(id.clone());
+            AgentEvent::ToolCall { id, name, args } => {
+                let id = ToolCallId::new(id.to_string());
                 let args_str = args.to_string();
                 let tool_call = ToolCall::new(id.clone(), name.to_string())
                     .raw_input(serde_json::from_str(&args_str).ok());
@@ -505,7 +503,6 @@ async fn run_prompt(
             }
             AgentEvent::SubagentToolCall { name, args } => {
                 let id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
-                tool_call_id = Some(id.clone());
                 let args_str = args.to_string();
                 let tool_call = ToolCall::new(id.clone(), format!("[subagent] {}", name))
                     .raw_input(serde_json::from_str(&args_str).ok());
@@ -517,10 +514,8 @@ async fn run_prompt(
                     tracing::warn!("ACP failed to send subagent tool call notification: {}", e);
                 }
             }
-            AgentEvent::ToolResult { output, .. } => {
-                let id = tool_call_id
-                    .take()
-                    .unwrap_or_else(|| ToolCallId::new(uuid::Uuid::new_v4().to_string()));
+            AgentEvent::ToolResult { id, output, .. } => {
+                let id = ToolCallId::new(id.to_string());
                 let fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .content(vec![ToolCallContent::from(ContentBlock::Text(
@@ -549,7 +544,7 @@ async fn run_prompt(
                     tracing::warn!("ACP failed to send retry notification: {}", e);
                 }
             }
-            AgentEvent::CompletionCall { .. } => {
+            AgentEvent::UsageDelta { .. } => {
                 // Mid-stream provider usage; ACP has no status bar to update, so
                 // there is nothing to surface for this event.
             }

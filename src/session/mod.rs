@@ -27,6 +27,9 @@ pub struct SessionMessage {
     pub role: MessageRole,
     pub content: CompactString,
     pub estimated_tokens: u64,
+    /// Stable internal identity for auditable call/result correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<CompactString>,
 }
 
 /// A single-step restore point captured before a conversation rewind, so the
@@ -342,11 +345,21 @@ impl Session {
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
+        self.add_message_with_tool_call_id(role, content, None);
+    }
+
+    fn add_message_with_tool_call_id(
+        &mut self,
+        role: MessageRole,
+        content: &str,
+        tool_call_id: Option<&str>,
+    ) {
         let tokens = Self::estimate_tokens(content);
         self.messages.push(SessionMessage {
             role,
             content: CompactString::new(content),
             estimated_tokens: tokens,
+            tool_call_id: tool_call_id.map(CompactString::new),
         });
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(tokens);
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
@@ -355,17 +368,47 @@ impl Session {
         self.rewind_undo = None;
     }
 
-    pub fn add_tool_call(&mut self, name: &str, args: &serde_json::Value) {
-        self.add_message(
+    pub fn add_tool_call_with_id(&mut self, id: &str, name: &str, args: &serde_json::Value) {
+        self.add_message_with_tool_call_id(
             MessageRole::ToolCall,
             &crate::ui::utils::format_tool_call_summary(name, args),
+            (!id.is_empty()).then_some(id),
         );
     }
 
-    pub fn add_tool_result(&mut self, name: &str, output: &str) -> String {
+    pub fn add_tool_result_with_id(&mut self, id: &str, name: &str, output: &str) -> String {
         let content = self.tool_result_content(name, output);
-        self.add_message(MessageRole::ToolResult, &content);
+        self.add_message_with_tool_call_id(
+            MessageRole::ToolResult,
+            &content,
+            (!id.is_empty()).then_some(id),
+        );
         content
+    }
+
+    /// Apply one reconciled provider-usage delta to every persisted accounting
+    /// total. Terminal responses are deliberately absent from this API so UI
+    /// and headless callers cannot charge an aggregate a second time.
+    pub fn charge_usage_delta(&mut self, usage: crate::event::UsageDelta, anthropic_native: bool) {
+        self.total_input_tokens = self.total_input_tokens.saturating_add(usage.input_tokens);
+        self.total_output_tokens = self.total_output_tokens.saturating_add(usage.output_tokens);
+        self.total_cached_input_tokens = self
+            .total_cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.total_cache_creation_input_tokens = self
+            .total_cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        self.total_cost += crate::pricing::estimate_cost(
+            crate::pricing::billable_input_tokens(
+                anthropic_native,
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_input_tokens,
+            ),
+            usage.output_tokens,
+            self.input_token_cost,
+            self.output_token_cost,
+        );
     }
 
     fn tool_result_content(&self, name: &str, output: &str) -> String {
@@ -432,6 +475,15 @@ impl Session {
         }
         self.calibrated_tokens = input_tokens.saturating_add(output_tokens);
         self.calibrated_msg_count = self.messages.len();
+    }
+
+    /// Mark messages appended after the most recent provider usage event as
+    /// covered by that calibration. The usage already includes the completed
+    /// assistant output, even though the UI persists that message on `Done`.
+    pub fn reanchor_calibration_to_current_messages(&mut self) {
+        if self.calibrated_tokens > 0 {
+            self.calibrated_msg_count = self.messages.len();
+        }
     }
 
     pub fn reset_calibration(&mut self) {
@@ -598,6 +650,7 @@ impl Session {
             role: MessageRole::System,
             content: CompactString::from(summary.clone()),
             estimated_tokens: summary_tokens,
+            tool_call_id: None,
         };
 
         // Remove summarized messages and insert summary

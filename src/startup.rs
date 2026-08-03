@@ -1037,6 +1037,7 @@ impl Startup {
                     role: MessageRole::User,
                     content: CompactString::new(&msg),
                     estimated_tokens: Session::estimate_tokens(&msg),
+                    tool_call_id: None,
                 });
                 crate::extras::advisor::set_session_messages(msgs);
             }
@@ -1062,29 +1063,8 @@ impl Startup {
                 let mut session = self.session;
                 session.add_message(MessageRole::User, &msg);
                 session.add_message(MessageRole::Assistant, &response);
-                session.total_input_tokens = session
-                    .total_input_tokens
-                    .saturating_add(usage.input_tokens);
-                session.total_output_tokens = session
-                    .total_output_tokens
-                    .saturating_add(usage.output_tokens);
-                session.total_cached_input_tokens = session
-                    .total_cached_input_tokens
-                    .saturating_add(usage.cached_input_tokens);
-                session.total_cache_creation_input_tokens = session
-                    .total_cache_creation_input_tokens
-                    .saturating_add(usage.cache_creation_input_tokens);
-                session.total_cost += crate::pricing::estimate_cost(
-                    crate::pricing::billable_input_tokens(
-                        self.cfg.is_anthropic_native(&session.provider),
-                        usage.input_tokens,
-                        usage.cached_input_tokens,
-                        usage.cache_creation_input_tokens,
-                    ),
-                    usage.output_tokens,
-                    session.input_token_cost,
-                    session.output_token_cost,
-                );
+                let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
+                session.charge_usage_delta(usage.into(), anthropic_native);
                 session::storage::save_session(&session)?;
                 let _ =
                     session::chat_history::append_entry(&session::chat_history::ChatHistoryEntry {
