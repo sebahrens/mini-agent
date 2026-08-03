@@ -13,6 +13,7 @@ pub(crate) use memory::verify_memory_editor_preservation;
 mod providers;
 pub(crate) mod review;
 mod session;
+pub(crate) use session::is_persistence_restart_required;
 pub(crate) mod settings;
 
 pub(crate) use providers::warm_model_cache;

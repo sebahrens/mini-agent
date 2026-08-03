@@ -177,6 +177,35 @@ pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
     Ok(sessions)
 }
 
+/// Load one private session by its complete portable identifier. This exact
+/// lookup is also used to reconcile the visible state when an atomic save
+/// reports an error after publication may already have occurred.
+pub fn load_session_exact(id: &str) -> anyhow::Result<Option<Session>> {
+    if disabled("sessions") {
+        return Ok(None);
+    }
+    crate::paths::validate_portable_component(id)?;
+    let Some(dir) = existing_session_dir()? else {
+        return Ok(None);
+    };
+    let path = dir.join(format!("{id}.json"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let json = read_private_string(&path)?;
+            let session: Session = serde_json::from_str(&json)
+                .map_err(|error| anyhow::anyhow!("invalid persisted session {id}: {error}"))?;
+            anyhow::ensure!(
+                session.id == id,
+                "persisted session ID mismatch: requested {id}, found {}",
+                session.id
+            );
+            Ok(Some(session))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn find_session_by_name(name: &str) -> anyhow::Result<Option<Session>> {
     if disabled("sessions") {
         return Ok(None);

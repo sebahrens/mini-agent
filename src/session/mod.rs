@@ -30,11 +30,11 @@ pub struct SessionMessage {
 }
 
 /// A single-step restore point captured before a conversation rewind, so the
-/// destructive truncation can be undone with `/unrewind`. Holds the full
+/// destructive truncation can be undone with `/redo`. Holds the full
 /// message list and the calibration/estimate fields that `truncate_to` mutates,
-/// which is everything needed to put the session back exactly as it was. Not
-/// persisted: a rewind is only undoable within the session that made it.
-#[derive(Debug, Clone)]
+/// which is everything needed to put the session back exactly as it was. It is
+/// persisted with private session storage so a restart retains one-step redo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewindUndo {
     messages: Vec<SessionMessage>,
     total_estimated_tokens: u64,
@@ -133,9 +133,10 @@ pub struct Session {
     /// persisted.
     #[serde(skip)]
     pub overhead_tokens: u64,
-    /// Restore point for the most recent `/unrewind`-able rewind, captured by
-    /// [`rewind_to`](Self::rewind_to). Runtime only, not persisted.
-    #[serde(skip)]
+    /// Restore point for the most recent `/redo`-able rewind, captured by
+    /// [`rewind_to`](Self::rewind_to). Persisted so an immediately restarted
+    /// session retains the same one-step undo/redo semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewind_undo: Option<RewindUndo>,
 }
 
@@ -617,8 +618,10 @@ impl Session {
         });
 
         // Compaction reindexes messages, so the calibration anchor no longer
-        // lines up. Drop it; the next completed turn re-anchors.
+        // lines up and an older redo snapshot is no longer composable. Drop
+        // both; the next completed turn re-anchors.
         self.reset_calibration();
+        self.rewind_undo = None;
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     }
 }

@@ -10,10 +10,10 @@ All slash commands are available from the TUI input prompt.
 
 | Command | Description |
 | ------- | ----------- |
-| `/clear` | Clear the current session (all messages, tokens, compactions). |
+| `/clear` | Clear the current session (all messages, tokens, compactions) and persist the change immediately. |
 | `/new` | Alias for `/clear`. |
-| `/undo` | Remove the last exchange (user message + assistant response). |
-| `/redo` | Restore whatever the most recent `/undo` or `/rewind` removed. |
+| `/undo` | Remove the last exchange (user message + assistant response), persisting both the shorter history and its redo point immediately. |
+| `/redo` | Restore whatever the most recent `/undo` or `/rewind` removed and persist the restored history immediately. |
 | `/rewind` | Open a picker to jump the session back to an earlier point. |
 | `/retry` | Load the last user message into the input editor for editing. |
 | `/quit` | Exit zerostack. |
@@ -24,7 +24,7 @@ All slash commands are available from the TUI input prompt.
 | `/rename <name>` | Rename the current session. |
 | `/history` | Show global chat history (last 10 entries across sessions). |
 | `/export [file]` | Export the current session to a standalone HTML page (default `zerostack-session-<id>.html`), or to JSONL when the file ends in `.jsonl`. Requires the `export` feature (default-on). |
-| `/import <file>` | Import a session from a versioned zerostack JSONL export (or a native session JSON document), save it, and load it. Schema markers select the format deterministically; imports are limited to 16 MiB and 10,000 messages. Requires the `export` feature. |
+| `/import <file>` | Import a session from a versioned zerostack JSONL export (or a native session JSON document), save it, and load it. Schema markers select the format deterministically; imports are limited to 16 MiB and 10,000 messages, and external native files cannot inject a hidden redo snapshot. Requires the `export` feature. |
 | `/share` | Upload the HTML export as a secret GitHub gist and print the URL. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). |
 | `/queue clear` | Empty the queue. |

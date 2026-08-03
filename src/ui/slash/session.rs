@@ -189,7 +189,13 @@ fn parse_imported_session(
     cfg: &crate::config::Config,
 ) -> anyhow::Result<crate::session::Session> {
     match crate::extras::export::parse_session_file(content)? {
-        crate::extras::export::ParsedSessionFile::Native(session) => Ok(session),
+        crate::extras::export::ParsedSessionFile::Native(mut session) => {
+            // Native imports are external input, unlike private storage reloads.
+            // Never accept a concealed redo payload that is absent from the
+            // visible top-level history.
+            session.rewind_undo = None;
+            Ok(session)
+        }
         crate::extras::export::ParsedSessionFile::Jsonl(import) => {
             crate::paths::validate_portable_component(&import.id)?;
             let mut session = crate::session::Session::new(
@@ -344,12 +350,30 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
 }
 
 async fn handle_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    match mutate_and_persist_session(
+        ctx.session,
+        clear_session_mutation,
+        |session| persist_session_unless_ephemeral(ctx.cli.no_session, session),
+        crate::session::storage::load_session_exact,
+    ) {
+        Ok(PersistedMutation::Persisted(())) => {}
+        Ok(PersistedMutation::PersistedWithWarning((), warning)) => {
+            write_error(ctx.renderer, warning);
+        }
+        Ok(PersistedMutation::Unchanged) => unreachable!("clear always changes the session"),
+        Err(error) => {
+            write_error(
+                ctx.renderer,
+                format!("failed to persist cleared session: {error}"),
+            );
+            if is_persistence_restart_required(&error) {
+                return Err(error);
+            }
+            return Ok(());
+        }
+    }
     #[cfg(feature = "hooks")]
     crate::extras::hooks::dispatch_session_end("clear").await;
-    ctx.session.messages.clear();
-    ctx.session.total_estimated_tokens = 0;
-    ctx.session.reset_calibration();
-    ctx.session.compactions.clear();
     ctx.context.chain_declined.clear();
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     #[cfg(feature = "hooks")]
@@ -358,12 +382,29 @@ async fn handle_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 }
 
 async fn handle_undo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let removed = undo_last(ctx.session);
-    if removed == 0 {
-        write_ok(ctx.renderer, "nothing to undo");
-        return Ok(());
-    }
-
+    let removed = match mutate_and_persist_session(
+        ctx.session,
+        undo_session_mutation,
+        |session| persist_session_unless_ephemeral(ctx.cli.no_session, session),
+        crate::session::storage::load_session_exact,
+    ) {
+        Ok(PersistedMutation::Persisted(removed)) => removed,
+        Ok(PersistedMutation::PersistedWithWarning(removed, warning)) => {
+            write_error(ctx.renderer, warning);
+            removed
+        }
+        Ok(PersistedMutation::Unchanged) => {
+            write_ok(ctx.renderer, "nothing to undo");
+            return Ok(());
+        }
+        Err(error) => {
+            write_error(ctx.renderer, format!("failed to persist undo: {error}"));
+            if is_persistence_restart_required(&error) {
+                return Err(error);
+            }
+            return Ok(());
+        }
+    };
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     write_ok(ctx.renderer, format!("removed {} message(s)", removed));
 
@@ -392,13 +433,164 @@ async fn handle_undo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 }
 
 async fn handle_redo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    if !ctx.session.redo() {
-        write_ok(ctx.renderer, "nothing to redo");
-        return Ok(());
+    match mutate_and_persist_session(
+        ctx.session,
+        redo_session_mutation,
+        |session| persist_session_unless_ephemeral(ctx.cli.no_session, session),
+        crate::session::storage::load_session_exact,
+    ) {
+        Ok(PersistedMutation::Persisted(())) => {}
+        Ok(PersistedMutation::PersistedWithWarning((), warning)) => {
+            write_error(ctx.renderer, warning);
+        }
+        Ok(PersistedMutation::Unchanged) => {
+            write_ok(ctx.renderer, "nothing to redo");
+            return Ok(());
+        }
+        Err(error) => {
+            write_error(ctx.renderer, format!("failed to persist redo: {error}"));
+            if is_persistence_restart_required(&error) {
+                return Err(error);
+            }
+            return Ok(());
+        }
     }
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     write_ok(ctx.renderer, "restored the last rewind");
     Ok(())
+}
+
+fn clear_session_mutation(session: &mut crate::session::Session) -> Option<()> {
+    session.messages.clear();
+    session.total_estimated_tokens = 0;
+    session.reset_calibration();
+    session.compactions.clear();
+    session.rewind_undo = None;
+    session.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+    Some(())
+}
+
+fn undo_session_mutation(session: &mut crate::session::Session) -> Option<usize> {
+    let removed = undo_last(session);
+    if removed == 0 {
+        None
+    } else {
+        session.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        Some(removed)
+    }
+}
+
+fn redo_session_mutation(session: &mut crate::session::Session) -> Option<()> {
+    if session.redo() {
+        session.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        Some(())
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PersistedMutation<T> {
+    Unchanged,
+    Persisted(T),
+    PersistedWithWarning(T, String),
+}
+
+fn mutate_and_persist_session<T>(
+    session: &mut crate::session::Session,
+    mutate: impl FnOnce(&mut crate::session::Session) -> Option<T>,
+    persist: impl FnOnce(&crate::session::Session) -> anyhow::Result<()>,
+    load_persisted: impl FnOnce(&str) -> anyhow::Result<Option<crate::session::Session>>,
+) -> anyhow::Result<PersistedMutation<T>> {
+    let previous = session.clone();
+    let Some(result) = mutate(session) else {
+        return Ok(PersistedMutation::Unchanged);
+    };
+    if let Err(error) = persist(session) {
+        let candidate = serde_json::to_vec(session).map_err(|serialization_error| {
+            *session = previous.clone();
+            persistence_restart_required(format!(
+                "save failed ({error}); candidate reconciliation failed ({serialization_error}); previous in-memory state was restored but disk state is unknown—restart before continuing"
+            ))
+        })?;
+        let previous_wire = serde_json::to_vec(&previous).map_err(|serialization_error| {
+            *session = previous.clone();
+            persistence_restart_required(format!(
+                "save failed ({error}); previous-state reconciliation failed ({serialization_error}); previous in-memory state was restored but disk state is unknown—restart before continuing"
+            ))
+        })?;
+        match load_persisted(&session.id) {
+            Ok(Some(on_disk)) => {
+                let on_disk_wire = serde_json::to_vec(&on_disk).map_err(|serialization_error| {
+                    *session = previous.clone();
+                    persistence_restart_required(format!(
+                        "save failed ({error}); persisted-state reconciliation failed ({serialization_error}); previous in-memory state was restored but disk state is unknown—restart before continuing"
+                    ))
+                })?;
+                if on_disk_wire == candidate {
+                    return Ok(PersistedMutation::PersistedWithWarning(
+                        result,
+                        format!(
+                            "session mutation was committed, but post-commit verification reported an error; live state was retained to match disk: {error}"
+                        ),
+                    ));
+                }
+                if on_disk_wire == previous_wire {
+                    *session = previous;
+                    anyhow::bail!(
+                        "save failed before commit; previous session was restored: {error}"
+                    );
+                }
+                *session = previous;
+                return Err(persistence_restart_required(format!(
+                    "save failed and disk contains a different session state ({error}); the previous live state was retained without autosaving and zerostack must restart to load the authoritative disk state"
+                )));
+            }
+            Ok(None) => {
+                *session = previous;
+                anyhow::bail!(
+                    "save failed and no persisted session was found; previous in-memory state was restored: {error}"
+                );
+            }
+            Err(reconcile_error) => {
+                *session = previous;
+                return Err(persistence_restart_required(format!(
+                    "save failed ({error}); disk reconciliation also failed ({reconcile_error}); previous in-memory state was restored without autosaving and zerostack must restart before continuing"
+                )));
+            }
+        }
+    }
+    Ok(PersistedMutation::Persisted(result))
+}
+
+#[derive(Debug)]
+struct PersistenceRestartRequired(String);
+
+impl std::fmt::Display for PersistenceRestartRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PersistenceRestartRequired {}
+
+fn persistence_restart_required(message: String) -> anyhow::Error {
+    PersistenceRestartRequired(message).into()
+}
+
+pub(crate) fn is_persistence_restart_required(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PersistenceRestartRequired>().is_some()
+}
+
+fn persist_session_unless_ephemeral(
+    no_session: bool,
+    session: &crate::session::Session,
+) -> anyhow::Result<()> {
+    if no_session {
+        Ok(())
+    } else {
+        crate::session::storage::save_session(session)
+    }
 }
 
 async fn handle_rewind(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
@@ -526,6 +718,26 @@ mod import_tests {
     }
 
     #[test]
+    fn native_session_import_discards_concealed_redo_history() {
+        let mut native = Session::new("native-provider", "native-model", 32_000, "native");
+        native.add_message(MessageRole::User, "concealed");
+        native.add_message(MessageRole::Assistant, "history");
+        assert_eq!(native.rewind_to(0), 2);
+        assert!(native.messages.is_empty());
+        assert!(native.rewind_undo.is_some());
+
+        let current = Session::new("current", "current", 128_000, "current");
+        let imported = parse_imported_session(
+            &serde_json::to_string(&native).unwrap(),
+            &current,
+            &Config::default(),
+        )
+        .unwrap();
+        assert!(imported.messages.is_empty());
+        assert!(imported.rewind_undo.is_none());
+    }
+
+    #[test]
     fn malformed_import_does_not_mutate_current_session() {
         let current = Session::new("current", "current", 128_000, "current");
         let original_id = current.id.clone();
@@ -579,5 +791,234 @@ mod import_tests {
         assert_eq!(session, "new session");
         assert_eq!(client, "new client");
         assert_eq!(agent.as_deref(), Some("new agent"));
+    }
+}
+
+#[cfg(test)]
+mod session_persistence_tests {
+    use super::{
+        PersistedMutation, clear_session_mutation, is_persistence_restart_required,
+        mutate_and_persist_session, redo_session_mutation, undo_session_mutation,
+    };
+    use crate::session::{MessageRole, Session};
+    use std::cell::{Cell, RefCell};
+
+    fn session_with_turn() -> Session {
+        let mut session = Session::new("provider", "model", 128_000, "persistence");
+        session.add_message(MessageRole::User, "question");
+        session.add_message(MessageRole::Assistant, "answer");
+        session
+    }
+
+    fn reload(snapshot: &RefCell<Option<String>>) -> Session {
+        serde_json::from_str(snapshot.borrow().as_deref().expect("snapshot must exist")).unwrap()
+    }
+
+    #[test]
+    fn slash_session_mutation_persistence_survives_immediate_reload() {
+        let snapshot = RefCell::new(None);
+        let mut session = session_with_turn();
+        let original_messages = session.messages.clone();
+
+        let removed = mutate_and_persist_session(
+            &mut session,
+            undo_session_mutation,
+            |candidate| {
+                *snapshot.borrow_mut() = Some(serde_json::to_string(candidate)?);
+                Ok(())
+            },
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(removed, PersistedMutation::Persisted(2));
+        assert!(session.messages.is_empty());
+        let mut reloaded_undo = reload(&snapshot);
+        assert!(reloaded_undo.messages.is_empty());
+        assert!(reloaded_undo.redo(), "restart must retain the redo point");
+        assert_eq!(reloaded_undo.messages.len(), original_messages.len());
+
+        mutate_and_persist_session(
+            &mut session,
+            redo_session_mutation,
+            |candidate| {
+                *snapshot.borrow_mut() = Some(serde_json::to_string(candidate)?);
+                Ok(())
+            },
+            |_| Ok(None),
+        )
+        .unwrap();
+        let mut reloaded_redo = reload(&snapshot);
+        assert_eq!(reloaded_redo.messages.len(), original_messages.len());
+        assert!(!reloaded_redo.redo(), "a consumed redo must stay consumed");
+
+        mutate_and_persist_session(
+            &mut session,
+            undo_session_mutation,
+            |_| Ok(()),
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert!(session.rewind_undo.is_some());
+        mutate_and_persist_session(
+            &mut session,
+            clear_session_mutation,
+            |candidate| {
+                *snapshot.borrow_mut() = Some(serde_json::to_string(candidate)?);
+                Ok(())
+            },
+            |_| Ok(None),
+        )
+        .unwrap();
+        let mut reloaded_clear = reload(&snapshot);
+        assert!(reloaded_clear.messages.is_empty());
+        assert_eq!(reloaded_clear.total_estimated_tokens, 0);
+        assert_eq!(reloaded_clear.calibrated_tokens, 0);
+        assert_eq!(reloaded_clear.calibrated_msg_count, 0);
+        assert!(reloaded_clear.compactions.is_empty());
+        assert!(
+            !reloaded_clear.redo(),
+            "clear must invalidate the redo point"
+        );
+    }
+
+    #[test]
+    fn slash_session_mutation_persistence_rolls_back_failed_save() {
+        let mut session = session_with_turn();
+        let persisted_before = session.clone();
+        let before = serde_json::to_string(&session).unwrap();
+        let error = mutate_and_persist_session(
+            &mut session,
+            undo_session_mutation,
+            |_| anyhow::bail!("injected persistence failure"),
+            |_| Ok(Some(persisted_before)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected persistence failure"));
+        assert_eq!(serde_json::to_string(&session).unwrap(), before);
+        assert!(session.rewind_undo.is_none());
+    }
+
+    #[test]
+    fn slash_session_mutation_persistence_retains_post_commit_state() {
+        let mut session = session_with_turn();
+        let committed = RefCell::new(None);
+        let outcome = mutate_and_persist_session(
+            &mut session,
+            undo_session_mutation,
+            |candidate| {
+                *committed.borrow_mut() = Some(candidate.clone());
+                anyhow::bail!("injected post-commit verification failure")
+            },
+            |_| Ok(committed.borrow().clone()),
+        )
+        .unwrap();
+        let PersistedMutation::PersistedWithWarning(2, warning) = outcome else {
+            panic!("committed candidate must be retained with a warning");
+        };
+        assert!(warning.contains("post-commit verification"));
+        assert!(session.messages.is_empty());
+        assert!(session.rewind_undo.is_some());
+    }
+
+    #[test]
+    fn slash_session_mutation_persistence_requires_restart_for_divergent_disk_state() {
+        let mut session = session_with_turn();
+        let previous_wire = serde_json::to_string(&session).unwrap();
+        let mut divergent = session.clone();
+        divergent.name = "concurrent disk writer".into();
+        let error = mutate_and_persist_session(
+            &mut session,
+            undo_session_mutation,
+            |_| anyhow::bail!("injected ambiguous save failure"),
+            |_| Ok(Some(divergent)),
+        )
+        .unwrap_err();
+        assert!(is_persistence_restart_required(&error));
+        assert!(error.to_string().contains("must restart"));
+        assert_eq!(serde_json::to_string(&session).unwrap(), previous_wire);
+    }
+
+    #[test]
+    fn slash_session_mutation_persistence_skips_empty_undo_and_redo() {
+        let mut session = Session::new("provider", "model", 128_000, "empty");
+        let persisted = Cell::new(false);
+        let undo = mutate_and_persist_session(
+            &mut session,
+            undo_session_mutation,
+            |_| {
+                persisted.set(true);
+                Ok(())
+            },
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(undo, PersistedMutation::Unchanged);
+        assert!(!persisted.get());
+
+        let redo = mutate_and_persist_session(
+            &mut session,
+            redo_session_mutation,
+            |_| {
+                persisted.set(true);
+                Ok(())
+            },
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(redo, PersistedMutation::Unchanged);
+        assert!(!persisted.get());
+    }
+
+    #[test]
+    fn slash_session_mutation_persistence_supports_repeated_undo_redo_cycles() {
+        let mut session = session_with_turn();
+        for _ in 0..3 {
+            assert_eq!(
+                mutate_and_persist_session(
+                    &mut session,
+                    undo_session_mutation,
+                    |_| Ok(()),
+                    |_| Ok(None),
+                )
+                .unwrap(),
+                PersistedMutation::Persisted(2)
+            );
+            assert!(session.messages.is_empty());
+            assert_eq!(
+                mutate_and_persist_session(
+                    &mut session,
+                    redo_session_mutation,
+                    |_| Ok(()),
+                    |_| Ok(None),
+                )
+                .unwrap(),
+                PersistedMutation::Persisted(())
+            );
+            assert_eq!(session.messages.len(), 2);
+        }
+    }
+
+    #[test]
+    fn slash_session_mutation_persistence_compaction_invalidates_redo_across_restart() {
+        let mut session = session_with_turn();
+        assert_eq!(
+            mutate_and_persist_session(
+                &mut session,
+                undo_session_mutation,
+                |_| Ok(()),
+                |_| Ok(None)
+            )
+            .unwrap(),
+            PersistedMutation::Persisted(2)
+        );
+        assert!(session.rewind_undo.is_some());
+        // Compaction mutates/reindexes the visible history after undo.
+        session.compress("summary".to_string(), 0, 0);
+        assert!(session.rewind_undo.is_none());
+
+        let serialized = serde_json::to_string(&session).unwrap();
+        let mut reloaded: Session = serde_json::from_str(&serialized).unwrap();
+        assert!(!reloaded.redo());
+        assert_eq!(reloaded.compacted_context().0, Some("summary"));
     }
 }
