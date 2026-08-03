@@ -176,17 +176,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
-        "src/extras/loop/headless.rs",
-        ".output()",
+        "src/extras/loop/validation.rs",
+        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
         1,
-        "TC-LOOP-VALIDATION",
+        "TEST-ONLY",
     ),
     (
-        "src/extras/loop/headless.rs",
-        "match tokio::process::Command::new(shell)",
+        "src/extras/loop/validation.rs",
+        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
         1,
-        "TC-LOOP-VALIDATION",
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "std::process::Command::new(\"/bin/kill\")",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/extras/loop/mod.rs",
@@ -232,22 +239,15 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-MCP-STDIO",
     ),
-    ("src/sandbox.rs", ".status();", 2, "TC-LIFECYCLE-HELPER"),
     (
-        "src/sandbox.rs",
-        "let _ = std::process::Command::new(\"kill\")",
-        2,
-        "TC-LIFECYCLE-HELPER",
+        "src/extras/mcp/client.rs",
+        "let mut child = Command::new(program);",
+        1,
+        "TC-MCP-STDIO",
     ),
     (
         "src/sandbox.rs",
         "let mut child = match cmd.spawn() {",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
         1,
         "TC-MODEL-ACTION",
     ),
@@ -259,21 +259,33 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(bwrap);",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(seatbelt);",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "use tokio::process::{Child, Command};",
         1,
         "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut child_command = std::process::Command::new(\"/bin/sh\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut child = child_command.spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut isolated = std::process::Command::new(current_exe);",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let status = isolated.status().unwrap();",
+        1,
+        "TEST-ONLY",
     ),
     ("src/session/mod.rs", ".output()", 1, "TC-INTERNAL-GIT"),
     (
@@ -306,18 +318,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "std::process::Command::new(\"bash\")",
         1,
         "TC-EXPLICIT-USER-SHELL",
-    ),
-    (
-        "src/ui/event_handler.rs",
-        ".output()",
-        1,
-        "TC-LOOP-VALIDATION",
-    ),
-    (
-        "src/ui/event_handler.rs",
-        "match tokio::process::Command::new(shell)",
-        1,
-        "TC-LOOP-VALIDATION",
     ),
     ("src/ui/input/mod.rs", ".status();", 1, "TC-SUPPORT-UTILITY"),
     (
@@ -355,11 +355,28 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 
 /// Sites whose identical terminal expression inherits different classes from
 /// the surrounding constructor, in source order.
-const MIXED_SITES: &[(&str, &str, &[&str])] = &[(
-    "src/ui/app.rs",
-    ".output()",
-    &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
-)];
+const MIXED_SITES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(\"zerobox\");",
+        &["TC-MODEL-ACTION", "TC-MCP-STDIO"],
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(bwrap);",
+        &["TC-MCP-STDIO", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(seatbelt);",
+        &["TC-MCP-STDIO", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/ui/app.rs",
+        ".output()",
+        &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
+    ),
+];
 
 const ALLOWED_CURRENT_CLASSES: &[&str] = &[
     "NON-PROCESS",
@@ -483,22 +500,28 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/sandbox.rs", ".status();", 2, "TC-LIFECYCLE-HELPER"),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
-        "src/sandbox.rs",
-        "let _ = std::process::Command::new(\"kill\")",
-        2,
-        "TC-LIFECYCLE-HELPER",
+        "src/extras/loop/validation.rs",
+        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/loop/validation.rs",
+        "std::process::Command::new(\"/bin/kill\")",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/sandbox.rs",
         "let mut child = match cmd.spawn() {",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
         1,
         "TC-MODEL-ACTION",
     ),
@@ -510,21 +533,33 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(bwrap);",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(seatbelt);",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "use tokio::process::{Child, Command};",
         1,
         "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut child_command = std::process::Command::new(\"/bin/sh\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut child = child_command.spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut isolated = std::process::Command::new(current_exe);",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let status = isolated.status().unwrap();",
+        1,
+        "TEST-ONLY",
     ),
     (
         "src/ui/app.rs",
@@ -546,24 +581,39 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
 ];
 
-const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[(
-    "src/ui/app.rs",
-    ".output()",
-    &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
-)];
+const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(\"zerobox\");",
+        &["TC-MODEL-ACTION", "TC-MCP-STDIO"],
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(bwrap);",
+        &["TC-MCP-STDIO", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(seatbelt);",
+        &["TC-MCP-STDIO", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/ui/app.rs",
+        ".output()",
+        &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
+    ),
+];
 
 /// Files whose non-disposition launch expressions all have one owner.
 const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/docs.rs", "TC-SUPPORT-UTILITY"),
     ("src/extras/git_worktree/mod.rs", "TC-INTERNAL-GIT"),
     ("src/extras/hooks/subprocess.rs", "TC-PROJECT-AUTOMATION"),
-    ("src/extras/loop/headless.rs", "TC-LOOP-VALIDATION"),
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
     ("src/session/mod.rs", "TC-INTERNAL-GIT"),
     ("src/startup.rs", "TC-EXPLICIT-USER-SHELL"),
-    ("src/ui/event_handler.rs", "TC-LOOP-VALIDATION"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/slash/memory.rs", "TC-SUPPORT-UTILITY"),
@@ -820,13 +870,6 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
             1,
             "TC-LIFECYCLE-HELPER",
             "a model action in the mixed sandbox family",
-        ),
-        (
-            "src/sandbox.rs",
-            "let _ = std::process::Command::new(\"kill\")",
-            1,
-            "TC-MODEL-ACTION",
-            "a lifecycle helper in the mixed sandbox family",
         ),
         (
             "src/ui/app.rs",

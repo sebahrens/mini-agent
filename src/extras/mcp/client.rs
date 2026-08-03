@@ -1,17 +1,26 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use compact_str::CompactString;
-use rmcp::service::{RoleClient, RunningService, serve_client};
-use rmcp::transport::{child_process::TokioChildProcess, which_command};
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
+use rmcp::service::{RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage, serve_client};
+use rmcp::transport::{Transport, child_process::TokioChildProcess, which_command};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
-use super::config::{McpServerConfig, TrustedMcpServer};
+use super::config::{McpServerConfig, McpStdioNetwork, TrustedMcpServer};
+use crate::sandbox::Sandbox;
 
 const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
@@ -21,6 +30,70 @@ pub struct McpClientHandle {
     pub server_name: CompactString,
     pub trusted_identity: Option<TrustedMcpServer>,
     pub running_service: RunningService<RoleClient, ()>,
+}
+
+struct OwnedStdioTransport {
+    inner: TokioChildProcess,
+    process_group: Option<u32>,
+}
+
+impl OwnedStdioTransport {
+    fn new(inner: TokioChildProcess) -> Self {
+        Self {
+            process_group: inner.id(),
+            inner,
+        }
+    }
+
+    fn terminate_tree(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.process_group.take() {
+            crate::sandbox::kill_process_group(pid);
+        }
+        #[cfg(not(unix))]
+        self.process_group.take();
+    }
+}
+
+impl Drop for OwnedStdioTransport {
+    fn drop(&mut self) {
+        self.terminate_tree();
+    }
+}
+
+impl Transport<RoleClient> for OwnedStdioTransport {
+    type Error = std::io::Error;
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleClient>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
+        self.inner.receive()
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            let result = self.inner.graceful_shutdown().await;
+            // A direct server may exit while a descendant that closed all MCP
+            // pipes survives. Terminate the still-owned group after graceful
+            // direct-child cleanup, before this transport can be forgotten.
+            self.terminate_tree();
+            result
+        }
+    }
+}
+
+impl Drop for McpClientHandle {
+    fn drop(&mut self) {
+        // RunningService's own DropGuard is asynchronous. Signal cancellation
+        // immediately. The service task's OwnedStdioTransport then closes and
+        // reaps its Unix process group or Windows Job Object.
+        self.running_service.cancellation_token().cancel();
+    }
 }
 
 impl McpClientHandle {
@@ -37,26 +110,48 @@ impl McpClientHandle {
         initialize_timeout: Duration,
     ) -> anyhow::Result<Self> {
         match config {
-            McpServerConfig::Command { command, args, env } => {
+            McpServerConfig::Command {
+                command,
+                args,
+                cwd,
+                env,
+                inherit_env,
+                sandbox,
+                network,
+            } => {
                 tracing::debug!(
-                    "MCP command transport: {} {:?} ({} env vars)",
+                    "MCP command transport configured ({} args, {} env vars, {} inherited env vars)",
+                    args.len(),
+                    env.len(),
+                    inherit_env.len(),
+                );
+                let cmd = stdio_command(
                     command,
                     args,
-                    env.len(),
-                );
-                let cmd = stdio_command(command, args, env).map_err(|error| {
-                    anyhow::anyhow!(
-                        "MCP command resolution failed for '{server_name}' ({command}): {error}"
+                    cwd.as_deref(),
+                    env,
+                    inherit_env,
+                    sandbox.as_deref(),
+                    *network,
+                )
+                .map_err(|error| {
+                    bounded_stdio_error(
+                        &server_name,
+                        &format!("command resolution failed: {error}"),
+                        "",
                     )
                 })?;
-                let (transport, stderr) = TokioChildProcess::builder(cmd)
+                let (transport, stderr) = TokioChildProcess::builder(owned_process_tree(cmd))
                     .stderr(Stdio::piped())
                     .spawn()
                     .map_err(|error| {
-                        anyhow::anyhow!(
-                            "MCP command spawn failed for '{server_name}' ({command}): {error}"
+                        bounded_stdio_error(
+                            &server_name,
+                            &format!("command spawn failed: {error}"),
+                            "",
                         )
                     })?;
+                let transport = OwnedStdioTransport::new(transport);
                 let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
                 let stderr_task =
                     stderr.map(|stderr| capture_stderr(stderr, Arc::clone(&stderr_buffer)));
@@ -65,10 +160,10 @@ impl McpClientHandle {
                         .await
                     {
                         Ok(Ok(service)) => service,
-                        Ok(Err(error)) => {
+                        Ok(Err(_)) => {
                             return Err(stdio_connect_error(
                                 &server_name,
-                                format!("initialization failed: {error}"),
+                                "initialization failed".to_string(),
                                 stderr_task,
                                 stderr_buffer,
                             )
@@ -198,23 +293,143 @@ async fn stdio_connect_error(
         let captured = stderr_buffer
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        String::from_utf8_lossy(&captured).trim().to_owned()
+        bounded_lossy_diagnostic(&captured)
     };
-    if diagnostic.is_empty() {
-        anyhow::anyhow!("MCP connection failed for '{server_name}': {reason}")
-    } else {
-        anyhow::anyhow!("MCP connection failed for '{server_name}': {reason}; stderr: {diagnostic}")
+    bounded_stdio_error(server_name, &reason, &diagnostic)
+}
+
+fn bounded_stdio_error(server_name: &str, reason: &str, diagnostic: &str) -> anyhow::Error {
+    let server_name = bounded_utf8(server_name.trim(), 256);
+    let reason = bounded_utf8(reason.trim(), 512);
+    let mut rendered = format!("MCP connection failed for '{server_name}': {reason}");
+    if !diagnostic.is_empty() && rendered.len() < MCP_STDERR_LIMIT {
+        append_bounded(&mut rendered, "; stderr: ", MCP_STDERR_LIMIT);
+        append_bounded(&mut rendered, &diagnostic, MCP_STDERR_LIMIT);
+    }
+    anyhow::anyhow!(rendered)
+}
+
+fn bounded_lossy_diagnostic(bytes: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(bytes);
+    bounded_utf8(lossy.trim(), MCP_STDERR_LIMIT)
+}
+
+fn bounded_utf8(value: &str, limit: usize) -> String {
+    let mut rendered = String::with_capacity(value.len().min(limit));
+    append_bounded(&mut rendered, value, limit);
+    rendered
+}
+
+fn append_bounded(rendered: &mut String, value: &str, limit: usize) {
+    for character in value.chars() {
+        if rendered.len() + character.len_utf8() > limit {
+            break;
+        }
+        rendered.push(character);
     }
 }
 
 fn stdio_command(
     command: &str,
     args: &[String],
+    configured_cwd: Option<&Path>,
     env: &HashMap<String, String>,
-) -> std::io::Result<Command> {
-    let mut command = which_command(command)?;
-    command.args(args).envs(env);
-    Ok(command)
+    inherit_env: &[String],
+    sandbox_backend: Option<&str>,
+    network: McpStdioNetwork,
+) -> anyhow::Result<Command> {
+    // Resolve against the parent's PATH before clearing the child's ambient
+    // environment. The immutable absolute identity is what is ultimately
+    // passed to exec; the child does not need PATH merely to locate itself.
+    let resolved = which_command(command)?;
+    let program = PathBuf::from(resolved.as_std().get_program());
+    let cwd = match configured_cwd {
+        Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
+        Some(cwd) => std::env::current_dir()?.join(cwd),
+        None => std::env::current_dir()?,
+    };
+    let cwd = cwd.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "configured MCP stdio working directory '{}' is unavailable: {error}",
+            cwd.display()
+        )
+    })?;
+
+    let delegated = delegated_environment(inherit_env, env)?;
+
+    if let Some(backend) = sandbox_backend {
+        return Sandbox::new(true, backend)
+            .wrap_workspace_service(
+                &program,
+                args,
+                &cwd,
+                &delegated,
+                network == McpStdioNetwork::Deny,
+            )
+            .map_err(anyhow::Error::msg);
+    }
+    if network == McpStdioNetwork::Deny {
+        anyhow::bail!("MCP stdio network denial requires an available workspace-service sandbox");
+    }
+
+    let mut child = Command::new(program);
+    child
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(delegated);
+    Ok(child)
+}
+
+fn delegated_environment(
+    inherit_env: &[String],
+    env: &HashMap<String, String>,
+) -> anyhow::Result<Vec<(OsString, OsString)>> {
+    let mut delegated = HashMap::<String, (OsString, OsString)>::new();
+    for name in inherit_env {
+        if name.is_empty() || name.contains('=') {
+            anyhow::bail!(
+                "MCP stdio inherited environment names must be non-empty and contain no '='"
+            );
+        }
+        if let Some(value) = std::env::var_os(name) {
+            delegated.insert(environment_identity(name), (OsString::from(name), value));
+        }
+    }
+    for (name, value) in env {
+        if name.is_empty() || name.contains('=') {
+            anyhow::bail!("MCP stdio environment names must be non-empty and contain no '='");
+        }
+        delegated.insert(
+            environment_identity(name),
+            (OsString::from(name), OsString::from(value)),
+        );
+    }
+    Ok(delegated.into_values().collect())
+}
+
+fn environment_identity(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        name.to_ascii_uppercase()
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_owned()
+    }
+}
+
+/// Give rmcp ownership of the complete process tree, not only the direct
+/// child. `Transport::close`, initialization failure, task cancellation, and
+/// service drop all then converge on the same kill-and-reap implementation.
+fn owned_process_tree(command: Command) -> CommandWrap {
+    let mut command = CommandWrap::from(command);
+    command.wrap(KillOnDrop);
+    #[cfg(unix)]
+    command.wrap(ProcessGroup::leader());
+    #[cfg(windows)]
+    command.wrap(JobObject);
+    command
 }
 
 fn parse_headers(
@@ -360,14 +575,54 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        parse_mcp_server_url, stdio_command, validate_mcp_server_url, validate_resolved_addresses,
+        bounded_lossy_diagnostic, delegated_environment, parse_mcp_server_url, stdio_command,
+        validate_mcp_server_url, validate_resolved_addresses,
     };
 
     #[test]
     fn stdio_command_resolves_path_lookup_before_spawn() {
-        let command = stdio_command("rustc", &[], &HashMap::new()).unwrap();
+        let command = stdio_command(
+            "rustc",
+            &[],
+            None,
+            &HashMap::new(),
+            &[],
+            None,
+            super::McpStdioNetwork::Inherit,
+        )
+        .unwrap();
 
         assert!(std::path::Path::new(command.as_std().get_program()).is_absolute());
+    }
+
+    #[test]
+    fn lossy_stderr_rendering_remains_within_the_byte_cap() {
+        let rendered = bounded_lossy_diagnostic(&vec![0xff; super::MCP_STDERR_LIMIT]);
+
+        assert!(rendered.len() <= super::MCP_STDERR_LIMIT);
+        assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn explicit_environment_overrides_inherited_value() {
+        let name = "PATH";
+        let explicit = HashMap::from([(name.to_string(), "explicit-path".to_string())]);
+        let delegated = delegated_environment(&[name.to_string()], &explicit).unwrap();
+
+        assert_eq!(delegated.len(), 1);
+        assert_eq!(delegated[0].0, std::ffi::OsString::from(name));
+        assert_eq!(delegated[0].1, std::ffi::OsString::from("explicit-path"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_environment_override_is_case_insensitive() {
+        let explicit = HashMap::from([("Path".to_string(), "explicit-path".to_string())]);
+        let delegated = delegated_environment(&["PATH".to_string()], &explicit).unwrap();
+
+        assert_eq!(delegated.len(), 1);
+        assert_eq!(delegated[0].0, std::ffi::OsString::from("Path"));
+        assert_eq!(delegated[0].1, std::ffi::OsString::from("explicit-path"));
     }
 
     #[tokio::test]

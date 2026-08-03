@@ -91,6 +91,20 @@ impl McpClientManager {
         cfg: &config::McpServerConfig,
     ) -> anyhow::Result<()> {
         tracing::info!("MCP reconnecting server '{}'", name);
+        // Command servers commonly own an exclusive local resource. Stop and
+        // reap the old tree before initializing its replacement; otherwise the
+        // replacement can fail on a port, socket, lock, or PID-file collision.
+        // Remote HTTP transports keep transactional connect-before-replace
+        // behavior because they do not own a local service process.
+        if matches!(cfg, config::McpServerConfig::Command { .. })
+            && let Some(index) = self
+                .handles
+                .iter()
+                .position(|handle| handle.server_name == name)
+        {
+            let mut previous = self.handles.remove(index);
+            let _ = previous.running_service.close().await;
+        }
         let handle = client::McpClientHandle::connect(CompactString::new(name), cfg).await?;
         self.handles.retain(|h| h.server_name != name);
         self.handles.push(handle);
@@ -99,12 +113,12 @@ impl McpClientManager {
 
     pub async fn shutdown(self) {
         tracing::debug!("MCP shutting down {} connections", self.handles.len());
-        for handle in self.handles {
+        for mut handle in self.handles {
             let name = handle.server_name.clone();
             // Explicitly shut down the running service so child processes and
             // HTTP connections are cleaned up properly, rather than relying on
             // Drop which may not await teardown.
-            let _ = handle.running_service.cancel().await;
+            let _ = handle.running_service.close().await;
             tracing::debug!("Disconnected from MCP server '{}'", name);
         }
     }
