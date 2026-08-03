@@ -13,6 +13,7 @@ pub(crate) use memory::verify_memory_editor_preservation;
 mod providers;
 pub(crate) mod review;
 mod session;
+pub(crate) use session::is_persistence_restart_required;
 pub(crate) mod settings;
 
 pub(crate) use providers::warm_model_cache;
@@ -72,6 +73,22 @@ impl SlashCtx<'_> {
             #[cfg(feature = "mcp")]
             mcp_manager: self.mcp_manager,
         }
+    }
+
+    async fn build_agent_for_client(&self, client: &AnyClient, model_id: &str) -> AnyAgent {
+        AgentBuildCtx {
+            cli: self.cli,
+            cfg: self.cfg,
+            context: self.context,
+            client,
+            permission: self.permission,
+            ask_tx: self.ask_tx,
+            sandbox: self.sandbox,
+            #[cfg(feature = "mcp")]
+            mcp_manager: self.mcp_manager,
+        }
+        .rebuild_agent(model_id, *self.reasoning_enabled)
+        .await
     }
 
     pub async fn rebuild_agent(&mut self) {

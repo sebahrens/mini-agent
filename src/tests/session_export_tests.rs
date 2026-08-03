@@ -1,4 +1,7 @@
-use crate::extras::export::{parse_jsonl_import, session_to_html, session_to_jsonl};
+use crate::extras::export::{
+    MAX_SESSION_IMPORT_BYTES, MAX_SESSION_IMPORT_MESSAGES, ParsedSessionFile, parse_jsonl_import,
+    parse_session_file, session_to_html, session_to_jsonl,
+};
 use crate::session::{MessageRole, Session};
 
 fn sample_session() -> Session {
@@ -13,7 +16,7 @@ fn sample_session() -> Session {
 #[test]
 fn jsonl_round_trip_preserves_messages() {
     let session = sample_session();
-    let jsonl = session_to_jsonl(&session);
+    let jsonl = session_to_jsonl(&session).unwrap();
     let messages = parse_jsonl_import(&jsonl).unwrap();
     assert_eq!(messages.len(), session.messages.len());
     for (imported, original) in messages.iter().zip(session.messages.iter()) {
@@ -25,7 +28,7 @@ fn jsonl_round_trip_preserves_messages() {
 #[test]
 fn jsonl_first_line_is_session_metadata() {
     let session = sample_session();
-    let jsonl = session_to_jsonl(&session);
+    let jsonl = session_to_jsonl(&session).unwrap();
     let header: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
     assert_eq!(header["type"], "session");
     assert_eq!(header["name"], "demo session");
@@ -57,6 +60,179 @@ fn jsonl_import_errors_with_line_number_on_bad_json() {
 fn jsonl_import_errors_when_no_messages() {
     let err = parse_jsonl_import("{\"type\":\"session\"}\n").unwrap_err();
     assert!(err.to_string().contains("no messages"));
+}
+
+#[test]
+fn exported_jsonl_schema_preserves_metadata_and_messages() {
+    let session = sample_session();
+    let jsonl = session_to_jsonl(&session).unwrap();
+    let ParsedSessionFile::Jsonl(imported) = parse_session_file(&jsonl).unwrap() else {
+        panic!("exported JSONL must select the JSONL schema");
+    };
+    assert_eq!(imported.id, session.id);
+    assert_eq!(imported.name, session.name);
+    assert_eq!(imported.provider, session.provider);
+    assert_eq!(imported.model, session.model);
+    assert_eq!(imported.created_at, session.created_at);
+    assert_eq!(imported.messages.len(), session.messages.len());
+    for (imported, original) in imported.messages.iter().zip(&session.messages) {
+        assert_eq!(imported.role, original.role);
+        assert_eq!(imported.content, original.content);
+        assert_eq!(imported.estimated_tokens, original.estimated_tokens);
+    }
+}
+
+#[test]
+fn native_pretty_json_with_bom_is_detected_and_fully_consumed() {
+    let session = sample_session();
+    let pretty = serde_json::to_string_pretty(&session).unwrap();
+    let content = format!("\u{feff}  {pretty}\n");
+    let ParsedSessionFile::Native(imported) = parse_session_file(&content).unwrap() else {
+        panic!("pretty native JSON must select the native schema");
+    };
+    assert_eq!(imported.id, session.id);
+    assert_eq!(imported.messages.len(), session.messages.len());
+
+    let error = parse_session_file(&format!("{pretty}\n{{}}"))
+        .err()
+        .expect("trailing native JSON value must fail");
+    assert!(error.to_string().contains("trailing values"));
+}
+
+#[test]
+fn session_file_detection_rejects_ambiguous_and_unsupported_schemas() {
+    let session = sample_session();
+    let mut ambiguous = serde_json::to_value(&session).unwrap();
+    let object = ambiguous.as_object_mut().unwrap();
+    object.insert("type".into(), serde_json::json!("session"));
+    object.insert(
+        "format".into(),
+        serde_json::json!("zerostack-session-jsonl"),
+    );
+    object.insert("version".into(), serde_json::json!(1));
+    let error = parse_session_file(&ambiguous.to_string())
+        .err()
+        .expect("mixed schema must fail");
+    assert!(error.to_string().contains("ambiguous"));
+
+    let jsonl = session_to_jsonl(&session)
+        .unwrap()
+        .replacen("\"version\":1", "\"version\":2", 1);
+    let error = parse_session_file(&jsonl)
+        .err()
+        .expect("unsupported version must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported JSONL session version 2")
+    );
+}
+
+#[test]
+fn strict_jsonl_detection_reports_malformed_middle_line() {
+    let session = sample_session();
+    let mut lines = session_to_jsonl(&session)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    lines.insert(2, "not json".to_string());
+    let error = parse_session_file(&lines.join("\n"))
+        .err()
+        .expect("malformed middle line must fail");
+    assert!(error.to_string().contains("line 3 is not valid JSON"));
+}
+
+#[test]
+fn session_file_detection_rejects_malformed_first_line_and_oversized_input() {
+    let first_line_error = parse_session_file("not json\n{}")
+        .err()
+        .expect("malformed first line must fail before schema dispatch");
+    assert!(
+        first_line_error
+            .to_string()
+            .contains("first session value is not valid JSON")
+    );
+
+    let oversized = "x".repeat(MAX_SESSION_IMPORT_BYTES + 1);
+    let oversized_error = parse_session_file(&oversized)
+        .err()
+        .expect("oversized input must fail before parsing");
+    assert!(oversized_error.to_string().contains("byte limit"));
+}
+
+#[test]
+fn strict_jsonl_detection_enforces_message_bound() {
+    let session = sample_session();
+    let header = session_to_jsonl(&session)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let message = serde_json::json!({
+        "role": "user",
+        "content": "bounded",
+        "estimated_tokens": 1,
+    })
+    .to_string();
+    let mut jsonl = String::with_capacity(
+        header.len() + (message.len() + 1) * (MAX_SESSION_IMPORT_MESSAGES + 1),
+    );
+    jsonl.push_str(&header);
+    for _ in 0..=MAX_SESSION_IMPORT_MESSAGES {
+        jsonl.push('\n');
+        jsonl.push_str(&message);
+    }
+
+    let error = parse_session_file(&jsonl)
+        .err()
+        .expect("too many messages must fail");
+    assert!(error.to_string().contains("more than 10000 messages"));
+}
+
+#[test]
+fn bounded_jsonl_export_round_trips_empty_and_maximum_message_sessions() {
+    let empty = Session::new("provider", "model", 128_000, "empty");
+    let empty_jsonl = session_to_jsonl(&empty).unwrap();
+    let ParsedSessionFile::Jsonl(empty_import) = parse_session_file(&empty_jsonl).unwrap() else {
+        panic!("empty export must retain the JSONL schema");
+    };
+    assert!(empty_import.messages.is_empty());
+
+    let mut maximum = Session::new("provider", "model", 128_000, "maximum");
+    for _ in 0..MAX_SESSION_IMPORT_MESSAGES {
+        maximum.add_message(MessageRole::User, "x");
+    }
+    let maximum_jsonl = session_to_jsonl(&maximum).unwrap();
+    let ParsedSessionFile::Jsonl(maximum_import) = parse_session_file(&maximum_jsonl).unwrap()
+    else {
+        panic!("maximum-sized message collection must retain the JSONL schema");
+    };
+    assert_eq!(maximum_import.messages.len(), MAX_SESSION_IMPORT_MESSAGES);
+}
+
+#[test]
+fn bounded_jsonl_export_refuses_outputs_its_importer_cannot_accept() {
+    let mut too_many = Session::new("provider", "model", 128_000, "too many");
+    for _ in 0..=MAX_SESSION_IMPORT_MESSAGES {
+        too_many.add_message(MessageRole::User, "x");
+    }
+    assert!(
+        session_to_jsonl(&too_many)
+            .unwrap_err()
+            .to_string()
+            .contains("more than 10000 messages")
+    );
+
+    let mut line_too_large = Session::new("provider", "model", 128_000, "line too large");
+    line_too_large.add_message(MessageRole::User, &"x".repeat(4 * 1024 * 1024));
+    assert!(
+        session_to_jsonl(&line_too_large)
+            .unwrap_err()
+            .to_string()
+            .contains("line limit")
+    );
 }
 
 #[test]

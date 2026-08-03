@@ -2,8 +2,8 @@ use crate::permission::checker::{CheckResult, PermissionChecker};
 use crate::permission::{PermissionConfigs, SecurityMode};
 use crate::session::MessageRole;
 use crate::session::storage::{
-    atomic_write, delete_session, find_sessions_by_prefix, load_suffix, save_session,
-    save_tool_output, suffix_path,
+    atomic_write, delete_session, find_sessions_by_prefix, load_session_exact, load_suffix,
+    save_session, save_tool_output, suffix_path,
 };
 use crate::session::{
     PermissionAllowEntry, Session, TOOL_RESULT_HEAD_CHARS, TOOL_RESULT_SAVE_THRESHOLD,
@@ -101,6 +101,42 @@ fn save_and_find_session_by_prefix() {
     assert_eq!(found.len(), 1, "id prefix: {}", &s.id[..8]);
     assert_eq!(found[0].id, s.id);
     assert_eq!(found[0].model.as_str(), "gpt-4");
+    drop(env);
+}
+
+#[test]
+fn load_session_exact_reconciles_the_private_saved_snapshot() {
+    let env = setup_test_env();
+    let mut session = Session::new("openai", "gpt-4", 128_000, "exact");
+    session.add_message(MessageRole::User, "visible");
+    session.add_message(MessageRole::Assistant, "history");
+    assert_eq!(session.rewind_to(0), 2);
+    save_session(&session).unwrap();
+
+    let mut loaded = load_session_exact(&session.id)
+        .unwrap()
+        .expect("exact persisted session must load");
+    assert!(loaded.messages.is_empty());
+    assert!(loaded.redo());
+    assert_eq!(loaded.messages.len(), 2);
+    assert!(load_session_exact("missing-session").unwrap().is_none());
+    drop(env);
+}
+
+#[test]
+fn load_session_exact_rejects_an_embedded_id_mismatch() {
+    let env = setup_test_env();
+    let expected = Session::new("openai", "gpt-4", 128_000, "expected");
+    save_session(&expected).unwrap();
+
+    let different = Session::new("openai", "gpt-4", 128_000, "different");
+    let path = Path::new(&env.data_dir)
+        .join("sessions")
+        .join(format!("{}.json", expected.id));
+    atomic_write(&path, &serde_json::to_string(&different).unwrap()).unwrap();
+
+    let error = load_session_exact(&expected.id).unwrap_err();
+    assert!(error.to_string().contains("persisted session ID mismatch"));
     drop(env);
 }
 

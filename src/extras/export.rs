@@ -11,9 +11,19 @@ use serde::Deserialize;
 
 use crate::session::{MessageRole, Session, SessionMessage};
 
+pub const MAX_SESSION_IMPORT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SESSION_IMPORT_MESSAGES: usize = 10_000;
+const MAX_SESSION_IMPORT_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Export a session as JSONL: one metadata header line, then one message per
-/// line. This is the format `parse_jsonl_import` accepts back.
-pub fn session_to_jsonl(session: &Session) -> String {
+/// line. Refuses output outside the same bounds [`parse_session_file`] accepts.
+pub fn session_to_jsonl(session: &Session) -> Result<String> {
+    if session.messages.len() > MAX_SESSION_IMPORT_MESSAGES {
+        anyhow::bail!(
+            "session contains more than {} messages",
+            MAX_SESSION_IMPORT_MESSAGES
+        );
+    }
     let mut out = String::new();
     let header = serde_json::json!({
         "type": "session",
@@ -25,18 +35,32 @@ pub fn session_to_jsonl(session: &Session) -> String {
         "model": session.model.as_str(),
         "created_at": session.created_at.as_str(),
     });
-    out.push_str(&header.to_string());
+    let header = header.to_string();
+    if header.len() > MAX_SESSION_IMPORT_LINE_BYTES {
+        anyhow::bail!("session header exceeds the JSONL line limit");
+    }
+    out.push_str(&header);
     for msg in &session.messages {
-        out.push('\n');
         let line = serde_json::json!({
             "role": msg.role,
             "content": msg.content.as_str(),
             "estimated_tokens": msg.estimated_tokens,
-        });
-        out.push_str(&line.to_string());
+        })
+        .to_string();
+        if line.len() > MAX_SESSION_IMPORT_LINE_BYTES {
+            anyhow::bail!("session message exceeds the JSONL line limit");
+        }
+        if out.len().saturating_add(line.len()).saturating_add(2) > MAX_SESSION_IMPORT_BYTES {
+            anyhow::bail!(
+                "session export exceeds the {} byte import limit",
+                MAX_SESSION_IMPORT_BYTES
+            );
+        }
+        out.push('\n');
+        out.push_str(&line);
     }
     out.push('\n');
-    out
+    Ok(out)
 }
 
 /// Tolerant import shape: `estimated_tokens` is optional so JSONL produced by
@@ -49,8 +73,157 @@ struct ImportMessage {
     estimated_tokens: u64,
 }
 
+#[derive(Deserialize)]
+struct JsonlSessionHeader {
+    #[serde(rename = "type")]
+    kind: CompactString,
+    format: CompactString,
+    version: u64,
+    id: CompactString,
+    #[serde(default)]
+    name: CompactString,
+    provider: CompactString,
+    model: CompactString,
+    created_at: CompactString,
+}
+
+pub struct JsonlSessionImport {
+    pub id: CompactString,
+    pub name: CompactString,
+    pub provider: CompactString,
+    pub model: CompactString,
+    pub created_at: CompactString,
+    pub messages: Vec<SessionMessage>,
+}
+
+pub enum ParsedSessionFile {
+    Native(Session),
+    Jsonl(JsonlSessionImport),
+}
+
+/// Detect a native Session document versus this repository's versioned JSONL
+/// export by schema. Arbitrary malformed JSON never falls through to the more
+/// tolerant line parser.
+pub fn parse_session_file(content: &str) -> Result<ParsedSessionFile> {
+    if content.len() > MAX_SESSION_IMPORT_BYTES {
+        anyhow::bail!(
+            "session import exceeds the {} byte limit",
+            MAX_SESSION_IMPORT_BYTES
+        );
+    }
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let trimmed = content.trim_start();
+    if trimmed.is_empty() {
+        anyhow::bail!("session import is empty");
+    }
+
+    let mut values = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    let first = values
+        .next()
+        .transpose()
+        .context("first session value is not valid JSON")?
+        .context("session import is empty")?;
+    let trailing = &trimmed[values.byte_offset()..];
+    let object = first
+        .as_object()
+        .context("first session value must be a JSON object")?;
+    let native_shape = ["id", "messages", "provider", "model", "context_window"]
+        .iter()
+        .all(|field| object.contains_key(*field));
+    let jsonl_marker = object.get("type").and_then(|value| value.as_str()) == Some("session")
+        || object.contains_key("format")
+        || object.contains_key("version");
+
+    if native_shape && jsonl_marker {
+        anyhow::bail!("ambiguous session object mixes native and JSONL schemas");
+    }
+    if jsonl_marker {
+        return parse_jsonl_export(content).map(ParsedSessionFile::Jsonl);
+    }
+    if !native_shape {
+        anyhow::bail!("unrecognized session schema");
+    }
+    if !trailing.trim().is_empty() {
+        anyhow::bail!("native session JSON has trailing values");
+    }
+
+    let session: Session = serde_json::from_value(first).context("invalid native session")?;
+    if session.messages.len() > MAX_SESSION_IMPORT_MESSAGES {
+        anyhow::bail!(
+            "native session contains more than {} messages",
+            MAX_SESSION_IMPORT_MESSAGES
+        );
+    }
+    Ok(ParsedSessionFile::Native(session))
+}
+
+fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut header = None;
+    let mut messages = Vec::new();
+    for (index, raw_line) in content.lines().enumerate() {
+        if raw_line.len() > MAX_SESSION_IMPORT_LINE_BYTES {
+            anyhow::bail!(
+                "line {} exceeds the {} byte limit",
+                index + 1,
+                MAX_SESSION_IMPORT_LINE_BYTES
+            );
+        }
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("line {} is not valid JSON", index + 1))?;
+        if header.is_none() {
+            let parsed: JsonlSessionHeader = serde_json::from_value(value)
+                .with_context(|| format!("line {} is not a JSONL session header", index + 1))?;
+            if parsed.kind != "session" || parsed.format != "zerostack-session-jsonl" {
+                anyhow::bail!("unsupported JSONL session format on line {}", index + 1);
+            }
+            if parsed.version != 1 {
+                anyhow::bail!(
+                    "unsupported JSONL session version {} on line {}",
+                    parsed.version,
+                    index + 1
+                );
+            }
+            header = Some(parsed);
+            continue;
+        }
+        if value.get("type").and_then(|item| item.as_str()) == Some("session")
+            || value.get("format").is_some()
+        {
+            anyhow::bail!("duplicate JSONL session header on line {}", index + 1);
+        }
+        let message: ImportMessage = serde_json::from_value(value)
+            .with_context(|| format!("line {} is not a session message", index + 1))?;
+        messages.push(SessionMessage {
+            role: message.role,
+            content: message.content,
+            estimated_tokens: message.estimated_tokens,
+        });
+        if messages.len() > MAX_SESSION_IMPORT_MESSAGES {
+            anyhow::bail!(
+                "JSONL session contains more than {} messages",
+                MAX_SESSION_IMPORT_MESSAGES
+            );
+        }
+    }
+    let header = header.context("JSONL session header is missing")?;
+    Ok(JsonlSessionImport {
+        id: header.id,
+        name: header.name,
+        provider: header.provider,
+        model: header.model,
+        created_at: header.created_at,
+        messages,
+    })
+}
+
 /// Parse a JSONL session export back into messages. The metadata header line
 /// is skipped; malformed lines error with their line number.
+#[cfg(test)]
 pub fn parse_jsonl_import(content: &str) -> Result<Vec<SessionMessage>> {
     let mut messages = Vec::new();
     for (idx, line) in content.lines().enumerate() {

@@ -1594,6 +1594,9 @@ impl<'a> App<'a> {
                     )?,
                 }
             }
+            Err(e) if crate::ui::slash::is_persistence_restart_required(&e) => {
+                return Err(e);
+            }
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted) =>
