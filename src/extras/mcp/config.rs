@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -55,8 +56,25 @@ pub enum McpServerConfig {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        /// Working directory for the service. When omitted, the connection
+        /// workspace is captured and applied explicitly before spawn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        /// Values supplied directly to the service after clearing the ambient
+        /// process environment.
         #[serde(default)]
         env: HashMap<String, String>,
+        /// Parent environment names deliberately delegated to the service.
+        /// Explicit `env` values win when a name appears in both collections.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inherit_env: Vec<String>,
+        /// Optional dedicated workspace-service sandbox backend. Omitting it
+        /// is an explicit trusted-code bypass, not an implicit sandbox claim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<String>,
+        /// Network authority requested for this service process.
+        #[serde(default, skip_serializing_if = "McpStdioNetwork::is_inherit")]
+        network: McpStdioNetwork,
     },
     Url {
         url: String,
@@ -73,6 +91,26 @@ pub enum McpServerConfig {
         #[serde(default)]
         headers: HashMap<String, String>,
     },
+}
+
+/// Network authority is a launch property, independent from permission to
+/// invoke any tool later exposed by the MCP server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpStdioNetwork {
+    /// Use the host network when unsandboxed, or retain network access in a
+    /// requested workspace-service sandbox.
+    #[default]
+    Inherit,
+    /// Require the selected sandbox backend to deny network access. This is
+    /// rejected when no sandbox is selected or the backend cannot enforce it.
+    Deny,
+}
+
+impl McpStdioNetwork {
+    const fn is_inherit(value: &Self) -> bool {
+        matches!(value, Self::Inherit)
+    }
 }
 
 impl McpServerConfig {

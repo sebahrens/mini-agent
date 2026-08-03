@@ -987,17 +987,36 @@ permission:
 ```
 
 When compiled with MCP support, `mcp_servers` accepts local stdio and remote
-URL-based servers. A local stdio entry launches `command` directly, passes
-`args` without shell parsing, extends the inherited process environment with
-`env`, and speaks MCP over the child process's stdin/stdout. `command` may be
-an executable available on `PATH` or an absolute executable path; zerostack
-resolves platform shims such as Windows `.cmd`/`.exe` launchers before spawn.
+URL-based servers. A local stdio entry launches `command` directly and passes
+`args` without shell parsing. `command` may be an executable available on
+`PATH` or an absolute executable path; zerostack resolves platform shims such
+as Windows `.cmd`/`.exe` launchers to an absolute identity before spawn.
+
+The child environment is empty by default. `env` supplies explicit values and
+`inherit_env` names individual parent variables that the server is allowed to
+receive; an `env` value wins if the same name appears in both. `cwd` selects an
+explicit working directory. When omitted, zerostack captures the connection
+workspace and still applies it explicitly rather than inheriting mutable
+process-global state.
+
+Configured command servers are human-trusted workspace services. Omitting
+`sandbox` is an explicit trusted-code bypass with inherited host filesystem and
+network access; it is not reported as sandboxed. Set `sandbox` to a supported
+backend name to require the dedicated workspace-service profile. A missing or
+unsupported requested backend denies launch. `network` is `inherit` by default;
+`network = "deny"` requires a selected backend that can enforce denial and
+otherwise also denies launch. Server launch trust, service sandbox/network
+authority, and permission to call each exposed MCP tool are independent.
+
 The server must reserve stdout for MCP protocol messages and write diagnostics
 to stderr. Local servers must complete the MCP initialization handshake within
 10 seconds. Resolution, spawn, handshake, malformed-output, and early-exit
 failures identify the configured server and include at most 8 KiB of captured
-stderr so startup diagnostics stay useful and bounded. A server that does not
-exit after stdin closes is force-terminated during shutdown.
+stderr (including invalid UTF-8 replacement) so startup diagnostics stay useful
+and bounded. The transport owns a Unix process group or Windows Job Object;
+initialization failure, cancellation, reconnect replacement, shutdown, and
+handle drop terminate and reap the service tree, including descendants that
+close inherited protocol pipes.
 
 Servers can also be added per project via `.zerostack/config.toml` (see
 *Project-local override* above); project servers merge with — and can override
@@ -1009,7 +1028,11 @@ Servers can also be added per project via `.zerostack/config.toml` (see
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
-      "env": {}
+      "cwd": ".",
+      "env": {},
+      "inherit_env": ["PATH", "HOME"],
+      "sandbox": "bwrap",
+      "network": "deny"
     },
     "remote-search": {
       "url": "https://example.com/mcp",

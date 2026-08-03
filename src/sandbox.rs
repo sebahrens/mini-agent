@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Output;
@@ -9,8 +10,6 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
-#[cfg(unix)]
-use crate::process_creation::StdCommandCreationExt;
 use crate::process_creation::TokioCommandCreationExt;
 
 #[cfg(feature = "js")]
@@ -694,6 +693,153 @@ impl Sandbox {
         Ok(cmd)
     }
 
+    /// Build a direct-exec workspace service boundary.
+    ///
+    /// Unlike [`Sandbox::wrap_command`], this profile never inserts a shell and
+    /// accepts only an already-resolved executable plus an ordered argv. It is
+    /// intended for human-configured, workspace-capable long-lived services
+    /// such as MCP stdio servers, not for the broker-only JS worker profile.
+    /// The supplied environment is the complete delegated environment.
+    pub(crate) fn wrap_workspace_service(
+        &self,
+        program: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        deny_network: bool,
+    ) -> Result<Command, String> {
+        match self.policy() {
+            SandboxPolicy::Disabled => {
+                return Err("workspace-service sandbox must be explicitly requested".to_string());
+            }
+            SandboxPolicy::RequiredButUnavailable => {
+                return Err(format!(
+                    "sandbox backend '{}' is not available — refusing MCP stdio launch (requested-but-unavailable)",
+                    self.backend
+                ));
+            }
+            SandboxPolicy::RequiredAndAvailable => {}
+        }
+
+        let cwd = canonical_non_root(cwd, "MCP stdio working directory")?;
+        let paths = crate::paths::process_paths()
+            .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
+        std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
+            format!(
+                "sandbox: failed to create application cache {}: {error}",
+                paths.cache_dir.display()
+            )
+        })?;
+        let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+
+        if self.backend == "seatbelt" {
+            let seatbelt = seatbelt_path().ok_or_else(|| {
+                "sandbox backend 'seatbelt' is not a trusted system executable — refusing MCP stdio launch"
+                    .to_string()
+            })?;
+            let workspace = seatbelt_string_literal(&cwd, "MCP stdio working directory")?;
+            let cache = seatbelt_string_literal(&cache_dir, "application cache")?;
+            let network_rule = if deny_network {
+                "(deny network*)"
+            } else {
+                "(allow network*)"
+            };
+            let profile = format!(
+                r#"(version 1)
+(deny default)
+(allow process*)
+(allow file-read*)
+(allow file-write*
+    (subpath "{workspace}")
+    (subpath "{cache}")
+    (subpath "/private/tmp")
+    (literal "/dev/null"))
+{network_rule}"#
+            );
+            let mut cmd = Command::new(seatbelt);
+            cmd.env_clear();
+            cmd.arg("-p").arg(profile).arg("/usr/bin/env").arg("-i");
+            for (key, value) in env {
+                let key = key.to_str().ok_or_else(|| {
+                    "MCP stdio environment name is not valid UTF-8 for Seatbelt".to_string()
+                })?;
+                if key.contains('=') {
+                    return Err("MCP stdio environment name must not contain '='".to_string());
+                }
+                let mut assignment = OsString::from(key);
+                assignment.push("=");
+                assignment.push(value);
+                cmd.arg(assignment);
+            }
+            cmd.arg(program).args(args).current_dir(&cwd);
+            configure_child_lifetime(&mut cmd);
+            return Ok(cmd);
+        }
+
+        if self.backend == "zerobox" {
+            if deny_network {
+                return Err(
+                    "sandbox backend 'zerobox' cannot truthfully enforce MCP stdio network denial"
+                        .to_string(),
+                );
+            }
+            let mut cmd = Command::new("zerobox");
+            cmd.env_clear();
+            cmd.envs(env.iter().cloned());
+            cmd.arg("--allow-write")
+                .arg(&cwd)
+                .arg("--")
+                .arg(program)
+                .args(args)
+                .current_dir(&cwd);
+            configure_child_lifetime(&mut cmd);
+            return Ok(cmd);
+        }
+
+        let bwrap = bwrap_path().ok_or_else(|| {
+            "sandbox backend 'bwrap' is not a trusted system executable — refusing MCP stdio launch"
+                .to_string()
+        })?;
+        let mut cmd = Command::new(bwrap);
+        cmd.env_clear();
+        cmd.arg("--clearenv");
+        for (key, value) in env {
+            cmd.arg("--setenv").arg(key).arg(value);
+        }
+        for path in [
+            "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/nix", "/opt",
+        ] {
+            cmd.args(["--ro-bind-try", path, path]);
+        }
+        cmd.args(["--dir", "/etc"]);
+        for path in ["/etc/localtime", "/etc/ld.so.cache"] {
+            cmd.args(["--ro-bind-try", path, path]);
+        }
+        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+        cmd.arg("--bind").arg(&cwd).arg(&cwd);
+        cmd.arg("--bind").arg(&cache_dir).arg(&cache_dir);
+        cmd.args([
+            "--unshare-user",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-cgroup",
+        ]);
+        if deny_network {
+            cmd.arg("--unshare-net");
+        }
+        cmd.arg("--remount-ro")
+            .arg("/")
+            .arg("--chdir")
+            .arg(&cwd)
+            .arg("--die-with-parent")
+            .arg("--")
+            .arg(program)
+            .args(args);
+        configure_child_lifetime(&mut cmd);
+        Ok(cmd)
+    }
+
     fn build_seatbelt_command(
         &self,
         seatbelt: &Path,
@@ -1259,20 +1405,30 @@ pub(crate) fn configure_child_lifetime(cmd: &mut Command) {
     cmd.process_group(0);
 }
 
-pub(crate) fn kill_process_group(_pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     #[cfg(unix)]
     {
-        let group = format!("-{}", _pid);
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", "--", &group])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status_guarded();
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", "--", &group])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status_guarded();
+        use nix::errno::Errno;
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        let Ok(group) = i32::try_from(pid) else {
+            tracing::warn!("sandbox: child process group ID {pid} is outside pid_t range");
+            return;
+        };
+        if group <= 0 {
+            tracing::warn!("sandbox: refusing invalid child process group ID {pid}");
+            return;
+        }
+        for (signal, label) in [(Signal::SIGTERM, "SIGTERM"), (Signal::SIGKILL, "SIGKILL")] {
+            if let Err(error) = killpg(Pid::from_raw(group), signal)
+                && error != Errno::ESRCH
+            {
+                tracing::warn!(
+                    "sandbox: failed to send {label} to child process group {pid}: {error}"
+                );
+            }
+        }
     }
 }
 
@@ -1356,12 +1512,57 @@ fn seatbelt_string_literal(path: &Path, label: &str) -> Result<String, String> {
 mod sandbox_tests {
     use super::*;
 
+    #[cfg(unix)]
+    const PATHLESS_KILLPG_CHILD: &str = "MINI_AGENT_PATHLESS_KILLPG_CHILD";
+
     fn disabled() -> Sandbox {
         Sandbox::new(false, "bwrap")
     }
 
     fn unavailable() -> Sandbox {
         Sandbox::new(true, "__no_such_backend_exists__")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_group_does_not_require_path() {
+        use std::os::unix::process::CommandExt as _;
+
+        if std::env::var_os(PATHLESS_KILLPG_CHILD).is_some() {
+            let mut child_command = std::process::Command::new("/bin/sh");
+            child_command
+                .args(["-c", "trap '' TERM; exec /bin/sleep 60"])
+                .process_group(0);
+            let mut child = child_command.spawn().unwrap();
+            let pid = child.id();
+
+            kill_process_group(pid);
+            for _ in 0..100 {
+                if child.try_wait().unwrap().is_some() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("PATH-independent process-group cleanup did not terminate child {pid}");
+        }
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut isolated = std::process::Command::new(current_exe);
+        isolated
+            .args([
+                "--exact",
+                "sandbox::sandbox_tests::kill_process_group_does_not_require_path",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(PATHLESS_KILLPG_CHILD, "1");
+        let status = isolated.status().unwrap();
+        assert!(
+            status.success(),
+            "process-group cleanup must work when PATH and the ambient environment are absent"
+        );
     }
 
     #[test]

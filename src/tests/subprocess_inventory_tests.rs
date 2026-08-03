@@ -886,12 +886,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(zerobox);",
         1,
         "TC-PROJECT-AUTOMATION",
@@ -998,6 +992,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/sandbox/worker/macos.rs",
         ".output()",
@@ -1010,7 +1005,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-SUPPORT-UTILITY",
     ),
-    ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/extras/loop/validation.rs",
         "assert!(!headless.contains(\"tokio::process::Command::new\"));",
@@ -1079,12 +1073,11 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-MCP-STDIO",
     ),
-    ("src/sandbox.rs", ".status();", 2, "TC-LIFECYCLE-HELPER"),
     (
-        "src/sandbox.rs",
-        "let _ = std::process::Command::new(\"kill\")",
-        2,
-        "TC-LIFECYCLE-HELPER",
+        "src/extras/mcp/client.rs",
+        "let mut child = Command::new(program);",
+        1,
+        "TC-MCP-STDIO",
     ),
     (
         "src/sandbox.rs",
@@ -1171,6 +1164,30 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/windows.rs",
         "Command::new(executable)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut child_command = std::process::Command::new(\"/bin/sh\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut child = child_command.spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut isolated = std::process::Command::new(current_exe);",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let status = isolated.status().unwrap();",
         1,
         "TEST-ONLY",
     ),
@@ -2187,13 +2204,18 @@ fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
 const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     (
         "src/sandbox.rs",
+        "let mut cmd = Command::new(\"zerobox\");",
+        &["TC-MODEL-ACTION", "TC-MCP-STDIO"],
+    ),
+    (
+        "src/sandbox.rs",
         "let mut cmd = Command::new(bwrap);",
-        &["TC-PROJECT-AUTOMATION", "TC-MODEL-ACTION"],
+        &["TC-PROJECT-AUTOMATION", "TC-MCP-STDIO", "TC-MODEL-ACTION"],
     ),
     (
         "src/sandbox.rs",
         "let mut cmd = Command::new(seatbelt);",
-        &["TC-PROJECT-AUTOMATION", "TC-MODEL-ACTION"],
+        &["TC-PROJECT-AUTOMATION", "TC-MCP-STDIO", "TC-MODEL-ACTION"],
     ),
     (
         "src/ui/app.rs",
@@ -2221,12 +2243,6 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
-        1,
-        "TC-MODEL-ACTION",
-    ),
     (
         "src/sandbox.rs",
         "let mut cmd = Command::new(zerobox);",
@@ -2404,13 +2420,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/sandbox.rs", ".status();", 2, "TC-LIFECYCLE-HELPER"),
-    (
-        "src/sandbox.rs",
-        "let _ = std::process::Command::new(\"kill\")",
-        2,
-        "TC-LIFECYCLE-HELPER",
-    ),
     (
         "src/sandbox.rs",
         "let mut child = match cmd.spawn() {",
@@ -2500,6 +2509,30 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "TEST-ONLY",
     ),
     (
+        "src/sandbox.rs",
+        "let mut child_command = std::process::Command::new(\"/bin/sh\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut child = child_command.spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut isolated = std::process::Command::new(current_exe);",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let status = isolated.status().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
         "src/ui/app.rs",
         "if std::process::Command::new(\"lazygit\")",
         1,
@@ -2519,11 +2552,28 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
 ];
 
-const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[(
-    "src/ui/app.rs",
-    ".output()",
-    &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
-)];
+const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(\"zerobox\");",
+        &["TC-MODEL-ACTION", "TC-MCP-STDIO"],
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(bwrap);",
+        &["TC-PROJECT-AUTOMATION", "TC-MCP-STDIO", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut cmd = Command::new(seatbelt);",
+        &["TC-PROJECT-AUTOMATION", "TC-MCP-STDIO", "TC-MODEL-ACTION"],
+    ),
+    (
+        "src/ui/app.rs",
+        ".output()",
+        &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
+    ),
+];
 
 /// Files whose non-disposition launch expressions all have one owner.
 const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
@@ -3089,13 +3139,6 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
             1,
             "TC-LIFECYCLE-HELPER",
             "a model action in the mixed sandbox family",
-        ),
-        (
-            "src/sandbox.rs",
-            "let _ = std::process::Command::new(\"kill\")",
-            1,
-            "TC-MODEL-ACTION",
-            "a lifecycle helper in the mixed sandbox family",
         ),
         (
             "src/sandbox/worker/linux.rs",
