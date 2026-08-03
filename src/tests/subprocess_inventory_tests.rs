@@ -1087,12 +1087,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut child = match cmd.spawn() {",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(&self.shell);",
         1,
         "TC-MODEL-ACTION",
@@ -1204,30 +1198,17 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-INTERNAL-GIT",
     ),
-    ("src/startup.rs", ".output()?;", 1, "TC-EXPLICIT-USER-SHELL"),
-    (
-        "src/startup.rs",
-        "let output = std::process::Command::new(\"bash\")",
-        1,
-        "TC-EXPLICIT-USER-SHELL",
-    ),
     (
         "src/ui/app.rs",
-        "if std::process::Command::new(\"lazygit\")",
+        "let command = tokio::process::Command::new(\"lazygit\");",
         1,
         "TC-SUPPORT-UTILITY",
     ),
     (
         "src/ui/app.rs",
-        "let _ = std::process::Command::new(\"lazygit\").status();",
+        "let mut probe = tokio::process::Command::new(\"lazygit\");",
         1,
         "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/ui/app.rs",
-        "std::process::Command::new(\"bash\")",
-        1,
-        "TC-EXPLICIT-USER-SHELL",
     ),
     ("src/ui/input/mod.rs", ".status();", 1, "TC-SUPPORT-UTILITY"),
     (
@@ -1717,7 +1698,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/sandbox.rs", "output.status,", 2, "NON-PROCESS"),
-    ("src/sandbox.rs", "output.status", 1, "NON-PROCESS"),
     (
         "src/sandbox.rs",
         "output.stdout.is_empty(),",
@@ -1725,9 +1705,21 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/ui/app.rs",
+        "outcome = ?output.status,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/app.rs",
+        "&format!(\"warning: lazygit ended with {:?}\", output.status),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/sandbox.rs",
         "status = child.wait() => CommandTermination::Exited(status),",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -2160,6 +2152,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/sandbox.rs",
         &[
             (
+                "b9ba7b946e716954ba269b40394f014187892aff4dbe028a7cffda9ae5c63bea",
+                1,
+            ),
+            (
                 "77288e0715e2e881aa2f70d0c79e2dc255ad6bb1cb187ddef46359df73a23762",
                 1,
             ),
@@ -2211,10 +2207,20 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/ui/app.rs",
-        &[(
-            "b7af79d5aa59730634d98c20d3fec794b65f77a4c75b6d6e476c8fbe491a0a8d",
-            1,
-        )],
+        &[
+            (
+                "842d29cd63634e7d8359ed65fd83710f1b986f46e826f81235b6c5a6c07e71c4",
+                1,
+            ),
+            (
+                "b7af79d5aa59730634d98c20d3fec794b65f77a4c75b6d6e476c8fbe491a0a8d",
+                1,
+            ),
+            (
+                "efbf1e616edc14fac2436cfd32c40c1a31fa90cb5f2516dad7ab725a76e5d4d4",
+                1,
+            ),
+        ],
     ),
     (
         "src/ui/renderer.rs",
@@ -2252,6 +2258,11 @@ fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
 const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     (
         "src/sandbox.rs",
+        "let mut child = match cmd.spawn() {",
+        &["TC-LIFECYCLE-HELPER", "TC-SUPPORT-UTILITY"],
+    ),
+    (
+        "src/sandbox.rs",
         "let mut cmd = Command::new(\"zerobox\");",
         &["TC-MODEL-ACTION", "TC-MCP-STDIO"],
     ),
@@ -2264,11 +2275,6 @@ const MIXED_SITES: &[(&str, &str, &[&str])] = &[
         "src/sandbox.rs",
         "let mut cmd = Command::new(seatbelt);",
         &["TC-PROJECT-AUTOMATION", "TC-MCP-STDIO", "TC-MODEL-ACTION"],
-    ),
-    (
-        "src/ui/app.rs",
-        ".output()",
-        &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
     ),
 ];
 
@@ -2470,12 +2476,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut child = match cmd.spawn() {",
-        1,
-        "TC-MODEL-ACTION",
-    ),
-    (
-        "src/sandbox.rs",
         "let mut cmd = Command::new(&self.shell);",
         1,
         "TC-MODEL-ACTION",
@@ -2582,25 +2582,24 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/app.rs",
-        "if std::process::Command::new(\"lazygit\")",
+        "let command = tokio::process::Command::new(\"lazygit\");",
         1,
         "TC-SUPPORT-UTILITY",
     ),
     (
         "src/ui/app.rs",
-        "let _ = std::process::Command::new(\"lazygit\").status();",
+        "let mut probe = tokio::process::Command::new(\"lazygit\");",
         1,
         "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/ui/app.rs",
-        "std::process::Command::new(\"bash\")",
-        1,
-        "TC-EXPLICIT-USER-SHELL",
     ),
 ];
 
 const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox.rs",
+        "let mut child = match cmd.spawn() {",
+        &["TC-LIFECYCLE-HELPER", "TC-SUPPORT-UTILITY"],
+    ),
     (
         "src/sandbox.rs",
         "let mut cmd = Command::new(\"zerobox\");",
@@ -2616,11 +2615,6 @@ const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
         "let mut cmd = Command::new(seatbelt);",
         &["TC-PROJECT-AUTOMATION", "TC-MCP-STDIO", "TC-MODEL-ACTION"],
     ),
-    (
-        "src/ui/app.rs",
-        ".output()",
-        &["TC-EXPLICIT-USER-SHELL", "TC-SUPPORT-UTILITY"],
-    ),
 ];
 
 /// Files whose non-disposition launch expressions all have one owner.
@@ -2633,7 +2627,6 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
     ("src/sandbox/worker/macos.rs", "TC-SUPPORT-UTILITY"),
     ("src/session/mod.rs", "TC-INTERNAL-GIT"),
-    ("src/startup.rs", "TC-EXPLICIT-USER-SHELL"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/slash/memory.rs", "TC-SUPPORT-UTILITY"),
@@ -3201,17 +3194,17 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
         ),
         (
             "src/ui/app.rs",
-            ".output()",
+            "let command = tokio::process::Command::new(\"lazygit\");",
             1,
-            "TC-SUPPORT-UTILITY",
-            "the explicit shell output occurrence in the mixed UI family",
+            "TC-EXPLICIT-USER-SHELL",
+            "the lazygit interactive utility launch",
         ),
         (
             "src/ui/app.rs",
-            "if std::process::Command::new(\"lazygit\")",
+            "let mut probe = tokio::process::Command::new(\"lazygit\");",
             1,
             "TC-EXPLICIT-USER-SHELL",
-            "the lazygit utility in the mixed UI family",
+            "the lazygit version probe",
         ),
     ];
 
