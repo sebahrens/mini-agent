@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +13,12 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE_TAG_PATTERN = re.compile(
+    r"^v(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
 
 
 def cargo_metadata(root: Path) -> dict[str, Any]:
@@ -69,6 +77,40 @@ def canonical_binary(metadata: dict[str, Any], root: Path) -> tuple[str | None, 
 
 def validate_workflow(text: str, binary: str) -> list[str]:
     errors: list[str] = []
+    if not re.search(
+        r'^on:\n  push:\n    tags:\n      - ["\']v\*["\']$',
+        text,
+        re.MULTILINE,
+    ):
+        errors.append(
+            ".github/workflows/release.yml must trigger on v* tag pushes"
+        )
+    if re.search(r"^\s*workflow_dispatch\s*:", text, re.MULTILINE):
+        errors.append(
+            ".github/workflows/release.yml must not allow manual dispatch"
+        )
+
+    package_metadata_start = text.find("\n  package-metadata:")
+    build_start = text.find("\n  build:", package_metadata_start + 1)
+    package_metadata_job = (
+        text[package_metadata_start:build_start]
+        if package_metadata_start >= 0 and build_start > package_metadata_start
+        else ""
+    )
+    release_identity_fragments = (
+        "RELEASE_REF_TYPE: ${{ github.ref_type }}",
+        "RELEASE_TAG: ${{ github.ref_name }}",
+        '--ref-type "$RELEASE_REF_TYPE"',
+        '--release-tag "$RELEASE_TAG"',
+    )
+    if not all(
+        fragment in package_metadata_job
+        for fragment in release_identity_fragments
+    ):
+        errors.append(
+            ".github/workflows/release.yml package-metadata job must validate "
+            "release identity before builds"
+        )
     required_counts = {
         f"CANONICAL_BINARY: {binary}": 1,
         # 3 jobs produce archives: build (Linux/macOS), build-static (musl), build-windows
@@ -101,6 +143,28 @@ def validate_workflow(text: str, binary: str) -> list[str]:
                 ".github/workflows/release.yml must not reference "
                 f"noncanonical binary path {fragment!r}"
             )
+    return errors
+
+
+def validate_release_identity(
+    *, version: str, ref_type: str, release_tag: str
+) -> list[str]:
+    """Require a canonical release tag for the Cargo package version."""
+    errors: list[str] = []
+    if ref_type != "tag":
+        errors.append(
+            f"release identity requires a tag ref, got {ref_type!r}"
+        )
+    if not RELEASE_TAG_PATTERN.fullmatch(release_tag):
+        errors.append(
+            f"release identity requires a valid release tag, got {release_tag!r}"
+        )
+    expected_tag = f"v{version}"
+    if release_tag != expected_tag:
+        errors.append(
+            f"release tag {release_tag!r} does not match Cargo package version "
+            f"{version!r} (expected {expected_tag!r})"
+        )
     return errors
 
 
@@ -146,12 +210,16 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"{binary}-aarch64-apple-darwin.tar.gz",
             f"{binary}-x86_64-unknown-linux-musl.tar.gz",
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
+            '--release-tag "v${VERSION}"',
+            '--release-tag "v${NEW_VERSION}"',
+            "cargo metadata --format-version 1 --no-deps >/dev/null",
         ),
         "README.md": (
             f"The Cargo package, installed CLI, and every release archive use the executable name\n`{binary}`.",
         ),
         "docs/agent/PUBLISHING_RELEASES.md": (
             f"Cargo and every package channel install the public executable as `{binary}`.",
+            "The release workflow accepts only pushed `v*` tags.",
         ),
     }
     errors: list[str] = []
@@ -244,7 +312,31 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
     return errors
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate release and package metadata"
+    )
+    parser.add_argument(
+        "--release-tag",
+        help="release tag to validate against the root Cargo package version",
+    )
+    parser.add_argument(
+        "--ref-type",
+        help="GitHub ref type; must be 'tag' when --release-tag is supplied",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
+    if bool(args.release_tag) != bool(args.ref_type):
+        print(
+            "package metadata check failed: --release-tag and --ref-type "
+            "must be supplied together",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         metadata = cargo_metadata(ROOT)
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
@@ -252,13 +344,21 @@ def main() -> int:
         return 1
 
     errors = validate(ROOT, metadata)
+    version = cargo_version(metadata, ROOT)
+    if args.release_tag and args.ref_type and version:
+        errors.extend(
+            validate_release_identity(
+                version=version,
+                ref_type=args.ref_type,
+                release_tag=args.release_tag,
+            )
+        )
     if errors:
         for error in errors:
             print(f"error: {error}", file=sys.stderr)
         return 1
 
     binary, _ = canonical_binary(metadata, ROOT)
-    version = cargo_version(metadata, ROOT)
     print(f"package metadata consistent: canonical binary {binary!r}, version {version!r}")
     return 0
 
