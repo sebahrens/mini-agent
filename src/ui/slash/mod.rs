@@ -74,6 +74,22 @@ impl SlashCtx<'_> {
         }
     }
 
+    async fn build_agent_for_client(&self, client: &AnyClient, model_id: &str) -> AnyAgent {
+        AgentBuildCtx {
+            cli: self.cli,
+            cfg: self.cfg,
+            context: self.context,
+            client,
+            permission: self.permission,
+            ask_tx: self.ask_tx,
+            sandbox: self.sandbox,
+            #[cfg(feature = "mcp")]
+            mcp_manager: self.mcp_manager,
+        }
+        .rebuild_agent(model_id, *self.reasoning_enabled)
+        .await
+    }
+
     pub async fn rebuild_agent(&mut self) {
         #[cfg(feature = "advisor")]
         {

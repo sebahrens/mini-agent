@@ -61,10 +61,14 @@ async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         .filter(|p| !p.is_empty())
         .unwrap_or(&default_name);
     let (content, kind) = if path.ends_with(".jsonl") {
-        (
-            crate::extras::export::session_to_jsonl(ctx.session),
-            "JSONL",
-        )
+        let content = match crate::extras::export::session_to_jsonl(ctx.session) {
+            Ok(content) => content,
+            Err(error) => {
+                write_error(ctx.renderer, format!("export failed: {}", error));
+                return Ok(());
+            }
+        };
+        (content, "JSONL")
     } else {
         (crate::extras::export::session_to_html(ctx.session), "HTML")
     };
@@ -81,7 +85,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         write_error(ctx.renderer, "usage: /import <file.jsonl|session.json>");
         return Ok(());
     };
-    let content = match std::fs::read_to_string(path) {
+    let content = match read_bounded_import(path) {
         Ok(c) => c,
         Err(e) => {
             write_error(ctx.renderer, format!("failed to read {}: {}", path, e));
@@ -89,55 +93,140 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     };
 
-    // Native session JSON imports directly; anything else is parsed as a
-    // JSONL export (one message per line).
-    let mut session = if content.trim_start().starts_with('{') {
-        match serde_json::from_str::<crate::session::Session>(&content) {
-            Ok(s) => s,
-            Err(e) => {
-                write_error(ctx.renderer, format!("invalid session file: {}", e));
-                return Ok(());
-            }
+    let mut session = match parse_imported_session(&content, ctx.session, ctx.cfg) {
+        Ok(session) => session,
+        Err(error) => {
+            write_error(ctx.renderer, format!("invalid session file: {}", error));
+            return Ok(());
         }
-    } else {
-        let messages = match crate::extras::export::parse_jsonl_import(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                write_error(ctx.renderer, format!("invalid JSONL session: {}", e));
-                return Ok(());
-            }
-        };
-        let name = std::path::Path::new(path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "imported".to_string());
-        let mut session = crate::session::Session::new(
-            ctx.session.provider.as_str(),
-            ctx.session.model.as_str(),
-            ctx.session.context_window,
-            &name,
-        );
-        for msg in messages {
-            session.add_message(msg.role, &msg.content);
-        }
-        session
     };
 
     if session.name.is_empty() {
         session.name = CompactString::new("imported");
     }
+    session.overhead_tokens =
+        crate::agent::builder::estimate_overhead(ctx.context, *ctx.reasoning_enabled);
+    let new_client = match crate::provider::create_client(
+        &session.provider,
+        ctx.cli.api_key.as_deref(),
+        &ctx.cfg.custom_providers_map(),
+        ctx.cfg.api_keys.as_ref(),
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            write_error(
+                ctx.renderer,
+                format!("cannot activate imported provider: {}", error),
+            );
+            return Ok(());
+        }
+    };
+    let new_agent = ctx
+        .build_agent_for_client(&new_client, &session.model)
+        .await;
     let msg_count = session.messages.len();
-    if let Err(e) = crate::session::storage::save_session(&session) {
+    if let Err(e) = commit_staged_import(
+        ctx.session,
+        ctx.client,
+        ctx.agent,
+        session,
+        new_client,
+        new_agent,
+        crate::session::storage::save_session,
+    ) {
         write_error(ctx.renderer, format!("failed to save session: {}", e));
         return Ok(());
     }
-    *ctx.session = session;
+    #[cfg(feature = "advisor")]
+    {
+        crate::extras::advisor::update_client(ctx.client.clone());
+        crate::extras::advisor::set_session_messages(ctx.session.messages.clone());
+    }
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     write_ok(
         ctx.renderer,
         format!("imported session from {} ({} msgs)", path, msg_count),
     );
     Ok(())
+}
+
+#[cfg(feature = "export")]
+fn commit_staged_import<S, C, A>(
+    current_session: &mut S,
+    current_client: &mut C,
+    current_agent: &mut Option<A>,
+    new_session: S,
+    new_client: C,
+    new_agent: A,
+    persist: impl FnOnce(&S) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    persist(&new_session)?;
+    *current_client = new_client;
+    *current_agent = Some(new_agent);
+    *current_session = new_session;
+    Ok(())
+}
+
+#[cfg(feature = "export")]
+fn read_bounded_import(path: &str) -> anyhow::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((crate::extras::export::MAX_SESSION_IMPORT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > crate::extras::export::MAX_SESSION_IMPORT_BYTES {
+        anyhow::bail!(
+            "session import exceeds the {} byte limit",
+            crate::extras::export::MAX_SESSION_IMPORT_BYTES
+        );
+    }
+    String::from_utf8(bytes).map_err(|error| anyhow::anyhow!("session file is not UTF-8: {error}"))
+}
+
+#[cfg(feature = "export")]
+fn parse_imported_session(
+    content: &str,
+    current: &crate::session::Session,
+    cfg: &crate::config::Config,
+) -> anyhow::Result<crate::session::Session> {
+    match crate::extras::export::parse_session_file(content)? {
+        crate::extras::export::ParsedSessionFile::Native(session) => Ok(session),
+        crate::extras::export::ParsedSessionFile::Jsonl(import) => {
+            crate::paths::validate_portable_component(&import.id)?;
+            let mut session = crate::session::Session::new(
+                import.provider.as_str(),
+                import.model.as_str(),
+                current.context_window,
+                import.name.as_str(),
+            );
+            session.id = import.id;
+            session.created_at = import.created_at;
+            session.working_dir = current.working_dir.clone();
+            session.total_estimated_tokens =
+                import.messages.iter().fold(0_u64, |total, message| {
+                    total.saturating_add(message.estimated_tokens)
+                });
+            session.messages = import.messages;
+            let quick_models = crate::config::quick_models_map(cfg);
+            session.update_context_window(cfg.resolve_context_window(
+                &session.provider,
+                &session.model,
+                &quick_models,
+            ));
+            if let Some(model) = quick_models
+                .values()
+                .find(|model| model.provider == session.provider && model.model == session.model)
+            {
+                session.input_token_cost = model.input_token_cost;
+                session.output_token_cost = model.output_token_cost;
+            } else if let Some((input, output)) =
+                crate::config::Config::catalog_input_output_cost(&session.provider, &session.model)
+            {
+                session.input_token_cost = input;
+                session.output_token_cost = output;
+            }
+            Ok(session)
+        }
+    }
 }
 
 #[cfg(feature = "export")]
@@ -372,4 +461,123 @@ async fn handle_history(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "export"))]
+mod import_tests {
+    use super::{commit_staged_import, parse_imported_session};
+    use crate::config::Config;
+    use crate::extras::export::session_to_jsonl;
+    use crate::session::{MessageRole, Session};
+    use std::cell::RefCell;
+
+    #[test]
+    fn session_jsonl_slash_import_round_trip() {
+        let mut exported = Session::new("source-provider", "source-model", 64_000, "source name");
+        exported.created_at = "2026-07-29T12:00:00Z".into();
+        exported.add_message(MessageRole::User, "first");
+        exported.add_message(MessageRole::Assistant, "second");
+        let jsonl = session_to_jsonl(&exported).unwrap();
+
+        let current = Session::new("current-provider", "current-model", 128_000, "current");
+        let cfg = Config::default();
+        let imported = parse_imported_session(&jsonl, &current, &cfg).unwrap();
+        assert_eq!(imported.id, exported.id);
+        assert_eq!(imported.name, exported.name);
+        assert_eq!(imported.provider, exported.provider);
+        assert_eq!(imported.model, exported.model);
+        assert_eq!(imported.created_at, exported.created_at);
+        assert_eq!(
+            imported.context_window,
+            cfg.resolve_context_window(
+                &exported.provider,
+                &exported.model,
+                &crate::config::quick_models_map(&cfg)
+            )
+        );
+        assert_eq!(imported.working_dir, current.working_dir);
+        assert_eq!(imported.messages.len(), exported.messages.len());
+        for (imported, original) in imported.messages.iter().zip(&exported.messages) {
+            assert_eq!(imported.role, original.role);
+            assert_eq!(imported.content, original.content);
+            assert_eq!(imported.estimated_tokens, original.estimated_tokens);
+        }
+
+        let persisted = serde_json::to_string(&imported).unwrap();
+        let reloaded: Session = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(reloaded.id, exported.id);
+        assert_eq!(reloaded.messages.len(), exported.messages.len());
+    }
+
+    #[test]
+    fn native_session_import_remains_exact() {
+        let mut native = Session::new("native-provider", "native-model", 32_000, "native");
+        native.input_token_cost = 1.25;
+        native.output_token_cost = 2.5;
+        let current = Session::new("current", "current", 128_000, "current");
+        let content = serde_json::to_string_pretty(&native).unwrap();
+        let cfg = Config::default();
+        let imported = parse_imported_session(&content, &current, &cfg).unwrap();
+        assert_eq!(imported.id, native.id);
+        assert_eq!(imported.provider, native.provider);
+        assert_eq!(imported.context_window, native.context_window);
+        assert_eq!(imported.input_token_cost, native.input_token_cost);
+        assert_eq!(imported.output_token_cost, native.output_token_cost);
+    }
+
+    #[test]
+    fn malformed_import_does_not_mutate_current_session() {
+        let current = Session::new("current", "current", 128_000, "current");
+        let original_id = current.id.clone();
+        let original_messages = current.messages.len();
+
+        let error = parse_imported_session("{\"id\":", &current, &Config::default())
+            .err()
+            .expect("malformed input must fail");
+        assert!(error.to_string().contains("not valid JSON"));
+        assert_eq!(current.id, original_id);
+        assert_eq!(current.messages.len(), original_messages);
+    }
+
+    #[test]
+    fn import_commit_is_save_first_and_transactional() {
+        let mut session = String::from("old session");
+        let mut client = String::from("old client");
+        let mut agent = Some(String::from("old agent"));
+        let error = commit_staged_import(
+            &mut session,
+            &mut client,
+            &mut agent,
+            String::from("new session"),
+            String::from("new client"),
+            String::from("new agent"),
+            |_| anyhow::bail!("injected save failure"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected save failure"));
+        assert_eq!(session, "old session");
+        assert_eq!(client, "old client");
+        assert_eq!(agent.as_deref(), Some("old agent"));
+
+        let persisted = RefCell::new(None);
+        commit_staged_import(
+            &mut session,
+            &mut client,
+            &mut agent,
+            String::from("new session"),
+            String::from("new client"),
+            String::from("new agent"),
+            |candidate| {
+                *persisted.borrow_mut() = Some(serde_json::to_string(candidate)?);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let reloaded: String =
+            serde_json::from_str(persisted.borrow().as_deref().unwrap()).unwrap();
+        assert_eq!(reloaded, "new session");
+        assert_eq!(session, "new session");
+        assert_eq!(client, "new client");
+        assert_eq!(agent.as_deref(), Some("new agent"));
+    }
 }
