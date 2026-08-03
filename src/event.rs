@@ -5,10 +5,12 @@ pub enum AgentEvent {
     Token(CompactString),
     Reasoning(CompactString),
     ToolCall {
+        id: String,
         name: CompactString,
         args: serde_json::Value,
     },
     ToolResult {
+        id: String,
         name: CompactString,
         output: CompactString,
     },
@@ -34,6 +36,10 @@ pub enum AgentEvent {
     },
     Done {
         response: CompactString,
+        /// Canonical Rig messages produced during this completed turn. Tool
+        /// call/result IDs come from the provider, so downstream history users
+        /// never need to reconstruct model interactions from display events.
+        interactions: Vec<rig::completion::Message>,
         input_tokens: u64,
         output_tokens: u64,
         cached_input_tokens: u64,

@@ -836,7 +836,7 @@ impl<'a> App<'a> {
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
         match &event {
-            AgentEvent::ToolCall { name, args } => {
+            AgentEvent::ToolCall { name, args, .. } => {
                 if self.run.turn_trace.len() < TURN_TRACE_MAX {
                     self.run
                         .turn_trace

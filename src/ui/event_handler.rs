@@ -101,7 +101,7 @@ pub async fn handle_agent_event(
             renderer.render_viewport()?;
             run.agent_line_started = true;
         }
-        AgentEvent::ToolCall { name, args } => {
+        AgentEvent::ToolCall { name, args, .. } => {
             run.was_reasoning = false;
             finalize_response_segment(renderer, run)?;
             if run.agent_line_started {
@@ -132,7 +132,7 @@ pub async fn handle_agent_event(
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
-        AgentEvent::ToolResult { name, output } => {
+        AgentEvent::ToolResult { name, output, .. } => {
             ui.session.add_tool_result(&name, &output);
             save_session_if_enabled(ui.session, ui.cli, renderer)?;
             if name == "todo_write" {
@@ -210,6 +210,7 @@ pub async fn handle_agent_event(
         }
         AgentEvent::Done {
             response,
+            interactions: _,
             input_tokens,
             output_tokens,
             cached_input_tokens,

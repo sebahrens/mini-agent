@@ -1084,6 +1084,19 @@ filesystem access is already relative to the retained handle. Relative file
 operations walk held directory descriptors and reject symlink or reparse-point
 components and targets.
 
+Each new ACP session also owns an independent in-memory conversation history.
+Only completed turns are committed: the user prompt, correlated structured tool
+call/result messages, and the terminal assistant response are retained together.
+The next prompt receives that committed history before its current user message.
+History is bounded to 128 complete turns and 2 MiB of serialized Rig messages;
+the oldest complete turns are evicted first. The process retains at most 64 ACP
+sessions. Because ACP exposes no session-close notification, creating a 65th
+session is rejected rather than silently invalidating any live session. Each
+session accepts at most eight pending turns and runs them in request order,
+without blocking protocol dispatch or work in other sessions. History is not
+persisted across server restarts, and the agent therefore neither advertises nor
+handles ACP `session/load`.
+
 ACP context includes managed global files and context files in the captured
 workspace root. It intentionally does not load `AGENTS.md`, `CLAUDE.md`, or
 `ARCHITECTURE.md` from ambient parent directories, because those parents are

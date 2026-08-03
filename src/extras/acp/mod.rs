@@ -1,8 +1,14 @@
 pub mod config;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -13,24 +19,84 @@ use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Dispatch, Responder, Role, Stdio,
 };
-use tokio::sync::Mutex;
+use rig::completion::Message;
+use tokio::sync::{Mutex, oneshot};
 
 use crate::acp_auth::authenticate_peer;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
+#[cfg(test)]
 use crate::sandbox::Sandbox;
 
 const AGENT_VERSION: &str = "1.0.5";
 const DEFAULT_TCP_HOST: &str = "127.0.0.1";
 const DEFAULT_TCP_PORT: u16 = 7243;
 const MAX_PENDING_AUTHENTICATIONS: usize = 16;
+const MAX_ACP_HISTORY_TURNS: usize = 128;
+const MAX_ACP_HISTORY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACP_SESSIONS: usize = 64;
+const MAX_PENDING_ACP_TURNS: usize = 8;
+
+struct CommittedTurn {
+    messages: Vec<Message>,
+    serialized_bytes: usize,
+}
+
+#[derive(Default)]
+struct SessionHistory {
+    turns: VecDeque<CommittedTurn>,
+    serialized_bytes: usize,
+}
+
+impl SessionHistory {
+    fn snapshot(&self) -> Vec<Message> {
+        self.turns
+            .iter()
+            .flat_map(|turn| turn.messages.iter().cloned())
+            .collect()
+    }
+
+    fn commit_completed_turn(&mut self, prompt: &str, interactions: Vec<Message>) {
+        let mut messages = Vec::with_capacity(interactions.len() + 1);
+        messages.push(Message::user(prompt));
+        messages.extend(interactions);
+
+        // Rig messages are serializable. Treat an unexpected serialization failure
+        // as oversized so history remains bounded instead of retaining it forever.
+        let serialized_bytes = serde_json::to_vec(&messages)
+            .map(|encoded| encoded.len())
+            .unwrap_or(MAX_ACP_HISTORY_BYTES.saturating_add(1));
+        self.serialized_bytes = self.serialized_bytes.saturating_add(serialized_bytes);
+        self.turns.push_back(CommittedTurn {
+            messages,
+            serialized_bytes,
+        });
+
+        while self.turns.len() > MAX_ACP_HISTORY_TURNS
+            || self.serialized_bytes > MAX_ACP_HISTORY_BYTES
+        {
+            let Some(evicted) = self.turns.pop_front() else {
+                break;
+            };
+            self.serialized_bytes = self
+                .serialized_bytes
+                .saturating_sub(evicted.serialized_bytes);
+        }
+    }
+}
+
+fn acp_capabilities() -> AgentCapabilities {
+    // Session history is intentionally process-local; session/load is unsupported.
+    AgentCapabilities::new()
+}
 
 struct SessionState {
-    messages: Vec<(String, String)>,
+    history: Arc<Mutex<SessionHistory>>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
+    turn_tx: tokio::sync::mpsc::Sender<oneshot::Sender<oneshot::Sender<()>>>,
 }
 
 struct AcpState {
@@ -38,6 +104,29 @@ struct AcpState {
     cfg: Config,
     context: ContextFiles,
     sessions: Mutex<HashMap<SessionId, SessionState>>,
+    #[cfg(test)]
+    prompt_fixture: Option<PromptFixture>,
+}
+
+#[cfg(test)]
+type PromptFixture = Arc<
+    dyn Fn(
+            String,
+            Vec<Message>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<AgentEvent>, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+async fn supervise_session_turns(
+    mut rx: tokio::sync::mpsc::Receiver<oneshot::Sender<oneshot::Sender<()>>>,
+) {
+    while let Some(start_tx) = rx.recv().await {
+        let (done_tx, done_rx) = oneshot::channel();
+        if start_tx.send(done_tx).is_ok() {
+            let _ = done_rx.await;
+        }
+    }
 }
 
 // --- TCP Transport ---
@@ -235,8 +324,35 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         cfg,
         context,
         sessions: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        prompt_fixture: None,
     });
 
+    // Choose transport: TCP if an endpoint is configured, otherwise stdio.
+    if let Some(settings) = tcp_settings {
+        connect_agent(
+            state,
+            TcpTransport {
+                host: settings.host,
+                port: settings.port,
+                api_key: settings.api_key,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("ACP TCP server error: {}", e))?;
+    } else {
+        connect_agent(state, Stdio::new())
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP stdio server error: {}", e))?;
+    }
+
+    Ok(())
+}
+
+async fn connect_agent(
+    state: Arc<AcpState>,
+    transport: impl ConnectTo<Agent> + 'static,
+) -> Result<(), agent_client_protocol::Error> {
     let builder = Agent.builder().name("zerostack");
 
     let builder = builder
@@ -283,24 +399,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
             agent_client_protocol::on_receive_dispatch!(),
         );
 
-    // Choose transport: TCP if an endpoint is configured, otherwise stdio.
-    if let Some(settings) = tcp_settings {
-        builder
-            .connect_to(TcpTransport {
-                host: settings.host,
-                port: settings.port,
-                api_key: settings.api_key,
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("ACP TCP server error: {}", e))?;
-    } else {
-        builder
-            .connect_to(Stdio::new())
-            .await
-            .map_err(|e| anyhow::anyhow!("ACP stdio server error: {}", e))?;
-    }
-
-    Ok(())
+    builder.connect_to(transport).await
 }
 
 // --- Request Handlers ---
@@ -310,7 +409,7 @@ async fn handle_initialize(
     responder: Responder<InitializeResponse>,
     _state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
-    let caps = AgentCapabilities::new();
+    let caps = acp_capabilities();
 
     let resp = InitializeResponse::new(req.protocol_version)
         .agent_capabilities(caps)
@@ -345,14 +444,27 @@ async fn handle_new_session(
         )
     })?;
 
-    state.sessions.lock().await.insert(
+    let (turn_tx, turn_rx) = tokio::sync::mpsc::channel(MAX_PENDING_ACP_TURNS);
+    tokio::spawn(supervise_session_turns(turn_rx));
+
+    let mut sessions = state.sessions.lock().await;
+    if sessions.len() >= MAX_ACP_SESSIONS {
+        return Err(agent_client_protocol::Error::new(
+            -32000,
+            "ACP session capacity is full",
+        ));
+    }
+
+    sessions.insert(
         session_id.clone(),
         SessionState {
-            messages: Vec::new(),
+            history: Arc::new(Mutex::new(SessionHistory::default())),
             workspace,
             context: Arc::new(context),
+            turn_tx,
         },
     );
+    drop(sessions);
 
     let resp = NewSessionResponse::new(session_id);
     responder.respond(resp)
@@ -389,30 +501,49 @@ async fn handle_prompt(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Append user message to session history
-    let (workspace, context) = {
-        let mut sessions = state.sessions.lock().await;
+    let (history, workspace, context, turn_rx) = {
+        let sessions = state.sessions.lock().await;
         let sess = sessions
-            .get_mut(&session_id)
+            .get(&session_id)
             .ok_or_else(|| agent_client_protocol::Error::new(-32602, "unknown ACP session"))?;
-        sess.messages
-            .push(("user".to_string(), prompt_text.clone()));
-        (sess.workspace.clone(), sess.context.clone())
+        let (start_tx, start_rx) = oneshot::channel();
+        sess.turn_tx.try_send(start_tx).map_err(|_| {
+            agent_client_protocol::Error::new(
+                -32000,
+                "ACP session prompt queue is full or unavailable",
+            )
+        })?;
+        (
+            sess.history.clone(),
+            sess.workspace.clone(),
+            sess.context.clone(),
+            start_rx,
+        )
     };
 
     cx.spawn({
         let cx = cx.clone();
         async move {
+            // Waiting happens inside the spawned task, so the protocol dispatcher
+            // remains free to accept cancellation and requests for other sessions.
+            // The completion sender is the FIFO turn permit; dropping it advances
+            // the session scheduler even when this task is aborted.
+            let _turn_done = turn_rx.await.map_err(|_| {
+                agent_client_protocol::Error::new(-32603, "ACP session prompt queue closed")
+            })?;
+            let history = history.lock_owned().await;
             run_prompt(
                 &state,
                 &prompt_text,
                 session_id,
+                history,
                 workspace,
                 context,
                 responder,
                 cx,
             )
-            .await
+            .await?;
+            Ok(())
         }
     })
 }
@@ -423,6 +554,7 @@ async fn run_prompt(
     state: &AcpState,
     prompt_text: &str,
     session_id: SessionId,
+    history: tokio::sync::OwnedMutexGuard<SessionHistory>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
     responder: Responder<PromptResponse>,
@@ -431,6 +563,35 @@ async fn run_prompt(
     workspace
         .validate()
         .map_err(|error| agent_client_protocol::Error::new(-32603, error))?;
+    let prior_history = history.snapshot();
+
+    #[cfg(test)]
+    if let Some(fixture) = &state.prompt_fixture {
+        let events = match fixture(prompt_text.to_owned(), prior_history).await {
+            Ok(events) => events,
+            Err(error) => {
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
+                    "[error: {error}]"
+                ))));
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id,
+                    SessionUpdate::AgentMessageChunk(chunk),
+                ));
+                let _ = responder.respond(PromptResponse::new(StopReason::Refusal));
+                return Ok(());
+            }
+        };
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(events.len().max(1));
+        for event in events {
+            event_tx.send(event).await.map_err(|_| {
+                agent_client_protocol::Error::new(-32603, "ACP fixture event channel closed")
+            })?;
+        }
+        drop(event_tx);
+        return relay_prompt_events(prompt_text, session_id, history, responder, cx, event_rx)
+            .await;
+    }
+
     let workspace_root = workspace.root();
     let (authority, sandbox) =
         crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg)
@@ -470,15 +631,6 @@ async fn run_prompt(
 
     let model = client.completion_model(model_str.to_string());
 
-    // Track session history for future context persistence
-    let _extra_messages = {
-        let sessions = state.sessions.lock().await;
-        sessions
-            .get(&session_id)
-            .map(|s| s.messages.clone())
-            .unwrap_or_default()
-    };
-
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
     let agent = crate::provider::build_agent_in_workspace(
@@ -501,21 +653,36 @@ async fn run_prompt(
     let runner = agent
         .spawn_runner(
             prompt_text.to_string(),
-            vec![],
+            prior_history,
             crate::retry::RetryConfig::default(),
             #[cfg(feature = "hooks")]
             None,
         )
         .await;
-    let mut rx = runner.event_rx;
+    relay_prompt_events(
+        prompt_text,
+        session_id,
+        history,
+        responder,
+        cx,
+        runner.event_rx,
+    )
+    .await
+}
 
-    let mut tool_call_id: Option<ToolCallId> = None;
-    let mut final_response = String::new();
+async fn relay_prompt_events(
+    prompt_text: &str,
+    session_id: SessionId,
+    mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
+    responder: Responder<PromptResponse>,
+    cx: ConnectionTo<Client>,
+    mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+) -> Result<(), agent_client_protocol::Error> {
+    let mut completed_interactions = None;
 
     while let Some(event) = rx.recv().await {
         match event {
             AgentEvent::Token(text) => {
-                final_response.push_str(&text);
                 let chunk =
                     ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
                 let notif = SessionNotification::new(
@@ -537,9 +704,8 @@ async fn run_prompt(
                     tracing::warn!("ACP failed to send reasoning notification: {}", e);
                 }
             }
-            AgentEvent::ToolCall { name, args } => {
-                let id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
-                tool_call_id = Some(id.clone());
+            AgentEvent::ToolCall { id, name, args } => {
+                let id = ToolCallId::new(id);
                 let args_str = args.to_string();
                 let tool_call = ToolCall::new(id.clone(), name.to_string())
                     .raw_input(serde_json::from_str(&args_str).ok());
@@ -551,30 +717,19 @@ async fn run_prompt(
                     tracing::warn!("ACP failed to send tool call notification: {}", e);
                 }
             }
-            AgentEvent::SubagentToolCall { name, args } => {
-                let id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
-                tool_call_id = Some(id.clone());
-                let args_str = args.to_string();
-                let tool_call = ToolCall::new(id.clone(), format!("[subagent] {}", name))
-                    .raw_input(serde_json::from_str(&args_str).ok());
-                let notif = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::ToolCall(tool_call),
-                );
-                if let Err(e) = cx.send_notification(notif) {
-                    tracing::warn!("ACP failed to send subagent tool call notification: {}", e);
-                }
+            AgentEvent::SubagentToolCall { .. } => {
+                // This is a display-only event from inside a task tool. The outer
+                // provider tool call/result is canonical and will arrive with a
+                // stable ID; advertising a nested call here would create an ACP
+                // call that can never receive a matching result.
             }
-            AgentEvent::ToolResult { output, .. } => {
-                let id = tool_call_id
-                    .take()
-                    .unwrap_or_else(|| ToolCallId::new(uuid::Uuid::new_v4().to_string()));
+            AgentEvent::ToolResult { id, output, .. } => {
                 let fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .content(vec![ToolCallContent::from(ContentBlock::Text(
                         TextContent::new(output.to_string()),
                     ))]);
-                let update = ToolCallUpdate::new(id, fields);
+                let update = ToolCallUpdate::new(ToolCallId::new(id), fields);
                 let notif = SessionNotification::new(
                     session_id.clone(),
                     SessionUpdate::ToolCallUpdate(update),
@@ -601,7 +756,8 @@ async fn run_prompt(
                 // Mid-stream provider usage; ACP has no status bar to update, so
                 // there is nothing to surface for this event.
             }
-            AgentEvent::Done { .. } => {
+            AgentEvent::Done { interactions, .. } => {
+                completed_interactions = Some(interactions);
                 break;
             }
             AgentEvent::Error(err) => {
@@ -622,17 +778,667 @@ async fn run_prompt(
         }
     }
 
-    // Store assistant response in session history
-    if !final_response.is_empty() {
-        let mut sessions = state.sessions.lock().await;
-        if let Some(sess) = sessions.get_mut(&session_id) {
-            sess.messages
-                .push(("assistant".to_string(), final_response));
-        }
-    }
+    let Some(completed_interactions) = completed_interactions else {
+        // A dropped runner is not a completed turn. Avoid committing a ghost user
+        // message or partial assistant/tool output to future model context.
+        let _ = responder.respond(PromptResponse::new(StopReason::Refusal));
+        return Ok(());
+    };
+
+    history.commit_completed_turn(prompt_text, completed_interactions);
 
     let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
     Ok(())
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use rig::agent::AgentBuilder;
+    use rig::completion::message::UserContent;
+    use rig::completion::{AssistantContent, Message};
+    use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+
+    async fn complete_prompt(
+        model: MockCompletionModel,
+        prompt: &str,
+        history: Vec<Message>,
+    ) -> Vec<Message> {
+        let agent = AgentBuilder::new(model).build();
+        let runner = crate::agent::runner::spawn_agent(
+            agent,
+            prompt.to_string(),
+            history,
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut events = runner.event_rx;
+        while let Some(event) = events.recv().await {
+            match event {
+                AgentEvent::Done { interactions, .. } => return interactions,
+                AgentEvent::Error(error) => panic!("fake ACP turn failed: {error}"),
+                _ => {}
+            }
+        }
+        panic!("fake ACP turn ended without a terminal event")
+    }
+
+    #[tokio::test]
+    async fn second_prompt_receives_the_first_committed_turn_exactly_once() {
+        let mut history = SessionHistory::default();
+        let first_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("The project code is red-fox."),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let first_observer = first_model.clone();
+        let first_interactions = complete_prompt(
+            first_model,
+            "Remember that the project code is red-fox.",
+            history.snapshot(),
+        )
+        .await;
+        assert!(
+            history.snapshot().is_empty(),
+            "running a turn must not insert its user message before an explicit commit"
+        );
+        history.commit_completed_turn(
+            "Remember that the project code is red-fox.",
+            first_interactions,
+        );
+
+        let first_request = first_observer.requests();
+        assert_eq!(first_request.len(), 1);
+        assert_eq!(
+            first_request[0]
+                .chat_history
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![Message::user("Remember that the project code is red-fox.")],
+            "Rig should append the current prompt exactly once to an empty prior snapshot"
+        );
+
+        let second_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("red-fox"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let second_observer = second_model.clone();
+        let _ = complete_prompt(
+            second_model,
+            "What project code did I ask you to remember?",
+            history.snapshot(),
+        )
+        .await;
+
+        let requests = second_observer.requests();
+        let received = requests[0].chat_history.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            received,
+            vec![
+                Message::user("Remember that the project code is red-fox."),
+                Message::assistant("The project code is red-fox."),
+                Message::user("What project code did I ask you to remember?"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_acp_sessions_keep_history_isolated() {
+        let first = Arc::new(Mutex::new(SessionHistory::default()));
+        let second = Arc::new(Mutex::new(SessionHistory::default()));
+        let first_task = {
+            let first = first.clone();
+            tokio::spawn(async move {
+                first.lock().await.commit_completed_turn(
+                    "first-user",
+                    vec![Message::assistant("first-assistant")],
+                );
+            })
+        };
+        let second_task = {
+            let second = second.clone();
+            tokio::spawn(async move {
+                second.lock().await.commit_completed_turn(
+                    "second-user",
+                    vec![Message::assistant("second-assistant")],
+                );
+            })
+        };
+        tokio::try_join!(first_task, second_task).unwrap();
+
+        assert_eq!(
+            first.lock().await.snapshot(),
+            vec![
+                Message::user("first-user"),
+                Message::assistant("first-assistant")
+            ]
+        );
+        assert_eq!(
+            second.lock().await.snapshot(),
+            vec![
+                Message::user("second-user"),
+                Message::assistant("second-assistant")
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_tool_history_keeps_call_and_result_correlated() {
+        let call = Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::one(AssistantContent::tool_call(
+                "call-17",
+                "read",
+                serde_json::json!({"path": "sentinel.txt"}),
+            )),
+        };
+        let result = Message::tool_result("call-17", "sentinel contents");
+        let mut history = SessionHistory::default();
+        history.commit_completed_turn(
+            "read the sentinel",
+            vec![call, result, Message::assistant("The sentinel is present.")],
+        );
+        let snapshot = history.snapshot();
+
+        let Message::Assistant { content, .. } = &snapshot[1] else {
+            panic!("tool call must remain an assistant message")
+        };
+        let AssistantContent::ToolCall(call) = content.first() else {
+            panic!("assistant history must retain a structured tool call")
+        };
+        assert_eq!(call.id, "call-17");
+        assert_eq!(call.function.name, "read");
+
+        let Message::User { content } = &snapshot[2] else {
+            panic!("tool result must remain a user message")
+        };
+        let UserContent::ToolResult(result) = content.first() else {
+            panic!("user history must retain a structured tool result")
+        };
+        assert_eq!(result.id, call.id);
+    }
+
+    #[test]
+    fn continuation_bridge_is_committed_as_the_exact_model_visible_transcript() {
+        let grouped_assistant = Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::many(vec![
+                AssistantContent::text("checking"),
+                AssistantContent::tool_call(
+                    "causal-tool",
+                    "read",
+                    serde_json::json!({"path": "sentinel.txt"}),
+                ),
+            ])
+            .expect("grouped assistant content is non-empty"),
+        };
+        let model_visible_transcript = vec![
+            Message::user("start"),
+            grouped_assistant,
+            Message::tool_result("causal-tool", "sentinel contents"),
+            Message::assistant(""),
+            Message::user("Please continue."),
+            Message::assistant("answer"),
+        ];
+
+        let mut history = SessionHistory::default();
+        history.commit_completed_turn("start", model_visible_transcript[1..].to_vec());
+
+        assert_eq!(history.snapshot(), model_visible_transcript);
+    }
+
+    #[test]
+    fn history_retention_evicts_whole_oldest_turns_at_both_bounds() {
+        let mut by_count = SessionHistory::default();
+        for index in 0..=MAX_ACP_HISTORY_TURNS {
+            by_count.commit_completed_turn(
+                &format!("user-{index}"),
+                vec![Message::assistant(format!("assistant-{index}"))],
+            );
+        }
+        let count_snapshot = by_count.snapshot();
+        assert_eq!(count_snapshot.len(), MAX_ACP_HISTORY_TURNS * 2);
+        assert!(!count_snapshot.contains(&Message::user("user-0")));
+        assert!(count_snapshot.contains(&Message::user(format!("user-{MAX_ACP_HISTORY_TURNS}"))));
+
+        let mut by_bytes = SessionHistory::default();
+        by_bytes.commit_completed_turn(
+            &"u".repeat(MAX_ACP_HISTORY_BYTES),
+            vec![Message::assistant("oversized")],
+        );
+        assert!(
+            by_bytes.snapshot().is_empty(),
+            "a single oversized turn must not leave history above its byte bound"
+        );
+    }
+
+    #[test]
+    fn initialize_truthfully_does_not_advertise_load_session() {
+        assert!(!acp_capabilities().load_session);
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    use agent_client_protocol::schema::ProtocolVersion;
+    use rig::completion::AssistantContent;
+
+    use super::*;
+
+    struct InMemoryAgent(Arc<AcpState>);
+
+    struct ProtocolTempDir(PathBuf);
+
+    impl ProtocolTempDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "mini-agent-acp-protocol-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ProtocolTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl ConnectTo<Client> for InMemoryAgent {
+        async fn connect_to(
+            self,
+            client: impl ConnectTo<Agent>,
+        ) -> Result<(), agent_client_protocol::Error> {
+            connect_agent(self.0, client).await
+        }
+    }
+
+    fn fixture_state(prompt_fixture: PromptFixture) -> Arc<AcpState> {
+        Arc::new(AcpState {
+            cli: Cli::default(),
+            cfg: Config::default(),
+            context: crate::context::load(true),
+            sessions: Mutex::new(HashMap::new()),
+            prompt_fixture: Some(prompt_fixture),
+        })
+    }
+
+    fn done(response: &str, interactions: Vec<Message>) -> AgentEvent {
+        AgentEvent::Done {
+            response: response.into(),
+            interactions,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
+    }
+
+    fn prompt(session_id: SessionId, text: &str) -> PromptRequest {
+        PromptRequest::new(session_id, vec![ContentBlock::Text(TextContent::new(text))])
+    }
+
+    fn canonical_tool_turn() -> Vec<Message> {
+        vec![
+            Message::Assistant {
+                id: None,
+                content: rig::OneOrMany::many([
+                    AssistantContent::tool_call(
+                        "provider-a",
+                        "read",
+                        serde_json::json!({"path": "a"}),
+                    ),
+                    AssistantContent::tool_call(
+                        "provider-b",
+                        "read",
+                        serde_json::json!({"path": "b"}),
+                    ),
+                ])
+                .unwrap(),
+            },
+            Message::User {
+                content: rig::OneOrMany::many([
+                    rig::message::UserContent::tool_result(
+                        "provider-a",
+                        rig::OneOrMany::one(rig::message::ToolResultContent::text("a-result")),
+                    ),
+                    rig::message::UserContent::tool_result(
+                        "provider-b",
+                        rig::OneOrMany::one(rig::message::ToolResultContent::text("b-result")),
+                    ),
+                ])
+                .unwrap(),
+            },
+            Message::assistant("tools-complete"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn in_memory_protocol_preserves_history_isolation_rollback_and_tool_ids() {
+        let observed = Arc::new(StdMutex::new(Vec::<(String, Vec<Message>)>::new()));
+        let answered_from_context = Arc::new(AtomicBool::new(false));
+        let fixture: PromptFixture = {
+            let observed = observed.clone();
+            let answered_from_context = answered_from_context.clone();
+            Arc::new(move |prompt, history| {
+                let observed = observed.clone();
+                let answered_from_context = answered_from_context.clone();
+                Box::pin(async move {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((prompt.clone(), history.clone()));
+                    if prompt == "fail" {
+                        return Err("fixture failure".to_owned());
+                    }
+                    if prompt == "tools" {
+                        return Ok(vec![
+                            AgentEvent::ToolCall {
+                                id: "lifecycle-a".to_owned(),
+                                name: "read".into(),
+                                args: serde_json::json!({"path": "a"}),
+                            },
+                            AgentEvent::ToolCall {
+                                id: "lifecycle-b".to_owned(),
+                                name: "read".into(),
+                                args: serde_json::json!({"path": "b"}),
+                            },
+                            AgentEvent::SubagentToolCall {
+                                name: "nested-display-only".into(),
+                                args: serde_json::json!({"not": "canonical"}),
+                            },
+                            AgentEvent::ToolResult {
+                                id: "lifecycle-b".to_owned(),
+                                name: "read".into(),
+                                output: "b-result".into(),
+                            },
+                            AgentEvent::ToolResult {
+                                id: "lifecycle-a".to_owned(),
+                                name: "read".into(),
+                                output: "a-result".into(),
+                            },
+                            done("tools-complete", canonical_tool_turn()),
+                        ]);
+                    }
+                    if prompt == "second" {
+                        let mut expected = vec![Message::user("tools")];
+                        expected.extend(canonical_tool_turn());
+                        if history != expected {
+                            return Err("first-turn sentinel was absent from history".to_owned());
+                        }
+                        answered_from_context.store(true, Ordering::Release);
+                        return Ok(vec![done(
+                            "sentinel-from-tools",
+                            vec![Message::assistant("sentinel-from-tools")],
+                        )]);
+                    }
+                    let response = format!("answer-{prompt}");
+                    Ok(vec![done(
+                        &response,
+                        vec![Message::assistant(response.clone())],
+                    )])
+                })
+            })
+        };
+        let state = fixture_state(fixture);
+        let notifications = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let notification_sink = notifications.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    notification_sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let initialized = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                assert!(!initialized.agent_capabilities.load_session);
+
+                let first = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let second = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                cx.send_request(prompt(first.clone(), "tools"))
+                    .block_task()
+                    .await?;
+                cx.send_request(prompt(first.clone(), "second"))
+                    .block_task()
+                    .await?;
+                let failed = cx
+                    .send_request(prompt(first.clone(), "fail"))
+                    .block_task()
+                    .await?;
+                assert_eq!(failed.stop_reason, StopReason::Refusal);
+                cx.send_request(prompt(first.clone(), "after-failure"))
+                    .block_task()
+                    .await?;
+                cx.send_request(prompt(second, "isolated"))
+                    .block_task()
+                    .await?;
+
+                assert!(
+                    cx.send_request(LoadSessionRequest::new(first, cwd))
+                        .block_task()
+                        .await
+                        .is_err(),
+                    "unadvertised load_session must also be rejected on the wire"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert!(observed[0].1.is_empty());
+        let mut exact_first_turn = vec![Message::user("tools")];
+        exact_first_turn.extend(canonical_tool_turn());
+        assert_eq!(observed[1].1, exact_first_turn);
+        assert!(answered_from_context.load(Ordering::Acquire));
+        let failed_history = &observed[2].1;
+        assert_eq!(
+            &observed[3].1, failed_history,
+            "failed turns must roll back"
+        );
+        assert!(observed[4].1.is_empty(), "live sessions must stay isolated");
+
+        let notifications = notifications.lock().unwrap();
+        let call_ids = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(call) => Some(call.tool_call_id.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let result_ids = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update.tool_call_id.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids, vec!["lifecycle-a", "lifecycle-b"]);
+        assert_eq!(result_ids, vec!["lifecycle-b", "lifecycle-a"]);
+    }
+
+    #[tokio::test]
+    async fn in_memory_protocol_dispatches_while_a_session_turn_is_queued() {
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let release_blocked = Arc::new(tokio::sync::Notify::new());
+        let queued_started = Arc::new(AtomicUsize::new(0));
+        let fixture: PromptFixture = {
+            let blocked_started = blocked_started.clone();
+            let release_blocked = release_blocked.clone();
+            let queued_started = queued_started.clone();
+            Arc::new(move |prompt, _history| {
+                let blocked_started = blocked_started.clone();
+                let release_blocked = release_blocked.clone();
+                let queued_started = queued_started.clone();
+                Box::pin(async move {
+                    if prompt == "blocked" {
+                        blocked_started.notify_one();
+                        release_blocked.notified().await;
+                    } else if prompt == "queued" {
+                        queued_started.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let state = fixture_state(fixture);
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let first = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                let first_cx = cx.clone();
+                let first_id = first.clone();
+                let blocked = tokio::spawn(async move {
+                    first_cx
+                        .send_request(prompt(first_id, "blocked"))
+                        .block_task()
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(1), blocked_started.notified())
+                    .await
+                    .expect("the first turn should start");
+
+                let queued_cx = cx.clone();
+                let queued_id = first.clone();
+                let queued = tokio::spawn(async move {
+                    queued_cx
+                        .send_request(prompt(queued_id, "queued"))
+                        .block_task()
+                        .await
+                });
+                tokio::task::yield_now().await;
+                cx.send_notification(CancelNotification::new(first))?;
+
+                let second = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    cx.send_request(NewSessionRequest::new(cwd)).block_task(),
+                )
+                .await
+                .expect("new-session dispatch must not wait behind the queued prompt")?
+                .session_id;
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    cx.send_request(prompt(second, "other-session"))
+                        .block_task(),
+                )
+                .await
+                .expect("another session must run while the first is blocked")?;
+                assert_eq!(queued_started.load(Ordering::Acquire), 0);
+
+                release_blocked.notify_one();
+                blocked.await.unwrap()?;
+                queued.await.unwrap()?;
+                assert_eq!(queued_started.load(Ordering::Acquire), 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_memory_protocol_rejects_capacity_without_evicting_live_sessions() {
+        let fixture: PromptFixture = Arc::new(|prompt, _history| {
+            Box::pin(async move {
+                Ok(vec![done(
+                    &prompt,
+                    vec![Message::assistant(prompt.clone())],
+                )])
+            })
+        });
+        let state = fixture_state(fixture);
+        let state_for_assertion = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let mut ids = Vec::new();
+                for _ in 0..MAX_ACP_SESSIONS {
+                    ids.push(
+                        cx.send_request(NewSessionRequest::new(cwd.clone()))
+                            .block_task()
+                            .await?
+                            .session_id,
+                    );
+                }
+                assert!(
+                    cx.send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await
+                        .is_err(),
+                    "the 65th session must be rejected"
+                );
+                cx.send_request(prompt(ids[0].clone(), "still-live"))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state_for_assertion.sessions.lock().await.len(),
+            MAX_ACP_SESSIONS
+        );
+    }
 }
 
 #[cfg(test)]
@@ -732,6 +1538,7 @@ mod workspace_tests {
         assert!(!first_agents.contains("SECOND_CONTEXT_SENTINEL"));
         assert!(second_agents.contains("SECOND_CONTEXT_SENTINEL"));
         assert!(!second_agents.contains("FIRST_CONTEXT_SENTINEL"));
+        #[cfg(feature = "archmd")]
         assert!(
             first_context
                 .architecture
@@ -739,6 +1546,7 @@ mod workspace_tests {
                 .unwrap_or_default()
                 .contains("FIRST_ARCHITECTURE_SENTINEL")
         );
+        #[cfg(feature = "archmd")]
         assert!(
             second_context
                 .architecture
