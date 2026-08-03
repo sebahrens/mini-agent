@@ -17,6 +17,7 @@ mod permission;
 mod pricing;
 mod print;
 mod process_creation;
+mod product;
 mod provider;
 mod retry;
 mod sandbox;

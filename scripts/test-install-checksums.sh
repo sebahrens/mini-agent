@@ -37,17 +37,29 @@ _assert_file_absent() {
     fi
 }
 
+_assert_file_contains() {
+    local label="$1" path="$2" expected="$3"
+    if grep -Fqx -- "$expected" "$path"; then
+        echo "  PASS: $label"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: $label (missing exact line: $expected)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 # ---- build fixture data ----
 FIXTURE="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE"' EXIT
 
 BINARY_NAME="mini-agent"
+CARGO_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${ROOT_DIR}/Cargo.toml" | head -1)"
 ASSET_NAME="${BINARY_NAME}-x86_64-unknown-linux-musl"
 ARCHIVE="${ASSET_NAME}.tar.gz"
 
 # Create a fake binary
 echo '#!/usr/bin/env bash' > "${FIXTURE}/${BINARY_NAME}"
-echo 'echo "mini-agent 1.7.2"' >> "${FIXTURE}/${BINARY_NAME}"
+echo "echo \"mini-agent ${CARGO_VERSION}\"" >> "${FIXTURE}/${BINARY_NAME}"
 chmod +x "${FIXTURE}/${BINARY_NAME}"
 
 # Create the archive
@@ -224,6 +236,70 @@ fi
 _assert_file_absent "no binary installed after wrong-platform entry" "${install_dir}/${BINARY_NAME}"
 rm -f "$WRONG_PLATFORM"
 rm -rf "$install_dir"
+
+# ---- Case 7: execute the checked-in installer and assert canonical URLs ----
+STUB_BIN="${FIXTURE}/stub-bin"
+REAL_INSTALL_DIR="${FIXTURE}/real-install"
+REQUEST_LOG="${FIXTURE}/requested-urls"
+mkdir -p "$STUB_BIN" "$REAL_INSTALL_DIR"
+
+cat > "${STUB_BIN}/uname" <<'STUB_UNAME'
+#!/usr/bin/env bash
+case "$1" in
+  -s) echo Linux ;;
+  -m) echo x86_64 ;;
+  *) exit 2 ;;
+esac
+STUB_UNAME
+
+cat > "${STUB_BIN}/curl" <<'STUB_CURL'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+url="${!#}"
+for ((i = 1; i <= $#; i++)); do
+    if [[ "${!i}" == "-o" ]]; then
+        next=$((i + 1))
+        out="${!next}"
+        break
+    fi
+done
+printf '%s\n' "$url" >> "$INSTALLER_REQUEST_LOG"
+case "$url" in
+  */SHA256SUMS) cp "$INSTALLER_MANIFEST" "$out" ;;
+  */mini-agent-x86_64-unknown-linux-musl.tar.gz) cp "$INSTALLER_ARCHIVE" "$out" ;;
+  *) echo "unexpected installer URL: $url" >&2; exit 22 ;;
+esac
+STUB_CURL
+chmod +x "${STUB_BIN}/uname" "${STUB_BIN}/curl"
+
+if PATH="${STUB_BIN}:$PATH" \
+    INSTALLER_REQUEST_LOG="$REQUEST_LOG" \
+    INSTALLER_MANIFEST="${FIXTURE}/SHA256SUMS" \
+    INSTALLER_ARCHIVE="${FIXTURE}/${ARCHIVE}" \
+    bash "${ROOT_DIR}/install.sh" --release "$CARGO_VERSION" --dir "$REAL_INSTALL_DIR" >/dev/null; then
+    if [[ -x "${REAL_INSTALL_DIR}/${BINARY_NAME}" ]] \
+        && [[ "$("${REAL_INSTALL_DIR}/${BINARY_NAME}")" == "mini-agent ${CARGO_VERSION}" ]]; then
+        echo "  PASS: checked-in installer executes canonical archive end to end"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: checked-in installer did not install a working canonical binary"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "  FAIL: checked-in installer failed against canonical release fixture"
+    FAIL=$((FAIL + 1))
+fi
+
+CANONICAL_BASE="https://github.com/sebahrens/mini-agent/releases/download/v${CARGO_VERSION}"
+_assert_file_contains \
+    "installer requests canonical archive origin" \
+    "$REQUEST_LOG" \
+    "${CANONICAL_BASE}/${ARCHIVE}"
+_assert_file_contains \
+    "installer requests canonical checksum origin" \
+    "$REQUEST_LOG" \
+    "${CANONICAL_BASE}/SHA256SUMS"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

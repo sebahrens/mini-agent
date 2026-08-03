@@ -99,7 +99,8 @@ pub fn render_session(
         feed.push_line(
             BlockStyle::Welcome,
             format!(
-                "[>] zerostack {} | {} | {}",
+                "[>] {} {} | {} | {}",
+                crate::product::PUBLIC_NAME,
                 env!("CARGO_PKG_VERSION"),
                 cli.resolve_model(cfg),
                 cwd_str,
@@ -182,7 +183,10 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
         BlockStyle::Welcome,
         "──────────────────────────────────────────",
     );
-    feed.push_line(BlockStyle::Welcome, "  zerostack Quickstart");
+    feed.push_line(
+        BlockStyle::Welcome,
+        format!("  {} Quickstart", crate::product::PUBLIC_NAME),
+    );
     feed.push_line(
         BlockStyle::Welcome,
         "──────────────────────────────────────────",
@@ -231,7 +235,7 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     );
     feed.push_line(
         BlockStyle::Plain,
-        "  Website: https://gi-dellav.github.io/zerostack/",
+        format!("  Website: {}", crate::product::REPOSITORY_URL),
     );
     feed.push_line(BlockStyle::Plain, "");
     feed.push_line(

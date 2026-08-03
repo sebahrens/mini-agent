@@ -294,7 +294,11 @@ fn render(ctx: &Ctx) -> io::Result<()> {
 }
 
 fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
-    write_centered(0, "ZEROSTACK SETUP", Color::Cyan)?;
+    write_centered(
+        0,
+        &format!("{} SETUP", crate::product::PUBLIC_NAME.to_uppercase()),
+        Color::Cyan,
+    )?;
     write_hline(2, Color::DarkGrey)?;
 
     let mut row = 4u16;

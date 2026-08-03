@@ -193,7 +193,10 @@ impl LspClient {
                 }
             },
             "initializationOptions": cfg.initialization.clone().unwrap_or(Value::Null),
-            "clientInfo": { "name": "zerostack", "version": env!("CARGO_PKG_VERSION") }
+            "clientInfo": {
+                "name": crate::product::PUBLIC_NAME,
+                "version": env!("CARGO_PKG_VERSION")
+            }
         });
         client
             .request("initialize", init_params, INIT_TIMEOUT)

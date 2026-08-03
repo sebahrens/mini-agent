@@ -260,7 +260,7 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
         ctx.renderer,
         "  /history               show global chat history",
     );
-    write_result(ctx.renderer, "  /quit [/exit]          exit zerostack");
+    write_result(ctx.renderer, "  /quit [/exit]          exit mini-agent");
     write_result(
         ctx.renderer,
         "  /welcome               show the quickstart guide",

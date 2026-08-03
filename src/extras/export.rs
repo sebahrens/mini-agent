@@ -177,7 +177,7 @@ pub async fn share_gist(filename: &str, content: &str, description: &str) -> Res
     });
     let response = reqwest::Client::new()
         .post("https://api.github.com/gists")
-        .header(reqwest::header::USER_AGENT, "zerostack")
+        .header(reqwest::header::USER_AGENT, crate::product::PUBLIC_NAME)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .json(&body)

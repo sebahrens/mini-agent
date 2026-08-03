@@ -18,7 +18,7 @@ pub use portable::{
 };
 pub use portable::{digest_filename, opaque_name, validate_portable_component};
 
-const APP_COMPONENT: &str = "zerostack";
+const APP_COMPONENT: &str = crate::product::LEGACY_APP_COMPONENT;
 const MIGRATION_VERSION: u32 = 1;
 pub(crate) const PRIVATE_PATH_LINK_POLICY: &str = "reject symlinked path components";
 
@@ -300,7 +300,11 @@ impl AppPaths {
             .as_deref()
             .map(|root| {
                 ensure_absolute(platform, AppPathRoot::Workspace, root)?;
-                Ok(join_component(platform, root, ".zerostack"))
+                Ok(join_component(
+                    platform,
+                    root,
+                    crate::product::LEGACY_PROJECT_DIRECTORY,
+                ))
             })
             .transpose()?;
 
