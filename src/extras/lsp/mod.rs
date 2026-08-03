@@ -14,7 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use lsp_types::DiagnosticSeverity;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
 use crate::config::types::LspConfig;
@@ -27,7 +31,7 @@ use client::{DiagStore, LspClient};
 const DIAG_WAIT: Duration = Duration::from_millis(1000);
 
 /// Max diagnostics lines appended to a tool result.
-const MAX_DIAG_LINES: usize = 20;
+pub(crate) const MAX_DIAG_LINES: usize = 20;
 
 #[derive(Clone)]
 pub struct LspManager {
@@ -42,10 +46,59 @@ struct Inner {
     clients: tokio::sync::Mutex<HashMap<String, Option<Arc<LspClient>>>>,
     diags: DiagStore,
     diag_notify: Arc<Notify>,
+    #[cfg(test)]
+    active_bindings: Arc<AtomicUsize>,
+    #[cfg(test)]
+    peak_bindings: Arc<AtomicUsize>,
+    #[cfg(test)]
+    test_synced_documents: Arc<std::sync::Mutex<HashMap<String, client::SyncedDocument>>>,
+}
+
+/// A diagnostic-cache entry bound to the exact regular file that produced it.
+/// The open handle keeps that object alive across an interactive permission
+/// wait; formatting later compares the cache identity to this handle rather
+/// than resolving the pathname again.
+pub(crate) struct BoundDiagnosticPath {
+    path: PathBuf,
+    uri: String,
+    identity: std::fs::Metadata,
+    _file: tokio::fs::File,
+    #[cfg(test)]
+    active_bindings: Arc<AtomicUsize>,
+}
+
+impl BoundDiagnosticPath {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+impl Drop for BoundDiagnosticPath {
+    fn drop(&mut self) {
+        self.active_bindings.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(crate) struct DiagnosticSnapshot {
+    uri: String,
+    lines: Vec<String>,
+    truncated: bool,
+}
+
+impl DiagnosticSnapshot {
+    pub(crate) fn retained_line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 impl LspManager {
     pub fn new(cfg: &LspConfig, root: PathBuf) -> Self {
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         let servers = registry::resolve_servers(&cfg.servers);
         tracing::debug!(
             "lsp: {} server definitions resolved (root {})",
@@ -59,8 +112,19 @@ impl LspManager {
                 clients: tokio::sync::Mutex::new(HashMap::new()),
                 diags: DiagStore::default(),
                 diag_notify: Arc::new(Notify::new()),
+                #[cfg(test)]
+                active_bindings: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                peak_bindings: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                test_synced_documents: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
         }
+    }
+
+    /// Workspace scope whose cached diagnostics are exposed by the tool.
+    pub fn root(&self) -> &Path {
+        &self.inner.root
     }
 
     /// Whether any configured server claims this path's extension.
@@ -87,8 +151,22 @@ impl LspManager {
     /// Syncs a file's disk content with its language server (no-op when no
     /// server handles the extension or the server failed to start).
     pub async fn notify_changed(&self, path: &Path) {
+        if !self.handles(path) {
+            return;
+        }
+        // Open and bind the file identity before a server is selected or
+        // launched. If a path approved by the caller is replaced by a symlink
+        // while permission is pending, the replacement content is never read
+        // and never reaches an LSP process.
+        let Ok(mut file) = crate::fs::open_stable_file(path).await else {
+            return;
+        };
+        let mut text = String::new();
+        if file.read_to_string(&mut text).await.is_err() {
+            return;
+        }
         if let Some(client) = self.client_for(path).await {
-            client.sync_file(path).await;
+            client.sync_file(path, text).await;
         }
     }
 
@@ -100,6 +178,10 @@ impl LspManager {
             return None;
         }
         let uri = client::file_uri(path)?;
+        // A production edit atomically replaces the file, so the previous
+        // cache identity is expected to be stale here. Its version remains the
+        // synchronization baseline while we wait for a publish tied to the new
+        // identity; stale diagnostics themselves are never returned.
         let v0 = self
             .inner
             .diags
@@ -110,6 +192,10 @@ impl LspManager {
             .unwrap_or(0);
         let deadline = tokio::time::Instant::now() + wait;
         loop {
+            // Register before inspecting the version so a publish between the
+            // check and await cannot be lost.
+            let notified = self.inner.diag_notify.notified();
+            tokio::pin!(notified);
             let current = self
                 .inner
                 .diags
@@ -121,7 +207,7 @@ impl LspManager {
             if current > v0 {
                 break;
             }
-            if tokio::time::timeout_at(deadline, self.inner.diag_notify.notified())
+            if tokio::time::timeout_at(deadline, &mut notified)
                 .await
                 .is_err()
             {
@@ -130,6 +216,9 @@ impl LspManager {
         }
         let store = self.inner.diags.lock().unwrap();
         let file = store.get(&uri)?;
+        if !diagnostic_identity_is_current(&uri, file) {
+            return None;
+        }
         format_file_diags(&file.server, &file.diagnostics)
     }
 
@@ -143,12 +232,132 @@ impl LspManager {
     /// All files that currently have diagnostics, formatted for the
     /// `lsp_diagnostics` tool. `None` when everything is clean.
     pub fn all_diagnostics_block(&self) -> Option<String> {
+        self.all_diagnostics_block_inner()
+    }
+
+    /// Sorted cache candidates that contain at least one error or warning.
+    /// The production cache is hard-capped at [`client::MAX_DIAGNOSTIC_FILES`],
+    /// which also bounds this allocation and sort.
+    /// Callers authorize the project scope before enumerating these opaque
+    /// identifiers and bind them one at a time before inspecting a path.
+    pub fn diagnostic_candidate_uris(&self) -> Vec<String> {
+        let store = self.inner.diags.lock().unwrap();
+        let mut uris: Vec<String> = store
+            .iter()
+            .filter(|(_, file)| {
+                file.diagnostics
+                    .iter()
+                    .any(|diag| diag.severity <= Some(DiagnosticSeverity::WARNING))
+            })
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        uris.sort();
+        uris
+    }
+
+    /// Bind one cache candidate to its canonical regular-file identity. The
+    /// canonicalization places Windows paths in the same extended-path form as
+    /// the manager root; re-emitting the URI confirms it is still the exact
+    /// cache identity rather than an alias.
+    pub async fn bind_diagnostic_uri(&self, uri: &str) -> Option<BoundDiagnosticPath> {
+        let decoded = client::file_path(uri)?;
+        let path = tokio::fs::canonicalize(decoded).await.ok()?;
+        if client::file_uri(&path).as_deref() != Some(uri) {
+            return None;
+        }
+        let file = crate::fs::open_stable_file(&path).await.ok()?;
+        let identity = file.metadata().await.ok()?;
+        let matches_cache = self
+            .inner
+            .diags
+            .lock()
+            .unwrap()
+            .get(uri)
+            .and_then(|cached| cached.identity.as_ref())
+            .is_some_and(|cached| crate::fs::ensure_same_file(&path, cached, &identity).is_ok());
+        if !matches_cache {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            let active = self.inner.active_bindings.fetch_add(1, Ordering::SeqCst) + 1;
+            self.inner.peak_bindings.fetch_max(active, Ordering::SeqCst);
+        }
+        Some(BoundDiagnosticPath {
+            path,
+            uri: uri.to_string(),
+            identity,
+            _file: file,
+            #[cfg(test)]
+            active_bindings: self.inner.active_bindings.clone(),
+        })
+    }
+
+    /// Copy diagnostics only when the cache still names the exact object held
+    /// by `binding`. The returned snapshot is independent of the file handle,
+    /// so the caller can release it before authorizing the next candidate.
+    pub fn snapshot_bound_diagnostics(
+        &self,
+        binding: &BoundDiagnosticPath,
+        remaining_lines: usize,
+    ) -> Option<DiagnosticSnapshot> {
+        let store = self.inner.diags.lock().unwrap();
+        let cached = store.get(&binding.uri)?;
+        let cache_identity = cached.identity.as_ref()?;
+        if crate::fs::ensure_same_file(&binding.path, &binding.identity, cache_identity).is_err() {
+            return None;
+        }
+        let display = binding
+            .path
+            .strip_prefix(&self.inner.root)
+            .map(|relative| relative.display().to_string())
+            .unwrap_or_else(|_| binding.path.display().to_string());
+        let mut interesting = cached
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.severity <= Some(DiagnosticSeverity::WARNING));
+        let lines: Vec<String> = interesting
+            .by_ref()
+            .take(remaining_lines)
+            .map(|diagnostic| format_diag_line(&display, diagnostic))
+            .collect();
+        let truncated = interesting.next().is_some();
+        Some(DiagnosticSnapshot {
+            uri: binding.uri.clone(),
+            lines,
+            truncated,
+        })
+    }
+
+    pub fn all_diagnostics_block_for_snapshots(
+        &self,
+        snapshots: &[DiagnosticSnapshot],
+    ) -> Option<String> {
+        let mut entries: Vec<_> = snapshots.iter().collect();
+        entries.sort_by(|a, b| a.uri.cmp(&b.uri));
+        let mut out = String::new();
+        for snapshot in entries {
+            for line in &snapshot.lines {
+                out.push_str(line);
+            }
+            if snapshot.truncated {
+                out.push_str("\n  … (truncated)");
+                return Some(out);
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    fn all_diagnostics_block_inner(&self) -> Option<String> {
         let store = self.inner.diags.lock().unwrap();
         let mut out = String::new();
         let mut lines = 0usize;
         let mut entries: Vec<_> = store.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (uri, file) in entries {
+            if !diagnostic_identity_is_current(uri, file) {
+                continue;
+            }
             let interesting: Vec<_> = file
                 .diagnostics
                 .iter()
@@ -157,10 +366,12 @@ impl LspManager {
             if interesting.is_empty() {
                 continue;
             }
-            let display = uri
-                .strip_prefix("file://")
-                .and_then(|p| p.strip_prefix(self.inner.root.to_str()?))
-                .map(|p| p.trim_start_matches('/').to_string())
+            let display = client::file_path(uri)
+                .map(|path| {
+                    path.strip_prefix(&self.inner.root)
+                        .map(|relative| relative.display().to_string())
+                        .unwrap_or_else(|_| path.display().to_string())
+                })
                 .unwrap_or_else(|| uri.clone());
             for d in interesting {
                 if lines >= MAX_DIAG_LINES {
@@ -174,6 +385,144 @@ impl LspManager {
         if out.is_empty() { None } else { Some(out) }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn cached_client_count(&self) -> usize {
+        self.inner.clients.lock().await.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_bound_diagnostic_count(&self) -> usize {
+        self.inner.peak_bindings.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_cache_metrics(&self) -> (usize, usize, usize, usize, bool) {
+        let store = self.inner.diags.lock().unwrap();
+        let total_bytes = store.values().map(|entry| entry.cached_bytes).sum();
+        let max_count = store
+            .values()
+            .map(|entry| entry.diagnostics.len())
+            .max()
+            .unwrap_or(0);
+        let max_message = store
+            .values()
+            .flat_map(|entry| &entry.diagnostics)
+            .map(|diagnostic| diagnostic.message.len())
+            .max()
+            .unwrap_or(0);
+        let has_extension_payload =
+            store
+                .values()
+                .flat_map(|entry| &entry.diagnostics)
+                .any(|diagnostic| {
+                    diagnostic.data.is_some()
+                        || diagnostic.related_information.is_some()
+                        || diagnostic.code_description.is_some()
+                        || diagnostic.source.is_some()
+                        || diagnostic.tags.is_some()
+                        || diagnostic.code.is_some()
+                });
+        (
+            store.len(),
+            total_bytes,
+            max_count,
+            max_message,
+            has_extension_payload,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_cache_entry_metrics(&self, uri: &str) -> Option<(u64, usize)> {
+        self.inner
+            .diags
+            .lock()
+            .unwrap()
+            .get(uri)
+            .map(|entry| (entry.version, entry.diagnostics.len()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_diagnostics_for_test(
+        &self,
+        uri: &str,
+        server: &str,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) -> bool {
+        let stored = client::store_diagnostics(
+            &self.inner.diags,
+            server,
+            &serde_json::json!({ "uri": uri, "diagnostics": diagnostics }),
+            None,
+        );
+        if stored {
+            self.inner.diag_notify.notify_waiters();
+        }
+        stored
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_synced_document_for_test(
+        &self,
+        uri: &str,
+        version: i64,
+        allow_versionless: bool,
+    ) {
+        self.inner.test_synced_documents.lock().unwrap().insert(
+            uri.to_string(),
+            client::SyncedDocument {
+                version,
+                allow_versionless,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_synced_diagnostics_for_test(
+        &self,
+        uri: &str,
+        server: &str,
+        published_version: Option<i64>,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) -> bool {
+        let mut params = serde_json::json!({ "uri": uri, "diagnostics": diagnostics });
+        if let Some(version) = published_version {
+            params["version"] = serde_json::json!(version);
+        }
+        let stored = client::store_diagnostics(
+            &self.inner.diags,
+            server,
+            &params,
+            Some(&self.inner.test_synced_documents),
+        );
+        if stored {
+            self.inner.diag_notify.notify_waiters();
+        }
+        stored
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_null_version_diagnostics_for_test(
+        &self,
+        uri: &str,
+        server: &str,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) -> bool {
+        let stored = client::store_diagnostics(
+            &self.inner.diags,
+            server,
+            &serde_json::json!({
+                "uri": uri,
+                "version": serde_json::Value::Null,
+                "diagnostics": diagnostics,
+            }),
+            Some(&self.inner.test_synced_documents),
+        );
+        if stored {
+            self.inner.diag_notify.notify_waiters();
+        }
+        stored
+    }
+
     /// Test hook: inject diagnostics as if a server had published them.
     #[cfg(test)]
     pub(crate) fn inject_diagnostics(
@@ -182,15 +531,33 @@ impl LspManager {
         server: &str,
         diagnostics: Vec<lsp_types::Diagnostic>,
     ) {
-        self.inner.diags.lock().unwrap().insert(
+        let identity = client::file_path(uri).and_then(|path| std::fs::symlink_metadata(path).ok());
+        let _ = client::commit_diagnostics(
+            &self.inner.diags,
             uri.to_string(),
-            client::FileDiags {
-                server: server.to_string(),
-                version: 1,
-                diagnostics,
-            },
+            server,
+            diagnostics,
+            identity,
         );
     }
+}
+
+fn diagnostic_identity_is_current(uri: &str, file: &client::FileDiags) -> bool {
+    let Some(approved) = file.identity.as_ref() else {
+        // Only raw unit-test fixtures omit identity; production insertion
+        // always records one.
+        return true;
+    };
+    let Some(path) = client::file_path(uri) else {
+        return false;
+    };
+    let Ok(current) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if current.file_type().is_symlink() {
+        return false;
+    }
+    crate::fs::ensure_same_file(&path, approved, &current).is_ok()
 }
 
 /// "LSP diagnostics (server):" header + one line per error/warning, capped.

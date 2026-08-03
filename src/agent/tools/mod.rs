@@ -175,12 +175,16 @@ async fn handle_ask_inner(
     permission: &PermCheck,
     tool: &str,
     input: &str,
+    suggested_pattern: Option<String>,
+    additional_allow_patterns: Vec<String>,
 ) -> Result<(), ToolError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     ask_tx
         .send(AskRequest {
             tool: CompactString::new(tool),
             input: input.to_string(),
+            suggested_pattern,
+            additional_allow_patterns: additional_allow_patterns.clone(),
             reply: reply_tx,
         })
         .await
@@ -188,10 +192,11 @@ async fn handle_ask_inner(
     match reply_rx.await {
         Ok(UserDecision::AllowOnce) => Ok(()),
         Ok(UserDecision::AllowAlways(pattern)) => {
-            permission
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .add_session_allowlist(tool.to_string(), &pattern);
+            let mut checker = permission.lock().unwrap_or_else(|e| e.into_inner());
+            checker.add_session_allowlist(tool.to_string(), &pattern);
+            for additional in additional_allow_patterns {
+                checker.add_session_allowlist(tool.to_string(), &additional);
+            }
             Ok(())
         }
         _ => Err(ToolError::Msg("Permission denied by user".to_string())),
@@ -223,7 +228,7 @@ pub async fn check_perm(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, input_key).await?;
+            handle_ask_inner(tx, perm, tool, input_key, None, Vec::new()).await?;
             Ok(None)
         }
     }
@@ -256,7 +261,7 @@ pub(crate) async fn check_mcp_perm(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, "mcp_tool", input_key).await?;
+            handle_ask_inner(tx, perm, "mcp_tool", input_key, None, Vec::new()).await?;
             Ok(None)
         }
     }
@@ -267,6 +272,17 @@ pub async fn check_perm_path(
     ask_tx: &Option<AskSender>,
     tool: &str,
     path: &str,
+) -> Result<Option<String>, ToolError> {
+    check_perm_path_with_suggestion(permission, ask_tx, tool, path, None, Vec::new()).await
+}
+
+pub(crate) async fn check_perm_path_with_suggestion(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    path: &str,
+    suggested_pattern: Option<String>,
+    additional_allow_patterns: Vec<String>,
 ) -> Result<Option<String>, ToolError> {
     let Some(perm) = permission else {
         return Ok(None);
@@ -287,7 +303,52 @@ pub async fn check_perm_path(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, path).await?;
+            handle_ask_inner(
+                tx,
+                perm,
+                tool,
+                path,
+                suggested_pattern,
+                additional_allow_patterns,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Check a canonical path whose exact filesystem object is held open by the
+/// caller. `external` is derived lexically from that canonical path and the
+/// canonical workspace root, so the checker must not resolve the live pathname
+/// again while an interactive decision is pending.
+#[cfg(feature = "lsp")]
+pub(crate) async fn check_perm_bound_path(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    path: &str,
+    external: bool,
+) -> Result<Option<String>, ToolError> {
+    let Some(perm) = permission else {
+        return Ok(None);
+    };
+    let result = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        guard.check_bound_path(tool, path, external)
+    };
+    match result {
+        CheckResult::Allowed => Ok(None),
+        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
+        CheckResult::Denied(reason) => {
+            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
+        }
+        CheckResult::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(
+                    "Permission denied (non-interactive mode)".to_string(),
+                ));
+            };
+            handle_ask_inner(tx, perm, tool, path, None, Vec::new()).await?;
             Ok(None)
         }
     }

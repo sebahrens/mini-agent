@@ -4,7 +4,7 @@
 //! error so a broken server never breaks an edit.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,27 +17,66 @@ use tokio::sync::{Notify, oneshot};
 use super::rpc;
 use crate::config::types::LspServerConfig;
 
-/// `file://` URI for a path, with minimal percent-encoding (anything outside
-/// RFC 3986 unreserved + `/` is hex-escaped). Relative paths resolve against
-/// the process cwd.
+/// Standards-compliant `file:` URI for an absolute path. Relative paths first
+/// resolve against the process cwd. `url` handles platform-specific Windows
+/// drive and UNC forms as well as UTF-8 and percent escaping.
 pub(crate) fn file_uri(path: &Path) -> Option<String> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().ok()?.join(path)
     };
-    let s = abs.to_str()?;
-    let mut out = String::with_capacity(s.len() + 7);
-    out.push_str("file://");
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
+    #[cfg(windows)]
+    let abs = standard_windows_uri_path(&abs)?;
+    url::Url::from_file_path(abs).ok().map(Into::into)
+}
+
+#[cfg(windows)]
+fn standard_windows_uri_path(path: &Path) -> Option<PathBuf> {
+    let path = path.to_str()?;
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        Some(PathBuf::from(format!(r"\\{rest}")))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        Some(PathBuf::from(rest))
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+/// Decode a standards-compliant file URI using platform-aware drive/UNC path
+/// handling. Query strings and fragments are rejected because they cannot be
+/// part of a filesystem permission key.
+pub(crate) fn file_path(uri: &str) -> Option<PathBuf> {
+    if !valid_percent_escapes(uri.as_bytes()) {
+        return None;
+    }
+    let uri = url::Url::parse(uri).ok()?;
+    if uri.scheme() != "file" || uri.query().is_some() || uri.fragment().is_some() {
+        return None;
+    }
+    let path = uri.to_file_path().ok()?;
+    if path.to_str().is_none() {
+        return None;
+    }
+    Some(path)
+}
+
+fn valid_percent_escapes(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if bytes
+                .get(index + 1..index + 3)
+                .is_none_or(|pair| !pair.iter().all(u8::is_ascii_hexdigit))
+            {
+                return false;
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            index += 3;
+        } else {
+            index += 1;
         }
     }
-    Some(out)
+    true
 }
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -49,11 +88,31 @@ pub struct FileDiags {
     /// wait for the publish that follows their `didChange`.
     pub version: u64,
     pub diagnostics: Vec<lsp_types::Diagnostic>,
+    /// File identity at publication time. Aggregate and explicit reads drop
+    /// the entry if the path is later replaced or becomes a symlink.
+    pub identity: Option<std::fs::Metadata>,
+    /// Conservative retained-memory accounting used by the global cache cap.
+    pub cached_bytes: usize,
 }
 
 /// uri → latest diagnostics. Shared between the manager and every client's
 /// reader task.
 pub type DiagStore = Arc<Mutex<HashMap<String, FileDiags>>>;
+
+/// Hard ceiling for distinct files retained in the diagnostic cache. Updates
+/// to existing files remain allowed at the ceiling; new files are ignored.
+pub(crate) const MAX_DIAGNOSTIC_FILES: usize = 256;
+pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 256;
+pub(crate) const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1024;
+pub(crate) const MAX_DIAGNOSTIC_CACHE_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) struct SyncedDocument {
+    pub(crate) version: i64,
+    /// Versionless publishes are unambiguous only before the first change in
+    /// an epoch, or after an exact versioned publish anchors that epoch.
+    pub(crate) allow_versionless: bool,
+}
 
 pub struct LspClient {
     name: String,
@@ -62,7 +121,7 @@ pub struct LspClient {
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     /// uri → last synced document version.
-    open: Mutex<HashMap<String, i64>>,
+    open: Arc<Mutex<HashMap<String, SyncedDocument>>>,
 }
 
 impl LspClient {
@@ -96,6 +155,7 @@ impl LspClient {
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
+        let open = Arc::new(Mutex::new(HashMap::new()));
 
         // Reader task: routes responses to pending requests, stores
         // diagnostics, and answers server→client requests with null so a
@@ -103,6 +163,7 @@ impl LspClient {
         {
             let pending = pending.clone();
             let stdin = stdin.clone();
+            let open = open.clone();
             let server_name = name.to_string();
             tokio::spawn(async move {
                 let mut stdout = stdout;
@@ -134,8 +195,9 @@ impl LspClient {
                             if m == "textDocument/publishDiagnostics"
                                 && let Some(params) = msg.get("params")
                             {
-                                store_diagnostics(&diags, &server_name, params);
-                                diag_notify.notify_waiters();
+                                if store_diagnostics(&diags, &server_name, params, Some(&open)) {
+                                    diag_notify.notify_waiters();
+                                }
                             }
                         }
                         // Response to one of our requests.
@@ -169,7 +231,7 @@ impl LspClient {
             stdin,
             next_id: AtomicI64::new(1),
             pending,
-            open: Mutex::new(HashMap::new()),
+            open,
         });
 
         let root_uri = file_uri(root)
@@ -188,7 +250,7 @@ impl LspClient {
                         "willSaveWaitUntil": false,
                         "didSave": false
                     },
-                    "publishDiagnostics": {}
+                    "publishDiagnostics": { "versionSupport": true }
                 }
             },
             "initializationOptions": cfg.initialization.clone().unwrap_or(Value::Null),
@@ -230,14 +292,12 @@ impl LspClient {
         }
     }
 
-    /// Syncs a file's current disk content with the server: `didOpen` on
-    /// first touch, full-content `didChange` afterwards.
-    pub async fn sync_file(&self, path: &Path) {
+    /// Sends caller-verified content to the server: `didOpen` on first touch,
+    /// full-content `didChange` afterwards. Disk access is deliberately owned
+    /// by `LspManager`, which binds a stable file handle after authorization.
+    pub async fn sync_file(&self, path: &Path, text: String) {
         let Some(uri) = file_uri(path) else {
             return;
-        };
-        let Ok(text) = tokio::fs::read_to_string(path).await else {
-            return; // unreadable/binary file — skip silently
         };
         let uri_str = uri.clone();
         enum Sync {
@@ -247,12 +307,19 @@ impl LspClient {
         let action = {
             let mut open = self.open.lock().unwrap();
             match open.get_mut(&uri_str) {
-                Some(version) => {
-                    *version += 1;
-                    Sync::Change(*version)
+                Some(document) => {
+                    document.version += 1;
+                    document.allow_versionless = false;
+                    Sync::Change(document.version)
                 }
                 None => {
-                    open.insert(uri_str, 1);
+                    open.insert(
+                        uri_str,
+                        SyncedDocument {
+                            version: 1,
+                            allow_versionless: true,
+                        },
+                    );
                     Sync::Open
                 }
             }
@@ -292,21 +359,175 @@ impl Drop for LspClient {
     }
 }
 
-fn store_diagnostics(diags: &DiagStore, server: &str, params: &Value) {
-    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
-        return;
+pub(crate) fn store_diagnostics(
+    diags: &DiagStore,
+    server: &str,
+    params: &Value,
+    synced_versions: Option<&Mutex<HashMap<String, SyncedDocument>>>,
+) -> bool {
+    let Some(raw_uri) = params.get("uri").and_then(Value::as_str) else {
+        return false;
     };
-    let diagnostics: Vec<lsp_types::Diagnostic> =
-        serde_json::from_value(params.get("diagnostics").cloned().unwrap_or(Value::Null))
-            .unwrap_or_default();
+    let Ok(diagnostics) = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(
+        params.get("diagnostics").cloned().unwrap_or(Value::Null),
+    ) else {
+        return false;
+    };
+    let Some(path) = file_path(raw_uri) else {
+        return false;
+    };
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(identity) = std::fs::symlink_metadata(&canonical) else {
+        return false;
+    };
+    if !identity.is_file() || identity.file_type().is_symlink() {
+        return false;
+    }
+    let Some(uri) = file_uri(&canonical) else {
+        return false;
+    };
+    // Cache only the one canonical URI spelling emitted by this client.
+    // This rejects symlink aliases, dot components, case/escape variants,
+    // and stale file URIs that cannot be rebound to a verified path.
+    if uri != raw_uri {
+        return false;
+    }
+    let mut synced_guard = synced_versions.map(|versions| versions.lock().unwrap());
+    let exact_version_anchor = if let Some(synced_versions) = synced_guard.as_mut() {
+        let Some(synced) = synced_versions.get_mut(&uri) else {
+            return false;
+        };
+        match params.get("version") {
+            Some(version) if !version.is_null() => {
+                let Some(published_version) = version.as_i64() else {
+                    return false;
+                };
+                if published_version != synced.version {
+                    return false;
+                }
+                true
+            }
+            None | Some(_) if synced.allow_versionless => false,
+            None | Some(_) => return false,
+        }
+    } else {
+        false
+    };
+    let stored = commit_diagnostics(&diags, uri.clone(), server, diagnostics, Some(identity));
+    if stored
+        && exact_version_anchor
+        && let Some(synced_versions) = synced_guard.as_mut()
+        && let Some(synced) = synced_versions.get_mut(&uri)
+    {
+        synced.allow_versionless = true;
+    }
+    stored
+}
+
+pub(crate) fn commit_diagnostics(
+    diags: &DiagStore,
+    uri: String,
+    server: &str,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    identity: Option<std::fs::Metadata>,
+) -> bool {
+    let diagnostics = sanitize_diagnostics(diagnostics);
+    let cached_bytes = retained_diagnostic_bytes(&uri, server, &diagnostics);
     let mut store = diags.lock().unwrap();
-    let entry = store.entry(uri.to_string()).or_insert_with(|| FileDiags {
+    if !store.contains_key(&uri) && store.len() >= MAX_DIAGNOSTIC_FILES {
+        return false;
+    }
+    let old_bytes = store.get(&uri).map(|entry| entry.cached_bytes).unwrap_or(0);
+    let current_bytes: usize = store.values().map(|entry| entry.cached_bytes).sum();
+    let replacement_bytes = current_bytes
+        .saturating_sub(old_bytes)
+        .saturating_add(cached_bytes);
+    if replacement_bytes > MAX_DIAGNOSTIC_CACHE_BYTES {
+        // This is still a valid, newer publish. If it replaces an existing
+        // URI, retain a tiny empty tombstone rather than the stale older
+        // diagnostics. Its incremented version wakes post-edit waiters, while
+        // empty diagnostics make explicit and aggregate queries disclose
+        // nothing from the superseded publish.
+        let Some(entry) = store.get_mut(&uri) else {
+            return false;
+        };
+        let mut tombstone_bytes = retained_diagnostic_bytes(&uri, server, &[]);
+        let retain_server = current_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(tombstone_bytes)
+            <= MAX_DIAGNOSTIC_CACHE_BYTES;
+        if !retain_server {
+            tombstone_bytes = retained_diagnostic_bytes(&uri, "", &[]);
+        }
+        entry.server.clear();
+        if retain_server {
+            entry.server.push_str(server);
+        }
+        entry.version += 1;
+        entry.diagnostics.clear();
+        entry.identity = identity;
+        entry.cached_bytes = tombstone_bytes;
+        return true;
+    }
+    let entry = store.entry(uri).or_insert_with(|| FileDiags {
         server: server.to_string(),
         version: 0,
         diagnostics: Vec::new(),
+        identity: None,
+        cached_bytes: 0,
     });
+    entry.server.clear();
+    entry.server.push_str(server);
     entry.version += 1;
     entry.diagnostics = diagnostics;
+    entry.identity = identity;
+    entry.cached_bytes = cached_bytes;
+    true
+}
+
+fn sanitize_diagnostics(diagnostics: Vec<lsp_types::Diagnostic>) -> Vec<lsp_types::Diagnostic> {
+    diagnostics
+        .into_iter()
+        .take(MAX_DIAGNOSTICS_PER_FILE)
+        .map(|diagnostic| lsp_types::Diagnostic {
+            range: diagnostic.range,
+            severity: diagnostic.severity,
+            message: truncate_utf8_bytes(&diagnostic.message, MAX_DIAGNOSTIC_MESSAGE_BYTES),
+            // Only range, severity, and message are rendered. Discard all
+            // extension payloads (especially arbitrary JSON `data`) before
+            // they can consume retained cache memory.
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn retained_diagnostic_bytes(
+    uri: &str,
+    server: &str,
+    diagnostics: &[lsp_types::Diagnostic],
+) -> usize {
+    uri.len().saturating_add(server.len()).saturating_add(
+        diagnostics
+            .iter()
+            .map(|diagnostic| {
+                std::mem::size_of::<lsp_types::Diagnostic>()
+                    .saturating_add(diagnostic.message.len())
+            })
+            .sum::<usize>(),
+    )
 }
 
 /// LSP `languageId` for didOpen. Servers mostly infer from the extension,

@@ -453,6 +453,36 @@ fn explicit_granular_rules_take_effect() {
     assert_eq!(checker.check("read", "main.rs"), CheckResult::Ask);
 }
 
+#[test]
+fn lsp_diagnostics_inherits_read_rules_and_path_semantics() {
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Granular(
+            [("**/secret.rs".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/home/user/project")),
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+
+    assert_eq!(
+        checker.check_path("lsp_diagnostics", "/home/user/project/src/main.rs"),
+        CheckResult::Allowed
+    );
+    assert_eq!(
+        checker.check_path("lsp_diagnostics", "/home/user/project/src/secret.rs"),
+        CheckResult::Denied("Blocked by deny rule".to_string())
+    );
+    assert_eq!(
+        checker.check_path("lsp_diagnostics", "/outside/file.rs"),
+        CheckResult::Ask
+    );
+}
+
 // --- Standard mode: allow path tools in CWD only when no rule matches ---
 
 #[test]
@@ -1339,6 +1369,53 @@ fn standard_external_dir_deny_rule_overrides_default_ask() {
     );
 }
 
+#[test]
+fn external_directory_deny_overrides_matching_read_and_lsp_allow_rules() {
+    for tool in ["read", "lsp_diagnostics"] {
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Simple(Action::Allow)),
+            external_directory: Some([("/tmp/restricted/**".to_string(), Action::Deny)].into()),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &configs_from(config),
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/workspace/project")),
+            default_modes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            checker.check_path(tool, "/tmp/restricted/secret.rs"),
+            CheckResult::Denied(_)
+        ));
+    }
+}
+
+#[test]
+fn external_directory_deny_overrides_broad_session_allow_always_scope() {
+    let config = PermissionConfig {
+        external_directory: Some([("/tmp/restricted/**".to_string(), Action::Deny)].into()),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/workspace/project")),
+        default_modes(),
+    )
+    .unwrap();
+    checker.add_session_allowlist("lsp_diagnostics".into(), "/tmp/**");
+
+    assert!(matches!(
+        checker.check_path("lsp_diagnostics", "/tmp/allowed.rs"),
+        CheckResult::Allowed
+    ));
+    assert!(matches!(
+        checker.check_path("lsp_diagnostics", "/tmp/restricted/secret.rs"),
+        CheckResult::Denied(_)
+    ));
+}
+
 // --- ReadOnly with explicit config rules ---
 
 #[test]
@@ -1699,6 +1776,63 @@ fn standard_respects_exact_bash_allow_rule() {
     ));
 }
 
+#[test]
+fn legacy_literal_bracket_path_deny_glob_keeps_its_original_meaning() {
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Granular(
+            [("/repo/[*]/secret.rs".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/repo")),
+        default_modes(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        checker.check_path("lsp_diagnostics", "/repo/[*]/secret.rs"),
+        CheckResult::Denied(_)
+    ));
+    assert!(matches!(
+        checker.check_path("lsp_diagnostics", "/repo/[tenant]/secret.rs"),
+        CheckResult::Denied(_)
+    ));
+    assert_eq!(
+        checker.check_path("lsp_diagnostics", "/repo/tenant/secret.rs"),
+        CheckResult::Allowed
+    );
+}
+
+#[test]
+fn generated_literal_path_scope_survives_session_reload_without_widening() {
+    let root = std::path::Path::new("/repo/project*?[");
+    let encoded = crate::permission::pattern::descendant_path_pattern(root);
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Simple(Action::Ask)),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        Some(root.to_path_buf()),
+        default_modes(),
+    )
+    .unwrap();
+    checker.load_session_allowlist(&[("lsp_diagnostics".to_string(), encoded)]);
+
+    assert_eq!(
+        checker.check_path("lsp_diagnostics", "/repo/project*?[/src/main.rs"),
+        CheckResult::Allowed
+    );
+    assert_eq!(
+        checker.check_path("lsp_diagnostics", "/repo/projectXYZ/src/secret.rs"),
+        CheckResult::Ask
+    );
+}
+
 // --- check_perm non-interactive Ask denial (guards headless dispatch) ---
 
 #[tokio::test]
@@ -1718,5 +1852,76 @@ async fn check_perm_denies_non_interactively_when_ask_tx_is_none_and_verdict_is_
             assert_eq!(msg, "Permission denied (non-interactive mode)");
         }
         other => panic!("expected non-interactive Ask denial error, got {:?}", other),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lsp_allow_always_matches_project_children_but_not_siblings() {
+    let parent = std::env::temp_dir().join(format!(
+        "mini-agent-lsp-windows-pattern-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let project = parent.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Simple(Action::Ask)),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        Some(project.clone()),
+        default_modes(),
+    )
+    .unwrap();
+    let pattern = crate::ui::utils::suggest_pattern("lsp_diagnostics", project.to_str().unwrap());
+    assert!(!pattern.contains('\\'), "{pattern}");
+    checker.add_session_allowlist("lsp_diagnostics".into(), &pattern);
+
+    assert_eq!(
+        checker.check_path(
+            "lsp_diagnostics",
+            project.join("src/main.rs").to_str().unwrap()
+        ),
+        CheckResult::Allowed
+    );
+    assert_eq!(
+        checker.check_path(
+            "lsp_diagnostics",
+            parent.join("sibling/secret.rs").to_str().unwrap()
+        ),
+        CheckResult::Ask
+    );
+    let _ = std::fs::remove_dir_all(parent);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_raw_permission_regex_deny_preserves_backslash_semantics_for_read_aliases() {
+    let denied = r"^C:\\workspace\\secret\.rs$";
+    for tool in ["read", "lsp_diagnostics"] {
+        let configs = PermissionConfigs {
+            glob: PermissionConfig::default(),
+            regex: PermissionConfig {
+                read: Some(ToolPerm::Granular(
+                    [(denied.to_string(), Action::Deny)].into(),
+                )),
+                ..PermissionConfig::default()
+            },
+        };
+        let mut checker = PermissionChecker::new(
+            &configs,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from(r"C:\workspace")),
+            default_modes(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            checker.check_path(tool, r"C:\workspace\secret.rs"),
+            CheckResult::Denied(_)
+        ));
     }
 }

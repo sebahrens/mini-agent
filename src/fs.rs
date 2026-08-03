@@ -18,6 +18,13 @@ fn path_changed_error(path: &Path) -> std::io::Error {
     )
 }
 
+fn non_regular_file_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("Path is not a regular file: {}", path.display()),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AtomicWriteFailure {
     None,
@@ -79,9 +86,30 @@ pub(crate) fn ensure_same_file(
 /// replaced while the open was in progress.
 pub(crate) async fn open_stable_file(path: &Path) -> std::io::Result<tokio::fs::File> {
     let before = stable_path_metadata(path).await?;
+    // Opening a FIFO can block forever. Reject every non-regular node from
+    // metadata before attempting the open, then verify the descriptor too so
+    // a replacement raced between those operations cannot be consumed.
+    if !before.is_file() {
+        return Err(non_regular_file_error(path));
+    }
+    #[cfg(unix)]
+    let file = {
+        let mut options = tokio::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.open(path).await?
+    };
+    #[cfg(not(unix))]
     let file = tokio::fs::File::open(path).await?;
     let opened = file.metadata().await?;
+    if !opened.is_file() {
+        return Err(non_regular_file_error(path));
+    }
     let after = stable_path_metadata(path).await?;
+    if !after.is_file() {
+        return Err(non_regular_file_error(path));
+    }
     ensure_same_file(path, &before, &opened)?;
     ensure_same_file(path, &opened, &after)?;
     Ok(file)

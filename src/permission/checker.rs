@@ -92,6 +92,8 @@ impl PermissionChecker {
                                     "invalid `{config_field}` rule for tool `{tool_name}` pattern `{pat}`: {error}"
                                 )
                             })?
+                        } else if is_path_tool_name(tool_name) {
+                            Pattern::new_path(pat)
                         } else {
                             Pattern::new(pat)
                         };
@@ -100,8 +102,8 @@ impl PermissionChecker {
                 }
             }
             rules.insert(tool_name.to_string(), entries.clone());
-            if let Some(alias) = js_file_tool_alias(tool_name) {
-                rules.insert(alias.to_string(), entries);
+            for alias in permission_tool_aliases(tool_name) {
+                rules.insert((*alias).to_string(), entries.clone());
             }
         }
         Ok(rules)
@@ -138,11 +140,17 @@ impl PermissionChecker {
         ) {
             if let Some(map) = entries {
                 for (tool, patterns) in map {
-                    let aliases = [Some(tool.as_str()), js_file_tool_alias(tool)];
-                    for alias in aliases.into_iter().flatten() {
+                    for alias in std::iter::once(tool.as_str())
+                        .chain(permission_tool_aliases(tool).iter().copied())
+                    {
                         let entry = rules.entry(alias.to_string()).or_default();
                         for pat in patterns {
-                            entry.push((Pattern::new(pat), action));
+                            let pattern = if is_path_tool_name(alias) {
+                                Pattern::new_path(pat)
+                            } else {
+                                Pattern::new(pat)
+                            };
+                            entry.push((pattern, action));
                         }
                     }
                 }
@@ -174,7 +182,7 @@ impl PermissionChecker {
             .as_ref()
             .map(|map| {
                 map.iter()
-                    .map(|(pat, action)| (Pattern::new(&resolve_glob_pattern(pat)), *action))
+                    .map(|(pat, action)| (Pattern::new_path(&resolve_glob_pattern(pat)), *action))
                     .collect()
             })
             .unwrap_or_default();
@@ -258,7 +266,13 @@ impl PermissionChecker {
     fn is_read_tool(&self, tool: &str) -> bool {
         matches!(
             tool,
-            "read" | "js/read_file" | "grep" | "find_files" | "list_dir" | "task"
+            "read"
+                | "js/read_file"
+                | "lsp_diagnostics"
+                | "grep"
+                | "find_files"
+                | "list_dir"
+                | "task"
         )
     }
 
@@ -303,7 +317,15 @@ impl PermissionChecker {
         tool: &str,
         matched: &SmallVec<[Action; 4]>,
         abs_path: &str,
+        external: bool,
+        external_action: Option<Action>,
     ) -> Action {
+        // External-directory deny is a second security baseline alongside
+        // tool-specific deny rules. A broad read/LSP allow must never widen
+        // access back into an explicitly denied external tree.
+        if external && external_action == Some(Action::Deny) {
+            return Action::Deny;
+        }
         let base = matched.last().copied();
         match self.mode {
             SecurityMode::Restrictive => base.unwrap_or(Action::Ask),
@@ -333,14 +355,10 @@ impl PermissionChecker {
             }),
             SecurityMode::Standard => {
                 let a = base.unwrap_or(self.default_action);
-                if matched.is_empty() && self.is_path_tool(tool) && !self.is_external_path(abs_path)
-                {
+                if matched.is_empty() && self.is_path_tool(tool) && !external {
                     Action::Allow
-                } else if matched.is_empty()
-                    && a == Action::Allow
-                    && self.is_external_path(abs_path)
-                {
-                    self.match_ext_dir(abs_path).unwrap_or(Action::Ask)
+                } else if matched.is_empty() && a == Action::Allow && external {
+                    external_action.unwrap_or(Action::Ask)
                 } else {
                     a
                 }
@@ -472,9 +490,53 @@ impl PermissionChecker {
         let expanded = crate::fs::expand_tilde(path);
         let abs_path = resolve_absolute(&expanded, &self.working_dir);
 
+        let external = self.is_external_path(&abs_path);
+        let external_action = if external {
+            self.match_ext_dir(&abs_path)
+        } else {
+            None
+        };
+        self.check_pre_resolved_path(tool, &expanded, &abs_path, external, external_action)
+    }
+
+    /// Check a canonical permission key bound by the caller to an already-open
+    /// filesystem object. No live path resolution occurs here: `external` was
+    /// computed from canonical workspace and file paths when the handle was
+    /// created, preventing a pathname swap from changing the policy subject.
+    #[cfg(feature = "lsp")]
+    pub(crate) fn check_bound_path(
+        &mut self,
+        tool: &str,
+        path: &str,
+        external: bool,
+    ) -> CheckResult {
+        tracing::debug!("perm check bound path: tool={}, path={}", tool, path);
+        let external_action = if external {
+            self.match_ext_dir_bound(path)
+        } else {
+            None
+        };
+        self.check_pre_resolved_path(tool, path, path, external, external_action)
+    }
+
+    fn check_pre_resolved_path(
+        &mut self,
+        tool: &str,
+        expanded: &str,
+        abs_path: &str,
+        external: bool,
+        external_action: Option<Action>,
+    ) -> CheckResult {
         // Deny rules first — security baseline, cannot be bypassed.
         if self.matches_deny_rule(tool, &[&abs_path, &expanded]) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
+        }
+        // External-directory denies are the same kind of security baseline as
+        // tool-specific denies. Evaluate them before hook one-shots and the
+        // session AllowAlways list so a broad prior grant cannot reopen a
+        // nested external tree that policy explicitly denies.
+        if external && external_action == Some(Action::Deny) {
+            return CheckResult::Denied("Blocked by external directory deny rule".to_string());
         }
         #[cfg(feature = "hooks")]
         if let Some(result) = self.take_pending_one_shot(tool) {
@@ -489,14 +551,14 @@ impl PermissionChecker {
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
-                if pattern.matches(&abs_path) || pattern.matches(&expanded) {
+                if pattern.matches_path(abs_path) || pattern.matches_path(expanded) {
                     matched.push(*action);
                 }
             }
         }
 
-        let action = self.resolve_path_action(tool, &matched, &abs_path);
-        self.doom_loop_check(tool, &expanded, action)
+        let action = self.resolve_path_action(tool, &matched, abs_path, external, external_action);
+        self.doom_loop_check(tool, expanded, action)
     }
 
     /// Check whether any deny rule matches the given inputs. Deny rules are
@@ -508,7 +570,14 @@ impl PermissionChecker {
         }
         if let Some(rules) = self.rules.get(tool) {
             for (pattern, action) in rules {
-                if *action == Action::Deny && inputs.iter().any(|inp| pattern.matches(inp)) {
+                let matches = |input: &&str| {
+                    if is_path_tool_name(tool) {
+                        pattern.matches_path(input)
+                    } else {
+                        pattern.matches(input)
+                    }
+                };
+                if *action == Action::Deny && inputs.iter().any(matches) {
                     return true;
                 }
             }
@@ -520,6 +589,8 @@ impl PermissionChecker {
         for (allowed_tool, pattern) in &self.session_allowlist {
             let matches = if tool == "bash" {
                 pattern.original == input
+            } else if is_path_tool_name(tool) {
+                pattern.matches_path(input)
             } else {
                 pattern.matches(input)
             };
@@ -531,27 +602,47 @@ impl PermissionChecker {
     }
 
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
-        let pattern = Pattern::new(pattern_str);
+        let generated_path_scope = self
+            .is_path_tool(&tool)
+            .then(|| Pattern::new_generated_path_scope(pattern_str))
+            .flatten();
+        let pattern = if let Some(pattern) = generated_path_scope {
+            pattern
+        } else if self.is_path_tool(&tool) {
+            Pattern::new_path(pattern_str)
+        } else {
+            Pattern::new(pattern_str)
+        };
         self.session_allowlist.push((tool.clone(), pattern));
-        if self.is_path_tool(&tool) {
+        if self.is_path_tool(&tool) && Pattern::new_generated_path_scope(pattern_str).is_none() {
             let expanded = crate::fs::expand_tilde(pattern_str);
             let abs = resolve_absolute(&expanded, &self.working_dir);
             if abs != expanded {
-                self.session_allowlist.push((tool, Pattern::new(&abs)));
+                self.session_allowlist.push((tool, Pattern::new_path(&abs)));
             }
         }
     }
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
         for (tool, pat) in entries {
-            let pattern = Pattern::new(pat);
+            let generated_path_scope = self
+                .is_path_tool(tool)
+                .then(|| Pattern::new_generated_path_scope(pat))
+                .flatten();
+            let pattern = if let Some(pattern) = generated_path_scope {
+                pattern
+            } else if self.is_path_tool(tool) {
+                Pattern::new_path(pat)
+            } else {
+                Pattern::new(pat)
+            };
             self.session_allowlist.push((tool.clone(), pattern));
-            if self.is_path_tool(tool) {
+            if self.is_path_tool(tool) && Pattern::new_generated_path_scope(pat).is_none() {
                 let expanded = crate::fs::expand_tilde(pat);
                 let abs = resolve_absolute(&expanded, &self.working_dir);
                 if abs != expanded {
                     self.session_allowlist
-                        .push((tool.clone(), Pattern::new(&abs)));
+                        .push((tool.clone(), Pattern::new_path(&abs)));
                 }
             }
         }
@@ -581,17 +672,7 @@ impl PermissionChecker {
     }
 
     fn is_path_tool(&self, tool: &str) -> bool {
-        matches!(
-            tool,
-            "read"
-                | "write"
-                | "edit"
-                | "grep"
-                | "find_files"
-                | "list_dir"
-                | "js/read_file"
-                | "js/write_file"
-        )
+        is_path_tool_name(tool)
     }
 
     fn is_external_path(&self, path_str: &str) -> bool {
@@ -614,11 +695,44 @@ impl PermissionChecker {
     fn match_ext_dir(&self, path_str: &str) -> Option<Action> {
         let resolved = resolve_path_allow_missing(Path::new(path_str))?;
         let resolved = resolved.to_string_lossy();
+        self.match_ext_dir_bound(&resolved)
+    }
+
+    fn match_ext_dir_bound(&self, path_str: &str) -> Option<Action> {
+        #[cfg(windows)]
+        {
+            // Callers may configure anchored raw regexes against either the
+            // ordinary Win32 spelling or the canonical verbatim spelling.
+            // Evaluate both without changing separators, and combine matches
+            // fail-closed so a permissive spelling cannot mask a restrictive
+            // one. This also covers bound LSP paths, which deliberately avoid
+            // a second filesystem resolution after authorization.
+            let ordinary = crate::permission::pattern::normalize_policy_path(path_str);
+            let verbatim = windows_verbatim_policy_path(&ordinary);
+            let mut decision = None;
+            for (pattern, action) in &self.ext_dir_rules {
+                if pattern.matches_path(path_str)
+                    || pattern.matches_path(&ordinary)
+                    || verbatim
+                        .as_deref()
+                        .is_some_and(|path| pattern.matches_path(path))
+                {
+                    decision = Some(match (decision, *action) {
+                        (_, Action::Deny) | (Some(Action::Deny), _) => Action::Deny,
+                        (_, Action::Ask) | (Some(Action::Ask), _) => Action::Ask,
+                        _ => Action::Allow,
+                    });
+                }
+            }
+            return decision;
+        }
+        #[cfg(not(windows))]
         for (pattern, action) in &self.ext_dir_rules {
-            if pattern.matches(&resolved) {
+            if pattern.matches_path(path_str) {
                 return Some(*action);
             }
         }
+        #[cfg(not(windows))]
         None
     }
 
@@ -652,11 +766,26 @@ impl PermissionChecker {
     }
 }
 
-fn js_file_tool_alias(tool: &str) -> Option<&'static str> {
+fn is_path_tool_name(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read"
+            | "write"
+            | "edit"
+            | "grep"
+            | "find_files"
+            | "list_dir"
+            | "js/read_file"
+            | "js/write_file"
+            | "lsp_diagnostics"
+    )
+}
+
+fn permission_tool_aliases(tool: &str) -> &'static [&'static str] {
     match tool {
-        "read" => Some("js/read_file"),
-        "write" => Some("js/write_file"),
-        _ => None,
+        "read" => &["js/read_file", "lsp_diagnostics"],
+        "write" => &["js/write_file"],
+        _ => &[],
     }
 }
 
@@ -667,6 +796,22 @@ fn resolve_absolute(path: &str, working_dir: &str) -> String {
         p.to_string_lossy().to_string()
     } else {
         Path::new(working_dir).join(p).to_string_lossy().to_string()
+    }
+}
+
+#[cfg(windows)]
+fn windows_verbatim_policy_path(path: &str) -> Option<String> {
+    if path.starts_with(r"\\?\") {
+        Some(path.to_string())
+    } else if let Some(rest) = path.strip_prefix(r"\\") {
+        Some(format!(r"\\?\UNC\{rest}"))
+    } else {
+        let bytes = path.as_bytes();
+        (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+        .then(|| format!(r"\\?\{path}"))
     }
 }
 
