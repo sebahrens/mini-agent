@@ -35,10 +35,24 @@ This single command handles everything up to crates.io publication. After CI fin
 
 1. Verifies the working tree is clean
 2. Bumps the version in `Cargo.toml`
-3. Syncs the new version to all packaging files (AUR, conda, Homebrew)
+3. Syncs the new version to `Cargo.lock` and all packaging files (AUR, conda, Homebrew)
 4. Commits as `bump to vX.Y.Z` and pushes the current branch
-5. Creates and pushes an annotated tag `vX.Y.Z` — this triggers the [GitHub Actions release workflow](../.github/workflows/release.yml), which builds binaries for all targets
-6. Runs `cargo publish` to publish the crate to crates.io
+5. Validates that the tag is exactly `vX.Y.Z` (or `vX.Y.Z-prerelease`) and matches the Cargo package version
+6. Creates and pushes an annotated tag — this triggers the [GitHub Actions release workflow](../../.github/workflows/release.yml), which builds binaries for all targets
+7. Runs `cargo publish` to publish the crate to crates.io
+
+Both local tag commands require all tracked working-tree and staged changes to be committed, so
+the metadata they validate is the metadata in the commit they tag.
+
+The release workflow accepts only pushed `v*` tags. Its first job rejects a non-tag ref,
+a malformed tag, or a tag whose version differs from the root Cargo package version before any
+release binary is built. Manual branch dispatch is intentionally disabled, so a branch name can
+never become a public release identity. Tags containing a prerelease suffix (for example,
+`v2.0.0-rc.1`) remain GitHub prereleases.
+
+If a tagged run needs recovery, use **Re-run jobs** on that tag's existing Actions run. Do not
+start the release workflow from a branch. Publication still happens only after every expected full
+and lite archive and `SHA256SUMS` have been assembled and checked.
 
 ## Post-release (after CI completes)
 
@@ -75,7 +89,7 @@ These are useful for partial workflows or recovery:
 |---------|---------|
 | `just sync-version` | Sync `Cargo.toml` version to packaging files (no commit) |
 | `just pre-release` | Same as `sync-version` (alias used by `release`) |
-| `just add-tag` | Tag the current version and push (no version bump) |
+| `just add-tag` | Validate, tag, and push the current Cargo version (no version bump) |
 | `just remove-tag [VERSION]` | Delete a local + remote tag (interactive picker if omitted) |
 | `just aur-checksums` | Update AUR checksums only |
 | `just conda-source-sha256` | Update conda source tarball checksum only |

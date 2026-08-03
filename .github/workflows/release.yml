@@ -1,10 +1,9 @@
 name: Release
 
 on:
-  workflow_dispatch: {}
-  # push:
-  #   tags:
-  #     - "v*"
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -28,7 +27,13 @@ jobs:
           toolchain: "1.96.0"
 
       - name: Validate Cargo and package metadata
-        run: python3 scripts/check-package-metadata.py
+        env:
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 scripts/check-package-metadata.py \
+            --ref-type "$RELEASE_REF_TYPE" \
+            --release-tag "$RELEASE_TAG"
 
   build:
     name: ${{ matrix.target }}

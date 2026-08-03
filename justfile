@@ -51,8 +51,12 @@ remove-hook:
 add-tag:
     #!/usr/bin/env bash
     set -euo pipefail
-    git push origin HEAD
     VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+    python3 scripts/check-package-metadata.py \
+        --require-clean \
+        --ref-type tag \
+        --release-tag "v${VERSION}"
+    git push origin HEAD
     git tag -a "v${VERSION}" -m "Release v${VERSION}"
     git push origin "v${VERSION}"
     echo "Created and pushed tag v${VERSION}"
@@ -182,7 +186,17 @@ release BUMP:
 
     just pre-release
 
+    # Refresh the root package entry before the locked release validation.
+    cargo metadata --format-version 1 --no-deps >/dev/null
+    python3 scripts/check-package-metadata.py \
+        --ref-type tag \
+        --release-tag "v${NEW_VERSION}"
+
     git commit -am "bump to v${NEW_VERSION}"
+    python3 scripts/check-package-metadata.py \
+        --require-clean \
+        --ref-type tag \
+        --release-tag "v${NEW_VERSION}"
     git push origin HEAD
 
     git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
