@@ -14,7 +14,7 @@ use crate::event::{AgentEvent, BtwEvent, UserEvent};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::provider::AnyAgent;
-use crate::session::MessageRole;
+use crate::session::{MessageRole, Session};
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
@@ -36,8 +36,8 @@ use super::handle_human_handoff;
 use super::spawn_merge_agent;
 use super::{
     C_AGENT, C_BTW, C_ERROR, C_TOOL, PrebuildPayload, apply_prompt_mode, classify_submission,
-    mid_turn_compact_and_respawn, refresh_display, spawn_event_thread, start_main_run,
-    stop_turn_context_exhausted,
+    mid_turn_compact_and_respawn, record_started_main_turn, refresh_display, spawn_event_thread,
+    start_main_run, stop_turn_context_exhausted,
 };
 #[cfg(feature = "git-worktree")]
 use super::{C_PERM, apply_current_prompt_mode};
@@ -275,14 +275,15 @@ impl<'a> App<'a> {
             renderer.write_line("", Color::White)?;
 
             event_handler::ensure_agent(&mut run.agent, &mut ui, slash.reasoning_enabled).await;
-            let history = crate::agent::runner::convert_history(ui.session);
+            let initial_turn = AutoTriggerTurn::prepare(ui.session, trigger_msg);
+            let (prompt, history, pending_record) = initial_turn.into_runner_inputs();
             let runner = run
                 .agent
                 .as_ref()
                 .unwrap()
                 .clone()
                 .spawn_runner(
-                    trigger_msg.to_string(),
+                    prompt,
                     history,
                     ui.cfg.retry.clone(),
                     #[cfg(feature = "hooks")]
@@ -295,9 +296,7 @@ impl<'a> App<'a> {
             if let Some(ss) = ui.status_signals.as_ref() {
                 ss.send_start();
             }
-            ui.session.add_message(MessageRole::User, trigger_msg);
-            #[cfg(feature = "advisor")]
-            crate::extras::advisor::set_session_messages(ui.session.messages.clone());
+            pending_record.record_started(&mut run, &mut ui);
         }
 
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
@@ -941,11 +940,7 @@ impl<'a> App<'a> {
 
     async fn finalize_turn(&mut self, turn_errored: bool) -> anyhow::Result<()> {
         if turn_errored {
-            if let Some(text) = self.run.pending_send.take() {
-                let len = self.ui.session.messages.len();
-                if len > 0 && self.ui.session.messages[len - 1].role == MessageRole::User {
-                    self.ui.session.truncate_to(len - 1);
-                }
+            if let Some(text) = rollback_failed_send(&mut self.run, self.ui.session) {
                 self.input.buffer = text.into();
                 self.input.cursor = self.input.buffer.len();
             }
@@ -2148,5 +2143,125 @@ impl<'a> App<'a> {
     #[cfg(not(feature = "git-worktree"))]
     async fn handle_worktree_auto_merge(&mut self) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+struct AutoTriggerTurn {
+    prompt: String,
+    history: Vec<rig::completion::Message>,
+}
+
+impl AutoTriggerTurn {
+    fn prepare(session: &Session, prompt: &str) -> Self {
+        Self {
+            prompt: prompt.to_string(),
+            history: crate::agent::runner::convert_history(session),
+        }
+    }
+
+    fn into_runner_inputs(
+        self,
+    ) -> (
+        String,
+        Vec<rig::completion::Message>,
+        PendingAutoTriggerPrompt,
+    ) {
+        let pending_record = PendingAutoTriggerPrompt(self.prompt.clone());
+        (self.prompt, self.history, pending_record)
+    }
+}
+
+struct PendingAutoTriggerPrompt(String);
+
+impl PendingAutoTriggerPrompt {
+    fn record_started(self, run: &mut AgentRunState, ui: &mut UiContext<'_>) {
+        record_started_main_turn(&self.0, run, ui);
+    }
+}
+
+fn rollback_failed_send(run: &mut AgentRunState, session: &mut Session) -> Option<String> {
+    let text = run.pending_send.take()?;
+    let len = session.messages.len();
+    if len > 0 && session.messages[len - 1].role == MessageRole::User {
+        session.truncate_to(len - 1);
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod initial_turn_tests {
+    use rig::completion::Message;
+
+    use super::{AutoTriggerTurn, rollback_failed_send};
+    use crate::session::{MessageRole, Session};
+    use crate::ui::state::AgentRunState;
+
+    #[test]
+    fn initial_turn_keeps_current_prompt_separate_until_runner_starts() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        let turn = AutoTriggerTurn::prepare(&session, "current prompt");
+        let (prompt, history, pending_record) = turn.into_runner_inputs();
+
+        assert_eq!(prompt, "current prompt");
+        assert!(history.is_empty());
+        assert!(session.messages.is_empty());
+
+        let mut run = AgentRunState::default();
+        crate::ui::mark_main_turn_started(&mut session, &mut run, &pending_record.0);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, MessageRole::User);
+        assert_eq!(session.messages[0].content, "current prompt");
+        assert_eq!(run.pending_send.as_deref(), Some("current prompt"));
+    }
+
+    #[test]
+    fn resumed_history_precedes_current_prompt_without_duplication() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        session.add_message(MessageRole::User, "prior question");
+        session.add_message(MessageRole::Assistant, "prior answer");
+
+        let turn = AutoTriggerTurn::prepare(&session, "new question");
+        let (prompt, history, pending_record) = turn.into_runner_inputs();
+
+        assert_eq!(prompt, "new question");
+        assert_eq!(
+            history,
+            vec![
+                Message::user("prior question"),
+                Message::assistant("prior answer")
+            ]
+        );
+        assert_eq!(session.messages.len(), 2);
+
+        let mut run = AgentRunState::default();
+        crate::ui::mark_main_turn_started(&mut session, &mut run, &pending_record.0);
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[2].role, MessageRole::User);
+        assert_eq!(session.messages[2].content, "new question");
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.content == "new question")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_initial_turn_restores_prompt_and_removes_unmatched_history() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        session.add_message(MessageRole::User, "prior question");
+        session.add_message(MessageRole::Assistant, "prior answer");
+        let mut run = AgentRunState::default();
+
+        crate::ui::mark_main_turn_started(&mut session, &mut run, "retry me");
+        let restored = rollback_failed_send(&mut run, &mut session);
+
+        assert_eq!(restored.as_deref(), Some("retry me"));
+        assert_eq!(run.pending_send, None);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "prior question");
+        assert_eq!(session.messages[1].content, "prior answer");
     }
 }

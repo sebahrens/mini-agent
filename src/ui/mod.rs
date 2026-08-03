@@ -559,10 +559,25 @@ pub(crate) async fn start_main_run(
     if let Some(ss) = ui.status_signals.as_ref() {
         ss.send_start();
     }
-    ui.session.add_message(MessageRole::User, text);
+    record_started_main_turn(text, run, ui);
+}
+
+pub(crate) fn mark_main_turn_started(session: &mut Session, run: &mut AgentRunState, text: &str) {
+    session.add_message(MessageRole::User, text);
     // Mark this message as the rollback target if the turn fails (see the
     // failed-send handling in the main event loop).
     run.pending_send = Some(text.to_string());
+}
+
+/// Records the common bookkeeping for a main turn only after its runner has
+/// started. Startup auto-triggers and editor-submitted turns must use the same
+/// path so rollback, advisor context, and chat history cannot drift apart.
+pub(crate) fn record_started_main_turn(
+    text: &str,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+) {
+    mark_main_turn_started(ui.session, run, text);
     #[cfg(feature = "advisor")]
     crate::extras::advisor::set_session_messages(ui.session.messages.clone());
     if !ui.cli.no_session
