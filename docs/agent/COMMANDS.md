@@ -32,6 +32,11 @@ All slash commands are available from the TUI input prompt.
 | `/welcome` | Show the welcome/onboarding screen. |
 | `/tutorial` | Alias for `/welcome`. |
 
+HTML exports treat every session field as untrusted. Raw HTML is displayed as escaped text;
+assistant Markdown keeps normal formatting, HTTP(S)/`mailto:` or relative links, and HTTPS images,
+while executable/active schemes, non-HTTPS images, and tags are removed. The page also carries a
+restrictive Content Security Policy as defense in depth. JSONL exports preserve the original text.
+
 ## Provider & Model
 
 | Command | Description |
