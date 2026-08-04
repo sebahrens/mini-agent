@@ -429,13 +429,13 @@ mod feasibility {
         LocalFree, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetEffectiveRightsFromAclW,
-        GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
-        TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_IS_USER, TRUSTEE_W,
+        ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+        GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
-        DeriveAppContainerSidFromAppContainerName,
+        DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
@@ -454,6 +454,7 @@ mod feasibility {
         FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, GetDriveTypeW, OPEN_EXISTING,
         WRITE_DAC, WRITE_OWNER,
     };
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::System::Console::{
         GetConsoleCP, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
         STD_OUTPUT_HANDLE,
@@ -2501,7 +2502,56 @@ mod feasibility {
         Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
     }
 
-    fn production_environment_block(hooks: &ProductionLaunchHooks) -> Result<Vec<u16>, GateError> {
+    fn appcontainer_local_data_path(sid: PSID) -> Result<PathBuf, GateError> {
+        let mut sid_text = null_mut();
+        // SAFETY: `sid` is the live profile SID. ConvertSidToStringSidW returns
+        // one LocalAlloc allocation, transferred immediately to LocalMemory.
+        if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 || sid_text.is_null() {
+            return Err(last_error("render production AppContainer SID"));
+        }
+        let sid_text_owner = LocalMemory(sid_text.cast());
+        let mut sid_length = 0usize;
+        while unsafe { *sid_text.add(sid_length) } != 0 {
+            sid_length += 1;
+            if sid_length > 256 {
+                return Err(GateError(
+                    "production AppContainer SID exceeded its native bound".to_string(),
+                ));
+            }
+        }
+        let sid_text = unsafe { std::slice::from_raw_parts(sid_text, sid_length + 1) };
+        let mut local_data = null_mut();
+        // SAFETY: `sid_text` is NUL-terminated and retained for the call.
+        // GetAppContainerFolderPath returns one CoTaskMem allocation.
+        let result = unsafe { GetAppContainerFolderPath(sid_text.as_ptr(), &mut local_data) };
+        drop(sid_text_owner);
+        if result < 0 || local_data.is_null() {
+            return Err(hresult_error(
+                "resolve production AppContainer local data",
+                result,
+            ));
+        }
+        let mut path_length = 0usize;
+        while unsafe { *local_data.add(path_length) } != 0 {
+            path_length += 1;
+            if path_length > 32_767 {
+                unsafe { CoTaskMemFree(local_data.cast()) };
+                return Err(GateError(
+                    "production AppContainer local data path exceeded its native bound".to_string(),
+                ));
+            }
+        }
+        let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+            std::slice::from_raw_parts(local_data, path_length)
+        }));
+        unsafe { CoTaskMemFree(local_data.cast()) };
+        Ok(path)
+    }
+
+    fn production_environment_block(
+        hooks: &ProductionLaunchHooks,
+        appcontainer_sid: PSID,
+    ) -> Result<Vec<u16>, GateError> {
         let marker = match hooks.child {
             ProductionChild::Worker | ProductionChild::FailureTest => INTERNAL_WORKER_MARKER_VALUE,
             #[cfg(test)]
@@ -2544,6 +2594,26 @@ mod feasibility {
         // resolution. No PATH, profile, credential, workspace, or application variable crosses.
         let system_root = system_windows_directory()?;
         entries.push(format!("SystemRoot={}", system_root.to_string_lossy()));
+        // A custom environment block suppresses Windows' inherited profile
+        // environment. Restore only the three AppContainer-local paths that
+        // Windows assigns to a profile; do not inherit user/profile variables.
+        let local_data = appcontainer_local_data_path(appcontainer_sid)?;
+        let temp = local_data.join("Temp");
+        std::fs::create_dir_all(&temp)
+            .map_err(|error| GateError(format!("create AppContainer temp directory: {error}")))?;
+        for (name, value) in [
+            ("LOCALAPPDATA", local_data.as_path()),
+            ("TEMP", temp.as_path()),
+            ("TMP", temp.as_path()),
+        ] {
+            let value = value.to_string_lossy();
+            if value.contains('\0') || value.contains('=') {
+                return Err(GateError(format!(
+                    "{name} cannot enter the production worker environment"
+                )));
+            }
+            entries.push(format!("{name}={value}"));
+        }
         entries.sort_by_key(|entry| entry.to_ascii_lowercase());
         let mut block = Vec::new();
         for entry in entries {
@@ -2630,7 +2700,7 @@ mod feasibility {
         let child_directory = system_windows_directory()?;
         let child_directory_wide = wide_null(child_directory.as_os_str())?;
         let mut command_line = production_command_line(&executable, hooks.child)?;
-        let environment = production_environment_block(&hooks)?;
+        let environment = production_environment_block(&hooks, profile.sid)?;
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;

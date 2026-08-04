@@ -511,6 +511,12 @@ pub(super) fn maybe_run_hosted_lifecycle() -> Option<ExitCode> {
 }
 
 fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
+    if !trusted_system_executable(Path::new("/bin/true")) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "macOS alternate-exec canary was not a trusted system executable",
+        ));
+    }
     let probes = HostedProbePaths::create().inspect_err(|_error| {
         eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_setup");
     })?;
@@ -714,8 +720,10 @@ fn process_group_has_live_members(group: libc::pid_t) -> io::Result<bool> {
     if required < 0 {
         return Err(io::Error::last_os_error());
     }
+    // libproc returns PID counts, while `size` is expressed in bytes. Leave
+    // slack for members created between the sizing and data calls.
+    let mut pids = vec![0; required as usize + 8];
     let item_size = std::mem::size_of::<libc::pid_t>();
-    let mut pids = vec![0; (required as usize).div_ceil(item_size)];
     let read = unsafe {
         proc_listpgrppids(
             group,
@@ -726,7 +734,7 @@ fn process_group_has_live_members(group: libc::pid_t) -> io::Result<bool> {
     if read < 0 {
         return Err(io::Error::last_os_error());
     }
-    pids.truncate((read as usize) / item_size);
+    pids.truncate(read as usize);
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut info = std::mem::MaybeUninit::<ProcBsdShortInfo>::uninit();
         let received = unsafe {
@@ -1208,11 +1216,14 @@ pub(super) fn attest_hosted_worker_containment() -> bool {
     require_probe!(network_connection_matrix_is_denied(), "network");
     require_probe!(fork_is_denied(), "fork");
     require_probe!(
-        executable_fails_with(Path::new("/bin/true"), &[libc::EPERM, libc::EACCES]),
+        executable_fails_with(
+            Path::new("/bin/true"),
+            &[libc::EPERM, libc::EACCES, libc::ENOENT]
+        ),
         "alternate_exec"
     );
     require_probe!(
-        executable_fails_with(&original, &[libc::EPERM, libc::EACCES]),
+        executable_fails_with(&original, &[libc::EPERM, libc::EACCES, libc::ENOENT]),
         "original_exec"
     );
     // The parent has already completed the descriptor/inode-verified unlink. Depending on whether
@@ -3923,6 +3934,15 @@ mod tests {
         ] {
             assert_eq!(parse_parent_death_record(rejected.as_bytes()), None);
         }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn process_group_enumeration_counts_live_pids_not_bytes() {
+        // SAFETY: getpgrp only reads the current process group identifier.
+        let group = unsafe { libc::getpgrp() };
+        assert!(group > 0);
+        assert!(process_group_has_live_members(group).unwrap());
     }
 
     #[test]

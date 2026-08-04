@@ -2113,7 +2113,7 @@ fn copy_directory_verified(
 #[allow(unsafe_code)]
 fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
     let stage = stage
         .as_os_str()
@@ -2128,7 +2128,11 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     // SAFETY: both path buffers are NUL-terminated and retained for the
     // synchronous call. The stage and target are constructed under the same
     // already-validated parent directory.
-    if unsafe { MoveFileExW(stage.as_ptr(), canonical.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+    // A zero-flag MoveFileExW is an atomic same-volume directory rename. The
+    // WRITE_THROUGH flag is intended for copy/delete moves and can make an
+    // otherwise same-parent directory publication fail with
+    // ERROR_NOT_SAME_DEVICE on Windows.
+    if unsafe { MoveFileExW(stage.as_ptr(), canonical.as_ptr(), 0) } == 0 {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
