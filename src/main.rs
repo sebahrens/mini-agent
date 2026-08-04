@@ -35,6 +35,16 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 
 fn main() -> anyhow::Result<ExitCode> {
+    #[cfg(all(feature = "js", target_os = "macos"))]
+    if let Some(exit_code) = sandbox::worker::maybe_run_macos_hosted_lifecycle() {
+        return Ok(exit_code);
+    }
+
+    #[cfg(all(feature = "js", target_os = "macos"))]
+    if let Some(exit_code) = sandbox::worker::maybe_run_macos_guardian() {
+        return Ok(exit_code);
+    }
+
     #[cfg(feature = "js")]
     if let Some(exit_code) = extras::js::worker::maybe_run_internal_worker() {
         return Ok(exit_code);

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
 #[cfg(feature = "skills")]
@@ -36,6 +36,8 @@ pub(crate) enum WireIdError {
     InvalidCharacter,
     #[error("grant identity must not be nil")]
     NilGrant,
+    #[error("launch challenge must not be nil")]
+    NilLaunchChallenge,
 }
 
 fn validate_text_id(value: &str) -> Result<(), WireIdError> {
@@ -161,6 +163,38 @@ impl From<GrantId> for Uuid {
     }
 }
 
+/// Fresh, parent-generated proof bound to exactly one worker launch handshake.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "Uuid", into = "Uuid")]
+pub(crate) struct LaunchChallenge(Uuid);
+
+impl LaunchChallenge {
+    pub(crate) fn new(value: Uuid) -> Result<Self, WireIdError> {
+        if value.is_nil() {
+            return Err(WireIdError::NilLaunchChallenge);
+        }
+        Ok(Self(value))
+    }
+
+    fn fresh() -> Self {
+        Self::new(Uuid::new_v4()).expect("UUID v4 launch challenges are non-nil")
+    }
+}
+
+impl TryFrom<Uuid> for LaunchChallenge {
+    type Error = WireIdError;
+
+    fn try_from(value: Uuid) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<LaunchChallenge> for Uuid {
+    fn from(value: LaunchChallenge) -> Self {
+        value.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WireFrame<M> {
@@ -237,13 +271,17 @@ pub(crate) enum WorkerFrame {
     ProtocolFault(ProtocolFault),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ParentHello {}
+pub(crate) struct ParentHello {
+    pub(crate) challenge: LaunchChallenge,
+}
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct WorkerReady {}
+pub(crate) struct WorkerReady {
+    pub(crate) challenge: LaunchChallenge,
+}
 
 /// Closed request used only by the Windows production runtime preflight.
 ///
@@ -928,6 +966,8 @@ pub(crate) enum ProtocolError {
     Sequence { expected: u64, actual: u64 },
     #[error("wire sequence space is exhausted")]
     SequenceExhausted,
+    #[error("worker launch challenge did not match the current connection")]
+    LaunchChallengeMismatch,
     #[error("frame requires an invocation identity")]
     MissingInvocation,
     #[error("connection frame must not carry an invocation identity")]
@@ -961,6 +1001,7 @@ pub(crate) enum ProtocolError {
 
 pub(crate) struct ParentProtocol {
     expected_build: BuildIdentity,
+    launch_challenge: LaunchChallenge,
     next_sequence: u64,
     state: ParentState,
     hello_sent: bool,
@@ -969,13 +1010,32 @@ pub(crate) struct ParentProtocol {
 
 impl ParentProtocol {
     pub(crate) fn new(expected_build: BuildIdentity) -> Self {
+        Self::with_challenge(expected_build, LaunchChallenge::fresh())
+    }
+
+    fn with_challenge(expected_build: BuildIdentity, launch_challenge: LaunchChallenge) -> Self {
         Self {
             expected_build,
+            launch_challenge,
             next_sequence: 0,
             state: ParentState::AwaitReady,
             hello_sent: false,
             active_kind: None,
         }
+    }
+
+    pub(crate) fn hello(&self) -> ParentHello {
+        ParentHello {
+            challenge: self.launch_challenge.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_challenge_for_test(
+        expected_build: BuildIdentity,
+        launch_challenge: LaunchChallenge,
+    ) -> Self {
+        Self::with_challenge(expected_build, launch_challenge)
     }
 
     #[cfg(test)]
@@ -996,8 +1056,9 @@ impl ParentProtocol {
     pub(crate) fn on_send(&mut self, frame: &ParentWireFrame) -> Result<(), ProtocolError> {
         self.validate_header(frame)?;
         let transition = match (&self.state, &frame.message) {
-            (ParentState::AwaitReady, ParentFrame::Hello(_)) if !self.hello_sent => {
+            (ParentState::AwaitReady, ParentFrame::Hello(hello)) if !self.hello_sent => {
                 require_connection(frame)?;
+                validate_launch_challenge(&self.launch_challenge, &hello.challenge)?;
                 self.hello_sent = true;
                 None
             }
@@ -1078,8 +1139,9 @@ impl ParentProtocol {
     pub(crate) fn on_receive(&mut self, frame: &WorkerWireFrame) -> Result<(), ProtocolError> {
         self.validate_header(frame)?;
         let transition = match (&self.state, &frame.message) {
-            (ParentState::AwaitReady, WorkerFrame::Ready(_)) if self.hello_sent => {
+            (ParentState::AwaitReady, WorkerFrame::Ready(ready)) if self.hello_sent => {
                 require_connection(frame)?;
+                validate_launch_challenge(&self.launch_challenge, &ready.challenge)?;
                 Some(ParentState::Idle)
             }
             (
@@ -1197,6 +1259,7 @@ impl ParentProtocol {
 
 pub(crate) struct WorkerProtocol {
     expected_build: BuildIdentity,
+    launch_challenge: Option<LaunchChallenge>,
     next_sequence: u64,
     state: WorkerState,
     hello_received: bool,
@@ -1207,6 +1270,7 @@ impl WorkerProtocol {
     pub(crate) fn new(expected_build: BuildIdentity) -> Self {
         Self {
             expected_build,
+            launch_challenge: None,
             next_sequence: 0,
             state: WorkerState::AwaitHello,
             hello_received: false,
@@ -1218,11 +1282,20 @@ impl WorkerProtocol {
         &self.state
     }
 
+    pub(crate) fn ready(&self) -> Result<WorkerReady, ProtocolError> {
+        self.launch_challenge
+            .as_ref()
+            .cloned()
+            .map(|challenge| WorkerReady { challenge })
+            .ok_or(ProtocolError::LaunchChallengeMismatch)
+    }
+
     pub(crate) fn on_receive(&mut self, frame: &ParentWireFrame) -> Result<(), ProtocolError> {
         self.validate_header(frame)?;
         let transition = match (&self.state, &frame.message) {
-            (WorkerState::AwaitHello, ParentFrame::Hello(_)) if !self.hello_received => {
+            (WorkerState::AwaitHello, ParentFrame::Hello(hello)) if !self.hello_received => {
                 require_connection(frame)?;
+                self.launch_challenge = Some(hello.challenge.clone());
                 self.hello_received = true;
                 None
             }
@@ -1301,8 +1374,13 @@ impl WorkerProtocol {
     pub(crate) fn on_send(&mut self, frame: &WorkerWireFrame) -> Result<(), ProtocolError> {
         self.validate_header(frame)?;
         let transition = match (&self.state, &frame.message) {
-            (WorkerState::AwaitHello, WorkerFrame::Ready(_)) if self.hello_received => {
+            (WorkerState::AwaitHello, WorkerFrame::Ready(ready)) if self.hello_received => {
                 require_connection(frame)?;
+                let expected = self
+                    .launch_challenge
+                    .as_ref()
+                    .ok_or(ProtocolError::LaunchChallengeMismatch)?;
+                validate_launch_challenge(expected, &ready.challenge)?;
                 Some(WorkerState::Idle)
             }
             (
@@ -1488,6 +1566,17 @@ fn validate_effect(expected: u32, actual: u32) -> Result<(), ProtocolError> {
         Err(ProtocolError::EffectOrdinal { expected, actual })
     } else {
         Ok(())
+    }
+}
+
+fn validate_launch_challenge(
+    expected: &LaunchChallenge,
+    actual: &LaunchChallenge,
+) -> Result<(), ProtocolError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(ProtocolError::LaunchChallengeMismatch)
     }
 }
 

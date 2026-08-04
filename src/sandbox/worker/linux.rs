@@ -137,6 +137,12 @@ fn launch_executable(
         reap_observer: None,
         #[cfg(test)]
         force_tree_termination_error: false,
+        #[cfg(test)]
+        authenticated_ready_observer: None,
+        #[cfg(test)]
+        force_authenticated_ready_finalization_error: false,
+        #[cfg(test)]
+        parent_write_observer: None,
     })
 }
 
@@ -952,14 +958,14 @@ fn run_worker_lifecycle_probes(bwrap: &Path, executable: &Path) -> io::Result<()
 #[cfg(test)]
 fn complete_hello_ready_and_run_step(process: &mut WorkerProcess) -> io::Result<()> {
     use crate::extras::js::protocol::{
-        BuildIdentity, InvocationId, ParentFrame, ParentHello, ParentProtocol, RunStep,
-        StepOutcome, WireFrame, WorkerFrame, WorkerWireFrame, write_frame,
+        BuildIdentity, InvocationId, ParentFrame, ParentProtocol, RunStep, StepOutcome, WireFrame,
+        WorkerFrame, WorkerWireFrame, write_frame,
     };
     use std::io::Write;
 
     let build = BuildIdentity::current();
     let mut protocol = ParentProtocol::new(build.clone());
-    let hello = WireFrame::connection(build, 0, ParentFrame::Hello(ParentHello {}));
+    let hello = WireFrame::connection(build, 0, ParentFrame::Hello(protocol.hello()));
     protocol
         .on_send(&hello)
         .map_err(|_| io::Error::other("lifecycle probe could not send Hello"))?;
@@ -975,6 +981,7 @@ fn complete_hello_ready_and_run_step(process: &mut WorkerProcess) -> io::Result<
             "lifecycle probe received a non-Ready startup frame",
         ));
     }
+    process.finalize_authenticated_ready()?;
     let invocation = InvocationId::new("linux-lifecycle-ready-probe")
         .map_err(|_| io::Error::other("lifecycle probe invocation identity was invalid"))?;
     let run_step = WireFrame::invocation(
@@ -1531,6 +1538,14 @@ impl WorkerChild {
 
     pub(super) fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    pub(super) fn finalize_authenticated_ready(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn retire_after_reap(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     pub(super) fn terminate_tree(&mut self) -> io::Result<()> {

@@ -251,6 +251,14 @@ impl WorkerChild {
         }
     }
 
+    pub(super) fn finalize_authenticated_ready(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn retire_after_reap(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     pub(super) fn terminate_tree(&mut self) -> io::Result<()> {
         match &mut self.inner {
             WorkerChildInner::Contained { job, .. } => {
@@ -2703,6 +2711,12 @@ mod feasibility {
             reap_observer: None,
             #[cfg(test)]
             force_tree_termination_error: false,
+            #[cfg(test)]
+            authenticated_ready_observer: None,
+            #[cfg(test)]
+            force_authenticated_ready_finalization_error: false,
+            #[cfg(test)]
+            parent_write_observer: None,
         })
     }
 
@@ -2787,12 +2801,12 @@ mod feasibility {
     ) -> Result<(), GateError> {
         use crate::extras::js::protocol::{
             BuildIdentity, ContainmentAttestation, ContainmentProbe, InvocationId, ParentFrame,
-            ParentHello, ParentProtocol, RunStep, StepOutcome, WireFrame, WorkerFrame, write_frame,
+            ParentProtocol, RunStep, StepOutcome, WireFrame, WorkerFrame, write_frame,
         };
 
         let build = BuildIdentity::current();
         let mut protocol = ParentProtocol::new(build.clone());
-        let hello = WireFrame::connection(build.clone(), 0, ParentFrame::Hello(ParentHello {}));
+        let hello = WireFrame::connection(build.clone(), 0, ParentFrame::Hello(protocol.hello()));
         protocol
             .on_send(&hello)
             .map_err(|error| GateError(format!("validate Windows Hello: {error}")))?;
@@ -2809,6 +2823,9 @@ mod feasibility {
         if !matches!(ready.message, WorkerFrame::Ready(_)) {
             return Err(GateError("Windows worker did not emit Ready".to_string()));
         }
+        process
+            .finalize_authenticated_ready()
+            .map_err(|error| GateError(format!("finalize authenticated Windows Ready: {error}")))?;
 
         let containment = WireFrame::connection(
             build.clone(),

@@ -22,7 +22,7 @@ use super::protocol::{
     DiagnosticStage, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
     JsErrorCode, ParentFrame, ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult,
     VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
-    WorkerProtocol, WorkerReady, WorkerWireFrame, read_frame, write_frame,
+    WorkerProtocol, WorkerWireFrame, read_frame, write_frame,
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
@@ -883,8 +883,11 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
 
     finalize_internal_worker().map_err(|_| ())?;
 
-    let ready: WorkerWireFrame =
-        WireFrame::connection(build.clone(), 1, WorkerFrame::Ready(WorkerReady {}));
+    let ready: WorkerWireFrame = WireFrame::connection(
+        build.clone(),
+        1,
+        WorkerFrame::Ready(protocol.ready().map_err(|_| ())?),
+    );
     protocol.on_send(&ready).map_err(|_| ())?;
     write_terminal(&mut output, &ready)?;
 
@@ -929,7 +932,17 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
                         super::protocol::ContainmentAttestation::Passed,
                     )
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = probe;
+                    if !crate::sandbox::worker::attest_macos_hosted_containment() {
+                        return Err(());
+                    }
+                    WorkerFrame::ContainmentAttested(
+                        super::protocol::ContainmentAttestation::Passed,
+                    )
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 {
                     let _ = probe;
                     return Err(());

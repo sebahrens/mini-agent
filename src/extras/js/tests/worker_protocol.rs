@@ -41,6 +41,14 @@ fn invocation() -> InvocationId {
     InvocationId::new("invocation-1").unwrap()
 }
 
+fn protocol_challenge() -> LaunchChallenge {
+    challenge(1)
+}
+
+fn parent_protocol() -> ParentProtocol {
+    ParentProtocol::with_challenge_for_test(build(), protocol_challenge())
+}
+
 fn connection<M>(sequence: u64, message: M) -> WireFrame<M> {
     WireFrame::connection(build(), sequence, message)
 }
@@ -50,11 +58,21 @@ fn invoked<M>(sequence: u64, message: M) -> WireFrame<M> {
 }
 
 fn hello() -> ParentWireFrame {
-    connection(0, ParentFrame::Hello(ParentHello {}))
+    connection(
+        0,
+        ParentFrame::Hello(ParentHello {
+            challenge: protocol_challenge(),
+        }),
+    )
 }
 
 fn ready() -> WorkerWireFrame {
-    connection(1, WorkerFrame::Ready(WorkerReady {}))
+    connection(
+        1,
+        WorkerFrame::Ready(WorkerReady {
+            challenge: protocol_challenge(),
+        }),
+    )
 }
 
 fn containment_probe(sequence: u64) -> ParentWireFrame {
@@ -95,6 +113,10 @@ fn verify(sequence: u64) -> ParentWireFrame {
 
 fn grant() -> GrantId {
     GrantId::new(Uuid::from_u128(1)).unwrap()
+}
+
+fn challenge(value: u128) -> LaunchChallenge {
+    LaunchChallenge::new(Uuid::from_u128(value)).unwrap()
 }
 
 fn effect_request(sequence: u64, ordinal: u32) -> WorkerWireFrame {
@@ -222,13 +244,161 @@ fn worker_protocol_rejects_same_version_with_a_different_build_fingerprint() {
         BuildIdentity::new(format!("{}+{}", env!("CARGO_PKG_VERSION"), "a".repeat(64))).unwrap();
     let worker_build =
         BuildIdentity::new(format!("{}+{}", env!("CARGO_PKG_VERSION"), "b".repeat(64))).unwrap();
-    let mut parent = ParentProtocol::new(parent_build);
-    let frame = WireFrame::connection(worker_build, 0, ParentFrame::Hello(ParentHello {}));
+    let mut parent = ParentProtocol::with_challenge_for_test(parent_build, protocol_challenge());
+    let frame = WireFrame::connection(
+        worker_build,
+        0,
+        ParentFrame::Hello(ParentHello {
+            challenge: protocol_challenge(),
+        }),
+    );
 
     assert!(matches!(
         parent.on_send(&frame),
         Err(ProtocolError::BuildMismatch { .. })
     ));
+}
+
+#[test]
+fn launch_challenge_rejects_nil_values_and_is_fresh_per_parent_protocol() {
+    assert_eq!(
+        LaunchChallenge::new(Uuid::nil()),
+        Err(WireIdError::NilLaunchChallenge)
+    );
+
+    let first = ParentProtocol::new(build()).hello();
+    let second = ParentProtocol::new(build()).hello();
+    assert_ne!(first.challenge, second.challenge);
+}
+
+#[test]
+fn parent_protocol_rejects_a_forged_ready_challenge_without_advancing() {
+    let expected = challenge(10);
+    let mut parent = ParentProtocol::with_challenge_for_test(build(), expected.clone());
+    let hello = connection(
+        0,
+        ParentFrame::Hello(ParentHello {
+            challenge: expected,
+        }),
+    );
+    parent.on_send(&hello).unwrap();
+
+    let forged = connection(
+        1,
+        WorkerFrame::Ready(WorkerReady {
+            challenge: challenge(11),
+        }),
+    );
+    assert_eq!(
+        parent.on_receive(&forged),
+        Err(ProtocolError::LaunchChallengeMismatch)
+    );
+    assert_eq!(parent.state(), &ParentState::AwaitReady);
+}
+
+#[test]
+fn parent_protocol_rejects_a_mismatched_hello_without_consuming_the_handshake() {
+    let expected = challenge(30);
+    let mut parent = ParentProtocol::with_challenge_for_test(build(), expected.clone());
+    let mismatched = connection(
+        0,
+        ParentFrame::Hello(ParentHello {
+            challenge: challenge(31),
+        }),
+    );
+    assert_eq!(
+        parent.on_send(&mismatched),
+        Err(ProtocolError::LaunchChallengeMismatch)
+    );
+    assert_eq!(parent.state(), &ParentState::AwaitReady);
+
+    let exact = connection(
+        0,
+        ParentFrame::Hello(ParentHello {
+            challenge: expected,
+        }),
+    );
+    parent.on_send(&exact).unwrap();
+    assert_eq!(parent.state(), &ParentState::AwaitReady);
+}
+
+#[test]
+fn parent_protocol_rejects_ready_replayed_from_another_launch() {
+    let old_challenge = challenge(40);
+    let current_challenge = challenge(41);
+    let mut old = ParentProtocol::with_challenge_for_test(build(), old_challenge.clone());
+    old.on_send(&connection(
+        0,
+        ParentFrame::Hello(ParentHello {
+            challenge: old_challenge.clone(),
+        }),
+    ))
+    .unwrap();
+    let replayed_ready = connection(
+        1,
+        WorkerFrame::Ready(WorkerReady {
+            challenge: old_challenge,
+        }),
+    );
+    old.on_receive(&replayed_ready).unwrap();
+
+    let mut current = ParentProtocol::with_challenge_for_test(build(), current_challenge.clone());
+    current
+        .on_send(&connection(
+            0,
+            ParentFrame::Hello(ParentHello {
+                challenge: current_challenge.clone(),
+            }),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        current.on_receive(&replayed_ready),
+        Err(ProtocolError::LaunchChallengeMismatch)
+    );
+    assert_eq!(current.state(), &ParentState::AwaitReady);
+    current
+        .on_receive(&connection(
+            1,
+            WorkerFrame::Ready(WorkerReady {
+                challenge: current_challenge,
+            }),
+        ))
+        .unwrap();
+    assert_eq!(current.state(), &ParentState::Idle);
+}
+
+#[test]
+fn worker_protocol_only_echoes_the_received_launch_challenge() {
+    let expected = challenge(20);
+    let mut worker = WorkerProtocol::new(build());
+    worker
+        .on_receive(&connection(
+            0,
+            ParentFrame::Hello(ParentHello {
+                challenge: expected.clone(),
+            }),
+        ))
+        .unwrap();
+
+    let forged = connection(
+        1,
+        WorkerFrame::Ready(WorkerReady {
+            challenge: challenge(21),
+        }),
+    );
+    assert_eq!(
+        worker.on_send(&forged),
+        Err(ProtocolError::LaunchChallengeMismatch)
+    );
+    let exact = connection(
+        1,
+        WorkerFrame::Ready(WorkerReady {
+            challenge: expected,
+        }),
+    );
+    worker.on_send(&exact).unwrap();
+    assert_eq!(worker.state(), &WorkerState::Idle);
 }
 
 #[test]
@@ -283,7 +453,7 @@ fn worker_protocol_rejects_malformed_unknown_and_wrong_direction_json() {
     ));
     assert!(matches!(
         read_frame::<_, ParentWireFrame>(&mut Cursor::new(framed(
-            br#"{"protocol_version":1,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"future_parent_message"}}"#
+            br#"{"protocol_version":2,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"future_parent_message"}}"#
         ))),
         Err(FrameError::InvalidJson)
     ));
@@ -295,7 +465,7 @@ fn worker_protocol_rejects_malformed_unknown_and_wrong_direction_json() {
 
 #[test]
 fn worker_protocol_rejects_unknown_fields_and_invalid_wire_ids() {
-    let payload = br#"{"protocol_version":1,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"shutdown"},"smuggled":"value"}"#;
+    let payload = br#"{"protocol_version":2,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"shutdown"},"smuggled":"value"}"#;
     let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
     bytes.extend_from_slice(payload);
     assert!(matches!(
@@ -307,6 +477,18 @@ fn worker_protocol_rejects_unknown_fields_and_invalid_wire_ids() {
     assert!(InvocationId::new("contains spaces").is_err());
     assert!(BuildIdentity::new("").is_err());
     assert!(GrantId::new(Uuid::nil()).is_err());
+
+    for hello in [
+        br#"{"protocol_version":2,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"hello","data":{}}}"#.as_slice(),
+        br#"{"protocol_version":2,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"hello","data":{"challenge":"00000000-0000-0000-0000-000000000000"}}}"#.as_slice(),
+    ] {
+        let mut bytes = (hello.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(hello);
+        assert!(matches!(
+            read_frame::<_, ParentWireFrame>(&mut Cursor::new(bytes)),
+            Err(FrameError::InvalidJson)
+        ));
+    }
 }
 
 #[test]
@@ -373,7 +555,7 @@ fn worker_protocol_bounds_outbound_and_nested_payloads() {
 
 #[test]
 fn worker_protocol_run_step_complete_transition_table() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     let mut worker = WorkerProtocol::new(build());
 
     parent.on_send(&hello()).unwrap();
@@ -407,7 +589,7 @@ fn worker_protocol_run_step_complete_transition_table() {
 
 #[test]
 fn worker_protocol_containment_attestation_is_closed_and_connection_scoped() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     let mut worker = WorkerProtocol::new(build());
 
     parent.on_send(&hello()).unwrap();
@@ -432,7 +614,7 @@ fn worker_protocol_containment_attestation_is_closed_and_connection_scoped() {
 
 #[test]
 fn worker_protocol_outcome_unknown_response_is_invocation_terminal() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     let mut worker = WorkerProtocol::new(build());
 
     parent.on_send(&hello()).unwrap();
@@ -457,7 +639,7 @@ fn worker_protocol_outcome_unknown_response_is_invocation_terminal() {
 #[cfg(feature = "skills")]
 #[test]
 fn worker_protocol_serializes_reusable_skill_calls_without_consuming_effect_ordinals() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     let mut worker = WorkerProtocol::new(build());
     parent.on_send(&hello()).unwrap();
     worker.on_receive(&hello()).unwrap();
@@ -483,7 +665,7 @@ fn worker_protocol_serializes_reusable_skill_calls_without_consuming_effect_ordi
     assert_eq!(parent.state(), &ParentState::Idle);
     assert_eq!(worker.state(), &WorkerState::Idle);
 
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     parent.on_send(&hello()).unwrap();
     parent.on_receive(&ready()).unwrap();
     parent.on_send(&run(2)).unwrap();
@@ -498,7 +680,7 @@ fn worker_protocol_serializes_reusable_skill_calls_without_consuming_effect_ordi
 
 #[test]
 fn worker_protocol_verify_artifact_complete_transition_table() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     let mut worker = WorkerProtocol::new(build());
     parent.on_send(&hello()).unwrap();
     worker.on_receive(&hello()).unwrap();
@@ -518,7 +700,7 @@ fn worker_protocol_verify_artifact_complete_transition_table() {
 
 #[test]
 fn worker_protocol_rejects_version_build_sequence_replay_gap_and_wrap() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
 
     let mut wrong_version = hello();
     wrong_version.protocol_version += 1;
@@ -535,19 +717,34 @@ fn worker_protocol_rejects_version_build_sequence_replay_gap_and_wrap() {
     ));
 
     parent.on_send(&hello()).unwrap();
-    let replay = connection(0, WorkerFrame::Ready(WorkerReady {}));
+    let replay = connection(
+        0,
+        WorkerFrame::Ready(WorkerReady {
+            challenge: protocol_challenge(),
+        }),
+    );
     assert!(matches!(
         parent.on_receive(&replay),
         Err(ProtocolError::Sequence { .. })
     ));
-    let gap = connection(2, WorkerFrame::Ready(WorkerReady {}));
+    let gap = connection(
+        2,
+        WorkerFrame::Ready(WorkerReady {
+            challenge: protocol_challenge(),
+        }),
+    );
     assert!(matches!(
         parent.on_receive(&gap),
         Err(ProtocolError::Sequence { .. })
     ));
 
     let mut near_wrap = ParentProtocol::with_next_sequence_for_test(build(), u64::MAX);
-    let max = connection(u64::MAX, ParentFrame::Hello(ParentHello {}));
+    let max = connection(
+        u64::MAX,
+        ParentFrame::Hello(ParentHello {
+            challenge: protocol_challenge(),
+        }),
+    );
     assert_eq!(
         near_wrap.on_send(&max),
         Err(ProtocolError::SequenceExhausted)
@@ -556,7 +753,7 @@ fn worker_protocol_rejects_version_build_sequence_replay_gap_and_wrap() {
 
 #[test]
 fn worker_protocol_rejects_wrong_invocation_and_effect_identity() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     parent.on_send(&hello()).unwrap();
     parent.on_receive(&ready()).unwrap();
     parent.on_send(&run(2)).unwrap();
@@ -602,7 +799,7 @@ fn worker_protocol_rejects_wrong_invocation_and_effect_identity() {
 
 #[test]
 fn worker_protocol_rejects_invalid_terminal_and_alternation_sequences() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     assert!(matches!(
         parent.on_receive(&step_result(0)),
         Err(ProtocolError::InvalidTransition { .. })
@@ -632,7 +829,7 @@ fn worker_protocol_rejects_invalid_terminal_and_alternation_sequences() {
 
 #[test]
 fn worker_protocol_rejects_duplicate_terminal_and_more_than_256_effects() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     parent.on_send(&hello()).unwrap();
     parent.on_receive(&ready()).unwrap();
     parent.on_send(&run(2)).unwrap();
@@ -664,7 +861,7 @@ fn worker_protocol_rejects_duplicate_terminal_and_more_than_256_effects() {
         })
     );
 
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     parent.on_send(&hello()).unwrap();
     parent.on_receive(&ready()).unwrap();
     parent.on_send(&run(2)).unwrap();
@@ -706,7 +903,7 @@ fn worker_protocol_protocol_fault_is_terminal_and_source_free() {
 
 #[test]
 fn worker_protocol_protocol_fault_closes_both_sides() {
-    let mut parent = ParentProtocol::new(build());
+    let mut parent = parent_protocol();
     let mut worker = WorkerProtocol::new(build());
     parent.on_send(&hello()).unwrap();
     worker.on_receive(&hello()).unwrap();

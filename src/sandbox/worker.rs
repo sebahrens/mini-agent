@@ -21,11 +21,30 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) const INTERNAL_WORKER_MARKER: &str = "MINI_AGENT_INTERNAL_JS_WORKER";
 pub(crate) const INTERNAL_WORKER_MARKER_VALUE: &str = "brokered-v1";
+#[cfg(target_os = "macos")]
+pub(crate) const MACOS_GUARDIAN_MARKER: &str = "MINI_AGENT_INTERNAL_JS_GUARDIAN";
+#[cfg(target_os = "macos")]
+pub(crate) const MACOS_HOSTED_LIFECYCLE_MARKER: &str = "MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE";
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_PREFLIGHT_MARKER_VALUE: &str = "linux-preflight-v1";
 
 pub(crate) fn is_internal_worker_marker_present() -> bool {
     std::env::var_os(INTERNAL_WORKER_MARKER).is_some()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn maybe_run_macos_guardian() -> Option<std::process::ExitCode> {
+    platform::maybe_run_guardian()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn maybe_run_macos_hosted_lifecycle() -> Option<std::process::ExitCode> {
+    platform::maybe_run_hosted_lifecycle()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn attest_macos_hosted_containment() -> bool {
+    platform::attest_hosted_worker_containment()
 }
 
 pub(crate) fn standard_streams_are_protocol_pipes() -> bool {
@@ -275,6 +294,12 @@ pub(crate) struct WorkerProcess {
     reap_observer: Option<Arc<AtomicUsize>>,
     #[cfg(test)]
     force_tree_termination_error: bool,
+    #[cfg(test)]
+    authenticated_ready_observer: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    force_authenticated_ready_finalization_error: bool,
+    #[cfg(test)]
+    parent_write_observer: Option<Arc<AtomicUsize>>,
 }
 
 #[cfg(all(test, windows))]
@@ -287,6 +312,22 @@ pub(crate) struct WindowsWorkerProcessObservation {
 impl WorkerProcess {
     pub(crate) fn id(&self) -> u32 {
         self.process.id()
+    }
+
+    /// Completes platform cleanup that is safe only after an exact, challenge-bound Ready.
+    pub(crate) fn finalize_authenticated_ready(&mut self) -> io::Result<()> {
+        self.process.finalize_authenticated_ready()?;
+        #[cfg(test)]
+        if self.force_authenticated_ready_finalization_error {
+            return Err(io::Error::other(
+                "forced authenticated-Ready finalization failure",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(observer) = &self.authenticated_ready_observer {
+            observer.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(())
     }
 
     #[cfg(all(test, windows))]
@@ -308,6 +349,7 @@ impl WorkerProcess {
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let status = self.process.try_wait()?;
         if status.is_some() {
+            self.process.retire_after_reap()?;
             self.notify_reaped();
         }
         Ok(status)
@@ -315,6 +357,7 @@ impl WorkerProcess {
 
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
         let status = self.process.wait()?;
+        self.process.retire_after_reap()?;
         self.notify_reaped();
         Ok(status)
     }
@@ -368,6 +411,36 @@ impl WorkerProcess {
     }
 
     #[cfg(test)]
+    pub(crate) fn observe_authenticated_ready_for_test(&mut self, observer: Arc<AtomicUsize>) {
+        assert!(
+            self.authenticated_ready_observer.is_none(),
+            "authenticated Ready observer already installed"
+        );
+        self.authenticated_ready_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_authenticated_ready_finalization_error_for_test(&mut self) {
+        self.force_authenticated_ready_finalization_error = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_parent_writes_for_test(&mut self, observer: Arc<AtomicUsize>) {
+        assert!(
+            self.parent_write_observer.is_none(),
+            "parent write observer already installed"
+        );
+        self.parent_write_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_parent_write_for_test(&self) {
+        if let Some(observer) = &self.parent_write_observer {
+            observer.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[cfg(test)]
     fn notify_reaped(&mut self) {
         if let Some(observer) = self.reap_observer.take() {
             observer.fetch_sub(1, Ordering::AcqRel);
@@ -412,6 +485,7 @@ pub(crate) enum TestSupervisorStartup {
     ExitBeforeReady,
     MalformedReady,
     BuildMismatch,
+    ChallengeMismatch,
 }
 
 #[cfg(test)]
@@ -579,6 +653,7 @@ impl WorkerLauncher for TestWorkerLauncher {
                             TestSupervisorStartup::ExitBeforeReady => "exit-before-ready",
                             TestSupervisorStartup::MalformedReady => "malformed-ready",
                             TestSupervisorStartup::BuildMismatch => "build-mismatch",
+                            TestSupervisorStartup::ChallengeMismatch => "challenge-mismatch",
                         },
                     );
                 }
@@ -611,6 +686,9 @@ impl WorkerLauncher for TestWorkerLauncher {
             backend,
             reap_observer: None,
             force_tree_termination_error: false,
+            authenticated_ready_observer: None,
+            force_authenticated_ready_finalization_error: false,
+            parent_write_observer: None,
         })
     }
 }

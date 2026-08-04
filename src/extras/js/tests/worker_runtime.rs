@@ -9,10 +9,10 @@ use crate::extras::js::protocol::ArtifactInput;
 use crate::extras::js::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, DiagnosticClass, DiagnosticStage,
     EffectError, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
-    GrantId, InvocationId, JsErrorCode, ParentFrame, ParentHello, ParentProtocol, ParentWireFrame,
-    RunStep, ScriptRole, StepOutcome, StepResult, VerificationCase, VerificationCaseResult,
-    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady,
-    WorkerWireFrame, read_frame, write_frame,
+    GrantId, InvocationId, JsErrorCode, LaunchChallenge, ParentFrame, ParentHello, ParentProtocol,
+    ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult, VerificationCase,
+    VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
+    WorkerProtocol, WorkerReady, WorkerWireFrame, read_frame, write_frame,
 };
 use crate::extras::js::supervisor::{
     EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
@@ -43,12 +43,16 @@ async fn windows_production_supervisor_rejects_nonproduction_test_image() {
     assert_eq!(error, WorkerError::ContainmentUnavailable);
 }
 
-fn hello(sequence: u64) -> ParentWireFrame {
+fn hello(parent: &ParentProtocol, sequence: u64) -> ParentWireFrame {
     WireFrame::connection(
         BuildIdentity::current(),
         sequence,
-        ParentFrame::Hello(ParentHello {}),
+        ParentFrame::Hello(parent.hello()),
     )
+}
+
+fn test_launch_challenge() -> LaunchChallenge {
+    LaunchChallenge::new(uuid::Uuid::from_u128(1)).unwrap()
 }
 
 fn shutdown(sequence: u64) -> ParentWireFrame {
@@ -216,7 +220,7 @@ fn run_worker_transcript(
     .expect("test worker should launch");
     let mut parent = ParentProtocol::new(BuildIdentity::current());
 
-    let hello = hello(0);
+    let hello = hello(&parent, 0);
     parent.on_send(&hello).unwrap();
     write_parent_frame(&mut process.input, &hello);
     let (preamble, ready) = read_worker_frame_after_test_preamble(&mut process.output);
@@ -994,7 +998,7 @@ fn worker_bootstrap_protocol_valid_hello_ready_shutdown_round_trip() {
         .expect("test worker should launch");
     let mut parent = ParentProtocol::new(BuildIdentity::current());
 
-    let hello = hello(0);
+    let hello = hello(&parent, 0);
     parent.on_send(&hello).expect("Hello should be valid");
     write_parent_frame(&mut process.input, &hello);
 
@@ -1068,7 +1072,9 @@ fn worker_bootstrap_rejects_wrong_build_without_ready() {
     let wrong = WireFrame::connection(
         BuildIdentity::new("forged-build").unwrap(),
         0,
-        ParentFrame::Hello(ParentHello {}),
+        ParentFrame::Hello(ParentHello {
+            challenge: test_launch_challenge(),
+        }),
     );
     write_parent_frame(&mut process.input, &wrong);
 
@@ -1242,6 +1248,45 @@ fn scripted_supervisor(stderr_bytes: usize) -> Arc<JsWorkerSupervisor> {
     Arc::new(JsWorkerSupervisor::with_launcher_for_test(
         TestWorkerLauncher::scripted_internal_worker(stderr_bytes),
     ))
+}
+
+#[derive(Clone)]
+struct ReadyFinalizationLauncher {
+    startup: TestSupervisorStartup,
+    finalized: Arc<AtomicUsize>,
+}
+
+impl WorkerLauncher for ReadyFinalizationLauncher {
+    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
+        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
+    }
+
+    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        let mut process =
+            TestWorkerLauncher::scripted_internal_worker_with_startup(0, self.startup).launch()?;
+        process.observe_authenticated_ready_for_test(self.finalized.clone());
+        Ok(process)
+    }
+}
+
+#[derive(Clone)]
+struct FailingReadyFinalizationLauncher {
+    live_processes: Arc<AtomicUsize>,
+    parent_writes: Arc<AtomicUsize>,
+}
+
+impl WorkerLauncher for FailingReadyFinalizationLauncher {
+    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
+        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
+    }
+
+    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
+        let mut process = TestWorkerLauncher::scripted_internal_worker(0).launch()?;
+        process.observe_reap_for_test(self.live_processes.clone());
+        process.observe_parent_writes_for_test(self.parent_writes.clone());
+        process.force_authenticated_ready_finalization_error_for_test();
+        Ok(process)
+    }
 }
 
 #[derive(Clone)]
@@ -1747,6 +1792,71 @@ async fn worker_supervisor_recovery_startup_exit_malformed_ready_and_pure_crash(
         WorkerError::Transport,
     )
     .await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_finalizes_only_after_an_authenticated_ready() {
+    let healthy_finalized = Arc::new(AtomicUsize::new(0));
+    let healthy = JsWorkerSupervisor::with_launcher_for_test(ReadyFinalizationLauncher {
+        startup: TestSupervisorStartup::Healthy,
+        finalized: healthy_finalized.clone(),
+    });
+    assert_eq!(
+        execute_success(&healthy).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    assert_eq!(healthy_finalized.load(Ordering::Acquire), 1);
+    healthy.shutdown_for_test().await.unwrap();
+
+    let forged_finalized = Arc::new(AtomicUsize::new(0));
+    let forged = JsWorkerSupervisor::with_launcher_for_test(ReadyFinalizationLauncher {
+        startup: TestSupervisorStartup::ChallengeMismatch,
+        finalized: forged_finalized.clone(),
+    });
+    assert_eq!(
+        forged
+            .execute(
+                RunStep::new("success".into()),
+                RecordingEffects::default(),
+                PermCancellation::new(),
+            )
+            .await,
+        Err(WorkerError::Protocol)
+    );
+    assert_eq!(forged_finalized.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn worker_supervisor_finalization_failure_is_launch_terminal_and_reaps() {
+    let live_processes = Arc::new(AtomicUsize::new(0));
+    let parent_writes = Arc::new(AtomicUsize::new(0));
+    let supervisor = JsWorkerSupervisor::with_launcher_for_test(FailingReadyFinalizationLauncher {
+        live_processes: live_processes.clone(),
+        parent_writes: parent_writes.clone(),
+    });
+
+    assert_eq!(
+        supervisor
+            .execute(
+                RunStep::new("must-not-run".into()),
+                RecordingEffects::default(),
+                PermCancellation::new(),
+            )
+            .await,
+        Err(WorkerError::Launch)
+    );
+    assert_eq!(
+        parent_writes.load(Ordering::Acquire),
+        1,
+        "only ParentHello may be written before finalization succeeds"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while live_processes.load(Ordering::Acquire) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("finalization failure did not reap the worker tree");
 }
 
 #[tokio::test]
@@ -2623,8 +2733,15 @@ fn run_scripted_supervisor_worker() -> ! {
     } else {
         build.clone()
     };
-    let ready = WireFrame::connection(ready_build, 1, WorkerFrame::Ready(WorkerReady {}));
-    if startup != "build-mismatch" {
+    let ready_payload = if startup == "challenge-mismatch" {
+        WorkerReady {
+            challenge: test_launch_challenge(),
+        }
+    } else {
+        protocol.ready().unwrap()
+    };
+    let ready = WireFrame::connection(ready_build, 1, WorkerFrame::Ready(ready_payload));
+    if startup != "build-mismatch" && startup != "challenge-mismatch" {
         protocol.on_send(&ready).unwrap();
     }
     write_frame(&mut output, &ready).unwrap();

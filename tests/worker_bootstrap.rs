@@ -16,6 +16,7 @@ const BUILD_ID: &str = concat!(
     "+",
     env!("MINI_AGENT_BUILD_FINGERPRINT")
 );
+const LAUNCH_CHALLENGE: &str = "00000000-0000-0000-0000-000000000001";
 
 fn frame(payload: serde_json::Value) -> Vec<u8> {
     let payload = serde_json::to_vec(&payload).unwrap();
@@ -26,17 +27,17 @@ fn frame(payload: serde_json::Value) -> Vec<u8> {
 
 fn hello() -> Vec<u8> {
     frame(serde_json::json!({
-        "protocol_version": 1,
+        "protocol_version": 2,
         "build_id": BUILD_ID,
         "invocation_id": null,
         "sequence": 0,
-        "message": { "kind": "hello", "data": {} }
+        "message": { "kind": "hello", "data": { "challenge": LAUNCH_CHALLENGE } }
     }))
 }
 
 fn shutdown() -> Vec<u8> {
     frame(serde_json::json!({
-        "protocol_version": 1,
+        "protocol_version": 2,
         "build_id": BUILD_ID,
         "invocation_id": null,
         "sequence": 2,
@@ -100,6 +101,7 @@ fn worker_bootstrap_production_main_emits_ready_from_byte_zero_before_clap_or_to
     let ready = decode_single_frame(&output.stdout);
     assert_eq!(ready["sequence"], 1);
     assert_eq!(ready["message"]["kind"], "ready");
+    assert_eq!(ready["message"]["data"]["challenge"], LAUNCH_CHALLENGE);
     assert!(output.stderr.is_empty(), "worker stderr must be silent");
 }
 

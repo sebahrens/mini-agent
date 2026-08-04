@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 
 use super::protocol::{
     BuildIdentity, DiagnosticClass, EffectErrorCode, EffectRequest, EffectResponse, EffectResult,
-    FrameError, InvocationId, JsErrorCode, ParentFrame, ParentHello, ParentProtocol,
-    ParentWireFrame, RunStep, StepOutcome, StepResult, VerificationResult, VerifyArtifact,
-    WireFrame, WorkerFrame, WorkerWireFrame, read_frame, write_frame,
+    FrameError, InvocationId, JsErrorCode, ParentFrame, ParentProtocol, ParentWireFrame, RunStep,
+    StepOutcome, StepResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
+    WorkerWireFrame, read_frame, write_frame,
 };
 #[cfg(feature = "skills")]
 use super::protocol::{SkillCallRequest, SkillCallResponse};
@@ -1335,7 +1335,7 @@ async fn launch_connection(
         completed_invocations: 0,
         retirement: None,
     };
-    let hello = WireFrame::connection(build, 0, ParentFrame::Hello(ParentHello {}));
+    let hello = WireFrame::connection(build, 0, ParentFrame::Hello(connection.protocol.hello()));
     connection
         .protocol
         .on_send(&hello)
@@ -1356,6 +1356,10 @@ async fn launch_connection(
     if !matches!(ready.message, WorkerFrame::Ready(_)) {
         return Err(WorkerError::Protocol);
     }
+    connection
+        .process
+        .finalize_authenticated_ready()
+        .map_err(|_| WorkerError::Launch)?;
     connection.sequence = 2;
     Ok(connection)
 }
@@ -1674,7 +1678,10 @@ async fn write_parent(
         .await?
         .map_err(|_| WorkerError::Transport)?;
     validate_generation(connection.generation, tagged.generation)?;
-    tagged.result.map_err(map_frame_error)
+    tagged.result.map_err(map_frame_error)?;
+    #[cfg(test)]
+    connection.process.notify_parent_write_for_test();
+    Ok(())
 }
 
 /// Cancellation can win the parent select after a mutating service has already completed but

@@ -369,12 +369,12 @@ jobs:
         with:
           rustflags: ''
 
-      - name: Reject a missing macOS Seatbelt blocker probe
+      - name: Reject a missing macOS production-binary containment matrix
         shell: bash
         run: |
           js_tests=$(cargo test --locked --no-default-features --features js -- --list)
           skills_tests=$(cargo test --locked --no-default-features --features skills -- --list)
-          containment_count=$(printf '%s\n' "$js_tests" | grep -c '^extras::js::tests::worker_containment::macos_js_worker_containment: test$')
+          containment_count=$(printf '%s\n' "$js_tests" | grep -c '^sandbox::worker::platform::tests::macos_hosted_lifecycle_marker_is_exact: test$')
           test "$containment_count" -eq 1
 
           require_suite() {
@@ -402,11 +402,15 @@ jobs:
           require_suite "$skills_tests" skill_held_out_evaluator '^extras::js::tests::skill_held_out_evaluator::'
           require_suite "$skills_tests" skill_admission_gate '^extras::js::tests::skill_admission_gate::'
 
-      - name: Validate the real macOS Seatbelt fail-closed gate
+      - name: Validate the non-libtest macOS production-binary containment matrix
         shell: bash
         run: |
-          cargo test --locked --no-default-features --features js \
-            macos_js_worker_containment -- --ignored --nocapture
+          install_root="${RUNNER_TEMP}/macos-hosted-matrix-install"
+          cargo install --locked --path . --debug --no-default-features --features js \
+            --root "$install_root"
+          matrix_output=$(MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE=production-binary-v1 \
+            "$install_root/bin/mini-agent")
+          test "$matrix_output" = 'MACOS_CONTAINMENT_MATRIX_V1=passed'
           echo 'PHASE6_REAL_PROBE=passed' >> "$GITHUB_ENV"
 
       - name: Measure macOS JS worker resources without gating noisy timing percentiles
@@ -484,6 +488,7 @@ jobs:
               backend = 'seatbelt'
               assurance = 'deprecated-best-effort-fail-closed'
               real_probe = $probe
+              production_binary_matrix = $probe
               resource_measurement = $resource
               native_resource_gate = 'unavailable-no-production-worker'
             }

@@ -153,6 +153,11 @@ windows-sys = { version = "0.61", features = [
 rustix = { version = "1.1", features = ["process", "thread"] }
 seccompiler = "0.5"
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+core-foundation = "0.10"
+security-framework = "3.7"
+security-framework-sys = "2.17"
+
 [dev-dependencies]
 proc-macro2 = { version = "1", features = ["span-locations"] }
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }

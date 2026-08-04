@@ -57,8 +57,9 @@ one source-level realm. It cannot create authority: every
 request is still intersected with parent session permissions and target-narrowing policy, and the
 grant is bound to the parent-created invocation. Platform containment separately removes ambient
 filesystem, network, credential, database, and parent-memory authority. An available Linux worker
-and an attested Windows worker also deny process creation. macOS is unavailable because its probed
-stable-image Seatbelt path cannot enforce that property.
+and an attested Windows worker also deny process creation. macOS implements the explicitly weaker
+scoped boundary below and reports `DeprecatedBestEffort`, but remains unavailable: authenticated
+Ready and launcher construction do not substitute for the pending production-binary hosted matrix.
 
 Out of scope are compromise of the parent, containment backend, operating system, or kernel, and
 availability after a host-wide resource failure. Phase 6 does not claim that JavaScript realms
@@ -150,6 +151,19 @@ production compile inputs, dependency lockfile, enabled features, target/profile
 Rust compiler version. Ordinary local and packaged builds therefore reject a same-version peer
 built from different inputs without relying on Git metadata, network access, timestamps, or random
 values.
+
+Protocol version 2 binds startup to one process launch. The parent generates a fresh non-nil UUID
+challenge when it constructs that launch's protocol state, sends it in `ParentHello`, and accepts
+`WorkerReady` only when the worker echoes the exact challenge. The worker records only the
+challenge received in its one accepted `ParentHello` and may send `WorkerReady` only with that
+exact value. A nil, missing, replayed, or different challenge is a closed protocol failure and
+does not advance either state machine.
+
+After the parent state machine validates the exact `WorkerReady`, and before sequence 2 or any
+containment probe, `RunStep`, or `VerifyArtifact`, the supervisor calls the worker process's
+`finalize_authenticated_ready` platform hook. Hook failure aborts startup and tears down the
+containment tree. The macOS hook removes the exact descriptor-pinned executable pathname after
+challenge-bound Ready and before sequence 2. Linux and Windows remain no-ops at this hook.
 
 After a versioned hello/ready exchange, the only invocation flow is:
 
@@ -442,7 +456,7 @@ unavailable.
 | Platform | Required worker containment |
 |----------|-----------------------------|
 | Linux | Available only after a broker-only empty-root bubblewrap preflight proves isolated namespaces/environment, exact mounts, resource limits, and in-worker seccomp denial of process creation and execution. |
-| macOS | Unavailable. The real Seatbelt probe proves that the stable worker image cannot be allowed for initial execution and simultaneously denied to a native-compromised worker for re-exec. Deprecated `sandbox-exec` is not accepted as a weaker production fallback. |
+| macOS | Unavailable pending the complete non-libtest hosted matrix. The scoped `DeprecatedBestEffort` launcher descriptor-publishes a one-time image, unlinks it after authenticated Ready, gracefully shuts down and reaps the exact process, and explicitly retires its lease/directory. No macOS major is allowlisted until worker-side denial/readback and guardian parent-death evidence passes. |
 | Windows | Available only after a cached minimal production attestation observes the LPAC/token shape, protocol handles, selected Job/mitigation state, closed protocol probe, fresh runtime, and clean shutdown for the same launcher used for real work. It does not establish filesystem, credential, network, actual-child, omitted-handle, or install-root denial. The hosted full canary/install-location gate is separate reference-runner evidence. |
 
 The Linux launcher is a dedicated broker-only bubblewrap profile, not the general command
@@ -473,16 +487,17 @@ completed Hello/Ready handshake and valid contained `RunStep`,
 and disappearance of the exact controlled sleeper PID/start-time after process-group teardown.
 
 Containment availability and the real backend are probed before JS is advertised. An available
-Linux or Windows worker denies process creation/exec. macOS reports the probed reusable-exec
-blocker without upgrading the claim. A backend that is absent, untrusted,
+Linux or Windows worker denies process creation/exec. macOS reports the weaker scoped assurance as
+typed unavailable until the hosted matrix below closes. A backend that is absent, untrusted,
 misconfigured, unverifiable, or unable to apply every required restriction makes JS unavailable.
 
 ### macOS standalone-CLI containment gate
 
-The standalone macOS CLI currently reports `Seatbelt` with typed
-`DeprecatedBestEffort` assurance and keeps production JavaScript unavailable. This is a deliberate
-fail-closed result, not a delivered macOS containment backend. A real local probe on macOS 26
-preserves the following platform evidence:
+The standalone macOS CLI reports unavailable `Seatbelt` with typed `DeprecatedBestEffort`
+assurance. This
+boundary trusts the parent-selected current executable and authenticated bootstrap, excludes
+hostile same-UID peer processes, and treats request evaluation after authenticated Ready as
+untrusted. A real local probe on macOS 26 preserves the following platform evidence:
 
 - a deny-default profile without `process-exec` prevents `/usr/bin/sandbox-exec` from executing
   the initial worker image;
@@ -493,18 +508,77 @@ macOS 15 remains an explicit CI probe target rather than a validated runtime maj
 allowlist must not classify it as validated until that runner has produced the same real-backend
 evidence. Both CI rows first prove that the target-gated test exists, so an unsupported target or
 an accidentally compiled-out test cannot pass as a zero-test success.
+macOS 26 is likewise not allowlisted: its earlier reusable-image negative probe did not attest the
+complete production worker denial/readback and guardian matrix.
 
-Consequently the current stable-image design cannot both enter the worker through `sandbox-exec`
-and deny a native-compromised worker from executing the allowed image again. The public
-`sandbox_init` API is deprecated, accepts only named profiles, and documents re-sandboxing as an
-error; the raw profile compile/apply functions used by `sandbox-exec` are private. A one-time
-securely published image whose only pathname is removed before untrusted work is a possible future
-design, not a delivered bypass: its code-signing behavior, publication race, descriptor/path
-re-exec surface, crash cleanup, and full capability matrix remain unvalidated. Until a validated
-standalone mechanism closes this transition, the launcher has no profile, descriptor, rlimit, or
-process-group fallback: every production launch returns unavailable. The ignored real-backend test
-`macos_js_worker_containment` is a blocker regression gate; it must not be represented as proof of
-the complete workspace, skill-store, network, descriptor, resource, or descendant-denial matrix.
+The production launcher closes that scoped transition with a fresh one-time pathname. The public
+`sandbox_init` API remains deprecated and the assurance therefore remains explicitly
+`DeprecatedBestEffort`.
+
+The production publisher creates an unguessable
+`0700` directory under a caller-supplied private root using descriptor-relative operations, copies
+the trusted source into a single-link `0600` file, verifies source and destination metadata plus
+SHA-256, changes the copy to `0500`, and retains close-on-exec descriptors so cleanup and unlink
+remain bound to the proven directory and inode. Under the approved scoped 2A boundary, the
+parent-selected current executable and authenticated bootstrap are trusted; production therefore
+uses that exact descriptor/metadata/SHA-256 proof and does not claim Security.framework identity as
+an additional control. The stricter static-code test slice asks
+Security.framework for the candidate CDHash set, constructs an exact CDHash requirement, and only
+returns that identity after strict all-architecture validation succeeds. It checks the retained
+descriptor, pathname metadata, and retained-descriptor SHA-256 both before and after the path-based
+framework calls. The untrusted framework dictionary value is dynamically verified as an array of
+one to eight distinct, exact 20-byte data values before any typed access; the generated requirement
+is capped at 512 bytes before parsing. Candidate signing information is never accepted after a
+validation failure.
+
+Unit tests cover source/root rejection, publication permissions and identity, descriptor flags,
+replacement detection, unlink refusal when an unexpected directory entry exists, and rejection of
+tampered or malformed executables. Positive source/copy and distinct-system-image identity probes
+exist but are ignored unless explicitly selected because macOS 26.5.2 on the development host
+returns `CSSMERR_TP_NOT_TRUSTED` for pristine Apple system binaries, including `/bin/ls`, even with
+an exact CDHash requirement. This is fail-closed evidence for that stricter test slice, not a
+production signature claim and not permission to weaken a future boundary that does claim
+Security.framework identity. The tests deliberately do not spawn `sandbox-exec` or claim
+real-backend evidence.
+
+A separate macOS-only module performs bounded crash-stale cleanup before publication. It validates
+a private root, serializes sweeps by applying
+an advisory `flock` directly to the validated, retained root directory descriptor without creating
+a lock artifact, recognizes only canonical UUID publication directories, and uses a nonblocking
+per-directory lease `flock` to skip live owners. Enumeration, candidate count, per-candidate
+entries, and minimum age are bounded before any deletion. Only empty, lease-only, and
+lease-plus-image (`0600` partial or `0500` sealed) states are recoverable; malformed names,
+unexpected entries, metadata or ACL violations, hard links, and identity replacements fail closed.
+The tests retain descriptors through identity revalidation, fsync removals, inject image and
+directory replacements before the final revalidation, and exercise crash-state reclassification
+and idempotence. They do not close the same-UID window between that validation and the final name
+resolution by `unlinkat`; hostile same-UID peers are outside the approved scoped threat model.
+
+Protocol v2 authenticates `WorkerReady` with a per-launch challenge. `WorkerChild` owns the exact
+publication and lease, then unlinks and fsyncs the descriptor-proven image after that acknowledgement
+and before sequence 2. Teardown removes the lease and directory. A trusted-current-binary guardian
+owns the dedicated process group; parent-heartbeat EOF kills the group. The pre-exec boundary clears
+the environment, closes every inherited descriptor except protocol streams and the guardian
+heartbeat, and installs 256 MiB address-space, 35-second CPU, 64-descriptor, zero-core, and 1 MiB
+file-size limits. The deny-default profile permits process execution only for the exact one-time
+image and denies network by omission.
+
+The production-path lifecycle probe uses authenticated Ready, exact-image unlink, graceful
+`Shutdown`, exact process reap, and fallible lease/directory retirement. Retirement propagates
+unlink, `rmdir`, and directory/root `fsync` failures through ordinary supervisor teardown; `Drop`
+is only last-resort cleanup and cannot turn a failed explicit retirement into availability.
+Authenticated Ready alone is not containment evidence. The delivered non-libtest production-binary
+matrix sends a typed post-unlink probe and emits one fixed source-free pass record only after the
+contained worker attests workspace, skill-store, and credential sentinel read/write denial;
+IPv4/IPv6 TCP and UDP denial; fork, alternate-exec, original-image, one-time-image, and `/dev/fd`
+re-exec denial with exact error classes; the complete bounded pre-limit descriptor range;
+resource-limit readback; and dedicated guardian process-group ownership. The parent additionally
+requires graceful shutdown/reap/retirement, sentinel integrity, guardian parent-death whole-group
+disappearance, and controlled one-day-policy stale recovery with no new publication entry left.
+The cached status path and hosted marker call the same full preflight. No major is allowlisted until
+that matrix passes on its unsandboxed hosted row; enclosing sandboxes that reject nested
+`sandbox-exec` remain a fail-closed environment-blocked observation. Every failure remains typed
+unavailable; there is no uncontained fallback.
 
 The Windows delivery gate is mandatory: an LPAC worker must load from every supported install
 location and start with only the protocol handles. Failure for a location leaves Windows JS
@@ -819,7 +893,7 @@ intentional last-mile placeholders; replace them only with reviewed CI artifacts
 | Persistence boundary | Tests prove no worker database/path authority, pure initialization, no writer in stored realms, identity-v1 quarantine, and parent-only canonical persistence. |
 | Verification parity | The QuickJS realm gate passes; production and all verifier modes use one loader/ABI path with only declared deterministic fake capabilities and the same sanitized typed diagnostic contract. |
 | Effect audit | Recovery and failure-injection tests prove durable intent before every real effect, bounded completion, hash-chain integrity, fixed version-1 HMAC target correlation/redaction, version-1 key failure, segment rotation/anchors, bounded retention, machine-wide single-writer exclusion, process-restart retry semantics, and no replay. Key rotation remains out of scope. |
-| Platform containment | **PENDING FINAL CI EVIDENCE.** Linux must publish its real empty-root bwrap probe; macOS must publish truthful status-only unavailability for the reusable-exec blocker; Windows must publish the cached-attestation and hosted reference-runner full-canary/supported-install-location observations before those results are recorded. |
+| Platform containment | **PENDING FINAL CI EVIDENCE.** Linux must publish its real empty-root bwrap probe; macOS must publish the production-binary authenticated live-preflight plus denial/guardian observations on every validated major; Windows must publish the cached-attestation and hosted reference-runner full-canary/supported-install-location observations before those results are recorded. |
 | Resource baseline | **PENDING EXTERNAL RUNS.** The schema and methodology are delivered in [`../benchmarks/js-worker.md`](../benchmarks/js-worker.md); [`../benchmarks/results/js-worker-baseline.json`](../benchmarks/results/js-worker-baseline.json) remains an explicit empty observation record until the reviewed aggregate is checked in. Target misses are recorded, not blocking, unless a miss is reproduced on a matched quiet host and explicitly promoted to a blocking acceptance issue. |
 | Failure semantics | Crash, OOM, timeout, cancellation, audit failure, backend absence, parent death, ambiguous-effect, and secret-in-thrown-value tests all fail closed with only stable class/code and source-free location metadata. |
 | Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded and records implementation-complete/evidence-pending status consistently. Final delivery wording is inserted only after the two pending rows above close. |
