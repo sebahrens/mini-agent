@@ -43,10 +43,9 @@ struct MacOsAttrList {
 
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-fn macos_attribute<T, const N: usize>(
+fn macos_common_attribute<T, const N: usize>(
     file: &T,
     common_attributes: u32,
-    volume_attributes: u32,
 ) -> std::io::Result<[u8; N]>
 where
     T: std::os::fd::AsRawFd,
@@ -68,7 +67,7 @@ where
         bitmap_count: ATTRIBUTE_BITMAP_COUNT,
         reserved: 0,
         common_attributes,
-        volume_attributes,
+        volume_attributes: 0,
         directory_attributes: 0,
         file_attributes: 0,
         fork_attributes: 0,
@@ -99,15 +98,86 @@ where
 }
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_volume_uuid<T>(file: &T) -> std::io::Result<[u8; 16]>
+where
+    T: std::os::fd::AsRawFd,
+{
+    use std::ffi::{c_char, c_void};
+
+    unsafe extern "C" {
+        fn getattrlist(
+            path: *const c_char,
+            attributes: *const c_void,
+            buffer: *mut c_void,
+            buffer_size: usize,
+            options: std::ffi::c_uint,
+        ) -> std::ffi::c_int;
+    }
+
+    const ATTRIBUTE_BITMAP_COUNT: u16 = 5;
+    const ATTR_VOL_UUID: u32 = 0x0004_0000;
+    const ATTR_VOL_INFO: u32 = 0x8000_0000;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: the descriptor remains live and `filesystem` points to writable
+    // storage of the exact structure expected by fstatfs.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful fstatfs initialized the complete structure, including
+    // its NUL-terminated mounted-on path.
+    let filesystem = unsafe { filesystem.assume_init() };
+    if !filesystem.f_mntonname.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS returned an unterminated volume mount path",
+        ));
+    }
+    let attributes = MacOsAttrList {
+        bitmap_count: ATTRIBUTE_BITMAP_COUNT,
+        reserved: 0,
+        common_attributes: 0,
+        volume_attributes: ATTR_VOL_INFO | ATTR_VOL_UUID,
+        directory_attributes: 0,
+        file_attributes: 0,
+        fork_attributes: 0,
+    };
+    let mut buffer = [0u8; size_of::<u32>() + 16];
+    // Darwin requires volume attributes to be requested against the mounted
+    // volume's root. The mount path comes from the already-open descriptor,
+    // and the returned UUID is paired with that descriptor's file ID below.
+    // SAFETY: both buffers remain live for the synchronous call and the mount
+    // path is the NUL-terminated array returned by fstatfs.
+    if unsafe {
+        getattrlist(
+            filesystem.f_mntonname.as_ptr(),
+            (&attributes as *const MacOsAttrList).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let returned_size = u32::from_ne_bytes(buffer[..size_of::<u32>()].try_into().unwrap());
+    if returned_size as usize != buffer.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS returned an invalid volume-identity attribute size",
+        ));
+    }
+    Ok(buffer[size_of::<u32>()..].try_into().unwrap())
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn macos_file_identity<T>(file: &T) -> std::io::Result<MacOsFileIdentity>
 where
     T: std::os::fd::AsRawFd,
 {
     const ATTR_CMN_FILEID: u32 = 0x0200_0000;
-    const ATTR_VOL_UUID: u32 = 0x0004_0000;
-    const ATTR_VOL_INFO: u32 = 0x8000_0000;
-    let volume_uuid = macos_attribute::<_, 16>(file, 0, ATTR_VOL_INFO | ATTR_VOL_UUID)?;
-    let file_id = u64::from_ne_bytes(macos_attribute(file, ATTR_CMN_FILEID, 0)?);
+    let volume_uuid = macos_volume_uuid(file)?;
+    let file_id = u64::from_ne_bytes(macos_common_attribute(file, ATTR_CMN_FILEID)?);
     if volume_uuid == [0; 16] || file_id == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
