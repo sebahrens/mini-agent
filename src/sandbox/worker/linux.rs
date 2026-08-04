@@ -391,7 +391,6 @@ fn broker_only_command(
         "ALL",
         "--die-with-parent",
         "--new-session",
-        "--close-fds",
         "--dir",
         "/mini-agent-worker",
         "--proc",
@@ -426,7 +425,30 @@ fn broker_only_command(
         ]);
     command.args(extra_args);
     command.process_group(0);
+    close_inherited_descriptors(&mut command);
     Ok(command)
+}
+
+fn close_inherited_descriptors(command: &mut Command) {
+    // Bubblewrap versions packaged by supported Linux distributions do not all expose
+    // `--close-fds`. Close everything above the protocol streams before exec instead. The
+    // callback uses only the async-signal-safe close_range syscall and fails closed when the
+    // running kernel cannot provide it.
+    unsafe {
+        command.pre_exec(|| {
+            let result = libc::syscall(
+                libc::SYS_close_range,
+                std::io::stderr().as_raw_fd() + 1,
+                libc::c_uint::MAX,
+                0,
+            );
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
 }
 
 fn trusted_runtime_files() -> Result<Vec<PathBuf>, WorkerLaunchError> {

@@ -7,6 +7,7 @@ use crate::sandbox::{
     Sandbox, SupportCommandAudit, SupportCommandLimits,
 };
 use tokio::time::{Duration, sleep, timeout};
+use tracing::instrument::WithSubscriber;
 
 const SHORT_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_millis(300),
@@ -280,14 +281,18 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
                 started.display(),
                 marker.display()
             );
-            let handle = tokio::spawn({
-                let sandbox = sandbox.clone();
-                async move {
-                    sandbox
-                        .run_explicit_shell(&interaction, SHORT_LIMITS, None)
-                        .await
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let handle = tokio::spawn(
+                {
+                    let sandbox = sandbox.clone();
+                    async move {
+                        sandbox
+                            .run_explicit_shell(&interaction, SHORT_LIMITS, None)
+                            .await
+                    }
                 }
-            });
+                .with_subscriber(dispatch),
+            );
 
             wait_until(|| sandbox.active_group_count() == 1 && started.exists()).await;
             handle.abort();

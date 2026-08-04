@@ -16,14 +16,7 @@ pub(crate) struct WorkspaceBinding {
     directory: std::fs::File,
     capability: cap_std::fs::Dir,
     ancestors: Vec<(PathBuf, cap_std::fs::Dir)>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume: u32,
-    #[cfg(windows)]
-    file_index: u64,
+    identity: crate::fs::CheckedMetadata,
 }
 
 impl WorkspaceBinding {
@@ -46,9 +39,10 @@ impl WorkspaceBinding {
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
                 .open(&root)?
         };
-        let metadata = directory.metadata()?;
-        let capability_metadata = capability.try_clone()?.into_std_file().metadata()?;
-        crate::fs::ensure_same_std_file(&root, &metadata, &capability_metadata)?;
+        let metadata = crate::fs::checked_file_metadata(&directory)?;
+        let capability_file = capability.try_clone()?.into_std_file();
+        let capability_metadata = crate::fs::checked_file_metadata(&capability_file)?;
+        crate::fs::ensure_same_file(&root, &metadata, &capability_metadata)?;
         if !metadata.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -59,45 +53,13 @@ impl WorkspaceBinding {
         // only the captured workspace capability prevents a coherently
         // reparented ancestor chain from injecting instructions after capture.
         let ancestors = vec![(root.clone(), capability.try_clone()?)];
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Ok(Self {
-                root,
-                directory,
-                capability,
-                ancestors,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            let volume = metadata
-                .volume_serial_number()
-                .ok_or_else(|| io::Error::other("workspace directory has no volume identity"))?;
-            let file_index = metadata
-                .file_index()
-                .ok_or_else(|| io::Error::other("workspace directory has no file identity"))?;
-            Ok(Self {
-                root,
-                directory,
-                capability,
-                ancestors,
-                volume,
-                file_index,
-            })
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            Ok(Self {
-                root,
-                directory,
-                capability,
-                ancestors,
-            })
-        }
+        Ok(Self {
+            root,
+            directory,
+            capability,
+            ancestors,
+            identity: metadata,
+        })
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -194,7 +156,7 @@ impl WorkspaceBinding {
         &self,
         path: &Path,
         content: &[u8],
-        expected: &std::fs::Metadata,
+        expected: &crate::fs::CheckedMetadata,
     ) -> io::Result<()> {
         self.replace_relative_atomic_with_hook(path, content, expected, || {})
     }
@@ -203,7 +165,7 @@ impl WorkspaceBinding {
         &self,
         path: &Path,
         content: &[u8],
-        expected: &std::fs::Metadata,
+        expected: &crate::fs::CheckedMetadata,
         before_final_identity_check: impl FnOnce(),
     ) -> io::Result<()> {
         if !expected.is_file() {
@@ -215,14 +177,14 @@ impl WorkspaceBinding {
         let path = self.normalize_relative(path)?;
         let (parent, name) = self.open_parent(&path, false)?;
         let current = open_file_no_follow(&parent, &name)?;
-        let current_metadata = current.metadata()?;
+        let current_metadata = crate::fs::checked_file_metadata(&current)?;
         if !current_metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "workspace replacement target is not a regular file",
             ));
         }
-        crate::fs::ensure_same_std_file(&path, expected, &current_metadata)?;
+        crate::fs::ensure_same_file(&path, expected, &current_metadata)?;
         let temp = sibling_temp_name(&name);
         let result = (|| {
             let mut options = cap_std::fs::OpenOptions::new();
@@ -237,17 +199,17 @@ impl WorkspaceBinding {
             file.flush()?;
             let file = file.into_std();
             file.set_permissions(expected.permissions())?;
-            let replacement_metadata = file.metadata()?;
+            let replacement_metadata = crate::fs::checked_file_metadata(&file)?;
             drop(file);
             let current = open_file_no_follow(&parent, &name)?;
-            let current_metadata = current.metadata()?;
+            let current_metadata = crate::fs::checked_file_metadata(&current)?;
             if !current_metadata.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "workspace replacement target is not a regular file",
                 ));
             }
-            crate::fs::ensure_same_std_file(&path, expected, &current_metadata)?;
+            crate::fs::ensure_same_file(&path, expected, &current_metadata)?;
             drop(current);
             before_final_identity_check();
             exchange_relative(&parent, &temp, &name)?;
@@ -352,47 +314,17 @@ impl WorkspaceBinding {
         if canonical != self.root {
             return Err("workspace binding changed after session creation".to_string());
         }
-        let metadata = std::fs::metadata(&canonical)
+        let metadata = crate::fs::checked_path_metadata(&canonical)
             .map_err(|error| format!("workspace binding is unavailable: {error}"))?;
         if !metadata.is_dir() {
             return Err("workspace binding is no longer a directory".to_string());
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.dev() != self.device || metadata.ino() != self.inode {
-                return Err("workspace binding identity changed after session creation".to_string());
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if metadata.volume_serial_number() != Some(self.volume)
-                || metadata.file_index() != Some(self.file_index)
-            {
-                return Err("workspace binding identity changed after session creation".to_string());
-            }
-        }
-        let held = self
-            .directory
-            .metadata()
+        crate::fs::ensure_same_file(&canonical, &self.identity, &metadata)
+            .map_err(|_| "workspace binding identity changed after session creation".to_string())?;
+        let held = crate::fs::checked_file_metadata(&self.directory)
             .map_err(|error| format!("workspace binding handle is unavailable: {error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if held.dev() != self.device || held.ino() != self.inode {
-                return Err("workspace binding handle identity changed".to_string());
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if held.volume_serial_number() != Some(self.volume)
-                || held.file_index() != Some(self.file_index)
-            {
-                return Err("workspace binding handle identity changed".to_string());
-            }
-        }
+        crate::fs::ensure_same_file(&canonical, &self.identity, &held)
+            .map_err(|_| "workspace binding handle identity changed".to_string())?;
         Ok(())
     }
 }
@@ -539,7 +471,7 @@ fn restore_after_failed_exchange(
     directory: &cap_std::fs::Dir,
     displaced: &OsStr,
     target: &OsStr,
-    replacement_metadata: &std::fs::Metadata,
+    replacement_metadata: &crate::fs::CheckedMetadata,
 ) -> io::Result<()> {
     let rollback = sibling_temp_name(target);
     if let Err(error) = rename_no_replace_relative(directory, target, &rollback) {
@@ -574,19 +506,15 @@ fn restore_after_failed_exchange(
 fn entry_matches_regular_file(
     directory: &cap_std::fs::Dir,
     name: &OsStr,
-    expected: &std::fs::Metadata,
+    expected: &crate::fs::CheckedMetadata,
 ) -> io::Result<bool> {
     let entry = directory.symlink_metadata(name)?;
     if !entry.is_file() {
         return Ok(false);
     }
     let file = open_file_no_follow(directory, name)?;
-    Ok(crate::fs::ensure_same_std_file(
-        Path::new("workspace replacement"),
-        expected,
-        &file.metadata()?,
-    )
-    .is_ok())
+    let current = crate::fs::checked_file_metadata(&file)?;
+    Ok(crate::fs::ensure_same_file(Path::new("workspace replacement"), expected, &current).is_ok())
 }
 
 fn open_file_no_follow(directory: &cap_std::fs::Dir, name: &OsStr) -> io::Result<std::fs::File> {
@@ -751,11 +679,10 @@ mod workspace_binding_tests {
         let existing = root.join("existing.sh");
         std::fs::write(&existing, "old").unwrap();
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o751)).unwrap();
-        let expected = binding
+        let expected_file = binding
             .open_relative(std::path::Path::new("existing.sh"))
-            .unwrap()
-            .metadata()
             .unwrap();
+        let expected = crate::fs::checked_file_metadata(&expected_file).unwrap();
         binding
             .replace_relative_atomic(std::path::Path::new("existing.sh"), b"new", &expected)
             .unwrap();
@@ -772,11 +699,8 @@ mod workspace_binding_tests {
         let binding = WorkspaceBinding::capture(&root).unwrap();
         std::fs::write(root.join("target.txt"), "expected").unwrap();
         std::fs::write(root.join("concurrent.txt"), "concurrent").unwrap();
-        let expected = binding
-            .open_relative(Path::new("target.txt"))
-            .unwrap()
-            .metadata()
-            .unwrap();
+        let expected_file = binding.open_relative(Path::new("target.txt")).unwrap();
+        let expected = crate::fs::checked_file_metadata(&expected_file).unwrap();
 
         let result = binding.replace_relative_atomic_with_hook(
             Path::new("target.txt"),
@@ -799,7 +723,7 @@ mod workspace_binding_tests {
         let binding = WorkspaceBinding::capture(&root).unwrap();
         std::fs::create_dir(root.join("target")).unwrap();
         std::fs::write(root.join("target/sentinel.txt"), "directory-content").unwrap();
-        let expected = std::fs::metadata(root.join("target")).unwrap();
+        let expected = crate::fs::checked_path_metadata(&root.join("target")).unwrap();
 
         let result =
             binding.replace_relative_atomic(Path::new("target"), b"agent replacement", &expected);
@@ -821,7 +745,7 @@ mod workspace_binding_tests {
         std::fs::write(root.join("directory-target"), "expected").unwrap();
         std::fs::create_dir(root.join("raced-directory")).unwrap();
         std::fs::write(root.join("raced-directory/sentinel.txt"), "raced-directory").unwrap();
-        let expected = std::fs::metadata(root.join("directory-target")).unwrap();
+        let expected = crate::fs::checked_path_metadata(&root.join("directory-target")).unwrap();
         let result = binding.replace_relative_atomic_with_hook(
             Path::new("directory-target"),
             b"agent replacement",
@@ -845,7 +769,7 @@ mod workspace_binding_tests {
 
         std::fs::write(root.join("symlink-target"), "expected").unwrap();
         std::fs::write(root.join("symlink-referent"), "referent").unwrap();
-        let expected = std::fs::metadata(root.join("symlink-target")).unwrap();
+        let expected = crate::fs::checked_path_metadata(&root.join("symlink-target")).unwrap();
         let result = binding.replace_relative_atomic_with_hook(
             Path::new("symlink-target"),
             b"agent replacement",

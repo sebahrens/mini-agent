@@ -18,6 +18,7 @@ async fn is_in_worktree(working_dir: &str) -> bool {
     }
     #[cfg(not(feature = "git-worktree"))]
     {
+        let _ = working_dir;
         false
     }
 }

@@ -14,7 +14,7 @@ use std::ffi::{OsStr, c_void};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::mem::{size_of, size_of_val};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
@@ -24,9 +24,8 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, FreeSid, GENERIC_ALL,
-    GENERIC_READ, GetHandleInformation, HANDLE, LocalFree, TRUE, WAIT_ABANDONED_0, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, GENERIC_ALL, GENERIC_READ,
+    GetHandleInformation, HANDLE, LocalFree, TRUE, WAIT_ABANDONED_0, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
@@ -40,7 +39,7 @@ use windows_sys::Win32::Security::Isolation::{
     DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
 };
 use windows_sys::Win32::Security::{
-    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DuplicateTokenEx, EqualSid,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DuplicateTokenEx, EqualSid, FreeSid,
     GetTokenInformation, ImpersonateLoggedOnUser, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, RevertToSelf,
     SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES,
@@ -50,7 +49,7 @@ use windows_sys::Win32::Security::{
     TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateFileW, DELETE, DRIVE_REMOTE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
@@ -88,7 +87,9 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::process_creation::StdCommandCreationExt;
-use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+use windows_sys::Win32::System::WindowsProgramming::{
+    DRIVE_REMOTE, PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
+};
 
 const HELPER_ARG: &str = "--mini-agent-windows-sandbox-helper-v1";
 const PROBE_ARG: &str = "--mini-agent-windows-sandbox-runtime-check";
@@ -2013,8 +2014,7 @@ fn verify_descendant_rendezvous(
         return Err("sandbox: descendant identity proof was multiply linked".into());
     }
     let mut proof = Vec::with_capacity(DESCENDANT_IDENTITY_MAX_BYTES + 1);
-    proof_file
-        .by_ref()
+    Read::by_ref(&mut proof_file)
         .take((DESCENDANT_IDENTITY_MAX_BYTES + 1) as u64)
         .read_to_end(&mut proof)
         .map_err(|error| format!("read descendant identity proof: {error}"))?;
@@ -3459,7 +3459,7 @@ fn wait_for_exact_probe_file(path: &Path) -> Result<(), String> {
 fn bounded_probe_contents(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
     let mut file = File::open(path).ok()?;
     let mut contents = Vec::with_capacity(max_bytes + 1);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take((max_bytes + 1) as u64)
         .read_to_end(&mut contents)
         .ok()?;

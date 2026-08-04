@@ -78,7 +78,7 @@ struct Inner {
 pub(crate) struct BoundDiagnosticPath {
     path: PathBuf,
     uri: String,
-    identity: std::fs::Metadata,
+    identity: crate::fs::CheckedMetadata,
     _file: tokio::fs::File,
     #[cfg(test)]
     active_bindings: Arc<AtomicUsize>,
@@ -380,7 +380,7 @@ impl LspManager {
             return None;
         }
         let file = crate::fs::open_stable_file(&path).await.ok()?;
-        let identity = file.metadata().await.ok()?;
+        let identity = crate::fs::checked_tokio_file_metadata(&file).await.ok()?;
         let matches_cache = self
             .inner
             .diags
@@ -388,9 +388,7 @@ impl LspManager {
             .unwrap()
             .get(uri)
             .and_then(|cached| cached.identity.as_ref())
-            .is_some_and(|cached| {
-                crate::fs::ensure_same_std_file(&path, cached, &identity).is_ok()
-            });
+            .is_some_and(|cached| crate::fs::ensure_same_file(&path, cached, &identity).is_ok());
         if !matches_cache {
             return None;
         }
@@ -420,9 +418,7 @@ impl LspManager {
         let store = self.inner.diags.lock().unwrap();
         let cached = store.get(&binding.uri)?;
         let cache_identity = cached.identity.as_ref()?;
-        if crate::fs::ensure_same_std_file(&binding.path, &binding.identity, cache_identity)
-            .is_err()
-        {
+        if crate::fs::ensure_same_file(&binding.path, &binding.identity, cache_identity).is_err() {
             return None;
         }
         let display = binding
@@ -649,7 +645,8 @@ impl LspManager {
         server: &str,
         diagnostics: Vec<lsp_types::Diagnostic>,
     ) {
-        let identity = client::file_path(uri).and_then(|path| std::fs::symlink_metadata(path).ok());
+        let identity =
+            client::file_path(uri).and_then(|path| crate::fs::checked_path_metadata(&path).ok());
         let _ = client::commit_diagnostics(
             &self.inner.diags,
             uri.to_string(),
@@ -669,13 +666,13 @@ fn diagnostic_identity_is_current(uri: &str, file: &client::FileDiags) -> bool {
     let Some(path) = client::file_path(uri) else {
         return false;
     };
-    let Ok(current) = std::fs::symlink_metadata(&path) else {
+    let Ok(current) = crate::fs::checked_path_metadata(&path) else {
         return false;
     };
     if current.file_type().is_symlink() {
         return false;
     }
-    crate::fs::ensure_same_std_file(&path, approved, &current).is_ok()
+    crate::fs::ensure_same_file(&path, approved, &current).is_ok()
 }
 
 /// "LSP diagnostics (server):" header + one line per error/warning, capped.

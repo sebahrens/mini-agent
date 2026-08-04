@@ -619,7 +619,7 @@ impl PermissionChecker {
         external_action: Option<Action>,
     ) -> CheckResult {
         // Deny rules first — security baseline, cannot be bypassed.
-        if self.matches_deny_rule(tool, &[&abs_path, &expanded]) {
+        if self.matches_deny_rule(tool, &[abs_path, expanded]) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         // External-directory denies are the same kind of security baseline as
@@ -633,7 +633,7 @@ impl PermissionChecker {
         if let Some(result) = self.take_pending_one_shot(tool) {
             return result;
         }
-        if self.is_session_allowed(tool, &expanded) || self.is_session_allowed(tool, &abs_path) {
+        if self.is_session_allowed(tool, expanded) || self.is_session_allowed(tool, abs_path) {
             return CheckResult::Allowed;
         }
 

@@ -179,6 +179,7 @@ pub(crate) fn filter_tools_by_allowlist(
 }
 
 #[cfg(feature = "js")]
+#[allow(clippy::too_many_arguments)]
 fn register_js_tool(
     tools: &mut Vec<Box<dyn rig::tool::ToolDyn>>,
     sandbox: Sandbox,

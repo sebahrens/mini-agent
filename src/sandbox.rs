@@ -905,7 +905,7 @@ impl Sandbox {
             .working_dir
             .clone()
             .map(Ok)
-            .unwrap_or_else(|| std::env::current_dir())
+            .unwrap_or_else(std::env::current_dir)
             .map_err(|error| format!("sandbox: failed to resolve working directory: {error}"))?;
         match self.policy() {
             SandboxPolicy::Disabled => {
@@ -2246,7 +2246,7 @@ pub(crate) fn kill_process_group(pid: u32) {
         }
     }
     #[cfg(windows)]
-    windows::terminate_helper(_pid);
+    windows::terminate_helper(pid);
 }
 
 fn essential_env() -> Vec<(&'static str, String)> {

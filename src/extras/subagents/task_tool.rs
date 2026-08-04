@@ -308,12 +308,6 @@ editing in a known location, grepping for a literal you will act on immediately.
                     }
                 };
                 #[cfg(feature = "hooks")]
-                let mut run = run;
-
-                #[cfg(feature = "hooks")]
-                let mut run = run;
-
-                #[cfg(feature = "hooks")]
                 if let Ok(response) = run.response.as_ref()
                     && let crate::extras::hooks::SubagentStopGate::Continue { reason } =
                         crate::extras::hooks::dispatch_subagent_stop("explore", false).await

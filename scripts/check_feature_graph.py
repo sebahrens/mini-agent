@@ -24,11 +24,19 @@ OPTIONAL_PACKAGE_OWNERS = {
     "lsp-types": "lsp",
     "matrixmultiply": "skills",
     "ort": "skills-embed",
+    "process-wrap": "mcp",
     "rmcp": "mcp",
     "rquickjs": "js",
     "rusqlite": "skills",
+    "url": "lsp",
+    "which": "lsp",
 }
 OPTIONAL_PACKAGES = frozenset(OPTIONAL_PACKAGE_OWNERS)
+# These direct optional dependencies are also present transitively in the base
+# graph, so `cargo tree` cannot prove whether their direct edge is active.
+# `validate_manifest` still verifies their owning feature's semantic closure.
+TRANSITIVELY_PRESENT_OPTIONAL_PACKAGES = frozenset({"url", "which"})
+ACTIVATION_PACKAGES = OPTIONAL_PACKAGES - TRANSITIVELY_PRESENT_OPTIONAL_PACKAGES
 JS_PACKAGES = frozenset({"rquickjs"})
 SKILLS_PACKAGES = JS_PACKAGES | {
     "hnsw_rs",
@@ -36,7 +44,8 @@ SKILLS_PACKAGES = JS_PACKAGES | {
     "rusqlite",
 }
 ACP_PACKAGES = frozenset({"agent-client-protocol", "blocking"})
-LSP_PACKAGES = frozenset({"lsp-types"})
+MCP_PACKAGES = frozenset({"process-wrap", "rmcp"})
+LSP_PACKAGES = frozenset({"lsp-types", "process-wrap", "url", "which"})
 EMBED_PACKAGES = SKILLS_PACKAGES | {"fastembed", "ort"}
 
 
@@ -62,7 +71,7 @@ class CargoInvocation:
 
 
 def row(name: str, features: str | None, required: frozenset[str]) -> FeatureRow:
-    return FeatureRow(name, features, required, OPTIONAL_PACKAGES - required)
+    return FeatureRow(name, features, required, ACTIVATION_PACKAGES - required)
 
 
 FEATURE_ROWS = (
@@ -72,7 +81,7 @@ FEATURE_ROWS = (
     row("sandbox", "sandbox", frozenset()),
     row("skills", "skills", SKILLS_PACKAGES),
     row("js-sandbox", "js,sandbox", JS_PACKAGES),
-    row("mcp", "mcp", frozenset({"rmcp"})),
+    row("mcp", "mcp", MCP_PACKAGES),
     row("acp", "acp", ACP_PACKAGES),
     row("lsp", "lsp", LSP_PACKAGES),
     row("js-skills", "js,skills", SKILLS_PACKAGES),
@@ -81,7 +90,7 @@ FEATURE_ROWS = (
     row(
         "full",
         "mcp,js,sandbox,skills,memory",
-        SKILLS_PACKAGES | {"rmcp"},
+        SKILLS_PACKAGES | MCP_PACKAGES,
     ),
 )
 

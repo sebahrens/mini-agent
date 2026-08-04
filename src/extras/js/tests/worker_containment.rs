@@ -146,7 +146,6 @@ fn linux_worker_launcher_source_is_broker_only_and_fail_closed() {
         "ALL",
         "--die-with-parent",
         "--new-session",
-        "--close-fds",
         "--proc",
         "--dev",
         "--tmpfs",
@@ -163,6 +162,7 @@ fn linux_worker_launcher_source_is_broker_only_and_fail_closed() {
     assert!(!source.contains("cache_dir"));
     assert!(!source.contains("fn launch_unconfined"));
     assert!(source.contains("trusted_runtime_files"));
+    assert!(source.contains("SYS_close_range"));
     assert!(source.contains("is_trusted_runtime_file"));
     let runtime_validation = source
         .split("fn trusted_runtime_files")

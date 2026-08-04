@@ -2186,7 +2186,7 @@ enum PreparedWriteEffect {
     BoundReplace {
         workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
         relative: PathBuf,
-        expected: std::fs::Metadata,
+        expected: crate::fs::CheckedMetadata,
     },
 }
 
@@ -2334,7 +2334,8 @@ impl FileEffectService {
                     Ok(file) => Ok(PreparedWriteEffect::BoundReplace {
                         workspace,
                         relative,
-                        expected: file.metadata().map_err(file_path_error)?,
+                        expected: crate::fs::checked_file_metadata(&file)
+                            .map_err(file_path_error)?,
                     }),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         let parent = relative
@@ -3202,7 +3203,10 @@ impl SpawnEffectService {
         #[cfg(windows)]
         let command = self
             .sandbox
-            .wrap_direct_command(prepared.executable.canonical_path(), &prepared.arguments)
+            .wrap_direct_command(
+                Path::new(prepared.executable.canonical_path()),
+                &prepared.arguments,
+            )
             .map_err(|_| EffectServiceError::BackendFailure)?;
         #[cfg(target_os = "linux")]
         let command = match &prepared.target {
@@ -3558,7 +3562,8 @@ impl ParentEffectService for ParentHostEffectService {
                             Ok(file) => PreparedWriteEffect::BoundReplace {
                                 workspace,
                                 relative,
-                                expected: file.metadata().map_err(file_path_error)?,
+                                expected: crate::fs::checked_file_metadata(&file)
+                                    .map_err(file_path_error)?,
                             },
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                                 let parent = relative
@@ -5479,6 +5484,19 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn open_spawn_snapshot_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                std::fs::read_link(entry.path())
+                    .map(|target| target.to_string_lossy().contains("memfd:mini-agent-spawn"))
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_oversized_snapshot_failure_closes_the_memfd() {
         let directory = TempDir::new();
@@ -5490,12 +5508,12 @@ mod tests {
         let mut source = std::fs::File::open(&executable).unwrap();
         let control =
             ExecutablePreparationControl::new_for_test(Instant::now() + Duration::from_secs(30));
-        let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = open_spawn_snapshot_count();
         assert!(matches!(
             create_sealed_executable_snapshot(&mut source, &control),
             Err(EffectServiceError::InvalidTarget)
         ));
-        let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let after = open_spawn_snapshot_count();
         assert_eq!(after, before, "failed snapshot capture leaked a descriptor");
     }
 

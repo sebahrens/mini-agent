@@ -511,13 +511,11 @@ pub(super) fn maybe_run_hosted_lifecycle() -> Option<ExitCode> {
 }
 
 fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
-    let probes = HostedProbePaths::create().map_err(|error| {
+    let probes = HostedProbePaths::create().inspect_err(|_error| {
         eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_setup");
-        error
     })?;
-    probes.verify_unchanged().map_err(|error| {
+    probes.verify_unchanged().inspect_err(|_error| {
         eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_precheck");
-        error
     })?;
     let result = (|| {
         let mut process = launch_executable_unchecked_with_probe(
@@ -545,13 +543,11 @@ fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
             eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=worker_attestation");
             return Err(error);
         }
-        probes.verify_unchanged().map_err(|error| {
+        probes.verify_unchanged().inspect_err(|_error| {
             eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_postcheck");
-            error
         })?;
-        probe_guardian_parent_death(&executable, &probes).map_err(|error| {
+        probe_guardian_parent_death(&executable, &probes).inspect_err(|_error| {
             eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=parent_death");
-            error
         })?;
         probes.verify_unchanged()
     })();
@@ -761,9 +757,8 @@ fn run_guardian() -> io::Result<ExitStatus> {
         ));
     }
     let (profile, image, worker_arguments) = parse_guardian_arguments(std::env::args_os().skip(1))
-        .map_err(|error| {
+        .inspect_err(|_error| {
             eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=guardian_arguments");
-            error
         })?;
     let probe_environment = if std::env::var_os(HOSTED_PROBE_MARKER).as_deref()
         == Some(std::ffi::OsStr::new(HOSTED_PROBE_MARKER_VALUE))
@@ -779,17 +774,14 @@ fn run_guardian() -> io::Result<ExitStatus> {
         None
     };
 
-    let heartbeat = guardian_heartbeat().map_err(|error| {
+    let heartbeat = guardian_heartbeat().inspect_err(|_error| {
         eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=guardian_heartbeat");
-        error
     })?;
-    let process_group = current_process_group().map_err(|error| {
+    let process_group = current_process_group().inspect_err(|_error| {
         eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=guardian_group");
-        error
     })?;
-    let descriptor_bound = finalize_guardian_process().map_err(|error| {
+    let descriptor_bound = finalize_guardian_process().inspect_err(|_error| {
         eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=worker_limits");
-        error
     })?;
     std::thread::Builder::new()
         .name("macos-worker-parent-death".into())
@@ -801,9 +793,8 @@ fn run_guardian() -> io::Result<ExitStatus> {
             // or intentionally dropped ownership, so killing the complete group is fail closed.
             unsafe { libc::kill(-process_group, libc::SIGKILL) };
         })
-        .map_err(|error| {
+        .inspect_err(|_error| {
             eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=guardian_monitor");
-            error
         })?;
 
     let mut worker = Command::new(SANDBOX_EXEC);
@@ -830,9 +821,8 @@ fn run_guardian() -> io::Result<ExitStatus> {
     }
     worker
         .spawn()
-        .map_err(|error| {
+        .inspect_err(|_error| {
             eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=worker_spawn");
-            error
         })?
         .wait()
 }
@@ -1341,11 +1331,11 @@ fn authenticate_ready_and_probe(
         .map_err(|_| io::Error::other("macOS preflight could not encode Hello"))?;
     process.input.flush()?;
 
-    let ready =
-        read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT).map_err(|error| {
+    let ready = read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT).inspect_err(
+        |_error| {
             eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=ready_read");
-            error
-        })?;
+        },
+    )?;
     protocol
         .on_receive(&ready)
         .map_err(|_| io::Error::other("macOS preflight received unauthenticated Ready"))?;
@@ -1354,10 +1344,11 @@ fn authenticate_ready_and_probe(
             "macOS preflight received a non-Ready frame",
         ));
     }
-    process.finalize_authenticated_ready().map_err(|error| {
-        eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=image_unlink");
-        error
-    })?;
+    process
+        .finalize_authenticated_ready()
+        .inspect_err(|_error| {
+            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=image_unlink");
+        })?;
 
     let containment = WireFrame::connection(
         build.clone(),
@@ -1370,11 +1361,11 @@ fn authenticate_ready_and_probe(
     write_frame(&mut process.input, &containment)
         .map_err(|_| io::Error::other("macOS hosted containment probe could not be encoded"))?;
     process.input.flush()?;
-    let attested =
-        read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT).map_err(|error| {
+    let attested = read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT).inspect_err(
+        |_error| {
             eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=attestation_read");
-            error
-        })?;
+        },
+    )?;
     protocol
         .on_receive(&attested)
         .map_err(|_| io::Error::other("macOS hosted containment attestation was invalid"))?;
@@ -1458,10 +1449,10 @@ fn read_worker_frame_bounded(
             ) as usize;
             if length > 0 && length <= MAX_FRAME_BYTES && encoded[offset + 4] == b'{' {
                 let end = offset.saturating_add(4).saturating_add(length);
-                if end <= encoded.len() {
-                    if let Ok(frame) = read_frame(&mut &encoded[offset..end]) {
-                        return Ok(frame);
-                    }
+                if end <= encoded.len()
+                    && let Ok(frame) = read_frame(&mut &encoded[offset..end])
+                {
+                    return Ok(frame);
                 }
             }
             offset += 1;
@@ -2146,12 +2137,12 @@ mod one_time_image {
                     ));
                 }
             }
-            if let Some(image) = self.image.as_ref() {
-                if image.metadata()?.nlink() != 0 {
-                    return Err(permission_denied(
-                        "created worker image retained a link after cleanup",
-                    ));
-                }
+            if let Some(image) = self.image.as_ref()
+                && image.metadata()?.nlink() != 0
+            {
+                return Err(permission_denied(
+                    "created worker image retained a link after cleanup",
+                ));
             }
             self.image.take();
 
@@ -2397,7 +2388,7 @@ mod one_time_image {
                 })
             })();
 
-            let result = match result {
+            match result {
                 Ok(image) => Ok(image),
                 Err(error) => match publication.cleanup() {
                     Ok(()) => Err(error),
@@ -2408,8 +2399,7 @@ mod one_time_image {
                         ),
                     )),
                 },
-            };
-            result
+            }
         }
 
         pub(super) fn image_path(&self) -> &Path {
@@ -2558,12 +2548,12 @@ mod one_time_image {
                 self.lease_linked = false;
             }
             self.directory.sync_all()?;
-            if let Some(lease) = self.lease.as_ref() {
-                if lease.metadata()?.nlink() != 0 {
-                    return Err(permission_denied(
-                        "one-time worker publication lease retained a link",
-                    ));
-                }
+            if let Some(lease) = self.lease.as_ref()
+                && lease.metadata()?.nlink() != 0
+            {
+                return Err(permission_denied(
+                    "one-time worker publication lease retained a link",
+                ));
             }
             self.lease.take();
 
@@ -2621,10 +2611,10 @@ mod one_time_image {
                     }
                     _ => false,
                 };
-                if can_unlink {
-                    if unlink_at(&self.directory, OsStr::new(ONE_TIME_LEASE_NAME), 0).is_ok() {
-                        self.lease_linked = false;
-                    }
+                if can_unlink
+                    && unlink_at(&self.directory, OsStr::new(ONE_TIME_LEASE_NAME), 0).is_ok()
+                {
+                    self.lease_linked = false;
                 }
             }
             self.lease.take();

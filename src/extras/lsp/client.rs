@@ -167,7 +167,7 @@ pub struct FileDiags {
     pub diagnostics: Vec<lsp_types::Diagnostic>,
     /// File identity at publication time. Aggregate and explicit reads drop
     /// the entry if the path is later replaced or becomes a symlink.
-    pub identity: Option<std::fs::Metadata>,
+    pub identity: Option<crate::fs::CheckedMetadata>,
     /// Conservative retained-memory accounting used by the global cache cap.
     pub cached_bytes: usize,
 }
@@ -864,7 +864,7 @@ pub(crate) fn store_diagnostics(
     let Ok(canonical) = std::fs::canonicalize(path) else {
         return false;
     };
-    let Ok(identity) = std::fs::symlink_metadata(&canonical) else {
+    let Ok(identity) = crate::fs::checked_path_metadata(&canonical) else {
         return false;
     };
     if !identity.is_file() || identity.file_type().is_symlink() {
@@ -915,7 +915,7 @@ pub(crate) fn commit_diagnostics(
     uri: String,
     server: &str,
     diagnostics: Vec<lsp_types::Diagnostic>,
-    identity: Option<std::fs::Metadata>,
+    identity: Option<crate::fs::CheckedMetadata>,
 ) -> bool {
     let diagnostics = sanitize_diagnostics(diagnostics);
     let cached_bytes = retained_diagnostic_bytes(&uri, server, &diagnostics);

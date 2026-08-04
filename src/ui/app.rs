@@ -1765,10 +1765,10 @@ impl<'a> App<'a> {
     }
 
     async fn run_bang_command(&mut self, text: &str) -> anyhow::Result<()> {
-        if !text
+        let command_is_empty = text
             .strip_prefix('!')
-            .is_some_and(|command| !command.trim().is_empty())
-        {
+            .is_none_or(|command| command.trim().is_empty());
+        if command_is_empty {
             self.renderer
                 .write_line("error: empty command after '!'", C_ERROR)?;
             return Ok(());

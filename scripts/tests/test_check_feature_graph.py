@@ -74,7 +74,9 @@ class FeatureGraphTests(unittest.TestCase):
         self.assertEqual(
             {"agent-client-protocol", "blocking"}, rows["acp"].required
         )
-        self.assertEqual({"lsp-types"}, rows["lsp"].required)
+        self.assertEqual(
+            {"lsp-types", "process-wrap", "url", "which"}, rows["lsp"].required
+        )
         self.assertEqual(
             {
                 "fastembed",

@@ -799,7 +799,7 @@ mod tests {
         let secret = "aba_unique_secret_marker";
         std::fs::write(replacement.join("secret.txt"), secret).unwrap();
 
-        let approved_metadata = std::fs::symlink_metadata(&authorized).unwrap();
+        let approved_metadata = crate::fs::checked_path_metadata(&authorized).unwrap();
         let bound = BoundDirectory::open(&authorized, &approved_metadata).unwrap();
         std::fs::rename(&authorized, &moved).unwrap();
         std::fs::rename(&replacement, &authorized).unwrap();

@@ -597,7 +597,7 @@ impl Tool for EditTool {
             .transpose()?;
         let capability_metadata = capability_file
             .as_ref()
-            .map(std::fs::File::metadata)
+            .map(crate::fs::checked_file_metadata)
             .transpose()?;
         let resolved = if bound_workspace.is_none() {
             Some(tokio::fs::canonicalize(&requested).await?)

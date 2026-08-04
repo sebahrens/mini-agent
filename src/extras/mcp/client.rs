@@ -71,6 +71,7 @@ impl Transport<RoleClient> for OwnedStdioTransport {
         self.inner.receive()
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
             let result = self.inner.graceful_shutdown().await;
@@ -321,7 +322,7 @@ fn bounded_stdio_error(server_name: &str, reason: &str, diagnostic: &str) -> any
     let mut rendered = format!("MCP connection failed for '{server_name}': {reason}");
     if !diagnostic.is_empty() && rendered.len() < MCP_STDERR_LIMIT {
         append_bounded(&mut rendered, "; stderr: ", MCP_STDERR_LIMIT);
-        append_bounded(&mut rendered, &diagnostic, MCP_STDERR_LIMIT);
+        append_bounded(&mut rendered, diagnostic, MCP_STDERR_LIMIT);
     }
     anyhow::anyhow!(rendered)
 }
@@ -346,6 +347,7 @@ fn append_bounded(rendered: &mut String, value: &str, limit: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stdio_command(
     command: &str,
     args: &[String],

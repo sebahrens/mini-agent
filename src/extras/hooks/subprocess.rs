@@ -534,7 +534,7 @@ async fn run_hook_with_policy_and_limits(
         RunOutcome::Cancelled => {
             terminate_and_reap(&mut child, pid).await;
             guard.disarm();
-            output_from_capture(&captured, None, HookStatus::Failed)
+            output_from_capture(&captured, None, HookStatus::Failed, policy.diagnostics())
         }
     }
 }

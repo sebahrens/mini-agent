@@ -305,7 +305,7 @@ mod bound_platform {
                 0,
                 FILE_SHARE_ALL,
                 FILE_OPEN,
-                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 ptr::null_mut(),
                 0,
             )
@@ -457,21 +457,23 @@ pub(super) struct BoundDirectory {
 impl BoundDirectory {
     pub(super) fn open(
         approved_root: &Path,
-        approved_metadata: &std::fs::Metadata,
+        approved_metadata: &crate::fs::CheckedMetadata,
     ) -> std::io::Result<Self> {
         if !approved_metadata.is_dir() || !bound_platform::is_safe_entry(approved_metadata) {
             return Err(path_changed_error(approved_root));
         }
         let root = bound_platform::open_root(approved_root)?;
-        let opened_metadata = root.metadata()?;
+        let opened_metadata = crate::fs::checked_file_metadata(&root)?;
         let current_metadata = std::fs::symlink_metadata(approved_root)?;
         if current_metadata.file_type().is_symlink()
             || !bound_platform::is_safe_entry(&opened_metadata)
         {
             return Err(path_changed_error(approved_root));
         }
-        crate::fs::ensure_same_std_file(approved_root, approved_metadata, &opened_metadata)?;
-        crate::fs::ensure_same_std_file(approved_root, &opened_metadata, &current_metadata)?;
+        crate::fs::ensure_same_file(approved_root, approved_metadata, &opened_metadata)?;
+        let current = bound_platform::open_root(approved_root)?;
+        let current_identity = crate::fs::checked_file_metadata(&current)?;
+        crate::fs::ensure_same_file(approved_root, &opened_metadata, &current_identity)?;
         Self::from_file(approved_root, root)
     }
 
@@ -1245,7 +1247,7 @@ mod tests {
         let secret = "aba_secret_marker.txt";
         std::fs::write(replacement.join(secret), "").unwrap();
 
-        let approved_metadata = std::fs::symlink_metadata(&authorized).unwrap();
+        let approved_metadata = crate::fs::checked_path_metadata(&authorized).unwrap();
         let bound = BoundDirectory::open(&authorized, &approved_metadata).unwrap();
         std::fs::rename(&authorized, &moved).unwrap();
         std::fs::rename(&replacement, &authorized).unwrap();

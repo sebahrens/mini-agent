@@ -1314,6 +1314,7 @@ where
     .0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent_with_start_mode<M>(
     agent: Agent<M>,
     prompt: String,
