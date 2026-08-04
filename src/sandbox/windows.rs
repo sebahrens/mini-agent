@@ -2589,7 +2589,12 @@ fn run_runtime_probe() -> Result<i32, String> {
         powershell_literal(&outside_secret)?,
         powershell_literal(&outside_file)?
     );
-    let powershell = resolve_program("powershell.exe", &workspace)?;
+    // Windows PowerShell 5.1 is not AppContainer-compatible: its .NET
+    // Framework startup can fail while initializing ServicePointManager even
+    // after the window-station and desktop ACLs are correct. PowerShell 7.6+
+    // explicitly supports AppContainer hosts, so use the supported shell for
+    // the native containment probe without granting a network capability.
+    let powershell = resolve_program("pwsh.exe", &workspace)?;
     let cleanup_ready = workspace.join("cleanup-ready.txt");
     let mut command = build_helper_with_ready(
         powershell.clone(),
@@ -3132,7 +3137,7 @@ fn run_parent_probe(marker: Option<&Path>) -> Result<i32, String> {
     let cache = base.join("cache");
     let ready_path = workspace.join("parent-target-ready.txt");
     let tree_ready = workspace.join("parent-tree-ready.txt");
-    let powershell = resolve_program("powershell.exe", &workspace)?;
+    let powershell = resolve_program("pwsh.exe", &workspace)?;
     let child_script = format!(
         "[System.IO.File]::WriteAllText({}, \"TARGET_READY`n\", [System.Text.UTF8Encoding]::new($false)); Start-Sleep -Seconds 2; Set-Content -LiteralPath {} -Value leaked",
         powershell_literal(&tree_ready)?,

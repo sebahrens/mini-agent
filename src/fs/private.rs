@@ -90,20 +90,15 @@ fn same_open_file_identity(
 ) -> std::io::Result<bool> {
     #[cfg(target_os = "macos")]
     {
-        let _ = (left, right);
-        let left = super::macos_file_identity(left_file)?;
-        let right = super::macos_file_identity(right_file)?;
-        if left != right {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "macOS file identity changed: volume_match={} file_match={}",
-                    left.volume_uuid == right.volume_uuid,
-                    left.file_id == right.file_id
-                ),
-            ));
-        }
-        Ok(true)
+        use std::os::unix::fs::MetadataExt;
+
+        // Both descriptors were opened independently through the same exact
+        // path, so they share the same APFS/firmlink metadata view. Comparing
+        // their descriptor metadata detects replacement without querying the
+        // protected volume root for ATTR_VOL_UUID, which hosted macOS runners
+        // can deny even though the selected file itself is accessible.
+        let _ = (left_file, right_file);
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
     }
     #[cfg(not(target_os = "macos"))]
     {
