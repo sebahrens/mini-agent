@@ -79,17 +79,15 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId,
     GetCurrentThreadId, GetExitCodeProcess, GetProcessId, GetProcessTimes,
     InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ReleaseMutex,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForMultipleObjects, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ReleaseMutex, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
-use windows_sys::Win32::System::WindowsProgramming::{
-    DRIVE_REMOTE, PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
-};
+use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 
 const HELPER_ARG: &str = "--mini-agent-windows-sandbox-helper-v1";
 const PROBE_ARG: &str = "--mini-agent-windows-sandbox-runtime-check";
@@ -2257,13 +2255,13 @@ fn launch_appcontainer(
     let handles = [stdin.raw(), stdout.raw(), stderr.raw()];
     let jobs = [job.raw()];
     let mut bytes = 0usize;
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 4, 0, &mut bytes) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 3, 0, &mut bytes) };
     if bytes == 0 {
         return Err(last_error("size restricted process attribute list"));
     }
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let list = storage.as_mut_ptr().cast();
-    if unsafe { InitializeProcThreadAttributeList(list, 4, 0, &mut bytes) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &mut bytes) } == 0 {
         return Err(last_error("initialize restricted process attribute list"));
     }
     struct DeleteList(windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -2323,21 +2321,13 @@ fn launch_appcontainer(
     {
         return Err(last_error("set AppContainer security capabilities"));
     }
-    let mut all_application_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-    if unsafe {
-        UpdateProcThreadAttribute(
-            list,
-            0,
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
-            (&mut all_application_packages_policy as *mut u32).cast(),
-            size_of::<u32>(),
-            null_mut(),
-            null_mut(),
-        )
-    } == 0
-    {
-        return Err(last_error("opt out of ALL APPLICATION PACKAGES authority"));
-    }
+    // This general launcher deliberately uses a standard zero-capability
+    // AppContainer. LPAC's ALL APPLICATION PACKAGES opt-out is reserved for
+    // the dedicated Rust JS worker: arbitrary configured Windows tools can
+    // depend on DLLs (notably the CLR) that are readable only through the
+    // normal packaged-application identity. Network still requires an
+    // explicit capability, and filesystem mutation remains limited to the
+    // exact ACL grants above.
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -2596,10 +2586,7 @@ fn run_runtime_probe() -> Result<i32, String> {
         .map_err(|e| format!("run write-boundary probe: {e}"))?;
     if !output.status.success() || !inside_file.exists() || outside_file.exists() {
         return Err(format!(
-            "explicit read/write boundary probe failed: status={:?} inside={} outside={} stderr={}",
-            output.status.code(),
-            inside_file.exists(),
-            outside_file.exists(),
+            "explicit read/write boundary probe failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }

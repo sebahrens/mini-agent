@@ -25,7 +25,7 @@ pub(crate) struct WindowsFileIdentity {
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MacOsFileIdentity {
-    fsid: [i32; 2],
+    volume_uuid: [u8; 16],
     file_id: u64,
 }
 
@@ -43,7 +43,11 @@ struct MacOsAttrList {
 
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-fn macos_common_attribute<T, const N: usize>(file: &T, attribute: u32) -> std::io::Result<[u8; N]>
+fn macos_attribute<T, const N: usize>(
+    file: &T,
+    common_attributes: u32,
+    volume_attributes: u32,
+) -> std::io::Result<[u8; N]>
 where
     T: std::os::fd::AsRawFd,
 {
@@ -67,8 +71,8 @@ where
     let attributes = MacOsAttrList {
         bitmap_count: ATTRIBUTE_BITMAP_COUNT,
         reserved: 0,
-        common_attributes: attribute,
-        volume_attributes: 0,
+        common_attributes,
+        volume_attributes,
         directory_attributes: 0,
         file_attributes: 0,
         fork_attributes: 0,
@@ -103,21 +107,19 @@ pub(crate) fn macos_file_identity<T>(file: &T) -> std::io::Result<MacOsFileIdent
 where
     T: std::os::fd::AsRawFd,
 {
-    const ATTR_CMN_FSID: u32 = 0x0000_0004;
     const ATTR_CMN_FILEID: u32 = 0x0200_0000;
-    let fsid = macos_common_attribute::<_, 8>(file, ATTR_CMN_FSID)?;
-    let file_id = u64::from_ne_bytes(macos_common_attribute(file, ATTR_CMN_FILEID)?);
-    if file_id == 0 {
+    const ATTR_VOL_UUID: u32 = 0x0004_0000;
+    const ATTR_VOL_INFO: u32 = 0x8000_0000;
+    let volume_uuid = macos_attribute::<_, 16>(file, 0, ATTR_VOL_INFO | ATTR_VOL_UUID)?;
+    let file_id = u64::from_ne_bytes(macos_attribute(file, ATTR_CMN_FILEID, 0)?);
+    if volume_uuid == [0; 16] || file_id == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "the filesystem does not expose a stable 64-bit file identity",
+            "the filesystem does not expose a stable volume and file identity",
         ));
     }
     Ok(MacOsFileIdentity {
-        fsid: [
-            i32::from_ne_bytes(fsid[..4].try_into().unwrap()),
-            i32::from_ne_bytes(fsid[4..].try_into().unwrap()),
-        ],
+        volume_uuid,
         file_id,
     })
 }

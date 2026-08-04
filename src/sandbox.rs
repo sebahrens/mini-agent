@@ -2509,8 +2509,6 @@ mod sandbox_tests {
             "DeriveAppContainerSidFromAppContainerName",
             "DeleteAppContainerProfile",
             "PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES",
-            "PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY",
-            "PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT",
             "SECURITY_CAPABILITIES",
             "CapabilityCount: 0",
             "TokenCapabilities",
@@ -2601,6 +2599,8 @@ mod sandbox_tests {
                 "missing Windows contract: {required}"
             );
         }
+        assert!(!source.contains("PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY"));
+        assert!(!source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
         assert!(
             source.contains(".stdin(Stdio::from"),
             "helper requests must use inherited stdin, not argv/env/temp files"
