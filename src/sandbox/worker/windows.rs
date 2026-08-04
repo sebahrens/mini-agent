@@ -1339,7 +1339,10 @@ mod feasibility {
                 "current user does not own the executable; ACL mutation refused".to_string(),
             ));
         }
-        inspect_acl(security.dacl, policy, appcontainer_sid, false, true)?;
+        // Ordinary per-user installs may inherit host Users read/execute. That
+        // is compatible with confinement: broad mutation remains forbidden and
+        // the package still receives one exact read/execute ACE.
+        inspect_acl(security.dacl, policy, appcontainer_sid, false, false)?;
 
         let trustee = trustee_for_sid(appcontainer_sid);
         let mut rights = 0u32;
@@ -1397,7 +1400,7 @@ mod feasibility {
         // Re-read after mutation: never trust a constructed ACL without
         // checking the state the filesystem actually committed.
         let committed = read_file_security(&executable)?;
-        inspect_acl(committed.dacl, policy, appcontainer_sid, true, true)?;
+        inspect_acl(committed.dacl, policy, appcontainer_sid, true, false)?;
         let mut effective = 0u32;
         let result =
             unsafe { GetEffectiveRightsFromAclW(committed.dacl, &trustee, &mut effective) };

@@ -1194,7 +1194,11 @@ pub(super) fn run_containment_child_probe() -> io::Result<()> {
         .next()
         .ok_or_else(|| io::Error::other("skill/config sentinel path is absent"))?;
 
-    let environment: Vec<_> = std::env::vars_os().collect();
+    let mut environment: Vec<_> = std::env::vars_os().collect();
+    environment.retain(|(key, value)| key != "PWD" || value != std::ffi::OsStr::new("/tmp"));
+    // Bubblewrap sets PWD to its descriptor-bound --chdir target on some
+    // distributions even after --clearenv. That fixed value carries no host
+    // information; every other variable remains forbidden.
     if environment.len() != 1
         || environment[0].0 != INTERNAL_WORKER_MARKER
         || environment[0].1 != std::ffi::OsStr::new(&marker)

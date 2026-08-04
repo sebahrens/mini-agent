@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use compact_str::CompactString;
 use tokio::sync::Notify;
@@ -288,12 +288,28 @@ impl FixtureBuild {
     }
 
     fn cleanup(self) {
-        fs::remove_dir_all(&self.root).unwrap_or_else(|error| {
-            panic!(
-                "fixture directory could not be removed; an LSP child may still be running ({}): {error}",
-                self.root.display()
-            )
-        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match fs::remove_dir_all(&self.root) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                #[cfg(windows)]
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(32 | 33))
+                        && Instant::now() < deadline =>
+                {
+                    // Windows can retain a reaped child's executable handle for
+                    // a short interval after process termination.
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => {
+                    panic!(
+                        "fixture directory could not be removed; an LSP child may still be running ({}): {error}",
+                        self.root.display()
+                    )
+                }
+            }
+        }
     }
 }
 

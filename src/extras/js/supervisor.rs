@@ -378,6 +378,7 @@ impl Drop for WorkerConnection {
 
 impl JsWorkerSupervisor {
     pub(crate) fn shared() -> Arc<Self> {
+        const WATCHDOG_GRACE: Duration = Duration::from_secs(5);
         static SHARED: OnceLock<Arc<JsWorkerSupervisor>> = OnceLock::new();
         SHARED
             .get_or_init(|| {
@@ -386,7 +387,11 @@ impl JsWorkerSupervisor {
                     Arc::new(crate::sandbox::worker::TestWorkerLauncher::internal_worker_process());
                 #[cfg(not(test))]
                 let launcher = Arc::new(ProductionWorkerLauncher);
-                Arc::new(Self::new(launcher, cfg!(test), STEP_TIMEOUT))
+                Arc::new(Self::new(
+                    launcher,
+                    cfg!(test),
+                    STEP_TIMEOUT + WATCHDOG_GRACE,
+                ))
             })
             .clone()
     }

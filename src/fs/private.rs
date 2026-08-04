@@ -372,7 +372,7 @@ mod windows {
         fn private() -> std::io::Result<Self> {
             let current_user = current_user_sid_string()?;
             let sddl = wide(OsStr::new(&format!(
-                "D:P(A;;FA;;;SY)(A;;FA;;;{current_user})"
+                "O:{current_user}D:P(A;;FA;;;SY)(A;;FA;;;{current_user})"
             )));
             let mut descriptor = null_mut();
             if unsafe {

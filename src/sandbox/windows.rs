@@ -660,12 +660,9 @@ fn lock_executable(path: &Path) -> Result<(File, FileProof), String> {
         GENERIC_READ | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ,
     )?;
-    if crate::fs::windows_file_link_count(&file)
-        .map_err(|error| format!("sandbox: inspect executable link count: {error}"))?
-        != 1
-    {
-        return Err("sandbox: multi-link executable denied".into());
-    }
+    // Installed executables may legitimately have multiple names. The proof
+    // binds volume/file identity and digest, while this live handle denies
+    // writes and deletion through every alias until process creation.
     let identity = crate::fs::windows_file_identity(&file)
         .map_err(|error| format!("sandbox: inspect executable identity: {error}"))?;
     let mut hasher = Sha256::new();

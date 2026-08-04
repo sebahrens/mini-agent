@@ -42,7 +42,7 @@ const VALIDATED_MACOS_MAJORS: &[u32] = &[26];
 // Darwin maps the dyld shared-cache address range into every process. Leave enough virtual-address
 // headroom for that non-resident mapping; the inherited hard limit may impose a stricter ceiling.
 // QuickJS retains its independent 64 MiB allocator cap.
-const ADDRESS_SPACE_LIMIT: libc::rlim_t = 64 * 1024 * 1024 * 1024;
+const ADDRESS_SPACE_LIMIT: libc::rlim_t = 1024 * 1024 * 1024 * 1024;
 const CPU_LIMIT_SECONDS: libc::rlim_t = 35;
 const FILE_DESCRIPTOR_LIMIT: libc::rlim_t = 64;
 const FILE_SIZE_LIMIT: libc::rlim_t = 1024 * 1024;

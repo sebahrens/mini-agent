@@ -298,6 +298,11 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
             handle.abort();
             let _ = handle.await;
             wait_until(|| sandbox.active_group_count() == 0).await;
+            wait_until(|| {
+                String::from_utf8_lossy(&logs.lock().unwrap())
+                    .contains("explicit user shell ended after process cleanup")
+            })
+            .await;
             sleep(Duration::from_millis(1200)).await;
             assert!(!marker.exists());
             let _ = std::fs::remove_file(started);

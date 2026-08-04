@@ -523,10 +523,11 @@ pub(crate) async fn open_stable_file(path: &Path) -> std::io::Result<tokio::fs::
 /// Atomically write `contents` to `path`.
 ///
 /// On Linux and macOS, every destination-directory operation is relative to an
-/// open directory descriptor and every traversed component uses `O_NOFOLLOW`.
-/// The final target must be absent or a regular file; symlinks and directories
-/// are rejected. The temporary file is created exclusively with a random name
-/// and mode `0600`, then renamed over the target in the same directory.
+/// identity-verified open directory descriptor. Descendants use `O_NOFOLLOW`;
+/// the final target must be absent or a regular file, so symlinks and
+/// directories are rejected. The temporary file is created exclusively with a
+/// random name and mode `0600`, then renamed over the target in the same
+/// directory.
 ///
 /// The helper intentionally flushes userspace buffers but does not `fsync`;
 /// this preserves the existing atomicity (not power-loss durability) contract.
@@ -952,24 +953,42 @@ fn atomic_write_platform(
     }
 
     fn open_absolute_directory(path: &Path) -> std::io::Result<File> {
-        use std::path::Component;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
 
-        let mut directory = File::open(Path::new("/"))?;
-        for component in path.components() {
-            match component {
-                Component::RootDir => {}
-                Component::Normal(name) => {
-                    directory = open_directory_at(&directory, name)?;
-                }
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "canonical root contains an invalid component",
-                    ));
+            // APFS firmlinks (notably /Users) can report a different st_dev
+            // when walked one component at a time from `/`. Opening the
+            // canonical path directly avoids that alias; the caller verifies
+            // this live descriptor against the retained approved identity
+            // before any relative operation.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(OPEN_DIRECTORY | OPEN_NOFOLLOW | OPEN_CLOEXEC)
+                .open(path)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::path::Component;
+
+            let mut directory = File::open(Path::new("/"))?;
+            for component in path.components() {
+                match component {
+                    Component::RootDir => {}
+                    Component::Normal(name) => {
+                        directory = open_directory_at(&directory, name)?;
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "canonical root contains an invalid component",
+                        ));
+                    }
                 }
             }
+            Ok(directory)
         }
-        Ok(directory)
     }
 
     fn open_parent(
@@ -1274,7 +1293,7 @@ fn atomic_write_platform(
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES,
         FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        FileDispositionInfo, FileRenameInfoEx, SYNCHRONIZE, SetFileInformationByHandle,
+        FileDispositionInfo, FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1312,13 +1331,14 @@ fn atomic_write_platform(
         let words = required.div_ceil(std::mem::size_of::<usize>());
         let mut storage = vec![0usize; words];
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        // FileRenameInfoEx with no replacement flag provides create-only
-        // publication. RootDirectory binds the destination to the already-open
-        // approved directory even if its pathname is concurrently replaced.
+        // FileRenameInfo with ReplaceIfExists=false provides create-only
+        // publication across supported Windows versions. RootDirectory binds
+        // the destination to the already-open approved directory even if its
+        // pathname is concurrently replaced.
         // SAFETY: `storage` is aligned, large enough for the header and UTF-16
         // name, and both handles remain live for the call.
         let renamed = unsafe {
-            (*information).Anonymous.Flags = 0;
+            (*information).Anonymous.ReplaceIfExists = false;
             (*information).RootDirectory = directory.as_raw_handle().cast();
             (*information).FileNameLength = name_bytes as u32;
             std::ptr::copy_nonoverlapping(
@@ -1328,7 +1348,7 @@ fn atomic_write_platform(
             );
             SetFileInformationByHandle(
                 file.as_raw_handle().cast(),
-                FileRenameInfoEx,
+                FileRenameInfo,
                 information.cast(),
                 required as u32,
             )
