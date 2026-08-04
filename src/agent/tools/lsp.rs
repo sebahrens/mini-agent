@@ -56,28 +56,15 @@ impl Tool for LspTool {
         match args.path {
             Some(path) => {
                 let expanded = crate::fs::expand_tilde(&path);
-                let path = self
-                    .manager
-                    .resolve_path(Path::new(&expanded))
-                    .map_err(ToolError::Msg)?;
+                let path = Path::new(&expanded);
                 if !path.exists() {
                     return Err(ToolError::Msg(format!("File '{expanded}' does not exist.")));
                 }
-                let relative = Path::new(&expanded);
-                let bound_relative = !relative.is_absolute() && !expanded.starts_with('~');
-                if bound_relative {
-                    self.manager.notify_changed_relative(relative).await;
-                } else {
-                    self.manager.notify_changed(&path).await;
-                }
-                let diagnostics = if bound_relative {
-                    self.manager
-                        .diagnostics_block_relative(relative, QUERY_WAIT)
-                        .await
-                } else {
-                    self.manager.diagnostics_block(&path, QUERY_WAIT).await
-                };
-                Ok(diagnostics
+                self.manager.notify_changed(path).await;
+                Ok(self
+                    .manager
+                    .diagnostics_block(path, QUERY_WAIT)
+                    .await
                     .map(|block| block.trim_start().to_string())
                     .unwrap_or_else(|| format!("No diagnostics for {expanded}.")))
             }

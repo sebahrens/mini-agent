@@ -2,7 +2,6 @@ pub mod config;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -30,8 +29,6 @@ const MAX_PENDING_AUTHENTICATIONS: usize = 16;
 
 struct SessionState {
     messages: Vec<(String, String)>,
-    workspace: Arc<crate::paths::WorkspaceBinding>,
-    context: Arc<ContextFiles>,
 }
 
 struct AcpState {
@@ -329,48 +326,23 @@ async fn handle_new_session(
     _cx: ConnectionTo<Client>,
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
-    let workspace = Arc::new(canonical_session_workspace(&req.cwd)?);
-    let workspace_root = workspace.root();
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
 
     tracing::info!(
         "ACP new session: {} (cwd: {})",
         session_id,
-        workspace_root.display()
+        req.cwd.display()
     );
-
-    let context = state
-        .context
-        .for_workspace_binding(state.cli.resolve_no_context_files(&state.cfg), &workspace);
-    workspace.validate().map_err(|error| {
-        agent_client_protocol::Error::new(
-            -32602,
-            format!("ACP session cwd changed while loading context: {error}"),
-        )
-    })?;
 
     state.sessions.lock().await.insert(
         session_id.clone(),
         SessionState {
             messages: Vec::new(),
-            workspace,
-            context: Arc::new(context),
         },
     );
 
     let resp = NewSessionResponse::new(session_id);
     responder.respond(resp)
-}
-
-fn canonical_session_workspace(
-    path: &Path,
-) -> Result<crate::paths::WorkspaceBinding, agent_client_protocol::Error> {
-    crate::paths::WorkspaceBinding::capture(path).map_err(|error| {
-        agent_client_protocol::Error::new(
-            -32602,
-            format!("invalid ACP session cwd '{}': {error}", path.display()),
-        )
-    })
 }
 
 async fn handle_prompt(
@@ -394,30 +366,17 @@ async fn handle_prompt(
         .join("\n");
 
     // Append user message to session history
-    let (workspace, context) = {
+    {
         let mut sessions = state.sessions.lock().await;
-        let sess = sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| agent_client_protocol::Error::new(-32602, "unknown ACP session"))?;
-        sess.messages
-            .push(("user".to_string(), prompt_text.clone()));
-        (sess.workspace.clone(), sess.context.clone())
-    };
+        if let Some(sess) = sessions.get_mut(&session_id) {
+            sess.messages
+                .push(("user".to_string(), prompt_text.clone()));
+        }
+    }
 
     cx.spawn({
         let cx = cx.clone();
-        async move {
-            run_prompt(
-                &state,
-                &prompt_text,
-                session_id,
-                workspace,
-                context,
-                responder,
-                cx,
-            )
-            .await
-        }
+        async move { run_prompt(&state, &prompt_text, session_id, responder, cx).await }
     })
 }
 
@@ -427,8 +386,6 @@ async fn run_prompt(
     state: &AcpState,
     prompt_text: &str,
     session_id: SessionId,
-    workspace: Arc<crate::paths::WorkspaceBinding>,
-    context: Arc<ContextFiles>,
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
@@ -460,23 +417,14 @@ async fn run_prompt(
 
     let model = client.completion_model(model_str.to_string());
 
-    workspace
-        .validate()
-        .map_err(|error| agent_client_protocol::Error::new(-32603, error))?;
-    let workspace_root = workspace.root();
     let mode = resolve_acp_mode(&state.cli, &state.cfg);
-    let (permission, ask_tx) = crate::permission::build_noninteractive_permission_at(
-        &state.cli,
-        &state.cfg,
-        mode,
-        Some(workspace_root.to_path_buf()),
-    );
+    let (permission, ask_tx) =
+        crate::permission::build_noninteractive_permission(&state.cli, &state.cfg, mode);
     let sandbox = Sandbox::new(
         state.cli.resolve_sandbox(&state.cfg),
         &state.cli.resolve_sandbox_backend(&state.cfg),
     )
-    .with_shell(&state.cli.resolve_shell(&state.cfg))
-    .with_workspace_binding(workspace.clone());
+    .with_shell(&state.cli.resolve_shell(&state.cfg));
 
     // Track session history for future context persistence
     let _extra_messages = {
@@ -489,12 +437,11 @@ async fn run_prompt(
 
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
-    let agent = crate::provider::build_agent_in_workspace(
+    let agent = crate::provider::build_agent(
         model,
         &state.cli,
         &state.cfg,
-        &context,
-        workspace,
+        &state.context,
         permission,
         ask_tx,
         sandbox,
@@ -658,607 +605,6 @@ pub(crate) fn resolve_acp_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
         }
     } else {
         SecurityMode::Standard
-    }
-}
-
-#[cfg(test)]
-mod workspace_tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use rig::tool::Tool;
-
-    use super::*;
-    use crate::agent::tools::{
-        BashArgs, BashTool, EditArgs, EditTool, FindFilesArgs, FindFilesTool, GrepArgs, GrepTool,
-        ListDirArgs, ListDirTool, ReadArgs, ReadTool, WriteArgs, WriteTool,
-    };
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "mini-agent-acp-workspace-{}-{id}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn roots() -> (TempDir, PathBuf, PathBuf) {
-        let container = TempDir::new();
-        let first = container.path().join("first");
-        let second = container.path().join("second");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        std::fs::write(first.join("sentinel.txt"), "first-only").unwrap();
-        std::fs::write(second.join("sentinel.txt"), "second-only").unwrap();
-        std::fs::write(first.join("AGENTS.md"), "FIRST_CONTEXT_SENTINEL").unwrap();
-        std::fs::write(second.join("AGENTS.md"), "SECOND_CONTEXT_SENTINEL").unwrap();
-        std::fs::write(first.join("ARCHITECTURE.md"), "FIRST_ARCHITECTURE_SENTINEL").unwrap();
-        std::fs::write(
-            second.join("ARCHITECTURE.md"),
-            "SECOND_ARCHITECTURE_SENTINEL",
-        )
-        .unwrap();
-        std::fs::create_dir_all(first.join(".zerostack/prompts")).unwrap();
-        std::fs::create_dir_all(second.join(".zerostack/prompts")).unwrap();
-        std::fs::write(
-            first.join(".zerostack/prompts/acp-root.md"),
-            "FIRST_PROMPT_SENTINEL",
-        )
-        .unwrap();
-        std::fs::write(
-            second.join(".zerostack/prompts/acp-root.md"),
-            "SECOND_PROMPT_SENTINEL",
-        )
-        .unwrap();
-        (
-            container,
-            first.canonicalize().unwrap(),
-            second.canonicalize().unwrap(),
-        )
-    }
-
-    #[test]
-    fn session_workspace_is_canonical_and_must_be_a_directory() {
-        let (_container, first, _) = roots();
-        assert_eq!(
-            canonical_session_workspace(&first).unwrap().root(),
-            first.canonicalize().unwrap()
-        );
-
-        let file = first.join("sentinel.txt");
-        assert!(canonical_session_workspace(&file).is_err());
-        assert!(canonical_session_workspace(&first.join("missing")).is_err());
-    }
-
-    #[tokio::test]
-    async fn concurrent_workspace_context_and_core_tools_remain_isolated() {
-        let (_container, first, second) = roots();
-        let base_context = crate::context::load(true);
-        let first_context = base_context.for_workspace(false, &first);
-        let second_context = base_context.for_workspace(false, &second);
-        let first_agents = first_context.agents.as_deref().unwrap_or_default();
-        let second_agents = second_context.agents.as_deref().unwrap_or_default();
-        assert!(first_agents.contains("FIRST_CONTEXT_SENTINEL"));
-        assert!(!first_agents.contains("SECOND_CONTEXT_SENTINEL"));
-        assert!(second_agents.contains("SECOND_CONTEXT_SENTINEL"));
-        assert!(!second_agents.contains("FIRST_CONTEXT_SENTINEL"));
-        assert!(
-            first_context
-                .architecture
-                .as_deref()
-                .unwrap_or_default()
-                .contains("FIRST_ARCHITECTURE_SENTINEL")
-        );
-        assert!(
-            second_context
-                .architecture
-                .as_deref()
-                .unwrap_or_default()
-                .contains("SECOND_ARCHITECTURE_SENTINEL")
-        );
-        assert_eq!(first_context.prompts["acp-root"], "FIRST_PROMPT_SENTINEL");
-        assert_eq!(second_context.prompts["acp-root"], "SECOND_PROMPT_SENTINEL");
-        let first_preamble = crate::agent::builder::build_preamble_for_workspace(
-            &first_context,
-            false,
-            Some(&first),
-        );
-        assert!(first_preamble.contains(&first.display().to_string()));
-        assert!(!first_preamble.contains(&second.display().to_string()));
-
-        let first_read = ReadTool::new(None, None, None, 100).with_workspace_root(first.clone());
-        let second_read = ReadTool::new(None, None, None, 100).with_workspace_root(second.clone());
-        let (first_value, second_value) = tokio::join!(
-            first_read.call(ReadArgs {
-                path: "sentinel.txt".into(),
-                offset: None,
-                limit: None,
-            }),
-            second_read.call(ReadArgs {
-                path: "sentinel.txt".into(),
-                offset: None,
-                limit: None,
-            })
-        );
-        assert!(first_value.unwrap().contains("first-only"));
-        assert!(second_value.unwrap().contains("second-only"));
-
-        let first_write = WriteTool::new(None, None, None).with_workspace_root(first.clone());
-        let second_write = WriteTool::new(None, None, None).with_workspace_root(second.clone());
-        let (first_result, second_result) = tokio::join!(
-            first_write.call(WriteArgs {
-                path: "created.txt".into(),
-                content: "created-first".into(),
-            }),
-            second_write.call(WriteArgs {
-                path: "created.txt".into(),
-                content: "created-second".into(),
-            })
-        );
-        first_result.unwrap();
-        second_result.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(first.join("created.txt")).unwrap(),
-            "created-first"
-        );
-        assert_eq!(
-            std::fs::read_to_string(second.join("created.txt")).unwrap(),
-            "created-second"
-        );
-
-        let first_workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&first).unwrap());
-        let second_workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&second).unwrap());
-        let first_grep_tool =
-            GrepTool::new(None, None, 100).with_workspace_binding(first_workspace.clone());
-        let second_grep_tool =
-            GrepTool::new(None, None, 100).with_workspace_binding(second_workspace.clone());
-        let (first_grep, second_grep) = tokio::join!(
-            first_grep_tool.call(GrepArgs {
-                pattern: "first-only".into(),
-                path: Some(".".into()),
-                include: None,
-                context_lines: None,
-            }),
-            second_grep_tool.call(GrepArgs {
-                pattern: "second-only".into(),
-                path: Some(".".into()),
-                include: None,
-                context_lines: None,
-            })
-        );
-        assert!(first_grep.unwrap().contains("first-only"));
-        assert!(second_grep.unwrap().contains("second-only"));
-
-        let first_find = FindFilesTool::new(None, None, 100)
-            .with_workspace_binding(first_workspace.clone())
-            .call(FindFilesArgs {
-                pattern: "sentinel".into(),
-                path: Some(".".into()),
-            })
-            .await
-            .unwrap();
-        let second_list = ListDirTool::new(None, None, Some(100))
-            .with_workspace_binding(second_workspace.clone())
-            .call(ListDirArgs {
-                path: Some(".".into()),
-            })
-            .await
-            .unwrap();
-        assert!(first_find.contains("sentinel.txt"));
-        assert!(second_list.contains("sentinel.txt"));
-
-        EditTool::new(None, None)
-            .with_workspace_binding(first_workspace)
-            .call(EditArgs {
-                path: "created.txt".into(),
-                block: Some(
-                    "<<<<<<< SEARCH\ncreated-first\n=======\nedited-first\n>>>>>>> REPLACE".into(),
-                ),
-                file_crc: None,
-                edits: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(first.join("created.txt")).unwrap(),
-            "edited-first"
-        );
-        assert_eq!(
-            std::fs::read_to_string(second.join("created.txt")).unwrap(),
-            "created-second"
-        );
-
-        let first_bash = BashTool::new(
-            None,
-            None,
-            Sandbox::new(false, "bwrap").with_workspace_binding(Arc::new(
-                crate::paths::WorkspaceBinding::capture(&first).unwrap(),
-            )),
-            None,
-        );
-        let second_bash = BashTool::new(
-            None,
-            None,
-            Sandbox::new(false, "bwrap").with_workspace_binding(Arc::new(
-                crate::paths::WorkspaceBinding::capture(&second).unwrap(),
-            )),
-            None,
-        );
-        let (first_pwd, second_pwd) = tokio::join!(
-            first_bash.call(BashArgs {
-                command: "pwd; cat sentinel.txt".into(),
-                timeout: None,
-            }),
-            second_bash.call(BashArgs {
-                command: "pwd; cat sentinel.txt".into(),
-                timeout: None,
-            })
-        );
-        let first_pwd = first_pwd.unwrap();
-        let second_pwd = second_pwd.unwrap();
-        assert!(first_pwd.contains(&first.display().to_string()));
-        assert!(first_pwd.contains("first-only"));
-        assert!(second_pwd.contains(&second.display().to_string()));
-        assert!(second_pwd.contains("second-only"));
-    }
-
-    #[tokio::test]
-    async fn relative_parent_escape_is_denied_by_session_permission_root() {
-        let (_container, first, second) = roots();
-        let cli = Cli::default();
-        let cfg = Config::default();
-        let (permission, ask_tx) = crate::permission::build_noninteractive_permission_at(
-            &cli,
-            &cfg,
-            SecurityMode::Standard,
-            Some(first.clone()),
-        );
-        let tool = ReadTool::new(permission, ask_tx, None, 100).with_workspace_root(first.clone());
-        let relative_escape = PathBuf::from("..")
-            .join(second.file_name().unwrap())
-            .join("sentinel.txt");
-        let error = tool
-            .call(ReadArgs {
-                path: relative_escape.to_string_lossy().into_owned(),
-                offset: None,
-                limit: None,
-            })
-            .await
-            .unwrap_err();
-        let error = error.to_string();
-        assert!(
-            error.contains("Permission denied")
-                || error.contains("workspace capability requires a contained relative path")
-        );
-        assert!(!error.contains("second-only"));
-    }
-
-    #[cfg(feature = "lsp")]
-    #[test]
-    fn lsp_relative_paths_resolve_under_each_session_root() {
-        let (_container, first, second) = roots();
-        let cfg = crate::config::types::LspConfig::default();
-        let first_lsp = crate::extras::lsp::LspManager::new(
-            &cfg,
-            Arc::new(crate::paths::WorkspaceBinding::capture(&first).unwrap()),
-        );
-        let second_lsp = crate::extras::lsp::LspManager::new(
-            &cfg,
-            Arc::new(crate::paths::WorkspaceBinding::capture(&second).unwrap()),
-        );
-        assert_eq!(
-            first_lsp.resolve_path(Path::new("sentinel.txt")),
-            Ok(first.join("sentinel.txt"))
-        );
-        assert_eq!(
-            second_lsp.resolve_path(Path::new("sentinel.txt")),
-            Ok(second.join("sentinel.txt"))
-        );
-        assert!(
-            first_lsp
-                .resolve_path(&second.join("sentinel.txt"))
-                .is_err()
-        );
-
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(
-                second.join("sentinel.txt"),
-                first.join("linked-sentinel.txt"),
-            )
-            .unwrap();
-            assert!(
-                first_lsp
-                    .resolve_path(Path::new("linked-sentinel.txt"))
-                    .is_err()
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[cfg(feature = "js")]
-    #[tokio::test]
-    async fn replacing_a_session_root_fails_every_bound_effect_closed() {
-        use crate::extras::js::host::AllowConfig;
-        use crate::extras::js::tool::{JsArgs, JsTool};
-
-        let (_container, first, second) = roots();
-        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&first).unwrap());
-        let read = ReadTool::new(None, None, None, 100).with_workspace_binding(workspace.clone());
-        let write = WriteTool::new(None, None, None).with_workspace_binding(workspace.clone());
-        let sandbox = Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone());
-        let bash = BashTool::new(None, None, sandbox.clone(), None);
-        let roots = vec![".".to_string()];
-        let js = JsTool::new(
-            sandbox,
-            None,
-            None,
-            AllowConfig::from_settings(&first, None, Some(&roots), Some(&roots), false, false)
-                .with_workspace_binding(workspace.clone()),
-        );
-        #[cfg(feature = "lsp")]
-        let lsp = crate::extras::lsp::LspManager::new(
-            &crate::config::types::LspConfig::default(),
-            workspace.clone(),
-        );
-
-        let original = first.with_file_name("first-original");
-        std::fs::rename(&first, &original).unwrap();
-        std::os::unix::fs::symlink(&second, &first).unwrap();
-
-        assert!(workspace.validate().is_err());
-        assert!(
-            read.call(ReadArgs {
-                path: "sentinel.txt".into(),
-                offset: None,
-                limit: None,
-            })
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("workspace binding")
-        );
-        assert!(
-            write
-                .call(WriteArgs {
-                    path: "rebound.txt".into(),
-                    content: "must-not-write".into(),
-                })
-                .await
-                .is_err()
-        );
-        assert!(
-            bash.call(BashArgs {
-                command: "cat sentinel.txt".into(),
-                timeout: None,
-            })
-            .await
-            .is_err()
-        );
-        let js_result = js
-            .call(JsArgs {
-                code: "read_file('sentinel.txt')".into(),
-            })
-            .await;
-        if let Ok(value) = js_result {
-            assert!(!value.contains("second-only"));
-        }
-        #[cfg(feature = "lsp")]
-        assert!(lsp.resolve_path(Path::new("sentinel.txt")).is_err());
-        assert!(!second.join("rebound.txt").exists());
-
-        std::fs::remove_file(&first).unwrap();
-        std::fs::rename(original, first).unwrap();
-    }
-
-    #[cfg(all(unix, feature = "js"))]
-    #[tokio::test]
-    async fn core_and_javascript_effects_reject_in_workspace_symlink_traversal() {
-        use crate::extras::js::host::AllowConfig;
-        use crate::extras::js::tool::{JsArgs, JsTool};
-
-        let (_container, first, _) = roots();
-        std::fs::create_dir_all(first.join("safe")).unwrap();
-        std::fs::create_dir_all(first.join("secret")).unwrap();
-        std::fs::write(first.join("secret/value.txt"), "secret-value").unwrap();
-        std::os::unix::fs::symlink("../secret/value.txt", first.join("safe/link.txt")).unwrap();
-        std::os::unix::fs::symlink("../secret", first.join("safe/link-dir")).unwrap();
-        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&first).unwrap());
-
-        let read = ReadTool::new(None, None, None, 100)
-            .with_workspace_binding(workspace.clone())
-            .call(ReadArgs {
-                path: "safe/link.txt".into(),
-                offset: None,
-                limit: None,
-            })
-            .await;
-        assert!(read.is_err());
-        let write = WriteTool::new(None, None, None)
-            .with_workspace_binding(workspace.clone())
-            .call(WriteArgs {
-                path: "safe/link-dir/core.txt".into(),
-                content: "must-not-write".into(),
-            })
-            .await;
-        assert!(write.is_err());
-
-        let roots = vec!["safe".to_string()];
-        let js = JsTool::new(
-            Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone()),
-            None,
-            None,
-            AllowConfig::from_settings(&first, None, Some(&roots), Some(&roots), false, false)
-                .with_workspace_binding(workspace),
-        );
-        let js_read = js
-            .call(JsArgs {
-                code: "read_file('safe/link.txt')".into(),
-            })
-            .await;
-        if let Ok(value) = &js_read {
-            assert!(value.starts_with("JS error:"), "the JS read must fail");
-            assert!(
-                !value.contains("secret-value"),
-                "a JS read must not reveal a symlink target"
-            );
-        }
-        let js_write = js
-            .call(JsArgs {
-                code: "write_file('safe/link-dir/js.txt', 'must-not-write')".into(),
-            })
-            .await;
-        if let Ok(value) = &js_write {
-            assert!(value.starts_with("JS error:"), "the JS write must fail");
-        }
-        assert!(!first.join("secret/core.txt").exists());
-        assert!(!first.join("secret/js.txt").exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn capability_handles_defeat_root_aba_between_check_and_effect() {
-        use std::io::Read as _;
-
-        let (_container, first, second) = roots();
-        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&first).unwrap());
-        let sandbox = Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone());
-        let mut command = sandbox.wrap_command("pwd; cat sentinel.txt").unwrap();
-        workspace.validate().unwrap();
-
-        let original = first.with_file_name("first-original");
-        let replacement = second.with_file_name("second-original");
-        std::fs::rename(&first, &original).unwrap();
-        std::fs::rename(&second, &replacement).unwrap();
-        std::fs::rename(&replacement, &first).unwrap();
-
-        let mut content = String::new();
-        workspace
-            .open_relative(Path::new("sentinel.txt"))
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-        assert_eq!(content, "first-only");
-        workspace
-            .create_relative_atomic(Path::new("handle-created.txt"), b"first-handle")
-            .unwrap();
-        assert!(!first.join("handle-created.txt").exists());
-        assert_eq!(
-            std::fs::read_to_string(original.join("handle-created.txt")).unwrap(),
-            "first-handle"
-        );
-        let context = crate::context::load(true).for_workspace_binding(false, &workspace);
-        assert!(
-            context
-                .agents
-                .as_deref()
-                .unwrap_or_default()
-                .contains("FIRST_CONTEXT_SENTINEL")
-        );
-        assert!(
-            !context
-                .agents
-                .as_deref()
-                .unwrap_or_default()
-                .contains("SECOND_CONTEXT_SENTINEL")
-        );
-
-        let output = command.output().await.unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("first-only"));
-        assert!(!stdout.contains("second-only"));
-
-        std::fs::rename(&first, &second).unwrap();
-        std::fs::rename(&original, &first).unwrap();
-    }
-
-    #[cfg(feature = "js")]
-    #[tokio::test]
-    async fn javascript_relative_files_and_spawn_use_the_session_root() {
-        use crate::extras::js::host::AllowConfig;
-        use crate::extras::js::tool::{JsArgs, JsTool};
-
-        let (_container, first, second) = roots();
-        let make_tool = |root: &Path| {
-            let roots = vec![".".to_string()];
-            let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root).unwrap());
-            JsTool::new(
-                Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone()),
-                None,
-                None,
-                AllowConfig::from_settings(root, None, Some(&roots), Some(&roots), false, false)
-                    .with_workspace_binding(workspace),
-            )
-        };
-        let first_tool = make_tool(&first);
-        let second_tool = make_tool(&second);
-        assert_eq!(
-            first_tool
-                .call(JsArgs {
-                    code: "read_file('sentinel.txt')".into(),
-                })
-                .await
-                .unwrap(),
-            "first-only"
-        );
-        let write_probe = first_tool
-            .call(JsArgs {
-                code: "write_file('probe.txt', 'probe'); 'ok'".into(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(write_probe, "ok");
-        assert_eq!(
-            std::fs::read_to_string(first.join("probe.txt")).unwrap(),
-            "probe"
-        );
-        let code =
-            "write_file('js-created.txt', read_file('sentinel.txt')); read_file('js-created.txt')";
-        let (first_value, second_value) = tokio::join!(
-            first_tool.call(JsArgs { code: code.into() }),
-            second_tool.call(JsArgs { code: code.into() })
-        );
-        assert_eq!(first_value.unwrap(), "first-only");
-        assert_eq!(second_value.unwrap(), "second-only");
-        assert_eq!(
-            std::fs::read_to_string(first.join("js-created.txt")).unwrap(),
-            "first-only"
-        );
-        assert_eq!(
-            std::fs::read_to_string(second.join("js-created.txt")).unwrap(),
-            "second-only"
-        );
-
-        let first_spawn = first_tool
-            .call(JsArgs {
-                code: "spawn('sh', ['-c', 'pwd']).stdout.trim()".into(),
-            })
-            .await
-            .unwrap();
-        let second_spawn = second_tool
-            .call(JsArgs {
-                code: "spawn('sh', ['-c', 'pwd']).stdout.trim()".into(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(first_spawn, first.display().to_string());
-        assert_eq!(second_spawn, second.display().to_string());
     }
 }
 

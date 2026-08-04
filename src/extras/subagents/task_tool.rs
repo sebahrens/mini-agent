@@ -196,9 +196,6 @@ editing in a known location, grepping for a literal you will act on immediately.
     }
 
     async fn call(&self, args: TaskArgs) -> Result<String, ToolError> {
-        if let Some(workspace) = &self.workspace {
-            workspace.validate().map_err(ToolError::Msg)?;
-        }
         let (client, model_name, max_turns, config, limits) = with_config(|cfg| {
             (
                 cfg.client.clone(),

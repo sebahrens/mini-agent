@@ -1151,7 +1151,6 @@ async fn build_openai_agent(
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
-    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
@@ -1172,7 +1171,6 @@ async fn build_openai_agent(
                 cli,
                 cfg,
                 context,
-                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox,
@@ -1194,7 +1192,6 @@ async fn build_openai_agent(
                 cli,
                 cfg,
                 context,
-                workspace,
                 permission,
                 ask_tx,
                 sandbox,
@@ -1233,9 +1230,7 @@ pub async fn build_agent(
     let js_worker_containment_status = crate::sandbox::worker::containment_status();
     #[cfg(feature = "skills")]
     let skills = {
-        let workspace_root = workspace.root();
-        let paths = crate::paths::process_paths()
-            .and_then(|paths| paths.with_workspace_root(workspace_root));
+        let paths = crate::paths::process_paths();
         let embedding = cfg.embedding.clone();
         let learned_js_enabled = matches!(
             &js_worker_containment_status,
@@ -1277,7 +1272,6 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
-                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox.clone(),
@@ -1299,7 +1293,6 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
-                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox.clone(),
@@ -1321,7 +1314,6 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
-                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox.clone(),
@@ -1343,7 +1335,6 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
-                workspace.clone(),
                 permission,
                 ask_tx,
                 sandbox.clone(),
@@ -1365,7 +1356,6 @@ pub async fn build_agent(
                 cli,
                 cfg,
                 context,
-                workspace,
                 permission,
                 ask_tx,
                 sandbox,

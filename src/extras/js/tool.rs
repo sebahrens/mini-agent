@@ -138,14 +138,6 @@ impl PermissionBridge {
         self.check_sync(PermissionCheckKind::Path, tool, key)
     }
 
-    pub(crate) fn check_bound_path(
-        &self,
-        tool: &str,
-        key: &str,
-    ) -> Result<(), PermissionBridgeError> {
-        self.check_sync(PermissionCheckKind::BoundPath, tool, key)
-    }
-
     fn check_sync(
         &self,
         kind: PermissionCheckKind,

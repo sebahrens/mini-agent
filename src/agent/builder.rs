@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
+#[cfg(feature = "skills")]
 use std::sync::Arc;
 
 use rig::agent::{Agent, AgentBuilder};
@@ -23,15 +23,6 @@ use crate::sandbox::Sandbox;
 /// `SUFFIX.md`. Extracted from [`build_agent_inner`] so its token cost can be
 /// estimated (see [`estimate_overhead`]) without building an `Agent`.
 pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String {
-    let workspace_root = std::env::current_dir().ok();
-    build_preamble_for_workspace(context, reasoning_enabled, workspace_root.as_deref())
-}
-
-pub(crate) fn build_preamble_for_workspace(
-    context: &ContextFiles,
-    reasoning_enabled: bool,
-    workspace_root: Option<&Path>,
-) -> String {
     let reasoning_prefix = if reasoning_enabled {
         "You reason carefully and think step-by-step.\n\n"
     } else {
@@ -213,7 +204,6 @@ fn register_js_tool_with_status(
         Arc<crate::extras::js::skills::turn::SkillTurnContext>,
     >,
 ) {
-    let workspace_root = workspace.root();
     use crate::extras::js::host::AllowConfig;
     use crate::extras::js::tool::JsTool;
     use crate::sandbox::worker::WorkerContainmentStatus;
@@ -235,7 +225,6 @@ fn register_js_tool_with_status(
         cfg.js_read_unrestricted.unwrap_or(false),
         cfg.js_write_unrestricted.unwrap_or(false),
     )
-    .with_workspace_binding(workspace.clone())
     .with_fetch_settings(
         cfg.js_fetch_origins.as_deref(),
         cfg.js_fetch_allow_http.unwrap_or(false),
@@ -249,11 +238,11 @@ fn register_js_tool_with_status(
             use crate::extras::js::skills::proposal::ProposalQueue;
             use crate::extras::js::skills::store::SkillStore;
             use crate::extras::js::skills::telemetry::TelemetryDispatcher;
+            use crate::paths::AppPaths;
             use std::time::Duration;
 
             let workers = (|| -> Result<_, String> {
-                let paths = crate::paths::process_paths()
-                    .and_then(|paths| paths.with_workspace_root(&startup_base))
+                let paths = AppPaths::from_process(Some(startup_base))
                     .map_err(|error| error.to_string())?;
                 let proposal_store =
                     SkillStore::open_at(&paths).map_err(|error| error.to_string())?;
@@ -329,7 +318,6 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
-    workspace: Arc<crate::paths::WorkspaceBinding>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
@@ -346,8 +334,6 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> Agent<M> {
-    let workspace_root = workspace.root();
-    let sandbox = sandbox.with_workspace_binding(workspace.clone());
     #[cfg(feature = "lsp")]
     let lsp_manager = if cli.resolve_no_tools(cfg) {
         None
@@ -357,8 +343,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     };
 
     #[cfg_attr(not(feature = "lsp"), allow(unused_mut))]
-    let mut preamble =
-        build_preamble_for_workspace(context, reasoning_enabled, Some(workspace_root));
+    let mut preamble = build_preamble(context, reasoning_enabled);
     #[cfg(feature = "lsp")]
     if lsp_manager.is_some() {
         preamble.push_str(crate::agent::prompt::LSP_PROMPT);

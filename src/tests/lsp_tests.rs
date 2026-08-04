@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use compact_str::CompactString;
@@ -9,33 +9,6 @@ use crate::config::types::{LspConfig, LspServerConfig};
 use crate::extras::lsp::client::{DiagStore, store_diagnostics_for_test};
 use crate::extras::lsp::registry::{resolve_servers, server_for_path};
 use crate::extras::lsp::{LspManager, rpc};
-
-#[cfg(unix)]
-#[tokio::test]
-async fn lsp_sync_rejects_file_swapped_to_external_symlink_after_resolution() {
-    let temp = std::env::temp_dir().join(format!("mini-agent-lsp-swap-{}", uuid::Uuid::new_v4()));
-    let workspace = temp.join("workspace");
-    let external = temp.join("external");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::create_dir_all(&external).unwrap();
-    let source = workspace.join("source.rs");
-    let secret = external.join("secret.rs");
-    std::fs::write(&source, "fn safe() {}").unwrap();
-    std::fs::write(&secret, "compile_error!(\"LSP_SECRET\");").unwrap();
-
-    let binding = std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
-    let manager = LspManager::new(&LspConfig::default(), binding);
-    let approved = manager.resolve_path(Path::new("source.rs")).unwrap();
-    std::fs::remove_file(&source).unwrap();
-    std::os::unix::fs::symlink(&secret, &source).unwrap();
-
-    assert!(
-        crate::extras::lsp::client::read_stable_text(&approved)
-            .await
-            .is_err()
-    );
-    std::fs::remove_dir_all(temp).unwrap();
-}
 
 // ── rpc framing ─────────────────────────────────────────────────────────
 
@@ -325,10 +298,7 @@ fn diag(
 
 #[tokio::test]
 async fn unhandled_extension_yields_nothing() {
-    let manager = LspManager::new(
-        &LspConfig::default(),
-        std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(Path::new("/tmp")).unwrap()),
-    );
+    let manager = LspManager::new(&LspConfig::default(), PathBuf::from("/tmp"));
     let path = Path::new("/tmp/x.unknownext");
     assert!(!manager.handles(path));
     assert!(
@@ -341,10 +311,7 @@ async fn unhandled_extension_yields_nothing() {
 
 #[tokio::test]
 async fn injected_diagnostics_format_errors_first() {
-    let manager = LspManager::new(
-        &LspConfig::default(),
-        std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(Path::new("/tmp")).unwrap()),
-    );
+    let manager = LspManager::new(&LspConfig::default(), PathBuf::from("/tmp"));
     let path = Path::new("/tmp/x.rs");
     assert!(manager.handles(path));
     manager.inject_diagnostics(
@@ -381,10 +348,7 @@ async fn injected_diagnostics_format_errors_first() {
 
 #[test]
 fn clean_project_reports_nothing() {
-    let manager = LspManager::new(
-        &LspConfig::default(),
-        std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(Path::new("/tmp")).unwrap()),
-    );
+    let manager = LspManager::new(&LspConfig::default(), PathBuf::from("/tmp"));
     assert!(manager.all_diagnostics_block().is_none());
     manager.inject_diagnostics(
         "file:///tmp/x.rs",

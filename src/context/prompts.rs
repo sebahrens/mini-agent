@@ -19,51 +19,15 @@ pub fn zerostack_dir() -> PathBuf {
 }
 
 pub fn load() -> HashMap<String, String> {
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
-    load_with_paths(&paths)
-}
-
-pub(crate) fn load_for_workspace(workspace_root: &std::path::Path) -> HashMap<String, String> {
-    let paths = crate::paths::process_paths()
-        .and_then(|paths| paths.with_workspace_root(workspace_root))
-        .expect("canonical workspace must produce application paths");
-    load_with_paths(&paths)
-}
-
-pub(crate) fn load_for_workspace_binding(
-    workspace: &crate::paths::WorkspaceBinding,
-) -> HashMap<String, String> {
-    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
-    let mut prompts: HashMap<String, String> = HashMap::new();
-    for (name, content) in crate::context::load_embedded_files(&EMBEDDED, "md") {
-        prompts.entry(name).or_insert(content);
-    }
-    for (name, content) in crate::context::load_dir_files(&paths.prompts_dir(), "md") {
-        prompts.insert(name, content);
-    }
-    if let Ok(project) =
-        workspace.read_relative_dir_files(std::path::Path::new(".zerostack/prompts"), "md")
-    {
-        for (name, content) in project {
-            prompts.insert(name, content);
-        }
-    }
-    prompts
-}
-
-fn load_with_paths(paths: &crate::paths::AppPaths) -> HashMap<String, String> {
     let mut prompts: HashMap<String, String> = HashMap::new();
 
     for (name, content) in crate::context::load_embedded_files(&EMBEDDED, "md") {
         prompts.entry(name).or_insert(content);
     }
-    for (name, content) in crate::context::load_dir_files(&paths.prompts_dir(), "md") {
+    for (name, content) in crate::context::load_dir_files(&global_dir(), "md") {
         prompts.insert(name, content);
     }
-    let project_prompts = paths
-        .project_prompts_dir()
-        .expect("workspace paths must have a project prompt directory");
-    for (name, content) in crate::context::load_dir_files(&project_prompts, "md") {
+    for (name, content) in crate::context::load_dir_files(&zerostack_dir(), "md") {
         prompts.insert(name, content);
     }
 

@@ -3,8 +3,8 @@ use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::{
-    AskSender, EditArgs, EditBlock, EditOp, PermCheck, ToolError, check_perm_bound_path,
-    check_perm_path, edit_system, levenshtein_similarity, normalize_whitespace,
+    AskSender, EditArgs, EditBlock, EditOp, PermCheck, ToolError, check_perm_path, edit_system,
+    levenshtein_similarity, normalize_whitespace,
 };
 use crate::config::types::EditSystem;
 #[cfg(feature = "lsp")]
@@ -582,23 +582,9 @@ impl Tool for EditTool {
             args.edits.as_ref().map(|e| e.len()).unwrap_or(0),
         );
         // Check the path atomic_write will modify, not a symlink that points to it.
-        let coaching = if let Some(workspace) = bound_workspace {
-            check_perm_bound_path(&self.permission, &self.ask_tx, "edit", workspace, relative)
-                .await?
-        } else {
-            check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await?
-        };
+        let coaching = check_perm_path(&self.permission, &self.ask_tx, "edit", &path).await?;
 
-        let mut file = if let Some(file) = capability_file {
-            tokio::fs::File::from_std(file)
-        } else {
-            crate::fs::open_stable_file(
-                resolved
-                    .as_deref()
-                    .expect("ambient edit must resolve an external path"),
-            )
-            .await?
-        };
+        let mut file = crate::fs::open_stable_file(&resolved).await?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
@@ -669,17 +655,8 @@ impl Tool for EditTool {
         #[cfg(feature = "lsp")]
         if let Some(lsp) = &self.lsp {
             let file = std::path::Path::new(&path);
-            if capability_metadata.is_some() {
-                lsp.notify_changed_relative(relative).await;
-            } else {
-                lsp.notify_changed(file).await;
-            }
-            let diagnostics = if capability_metadata.is_some() {
-                lsp.diagnostics_block_for_relative_edit(relative).await
-            } else {
-                lsp.diagnostics_block_for_edit(file).await
-            };
-            if let Some(block) = diagnostics {
+            lsp.notify_changed(file).await;
+            if let Some(block) = lsp.diagnostics_block_for_edit(file).await {
                 result.push_str(&block);
             }
         }

@@ -548,68 +548,6 @@ impl Drop for ProcessGroupGuard {
 }
 
 impl Sandbox {
-    #[cfg(unix)]
-    #[allow(unsafe_code)]
-    fn bind_workspace_cwd(&self, command: &mut Command) -> Result<(), String> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
-
-        let Some(workspace) = &self.workspace_binding else {
-            return Ok(());
-        };
-        let directory = workspace
-            .try_clone_directory_file()
-            .map_err(|error| format!("sandbox: failed to clone workspace handle: {error}"))?;
-        let fd = directory.as_raw_fd();
-        unsafe {
-            command.as_std_mut().pre_exec(move || {
-                let _keep_directory_alive = &directory;
-                if libc::dup2(fd, WORKSPACE_AUTHORITY_FD) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // dup2 is a no-op when the source already equals the fixed
-                // descriptor, so explicitly clear CLOEXEC in both cases.
-                let descriptor_flags = libc::fcntl(WORKSPACE_AUTHORITY_FD, libc::F_GETFD);
-                if descriptor_flags == -1
-                    || libc::fcntl(
-                        WORKSPACE_AUTHORITY_FD,
-                        libc::F_SETFD,
-                        descriptor_flags & !libc::FD_CLOEXEC,
-                    ) == -1
-                    || libc::fchdir(WORKSPACE_AUTHORITY_FD) == -1
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        Ok(())
-    }
-
-    #[cfg(all(unix, target_os = "linux"))]
-    fn workspace_authority_path(&self) -> Option<PathBuf> {
-        self.workspace_binding
-            .as_ref()
-            .map(|_| PathBuf::from(format!("/proc/self/fd/{WORKSPACE_AUTHORITY_FD}")))
-    }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
-    fn workspace_authority_path(&self) -> Option<PathBuf> {
-        self.workspace_binding
-            .as_ref()
-            .map(|_| PathBuf::from(format!("/dev/fd/{WORKSPACE_AUTHORITY_FD}")))
-    }
-
-    #[cfg(not(unix))]
-    fn workspace_authority_path(&self) -> Option<PathBuf> {
-        None
-    }
-
-    #[cfg(not(unix))]
-    fn bind_workspace_cwd(&self, _command: &mut Command) -> Result<(), String> {
-        Ok(())
-    }
-
     pub fn new(enabled: bool, backend: &str) -> Self {
         Sandbox {
             enabled,
@@ -846,7 +784,6 @@ impl Sandbox {
                     cmd.current_dir(working_dir);
                 }
                 configure_child_lifetime(&mut cmd);
-                self.bind_workspace_cwd(&mut cmd)?;
                 return Ok(cmd);
             }
             SandboxPolicy::RequiredButUnavailable => {
@@ -865,11 +802,6 @@ impl Sandbox {
         let cwd = canonical_non_root(&cwd, "working directory")?;
 
         if self.backend == "zerobox" {
-            if self.workspace_binding.is_some() && cfg!(unix) {
-                return Err(
-                    "sandbox backend 'zerobox' cannot consume an ACP workspace handle".to_string(),
-                );
-            }
             let mut cmd = Command::new("zerobox");
             cmd.arg("--allow-write");
             cmd.arg(cwd.as_os_str());
@@ -879,7 +811,6 @@ impl Sandbox {
             cmd.arg(command);
             cmd.current_dir(&cwd);
             configure_child_lifetime(&mut cmd);
-            self.bind_workspace_cwd(&mut cmd)?;
             return Ok(cmd);
         }
 
@@ -898,21 +829,14 @@ impl Sandbox {
                 "sandbox backend 'seatbelt' is not a trusted system executable — refusing to run unsandboxed"
                     .to_string()
             })?;
-            let mut command = self.build_seatbelt_command(seatbelt, command, &cwd, &cache_dir)?;
-            if self.workspace_binding.is_some() && cfg!(unix) {
-                command.current_dir("/");
-            }
-            self.bind_workspace_cwd(&mut command)?;
-            return Ok(command);
+            return self.build_seatbelt_command(seatbelt, command, &cwd, &cache_dir);
         }
 
         let bwrap = bwrap_path().ok_or_else(|| {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
         })?;
-        let mut command = self.build_bwrap_command(bwrap, command, &cwd, &cache_dir);
-        self.bind_workspace_cwd(&mut command)?;
-        Ok(command)
+        Ok(self.build_bwrap_command(bwrap, command, &cwd, &cache_dir))
     }
 
     /// Builds a direct-exec command under the general workspace policy.
