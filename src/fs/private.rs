@@ -159,9 +159,10 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(unix)]
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    prepare_write(path)?;
-    super::atomic_write_sync(path, bytes)?;
-    drop(open_existing(path)?);
+    prepare_write(path).map_err(|error| stage_error("write_prepare", error))?;
+    super::atomic_write_sync(path, bytes)
+        .map_err(|error| stage_error("write_publication", error))?;
+    drop(open_existing(path).map_err(|error| stage_error("write_final_revalidation", error))?);
     Ok(())
 }
 
@@ -220,11 +221,13 @@ fn prepare_write(path: &Path) -> std::io::Result<()> {
             "private file must have a parent directory",
         )
     })?;
-    ensure_directory(parent)?;
+    ensure_directory(parent).map_err(|error| stage_error("write_parent", error))?;
     match std::fs::symlink_metadata(path) {
-        Ok(_) => drop(open_existing(path)?),
+        Ok(_) => drop(
+            open_existing(path).map_err(|error| stage_error("write_target_revalidation", error))?,
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(stage_error("write_target_inspection", error)),
     }
     Ok(())
 }
