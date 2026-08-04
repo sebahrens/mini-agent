@@ -23,11 +23,11 @@ Phase 2 adds:
 
 1. permission-gated `fetch(url, opts?)` with URL allow-lists and bounded responses;
 2. read/write path allow-lists that can only narrow Phase 1 file authorization; and
-3. effective general child-process isolation on Linux and macOS through the shared `Sandbox`
-   abstraction.
+3. platform-specific general child-process isolation through the shared `Sandbox` abstraction.
 
-Phase 2 does not deliver Windows isolation for the general subprocess path. JavaScript VM limits
-are not a substitute for child-process isolation on any platform.
+JavaScript VM limits are not a substitute for child-process isolation on any platform. The
+general subprocess profiles remain distinct from the stricter, workspace-invisible Phase 6
+JavaScript worker containment.
 
 ## Cargo.toml additions
 
@@ -161,12 +161,23 @@ whose broker-only containment has no workspace/cache visibility and fails closed
 |----------|---------------------------|
 | Linux | Effective configured isolation using the supported Linux backend, verified by escape/denial tests |
 | macOS | Seatbelt denies network and writes outside the workspace/cache/temp boundary; host-readable files, devices, and process namespaces are explicitly not claimed as isolated |
-| Windows | No Phase 2 process-isolation guarantee; execution is disabled or explicitly reported as non-isolated according to product policy |
+| Windows | `appcontainer` candidate: explicit package-SID roots, zero network capabilities, private profile storage, and Job lifetime are implemented, but production availability remains fail-closed pending successful native hosted attestation |
 
-Backend absence or setup failure never masquerades as isolation. Whether fallback execution is
-allowed is an explicit user/product policy decision for the general subprocess path and remains
-visible to the caller. It is never permission for an uncontained JS worker fallback. Phase 2 does
-not claim Job Objects, AppContainer, `rappct`, or Windows child termination.
+The general subprocess sandbox is enabled by default. `--no-sandbox` disables it;
+`--sandbox` overrides configuration and explicitly requires it; otherwise `sandbox = false`
+disables it and `sandbox = true` explicitly requires it. While sandboxing remains enabled,
+selecting a backend through `--sandbox-backend` or the `sandbox-backend` config key also makes the
+request explicit. On non-Windows hosts, if the sandbox was enabled only by the default and its
+backend is absent, startup warns and continues unsandboxed. An explicitly required missing backend
+fails closed, and Windows always fails closed while its enabled backend is unavailable. Backend
+absence or setup failure never masquerades as isolation, and this fallback policy is never
+permission for an uncontained JS worker.
+
+The Windows general-process AppContainer candidate is not the Phase 6 LPAC worker profile.
+Subject to the pending native hosted attestation required for production availability, its
+contract claims AppContainer identity, scoped filesystem reads and writes, zero-capability network
+denial, a private desktop with Job UI restrictions, and bounded Job lifetime. It does not claim
+registry isolation, host-readable device isolation, or broader Windows session isolation.
 
 The implementation must not add a parallel raw `std::process::Command` path for JS. Any blocking
 adapter remains behind the shared wrapper and preserves Phase 1 permission, argument, timeout,
@@ -174,9 +185,9 @@ cancellation, and output bounds.
 
 ### Linux general-process `bwrap` capability matrix
 
-The default Linux general-subprocess policy is opt-in (`--sandbox` or `sandbox = true`). When disabled,
-the wrapper intentionally inherits host capabilities and reports that state. When enabled with
-the default `bwrap` backend, the following matrix is normative:
+The Linux general-subprocess policy is enabled by default. `--no-sandbox` or `sandbox = false`
+disables it; explicit `--sandbox` or `sandbox = true` requires the backend. When enabled with the
+default `bwrap` backend, the following matrix is normative:
 
 | Capability | Enforced policy |
 |------------|-----------------|
@@ -213,8 +224,9 @@ bounds; it does not grant network access to spawned processes or to the JS worke
 
 ### macOS general-process `seatbelt` capability matrix
 
-macOS defaults to the fixed `/usr/bin/sandbox-exec` backend. The executable and every parent
-directory must be root-owned and not group/world-writable. The generated profile denies by
+Supported macOS hosts default to the system-provided Seatbelt backend at the fixed
+`/usr/bin/sandbox-exec` path. The executable and every parent directory must be root-owned and not
+group/world-writable. The generated profile denies by
 default, allows child processes, allows host-readable files, permits writes only below the
 canonical workspace, canonical application cache, `/private/tmp`, and `/dev/null`, and denies all
 Seatbelt network operations. The child starts through `/usr/bin/env -i`; only the same
@@ -227,14 +239,58 @@ isolation on macOS. It does enforce the stated write and network boundaries, and
 inherit the profile. Backend absence, profile application failure, or child setup failure starts
 no requested child and is never retried unsandboxed.
 
-## Windows behavior
+## Windows general-process `appcontainer` capability matrix
 
-Phase 2's in-process QuickJS placement is historical and superseded by Phase 6; Phase 2 did not
-make the full action primitive secure or release-ready on Windows. Phase 6 separately implements a
-zero-capability LPAC worker with a creation-time Job Object. That worker boundary contains only
-QuickJS evaluation and does not confer authority on a brokered child command. Parent-brokered JS
-`spawn` therefore remains disabled on Windows until the general command path has its own normative
-backend, complete descendant-lifetime ownership, CI, and release gate.
+Windows selects `appcontainer` by default; persisted `restricted-token` values normalize to that
+backend as a compatibility alias. It remains production-unavailable until native hosted
+attestation succeeds, so requested launch fails closed unless `--no-sandbox` is explicit. This
+workspace-capable boundary is separate from Phase 6's workspace-invisible LPAC worker.
+
+Every launch creates a unique AppContainer profile with zero capabilities. Its package SID is
+passed through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, with ambient `ALL APPLICATION
+PACKAGES` authority opted out. The bounded explicit root policy grants the canonical workspace
+read/write, grants the application cache read/execute, and grants the exact selected executable
+read/execute. It never recursively grants an executable parent, ambient `PATH`, home, Cargo, or
+Rustup root. The AppContainer-scoped `windows-appcontainer-read-roots` and
+`windows-appcontainer-write-roots` settings add bounded explicit roots; relative paths resolve
+from the canonical workspace. There is no implicit writable cache root. Remote/UNC, reparse,
+multi-link, read/write-overlapping, or otherwise unsafe roots fail closed.
+
+ACL traversal is recursive, no-follow, handle-bound, and identity checked. Reparse points and
+multi-link files fail closed; cleanup revokes existing and newly created objects. `TEMP` and `TMP`
+use the OS-managed private per-profile storage directory, not a host writable root. An exclusive
+cleanup lease journals the exact SID and roots in a private sibling control directory outside all
+granted trees. That directory is owner-only with a protected DACL, and the hosted child canary must
+fail both read and write access. Cleanup begins only after the exact Job reports zero active
+processes. The journal records a unique parent-only named Job; crash recovery opens and validates
+that exact Job (or proves the name no longer exists under Job lifetime semantics) before revoking
+anything. Every ACE revoke and profile deletion must succeed before the journal is removed. Later
+launches skip live leases and reclaim at most 64 crash-stale profiles; uncertain Job state or any
+revoke/delete failure retains the journal, and malformed, aliased, or unbounded cleanup state fails
+closed.
+
+| Capability | Enforced Windows policy |
+|------------|-------------------------|
+| Filesystem reads | Canonical workspace and application cache, exact selected executable, and bounded explicit `windows-appcontainer-read-roots`. Ambient `PATH`, home, Cargo, and Rustup roots are not inferred. |
+| Filesystem writes | Canonical workspace plus bounded explicit `windows-appcontainer-write-roots`. The unique profile's OS-managed storage is private ephemeral sandbox storage. |
+| Executable | The parent supplies stable identity plus SHA-256. The helper reopens and hashes the executable, denies write/delete sharing, verifies the proof, and retains that handle through `CreateProcessAsUserW`. |
+| Process lifetime | The target enters a kill-on-close Job at creation time. The Job limits active processes, per-process memory, aggregate Job memory, process CPU time, and UI operations. Descendants retain the AppContainer SID and exact Job without breakaway. Helper cancellation and parent death terminate the exact Job and wait for `ActiveProcesses == 0` before ACL/profile cleanup. |
+| Environment | The helper request travels only through inherited stdin. The target environment is cleared and rebuilt from `PATH`, `PATHEXT`, Windows system/shell variables, and non-credential locale/terminal variables. API keys, agent sockets, and credential variables are not forwarded. |
+| Network | No capability is supplied. Hosted proof requires zero `TokenCapabilities`, no current-SID loopback exemption, and AccessDenied for IPv4/IPv6 TCP and UDP against loopback and an external address. |
+| Registry | Host registry visibility is inherited. No registry virtualization or isolation is claimed. |
+| Devices/UI | Host-readable devices remain visible. The target receives a private per-launch desktop and the Job's full UI restriction mask. No broader Windows session, named-object, or broker-channel isolation is claimed. |
+
+The same-executable helper is fixed-function trusted code. Program, arguments, roots, and parent
+identity are length-bounded JSON on an anonymous pipe wired to helper stdin; a capped feeder starts
+before process creation so a small advisory pipe buffer cannot block the caller without a reader.
+The request fields never appear in
+the helper command line, environment, or a temporary request file. The helper verifies the parent
+PID's creation time before launch and waits on the exact parent process handle. The target receives
+only duplicated stdout/stderr plus a `NUL` stdin through an explicit handle list. A creation-time
+Job attribute closes the assignment race. `CreateProcessAsUserW` combines the caller's primary
+token with the AppContainer security-capabilities attribute and does not elevate or configure
+machine-wide firewall policy. General commands retain descendant authority inside the bounded Job;
+no child-process-restricted flag is set.
 
 ## Acceptance criteria
 
@@ -244,8 +300,13 @@ backend, complete descendant-lifetime ownership, CI, and release gate.
       the narrowing allow-list, and always obtains `js/fetch` permission.
 - [x] File allow-lists match resolved targets and never bypass Phase 1 permissions or secure I/O.
 - [x] Linux and macOS process escape/denial tests prove their documented backend guarantees.
-- [x] Backend absence/failure and Windows non-isolation are visible and never reported as
+- [x] Backend absence/failure and Windows residual non-isolation are visible and never reported as
       sandboxed.
+- [ ] Windows can report the default AppContainer backend available only after hosted attestation
+      proves explicit-root reads, workspace-only host writes, outside read/write denial,
+      hard-link/path/executable stability, crash-stale cleanup, zero capabilities and absent
+      loopback exemptions, TCP/UDP loopback and external denial, private desktop, bounded request
+      transport, launcher-token denial, and parent-owned Job cleanup.
 - [x] The general command created for JS `spawn` still uses the one shared
       `Sandbox::wrap_command` path; this is not the Phase 6 worker-launch path.
 - [x] Default and `js`-only behavior deny JS file access until roots or explicit unrestricted
@@ -255,7 +316,6 @@ backend, complete descendant-lifetime ownership, CI, and release gate.
 
 ## Out of scope for Phase 2
 
-- Windows general-process isolation and Windows child-process lifecycle enforcement
 - broker-only JS worker containment (Phase 6)
 - UI for editing allow-lists
 - portable/learned skill libraries (Phase 3)

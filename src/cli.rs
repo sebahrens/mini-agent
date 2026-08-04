@@ -5,7 +5,9 @@ use crate::config;
 use crate::config::types::EditSystem;
 
 fn default_sandbox_backend() -> String {
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "windows") {
+        "appcontainer".to_string()
+    } else if cfg!(target_os = "macos") {
         "seatbelt".to_string()
     } else {
         "bwrap".to_string()
@@ -202,7 +204,7 @@ pub struct Cli {
 
     #[arg(
         long = "sandbox",
-        help = "Enforce subprocess filesystem/process isolation and deny network; fail closed if the backend is unavailable"
+        help = "Enforce the selected platform subprocess policy; fail closed if the backend is unavailable (capabilities vary by backend)"
     )]
     pub sandbox: bool,
 
@@ -215,13 +217,27 @@ pub struct Cli {
 
     #[arg(
         long = "sandbox-backend",
-        help = "Sandbox backend: bwrap (Linux default), seatbelt (macOS default), or zerobox"
+        help = "Sandbox backend: bwrap (Linux), seatbelt (macOS), appcontainer (Windows; restricted-token is a compatibility alias), or zerobox"
     )]
     pub sandbox_backend: Option<String>,
 
     #[arg(
+        long = "windows-appcontainer-read-root",
+        value_name = "PATH",
+        help = "Add an explicit Windows AppContainer read/execute root (repeatable; relative paths resolve from the workspace)"
+    )]
+    pub windows_appcontainer_read_roots: Vec<std::path::PathBuf>,
+
+    #[arg(
+        long = "windows-appcontainer-write-root",
+        value_name = "PATH",
+        help = "Add an explicit Windows AppContainer read/write root (repeatable; relative paths resolve from the workspace)"
+    )]
+    pub windows_appcontainer_write_roots: Vec<std::path::PathBuf>,
+
+    #[arg(
         long = "shell",
-        help = "Shell binary to use for bash tool (default: bash)"
+        help = "Shell binary to use for the bash tool (default: bash; powershell.exe on Windows)"
     )]
     pub shell: Option<String>,
 
@@ -456,12 +472,16 @@ impl Cli {
         self.sandbox || cfg.sandbox.unwrap_or(true)
     }
 
-    /// Whether the operator asked for a sandbox rather than inheriting the
-    /// default. An explicit request stays fail-closed when the backend is
-    /// missing; the default degrades to unsandboxed with a warning, because
-    /// Windows has no backend at all and would otherwise be unable to start.
+    /// Whether the operator asked for a sandbox or selected its backend rather
+    /// than inheriting the complete default. An explicit request stays
+    /// fail-closed when the backend is missing; an unavailable platform
+    /// default may degrade with a warning where the platform policy permits.
     pub fn sandbox_explicitly_requested(&self, cfg: &config::Config) -> bool {
-        !self.no_sandbox && (self.sandbox || cfg.sandbox == Some(true))
+        !self.no_sandbox
+            && (self.sandbox
+                || cfg.sandbox == Some(true)
+                || self.sandbox_backend.is_some()
+                || cfg.sandbox_backend.is_some())
     }
 
     pub fn resolve_sandbox_backend(&self, cfg: &config::Config) -> String {
@@ -471,11 +491,39 @@ impl Cli {
             .unwrap_or_else(default_sandbox_backend)
     }
 
+    pub fn resolve_windows_appcontainer_read_roots(
+        &self,
+        cfg: &config::Config,
+    ) -> Vec<std::path::PathBuf> {
+        if self.windows_appcontainer_read_roots.is_empty() {
+            cfg.windows_appcontainer_read_roots.clone()
+        } else {
+            self.windows_appcontainer_read_roots.clone()
+        }
+    }
+
+    pub fn resolve_windows_appcontainer_write_roots(
+        &self,
+        cfg: &config::Config,
+    ) -> Vec<std::path::PathBuf> {
+        if self.windows_appcontainer_write_roots.is_empty() {
+            cfg.windows_appcontainer_write_roots.clone()
+        } else {
+            self.windows_appcontainer_write_roots.clone()
+        }
+    }
+
     pub fn resolve_shell(&self, cfg: &config::Config) -> String {
         self.shell
             .clone()
             .or_else(|| cfg.shell.clone())
-            .unwrap_or_else(|| "bash".to_string())
+            .unwrap_or_else(|| {
+                if cfg!(target_os = "windows") {
+                    "powershell.exe".to_string()
+                } else {
+                    "bash".to_string()
+                }
+            })
     }
 
     pub fn resolve_edit_system(&self, cfg: &config::Config) -> EditSystem {
@@ -581,6 +629,39 @@ mod tests {
     }
 
     #[test]
+    fn windows_appcontainer_roots_are_explicit_scoped_and_cli_overrides_config() {
+        let mut cfg = config::Config {
+            windows_appcontainer_read_roots: vec!["configured-read".into()],
+            windows_appcontainer_write_roots: vec!["configured-write".into()],
+            ..Default::default()
+        };
+        let mut cli = Cli::default();
+        assert_eq!(
+            cli.resolve_windows_appcontainer_read_roots(&cfg),
+            vec![std::path::PathBuf::from("configured-read")]
+        );
+        assert_eq!(
+            cli.resolve_windows_appcontainer_write_roots(&cfg),
+            vec![std::path::PathBuf::from("configured-write")]
+        );
+
+        cli.windows_appcontainer_read_roots = vec!["cli-read".into()];
+        cli.windows_appcontainer_write_roots = vec!["cli-write".into()];
+        assert_eq!(
+            cli.resolve_windows_appcontainer_read_roots(&cfg),
+            vec![std::path::PathBuf::from("cli-read")]
+        );
+        assert_eq!(
+            cli.resolve_windows_appcontainer_write_roots(&cfg),
+            vec![std::path::PathBuf::from("cli-write")]
+        );
+
+        cfg.windows_appcontainer_read_roots.clear();
+        cfg.windows_appcontainer_write_roots.clear();
+        assert!(!cli.resolve_windows_appcontainer_read_roots(&cfg).is_empty());
+    }
+
+    #[test]
     fn sandbox_is_on_by_default_and_refusable() {
         let mut cli = Cli::default();
         let mut cfg = config::Config::default();
@@ -598,5 +679,27 @@ mod tests {
         assert!(!cli.resolve_sandbox(&cfg));
         cfg.sandbox = Some(true);
         assert!(!cli.resolve_sandbox(&cfg));
+    }
+
+    #[test]
+    fn selecting_a_sandbox_backend_is_an_explicit_fail_closed_request() {
+        let cli = Cli {
+            sandbox_backend: Some("selected-backend".to_string()),
+            ..Cli::default()
+        };
+        assert!(cli.sandbox_explicitly_requested(&config::Config::default()));
+
+        let cfg = config::Config {
+            sandbox_backend: Some("configured-backend".to_string()),
+            ..config::Config::default()
+        };
+        assert!(Cli::default().sandbox_explicitly_requested(&cfg));
+
+        let refused = Cli {
+            no_sandbox: true,
+            sandbox_backend: Some("ignored-backend".to_string()),
+            ..Cli::default()
+        };
+        assert!(!refused.sandbox_explicitly_requested(&cfg));
     }
 }

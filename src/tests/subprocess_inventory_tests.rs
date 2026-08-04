@@ -1180,6 +1180,48 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TEST-ONLY",
     ),
+    (
+        "src/sandbox/windows.rs",
+        ") -> Result<tokio::process::Command, String> {",
+        4,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut helper = Command::new(executable);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut helper = tokio::process::Command::from(helper);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".output()",
+        5,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".spawn()",
+        6,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut parent = Command::new(executable)",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
     ("src/session/mod.rs", ".output()", 1, "TC-INTERNAL-GIT"),
     (
         "src/session/mod.rs",
@@ -1436,6 +1478,12 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/js/audit.rs",
         "let _ = write!(output, \"{byte:02x}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "String::from_utf8_lossy(&output.stderr)",
         1,
         "NON-PROCESS",
     ),
@@ -2171,6 +2219,13 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             1,
         )],
     ),
+    (
+        "src/sandbox/windows.rs",
+        &[(
+            "48b38d261851e6e3c7bb387f8fb5d093448cb69f8047816907f7b7dc699ca584",
+            1,
+        )],
+    ),
 ];
 
 fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
@@ -2492,6 +2547,48 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "Command::new(executable)",
         1,
         "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ") -> Result<tokio::process::Command, String> {",
+        4,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut helper = Command::new(executable);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut helper = tokio::process::Command::from(helper);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".output()",
+        5,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".spawn()",
+        6,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut parent = Command::new(executable)",
+        1,
+        "TC-INTERNAL-VERIFICATION",
     ),
     (
         "src/ui/app.rs",

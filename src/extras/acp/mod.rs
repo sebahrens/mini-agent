@@ -421,7 +421,15 @@ async fn run_prompt(
         state.cli.resolve_sandbox(&state.cfg),
         &state.cli.resolve_sandbox_backend(&state.cfg),
     )
-    .with_shell(&state.cli.resolve_shell(&state.cfg));
+    .with_shell(&state.cli.resolve_shell(&state.cfg))
+    .with_windows_appcontainer_roots(
+        state
+            .cli
+            .resolve_windows_appcontainer_read_roots(&state.cfg),
+        state
+            .cli
+            .resolve_windows_appcontainer_write_roots(&state.cfg),
+    );
 
     // Track session history for future context persistence
     let _extra_messages = {

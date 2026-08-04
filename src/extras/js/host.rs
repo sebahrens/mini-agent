@@ -41,7 +41,7 @@ use crate::extras::js::types::{
 };
 #[cfg(target_os = "linux")]
 use crate::sandbox::SandboxCommand;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::sandbox::{CommandCancellation, CommandLimits, CommandOutputLimit, CommandStatus};
 use crate::sandbox::{Sandbox, SandboxPolicy};
 #[cfg(feature = "sandbox")]
@@ -2978,7 +2978,7 @@ impl SpawnEffectService {
         .await
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     async fn execute_prepared(
         &self,
         prepared: PreparedSpawnEffect,
@@ -2989,7 +2989,7 @@ impl SpawnEffectService {
         Err(EffectServiceError::BackendFailure)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn execute_prepared(
         &self,
         prepared: PreparedSpawnEffect,
@@ -2997,6 +2997,11 @@ impl SpawnEffectService {
     ) -> Result<SpawnResult, EffectServiceError> {
         prepared.revalidate()?;
 
+        #[cfg(windows)]
+        let command = self
+            .sandbox
+            .wrap_direct_command(prepared.executable.canonical_path(), &prepared.arguments)
+            .map_err(|_| EffectServiceError::BackendFailure)?;
         #[cfg(target_os = "linux")]
         let command = match &prepared.target {
             PreparedSpawnTarget::SealedSnapshot(snapshot) => {

@@ -64,6 +64,10 @@ fn resolve_mode(cli: &Cli, cfg: &Config) -> SecurityMode {
     }
 }
 
+fn unavailable_sandbox_must_fail(cli: &Cli, cfg: &Config, is_windows: bool) -> bool {
+    cli.resolve_sandbox(cfg) && (is_windows || cli.sandbox_explicitly_requested(cfg))
+}
+
 fn build_permission_checker(
     cli: &Cli,
     cfg: &Config,
@@ -486,6 +490,29 @@ impl Startup {
         })
     }
 
+    /// Validate the common process sandbox contract before entering any
+    /// execution surface, including ACP which intentionally skips feature
+    /// initialization. Windows is always fail-closed while sandboxing is on;
+    /// other platforms retain the legacy warning only for an entirely
+    /// inherited default.
+    pub(crate) fn validate_sandbox_availability(&self) -> anyhow::Result<()> {
+        let backend = self.cli.resolve_sandbox_backend(&self.cfg);
+        let sandbox = Sandbox::new(self.cli.resolve_sandbox(&self.cfg), &backend)
+            .with_shell(&self.cli.resolve_shell(&self.cfg))
+            .with_windows_appcontainer_roots(
+                self.cli.resolve_windows_appcontainer_read_roots(&self.cfg),
+                self.cli.resolve_windows_appcontainer_write_roots(&self.cfg),
+            );
+        if sandbox.policy() == SandboxPolicy::RequiredButUnavailable
+            && unavailable_sandbox_must_fail(&self.cli, &self.cfg, cfg!(target_os = "windows"))
+        {
+            anyhow::bail!(
+                "sandbox backend '{backend}' is unavailable or has no successful production preflight — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
+            );
+        }
+        Ok(())
+    }
+
     /// Phase 2: subagents, OpenRouter pricing, sandbox, tools config,
     /// permission checker, advisor.
     pub(crate) async fn init_features(&mut self) -> anyhow::Result<()> {
@@ -575,18 +602,18 @@ impl Startup {
         }
 
         // Sandbox, tools config, status signals, permission checker
+        self.validate_sandbox_availability()?;
         self.sandbox = Sandbox::new(
             self.cli.resolve_sandbox(&self.cfg),
             &self.cli.resolve_sandbox_backend(&self.cfg),
         )
-        .with_shell(&self.cli.resolve_shell(&self.cfg));
+        .with_shell(&self.cli.resolve_shell(&self.cfg))
+        .with_windows_appcontainer_roots(
+            self.cli.resolve_windows_appcontainer_read_roots(&self.cfg),
+            self.cli.resolve_windows_appcontainer_write_roots(&self.cfg),
+        );
         if self.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
             let backend = self.cli.resolve_sandbox_backend(&self.cfg);
-            if self.cli.sandbox_explicitly_requested(&self.cfg) {
-                anyhow::bail!(
-                    "sandbox backend '{backend}' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
-                );
-            }
             tracing::warn!(
                 "sandbox backend '{backend}' was not found — continuing UNSANDBOXED; pass --sandbox to fail closed instead"
             );
@@ -1193,6 +1220,7 @@ impl Startup {
 mod tests {
     use super::{
         ResumeProviderDecision, apply_resume_provider_decision, resolve_resume_provider_decision,
+        unavailable_sandbox_must_fail,
     };
     use crate::cli::Cli;
     use crate::config::Config;
@@ -1235,6 +1263,17 @@ mod tests {
         };
         assert!(!refused.resolve_sandbox(&configured));
         assert!(!refused.sandbox_explicitly_requested(&configured));
+
+        // Windows never silently drops an enabled sandbox, including when an
+        // unknown or stale backend name was selected.
+        assert!(unavailable_sandbox_must_fail(&cli, &cfg, true));
+        assert!(!unavailable_sandbox_must_fail(&refused, &configured, true));
+
+        let selected = Cli {
+            sandbox_backend: Some("definitely-not-a-real-backend".into()),
+            ..Cli::default()
+        };
+        assert!(unavailable_sandbox_must_fail(&selected, &cfg, false));
     }
 
     #[test]

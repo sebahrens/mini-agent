@@ -62,11 +62,26 @@ artifact retained for history and must not guide implementation.
 - Phase 4 requires human approval into non-retrievable canary state. Phase 5 owns the limited,
   evidence-based automatic lifecycle.
 
-## General Linux subprocess sandbox
+## General subprocess sandbox
 
-Sandboxing is opt-in (`--sandbox` or `sandbox = true`) and fail-closed. Without it, subprocesses
-inherit the host filesystem, environment, devices, process namespaces, and network. With the
-default `bwrap` backend on Linux, mini-agent applies this capability matrix:
+Sandboxing and memory support are included in the default build, and the general subprocess
+sandbox is on by default. `--no-sandbox` disables it. While sandboxing remains enabled,
+`--sandbox`, `sandbox = true`, or selecting a backend through `--sandbox-backend` or
+`sandbox-backend` makes the request explicit: if that backend is unavailable, startup fails
+closed. On non-Windows hosts, when only the default requested sandbox is unavailable, mini-agent
+warns and continues unsandboxed so hosts without the platform backend can still start. An
+unsandboxed subprocess inherits the host filesystem, environment, devices, process namespaces,
+and network.
+
+The default general-process backend is platform-specific:
+
+| Platform | Default backend |
+|----------|-----------------|
+| Linux | `bwrap`, when an installed trusted binary passes the real preflight |
+| macOS | System-provided Seatbelt at `/usr/bin/sandbox-exec` on supported macOS hosts |
+| Windows | `appcontainer` candidate; selected by default but production-unavailable pending native hosted attestation (`restricted-token` is a compatibility alias) |
+
+With the Linux `bwrap` backend, mini-agent applies this capability matrix:
 
 | Capability | Enforced Linux `bwrap` policy |
 |------------|---------------------------------|
@@ -86,9 +101,28 @@ fails, the subprocess does not run. The optional `zerobox` backend has
 backend-defined read/process/device/environment/network behavior and is not reported as providing
 the Linux `bwrap` guarantee.
 
-Use `mini-agent --sandbox --sandbox-backend bwrap --print-config` to see the configured backend,
+Use `mini-agent --sandbox-backend bwrap --print-config` to see the configured backend,
 availability, and effective capability report. Parent-brokered, permission-gated HTTP fetches are
 a separate boundary; subprocess network isolation does not bypass or replace fetch permissions.
+
+On Windows, `appcontainer` is currently a hosted candidate, not an available production
+backend. Startup fails closed unless the operator explicitly selects `--no-sandbox`. The native
+probe exercises explicit package-SID access: the workspace is read/write, while the application
+cache and exact selected executable are read/execute only. No ambient `PATH`, home, Cargo, or
+Rustup root is inferred. Operators may add bounded AppContainer-only read or write roots explicitly;
+relative values resolve from the workspace, and remote, reparse, hard-link, or permission-widening
+overlaps fail closed. A unique
+zero-capability AppContainer identity, handle-bound recursive ACL updates, bounded crash-stale
+cleanup journal outside every granted tree, private OS-managed temporary storage, locked executable
+proof, private desktop, and creation-time bounded Job all fail closed. ACL/profile removal starts
+only after the exact Job reports zero active processes. Crash recovery records a unique parent-only
+named Job and opens that exact object before stale cleanup; uncertain state retains the journal and
+authority. The control directory has an owner-only protected DACL and is denied to the target. Any
+cleanup failure retains the journal for stale recovery. No network capability is granted; hosted acceptance also requires zero token
+capabilities, no loopback exemption, IPv4/IPv6 TCP/UDP loopback and external denial, outside
+read/write denial, omitted-handle denial, and parent-owned descendant cleanup. Registry/device/
+session isolation beyond the stated AppContainer and Job boundaries is not claimed. Use
+`mini-agent --sandbox-backend appcontainer --print-config` for the fail-closed capability report.
 
 ## Broker-only JavaScript worker
 
@@ -98,7 +132,7 @@ The worker boundary is mandatory and independent of the optional general subproc
 |----------|----------------------|
 | Linux | Available only after a real empty-root `bwrap` preflight proves trusted runtime mounts, isolated namespaces/network, rlimits, non-dumpability, `no_new_privs`, and seccomp process/exec denial. The workspace, cache, configuration, credentials, and ambient environment are absent. |
 | macOS | Unavailable. The real Seatbelt probe proves that allowing the stable image for initial execution also leaves it reusable for later exec; deprecated best-effort Seatbelt is not accepted as a fallback. |
-| Windows | Available only after a process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, protocol probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots; the full hosted canary records those observations only for its reference runner, and its final artifact remains pending. General JS `spawn` is still disabled. |
+| Windows | Available only after a process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, protocol probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots; the full hosted canary records those observations only for its reference runner, and its final artifact remains pending. Model-authored JS `spawn` uses the separate general AppContainer backend; learned-skill spawn still requires an immutable-executable backend and remains disabled. |
 
 Hooks, MCP servers, LSPs, loop validation, and the explicit interactive shell are separate trust
 classes with different workspace, credential, and lifecycle needs. They never inherit the

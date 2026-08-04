@@ -34,6 +34,11 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 
 fn main() -> anyhow::Result<ExitCode> {
+    #[cfg(target_os = "windows")]
+    if let Some(exit_code) = sandbox::windows::maybe_run_from_args() {
+        std::process::exit(exit_code);
+    }
+
     #[cfg(feature = "js")]
     if let Some(exit_code) = extras::js::worker::maybe_run_internal_worker() {
         return Ok(exit_code);
@@ -199,6 +204,10 @@ async fn run() -> anyhow::Result<()> {
         is_interactive,
     )
     .await?;
+
+    // ACP mode skips feature initialization, so validate the shared process
+    // sandbox contract before entering either execution surface.
+    startup.validate_sandbox_availability()?;
 
     // ACP mode: serve and exit before feature init
     #[cfg(feature = "acp")]

@@ -162,12 +162,23 @@ If you want to use zerostack from scripts, from other programs, or if you just w
 | `--session <id-or-name>` | Load session by ID prefix or name |
 | `--read-only` | Only reads files |
 | `--yolo` | No limitations given to the agent |
-| `--sandbox` | Run the agent inside a sandbox (Experimental) |
+| `--sandbox` | Explicitly require the platform general-process sandbox; fail if unavailable |
+| `--no-sandbox` | Disable the default-on general-process sandbox |
 | `--worktree` | Run the agent inside a git worktree (Experimental) |
 | `--parallel` | Run the agent inside a self-managed git worktree (Experimental) |
 | `--load-prompt <prompt>` | Use a specific prompt |
 
 ## 6. Feature contract
+
+Sandboxing and memory support are compiled into the default build. The general-process sandbox is
+enabled by default: Linux uses `bwrap` when installed and trusted, supported macOS hosts use the
+system-provided Seatbelt backend at `/usr/bin/sandbox-exec`, and Windows selects the AppContainer
+candidate (`restricted-token` remains a compatibility alias). That Windows candidate currently
+reports unavailable pending native hosted attestation, so startup fails closed unless
+`--no-sandbox` explicitly opts out. Other implicitly selected unavailable defaults warn and start
+unsandboxed. While sandboxing remains enabled, explicit `--sandbox`, `sandbox = true`, or selecting
+a backend through `--sandbox-backend` or `sandbox-backend` remains fail-closed. This general
+subprocess policy is distinct from the mandatory, stricter JavaScript worker containment below.
 
 The default build and every pre-built release archive include the brokered
 JavaScript engine (`js` feature). QuickJS runs only in a contained same-executable worker; the
