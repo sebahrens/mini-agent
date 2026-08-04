@@ -4625,6 +4625,21 @@ mod tests {
         // private copy owned by the current user instead.
         let executable = PrivateFailureExecutable::copy_current();
 
+        // The first successful AppContainer process creation initializes a
+        // second process-global Windows cache. Warm it before taking per-launch
+        // kernel HANDLE baselines so the measured loop still detects every
+        // handle owned by the launcher itself.
+        LAST_PRODUCTION_TEST_PID.store(0, Ordering::Release);
+        let process_warmup = launch_production(ProductionLaunchHooks::fail_at_with_executable(
+            ProductionFailurePoint::OwnProcessHandle,
+            executable.path.clone(),
+        ))
+        .expect_err("process warmup must stop at the injected checkpoint");
+        assert!(process_warmup.to_string().contains("OwnProcessHandle"));
+        let warmup_pid = LAST_PRODUCTION_TEST_PID.load(Ordering::Acquire);
+        assert_ne!(warmup_pid, 0, "process warmup did not create a child");
+        assert_process_exits_after_job_cleanup(warmup_pid);
+
         let points = [
             ProductionFailurePoint::CreateProfile,
             ProductionFailurePoint::PrepareExecutableAcl,

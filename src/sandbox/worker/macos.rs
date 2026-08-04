@@ -511,7 +511,7 @@ pub(super) fn maybe_run_hosted_lifecycle() -> Option<ExitCode> {
 }
 
 fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
-    if !trusted_system_executable(Path::new("/bin/true")) {
+    if !trusted_system_executable(Path::new("/usr/bin/true")) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "macOS alternate-exec canary was not a trusted system executable",
@@ -1217,7 +1217,7 @@ pub(super) fn attest_hosted_worker_containment() -> bool {
     require_probe!(fork_is_denied(), "fork");
     require_probe!(
         executable_fails_with(
-            Path::new("/bin/true"),
+            Path::new("/usr/bin/true"),
             &[libc::EPERM, libc::EACCES, libc::ENOENT]
         ),
         "alternate_exec"

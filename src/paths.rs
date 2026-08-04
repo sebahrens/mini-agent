@@ -2113,26 +2113,79 @@ fn copy_directory_verified(
 #[allow(unsafe_code)]
 fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FileRenameInfo, SetFileInformationByHandle,
+    };
 
-    let stage = stage
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let canonical = canonical
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    // SAFETY: both path buffers are NUL-terminated and retained for the
-    // synchronous call. The stage and target are constructed under the same
-    // already-validated parent directory.
-    // A zero-flag MoveFileExW is an atomic same-volume directory rename. The
-    // WRITE_THROUGH flag is intended for copy/delete moves and can make an
-    // otherwise same-parent directory publication fail with
-    // ERROR_NOT_SAME_DEVICE on Windows.
-    if unsafe { MoveFileExW(stage.as_ptr(), canonical.as_ptr(), 0) } == 0 {
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let stage_parent = stage
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stage has no parent"))?;
+    let canonical_parent = canonical
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no parent"))?;
+    if stage_parent != canonical_parent {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "staged directory and target do not share a parent",
+        ));
+    }
+    let leaf = canonical
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no file name"))?;
+    let name: Vec<u16> = leaf.encode_wide().collect();
+    if name.is_empty() || name.len() > (u32::MAX as usize / 2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "migration target has an invalid file name",
+        ));
+    }
+
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let source = std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(stage)?;
+    let parent = std::fs::OpenOptions::new()
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(canonical_parent)?;
+
+    let name_bytes = name.len() * std::mem::size_of::<u16>();
+    let required = std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes;
+    let words = required.div_ceil(std::mem::size_of::<usize>());
+    let mut storage = vec![0usize; words];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+
+    // Rename the opened directory relative to its already-opened parent. This
+    // keeps the publication on one volume and avoids path-namespace ambiguity
+    // in MoveFileExW for verbatim hosted-runner paths.
+    // SAFETY: storage is aligned and large enough for the header plus the
+    // UTF-16 leaf, and both directory handles remain live for the call.
+    let renamed = unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = parent.as_raw_handle().cast();
+        (*information).FileNameLength = name_bytes as u32;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (*information).FileName.as_mut_ptr(),
+            name.len(),
+        );
+        SetFileInformationByHandle(
+            source.as_raw_handle().cast(),
+            FileRenameInfo,
+            information.cast(),
+            required as u32,
+        )
+    };
+    if renamed == 0 {
         Err(io::Error::last_os_error())
     } else {
         Ok(())

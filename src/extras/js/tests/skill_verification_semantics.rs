@@ -321,10 +321,11 @@ mod tests {
             vec![HostCapability::WriteFile],
         );
 
-        assert!(matches!(
-            verify_skill(&s),
-            Err(VerificationError::SourceEvaluationFailed(_))
-        ));
+        let result = verify_skill(&s);
+        assert!(
+            matches!(result, Err(VerificationError::SourceEvaluationFailed(_))),
+            "unexpected infinite-source result: {result:?}"
+        );
     }
 
     #[test]

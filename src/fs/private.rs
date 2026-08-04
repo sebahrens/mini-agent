@@ -69,11 +69,13 @@ fn same_open_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) 
 
     #[cfg(target_os = "macos")]
     {
+        use std::os::macos::fs::MetadataExt as MacOsMetadataExt;
+
         // APFS firmlinks can expose different synthetic device IDs even to
-        // separate descriptors for one file. The containing directory has
-        // already been verified as private and non-symlinked, so an inode
-        // match is the stable macOS identity proof at this boundary.
-        left.ino() == right.ino()
+        // separate descriptors for one file. The kernel generation prevents
+        // a recycled inode from being accepted while remaining stable across
+        // those synthetic views.
+        left.ino() == right.ino() && left.st_gen() == right.st_gen()
     }
     #[cfg(not(target_os = "macos"))]
     {

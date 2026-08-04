@@ -98,8 +98,10 @@ where
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileIdentity {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     Unix { device: u64, inode: u64 },
+    #[cfg(target_os = "macos")]
+    MacOs { inode: u64, generation: u32 },
     #[cfg(windows)]
     Windows {
         volume_serial_number: u64,
@@ -129,13 +131,25 @@ fn checked_owned_file(
     file: std::fs::File,
     metadata: std::fs::Metadata,
 ) -> std::io::Result<CheckedMetadata> {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     let identity = {
         use std::os::unix::fs::MetadataExt;
 
         FileIdentity::Unix {
             device: metadata.dev(),
             inode: metadata.ino(),
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let identity = {
+        use std::os::macos::fs::MetadataExt;
+
+        // APFS firmlinks can give two handles for one object different
+        // synthetic device IDs. Inode plus the kernel generation number is
+        // stable across those views and still rejects inode reuse.
+        FileIdentity::MacOs {
+            inode: metadata.st_ino(),
+            generation: metadata.st_gen(),
         }
     };
     #[cfg(windows)]

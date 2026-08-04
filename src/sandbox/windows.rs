@@ -1007,12 +1007,14 @@ fn reject_reparse_components(path: &Path) -> Result<(), String> {
 struct GrantedObject {
     file: File,
     directory: bool,
+    acl_mutated: bool,
 }
 
 struct AccessGrants {
     profile: AppContainerProfile,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
+    acl_roots: Vec<PathBuf>,
     objects: Vec<GrantedObject>,
     cleaned: bool,
     cleanup_attempted: bool,
@@ -1029,10 +1031,15 @@ impl AccessGrants {
         read_roots.dedup();
         write_roots.sort();
         write_roots.dedup();
+        let mut acl_roots = read_roots.clone();
+        acl_roots.extend(write_roots.iter().cloned());
+        acl_roots.sort();
+        acl_roots.dedup();
         Self {
             profile,
             read_roots,
             write_roots,
+            acl_roots,
             objects: Vec::new(),
             cleaned: false,
             cleanup_attempted: false,
@@ -1060,11 +1067,7 @@ impl AccessGrants {
         }
         self.cleanup_attempted = true;
         let mut first_error = None;
-        let mut roots = self.read_roots.clone();
-        roots.extend(self.write_roots.iter().cloned());
-        roots.sort();
-        roots.dedup();
-        for root in &roots {
+        for root in &self.acl_roots {
             if let Err(error) = revoke_tree(root, self.sid())
                 && first_error.is_none()
             {
@@ -1072,8 +1075,9 @@ impl AccessGrants {
             }
         }
         for object in self.objects.iter().rev() {
-            if let Err(error) =
-                update_access_ace(&object.file, object.directory, self.sid(), REVOKE_ACCESS, 0)
+            if object.acl_mutated
+                && let Err(error) =
+                    update_access_ace(&object.file, object.directory, self.sid(), REVOKE_ACCESS, 0)
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -1105,12 +1109,45 @@ impl Drop for AccessGrants {
 }
 
 fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> Result<(), String> {
+    if trusted_system_read_file(root)? {
+        // Windows system executables already carry the application-package
+        // read/execute grant and are commonly owned by TrustedInstaller. Keep
+        // a non-share-write/delete handle live to bind their identity without
+        // attempting an unauthorized DACL mutation.
+        let file = open_stable_path(
+            root,
+            false,
+            GENERIC_READ | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+        )?;
+        crate::fs::windows_file_identity(&file)
+            .map_err(|error| format!("sandbox: inspect trusted system identity: {error}"))?;
+        grants.acl_roots.retain(|candidate| candidate != root);
+        grants.objects.push(GrantedObject {
+            file,
+            directory: false,
+            acl_mutated: false,
+        });
+        return Ok(());
+    }
     grant_access_root(
         root,
         grants,
         parent,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
     )
+}
+
+fn trusted_system_read_file(path: &Path) -> Result<bool, String> {
+    let Some(system_root) = std::env::var_os("SystemRoot") else {
+        return Ok(false);
+    };
+    let system_root = canonical_root(Path::new(&system_root), "Windows system root")?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("sandbox: inspect trusted system path: {error}"))?;
+    Ok(metadata.is_file()
+        && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && path.starts_with(system_root))
 }
 
 fn grant_write_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> Result<(), String> {
@@ -1187,7 +1224,11 @@ fn grant_access_root(
         {
             return Err("sandbox: writable identity changed while applying ACL".into());
         }
-        grants.objects.push(GrantedObject { file, directory });
+        grants.objects.push(GrantedObject {
+            file,
+            directory,
+            acl_mutated: true,
+        });
         if directory {
             for entry in std::fs::read_dir(&resolved).map_err(|error| {
                 format!(
@@ -3501,5 +3542,25 @@ mod tests {
         assert_eq!(quote_windows_argument("a b"), "\"a b\"");
         assert_eq!(quote_windows_argument("a\\\"b"), "\"a\\\\\\\"b\"");
         assert_eq!(quote_windows_argument("a b\\"), "\"a b\\\\\"");
+    }
+
+    #[test]
+    fn windows_system_executables_use_the_preexisting_package_acl() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let command = resolve_program("cmd.exe", &cwd).expect("resolve system command");
+        assert!(
+            trusted_system_read_file(&command).expect("classify system command"),
+            "{}",
+            command.display()
+        );
+
+        let ordinary = std::env::temp_dir().join(format!(
+            "mini-agent-nonsystem-read-root-{}-{}.exe",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&ordinary, b"not an executable").expect("write ordinary fixture");
+        assert!(!trusted_system_read_file(&ordinary).expect("classify ordinary file"));
+        std::fs::remove_file(ordinary).expect("remove ordinary fixture");
     }
 }

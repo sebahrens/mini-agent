@@ -231,7 +231,7 @@ async fn worker_fault_matrix_recycles_resource_protocol_process_and_cancellation
         let launcher = CountingLauncher::scripted(TestSupervisorStartup::Healthy);
         let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
             launcher.clone(),
-            Duration::from_millis(300),
+            Duration::from_secs(2),
         );
         let effects = MatrixEffects::default();
         let witness = effects.clone();

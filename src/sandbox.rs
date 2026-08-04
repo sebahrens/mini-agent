@@ -1848,7 +1848,6 @@ impl Sandbox {
         if command_status != CommandStatus::Completed {
             exit_status = None;
         }
-        guard.disarm();
         self.take_cancelled(pid);
 
         let mut captured = captured.lock().unwrap_or_else(|e| e.into_inner());
@@ -1862,6 +1861,10 @@ impl Sandbox {
         if let Some(audit) = &audit {
             audit.emit(&output);
         }
+        // Keep the group accounted as active until its terminal audit has
+        // been emitted. Observers can then treat a zero group count as the
+        // completed lifecycle boundary, including cleanup and accounting.
+        guard.disarm();
         let _ = response_tx.send(output);
     }
 
