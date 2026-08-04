@@ -2113,15 +2113,7 @@ fn copy_directory_verified(
 #[allow(unsafe_code)]
 fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileRenameInfo, SetFileInformationByHandle,
-    };
-
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
     let stage_parent = stage
         .parent()
@@ -2135,45 +2127,20 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
             "staged directory and target do not share a parent",
         ));
     }
-    let name: Vec<u16> = canonical.as_os_str().encode_wide().collect();
-    if name.is_empty() || name.len() > (u32::MAX as usize / 2) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "migration target has an invalid file name",
-        ));
-    }
-
-    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    let source = std::fs::OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
-        .share_mode(share)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(stage)?;
-    let name_bytes = name.len() * std::mem::size_of::<u16>();
-    let required = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name_bytes;
-    let words = required.div_ceil(std::mem::size_of::<usize>());
-    let mut storage = vec![0usize; words];
-    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-
-    // With a null RootDirectory, Windows requires the complete destination
-    // path. Supplying only a leaf or pairing it with a parent directory handle
-    // is rejected as a cross-device move by hosted Windows filesystems.
-    // SAFETY: storage is aligned and large enough for the header plus the
-    // UTF-16 leaf, and the source directory handle remains live for the call.
+    let source: Vec<u16> = stage.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
+    // The paths were constructed as siblings beneath the private canonical
+    // parent. Omitting MOVEFILE_REPLACE_EXISTING makes publication
+    // create-if-absent, while WRITE_THROUGH preserves the migration's durable
+    // publication boundary. MoveFileExW accepts the verbatim paths used by the
+    // hosted runner without reinterpreting them as a cross-device handle move.
+    // SAFETY: both buffers are live, NUL-terminated UTF-16 paths and the API
+    // retains neither pointer after returning.
     let renamed = unsafe {
-        (*information).Anonymous.ReplaceIfExists = false;
-        (*information).RootDirectory = std::ptr::null_mut();
-        (*information).FileNameLength = name_bytes as u32;
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            (*information).FileName.as_mut_ptr(),
-            name.len(),
-        );
-        SetFileInformationByHandle(
-            source.as_raw_handle().cast(),
-            FileRenameInfo,
-            information.cast(),
-            required as u32,
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
         )
     };
     if renamed == 0 {

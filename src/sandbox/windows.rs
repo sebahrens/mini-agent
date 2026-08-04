@@ -2596,7 +2596,10 @@ fn run_runtime_probe() -> Result<i32, String> {
         .map_err(|e| format!("run write-boundary probe: {e}"))?;
     if !output.status.success() || !inside_file.exists() || outside_file.exists() {
         return Err(format!(
-            "explicit read/write boundary probe failed: {}",
+            "explicit read/write boundary probe failed: status={:?} inside={} outside={} stderr={}",
+            output.status.code(),
+            inside_file.exists(),
+            outside_file.exists(),
             String::from_utf8_lossy(&output.stderr)
         ));
     }
