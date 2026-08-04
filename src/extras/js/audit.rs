@@ -1283,8 +1283,15 @@ fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Resu
     } else if path.exists() {
         drop(crate::fs::open_private_file(path)?);
     }
+    #[cfg(target_os = "macos")]
+    let before = crate::fs::open_private_file(path)?;
+    #[cfg(not(target_os = "macos"))]
     let before = crate::fs::checked_path_metadata(path)?;
-    if before.file_type().is_symlink() || !before.is_file() {
+    #[cfg(target_os = "macos")]
+    let before_is_file = before.metadata()?.is_file();
+    #[cfg(not(target_os = "macos"))]
+    let before_is_file = !before.file_type().is_symlink() && before.is_file();
+    if !before_is_file {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "audit file is not a regular file",
@@ -1303,10 +1310,31 @@ fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Resu
         options.custom_flags(NOFOLLOW);
     }
     let file = options.open(path)?;
-    let opened = crate::fs::checked_file_metadata(&file)?;
-    let after = crate::fs::checked_path_metadata(path)?;
-    crate::fs::ensure_same_file(path, &before, &opened)?;
-    crate::fs::ensure_same_file(path, &opened, &after)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let before = before.metadata()?;
+        let opened = file.metadata()?;
+        let after = crate::fs::open_private_file(path)?.metadata()?;
+        if before.dev() != opened.dev()
+            || before.ino() != opened.ino()
+            || opened.dev() != after.dev()
+            || opened.ino() != after.ino()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "audit path changed during private open",
+            ));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let opened = crate::fs::checked_file_metadata(&file)?;
+        let after = crate::fs::checked_path_metadata(path)?;
+        crate::fs::ensure_same_file(path, &before, &opened)?;
+        crate::fs::ensure_same_file(path, &opened, &after)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
