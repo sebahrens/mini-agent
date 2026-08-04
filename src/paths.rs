@@ -2089,7 +2089,7 @@ fn copy_directory_verified(
             ));
         }
         sync_directory_tree(&stage)?;
-        std::fs::rename(&stage, canonical)?;
+        publish_staged_directory(&stage, canonical)?;
         sync_directory(parent)
     });
     match copy_result {
@@ -2107,6 +2107,36 @@ fn copy_directory_verified(
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let stage = stage
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let canonical = canonical
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both path buffers are NUL-terminated and retained for the
+    // synchronous call. The stage and target are constructed under the same
+    // already-validated parent directory.
+    if unsafe { MoveFileExW(stage.as_ptr(), canonical.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
+    std::fs::rename(stage, canonical)
 }
 
 fn existing_content_is_identical(left: &Path, right: &Path) -> bool {

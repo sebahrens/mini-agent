@@ -766,5 +766,8 @@ async fn lsp_process_manager_restarts_stopped_server() {
 
     manager.shutdown().await;
     assert_process_reaped(second_pid).await;
+    // The manager deliberately retains a stable workspace directory handle.
+    // Release it before asserting Windows can remove the fixture tree.
+    drop(manager);
     fixture.cleanup();
 }

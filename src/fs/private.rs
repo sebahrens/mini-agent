@@ -67,16 +67,13 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
 pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let before = super::checked_path_metadata(path).map_err(|error| {
-        if super::is_symlink_loop_error(&error) {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "private file is not an owned regular file",
-            )
-        } else {
-            error
-        }
-    })?;
+    // A retained descriptor is essential while permission is pending, but it
+    // is counterproductive for this immediate open/verify sequence: older
+    // APFS firmlink implementations can report a different device identity
+    // for the extra O_NOFOLLOW path descriptor. The ordinary lstat/open/fstat
+    // comparison remains race-safe because `file` keeps the selected inode
+    // alive until the final lstat has matched it.
+    let before = std::fs::symlink_metadata(path)?;
     if before.file_type().is_symlink() || !before.is_file() || before.uid() != current_uid() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -87,11 +84,21 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         .read(true)
         .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC)
         .open(path)?;
-    let opened = super::checked_file_metadata(&file)?;
-    super::ensure_same_file(path, &before, &opened)?;
+    let opened = file.metadata()?;
+    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Path changed after permission check: {}", path.display()),
+        ));
+    }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    let after = super::checked_path_metadata(path)?;
-    super::ensure_same_file(path, &opened, &after)?;
+    let after = std::fs::symlink_metadata(path)?;
+    if opened.dev() != after.dev() || opened.ino() != after.ino() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Path changed after permission check: {}", path.display()),
+        ));
+    }
     Ok(file)
 }
 

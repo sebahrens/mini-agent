@@ -472,6 +472,17 @@ pub fn load_with_paths(paths: &AppPaths, interactive: bool) -> (Config, bool) {
     )
 }
 
+fn fatal_config_load(message: String) -> ! {
+    #[cfg(test)]
+    panic!("{message}");
+
+    #[cfg(not(test))]
+    {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+}
+
 fn load_from_path(
     path: PathBuf,
     local_config_path: Option<&Path>,
@@ -479,13 +490,12 @@ fn load_from_path(
     interactive: bool,
 ) -> (Config, bool) {
     let is_first_startup = !path_entry_exists(&path).unwrap_or_else(|error| {
-        eprintln!(
+        fatal_config_load(format!(
             "error: failed to inspect config path ({}): {}\n\
              Fix the path or remove it to use defaults.",
             path.display(),
             error,
-        );
-        std::process::exit(1);
+        ))
     });
     #[allow(unused_mut)]
     let mut cfg: Config = if is_first_startup {
@@ -498,34 +508,31 @@ fn load_from_path(
             && let Ok(content) = toml::to_string(&default)
         {
             atomic_config_write(&path, &content).unwrap_or_else(|error| {
-                eprintln!(
+                fatal_config_load(format!(
                     "error: failed to create private config file ({}): {}\n\
                      Fix the path or its permissions, then restart.",
                     path.display(),
                     error,
-                );
-                std::process::exit(1);
+                ))
             });
         }
         default
     } else {
-        let content = read_config_content(&path).unwrap_or_else(|e| {
-            eprintln!(
+        let content = read_config_content(&path).unwrap_or_else(|error| {
+            fatal_config_load(format!(
                 "error: failed to read config file ({}): {}\n\
                  Fix the file or remove it to use defaults.",
                 path.display(),
-                e,
-            );
-            std::process::exit(1);
+                error,
+            ))
         });
         parse_config_content(&path, &content).unwrap_or_else(|error| {
-            eprintln!(
+            fatal_config_load(format!(
                 "error: {} is not a valid config: {}\n\
                  Fix the file or remove it to use defaults.",
                 path.display(),
                 error,
-            );
-            std::process::exit(1);
+            ))
         })
     };
 

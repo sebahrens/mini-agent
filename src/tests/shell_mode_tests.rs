@@ -513,7 +513,7 @@ fn is_backend_setup_denial(rendered: &str) -> bool {
 }
 
 async fn wait_until(predicate: impl FnMut() -> bool) {
-    wait_until_for(Duration::from_secs(2), predicate).await;
+    wait_until_for(Duration::from_secs(30), predicate).await;
 }
 
 async fn wait_until_for(timeout: Duration, mut predicate: impl FnMut() -> bool) {

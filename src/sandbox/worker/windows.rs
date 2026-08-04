@@ -413,7 +413,7 @@ mod feasibility {
     #[cfg(test)]
     use std::net::TcpListener;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::AsRawHandle;
     #[cfg(test)]
@@ -472,6 +472,7 @@ mod feasibility {
         GetProcessHeap, HEAP_ZERO_MEMORY, HeapAlloc, HeapFree,
     };
     use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
     use windows_sys::Win32::System::SystemServices::JOB_OBJECT_UILIMIT_ALL;
     use windows_sys::Win32::System::SystemServices::{
         PROCESS_MITIGATION_ASLR_POLICY, PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
@@ -2478,6 +2479,28 @@ mod feasibility {
         Ok(wide_string(&format!("\"{display}\"{arguments}")))
     }
 
+    fn system_windows_directory() -> Result<PathBuf, GateError> {
+        // The worker's current directory must be traversable by its zero-capability
+        // AppContainer. In particular, it cannot be the private executable snapshot
+        // directory used by the production launcher. Query Windows directly instead
+        // of trusting a caller-controlled SystemRoot environment value.
+        let mut buffer = vec![0u16; 32_768];
+        // SAFETY: `buffer` is writable for its full reported length and remains live
+        // for the synchronous call.
+        let length =
+            unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return Err(last_error("resolve system Windows directory"));
+        }
+        if length as usize >= buffer.len() {
+            return Err(GateError(
+                "system Windows directory exceeded the native path bound".to_string(),
+            ));
+        }
+        buffer.truncate(length as usize);
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+    }
+
     fn production_environment_block(hooks: &ProductionLaunchHooks) -> Result<Vec<u16>, GateError> {
         let marker = match hooks.child {
             ProductionChild::Worker | ProductionChild::FailureTest => INTERNAL_WORKER_MARKER_VALUE,
@@ -2519,15 +2542,8 @@ mod feasibility {
         }
         // SystemRoot is non-secret loader configuration required by Windows system DLL
         // resolution. No PATH, profile, credential, workspace, or application variable crosses.
-        if let Some(system_root) = std::env::var_os("SystemRoot") {
-            let system_root = system_root.to_string_lossy();
-            if system_root.contains('\0') || system_root.contains('=') {
-                return Err(GateError(
-                    "SystemRoot cannot enter the worker environment".to_string(),
-                ));
-            }
-            entries.push(format!("SystemRoot={system_root}"));
-        }
+        let system_root = system_windows_directory()?;
+        entries.push(format!("SystemRoot={}", system_root.to_string_lossy()));
         entries.sort_by_key(|entry| entry.to_ascii_lowercase());
         let mut block = Vec::new();
         for entry in entries {
@@ -2611,9 +2627,7 @@ mod feasibility {
         attributes.update_slice(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited_handles)?;
 
         let executable_wide = wide_null(executable.as_os_str())?;
-        let child_directory = executable
-            .parent()
-            .ok_or_else(|| GateError("worker executable has no parent directory".to_string()))?;
+        let child_directory = system_windows_directory()?;
         let child_directory_wide = wide_null(child_directory.as_os_str())?;
         let mut command_line = production_command_line(&executable, hooks.child)?;
         let environment = production_environment_block(&hooks)?;

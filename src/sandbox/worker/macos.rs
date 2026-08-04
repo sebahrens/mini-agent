@@ -650,9 +650,9 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
     let deadline = Instant::now() + PREFLIGHT_TIMEOUT;
     loop {
         // SAFETY: signal zero performs an existence check without modifying the process group.
-        if unsafe { libc::kill(-guardian, 0) } < 0
-            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        {
+        let group_absent = unsafe { libc::kill(-guardian, 0) } < 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if group_absent || !process_group_has_live_members(guardian)? {
             retry_busy_sweep(Instant::now() + SWEEP_CONTENTION_TIMEOUT, || {
                 stale_sweep::sweep_hosted_parent_death_publications(&publication_root)
             })?;
@@ -671,6 +671,80 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pid: u32,
+    parent_pid: u32,
+    process_group: u32,
+    status: u32,
+    command: [std::os::raw::c_char; 16],
+    flags: u32,
+    uid: u32,
+    gid: u32,
+    real_uid: u32,
+    real_gid: u32,
+    saved_uid: u32,
+    saved_gid: u32,
+    reserved: u32,
+}
+
+#[allow(unsafe_code)]
+fn process_group_has_live_members(group: libc::pid_t) -> io::Result<bool> {
+    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
+    const ZOMBIE_STATUS: u32 = 5;
+    unsafe extern "C" {
+        fn proc_listpgrppids(group: libc::pid_t, buffer: *mut libc::c_void, size: i32) -> i32;
+        fn proc_pidinfo(
+            pid: libc::pid_t,
+            flavor: i32,
+            argument: u64,
+            buffer: *mut libc::c_void,
+            size: i32,
+        ) -> i32;
+    }
+
+    // A process group made solely of dead, unreaped zombies has already lost
+    // all executable authority and can safely enter stale-publication cleanup.
+    let required = unsafe { proc_listpgrppids(group, std::ptr::null_mut(), 0) };
+    if required == 0 {
+        return Ok(false);
+    }
+    if required < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let item_size = std::mem::size_of::<libc::pid_t>();
+    let mut pids = vec![0; (required as usize).div_ceil(item_size)];
+    let read = unsafe {
+        proc_listpgrppids(
+            group,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * item_size) as i32,
+        )
+    };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    pids.truncate((read as usize) / item_size);
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let mut info = std::mem::MaybeUninit::<ProcBsdShortInfo>::uninit();
+        let received = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDT_SHORTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<ProcBsdShortInfo>() as i32,
+            )
+        };
+        if received == std::mem::size_of::<ProcBsdShortInfo>() as i32
+            && unsafe { info.assume_init() }.status != ZOMBIE_STATUS
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn retry_busy_sweep(
@@ -1278,7 +1352,7 @@ fn executable_fails_with(path: &Path, expected_errors: &[i32]) -> bool {
             // rejects image activation. Accept only a prompt unsuccessful
             // child outcome; success proves the alternate image executed, and
             // a live child is killed and treated as a failed canary.
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + PREFLIGHT_TIMEOUT;
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => return !status.success(),

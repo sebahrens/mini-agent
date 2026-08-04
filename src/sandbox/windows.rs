@@ -53,7 +53,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
-    OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+    OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
@@ -1617,7 +1617,7 @@ fn protect_and_attest_control_root(root: &Path) -> Result<(), String> {
     let directory = open_stable_path(
         root,
         true,
-        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     )?;
     let user = current_user_sid_buffer()?;
@@ -1646,8 +1646,10 @@ fn protect_and_attest_control_root(root: &Path) -> Result<(), String> {
         SetSecurityInfo(
             directory.as_raw_handle(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            user_sid,
             null_mut(),
             dacl,
             null_mut(),
