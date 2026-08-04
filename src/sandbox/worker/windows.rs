@@ -3123,7 +3123,14 @@ mod feasibility {
                     "an untrusted principal owns a Windows gate executable".to_string(),
                 ));
             }
-            inspect_acl(security.dacl, &policy, null_mut(), false, false)?;
+            // These are test-owned build/install artifacts whose inherited
+            // hosted-runner ACL is precisely what this setup repairs. Do not
+            // apply the production source-artifact ACL gate before repairing
+            // it: GitHub's build directories intentionally grant Users write
+            // access. Ownership is still restricted to the same trusted
+            // principals as production validation, and open_private_file
+            // reopens the exact non-reparse file, verifies ownership and file
+            // identity, then commits and attests a protected user-only DACL.
             if !sid_equal(security.owner, policy.user.as_psid()) {
                 let mut path = wide_null(executable.as_os_str())?;
                 // Hosted Windows runners can create Cargo outputs with the
