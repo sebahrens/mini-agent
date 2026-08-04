@@ -68,8 +68,9 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, CreateDesktopW, DESKTOP_CREATEWINDOW, DESKTOP_READOBJECTS,
-    GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, HDESK, UOI_NAME,
+    CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
+    GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, HDESK, HWINSTA,
+    SetProcessWindowStation, UOI_NAME,
 };
 use windows_sys::Win32::System::SystemServices::{
     JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE, JOB_OBJECT_UILIMIT_ALL, SECURITY_DESCRIPTOR_REVISION,
@@ -284,6 +285,7 @@ struct CleanupProof {
 }
 
 struct PrivateDesktop {
+    station: HWINSTA,
     handle: HDESK,
     name: String,
     startup_name: Vec<u16>,
@@ -293,6 +295,9 @@ impl Drop for PrivateDesktop {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe { CloseDesktop(self.handle) };
+        }
+        if !self.station.is_null() {
+            unsafe { CloseWindowStation(self.station) };
         }
     }
 }
@@ -1387,39 +1392,55 @@ fn update_handle_ace(
 }
 
 fn private_desktop(sid: PSID) -> Result<PrivateDesktop, String> {
-    let station = unsafe { GetProcessWindowStation() };
+    let station_name = format!("mini-agent-{}", uuid::Uuid::new_v4());
+    let station_name_wide = wide_string(&station_name);
+    let station =
+        unsafe { CreateWindowStationW(station_name_wide.as_ptr(), 0, GENERIC_ALL, null()) };
     if station.is_null() {
-        return Err(last_error("get sandbox helper window station"));
+        return Err(last_error("create private sandbox window station"));
     }
-    let station_name = user_object_name(station, "sandbox window-station")?;
+    let mut desktop = PrivateDesktop {
+        station,
+        handle: null_mut(),
+        name: String::new(),
+        startup_name: Vec::new(),
+    };
+    update_handle_ace(
+        desktop.station,
+        SE_WINDOW_OBJECT,
+        sid,
+        GRANT_ACCESS,
+        GENERIC_ALL,
+        0,
+    )?;
+    if unsafe { SetProcessWindowStation(desktop.station) } == 0 {
+        return Err(last_error("select private sandbox window station"));
+    }
+    let station_name = user_object_name(desktop.station, "sandbox window-station")?;
     let desktop_name = format!("mini-agent-{}", uuid::Uuid::new_v4());
     let desktop_name_wide = wide_string(&desktop_name);
-    let child_desired = DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS;
-    let creator_desired = child_desired | READ_CONTROL | WRITE_DAC;
     let handle = unsafe {
         CreateDesktopW(
             desktop_name_wide.as_ptr(),
             null(),
             null(),
             0,
-            creator_desired,
+            GENERIC_ALL,
             null(),
         )
     };
     if handle.is_null() {
         return Err(last_error("create private sandbox desktop"));
     }
-    let desktop = PrivateDesktop {
-        handle,
-        name: desktop_name.clone(),
-        startup_name: wide_string(&format!("{station_name}\\{desktop_name}")),
-    };
+    desktop.handle = handle;
+    desktop.name = desktop_name.clone();
+    desktop.startup_name = wide_string(&format!("{station_name}\\{desktop_name}"));
     update_handle_ace(
         desktop.handle,
         SE_WINDOW_OBJECT,
         sid,
         GRANT_ACCESS,
-        child_desired,
+        GENERIC_ALL,
         0,
     )?;
     Ok(desktop)

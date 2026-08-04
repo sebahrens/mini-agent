@@ -655,6 +655,21 @@ pub(crate) fn ensure_same_file(
     if checked.identity == current.identity {
         Ok(())
     } else {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = path;
+            let (FileIdentity::MacOs(checked), FileIdentity::MacOs(current)) =
+                (checked.identity, current.identity);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "macOS checked identity changed: volume_match={} file_match={}",
+                    checked.volume_uuid == current.volume_uuid,
+                    checked.file_id == current.file_id
+                ),
+            ));
+        }
+        #[cfg(not(target_os = "macos"))]
         Err(path_changed_error(path))
     }
 }
