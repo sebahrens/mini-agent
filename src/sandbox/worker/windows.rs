@@ -440,10 +440,10 @@ mod feasibility {
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
         AclSizeInformation, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
-        GetAce, GetAclInformation, GetLengthSid, GetTokenInformation, INHERITED_ACE, IsValidSid,
-        NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
-        SECURITY_CAPABILITIES, TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenIsAppContainer,
-        TokenIsLessPrivilegedAppContainer, TokenUser, WinAuthenticatedUserSid,
+        GetAce, GetAclInformation, GetLengthSid, GetTokenInformation, INHERIT_ONLY_ACE,
+        INHERITED_ACE, IsValidSid, NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSID,
+        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, TOKEN_QUERY, TOKEN_USER, TokenCapabilities,
+        TokenIsAppContainer, TokenIsLessPrivilegedAppContainer, TokenUser, WinAuthenticatedUserSid,
         WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid, WinBuiltinUsersSid,
         WinLocalSystemSid, WinWorldSid,
     };
@@ -1200,6 +1200,10 @@ mod feasibility {
             != 0
     }
 
+    pub(super) fn ace_is_effective(flags: u8) -> bool {
+        u32::from(flags) & INHERIT_ONLY_ACE == 0
+    }
+
     fn inspect_acl(
         dacl: *mut ACL,
         policy: &SidPolicy,
@@ -1235,6 +1239,9 @@ mod feasibility {
             }
             if usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>() {
                 return Err(GateError("DACL contains a truncated ACE".to_string()));
+            }
+            if !ace_is_effective(header.AceFlags) {
+                continue;
             }
             let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
             let sid = (&ace.SidStart as *const u32).cast_mut().cast();
@@ -4154,6 +4161,7 @@ mod tests {
     #[test]
     fn windows_lpac_acl_policy_distinguishes_rx_from_mutation() {
         use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ};
+        use windows_sys::Win32::Security::INHERIT_ONLY_ACE;
         use windows_sys::Win32::Storage::FileSystem::{
             DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_WRITE_DATA,
         };
@@ -4168,6 +4176,10 @@ mod tests {
         ));
         assert!(super::feasibility::dangerous_write_mask(FILE_WRITE_DATA));
         assert!(super::feasibility::dangerous_write_mask(DELETE));
+        assert!(super::feasibility::ace_is_effective(0));
+        assert!(!super::feasibility::ace_is_effective(
+            INHERIT_ONLY_ACE as u8
+        ));
         assert!(super::feasibility::package_allow_set_is_exact(&[(
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             0

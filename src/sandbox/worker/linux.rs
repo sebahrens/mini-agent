@@ -429,6 +429,7 @@ fn broker_only_command(
     Ok(command)
 }
 
+#[allow(unsafe_code)]
 fn close_inherited_descriptors(command: &mut Command) {
     // Bubblewrap versions packaged by supported Linux distributions do not all expose
     // `--close-fds`. Close everything above the protocol streams before exec instead. The

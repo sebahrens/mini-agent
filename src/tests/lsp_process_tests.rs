@@ -375,11 +375,19 @@ async fn wait_for_file_contains(path: &Path, pattern: &str) -> String {
 }
 
 async fn wait_for_pid(path: &Path) -> u32 {
-    wait_for_file(path)
-        .await
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("fixture PID was invalid in {}", path.display()))
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(value) = fs::read_to_string(path)
+                && let Ok(pid) = value.trim().parse::<u32>()
+                && pid != 0
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fixture PID was invalid in {}", path.display()))
 }
 
 fn process_is_alive(pid: u32) -> bool {
@@ -455,8 +463,13 @@ async fn lsp_process_launch_uses_canonical_root_and_delegated_environment() {
     let parent_pid = wait_for_pid(&lease).await;
     let observed = wait_for_file(&probe).await;
     let canonical = workspace.canonicalize().unwrap();
-    assert!(
-        observed.contains(&format!("cwd={}", canonical.display())),
+    let observed_cwd = observed
+        .lines()
+        .find_map(|line| line.strip_prefix("cwd="))
+        .expect("child probe should report its working directory");
+    assert_eq!(
+        PathBuf::from(observed_cwd).canonicalize().unwrap(),
+        canonical,
         "child cwd was not canonical: {observed}"
     );
     assert!(observed.contains("ambient=<missing>"), "{observed}");

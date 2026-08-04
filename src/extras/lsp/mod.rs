@@ -211,22 +211,25 @@ impl LspManager {
     /// Syncs a file's disk content with its language server (no-op when no
     /// server handles the extension or the server failed to start).
     pub async fn notify_changed(&self, path: &Path) {
-        if !self.handles(path) {
+        let Ok(path) = std::fs::canonicalize(path) else {
+            return;
+        };
+        if !self.handles(&path) {
             return;
         }
         // Open and bind the file identity before a server is selected or
         // launched. If a path approved by the caller is replaced by a symlink
         // while permission is pending, the replacement content is never read
         // and never reaches an LSP process.
-        let Ok(mut file) = crate::fs::open_stable_file(path).await else {
+        let Ok(mut file) = crate::fs::open_stable_file(&path).await else {
             return;
         };
         let mut text = String::new();
         if file.read_to_string(&mut text).await.is_err() {
             return;
         }
-        if let Some(client) = self.client_for(path).await {
-            client.sync_text(path, text).await;
+        if let Some(client) = self.client_for(&path).await {
+            client.sync_text(&path, text).await;
         }
     }
 

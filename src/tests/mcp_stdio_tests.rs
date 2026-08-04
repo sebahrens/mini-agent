@@ -70,7 +70,7 @@ fn tool_payload() -> String {
         .collect::<Vec<_>>()
         .join(",");
     let configured = env::var("MCP_FIXTURE_CONFIGURED").unwrap_or_default();
-    let inherited_home = env::var("HOME").ok();
+    let inherited_home = env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok();
     let inherited_env = env::var_os("PATH").is_some();
     let cwd = env::current_dir().unwrap();
     let executable = env::current_exe().unwrap();
@@ -581,8 +581,9 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
         "normal",
         &inherited_lease,
     );
+    let home_variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     if let McpServerConfig::Command { inherit_env, .. } = &mut inherited_config {
-        inherit_env.push("HOME".to_string());
+        inherit_env.push(home_variable.to_string());
     }
     let inherited_handle =
         McpClientHandle::connect(CompactString::new("fixture"), &inherited_config)
@@ -594,7 +595,7 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
     };
     assert_eq!(
         call_fixture_tool(&inherited_manager).await["inherited_home"],
-        std::env::var("HOME").unwrap()
+        std::env::var(home_variable).unwrap()
     );
     let inherited_pid = wait_for_pid(&inherited_lease).await;
     shutdown(inherited_manager).await;

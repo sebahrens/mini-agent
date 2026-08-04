@@ -101,6 +101,7 @@ pub struct JsonlSessionImport {
     pub messages: Vec<SessionMessage>,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum ParsedSessionFile {
     Native(Session),
     Jsonl(JsonlSessionImport),

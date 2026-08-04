@@ -57,7 +57,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 "ubuntu-latest",
             ),
             "macos-worker-containment-gate": (
-                "macos_js_worker_containment",
+                "MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE=production-binary-v1",
                 "macos-15",
             ),
             "windows-worker-containment-gate": (
@@ -70,7 +70,13 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 body = job_body(self.workflow, job)
                 self.assertIn(runner, body)
                 self.assertIn(probe, body)
-                self.assertRegex(body, rf"(?s){probe}.+Count.+(?:-eq|-ne) 1|count.+-eq 1")
+                if job == "macos-worker-containment-gate":
+                    self.assertIn("MACOS_CONTAINMENT_MATRIX_V1=passed", body)
+                else:
+                    self.assertRegex(
+                        body,
+                        rf"(?s){probe}.+Count.+(?:-eq|-ne) 1|count.+-eq 1",
+                    )
                 self.assertRegex(body.lower(), r"shared_?suites")
                 self.assertRegex(body.lower(), r"skills_?suites")
                 self.assertEqual(

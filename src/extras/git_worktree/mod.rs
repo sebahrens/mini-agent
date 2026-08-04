@@ -1751,9 +1751,10 @@ async fn rollback_merge_index(state: &MergeState) -> Result<(), String> {
             "restore-missing-target-ref",
         )
         .await?;
-        return Err(format!(
+        return Err(
             "missing target ref was restored safely, but index/tree state was retained for recovery"
-        ));
+                .to_string(),
+        );
     }
     let observed_target = observed_target.expect("missing target handled above");
     let observed_is_owned = state.target_head_before_pull.as_deref() == Some(&observed_target)
@@ -1774,9 +1775,10 @@ async fn rollback_merge_index(state: &MergeState) -> Result<(), String> {
         )
         .await?;
     }
-    Err(format!(
+    Err(
         "target ref was rolled back safely, but index/tree state was retained for recovery"
-    ))
+            .to_string(),
+    )
 }
 
 async fn compare_and_set_direct_ref(

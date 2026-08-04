@@ -39,10 +39,10 @@ const HOSTED_PASS_RECORD: &str = "MACOS_CONTAINMENT_MATRIX_V1=passed";
 // Only majors that passed the exact non-libtest production-binary matrix are enabled. Ready alone
 // is never availability evidence. macOS 26 passed on 26.5.2; other majors remain fail closed.
 const VALIDATED_MACOS_MAJORS: &[u32] = &[26];
-// Darwin maps the dyld shared-cache address range into every process. On macOS 26 this makes any
-// limit below roughly 40 GiB invalid even though those pages are not resident. QuickJS retains its
-// independent 64 MiB allocator cap; this finite process ceiling bounds native address growth.
-const ADDRESS_SPACE_LIMIT: libc::rlim_t = 40 * 1024 * 1024 * 1024;
+// Darwin maps the dyld shared-cache address range into every process. Leave enough virtual-address
+// headroom for that non-resident mapping; the inherited hard limit may impose a stricter ceiling.
+// QuickJS retains its independent 64 MiB allocator cap.
+const ADDRESS_SPACE_LIMIT: libc::rlim_t = 64 * 1024 * 1024 * 1024;
 const CPU_LIMIT_SECONDS: libc::rlim_t = 35;
 const FILE_DESCRIPTOR_LIMIT: libc::rlim_t = 64;
 const FILE_SIZE_LIMIT: libc::rlim_t = 1024 * 1024;
@@ -1033,6 +1033,16 @@ fn finalize_guardian_process() -> io::Result<RawFd> {
 
 #[allow(unsafe_code)]
 fn set_limit(resource: libc::c_int, value: libc::rlim_t) -> io::Result<()> {
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(resource, &mut inherited) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // An unprivileged child cannot raise a hard limit inherited from the host.
+    // Retaining the stricter value still leaves the worker unable to relax it.
+    let value = bounded_limit(value, inherited.rlim_max);
     let limit = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,
@@ -1054,6 +1064,14 @@ fn set_limit(resource: libc::c_int, value: libc::rlim_t) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+const fn bounded_limit(requested: libc::rlim_t, inherited_max: libc::rlim_t) -> libc::rlim_t {
+    if requested < inherited_max {
+        requested
+    } else {
+        inherited_max
+    }
 }
 
 pub(super) fn attest_hosted_worker_containment() -> bool {
@@ -1294,8 +1312,9 @@ fn resource_limits_match() -> bool {
             rlim_max: 0,
         };
         (unsafe { libc::getrlimit(resource, &mut observed) }) == 0
-            && observed.rlim_cur == expected
-            && observed.rlim_max == expected
+            && observed.rlim_cur == observed.rlim_max
+            && observed.rlim_cur <= expected
+            && (expected == 0 || observed.rlim_cur > 0)
     })
 }
 
@@ -3836,5 +3855,12 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn guardian_limits_preserve_stricter_inherited_hard_limits() {
+        assert_eq!(bounded_limit(64, 32), 32);
+        assert_eq!(bounded_limit(64, 128), 64);
+        assert_eq!(bounded_limit(0, 128), 0);
     }
 }

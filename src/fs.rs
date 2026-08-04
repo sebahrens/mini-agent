@@ -177,7 +177,7 @@ pub(crate) fn checked_path_metadata(path: &Path) -> std::io::Result<CheckedMetad
         #[cfg(target_os = "linux")]
         let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         #[cfg(target_os = "macos")]
-        let flags = libc::O_EVTONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
         // SAFETY: `path_bytes` is NUL-terminated and a successful descriptor
@@ -1853,6 +1853,21 @@ mod tests {
         assert!(checked.handle.metadata().is_ok());
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CheckedMetadata>();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_path_and_open_file_metadata_use_the_same_identity() {
+        let directory = TestDirectory::new("path_and_file_identity");
+        let path = directory.path().join("checked.txt");
+        std::fs::write(&path, b"identity").expect("write checked file");
+
+        let path_metadata = checked_path_metadata(&path).expect("capture path identity");
+        let file = std::fs::File::open(&path).expect("open checked file");
+        let file_metadata = checked_file_metadata(&file).expect("capture file identity");
+
+        ensure_same_file(&path, &path_metadata, &file_metadata)
+            .expect("path and open handle must identify the same file");
     }
 
     #[cfg(unix)]

@@ -2420,7 +2420,7 @@ mod sandbox_tests {
 
     #[test]
     fn windows_appcontainer_source_covers_general_process_security_contract() {
-        let source = include_str!("sandbox/windows.rs");
+        let source = include_str!("sandbox/windows.rs").replace("\r\n", "\n");
         for required in [
             "CreateAppContainerProfile",
             "DeriveAppContainerSidFromAppContainerName",
