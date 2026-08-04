@@ -368,17 +368,17 @@ mod tests {
         working_dir: &Path,
         ask_tx: Option<crate::permission::ask::AskSender>,
     ) -> SubagentAuthorization {
-        let checker = PermissionChecker::new(
-            &PermissionConfigs::default(),
-            SecurityMode::Standard,
-            Some(working_dir.to_path_buf()),
-            Some(vec!["standard".to_string()]),
-        )
-        .expect("valid permission test configuration");
         let workspace = std::sync::Arc::new(
             crate::paths::WorkspaceBinding::capture(working_dir)
                 .expect("capture subagent test workspace"),
         );
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace.root().to_path_buf()),
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid permission test configuration");
         SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), ask_tx, true)
             .with_workspace_binding(Some(workspace))
     }

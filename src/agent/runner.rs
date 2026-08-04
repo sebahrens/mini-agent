@@ -543,6 +543,17 @@ fn attributed_tool_result(
     Some((CompactString::new(call.name), output))
 }
 
+fn append_attributed_tool_result(
+    tracker: &mut ToolCallTracker,
+    interactions: &mut Vec<Message>,
+    internal_call_id: &str,
+    tool_result: &ToolResult,
+) -> Option<(CompactString, String)> {
+    let attributed = attributed_tool_result(tracker, internal_call_id, tool_result)?;
+    interactions.push(tool_result.clone().into());
+    Some(attributed)
+}
+
 async fn finalize_interactive_tool_calls(
     tracker: &mut ToolCallTracker,
     interactions: &mut Vec<Message>,
@@ -1553,9 +1564,9 @@ where
                                 .await;
                             return;
                         }
-                        interactions.push(tool_result.clone().into());
-                        let Some((tool_name, output)) = attributed_tool_result(
+                        let Some((tool_name, output)) = append_attributed_tool_result(
                             &mut tool_calls,
+                            &mut interactions,
                             &internal_call_id,
                             &tool_result,
                         ) else {
@@ -2000,9 +2011,12 @@ where
                         tool_calls.finalize_unresolved(&mut interactions);
                         anyhow::bail!(token_budget_exhaustion_message(used, budget));
                     }
-                    let Some((name, output)) =
-                        attributed_tool_result(&mut tool_calls, &internal_call_id, &tool_result)
-                    else {
+                    let Some((name, output)) = append_attributed_tool_result(
+                        &mut tool_calls,
+                        &mut interactions,
+                        &internal_call_id,
+                        &tool_result,
+                    ) else {
                         continue;
                     };
                     if pure_stdout && !output.is_empty() {
@@ -2017,7 +2031,6 @@ where
                         }
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
-                    interactions.push(tool_result.clone().into());
                 }
                 Ok(MultiTurnStreamItem::CompletionCall(call)) => {
                     turns_used = turns_used.saturating_add(1);
@@ -2282,8 +2295,8 @@ mod tests {
     use super::{
         MAX_PENDING_TOOL_CALLS, NonTerminalStreamExhausted, RunnerStreamPolicy, ToolCallTracker,
         ToolCallTrackerError, UNKNOWN_TOOL_OUTCOME, UNRESOLVED_TOOL_CALLS_ERROR, UsageLedger,
-        attributed_tool_result, charge_nonterminal_eof, completed_stream_delta,
-        streamed_reasoning_text, warn_unknown_stream_item,
+        append_attributed_tool_result, attributed_tool_result, charge_nonterminal_eof,
+        completed_stream_delta, streamed_reasoning_text, warn_unknown_stream_item,
     };
     use futures::StreamExt;
     use rig::OneOrMany;
@@ -4326,14 +4339,19 @@ mod tests {
             .unwrap();
 
         assert!(
-            attributed_tool_result(
+            append_attributed_tool_result(
                 &mut tracker,
+                &mut interactions,
                 "stable-internal",
                 &text_result("wrong-provider", "malformed"),
             )
             .is_none()
         );
         assert_eq!(tracker.pending.len(), 1);
+        assert!(
+            interactions.is_empty(),
+            "a rejected provider result must not enter persisted history"
+        );
         let finalized = tracker.finalize_unresolved(&mut interactions);
         assert_eq!(finalized.len(), 1);
         assert_eq!(finalized[0].internal_call_id, "stable-internal");

@@ -736,17 +736,19 @@ mod execution_authority_tests {
     }
 
     #[test]
-    fn configured_authority_materializes_default_unavailability_as_disabled() {
+    fn configured_authority_rejects_configured_unavailable_backend() {
         let cfg = Config {
             sandbox_backend: Some("definitely-not-a-real-backend".to_string()),
             ..Config::default()
         };
 
-        let (authority, sandbox) =
-            resolve_configured_execution_authority(&Cli::default(), &cfg).unwrap();
+        let error = resolve_configured_execution_authority(&Cli::default(), &cfg)
+            .expect_err("a configured backend is an explicit fail-closed selection");
 
-        assert_eq!(authority.sandbox, SandboxResolution::DegradedUnavailable);
-        assert_eq!(sandbox.policy(), SandboxPolicy::Disabled);
+        assert_eq!(
+            error.to_string(),
+            "sandbox backend 'definitely-not-a-real-backend' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
+        );
     }
 }
 

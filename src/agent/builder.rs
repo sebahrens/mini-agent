@@ -23,8 +23,11 @@ use crate::sandbox::Sandbox;
 /// `SUFFIX.md`. Extracted from [`build_agent_inner`] so its token cost can be
 /// estimated (see [`estimate_overhead`]) without building an `Agent`.
 pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String {
-    let workspace_root = std::env::current_dir().ok();
-    build_preamble_for_workspace(context, reasoning_enabled, workspace_root.as_deref())
+    build_preamble_for_workspace(
+        context,
+        reasoning_enabled,
+        Some(context.workspace_root.as_path()),
+    )
 }
 
 pub(crate) fn build_preamble_for_workspace(
