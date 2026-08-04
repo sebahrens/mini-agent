@@ -2110,6 +2110,7 @@ fn copy_directory_verified(
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};

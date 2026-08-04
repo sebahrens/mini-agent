@@ -67,12 +67,12 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
 pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    // A retained descriptor is essential while permission is pending, but it
-    // is counterproductive for this immediate open/verify sequence: older
-    // APFS firmlink implementations can report a different device identity
-    // for the extra O_NOFOLLOW path descriptor. The ordinary lstat/open/fstat
-    // comparison remains race-safe because `file` keeps the selected inode
-    // alive until the final lstat has matched it.
+    // Use lstat only to reject an initial symlink before opening. On APFS,
+    // especially across the /Users firmlink, path and descriptor metadata can
+    // legitimately report different device IDs for the same inode. The final
+    // identity proof therefore compares two independently opened descriptors,
+    // which use the same metadata view while `file` keeps the selected inode
+    // alive throughout the check.
     let before = std::fs::symlink_metadata(path)?;
     if before.file_type().is_symlink() || !before.is_file() || before.uid() != current_uid() {
         return Err(std::io::Error::new(
@@ -85,14 +85,18 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC)
         .open(path)?;
     let opened = file.metadata()?;
-    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+    if !opened.is_file() || opened.uid() != current_uid() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("Path changed after permission check: {}", path.display()),
+            "private file is not an owned regular file",
         ));
     }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    let after = std::fs::symlink_metadata(path)?;
+    let current = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC)
+        .open(path)?;
+    let after = current.metadata()?;
     if opened.dev() != after.dev() || opened.ino() != after.ino() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
