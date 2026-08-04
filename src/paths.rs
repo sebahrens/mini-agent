@@ -2113,7 +2113,7 @@ fn copy_directory_verified(
 #[allow(unsafe_code)]
 fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
     let stage_parent = stage
         .parent()
@@ -2131,18 +2131,13 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     let destination: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
     // The paths were constructed as siblings beneath the private canonical
     // parent. Omitting MOVEFILE_REPLACE_EXISTING makes publication
-    // create-if-absent, while WRITE_THROUGH preserves the migration's durable
-    // publication boundary. MoveFileExW accepts the verbatim paths used by the
-    // hosted runner without reinterpreting them as a cross-device handle move.
+    // create-if-absent. A zero-flag MoveFileExW is the atomic same-volume
+    // directory rename; WRITE_THROUGH instead selects copy/delete durability
+    // behavior and can report ERROR_NOT_SAME_DEVICE for this directory case.
+    // The caller syncs the parent immediately after this publication boundary.
     // SAFETY: both buffers are live, NUL-terminated UTF-16 paths and the API
     // retains neither pointer after returning.
-    let renamed = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    };
+    let renamed = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
     if renamed == 0 {
         Err(io::Error::last_os_error())
     } else {

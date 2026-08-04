@@ -64,10 +64,6 @@ where
     }
 
     const ATTRIBUTE_BITMAP_COUNT: u16 = 5;
-    // APFS firmlinks can expose a synthetic device identity that changes
-    // between path resolutions. Ask Darwin for the underlying device view so
-    // independently opened descriptors produce the same volume identity.
-    const FSOPT_RETURN_REALDEV: u32 = 0x0000_0200;
     let attributes = MacOsAttrList {
         bitmap_count: ATTRIBUTE_BITMAP_COUNT,
         reserved: 0,
@@ -86,7 +82,7 @@ where
             (&attributes as *const MacOsAttrList).cast(),
             buffer.as_mut_ptr().cast(),
             buffer.len(),
-            FSOPT_RETURN_REALDEV,
+            0,
         )
     } != 0
     {
