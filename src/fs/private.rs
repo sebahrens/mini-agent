@@ -31,6 +31,14 @@ const OPEN_CLOEXEC: std::os::raw::c_int = 0x100_0000;
 const OPEN_CLOEXEC: std::os::raw::c_int = 0;
 
 #[cfg(unix)]
+fn stage_error(stage: &'static str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("private persistence failed at {stage}: {error}"),
+    )
+}
+
+#[cfg(unix)]
 pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -43,9 +51,12 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
 
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
-    builder.create(path)?;
+    builder
+        .create(path)
+        .map_err(|error| stage_error("directory_create", error))?;
 
-    let before = super::checked_path_metadata(path)?;
+    let before = super::checked_path_metadata(path)
+        .map_err(|error| stage_error("directory_initial_identity", error))?;
     if before.file_type().is_symlink() || !before.is_dir() || before.uid() != current_uid() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -55,12 +66,19 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(OPEN_DIRECTORY | OPEN_NOFOLLOW | OPEN_CLOEXEC)
-        .open(path)?;
-    let opened = super::checked_file_metadata(&directory)?;
-    super::ensure_same_file(path, &before, &opened)?;
-    directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-    let after = super::checked_path_metadata(path)?;
+        .open(path)
+        .map_err(|error| stage_error("directory_open", error))?;
+    let opened = super::checked_file_metadata(&directory)
+        .map_err(|error| stage_error("directory_open_identity", error))?;
+    super::ensure_same_file(path, &before, &opened)
+        .map_err(|error| stage_error("directory_initial_revalidation", error))?;
+    directory
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| stage_error("directory_permissions", error))?;
+    let after = super::checked_path_metadata(path)
+        .map_err(|error| stage_error("directory_final_identity", error))?;
     super::ensure_same_file(path, &opened, &after)
+        .map_err(|error| stage_error("directory_final_revalidation", error))
 }
 
 #[cfg(unix)]
@@ -155,7 +173,7 @@ pub(crate) fn atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             "private file must have a parent directory",
         )
     })?;
-    ensure_directory(parent)?;
+    ensure_directory(parent).map_err(|error| stage_error("create_parent", error))?;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(std::io::Error::new(
@@ -170,10 +188,11 @@ pub(crate) fn atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(stage_error("create_target_inspection", error)),
     }
-    super::atomic_create_sync(path, bytes)?;
-    drop(open_existing(path)?);
+    super::atomic_create_sync(path, bytes)
+        .map_err(|error| stage_error("create_publication", error))?;
+    drop(open_existing(path).map_err(|error| stage_error("create_final_revalidation", error))?);
     Ok(())
 }
 

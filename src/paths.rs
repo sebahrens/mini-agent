@@ -2159,14 +2159,12 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
         .open(stage)?;
     let parent = std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(share)
+        // Denying delete sharing pins the absolute parent path while Windows
+        // resolves the target name supplied to FileRenameInfo below.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(canonical_parent)?;
-    let target_name = canonical
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no filename"))?
-        .encode_wide()
-        .collect::<Vec<_>>();
+    let target_name = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
     let name_bytes = target_name
         .len()
         .checked_mul(size_of::<u16>())
@@ -2193,7 +2191,9 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     // handles and the buffer remain live for the synchronous system call.
     unsafe {
         (*information).Anonymous.ReplaceIfExists = false;
-        (*information).RootDirectory = parent.as_raw_handle().cast();
+        // SetFileInformationByHandle documents NULL as the common Win32 form;
+        // the pinned parent above keeps this absolute target bound meanwhile.
+        (*information).RootDirectory = std::ptr::null_mut();
         (*information).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,

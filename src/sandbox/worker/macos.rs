@@ -647,18 +647,26 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
         io::Error::other("macOS parent-death canary record was invalid")
     })?;
     let orphan_path = publication_root.join(&orphan);
-    let orphan_metadata = std::fs::symlink_metadata(&orphan_path)
-        .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=publication_missing"))?;
-    if !orphan_metadata.is_dir()
-        || orphan_metadata.uid() != current_uid()
-        || orphan_metadata.mode() & 0o7777 != 0o700
-    {
-        eprintln!("MACOS_PARENT_DEATH_FAILED=publication_identity");
-        return Err(io::Error::other(
-            "macOS parent-death publication identity was invalid",
-        ));
-    }
-    let orphan_identity = (orphan_metadata.dev(), orphan_metadata.ino());
+    let orphan_identity = match std::fs::symlink_metadata(&orphan_path) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && metadata.uid() == current_uid()
+                && metadata.mode() & 0o7777 == 0o700 =>
+        {
+            Some((metadata.dev(), metadata.ino()))
+        }
+        Ok(_) => {
+            eprintln!("MACOS_PARENT_DEATH_FAILED=publication_identity");
+            return Err(io::Error::other(
+                "macOS parent-death publication identity was invalid",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            eprintln!("MACOS_PARENT_DEATH_FAILED=publication_query");
+            return Err(error);
+        }
+    };
     let deadline = Instant::now() + PREFLIGHT_TIMEOUT;
     loop {
         // SAFETY: signal zero performs an existence check without modifying the process group.
@@ -671,7 +679,9 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
                 stale_sweep::sweep_hosted_parent_death_publications(&publication_root)
             })
             .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=recovery"))?;
-            if std::fs::symlink_metadata(&orphan_path).is_ok() || orphan_identity == (0, 0) {
+            if std::fs::symlink_metadata(&orphan_path).is_ok()
+                || orphan_identity.is_some_and(|identity| identity == (0, 0))
+            {
                 eprintln!("MACOS_PARENT_DEATH_FAILED=recovery_survived");
                 return Err(io::Error::other(
                     "macOS parent-death publication identity survived recovery",
