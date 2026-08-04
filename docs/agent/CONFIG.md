@@ -390,9 +390,10 @@ Accepted top-level keys:
 JavaScript worker containment is a runtime prerequisite, not a user-selected sandbox mode.
 `--print-config` reports its backend, assurance, and availability separately from the general
 subprocess backend. Linux becomes available only after the real empty-root `bwrap` preflight;
-macOS reports unavailable because of the stable-image Seatbelt re-exec blocker; Windows requires a
-cached minimal LPAC/Job production attestation. No unavailable worker backend falls back to
-in-parent or uncontained JavaScript.
+validated macOS 26 hosts require the one-time-image Seatbelt denial and guardian lifecycle
+preflight and report typed `DeprecatedBestEffort` assurance; Windows requires a cached minimal
+LPAC/Job production attestation. Other macOS majors remain unavailable. No unavailable worker
+backend falls back to in-parent or uncontained JavaScript.
 
 ## System Prompt Suffix (`SUFFIX.md`)
 

@@ -179,8 +179,9 @@ subprocess policy is distinct from the mandatory, stricter JavaScript worker con
 The default build and every pre-built release archive include the brokered
 JavaScript engine (`js` feature). QuickJS runs only in a contained same-executable worker; the
 parent retains permissions, external effects, persistence, and audit. Linux requires its real
-empty-root `bwrap` preflight, macOS currently reports unavailable because Seatbelt cannot prevent
-stable-image re-exec, and Windows requires a cached minimal LPAC/Job production attestation.
+empty-root `bwrap` preflight, validated macOS 26 hosts require the one-time-image Seatbelt denial
+and guardian lifecycle preflight with typed `DeprecatedBestEffort` assurance, and Windows requires
+a cached minimal LPAC/Job production attestation. Other macOS majors remain unavailable.
 There is no in-parent or uncontained fallback. The `mini-agent-lite-*` release archives
 are built with `--no-default-features` and omit JS and other default features
 — use those only when you need a minimal binary without the JS runtime.

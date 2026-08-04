@@ -2,11 +2,6 @@
 use std::process::{Command, Output};
 
 #[cfg(target_os = "macos")]
-use crate::sandbox::worker::{
-    WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus, containment_status,
-};
-
-#[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 #[cfg(target_os = "macos")]
@@ -17,23 +12,6 @@ fn run_seatbelt(profile: &str, executable: &str, arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .expect("the supported macOS probe requires /usr/bin/sandbox-exec")
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn macos_worker_status_is_typed_unavailable_pending_the_hosted_matrix() {
-    let WorkerContainmentStatus::Unavailable {
-        backend,
-        assurance,
-        reason,
-    } = containment_status()
-    else {
-        panic!("macOS must remain unavailable until the hosted production-binary matrix passes");
-    };
-
-    assert_eq!(backend, WorkerBackend::Seatbelt);
-    assert_eq!(assurance, WorkerContainmentAssurance::DeprecatedBestEffort);
-    assert!(reason.contains("unvalidated macOS major version"));
 }
 
 /// Real evidence for the macOS fail-closed gate.
@@ -120,8 +98,6 @@ fn macos_js_worker_containment() {
             && rejected_tightening_stderr.contains("Operation not permitted"),
         "profile tightening failed for an unrelated reason: {rejected_tightening_stderr}"
     );
-
-    macos_worker_status_is_typed_unavailable_pending_the_hosted_matrix();
 }
 
 #[test]
@@ -140,7 +116,7 @@ fn macos_worker_launcher_source_owns_the_one_time_publication_transition() {
         "unlink_after_exec",
         "retire_after_reap",
         "ParentFrame::Shutdown",
-        "VALIDATED_MACOS_MAJORS: &[u32] = &[]",
+        "VALIDATED_MACOS_MAJORS: &[u32] = &[26]",
         "run_full_containment_preflight",
         "attest_hosted_worker_containment",
         "probe_guardian_parent_death",

@@ -145,7 +145,7 @@ The worker boundary is mandatory and independent of the optional general subproc
 | Platform | Production JS status |
 |----------|----------------------|
 | Linux | Available only after a real empty-root `bwrap` preflight proves trusted runtime mounts, isolated namespaces/network, rlimits, non-dumpability, `no_new_privs`, and seccomp process/exec denial. The workspace, cache, configuration, credentials, and ambient environment are absent. |
-| macOS | Unavailable. The real Seatbelt probe proves that allowing the stable image for initial execution also leaves it reusable for later exec; deprecated best-effort Seatbelt is not accepted as a fallback. |
+| macOS | Available on validated macOS 26 hosts with typed `DeprecatedBestEffort` assurance. A trusted guardian launches an exact one-time image under deny-default Seatbelt, the parent unlinks that image after authenticated Ready, and every startup repeats the full denial, limit, lifecycle, and parent-death preflight. Other macOS majors remain unavailable. |
 | Windows | Available only after a process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, protocol probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots; the full hosted canary records those observations only for its reference runner, and its final artifact remains pending. Model-authored JS `spawn` uses the separate general AppContainer backend; learned-skill spawn still requires an immutable-executable backend and remains disabled. |
 
 Hooks, MCP servers, LSPs, loop validation, and the explicit interactive shell are separate trust

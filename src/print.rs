@@ -60,8 +60,8 @@ fn javascript_worker_entries_for_status(
             WorkerBackend::WindowsLpac => ("1 worker process", "256 MiB", "35 seconds"),
             WorkerBackend::Seatbelt => (
                 "process creation denied",
-                "not independently capped",
-                "not independently capped",
+                "at most 40 GiB virtual address space",
+                "at most 35 seconds",
             ),
         };
         let spawn = if backend == WorkerBackend::WindowsLpac {
@@ -644,5 +644,29 @@ mod tests {
             entries["native memory limit"],
             "not active; no worker process"
         );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn config_reports_available_macos_limits_and_weaker_assurance() {
+        use crate::sandbox::worker::{
+            WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus,
+        };
+
+        let entries =
+            super::javascript_worker_entries_for_status(WorkerContainmentStatus::Available {
+                backend: WorkerBackend::Seatbelt,
+                assurance: WorkerContainmentAssurance::DeprecatedBestEffort,
+            })
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(entries["status"], "available");
+        assert_eq!(entries["assurance"], "deprecated weaker best-effort");
+        assert_eq!(
+            entries["native memory limit"],
+            "at most 40 GiB virtual address space"
+        );
+        assert_eq!(entries["native CPU limit"], "at most 35 seconds");
     }
 }

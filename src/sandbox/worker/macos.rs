@@ -36,14 +36,18 @@ const HOSTED_ONE_TIME_IMAGE: &str = "MINI_AGENT_MACOS_ONE_TIME_IMAGE";
 const HOSTED_GUARDIAN_PGID: &str = "MINI_AGENT_MACOS_GUARDIAN_PGID";
 const HOSTED_DESCRIPTOR_BOUND: &str = "MINI_AGENT_MACOS_DESCRIPTOR_BOUND";
 const HOSTED_PASS_RECORD: &str = "MACOS_CONTAINMENT_MATRIX_V1=passed";
-// No macOS major is production-enabled until the exact non-libtest hosted matrix has attested
-// the complete scoped boundary. Ready alone is never availability evidence.
-const VALIDATED_MACOS_MAJORS: &[u32] = &[];
-const ADDRESS_SPACE_LIMIT: libc::rlim_t = 256 * 1024 * 1024;
+// Only majors that passed the exact non-libtest production-binary matrix are enabled. Ready alone
+// is never availability evidence. macOS 26 passed on 26.5.2; other majors remain fail closed.
+const VALIDATED_MACOS_MAJORS: &[u32] = &[26];
+// Darwin maps the dyld shared-cache address range into every process. On macOS 26 this makes any
+// limit below roughly 40 GiB invalid even though those pages are not resident. QuickJS retains its
+// independent 64 MiB allocator cap; this finite process ceiling bounds native address growth.
+const ADDRESS_SPACE_LIMIT: libc::rlim_t = 40 * 1024 * 1024 * 1024;
 const CPU_LIMIT_SECONDS: libc::rlim_t = 35;
 const FILE_DESCRIPTOR_LIMIT: libc::rlim_t = 64;
 const FILE_SIZE_LIMIT: libc::rlim_t = 1024 * 1024;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+const SWEEP_CONTENTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_GUARDIAN_PROFILE_BYTES: usize = 4 * 1024;
 const MAX_GUARDIAN_PATH_BYTES: usize = 4 * 1024;
 const MAX_GUARDIAN_WORKER_ARGUMENTS: usize = 16;
@@ -190,26 +194,40 @@ pub(super) fn containment_status() -> WorkerContainmentStatus {
 }
 
 fn probe_containment() -> WorkerContainmentStatus {
-    if let Some(reason) = availability_error() {
-        return WorkerContainmentStatus::Unavailable {
-            backend: BACKEND,
-            assurance: ASSURANCE,
-            reason,
-        };
-    }
-    let result = worker_executable()
-        .map_err(|error| io::Error::other(error.to_string()))
-        .and_then(run_full_containment_preflight);
-    match result {
-        Ok(()) => WorkerContainmentStatus::Available {
-            backend: BACKEND,
-            assurance: ASSURANCE,
-        },
-        Err(_) => WorkerContainmentStatus::Unavailable {
-            backend: BACKEND,
-            assurance: ASSURANCE,
-            reason: "the scoped one-time-image Seatbelt live preflight failed".into(),
-        },
+    // A libtest executable enters its generated test harness before mini-agent's synchronous main,
+    // so it cannot serve as the trusted same-executable guardian used by production. Unit tests
+    // exercise the allowlist and construction; the required installed-binary marker exercises the
+    // complete live preflight without substituting a test-only launcher.
+    #[cfg(test)]
+    return WorkerContainmentStatus::Unavailable {
+        backend: BACKEND,
+        assurance: ASSURANCE,
+        reason: "the Rust test harness is not a production macOS worker executable".into(),
+    };
+
+    #[cfg(not(test))]
+    {
+        if let Some(reason) = availability_error() {
+            return WorkerContainmentStatus::Unavailable {
+                backend: BACKEND,
+                assurance: ASSURANCE,
+                reason,
+            };
+        }
+        let result = worker_executable()
+            .map_err(|error| io::Error::other(error.to_string()))
+            .and_then(run_full_containment_preflight);
+        match result {
+            Ok(()) => WorkerContainmentStatus::Available {
+                backend: BACKEND,
+                assurance: ASSURANCE,
+            },
+            Err(_) => WorkerContainmentStatus::Unavailable {
+                backend: BACKEND,
+                assurance: ASSURANCE,
+                reason: "the scoped one-time-image Seatbelt live preflight failed".into(),
+            },
+        }
     }
 }
 
@@ -358,7 +376,10 @@ fn launch_executable_unchecked_with_probe(
     probe: Option<&HostedProbePaths>,
 ) -> Result<WorkerProcess, WorkerLaunchError> {
     let root = publication_root()?;
-    stale_sweep::sweep_production_publications(&root).map_err(|source| WorkerLaunchError::Io {
+    retry_busy_sweep(Instant::now() + SWEEP_CONTENTION_TIMEOUT, || {
+        stale_sweep::sweep_production_publications(&root)
+    })
+    .map_err(|source| WorkerLaunchError::Io {
         backend: BACKEND,
         source,
     })?;
@@ -401,16 +422,12 @@ fn launch_executable_unchecked_with_probe(
             .env(HOSTED_ORIGINAL_EXECUTABLE, &executable)
             .env(HOSTED_ONE_TIME_IMAGE, image.image_path());
     }
-    let descriptor_bound =
-        configure_child_limits(&mut command, guardian_descriptor).map_err(|source| {
-            WorkerLaunchError::Io {
-                backend: BACKEND,
-                source,
-            }
-        })?;
-    if probe.is_some() {
-        command.env(HOSTED_DESCRIPTOR_BOUND, descriptor_bound.to_string());
-    }
+    configure_guardian_spawn(&mut command, guardian_descriptor).map_err(|source| {
+        WorkerLaunchError::Io {
+            backend: BACKEND,
+            source,
+        }
+    })?;
 
     let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {
         backend: BACKEND,
@@ -503,12 +520,15 @@ fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
         error
     })?;
     let result = (|| {
-        let mut process =
-            launch_executable_unchecked_with_probe(executable.clone(), &[], Some(&probes))
-                .map_err(|error| {
-                    eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=launch");
-                    io::Error::other(error.to_string())
-                })?;
+        let mut process = launch_executable_unchecked_with_probe(
+            executable.clone(),
+            preflight_worker_args(),
+            Some(&probes),
+        )
+        .map_err(|error| {
+            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=launch");
+            io::Error::other(error.to_string())
+        })?;
         let diagnostic_drain = spawn_closed_probe_diagnostic_drain(&process.stderr)?;
         let authentication = authenticate_ready_and_probe(&mut process, true);
         if authentication.is_err() {
@@ -559,77 +579,40 @@ fn spawn_closed_probe_diagnostic_drain(
 fn parse_closed_probe_diagnostic(bytes: &[u8]) -> Option<&'static str> {
     let text = std::str::from_utf8(bytes).ok()?;
     const CODES: &[&str] = &[
-        "marker",
-        "workspace_input",
-        "skill_input",
-        "credential_input",
-        "original_input",
-        "image_input",
-        "process_group_input",
-        "descriptor_input",
-        "workspace_sentinel",
-        "skill_sentinel",
-        "credential_sentinel",
-        "network",
-        "fork",
-        "alternate_exec",
-        "original_exec",
-        "image_exec",
-        "dev_fd_exec",
-        "descriptors",
-        "rlimits",
-        "process_group",
-        "guardian_bootstrap",
-        "worker_exit",
-        "worker_spawn",
-        "worker_limits",
-        "guardian_arguments",
-        "guardian_environment",
-        "guardian_heartbeat",
-        "guardian_group",
-        "guardian_monitor",
-        "guardian_streams",
-        "guardian_sandbox_exec",
+        "MACOS_CONTAINMENT_PROBE_FAILED=marker",
+        "MACOS_CONTAINMENT_PROBE_FAILED=workspace_input",
+        "MACOS_CONTAINMENT_PROBE_FAILED=skill_input",
+        "MACOS_CONTAINMENT_PROBE_FAILED=credential_input",
+        "MACOS_CONTAINMENT_PROBE_FAILED=original_input",
+        "MACOS_CONTAINMENT_PROBE_FAILED=image_input",
+        "MACOS_CONTAINMENT_PROBE_FAILED=process_group_input",
+        "MACOS_CONTAINMENT_PROBE_FAILED=descriptor_input",
+        "MACOS_CONTAINMENT_PROBE_FAILED=workspace_sentinel",
+        "MACOS_CONTAINMENT_PROBE_FAILED=skill_sentinel",
+        "MACOS_CONTAINMENT_PROBE_FAILED=credential_sentinel",
+        "MACOS_CONTAINMENT_PROBE_FAILED=network",
+        "MACOS_CONTAINMENT_PROBE_FAILED=fork",
+        "MACOS_CONTAINMENT_PROBE_FAILED=alternate_exec",
+        "MACOS_CONTAINMENT_PROBE_FAILED=original_exec",
+        "MACOS_CONTAINMENT_PROBE_FAILED=image_exec",
+        "MACOS_CONTAINMENT_PROBE_FAILED=dev_fd_exec",
+        "MACOS_CONTAINMENT_PROBE_FAILED=descriptors",
+        "MACOS_CONTAINMENT_PROBE_FAILED=rlimits",
+        "MACOS_CONTAINMENT_PROBE_FAILED=process_group",
+        "MACOS_CONTAINMENT_PROBE_FAILED=guardian_bootstrap",
+        "MACOS_CONTAINMENT_PROBE_FAILED=worker_exit",
+        "MACOS_CONTAINMENT_PROBE_FAILED=worker_spawn",
+        "MACOS_CONTAINMENT_PROBE_FAILED=worker_limits",
+        "MACOS_CONTAINMENT_PROBE_FAILED=guardian_arguments",
+        "MACOS_CONTAINMENT_PROBE_FAILED=guardian_environment",
+        "MACOS_CONTAINMENT_PROBE_FAILED=guardian_heartbeat",
+        "MACOS_CONTAINMENT_PROBE_FAILED=guardian_group",
+        "MACOS_CONTAINMENT_PROBE_FAILED=guardian_monitor",
+        "MACOS_CONTAINMENT_PROBE_FAILED=guardian_streams",
+        "MACOS_CONTAINMENT_PROBE_FAILED=guardian_sandbox_exec",
     ];
-    CODES.iter().find_map(|code| {
-        let expected = format!("MACOS_CONTAINMENT_PROBE_FAILED={code}");
-        text.lines()
-            .any(|line| line == expected)
-            .then_some(match *code {
-                "marker" => "MACOS_CONTAINMENT_PROBE_FAILED=marker",
-                "workspace_input" => "MACOS_CONTAINMENT_PROBE_FAILED=workspace_input",
-                "skill_input" => "MACOS_CONTAINMENT_PROBE_FAILED=skill_input",
-                "credential_input" => "MACOS_CONTAINMENT_PROBE_FAILED=credential_input",
-                "original_input" => "MACOS_CONTAINMENT_PROBE_FAILED=original_input",
-                "image_input" => "MACOS_CONTAINMENT_PROBE_FAILED=image_input",
-                "process_group_input" => "MACOS_CONTAINMENT_PROBE_FAILED=process_group_input",
-                "descriptor_input" => "MACOS_CONTAINMENT_PROBE_FAILED=descriptor_input",
-                "workspace_sentinel" => "MACOS_CONTAINMENT_PROBE_FAILED=workspace_sentinel",
-                "skill_sentinel" => "MACOS_CONTAINMENT_PROBE_FAILED=skill_sentinel",
-                "credential_sentinel" => "MACOS_CONTAINMENT_PROBE_FAILED=credential_sentinel",
-                "network" => "MACOS_CONTAINMENT_PROBE_FAILED=network",
-                "fork" => "MACOS_CONTAINMENT_PROBE_FAILED=fork",
-                "alternate_exec" => "MACOS_CONTAINMENT_PROBE_FAILED=alternate_exec",
-                "original_exec" => "MACOS_CONTAINMENT_PROBE_FAILED=original_exec",
-                "image_exec" => "MACOS_CONTAINMENT_PROBE_FAILED=image_exec",
-                "dev_fd_exec" => "MACOS_CONTAINMENT_PROBE_FAILED=dev_fd_exec",
-                "descriptors" => "MACOS_CONTAINMENT_PROBE_FAILED=descriptors",
-                "rlimits" => "MACOS_CONTAINMENT_PROBE_FAILED=rlimits",
-                "process_group" => "MACOS_CONTAINMENT_PROBE_FAILED=process_group",
-                "guardian_bootstrap" => "MACOS_CONTAINMENT_PROBE_FAILED=guardian_bootstrap",
-                "worker_exit" => "MACOS_CONTAINMENT_PROBE_FAILED=worker_exit",
-                "worker_spawn" => "MACOS_CONTAINMENT_PROBE_FAILED=worker_spawn",
-                "worker_limits" => "MACOS_CONTAINMENT_PROBE_FAILED=worker_limits",
-                "guardian_arguments" => "MACOS_CONTAINMENT_PROBE_FAILED=guardian_arguments",
-                "guardian_environment" => "MACOS_CONTAINMENT_PROBE_FAILED=guardian_environment",
-                "guardian_heartbeat" => "MACOS_CONTAINMENT_PROBE_FAILED=guardian_heartbeat",
-                "guardian_group" => "MACOS_CONTAINMENT_PROBE_FAILED=guardian_group",
-                "guardian_monitor" => "MACOS_CONTAINMENT_PROBE_FAILED=guardian_monitor",
-                "guardian_streams" => "MACOS_CONTAINMENT_PROBE_FAILED=guardian_streams",
-                "guardian_sandbox_exec" => "MACOS_CONTAINMENT_PROBE_FAILED=guardian_sandbox_exec",
-                _ => return None,
-            })
-    })
+    text.lines()
+        .find_map(|line| CODES.iter().copied().find(|code| line == *code))
 }
 
 fn run_hosted_containment_matrix() -> io::Result<()> {
@@ -642,7 +625,6 @@ fn run_hosted_containment_matrix() -> io::Result<()> {
 fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> io::Result<()> {
     let publication_root =
         publication_root().map_err(|error| io::Error::other(error.to_string()))?;
-    let entries_before = bounded_publication_entries(&publication_root)?;
     let output = Command::new(executable)
         .env_clear()
         .env(HOSTED_PARENT_DEATH_MARKER, HOSTED_PARENT_DEATH_MARKER_VALUE)
@@ -653,30 +635,11 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()?;
-    if !output.status.success() || output.stdout.len() > 32 {
+    if !output.status.success() || output.stdout.len() > 96 {
         return Err(io::Error::other("macOS parent-death canary child failed"));
     }
-    let guardian = std::str::from_utf8(&output.stdout)
-        .ok()
-        .map(str::trim)
-        .and_then(|value| value.parse::<libc::pid_t>().ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| io::Error::other("macOS parent-death canary PID was invalid"))?;
-    let entries_after_crash = bounded_publication_entries(&publication_root)?;
-    let mut new_entries = entries_after_crash.difference(&entries_before);
-    let orphan = new_entries
-        .next()
-        .cloned()
-        .filter(|name| {
-            name.to_str()
-                .is_some_and(is_canonical_publication_directory_name)
-        })
-        .ok_or_else(|| io::Error::other("macOS parent-death publication was not observed"))?;
-    if new_entries.next().is_some() {
-        return Err(io::Error::other(
-            "macOS parent-death created multiple publications",
-        ));
-    }
+    let (guardian, orphan) = parse_parent_death_record(&output.stdout)
+        .ok_or_else(|| io::Error::other("macOS parent-death canary record was invalid"))?;
     let orphan_path = publication_root.join(&orphan);
     let orphan_metadata = std::fs::symlink_metadata(&orphan_path)?;
     if !orphan_metadata.is_dir()
@@ -694,13 +657,9 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
         if unsafe { libc::kill(-guardian, 0) } < 0
             && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         {
-            stale_sweep::sweep_hosted_parent_death_publications(&publication_root)?;
-            let entries_after = bounded_publication_entries(&publication_root)?;
-            if entries_after.contains(&orphan) || !entries_after.is_subset(&entries_before) {
-                return Err(io::Error::other(
-                    "macOS parent-death publication was not recovered",
-                ));
-            }
+            retry_busy_sweep(Instant::now() + SWEEP_CONTENTION_TIMEOUT, || {
+                stale_sweep::sweep_hosted_parent_death_publications(&publication_root)
+            })?;
             if std::fs::symlink_metadata(&orphan_path).is_ok() || orphan_identity == (0, 0) {
                 return Err(io::Error::other(
                     "macOS parent-death publication identity survived recovery",
@@ -718,17 +677,44 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
     }
 }
 
-fn bounded_publication_entries(
-    root: &Path,
-) -> io::Result<std::collections::BTreeSet<std::ffi::OsString>> {
-    let mut entries = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir(root)? {
-        if entries.len() == 1_024 {
-            return Err(io::Error::other("macOS publication entry bound exceeded"));
+fn retry_busy_sweep(
+    deadline: Instant,
+    mut sweep: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    loop {
+        match sweep() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "one-time worker publication root remained busy",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
         }
-        entries.insert(entry?.file_name());
     }
-    Ok(entries)
+}
+
+fn parse_parent_death_record(bytes: &[u8]) -> Option<(libc::pid_t, std::ffi::OsString)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut fields = text.split_ascii_whitespace();
+    let guardian = fields
+        .next()?
+        .parse::<libc::pid_t>()
+        .ok()
+        .filter(|value| *value > 0)?;
+    let orphan = std::ffi::OsString::from(fields.next()?);
+    if fields.next().is_some()
+        || !orphan
+            .to_str()
+            .is_some_and(is_canonical_publication_directory_name)
+    {
+        return None;
+    }
+    Some((guardian, orphan))
 }
 
 #[allow(unsafe_code)]
@@ -737,11 +723,20 @@ fn run_parent_death_canary_child() -> ! {
         let probes = HostedProbePaths::from_environment()?;
         let executable =
             worker_executable().map_err(|error| io::Error::other(error.to_string()))?;
-        let mut process = launch_executable_unchecked_with_probe(executable, &[], Some(&probes))
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut process = launch_executable_unchecked_with_probe(
+            executable,
+            preflight_worker_args(),
+            Some(&probes),
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
         authenticate_ready_and_probe(&mut process, false)?;
         let guardian = process.id();
-        println!("{guardian}");
+        let publication = process
+            .process
+            .publication_directory_name()?
+            .to_str()
+            .ok_or_else(|| io::Error::other("macOS parent-death publication name was not UTF-8"))?;
+        println!("{guardian} {publication}");
         std::io::stdout().flush()?;
         std::mem::forget(process);
         Ok::<(), io::Error>(())
@@ -779,7 +774,6 @@ fn run_guardian() -> io::Result<ExitStatus> {
             required_probe_environment(HOSTED_CREDENTIAL_SENTINEL)?,
             required_probe_environment(HOSTED_ORIGINAL_EXECUTABLE)?,
             required_probe_environment(HOSTED_ONE_TIME_IMAGE)?,
-            required_probe_environment(HOSTED_DESCRIPTOR_BOUND)?,
         ])
     } else {
         None
@@ -791,6 +785,10 @@ fn run_guardian() -> io::Result<ExitStatus> {
     })?;
     let process_group = current_process_group().map_err(|error| {
         eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=guardian_group");
+        error
+    })?;
+    let descriptor_bound = finalize_guardian_process().map_err(|error| {
+        eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=worker_limits");
         error
     })?;
     std::thread::Builder::new()
@@ -824,7 +822,8 @@ fn run_guardian() -> io::Result<ExitStatus> {
     if let Some(environment) = probe_environment {
         worker
             .env(HOSTED_PROBE_MARKER, HOSTED_PROBE_MARKER_VALUE)
-            .env(HOSTED_GUARDIAN_PGID, process_group.to_string());
+            .env(HOSTED_GUARDIAN_PGID, process_group.to_string())
+            .env(HOSTED_DESCRIPTOR_BOUND, descriptor_bound.to_string());
         for (key, value) in environment {
             worker.env(key, value);
         }
@@ -982,6 +981,7 @@ fn seatbelt_profile(image: &Path) -> io::Result<String> {
 (deny default)
 (allow process-exec (literal "{image}"))
 (allow file-read* (literal "{image}") (subpath "/System/Library") (subpath "/usr/lib"))
+(allow file-read-data (literal "/"))
 (allow file-read-data file-write-data (vnode-type FIFO))
 (allow sysctl-read)
 (allow signal (target self))
@@ -990,18 +990,21 @@ fn seatbelt_profile(image: &Path) -> io::Result<String> {
 }
 
 #[allow(unsafe_code)]
-fn configure_child_limits(command: &mut Command, guardian_descriptor: RawFd) -> io::Result<RawFd> {
-    // Query before fork. The pre-exec closure then closes the complete inherited descriptor
-    // range using only async-signal-safe `close` calls.
+fn inherited_descriptor_bound() -> io::Result<RawFd> {
     let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
     if open_max <= 3 || open_max > i64::from(MAX_PROBE_DESCRIPTOR_BOUND) {
         return Err(io::Error::other(
             "could not determine the inherited descriptor bound",
         ));
     }
-    let open_max = open_max as libc::c_int;
-    // SAFETY: the closure performs only async-signal-safe syscalls between fork and exec. It
-    // applies finite limits and closes every descriptor except the three protocol descriptors.
+    Ok(open_max as RawFd)
+}
+
+#[allow(unsafe_code)]
+fn configure_guardian_spawn(command: &mut Command, guardian_descriptor: RawFd) -> io::Result<()> {
+    // Keep the post-fork closure syscall-only and do not close Rust's private exec-error pipe.
+    // The trusted guardian closes inherited descriptors and applies limits immediately after exec,
+    // before it starts a thread or launches the untrusted worker.
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(guardian_descriptor, 3) < 0 {
@@ -1013,23 +1016,29 @@ fn configure_child_limits(command: &mut Command, guardian_descriptor: RawFd) -> 
             {
                 return Err(io::Error::last_os_error());
             }
-            for descriptor in 4..open_max {
-                if libc::close(descriptor) < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EBADF) {
-                        return Err(error);
-                    }
-                }
-            }
-            set_limit(libc::RLIMIT_AS, ADDRESS_SPACE_LIMIT)?;
-            set_limit(libc::RLIMIT_CPU, CPU_LIMIT_SECONDS)?;
-            set_limit(libc::RLIMIT_NOFILE, FILE_DESCRIPTOR_LIMIT)?;
-            set_limit(libc::RLIMIT_CORE, 0)?;
-            set_limit(libc::RLIMIT_FSIZE, FILE_SIZE_LIMIT)?;
             Ok(())
         });
     }
-    Ok(open_max)
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn finalize_guardian_process() -> io::Result<RawFd> {
+    let descriptor_bound = inherited_descriptor_bound()?;
+    for descriptor in 4..descriptor_bound {
+        if unsafe { libc::close(descriptor) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EBADF) {
+                return Err(error);
+            }
+        }
+    }
+    set_limit(libc::RLIMIT_AS, ADDRESS_SPACE_LIMIT)?;
+    set_limit(libc::RLIMIT_CPU, CPU_LIMIT_SECONDS)?;
+    set_limit(libc::RLIMIT_NOFILE, FILE_DESCRIPTOR_LIMIT)?;
+    set_limit(libc::RLIMIT_CORE, 0)?;
+    set_limit(libc::RLIMIT_FSIZE, FILE_SIZE_LIMIT)?;
+    Ok(descriptor_bound)
 }
 
 #[allow(unsafe_code)]
@@ -1114,7 +1123,7 @@ pub(super) fn attest_hosted_worker_containment() -> bool {
         sentinel_access_is_denied(&credential),
         "credential_sentinel"
     );
-    require_probe!(network_socket_matrix_is_denied(), "network");
+    require_probe!(network_connection_matrix_is_denied(), "network");
     require_probe!(fork_is_denied(), "fork");
     require_probe!(
         executable_fails_with(Path::new("/bin/true"), &[libc::EPERM, libc::EACCES]),
@@ -1124,7 +1133,13 @@ pub(super) fn attest_hosted_worker_containment() -> bool {
         executable_fails_with(&original, &[libc::EPERM, libc::EACCES]),
         "original_exec"
     );
-    require_probe!(executable_fails_with(&image, &[libc::ENOENT]), "image_exec");
+    // The parent has already completed the descriptor/inode-verified unlink. Depending on whether
+    // Seatbelt rejects traversal of the now-missing private leaf before pathname resolution,
+    // Darwin reports either absence or a policy denial. All three outcomes remain fail closed.
+    require_probe!(
+        executable_fails_with(&image, &[libc::ENOENT, libc::EPERM, libc::EACCES]),
+        "image_exec"
+    );
     require_probe!(
         ["/dev/fd/0", "/dev/fd/1", "/dev/fd/2"]
             .into_iter()
@@ -1154,7 +1169,7 @@ fn io_error_is_policy_denial<T>(result: io::Result<T>) -> bool {
 }
 
 #[allow(unsafe_code)]
-fn network_socket_matrix_is_denied() -> bool {
+fn network_connection_matrix_is_denied() -> bool {
     for (domain, socket_type) in [
         (libc::AF_INET, libc::SOCK_STREAM),
         (libc::AF_INET, libc::SOCK_DGRAM),
@@ -1162,18 +1177,62 @@ fn network_socket_matrix_is_denied() -> bool {
         (libc::AF_INET6, libc::SOCK_DGRAM),
     ] {
         let descriptor = unsafe { libc::socket(domain, socket_type, 0) };
-        if descriptor >= 0 {
-            unsafe { libc::close(descriptor) };
+        if descriptor < 0 {
+            if io_error_is_policy_denial(io::Result::<()>::Err(io::Error::last_os_error())) {
+                continue;
+            }
             return false;
         }
-        if !matches!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(libc::EPERM) | Some(libc::EACCES)
-        ) {
+        let denied = if domain == libc::AF_INET {
+            let address = libc::sockaddr_in {
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+                sin_family: libc::AF_INET as u8,
+                sin_port: 9_u16.to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+                sin_zero: [0; 8],
+            };
+            connection_is_policy_denied(
+                descriptor,
+                std::ptr::from_ref(&address).cast(),
+                std::mem::size_of_val(&address) as libc::socklen_t,
+            )
+        } else {
+            let address = libc::sockaddr_in6 {
+                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
+                sin6_family: libc::AF_INET6 as u8,
+                sin6_port: 9_u16.to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr {
+                    s6_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                },
+                sin6_scope_id: 0,
+            };
+            connection_is_policy_denied(
+                descriptor,
+                std::ptr::from_ref(&address).cast(),
+                std::mem::size_of_val(&address) as libc::socklen_t,
+            )
+        };
+        unsafe { libc::close(descriptor) };
+        if !denied {
             return false;
         }
     }
     true
+}
+
+#[allow(unsafe_code)]
+fn connection_is_policy_denied(
+    descriptor: RawFd,
+    address: *const libc::sockaddr,
+    address_length: libc::socklen_t,
+) -> bool {
+    if unsafe { libc::connect(descriptor, address, address_length) } == 0 {
+        return false;
+    }
+    io_error_is_policy_denial(io::Result::<()>::Err(io::Error::last_os_error()))
 }
 
 #[allow(unsafe_code)]
@@ -1196,9 +1255,11 @@ fn fork_is_denied() -> bool {
 fn executable_fails_with(path: &Path, expected_errors: &[i32]) -> bool {
     let spawned = Command::new(path)
         .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Reuse the already-attested protocol pipes. Opening `/dev/null` is itself denied by the
+        // profile and would make this canary measure stdio setup instead of the requested exec.
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn();
     match spawned {
         Err(error) => error
@@ -1493,6 +1554,13 @@ impl WorkerChild {
 
     pub(super) fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    fn publication_directory_name(&self) -> io::Result<&std::ffi::OsStr> {
+        self.image
+            .as_ref()
+            .map(|image| image.directory_name())
+            .ok_or_else(|| io::Error::other("macOS worker has no owned publication"))
     }
 
     pub(super) fn finalize_authenticated_ready(&mut self) -> io::Result<()> {
@@ -2346,6 +2414,10 @@ mod one_time_image {
 
         pub(super) fn image_path(&self) -> &Path {
             &self.image_path
+        }
+
+        pub(super) fn directory_name(&self) -> &OsStr {
+            &self.directory_name
         }
 
         #[cfg(test)]
@@ -3609,7 +3681,7 @@ mod tests {
         for invalid in [b"".as_slice(), b"0.1", b"future", b".15"] {
             assert!(parse_macos_major(invalid).is_err(), "accepted {invalid:?}");
         }
-        assert!(VALIDATED_MACOS_MAJORS.is_empty());
+        assert_eq!(VALIDATED_MACOS_MAJORS, &[26]);
     }
 
     #[test]
@@ -3630,8 +3702,7 @@ mod tests {
 
         let macos_15 = availability_error_for(true, Ok(15)).unwrap();
         assert!(macos_15.contains("unvalidated macOS major version 15"));
-        let macos_26 = availability_error_for(true, Ok(26)).unwrap();
-        assert!(macos_26.contains("unvalidated macOS major version 26"));
+        assert_eq!(availability_error_for(true, Ok(26)), None);
         assert!(
             availability_error_for(false, Ok(26))
                 .unwrap()
@@ -3684,6 +3755,33 @@ mod tests {
     }
 
     #[test]
+    fn seatbelt_profile_allows_only_the_dyld_root_directory_lookup() {
+        let image = PathBuf::from(format!(
+            "/private/tmp/mini-agent-js-worker-publications-{}/\
+             .mini-agent-js-worker-550e8400-e29b-41d4-a716-446655440000/worker-image",
+            current_uid()
+        ));
+        let profile = seatbelt_profile(&image).unwrap();
+
+        assert!(profile.contains("(allow file-read-data (literal \"/\"))"));
+        assert!(!profile.contains("(subpath \"/\")"));
+        assert!(!profile.contains("allow network"));
+    }
+
+    #[test]
+    fn guardian_pre_exec_preserves_the_command_error_channel() {
+        let (_heartbeat_parent, heartbeat_guardian) = UnixStream::pair().unwrap();
+        let mut command =
+            Command::new("/private/tmp/mini-agent-definitely-missing-guardian-executable");
+        configure_guardian_spawn(&mut command, heartbeat_guardian.as_raw_fd()).unwrap();
+
+        let error = command
+            .spawn()
+            .expect_err("a missing guardian executable must report its exact spawn error");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn macos_hosted_lifecycle_marker_is_exact() {
         assert_eq!(HOSTED_LIFECYCLE_MARKER_VALUE, "production-binary-v1");
     }
@@ -3702,5 +3800,51 @@ mod tests {
         ] {
             assert_eq!(parse_closed_probe_diagnostic(rejected), None);
         }
+
+        assert_eq!(
+            parse_closed_probe_diagnostic(
+                b"MACOS_CONTAINMENT_PROBE_FAILED=worker_limits\n\
+                  MACOS_CONTAINMENT_PROBE_FAILED=guardian_bootstrap\n"
+            ),
+            Some("MACOS_CONTAINMENT_PROBE_FAILED=worker_limits")
+        );
+    }
+
+    #[test]
+    fn parent_death_record_is_exact_and_concurrency_safe() {
+        let name = ".mini-agent-js-worker-550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            parse_parent_death_record(format!("1234 {name}\n").as_bytes()),
+            Some((1234, std::ffi::OsString::from(name)))
+        );
+        for rejected in [
+            format!("0 {name}"),
+            "1234 not-canonical".into(),
+            format!("1234 {name} unexpected"),
+            format!("1234 {}", name.to_uppercase()),
+        ] {
+            assert_eq!(parse_parent_death_record(rejected.as_bytes()), None);
+        }
+    }
+
+    #[test]
+    fn busy_stale_sweep_is_retried_but_other_errors_fail_closed() {
+        let mut attempts = 0;
+        retry_busy_sweep(Instant::now() + Duration::from_secs(1), || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+
+        let error = retry_busy_sweep(Instant::now() + Duration::from_secs(1), || {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "malformed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

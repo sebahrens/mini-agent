@@ -57,9 +57,10 @@ one source-level realm. It cannot create authority: every
 request is still intersected with parent session permissions and target-narrowing policy, and the
 grant is bound to the parent-created invocation. Platform containment separately removes ambient
 filesystem, network, credential, database, and parent-memory authority. An available Linux worker
-and an attested Windows worker also deny process creation. macOS implements the explicitly weaker
-scoped boundary below and reports `DeprecatedBestEffort`, but remains unavailable: authenticated
-Ready and launcher construction do not substitute for the pending production-binary hosted matrix.
+and an attested Windows worker also deny process creation. On validated macOS 26 hosts, macOS
+implements the explicitly weaker scoped boundary below and reports `DeprecatedBestEffort`; every
+production status check still requires the complete production-binary live preflight. Other macOS
+majors remain unavailable.
 
 Out of scope are compromise of the parent, containment backend, operating system, or kernel, and
 availability after a host-wide resource failure. Phase 6 does not claim that JavaScript realms
@@ -456,7 +457,7 @@ unavailable.
 | Platform | Required worker containment |
 |----------|-----------------------------|
 | Linux | Available only after a broker-only empty-root bubblewrap preflight proves isolated namespaces/environment, exact mounts, resource limits, and in-worker seccomp denial of process creation and execution. |
-| macOS | Unavailable pending the complete non-libtest hosted matrix. The scoped `DeprecatedBestEffort` launcher descriptor-publishes a one-time image, unlinks it after authenticated Ready, gracefully shuts down and reaps the exact process, and explicitly retires its lease/directory. No macOS major is allowlisted until worker-side denial/readback and guardian parent-death evidence passes. |
+| macOS | Available on validated macOS 26 hosts with typed `DeprecatedBestEffort` assurance. The launcher descriptor-publishes a one-time image, unlinks it after authenticated Ready, gracefully shuts down and reaps the exact process, explicitly retires its lease/directory, and repeats the worker denial/readback plus guardian parent-death preflight. Other majors remain unavailable. |
 | Windows | Available only after a cached minimal production attestation observes the LPAC/token shape, protocol handles, selected Job/mitigation state, closed protocol probe, fresh runtime, and clean shutdown for the same launcher used for real work. It does not establish filesystem, credential, network, actual-child, omitted-handle, or install-root denial. The hosted full canary/install-location gate is separate reference-runner evidence. |
 
 The Linux launcher is a dedicated broker-only bubblewrap profile, not the general command
@@ -493,11 +494,11 @@ misconfigured, unverifiable, or unable to apply every required restriction makes
 
 ### macOS standalone-CLI containment gate
 
-The standalone macOS CLI reports unavailable `Seatbelt` with typed `DeprecatedBestEffort`
-assurance. This
-boundary trusts the parent-selected current executable and authenticated bootstrap, excludes
-hostile same-UID peer processes, and treats request evaluation after authenticated Ready as
-untrusted. A real local probe on macOS 26 preserves the following platform evidence:
+The standalone macOS CLI reports available `Seatbelt` with typed `DeprecatedBestEffort` assurance
+only on validated macOS 26 hosts after the complete live preflight passes. This boundary trusts the
+parent-selected current executable and authenticated bootstrap, excludes hostile same-UID peer
+processes, and treats request evaluation after authenticated Ready as untrusted. The earlier real
+local probes on macOS 26 preserve the constraints that motivated the one-time-image transition:
 
 - a deny-default profile without `process-exec` prevents `/usr/bin/sandbox-exec` from executing
   the initial worker image;
@@ -508,8 +509,10 @@ macOS 15 remains an explicit CI probe target rather than a validated runtime maj
 allowlist must not classify it as validated until that runner has produced the same real-backend
 evidence. Both CI rows first prove that the target-gated test exists, so an unsupported target or
 an accidentally compiled-out test cannot pass as a zero-test success.
-macOS 26 is likewise not allowlisted: its earlier reusable-image negative probe did not attest the
-complete production worker denial/readback and guardian matrix.
+macOS 26 is allowlisted after the exact installed production binary emitted
+`MACOS_CONTAINMENT_MATRIX_V1=passed` on macOS 26.5.2 for the complete worker denial/readback,
+one-time-image lifecycle, and guardian parent-death matrix. Availability is still recomputed by
+that same preflight, so a rejected profile or failed control returns typed unavailable.
 
 The production launcher closes that scoped transition with a fresh one-time pathname. The public
 `sandbox_init` API remains deprecated and the assurance therefore remains explicitly
@@ -558,10 +561,13 @@ Protocol v2 authenticates `WorkerReady` with a per-launch challenge. `WorkerChil
 publication and lease, then unlinks and fsyncs the descriptor-proven image after that acknowledgement
 and before sequence 2. Teardown removes the lease and directory. A trusted-current-binary guardian
 owns the dedicated process group; parent-heartbeat EOF kills the group. The pre-exec boundary clears
-the environment, closes every inherited descriptor except protocol streams and the guardian
-heartbeat, and installs 256 MiB address-space, 35-second CPU, 64-descriptor, zero-core, and 1 MiB
-file-size limits. The deny-default profile permits process execution only for the exact one-time
-image and denies network by omission.
+the environment and installs the guardian heartbeat. Immediately after the trusted guardian exec,
+before it starts a thread or launches the untrusted worker, the guardian closes every inherited
+descriptor except protocol streams and the heartbeat and installs a 40 GiB virtual-address-space
+ceiling, 35-second CPU, 64-descriptor, zero-core, and 1 MiB file-size limits. Darwin maps roughly
+40 GiB of dyld shared-cache address space without making it resident, so smaller `RLIMIT_AS` values
+are rejected on macOS 26; QuickJS retains its independent 64 MiB allocator cap. The deny-default
+profile permits process execution only for the exact one-time image and denies network by omission.
 
 The production-path lifecycle probe uses authenticated Ready, exact-image unlink, graceful
 `Shutdown`, exact process reap, and fallible lease/directory retirement. Retirement propagates
@@ -574,11 +580,12 @@ IPv4/IPv6 TCP and UDP denial; fork, alternate-exec, original-image, one-time-ima
 re-exec denial with exact error classes; the complete bounded pre-limit descriptor range;
 resource-limit readback; and dedicated guardian process-group ownership. The parent additionally
 requires graceful shutdown/reap/retirement, sentinel integrity, guardian parent-death whole-group
-disappearance, and controlled one-day-policy stale recovery with no new publication entry left.
-The cached status path and hosted marker call the same full preflight. No major is allowlisted until
-that matrix passes on its unsandboxed hosted row; enclosing sandboxes that reject nested
-`sandbox-exec` remain a fail-closed environment-blocked observation. Every failure remains typed
-unavailable; there is no uncontained fallback.
+disappearance, and controlled one-day-policy stale recovery with the exact canary-owned publication
+identity removed. Concurrent mini-agent publications are not misclassified as canary orphans.
+The cached status path and hosted marker call the same full preflight. Only macOS 26 is currently
+allowlisted; no other major is enabled until that matrix passes there. Enclosing sandboxes that
+reject nested `sandbox-exec` remain a fail-closed environment-blocked observation. Every failure
+remains typed unavailable; there is no uncontained fallback.
 
 The Windows delivery gate is mandatory: an LPAC worker must load from every supported install
 location and start with only the protocol handles. Failure for a location leaves Windows JS

@@ -1,0 +1,54 @@
+{
+  "run_id": "20260804-macos-native",
+  "mode": "autofix",
+  "intent": "Finish and production-enable the scoped native macOS 26 broker-only JavaScript worker containment boundary after exact hosted validation.",
+  "base": "origin/all-beads-integration",
+  "reviewers": [
+    "correctness",
+    "testing",
+    "maintainability",
+    "project-standards",
+    "agent-native",
+    "learnings",
+    "security",
+    "reliability",
+    "performance",
+    "adversarial"
+  ],
+  "findings": [
+    {
+      "title": "Normative descriptor-closure wording no longer matched the trusted guardian exec sequence",
+      "severity": "P2",
+      "file": "docs/specs/phase-6-brokered-js-runtime.md",
+      "confidence": 1.0,
+      "autofix_class": "safe_auto",
+      "status": "fixed"
+    },
+    {
+      "title": "New macOS canary spawn sites were absent from the enforced subprocess inventory",
+      "severity": "P1",
+      "file": "src/tests/subprocess_inventory_tests.rs",
+      "confidence": 1.0,
+      "autofix_class": "safe_auto",
+      "status": "fixed"
+    }
+  ],
+  "applied_fixes": 2,
+  "residual_actionable_work": [],
+  "residual_risks": [
+    "Seatbelt and sandbox-exec remain deprecated platform mechanisms, so status intentionally reports DeprecatedBestEffort rather than enforced equivalence with Linux.",
+    "The accepted scoped boundary excludes hostile same-UID peer processes and enables only the natively validated macOS 26 major; all other majors fail closed."
+  ],
+  "testing_gaps": [],
+  "validation": {
+    "format_and_diff_check": "passed",
+    "full_cargo_test": "1511 passed, 1 unrelated timing test failed, 5 intentionally ignored; the lone failure passed immediately in isolation",
+    "real_seatbelt_test": "1 passed",
+    "production_containment_marker": "MACOS_CONTAINMENT_MATRIX_V1=passed",
+    "installed_print_config": "seatbelt available; DeprecatedBestEffort; 40 GiB virtual address space; 35 seconds CPU",
+    "concurrent_native_stress": "three simultaneous production matrices and one print-config preflight passed",
+    "debug_install": "passed",
+    "headless_smoke": "passed with Hello"
+  },
+  "verdict": "ready"
+}

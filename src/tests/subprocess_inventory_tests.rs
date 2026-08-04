@@ -1057,9 +1057,9 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/macos.rs",
-        ".spawn()",
+        "Command::new(\"/private/tmp/mini-agent-definitely-missing-guardian-executable\");",
         1,
-        "TC-BROKER-JS-WORKER",
+        "TEST-ONLY",
     ),
     (
         "src/sandbox/worker/macos.rs",
@@ -2493,6 +2493,11 @@ fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
 /// the surrounding constructor, in source order.
 const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     (
+        "src/sandbox/worker/macos.rs",
+        ".spawn()",
+        &["TC-BROKER-JS-WORKER", "TEST-ONLY"],
+    ),
+    (
         "src/sandbox.rs",
         "let mut child = match cmd.spawn() {",
         &["TC-LIFECYCLE-HELPER", "TC-SUPPORT-UTILITY"],
@@ -2588,9 +2593,9 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/macos.rs",
-        ".spawn()",
+        "Command::new(\"/private/tmp/mini-agent-definitely-missing-guardian-executable\");",
         1,
-        "TC-BROKER-JS-WORKER",
+        "TEST-ONLY",
     ),
     (
         "src/sandbox/worker/macos.rs",
@@ -3018,6 +3023,11 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
 ];
 
 const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox/worker/macos.rs",
+        ".spawn()",
+        &["TC-BROKER-JS-WORKER", "TEST-ONLY"],
+    ),
     (
         "src/sandbox.rs",
         "let mut child = match cmd.spawn() {",

@@ -745,17 +745,17 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn worker_launcher_production_is_fail_closed_until_backend_delivery() {
+    fn worker_launcher_test_harness_cannot_impersonate_the_production_guardian() {
         let WorkerContainmentStatus::Unavailable {
             backend,
             assurance: _,
             reason,
         } = containment_status()
         else {
-            panic!("macOS production worker launcher must remain unavailable");
+            panic!("the libtest executable must not impersonate the production guardian");
         };
         assert_eq!(backend, WorkerBackend::for_current_platform());
-        assert!(!reason.trim().is_empty());
+        assert!(reason.contains("test harness"));
 
         let error = launch().expect_err("production must not select the test launcher");
         assert_eq!(error.backend(), backend);
