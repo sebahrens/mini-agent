@@ -2217,7 +2217,20 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
             })?,
         ) == 0
         {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(17) {
+                let source_identity = crate::fs::windows_file_identity(&source)?;
+                let parent_identity = crate::fs::windows_file_identity(&parent)?;
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Windows directory publication crossed devices: volume_match={}",
+                        source_identity.volume_serial_number
+                            == parent_identity.volume_serial_number
+                    ),
+                ));
+            }
+            return Err(error);
         }
     }
     Ok(())

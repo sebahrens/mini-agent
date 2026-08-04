@@ -1053,8 +1053,6 @@ const OPEN_CLOEXEC: std::os::raw::c_int = 0x100_0000;
 const OPEN_CREATE: std::os::raw::c_int = 0x200;
 #[cfg(target_os = "macos")]
 const OPEN_EXCLUSIVE: std::os::raw::c_int = 0x800;
-#[cfg(target_os = "macos")]
-const OPEN_EVENT_ONLY: std::os::raw::c_int = 0x8000;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments, unsafe_code)]
@@ -1247,6 +1245,36 @@ fn atomic_write_platform(
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn temp_entry_matches(
+        directory: &File,
+        name: &CString,
+        identity: &CheckedMetadata,
+    ) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `directory` and `name` remain live for the call, and `entry`
+        // points to writable storage of the exact stat structure. NOFOLLOW
+        // makes a substituted symlink observable instead of traversing it.
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                entry.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatat initialized the complete structure.
+        let entry = unsafe { entry.assume_init() };
+        Ok(entry.st_mode & libc::S_IFMT == libc::S_IFREG
+            && u64::try_from(entry.st_dev).ok() == Some(identity.dev())
+            && entry.st_ino == identity.ino())
+    }
+
     fn rename_entry(
         directory: &File,
         old_name: &CString,
@@ -1399,20 +1427,31 @@ fn atomic_write_platform(
     }
 
     #[cfg(target_os = "macos")]
-    let temp_verify_flags = OPEN_EVENT_ONLY | OPEN_NOFOLLOW | OPEN_CLOEXEC;
+    match temp_entry_matches(&directory, &temp_name, &temp_identity) {
+        Ok(true) => {}
+        Ok(false) => {
+            drop(temp);
+            return Err(path_changed_error(&target_path));
+        }
+        Err(error) => {
+            drop(temp);
+            return Err(error);
+        }
+    }
     #[cfg(target_os = "linux")]
-    let temp_verify_flags = OPEN_NOFOLLOW | OPEN_CLOEXEC;
-    let temp_still_ours = open_at(
-        &directory,
-        OsStr::from_bytes(temp_name.as_bytes()),
-        temp_verify_flags,
-        0,
-    )
-    .and_then(|file| checked_file_metadata(&file))
-    .and_then(|metadata| ensure_same_file(&target_path, &temp_identity, &metadata));
-    if let Err(error) = temp_still_ours {
-        drop(temp);
-        return Err(error);
+    {
+        let temp_still_ours = open_at(
+            &directory,
+            OsStr::from_bytes(temp_name.as_bytes()),
+            OPEN_NOFOLLOW | OPEN_CLOEXEC,
+            0,
+        )
+        .and_then(|file| checked_file_metadata(&file))
+        .and_then(|metadata| ensure_same_file(&target_path, &temp_identity, &metadata));
+        if let Err(error) = temp_still_ours {
+            drop(temp);
+            return Err(error);
+        }
     }
 
     #[cfg(test)]

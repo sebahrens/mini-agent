@@ -636,18 +636,24 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()?;
+        .output()
+        .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=child_spawn"))?;
     if !output.status.success() || output.stdout.len() > 96 {
+        eprintln!("MACOS_PARENT_DEATH_FAILED=child_status");
         return Err(io::Error::other("macOS parent-death canary child failed"));
     }
-    let (guardian, orphan) = parse_parent_death_record(&output.stdout)
-        .ok_or_else(|| io::Error::other("macOS parent-death canary record was invalid"))?;
+    let (guardian, orphan) = parse_parent_death_record(&output.stdout).ok_or_else(|| {
+        eprintln!("MACOS_PARENT_DEATH_FAILED=child_record");
+        io::Error::other("macOS parent-death canary record was invalid")
+    })?;
     let orphan_path = publication_root.join(&orphan);
-    let orphan_metadata = std::fs::symlink_metadata(&orphan_path)?;
+    let orphan_metadata = std::fs::symlink_metadata(&orphan_path)
+        .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=publication_missing"))?;
     if !orphan_metadata.is_dir()
         || orphan_metadata.uid() != current_uid()
         || orphan_metadata.mode() & 0o7777 != 0o700
     {
+        eprintln!("MACOS_PARENT_DEATH_FAILED=publication_identity");
         return Err(io::Error::other(
             "macOS parent-death publication identity was invalid",
         ));
@@ -658,11 +664,15 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
         // SAFETY: signal zero performs an existence check without modifying the process group.
         let group_absent = unsafe { libc::kill(-guardian, 0) } < 0
             && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if group_absent || !process_group_has_live_members(guardian)? {
+        let has_live_members = process_group_has_live_members(guardian)
+            .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=group_query"))?;
+        if group_absent || !has_live_members {
             retry_busy_sweep(Instant::now() + SWEEP_CONTENTION_TIMEOUT, || {
                 stale_sweep::sweep_hosted_parent_death_publications(&publication_root)
-            })?;
+            })
+            .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=recovery"))?;
             if std::fs::symlink_metadata(&orphan_path).is_ok() || orphan_identity == (0, 0) {
+                eprintln!("MACOS_PARENT_DEATH_FAILED=recovery_survived");
                 return Err(io::Error::other(
                     "macOS parent-death publication identity survived recovery",
                 ));
@@ -670,6 +680,7 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
             return Ok(());
         }
         if Instant::now() >= deadline {
+            eprintln!("MACOS_PARENT_DEATH_FAILED=group_timeout");
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "macOS guardian process group survived parent death",
