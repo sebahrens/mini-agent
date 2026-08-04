@@ -1009,12 +1009,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/sandbox/worker/macos.rs",
-        ".output()",
-        1,
-        "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/sandbox/worker/macos.rs",
         "let output = std::process::Command::new(SW_VERS)",
         1,
         "TC-SUPPORT-UTILITY",
@@ -1040,12 +1034,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let output = Command::new(executable)",
-        1,
-        "TC-BROKER-JS-WORKER",
-    ),
-    (
-        "src/sandbox/worker/macos.rs",
-        ".output()?;",
         1,
         "TC-BROKER-JS-WORKER",
     ),
@@ -2494,6 +2482,11 @@ fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
 const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     (
         "src/sandbox/worker/macos.rs",
+        ".output()",
+        &["TC-BROKER-JS-WORKER", "TC-SUPPORT-UTILITY"],
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
         ".spawn()",
         &["TC-BROKER-JS-WORKER", "TEST-ONLY"],
     ),
@@ -2545,12 +2538,6 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
-        ".output()",
-        1,
-        "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/sandbox/worker/macos.rs",
         "let output = std::process::Command::new(SW_VERS)",
         1,
         "TC-SUPPORT-UTILITY",
@@ -2576,12 +2563,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let output = Command::new(executable)",
-        1,
-        "TC-BROKER-JS-WORKER",
-    ),
-    (
-        "src/sandbox/worker/macos.rs",
-        ".output()?;",
         1,
         "TC-BROKER-JS-WORKER",
     ),
@@ -3023,6 +3004,11 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
 ];
 
 const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox/worker/macos.rs",
+        ".output()",
+        &["TC-BROKER-JS-WORKER", "TC-SUPPORT-UTILITY"],
+    ),
     (
         "src/sandbox/worker/macos.rs",
         ".spawn()",

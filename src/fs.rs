@@ -266,10 +266,8 @@ where
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileIdentity {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     Unix { device: u64, inode: u64 },
-    #[cfg(target_os = "macos")]
-    MacOs(MacOsFileIdentity),
     #[cfg(windows)]
     Windows {
         volume_serial_number: u64,
@@ -299,7 +297,7 @@ fn checked_owned_file(
     file: std::fs::File,
     metadata: std::fs::Metadata,
 ) -> std::io::Result<CheckedMetadata> {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     let identity = {
         use std::os::unix::fs::MetadataExt;
 
@@ -308,8 +306,6 @@ fn checked_owned_file(
             inode: metadata.ino(),
         }
     };
-    #[cfg(target_os = "macos")]
-    let identity = FileIdentity::MacOs(macos_file_identity(&file)?);
     #[cfg(windows)]
     let identity = windows_file_identity(&file)?;
     #[cfg(windows)]
@@ -655,21 +651,6 @@ pub(crate) fn ensure_same_file(
     if checked.identity == current.identity {
         Ok(())
     } else {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = path;
-            let (FileIdentity::MacOs(checked), FileIdentity::MacOs(current)) =
-                (checked.identity, current.identity);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "macOS checked identity changed: volume_match={} file_match={}",
-                    checked.volume_uuid == current.volume_uuid,
-                    checked.file_id == current.file_id
-                ),
-            ));
-        }
-        #[cfg(not(target_os = "macos"))]
         Err(path_changed_error(path))
     }
 }
