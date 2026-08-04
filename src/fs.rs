@@ -1230,6 +1230,7 @@ fn atomic_write_platform(
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn unlink_owned_temp(directory: &File, name: &CString, identity: &CheckedMetadata) {
         let still_ours = open_at(
             directory,
@@ -1246,10 +1247,19 @@ fn atomic_write_platform(
     }
 
     #[cfg(target_os = "macos")]
+    fn unlink_owned_temp(directory: &File, name: &CString, identity: &std::fs::Metadata) {
+        if temp_entry_matches(directory, name, identity).unwrap_or(false) {
+            // SAFETY: both the directory descriptor and C string are valid,
+            // and the descriptor-relative identity check selected this entry.
+            let _ = unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn temp_entry_matches(
         directory: &File,
         name: &CString,
-        identity: &CheckedMetadata,
+        identity: &std::fs::Metadata,
     ) -> std::io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
 
@@ -1351,6 +1361,9 @@ fn atomic_write_platform(
                 0o600,
             ) {
                 Ok(file) => {
+                    #[cfg(target_os = "macos")]
+                    let identity = file.metadata()?;
+                    #[cfg(target_os = "linux")]
                     let identity = checked_file_metadata(&file)?;
                     result = Some((candidate, file, identity));
                     break;
