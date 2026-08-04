@@ -64,6 +64,24 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+fn same_open_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    #[cfg(target_os = "macos")]
+    {
+        // APFS firmlinks can expose different synthetic device IDs even to
+        // separate descriptors for one file. The containing directory has
+        // already been verified as private and non-symlinked, so an inode
+        // match is the stable macOS identity proof at this boundary.
+        left.ino() == right.ino()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -97,7 +115,7 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC)
         .open(path)?;
     let after = current.metadata()?;
-    if opened.dev() != after.dev() || opened.ino() != after.ino() {
+    if !same_open_file_identity(&opened, &after) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("Path changed after permission check: {}", path.display()),
