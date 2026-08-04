@@ -22,6 +22,102 @@ pub(crate) struct WindowsFileIdentity {
     pub(crate) file_id: [u8; 16],
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MacOsFileIdentity {
+    fsid: [i32; 2],
+    file_id: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacOsAttrList {
+    bitmap_count: u16,
+    reserved: u16,
+    common_attributes: u32,
+    volume_attributes: u32,
+    directory_attributes: u32,
+    file_attributes: u32,
+    fork_attributes: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_common_attribute<T, const N: usize>(file: &T, attribute: u32) -> std::io::Result<[u8; N]>
+where
+    T: std::os::fd::AsRawFd,
+{
+    use std::ffi::c_void;
+
+    unsafe extern "C" {
+        fn fgetattrlist(
+            descriptor: std::ffi::c_int,
+            attributes: *const c_void,
+            buffer: *mut c_void,
+            buffer_size: usize,
+            options: std::ffi::c_uint,
+        ) -> std::ffi::c_int;
+    }
+
+    const ATTRIBUTE_BITMAP_COUNT: u16 = 5;
+    let attributes = MacOsAttrList {
+        bitmap_count: ATTRIBUTE_BITMAP_COUNT,
+        reserved: 0,
+        common_attributes: attribute,
+        volume_attributes: 0,
+        directory_attributes: 0,
+        file_attributes: 0,
+        fork_attributes: 0,
+    };
+    let mut buffer = vec![0u8; size_of::<u32>() + N];
+    // SAFETY: `file` owns a live descriptor, both pointers reference initialized
+    // storage of the supplied sizes, and `fgetattrlist` does not retain them.
+    if unsafe {
+        fgetattrlist(
+            file.as_raw_fd(),
+            (&attributes as *const MacOsAttrList).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let returned_size = u32::from_ne_bytes(buffer[..size_of::<u32>()].try_into().unwrap());
+    if returned_size as usize != buffer.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS returned an invalid file-identity attribute size",
+        ));
+    }
+    Ok(buffer[size_of::<u32>()..].try_into().unwrap())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_file_identity<T>(file: &T) -> std::io::Result<MacOsFileIdentity>
+where
+    T: std::os::fd::AsRawFd,
+{
+    const ATTR_CMN_FSID: u32 = 0x0000_0004;
+    const ATTR_CMN_FILEID: u32 = 0x0200_0000;
+    let fsid = macos_common_attribute::<_, 8>(file, ATTR_CMN_FSID)?;
+    let file_id = u64::from_ne_bytes(macos_common_attribute(file, ATTR_CMN_FILEID)?);
+    if file_id == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the filesystem does not expose a stable 64-bit file identity",
+        ));
+    }
+    Ok(MacOsFileIdentity {
+        fsid: [
+            i32::from_ne_bytes(fsid[..4].try_into().unwrap()),
+            i32::from_ne_bytes(fsid[4..].try_into().unwrap()),
+        ],
+        file_id,
+    })
+}
+
 #[cfg(windows)]
 fn validated_windows_file_identity(
     volume_serial_number: u64,
@@ -101,7 +197,7 @@ enum FileIdentity {
     #[cfg(all(unix, not(target_os = "macos")))]
     Unix { device: u64, inode: u64 },
     #[cfg(target_os = "macos")]
-    MacOs { inode: u64 },
+    MacOs(MacOsFileIdentity),
     #[cfg(windows)]
     Windows {
         volume_serial_number: u64,
@@ -141,17 +237,7 @@ fn checked_owned_file(
         }
     };
     #[cfg(target_os = "macos")]
-    let identity = {
-        use std::os::unix::fs::MetadataExt;
-
-        // APFS firmlinks can give two handles for one object different
-        // synthetic device and generation metadata. The retained open handle
-        // pins the selected inode, so comparing that stable object identifier
-        // rejects replacement without relying on either synthetic field.
-        FileIdentity::MacOs {
-            inode: metadata.ino(),
-        }
-    };
+    let identity = FileIdentity::MacOs(macos_file_identity(&file)?);
     #[cfg(windows)]
     let identity = windows_file_identity(&file)?;
     #[cfg(windows)]

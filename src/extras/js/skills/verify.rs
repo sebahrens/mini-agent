@@ -254,6 +254,21 @@ fn verify_in_worker(request: VerifyArtifact) -> Result<VerificationResult, Verif
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     };
+    #[cfg(test)]
+    let supervisor = {
+        static TEST_VERIFICATION_SUPERVISOR: std::sync::OnceLock<
+            std::sync::Arc<JsWorkerSupervisor>,
+        > = std::sync::OnceLock::new();
+        TEST_VERIFICATION_SUPERVISOR
+            .get_or_init(|| {
+                std::sync::Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+                    crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+                    VERIFY_TIMEOUT + Duration::from_secs(30),
+                ))
+            })
+            .clone()
+    };
+    #[cfg(not(test))]
     let supervisor = JsWorkerSupervisor::shared();
     let outcome = if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::scope(|scope| {

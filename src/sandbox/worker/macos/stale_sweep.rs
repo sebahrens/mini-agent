@@ -92,29 +92,12 @@ enum SweepFaultStage {
     BeforeDirectoryRemove,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InodeIdentity {
-    device: u64,
-    inode: u64,
-}
-
-impl InodeIdentity {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-
-    fn matches(self, metadata: &std::fs::Metadata) -> bool {
-        self.device == metadata.dev() && self.inode == metadata.ino()
-    }
-}
+type FileIdentity = crate::fs::MacOsFileIdentity;
 
 #[derive(Debug)]
 struct HeldLock {
     file: std::fs::File,
-    identity: InodeIdentity,
+    identity: FileIdentity,
 }
 
 #[derive(Debug)]
@@ -142,9 +125,9 @@ struct StaleCandidate {
     name: Vec<u8>,
     path: PathBuf,
     directory: std::fs::File,
-    directory_identity: InodeIdentity,
+    directory_identity: FileIdentity,
     lease: Option<HeldLock>,
-    image: Option<(std::fs::File, InodeIdentity)>,
+    image: Option<(std::fs::File, FileIdentity)>,
 }
 
 #[repr(C)]
@@ -454,8 +437,7 @@ fn try_lock_file(file: std::fs::File) -> io::Result<TryLock> {
         #[link_name = "flock"]
         fn stale_sweep_flock(descriptor: c_int, operation: c_int) -> c_int;
     }
-    let metadata = file.metadata()?;
-    let identity = InodeIdentity::from_metadata(&metadata);
+    let identity = crate::fs::macos_file_identity(&file)?;
     let mut consecutive_interrupts = 0;
     loop {
         // SAFETY: file owns a live descriptor and Darwin accepts this flag combination.
@@ -479,12 +461,12 @@ fn try_lock_file(file: std::fs::File) -> io::Result<TryLock> {
 fn revalidate_file_entry(
     parent: &std::fs::File,
     name: &OsStr,
-    expected: InodeIdentity,
+    expected: FileIdentity,
     flags: i32,
     label: &str,
 ) -> io::Result<std::fs::File> {
     let file = open_at(parent, name, flags | OPEN_NOFOLLOW | OPEN_CLOEXEC, 0)?;
-    if !expected.matches(&file.metadata()?) {
+    if expected != crate::fs::macos_file_identity(&file)? {
         return Err(permission_denied(format!("{label} was replaced")));
     }
     Ok(file)
@@ -537,7 +519,7 @@ fn preflight_candidate(
             "stale publication directory is not close-on-exec",
         ));
     }
-    let directory_identity = InodeIdentity::from_metadata(&directory_metadata);
+    let directory_identity = crate::fs::macos_file_identity(&directory)?;
     revalidate_file_entry(
         root,
         name_os,
@@ -629,7 +611,7 @@ fn preflight_candidate(
                 "stale publication image is not close-on-exec",
             ));
         }
-        let identity = InodeIdentity::from_metadata(&metadata);
+        let identity = crate::fs::macos_file_identity(&image)?;
         revalidate_file_entry(
             &directory,
             OsStr::new(IMAGE_NAME),
@@ -790,9 +772,6 @@ where
     let root = open_directory(root_path)?;
     let opened = root.metadata()?;
     validate_private_directory(&opened, "stale publication root")?;
-    if !InodeIdentity::from_metadata(&supplied).matches(&opened) {
-        return Err(permission_denied("stale publication root was replaced"));
-    }
     ensure_no_extended_acl(&root, "stale publication root")?;
     if !descriptor_has_close_on_exec(root.as_raw_fd())? {
         return Err(permission_denied(
@@ -804,8 +783,8 @@ where
         TryLock::Busy => return Ok(SweepOutcome::RootBusy),
         TryLock::Acquired(lock) => lock,
     };
-    let revalidated_root = std::fs::symlink_metadata(root_path)?;
-    if !root_lock.identity.matches(&revalidated_root) {
+    let revalidated_root = open_directory(root_path)?;
+    if root_lock.identity != crate::fs::macos_file_identity(&revalidated_root)? {
         return Err(permission_denied(
             "stale publication root was replaced after locking",
         ));

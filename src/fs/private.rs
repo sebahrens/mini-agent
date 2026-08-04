@@ -64,20 +64,23 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn same_open_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
+fn same_open_file_identity(
+    left_file: &std::fs::File,
+    left: &std::fs::Metadata,
+    right_file: &std::fs::File,
+    right: &std::fs::Metadata,
+) -> std::io::Result<bool> {
     #[cfg(target_os = "macos")]
     {
-        // APFS firmlinks can expose different synthetic device and generation
-        // metadata to separate descriptors for one file. The first descriptor
-        // remains open throughout this comparison, pinning the inode against
-        // recycling while the second descriptor proves the path still names it.
-        left.ino() == right.ino()
+        let _ = (left, right);
+        Ok(super::macos_file_identity(left_file)? == super::macos_file_identity(right_file)?)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        left.dev() == right.dev() && left.ino() == right.ino()
+        use std::os::unix::fs::MetadataExt;
+
+        let _ = (left_file, right_file);
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
     }
 }
 
@@ -115,7 +118,7 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         .custom_flags(OPEN_NOFOLLOW | OPEN_CLOEXEC)
         .open(path)?;
     let after = current.metadata()?;
-    if !same_open_file_identity(&opened, &after) {
+    if !same_open_file_identity(&file, &opened, &current, &after)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("Path changed after permission check: {}", path.display()),

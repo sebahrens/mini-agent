@@ -1582,12 +1582,17 @@ mod js_permission_bridge {
         assert_send_sync::<JsTool>();
 
         let (ask_tx, mut ask_rx) = tokio_mpsc::channel(1);
-        let supervisor = JsWorkerSupervisor::shared();
-        let tool = JsTool::new(
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let audit = shared_effect_audit().expect("test effect audit");
+        let tool = JsTool::new_with_runtime_for_test(
             Sandbox::new(false, "bwrap"),
             None,
             Some(ask_tx),
             AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor.clone(),
+            audit.clone(),
         );
         assert_eq!(
             tool.call(JsArgs {
@@ -1614,7 +1619,7 @@ mod js_permission_bridge {
                 .is_none()
         );
 
-        let rebuilt = JsTool::new(
+        let rebuilt = JsTool::new_with_runtime_for_test(
             Sandbox::new(false, "bwrap"),
             None,
             None,
@@ -1626,6 +1631,8 @@ mod js_permission_bridge {
                 false,
                 false,
             ),
+            supervisor.clone(),
+            audit,
         );
         assert_eq!(
             rebuilt

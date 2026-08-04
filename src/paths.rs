@@ -2135,10 +2135,7 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
             "staged directory and target do not share a parent",
         ));
     }
-    let leaf = canonical
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no file name"))?;
-    let name: Vec<u16> = leaf.encode_wide().collect();
+    let name: Vec<u16> = canonical.as_os_str().encode_wide().collect();
     if name.is_empty() || name.len() > (u32::MAX as usize / 2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2158,9 +2155,9 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     let mut storage = vec![0usize; words];
     let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
 
-    // A null RootDirectory with a leaf name requests a rename within the
-    // opened source's current directory. Supplying the same parent as a root
-    // is treated as a cross-device move by hosted Windows filesystems.
+    // With a null RootDirectory, Windows requires the complete destination
+    // path. Supplying only a leaf or pairing it with a parent directory handle
+    // is rejected as a cross-device move by hosted Windows filesystems.
     // SAFETY: storage is aligned and large enough for the header plus the
     // UTF-16 leaf, and the source directory handle remains live for the call.
     let renamed = unsafe {

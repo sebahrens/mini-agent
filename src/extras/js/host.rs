@@ -2873,9 +2873,55 @@ enum PreparedSpawnTarget {
     #[cfg(unix)]
     OpenedPath(std::fs::File),
     #[cfg(target_os = "linux")]
-    SealedSnapshot(std::fs::File),
+    SealedSnapshot(SealedExecutableSnapshot),
     #[cfg(not(unix))]
     Path,
+}
+
+#[cfg(target_os = "linux")]
+struct SealedExecutableSnapshot {
+    // Rust drops fields in declaration order, so the test witness observes the
+    // descriptor only after the owned file has actually closed.
+    file: std::fs::File,
+    #[cfg(test)]
+    drop_witness: Option<SnapshotDropWitness>,
+}
+
+#[cfg(target_os = "linux")]
+impl SealedExecutableSnapshot {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file,
+            #[cfg(test)]
+            drop_witness: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_drop(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.drop_witness = Some(SnapshotDropWitness(observed.clone()));
+        observed
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for SealedExecutableSnapshot {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+#[cfg(all(target_os = "linux", test))]
+struct SnapshotDropWitness(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(all(target_os = "linux", test))]
+impl Drop for SnapshotDropWitness {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl PreparedSpawnEffect {
@@ -2927,7 +2973,9 @@ impl PreparedSpawnEffect {
                 return Ok(Self {
                     executable,
                     arguments,
-                    target: PreparedSpawnTarget::SealedSnapshot(snapshot),
+                    target: PreparedSpawnTarget::SealedSnapshot(SealedExecutableSnapshot::new(
+                        snapshot,
+                    )),
                 });
             }
             #[cfg(not(target_os = "linux"))]
@@ -5520,10 +5568,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_bwrap_construction_failure_closes_snapshot_without_spawning() {
-        let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
-        let prepared = PreparedSpawnEffect::capture("printf", Vec::new(), true).unwrap();
-        let captured = std::fs::read_dir("/proc/self/fd").unwrap().count();
-        assert_eq!(captured, before + 1, "capture should own exactly one memfd");
+        let mut prepared = PreparedSpawnEffect::capture("printf", Vec::new(), true).unwrap();
+        let PreparedSpawnTarget::SealedSnapshot(snapshot) = &mut prepared.target else {
+            panic!("immutable capture must own a sealed snapshot");
+        };
+        let snapshot_dropped = snapshot.observe_drop();
         let owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
         let service = SpawnEffectService::new(
             Sandbox::new(true, "__unavailable_snapshot_backend__"),
@@ -5534,8 +5583,10 @@ mod tests {
             service.execute_prepared(prepared, owner.bridge()).await,
             Err(EffectServiceError::BackendFailure)
         ));
-        let after = std::fs::read_dir("/proc/self/fd").unwrap().count();
-        assert_eq!(after, before, "failed bwrap construction leaked a memfd");
+        assert!(
+            snapshot_dropped.load(std::sync::atomic::Ordering::Acquire),
+            "failed bwrap construction retained its sealed snapshot"
+        );
     }
 
     #[cfg(all(feature = "skills", target_os = "linux"))]

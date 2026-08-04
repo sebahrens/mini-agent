@@ -3109,6 +3109,7 @@ mod feasibility {
 
     #[cfg(test)]
     pub(super) fn privatize_hosted_gate_inputs() -> Result<(), GateError> {
+        let policy = SidPolicy::current()?;
         let mut executables = vec![std::env::current_exe().map_err(|error| {
             GateError(format!("resolve Windows gate test executable: {error}"))
         })?];
@@ -3116,6 +3117,39 @@ mod feasibility {
             executables.push(PathBuf::from(installed));
         }
         for executable in executables {
+            let security = read_file_security(&executable)?;
+            if !policy.trusted_writer(security.owner) {
+                return Err(GateError(
+                    "an untrusted principal owns a Windows gate executable".to_string(),
+                ));
+            }
+            inspect_acl(security.dacl, &policy, null_mut(), false, false)?;
+            if !sid_equal(security.owner, policy.user.as_psid()) {
+                let mut path = wide_null(executable.as_os_str())?;
+                // Hosted Windows runners can create Cargo outputs with the
+                // Administrators SID as owner even though the token user owns
+                // the build. This test-only preflight first admits only the
+                // same trusted owners accepted by source validation, then
+                // makes the exact token user the owner before private.rs
+                // applies and attests its user-only DACL.
+                let result = unsafe {
+                    SetNamedSecurityInfoW(
+                        path.as_mut_ptr(),
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION,
+                        policy.user.as_psid(),
+                        null_mut(),
+                        null_mut(),
+                        null_mut(),
+                    )
+                };
+                if result != 0 {
+                    return Err(win32_error(
+                        "assign Windows gate executable to the token user",
+                        result,
+                    ));
+                }
+            }
             drop(crate::fs::open_private_file(&executable).map_err(|error| {
                 GateError(format!(
                     "apply exact private ACL to Windows gate executable: {error}"

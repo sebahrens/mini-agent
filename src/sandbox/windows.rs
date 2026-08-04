@@ -1526,6 +1526,9 @@ fn create_appcontainer_profile(
                 profile.storage.display()
             )
         })?;
+        std::fs::create_dir_all(profile.storage.join("Temp")).map_err(|error| {
+            format!("sandbox: create private AppContainer temporary storage: {error}")
+        })?;
         let mut roots = read_roots.to_vec();
         roots.extend(write_roots.iter().cloned());
         roots.sort();
