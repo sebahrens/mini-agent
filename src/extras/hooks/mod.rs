@@ -68,9 +68,17 @@ static PROCESS_SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::ne
 static ACTIVE_WORKSPACE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 pub(crate) fn set_active_workspace(path: &std::path::Path) {
+    let selected = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     *ACTIVE_WORKSPACE
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_path_buf());
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(selected);
+    if let Some(dispatcher) = get_dispatcher()
+        && let Err(error) = dispatcher.rebind_execution_root(path)
+    {
+        // The dispatcher records an invalid execution state and will refuse
+        // to launch hooks until a valid workspace is selected.
+        tracing::error!(error = %error, "hooks: failed to rebind execution workspace");
+    }
 }
 
 pub(crate) fn active_workspace() -> std::path::PathBuf {

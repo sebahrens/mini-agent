@@ -31,7 +31,7 @@ enum PlanWritePathDecision {
 struct PlanWriteRoot {
     configured: PathBuf,
     canonical: PathBuf,
-    identity: std::fs::Metadata,
+    identity: crate::fs::CheckedMetadata,
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +48,7 @@ impl PlanWriteAuthorization {
                 "PlanWrite workspace changed after authorization",
             ));
         }
-        let current_identity = std::fs::metadata(&current_root)?;
+        let current_identity = crate::fs::checked_path_metadata(&current_root)?;
         if !current_identity.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -100,7 +100,7 @@ impl PermissionChecker {
         self.plan_write_root = std::fs::canonicalize(working_dir)
             .ok()
             .and_then(|canonical| {
-                let identity = std::fs::metadata(&canonical).ok()?;
+                let identity = crate::fs::checked_path_metadata(&canonical).ok()?;
                 identity.is_dir().then_some(PlanWriteRoot {
                     configured: working_dir.to_path_buf(),
                     canonical,
@@ -236,7 +236,7 @@ impl PermissionChecker {
         let plan_write_root = std::fs::canonicalize(&working_dir)
             .ok()
             .and_then(|canonical| {
-                let identity = std::fs::metadata(&canonical).ok()?;
+                let identity = crate::fs::checked_path_metadata(&canonical).ok()?;
                 identity.is_dir().then_some(PlanWriteRoot {
                     configured: working_dir.clone(),
                     canonical,

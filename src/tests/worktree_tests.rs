@@ -210,7 +210,7 @@ mod tests {
         #[cfg(feature = "hooks")]
         assert_eq!(
             crate::extras::hooks::best_effort_ctx().cwd,
-            worktree.display().to_string()
+            worktree.canonicalize().unwrap().display().to_string()
         );
         std::fs::write(worktree.join("tracked.txt"), "undo stash workspace\n").unwrap();
         let undo_stash = crate::ui::git_stash_in_workspace(&worktree).unwrap();
@@ -229,6 +229,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn worktree_rebind_updates_production_hook_child_envelope_and_project_dir() {
+        use std::collections::HashMap;
+
+        use crate::extras::hooks::dispatcher::HookDispatcher;
+        use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust};
+
+        let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let repo = TempRepo::new("hook workspace rebind");
+        let worktree = repo.path().with_extension("hook workspace linked worktree");
+        git(
+            repo.path(),
+            vec![
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("-b"),
+                OsString::from("hook-workspace"),
+                worktree.as_os_str().to_os_string(),
+            ],
+        );
+        let observed = worktree.join("hook-observed.txt");
+        let handler = HookHandler {
+            kind: "command".to_string(),
+            command: Some("sh".to_string()),
+            args: Some(vec![
+                "-c".to_string(),
+                "printf '%s\\n%s\\n' \"$PWD\" \"$ZEROSTACK_PROJECT_DIR\" > \"$1\"; cat >> \"$1\""
+                    .to_string(),
+                "hook-workspace-observer".to_string(),
+                observed.to_string_lossy().into_owned(),
+            ]),
+            timeout: Some(5),
+            is_async: false,
+            condition: None,
+            once: false,
+            trust: HookTrust::Trusted,
+            env: Default::default(),
+        };
+        let mut config = HashMap::new();
+        config.insert(
+            "PreToolUse".to_string(),
+            vec![HookGroup {
+                matcher: None,
+                hooks: vec![handler],
+            }],
+        );
+        let dispatcher =
+            HookDispatcher::from_config_with_backend_and_root(&config, "unused", repo.path())
+                .unwrap();
+        crate::extras::hooks::init_dispatcher(dispatcher);
+
+        let process_cwd = std::env::current_dir().unwrap();
+        let mut session = crate::session::Session::new("test", "test", 1, "test");
+        let mut context = crate::context::load(true);
+        crate::ui::rebind_worktree_workspace(&mut session, &mut context, &None, &worktree);
+
+        let ctx = crate::extras::hooks::best_effort_ctx();
+        let dispatcher = crate::extras::hooks::get_dispatcher().expect("production dispatcher");
+        let _ = dispatcher
+            .dispatch_pre_tool_use(&ctx, "bash", serde_json::json!({"command": "true"}))
+            .await;
+
+        let captured = std::fs::read_to_string(&observed).expect("hook observation");
+        let mut sections = captured.splitn(3, '\n');
+        let expected = worktree.canonicalize().unwrap().display().to_string();
+        assert_eq!(sections.next(), Some(expected.as_str()));
+        assert_eq!(sections.next(), Some(expected.as_str()));
+        let envelope: serde_json::Value = serde_json::from_str(
+            sections
+                .next()
+                .expect("hook envelope follows cwd observations"),
+        )
+        .unwrap();
+        assert_eq!(envelope["cwd"], expected);
+        assert_eq!(ctx.cwd, expected);
+        assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+
+        std::fs::remove_file(observed).unwrap();
+        crate::ui::rebind_worktree_workspace(&mut session, &mut context, &None, repo.path());
+        cleanup_worktree(&worktree, "hook-workspace", repo.path(), true)
+            .await
+            .unwrap();
+        crate::extras::hooks::set_active_workspace(&process_cwd);
     }
 
     #[tokio::test]

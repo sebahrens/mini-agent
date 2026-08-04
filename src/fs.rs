@@ -107,7 +107,7 @@ enum FileIdentity {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CheckedMetadata {
     metadata: std::fs::Metadata,
     identity: FileIdentity,

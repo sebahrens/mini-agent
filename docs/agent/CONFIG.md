@@ -485,7 +485,7 @@ zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `type` | string | Only `"command"` is supported. |
-| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical project directory. Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
+| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace. Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
 | `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
 | `timeout` | integer (seconds) | Per-hook timeout; the whole process group is killed on expiry. Default: 60. |
 | `async` | boolean | When `true`, the hook runs concurrently with other matching handlers and its decision is ignored. Cancellation remains scoped to the dispatch, so dropping the dispatch still terminates and reaps it. Default: `false`. |
@@ -494,10 +494,15 @@ zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 | `trust` | `"sandboxed"` or `"trusted"` | Subprocess authority. Default: `"sandboxed"`, which requires the configured general workspace sandbox and denies the hook and guarded action before child creation if the backend is unavailable. `"trusted"` is an explicit, audited containment bypass for reviewed automation; it does not restore the parent environment. |
 | `env` | object of string values | Explicit environment additions. Values are literal (no shell expansion). The reserved `ZEROSTACK_PROJECT_DIR` key cannot be overridden in any ASCII case. Invalid names, NUL values, or case-insensitively colliding keys deny launch for portable Windows semantics. |
 
-Conditions and handlers use the same immutable canonical startup project cwd,
-environment, trust, and sandbox policy. Changing the parent process cwd later
-cannot retarget a trusted relative hook. Before every launch zerostack clears
-the ambient environment, then
+Project-hook approval remains bound to the immutable canonical startup project
+root where the configuration was loaded. Worktree selection does not reload or
+reapprove hook configuration; it separately rebinds execution to the canonical
+selected workspace. That execution root is identity-pinned, revalidated for the
+stdin envelope and immediately before every condition and handler child, and a
+failed rebind or directory replacement denies subsequent launches. Conditions
+and handlers use that same selected root, environment, trust, and sandbox
+policy. Changing the parent process cwd cannot retarget them. Before every
+launch zerostack clears the ambient environment, then
 restores only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`,
 `LC_ALL`, `COLORTERM`, `NO_COLOR`, `TMPDIR`, and the Windows runtime names
 `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `TEMP`, `TMP`, `USERNAME`, and
