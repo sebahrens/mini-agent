@@ -273,6 +273,10 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let shell = cli.resolve_shell(cfg);
     let sandbox_capabilities = Sandbox::new(sandbox, &sandbox_backend)
         .with_shell(&shell)
+        .with_windows_appcontainer_roots(
+            cli.resolve_windows_appcontainer_read_roots(cfg),
+            cli.resolve_windows_appcontainer_write_roots(cfg),
+        )
         .capability_matrix();
     let edit_system = cli.resolve_edit_system(cfg);
     let compact = cfg.resolve_compact_enabled();

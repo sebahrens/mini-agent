@@ -129,6 +129,18 @@ pub struct Config {
     pub sandbox: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "sandbox-backend")]
     pub sandbox_backend: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "windows-appcontainer-read-roots"
+    )]
+    pub windows_appcontainer_read_roots: Vec<std::path::PathBuf>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "windows-appcontainer-write-roots"
+    )]
+    pub windows_appcontainer_write_roots: Vec<std::path::PathBuf>,
     #[cfg(feature = "js")]
     #[serde(skip_serializing_if = "Option::is_none", rename = "js-file-base-dir")]
     pub js_file_base_dir: Option<String>,

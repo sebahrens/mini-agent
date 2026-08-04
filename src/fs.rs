@@ -1825,9 +1825,14 @@ mod tests {
         assert!(source.contains("access_mode(0)"));
         assert!(source.contains("spawn_blocking(move || checked_owned_file(file, metadata))"));
         assert!(source.contains("struct CheckedMetadata"));
-        assert!(!source.contains(concat!(".", "volume_serial_number()")));
-        assert!(!source.contains(concat!(".", "file_index()")));
-        assert!(!source.contains(concat!(".", "number_of_links()")));
+        let stable_identity = source
+            .split("pub(crate) fn windows_file_identity")
+            .nth(1)
+            .and_then(|source| source.split("enum FileIdentity").next())
+            .expect("Windows stable-handle identity implementation missing");
+        assert!(!stable_identity.contains(concat!(".", "volume_serial_number()")));
+        assert!(!stable_identity.contains(concat!(".", "file_index()")));
+        assert!(!stable_identity.contains(concat!(".", "number_of_links()")));
     }
 
     #[cfg(windows)]

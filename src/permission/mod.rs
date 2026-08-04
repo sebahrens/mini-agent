@@ -150,8 +150,12 @@ pub(crate) fn resolve_configured_execution_authority(
 ) -> Result<(ResolvedExecutionAuthority, crate::sandbox::Sandbox), ExecutionAuthorityError> {
     let backend = cli.resolve_sandbox_backend(cfg);
     let shell = cli.resolve_shell(cfg);
-    let configured =
-        crate::sandbox::Sandbox::new(cli.resolve_sandbox(cfg), &backend).with_shell(&shell);
+    let configured = crate::sandbox::Sandbox::new(cli.resolve_sandbox(cfg), &backend)
+        .with_shell(&shell)
+        .with_windows_appcontainer_roots(
+            cli.resolve_windows_appcontainer_read_roots(cfg),
+            cli.resolve_windows_appcontainer_write_roots(cfg),
+        );
     let authority = resolve_execution_authority(cli, cfg, configured.policy(), &backend)?;
     let sandbox = if authority.sandbox == SandboxResolution::DegradedUnavailable {
         tracing::warn!(

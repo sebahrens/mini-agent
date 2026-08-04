@@ -19,6 +19,9 @@ use crate::process_creation::TokioCommandCreationExt;
 #[cfg(feature = "js")]
 pub(crate) mod worker;
 
+#[cfg(target_os = "windows")]
+pub(crate) mod windows;
+
 #[cfg(all(feature = "js", target_os = "linux"))]
 pub(crate) type SandboxCommand = Command;
 #[cfg(unix)]
@@ -33,6 +36,8 @@ pub struct Sandbox {
     disabled_reason: DisabledSandboxReason,
     working_dir: Option<PathBuf>,
     workspace_binding: Option<Arc<crate::paths::WorkspaceBinding>>,
+    windows_appcontainer_read_roots: Vec<PathBuf>,
+    windows_appcontainer_write_roots: Vec<PathBuf>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
     #[cfg(test)]
@@ -614,6 +619,11 @@ impl Sandbox {
     }
 
     pub fn new(enabled: bool, backend: &str) -> Self {
+        let backend = if backend == "restricted-token" {
+            "appcontainer"
+        } else {
+            backend
+        };
         Sandbox {
             enabled,
             backend: backend.to_string(),
@@ -622,11 +632,23 @@ impl Sandbox {
             disabled_reason: DisabledSandboxReason::UserTrustedBypass,
             working_dir: None,
             workspace_binding: None,
+            windows_appcontainer_read_roots: Vec::new(),
+            windows_appcontainer_write_roots: Vec::new(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             complete_process_tree_for_test: false,
         }
+    }
+
+    pub fn with_windows_appcontainer_roots(
+        mut self,
+        read_roots: Vec<PathBuf>,
+        write_roots: Vec<PathBuf>,
+    ) -> Self {
+        self.windows_appcontainer_read_roots = read_roots;
+        self.windows_appcontainer_write_roots = write_roots;
+        self
     }
 
     /// Explicit three-state policy derived from the requested configuration
@@ -639,6 +661,8 @@ impl Sandbox {
             "bwrap" => bwrap_exists(),
             "seatbelt" => seatbelt_exists(),
             "zerobox" => zerobox_exists(),
+            #[cfg(target_os = "windows")]
+            "appcontainer" => windows::is_available(),
             _ => false,
         };
         if available {
@@ -702,6 +726,19 @@ impl Sandbox {
                     requested_network_policy: SEATBELT_REQUESTED_NETWORK_POLICY,
                 }
             }
+            SandboxPolicy::RequiredAndAvailable if self.backend == "appcontainer" => {
+                SandboxCapabilityMatrix {
+                    backend: self.backend.clone(),
+                    status: "required-and-available",
+                    filesystem_reads: "explicit workspace, executable/toolchain, and required cache roots only",
+                    filesystem_writes: "AppContainer writes are granted only to the canonical workspace; additional roots require explicit configuration",
+                    process_namespace: "no namespace isolation; a creation-time bounded Job owns the complete descendant tree",
+                    devices: "host-readable devices remain visible; no device isolation is claimed",
+                    environment: "cleared, then populated from a narrow non-credential Windows allow-list",
+                    network: "AppContainer network capabilities are empty; IP network access is denied by default",
+                    requested_network_policy: "default-deny AppContainer with no network capability",
+                }
+            }
             SandboxPolicy::RequiredAndAvailable => SandboxCapabilityMatrix {
                 backend: self.backend.clone(),
                 status: "required-and-available",
@@ -723,8 +760,8 @@ impl Sandbox {
         if self.complete_process_tree_for_test {
             return true;
         }
-        cfg!(target_os = "linux")
-            && self.backend == "bwrap"
+        (cfg!(target_os = "linux") && self.backend == "bwrap"
+            || cfg!(target_os = "windows") && self.backend == "appcontainer")
             && self.policy() == SandboxPolicy::RequiredAndAvailable
     }
 
@@ -758,6 +795,9 @@ impl Sandbox {
     }
 
     pub fn with_shell(self, shell: &str) -> Self {
+        #[cfg(target_os = "windows")]
+        return self.with_shell_command_arg(shell, "-Command");
+        #[cfg(not(target_os = "windows"))]
         self.with_shell_command_arg(shell, "-c")
     }
 
@@ -888,6 +928,28 @@ impl Sandbox {
             .workspace_authority_path()
             .map(Ok)
             .unwrap_or_else(|| canonical_non_root(&requested_cwd, "working directory"))?;
+
+        #[cfg(target_os = "windows")]
+        if self.backend == "appcontainer" {
+            let paths = crate::paths::process_paths()
+                .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
+            std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
+                format!(
+                    "sandbox: failed to create application cache {}: {error}",
+                    paths.cache_dir.display()
+                )
+            })?;
+            let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+            return windows::build_shell_helper(
+                &self.shell,
+                &self.shell_command_arg,
+                command,
+                &cwd,
+                &cache_dir,
+                &self.windows_appcontainer_read_roots,
+                &self.windows_appcontainer_write_roots,
+            );
+        }
 
         if self.backend == "zerobox" {
             if self.workspace_binding.is_some() && cfg!(unix) {
@@ -1241,6 +1303,40 @@ impl Sandbox {
             .args(args);
         configure_child_lifetime(&mut cmd);
         Ok(cmd)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn wrap_direct_command(
+        &self,
+        program: &Path,
+        arguments: &[String],
+    ) -> Result<Command, String> {
+        if self.policy() != SandboxPolicy::RequiredAndAvailable || self.backend != "appcontainer" {
+            return Err("Windows direct process launch requires the AppContainer sandbox".into());
+        }
+        let cwd = canonical_non_root(
+            &std::env::current_dir().map_err(|error| {
+                format!("sandbox: failed to resolve working directory: {error}")
+            })?,
+            "working directory",
+        )?;
+        let paths = crate::paths::process_paths()
+            .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
+        std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
+            format!(
+                "sandbox: failed to create application cache {}: {error}",
+                paths.cache_dir.display()
+            )
+        })?;
+        let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+        windows::build_direct_helper(
+            program,
+            arguments,
+            &cwd,
+            &cache_dir,
+            &self.windows_appcontainer_read_roots,
+            &self.windows_appcontainer_write_roots,
+        )
     }
 
     fn build_seatbelt_command(
@@ -1688,8 +1784,12 @@ impl Sandbox {
             CommandTermination::Exited(Ok(status)) => {
                 // A descendant may inherit a pipe after the shell exits. End
                 // the process group before joining readers so it cannot hold
-                // the command open or continue running in the background.
-                if let Some(pid) = pid {
+                // the command open or continue running in the background. The
+                // Windows AppContainer helper has already closed its Job
+                // before it exits, so there is no live tree left to terminate.
+                if let Some(pid) = pid
+                    && !(cfg!(windows) && self.backend == "appcontainer")
+                {
                     kill_process_group(pid);
                 }
                 let command_status = if self.take_cancelled(pid) {
@@ -2145,6 +2245,8 @@ pub(crate) fn kill_process_group(pid: u32) {
             }
         }
     }
+    #[cfg(windows)]
+    windows::terminate_helper(_pid);
 }
 
 fn essential_env() -> Vec<(&'static str, String)> {
@@ -2314,6 +2416,296 @@ mod sandbox_tests {
             unavailable().policy(),
             SandboxPolicy::RequiredButUnavailable
         );
+    }
+
+    #[test]
+    fn windows_appcontainer_source_covers_general_process_security_contract() {
+        let source = include_str!("sandbox/windows.rs");
+        for required in [
+            "CreateAppContainerProfile",
+            "DeriveAppContainerSidFromAppContainerName",
+            "DeleteAppContainerProfile",
+            "PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES",
+            "PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY",
+            "PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT",
+            "SECURITY_CAPABILITIES",
+            "CapabilityCount: 0",
+            "TokenCapabilities",
+            "tcp_attempt_denied(\"127.0.0.1:9\")",
+            "tcp_attempt_denied(\"1.1.1.1:9\")",
+            "udp_attempt_denied(\"127.0.0.1:9\")",
+            "udp_attempt_denied(\"1.1.1.1:9\")",
+            "tcp_attempt_denied(\"[::1]:9\")",
+            "udp_attempt_denied(\"[::1]:9\")",
+            "grant_read_root",
+            "grant_write_root",
+            "sweep_stale_profiles",
+            "MAX_STALE_PROFILE_JOURNALS",
+            "terminate_and_drain_job",
+            "OpenJobObjectW",
+            "JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE",
+            "STALE_JOB_CLEANUP_EXIT_CODE",
+            "job_name",
+            "wait_for_stale_job_quiescence",
+            "verify_descendant_rendezvous",
+            "wait_for_descendant_identity",
+            "parse_descendant_identity",
+            "wait_for_exact_probe_file",
+            "IsProcessInJob(descendant.raw(), job.raw()",
+            "CREATE_BREAKAWAY_FROM_JOB",
+            "JobObjectBasicAccountingInformation",
+            "ActiveProcesses == 0",
+            "reject_remote_access_path",
+            "GetDriveTypeW",
+            "DRIVE_REMOTE",
+            "GetHandleInformation",
+            "GetAppContainerFolderPath",
+            "NetworkIsolationGetAppContainerConfig",
+            "FILE_GENERIC_READ",
+            "uuid::Uuid::new_v4()",
+            "GetSecurityInfo",
+            "SetSecurityInfo",
+            "InitializeSecurityDescriptor",
+            "SetSecurityDescriptorOwner",
+            "SetSecurityDescriptorDacl",
+            "Global\\\\mini-agent-general-job-",
+            "CreateMutexW",
+            "WAIT_ABANDONED_0",
+            "AclMutationGuard::acquire()?",
+            "windows_file_link_count",
+            "program_proof",
+            "MAX_REQUEST_FEEDERS",
+            "CreateDesktopW",
+            "GetThreadDesktop",
+            "let desktop = private_desktop(grants.sid())?",
+            "startup.StartupInfo.lpDesktop",
+            "ImpersonateLoggedOnUser",
+            "PROC_THREAD_ATTRIBUTE_JOB_LIST",
+            "IsProcessInJob",
+            "QueryInformationJobObject",
+            "if let Err(error) = verify_job_membership_and_limits(&job, &child)",
+            "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+            "JOB_OBJECT_LIMIT_ACTIVE_PROCESS",
+            "JOB_OBJECT_LIMIT_PROCESS_MEMORY",
+            "JOB_OBJECT_UILIMIT_ALL",
+            "env_clear()",
+            "reject_reparse_components",
+            "outside_write=denied",
+            "hardlink=denied",
+            "stable_handle_swap=denied",
+            "unique_profile_crash=pass",
+            "authority_escape=denied",
+            "bounded_pipe=pass",
+            "acl_serialization=pass",
+            "parent_death_job=pass",
+            "private_desktop=pass",
+            "omitted_handle=denied",
+            "descendant=contained",
+            "control_journal=denied",
+            "configured_tool=pass",
+            "breakaway=denied",
+            "configured_read_roots",
+            "configured_write_roots",
+            "attest_cleanup_proof(&crash_proof",
+            "attest_tree_has_no_explicit_sid",
+            "OWNER_SECURITY_INFORMATION",
+            "PROTECTED_DACL_SECURITY_INFORMATION",
+            "network=denied",
+            "registry=not_isolated",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing Windows contract: {required}"
+            );
+        }
+        assert!(
+            source.contains(".stdin(Stdio::from"),
+            "helper requests must use inherited stdin, not argv/env/temp files"
+        );
+        assert!(!source.contains("GetNamedSecurityInfo"));
+        assert!(!source.contains("SetNamedSecurityInfo"));
+        assert!(!source.contains("S-1-5-21-3380456832"));
+        assert!(!source.contains("SECURITY_CAPABILITY_INTERNET_CLIENT"));
+        assert!(!source.contains("PROCESS_CREATION_CHILD_PROCESS_RESTRICTED"));
+        assert!(!source.contains("SE_KERNEL_OBJECT"));
+        assert!(!source.contains("DESKTOP_WRITEOBJECTS"));
+        let root_policy = source
+            .split("fn collect_read_roots(")
+            .nth(1)
+            .and_then(|source| source.split("fn canonicalize_access_roots").next())
+            .expect("explicit root-policy implementation missing");
+        assert!(!root_policy.contains("std::env::split_paths"));
+        assert!(!root_policy.contains("CARGO_HOME"));
+        assert!(!root_policy.contains("RUSTUP_HOME"));
+        assert!(source.contains("build_helper_with_ready_and_roots"));
+        assert!(source.contains("configured writable root overlaps a read-only root"));
+        assert!(!source.contains("CreateRestrictedToken"));
+        assert!(!source.contains("WRITE_RESTRICTED"));
+        assert!(!source.contains("RegOverridePredefKey"));
+        assert!(source.contains("Keep it unavailable until a"));
+        assert!(source.contains("cached production preflight exists"));
+
+        let update = source
+            .split("fn update_handle_ace(")
+            .nth(1)
+            .expect("ACL update implementation missing");
+        let lock = update
+            .find("AclMutationGuard::acquire()?")
+            .expect("ACL transaction lock missing");
+        let read = update
+            .find("GetSecurityInfo(")
+            .expect("ACL transaction read missing");
+        let write = update
+            .find("SetSecurityInfo(")
+            .expect("ACL transaction write missing");
+        assert!(lock < read && read < write);
+
+        let helper = source
+            .split("fn run_helper()")
+            .nth(1)
+            .and_then(|source| source.split("fn validate_ready_path").next())
+            .expect("Windows helper implementation missing");
+        let disarm = helper
+            .find("grants.disarm_for_launch()")
+            .expect("cleanup must disarm before launch");
+        let launch = helper
+            .find("launch_appcontainer(")
+            .expect("AppContainer launch missing");
+        assert!(disarm < launch);
+        assert!(helper.contains("verify_descendant_rendezvous(&job, &child"));
+        assert!(helper.contains("terminate_and_drain_job(&job, 126)?;\n        grants.mark_job_quiescent();\n        grants.cleanup()?;"));
+
+        let profile_creation = source
+            .split("fn create_appcontainer_profile(")
+            .nth(1)
+            .and_then(|source| source.split("fn appcontainer_storage_path").next())
+            .expect("AppContainer profile creation missing");
+        let journal_sync = profile_creation
+            .find("sync_all()")
+            .expect("journal durability sync missing");
+        let journal_publish = profile_creation
+            .find("profile.journal_path =")
+            .expect("journal publication missing");
+        assert!(journal_sync < journal_publish);
+
+        let stale_sweep = source
+            .split("fn sweep_stale_profiles(")
+            .nth(1)
+            .and_then(|source| source.split("fn sid_text").next())
+            .expect("stale profile sweep missing");
+        let stale_quiescence = stale_sweep
+            .find("wait_for_stale_job_quiescence")
+            .expect("stale exact-Job quiescence proof missing");
+        let stale_revoke = stale_sweep
+            .find("revoke_tree")
+            .expect("stale ACE cleanup missing");
+        assert!(stale_quiescence < stale_revoke);
+
+        let stale_job_cleanup = source
+            .split("fn wait_for_stale_job_quiescence(")
+            .nth(1)
+            .and_then(|source| source.split("fn wait_for_job_zero(").next())
+            .expect("stale exact-Job cleanup implementation missing");
+        let stale_job_open = stale_job_cleanup
+            .find("OpenJobObjectW")
+            .expect("stale exact Job open missing");
+        let stale_job_validate = stale_job_cleanup
+            .find("verify_job_limits")
+            .expect("stale exact Job policy validation missing");
+        let stale_job_terminate = stale_job_cleanup
+            .find("TerminateJobObject")
+            .expect("stale exact Job termination missing");
+        let stale_job_drain = stale_job_cleanup
+            .find("wait_for_job_zero")
+            .expect("stale exact Job drain missing");
+        assert!(
+            stale_job_open < stale_job_validate
+                && stale_job_validate < stale_job_terminate
+                && stale_job_terminate < stale_job_drain
+        );
+
+        let descendant_verification = source
+            .split("fn verify_descendant_rendezvous(")
+            .nth(1)
+            .and_then(|source| source.split("fn verify_job_limits(").next())
+            .expect("descendant rendezvous implementation missing");
+        assert!(descendant_verification.contains("wait_for_descendant_identity(ready)?"));
+        assert!(!descendant_verification.contains("wait_for_probe_file(ready)?"));
+
+        let parent_probe = source
+            .split("fn run_parent_probe(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_authority_probe(").next())
+            .expect("parent-death probe implementation missing");
+        assert!(parent_probe.contains("[System.IO.File]::WriteAllText"));
+        assert!(parent_probe.contains("'-EncodedCommand'"));
+        assert!(parent_probe.contains("wait_for_exact_probe_file(&tree_ready)?"));
+        assert!(!parent_probe.contains("wait_for_probe_file(&tree_ready)?"));
+
+        let named_job = source
+            .split("fn bounded_job(")
+            .nth(1)
+            .and_then(|source| source.split("fn verify_job_membership_and_limits(").next())
+            .expect("bounded named Job implementation missing");
+        let owner_dacl = named_job
+            .find("SetSecurityDescriptorDacl")
+            .expect("named Job owner-only DACL missing");
+        let create_job = named_job
+            .find("CreateJobObjectW(&attributes")
+            .expect("named Job secured creation missing");
+        assert!(owner_dacl < create_job);
+
+        let runtime_probe = source
+            .split("fn run_runtime_probe(")
+            .nth(1)
+            .and_then(|source| source.split("fn attest_completed_cleanup(").next())
+            .expect("Windows runtime probe implementation missing");
+        assert!(runtime_probe.contains("configured_cleanup_ready"));
+        assert!(runtime_probe.contains("build_helper_with_ready_and_roots("));
+        assert!(runtime_probe.contains(
+            "configured_read.as_path(),\n            configured_write.as_path(),\n            configured_tool.as_path(),"
+        ));
+
+        let journal_root = source
+            .split("fn profile_journal_root(")
+            .nth(1)
+            .and_then(|source| source.split("fn create_profile_journal").next())
+            .expect("profile journal root implementation missing");
+        assert!(journal_root.contains(".parent()"));
+        assert!(journal_root.contains(".mini-agent-appcontainer-control-v1"));
+        assert!(!journal_root.contains("cache.join("));
+
+        let startup = include_str!("startup.rs");
+        assert!(startup.contains("unavailable_sandbox_must_fail"));
+        assert!(startup.contains("no successful production preflight"));
+
+        let main = include_str!("main.rs");
+        let validation = main
+            .find("startup.validate_sandbox_availability()?")
+            .expect("common sandbox validation missing");
+        let acp = main
+            .find("if startup.cli.acp_enabled")
+            .expect("ACP dispatch missing");
+        assert!(validation < acp, "ACP must not bypass sandbox validation");
+
+        assert!(source.contains("Global\\\\mini-agent-general-sandbox-acl-v1"));
+        assert!(!source.contains("Local\\\\mini-agent-general-sandbox-acl-v1"));
+    }
+
+    #[test]
+    fn windows_capability_copy_reports_explicit_roots_and_default_network_denial() {
+        let source = include_str!("sandbox.rs");
+        assert!(source.contains(
+            "AppContainer network capabilities are empty; IP network access is denied by default"
+        ));
+        assert!(
+            source.contains(
+                "explicit workspace, executable/toolchain, and required cache roots only"
+            )
+        );
+        assert!(source.contains("default-deny AppContainer with no network capability"));
+        let forbidden_registry_claim = ["registry isolation", " is enforced"].concat();
+        assert!(!source.contains(&forbidden_registry_claim));
     }
 
     #[test]

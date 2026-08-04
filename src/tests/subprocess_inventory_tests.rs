@@ -785,6 +785,50 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// Counts make adding an identical launch expression visible without coupling
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/agent/runner.rs",
+        "std::mem::drop(self.runtime.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/runner.rs",
+        "let hook_is_live = std::process::Command::new(\"kill\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/agent/runner.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/extras/acp/mod.rs",
+        "std::process::Command::new(\"kill\")",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/acp/mod.rs",
+        "!std::process::Command::new(\"kill\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/extras/acp/mod.rs", ".status()", 2, "TEST-ONLY"),
+    (
+        "src/extras/acp/mod.rs",
+        "let output = command.output().await.unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/lsp/client.rs",
+        "command: &mut tokio::process::Command,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/lsp/client.rs",
+        "_command: &mut tokio::process::Command,",
+        1,
+        "NON-PROCESS",
+    ),
     ("src/agent/tools/bash.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/agent/tools/bash.rs",
@@ -921,12 +965,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/skills/turn.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/extras/js/skills/verify.rs",
         ".spawn(|| supervisor.verify_blocking(request))",
         1,
@@ -980,6 +1018,60 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "let output = std::process::Command::new(SW_VERS)",
         1,
         "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut command = Command::new(&executable);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".spawn(move || {",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let output = Command::new(executable)",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".output()?;",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut worker = Command::new(SANDBOX_EXEC);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".spawn()",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let spawned = Command::new(path)",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".spawn();",
+        1,
+        "TC-BROKER-JS-WORKER",
     ),
     (
         "src/extras/loop/validation.rs",
@@ -1167,6 +1259,72 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TEST-ONLY",
     ),
+    (
+        "src/sandbox/windows.rs",
+        ") -> Result<tokio::process::Command, String> {",
+        6,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut helper = Command::new(executable);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut helper = tokio::process::Command::from(helper);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".output()",
+        6,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".spawn()",
+        6,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut parent = Command::new(executable)",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let descendant = Command::new(executable)",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut breakaway = Command::new(",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "match breakaway.status() {",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".status()",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
     ("src/session/mod.rs", ".output()", 1, "TC-INTERNAL-GIT"),
     (
         "src/session/mod.rs",
@@ -1236,6 +1394,54 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/agent/runner.rs",
+        "assert_eq!(output, UNKNOWN_TOOL_OUTCOME);",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(\"No files found\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(!output.contains(\"must_not_be_returned.txt\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.contains(\"No matches found\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"must_not_be_returned\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/mod.rs",
+        "output: \"b-result\".into(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/mod.rs",
+        "output: \"a-result\".into(),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/acp/mod.rs",
+        ".is_ok_and(|status| status.success()),",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/agent/runner.rs",
         "assert!(output.contains(\"cacheStatus\"));",
@@ -1421,6 +1627,12 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/js/audit.rs",
         "let _ = write!(output, \"{byte:02x}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "String::from_utf8_lossy(&output.stderr)",
         1,
         "NON-PROCESS",
     ),
@@ -1759,6 +1971,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 "c7984bb9ee969797484f192f11aa877a68f90f5b456d5d2ee40a2a7e7f834fbd",
                 1,
             ),
+            (
+                "225002167cc20f4e6df35ecd65a6c50e007af4b1cfdcb530eb6a48de70d02689",
+                2,
+            ),
         ],
     ),
     (
@@ -1845,6 +2061,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 "f25fa463789bdff96f2ac1db892cb80aa2acf858cae6fce6207f6faa70bc85b8",
                 1,
             ),
+            (
+                "bf75191f6049b49ba3066fe7c1afe9dff0a585c144d3231ac53532058b16f0a7",
+                1,
+            ),
+            (
+                "3462a253774a87b69c35808079213817cbb63784594c3b6c36e1cf0d433edd76",
+                1,
+            ),
         ],
     ),
     (
@@ -1882,14 +2106,32 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 "ddc400f7816d0659ba5fe6e89b565e7e22473e6551c6c5be7a2ee53dca51c0ab",
                 1,
             ),
+            (
+                "41db4c0ce2690c675124ac22b2e8c8e42e31dc78f69918c069d5683fdb587955",
+                1,
+            ),
+            (
+                "f9bb10578ae06a1346990778eb26b16f15fbed1f8f35faef03215060ce6723e5",
+                1,
+            ),
         ],
     ),
     (
         "src/extras/acp/mod.rs",
-        &[(
-            "295618629907043194c80029881ca6c0c7fd6c758a98c278f3d845cdf7e45f7f",
-            1,
-        )],
+        &[
+            (
+                "295618629907043194c80029881ca6c0c7fd6c758a98c278f3d845cdf7e45f7f",
+                1,
+            ),
+            (
+                "4a380a581094e084f73541311b41c717d6b4aff6302b66a691885543bc79a92b",
+                1,
+            ),
+            (
+                "458562ae8615a7b8f5df26c3c5b4fb1f20bd7bb2c54191d9011ed73396156315",
+                1,
+            ),
+        ],
     ),
     (
         "src/extras/export.rs",
@@ -2223,6 +2465,13 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             1,
         )],
     ),
+    (
+        "src/sandbox/windows.rs",
+        &[(
+            "48b38d261851e6e3c7bb387f8fb5d093448cb69f8047816907f7b7dc699ca584",
+            1,
+        )],
+    ),
 ];
 
 fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
@@ -2289,6 +2538,116 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/sandbox/worker/macos.rs",
+        ".output()",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let output = std::process::Command::new(SW_VERS)",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut command = Command::new(&executable);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".spawn(move || {",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let output = Command::new(executable)",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".output()?;",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut worker = Command::new(SANDBOX_EXEC);",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".spawn()",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let spawned = Command::new(path)",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        ".spawn();",
+        1,
+        "TC-BROKER-JS-WORKER",
+    ),
+    (
+        "src/agent/runner.rs",
+        "std::mem::drop(self.runtime.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/runner.rs",
+        "let hook_is_live = std::process::Command::new(\"kill\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/agent/runner.rs", ".status()", 1, "TEST-ONLY"),
+    (
+        "src/extras/acp/mod.rs",
+        "std::process::Command::new(\"kill\")",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/acp/mod.rs",
+        "!std::process::Command::new(\"kill\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/extras/acp/mod.rs", ".status()", 2, "TEST-ONLY"),
+    (
+        "src/extras/acp/mod.rs",
+        "let output = command.output().await.unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/lsp/client.rs",
+        "command: &mut tokio::process::Command,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/lsp/client.rs",
+        "_command: &mut tokio::process::Command,",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/sandbox.rs",
         "let mut cmd = Command::new(zerobox);",
@@ -2420,12 +2779,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/js/skills/telemetry.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
         ".spawn(move || {",
         1,
         "NON-PROCESS",
@@ -2567,6 +2920,72 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "TEST-ONLY",
     ),
     (
+        "src/sandbox/windows.rs",
+        ") -> Result<tokio::process::Command, String> {",
+        6,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut helper = Command::new(executable);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut helper = tokio::process::Command::from(helper);",
+        1,
+        "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".output()",
+        6,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".spawn()",
+        6,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut parent = Command::new(executable)",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let descendant = Command::new(executable)",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut breakaway = Command::new(",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "match breakaway.status() {",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        ".status()",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
         "src/ui/app.rs",
         "let mut command = tokio::process::Command::new(\"lazygit\");",
         1,
@@ -2634,7 +3053,6 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
-    ("src/sandbox/worker/macos.rs", "TC-SUPPORT-UTILITY"),
     ("src/session/mod.rs", "TC-INTERNAL-GIT"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),

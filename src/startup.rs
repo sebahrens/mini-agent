@@ -9,7 +9,7 @@ use crate::paths::AppPaths;
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::PermCheck;
 use crate::provider::{self, AnyClient};
-use crate::sandbox::{DEFAULT_COMMAND_LIMITS, Sandbox};
+use crate::sandbox::{DEFAULT_COMMAND_LIMITS, Sandbox, SandboxPolicy};
 use crate::session::{self, MessageRole, Session};
 
 #[cfg(feature = "advisor")]
@@ -48,6 +48,9 @@ fn validate_startup_permission_policy(cli: &Cli, cfg: &Config) -> anyhow::Result
     )?;
     crate::permission::build_noninteractive_permission(cfg, authority)?;
     Ok(())
+}
+fn unavailable_sandbox_must_fail(cli: &Cli, cfg: &Config, is_windows: bool) -> bool {
+    cli.resolve_sandbox(cfg) && (is_windows || cli.sandbox_explicitly_requested(cfg))
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderIdentity {
@@ -453,6 +456,29 @@ impl Startup {
             session_resumed,
             resume_override_pending,
         })
+    }
+
+    /// Validate the common process sandbox contract before entering any
+    /// execution surface, including ACP which intentionally skips feature
+    /// initialization. Windows is always fail-closed while sandboxing is on;
+    /// other platforms retain the legacy warning only for an entirely
+    /// inherited default.
+    pub(crate) fn validate_sandbox_availability(&self) -> anyhow::Result<()> {
+        let backend = self.cli.resolve_sandbox_backend(&self.cfg);
+        let sandbox = Sandbox::new(self.cli.resolve_sandbox(&self.cfg), &backend)
+            .with_shell(&self.cli.resolve_shell(&self.cfg))
+            .with_windows_appcontainer_roots(
+                self.cli.resolve_windows_appcontainer_read_roots(&self.cfg),
+                self.cli.resolve_windows_appcontainer_write_roots(&self.cfg),
+            );
+        if sandbox.policy() == SandboxPolicy::RequiredButUnavailable
+            && unavailable_sandbox_must_fail(&self.cli, &self.cfg, cfg!(target_os = "windows"))
+        {
+            anyhow::bail!(
+                "sandbox backend '{backend}' is unavailable or has no successful production preflight — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
+            );
+        }
+        Ok(())
     }
 
     /// Phase 2: subagents, OpenRouter pricing, sandbox, tools config,
@@ -1147,7 +1173,7 @@ mod tests {
     use super::{
         ResumeProviderDecision, apply_resume_provider_decision, interactive_initial_message,
         resolve_resume_provider_decision, select_interactive_auto_trigger,
-        validate_startup_permission_policy,
+        unavailable_sandbox_must_fail, validate_startup_permission_policy,
     };
     use crate::cli::Cli;
     use crate::config::Config;
@@ -1300,6 +1326,17 @@ mod tests {
         };
         assert!(!refused.resolve_sandbox(&configured));
         assert!(!refused.sandbox_explicitly_requested(&configured));
+
+        // Windows never silently drops an enabled sandbox, including when an
+        // unknown or stale backend name was selected.
+        assert!(unavailable_sandbox_must_fail(&cli, &cfg, true));
+        assert!(!unavailable_sandbox_must_fail(&refused, &configured, true));
+
+        let selected = Cli {
+            sandbox_backend: Some("definitely-not-a-real-backend".into()),
+            ..Cli::default()
+        };
+        assert!(unavailable_sandbox_must_fail(&selected, &cfg, false));
     }
 
     #[test]

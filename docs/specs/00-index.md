@@ -97,7 +97,7 @@ Cargo features are not phase-completion claims:
 |-------|------------------|--------------|
 | Foundation | None | The resolver, ownership matrix, migration, secure creation, and platform tests in `platform-paths.md` pass. |
 | 1 | None for the non-persistent engine; Foundation for any persistent artifact or unqualified platform-storage claim | The Phase 1 acceptance criteria pass, including mandatory permissions, bounded host calls, fresh runtimes, and `Sandbox::wrap_command` routing. |
-| 2 | Phase 1 | Phase 2 acceptance criteria pass on Linux and macOS. Windows isolation for the general subprocess path remains explicitly unsupported until a separate normative phase adds and verifies it. |
+| 2 | Phase 1 | Phase 2 acceptance criteria pass on Linux and macOS; the later Windows AppContainer candidate remains production-unavailable until native hosted attestation proves its explicit roots, zero-capability network denial, private storage, and Job boundary. |
 | 3 | Foundation and Phase 1; Phase 2 is optional | Manual admission, full artifact identity, no-effect verification, prompt-time retrieval, and turn binding pass. |
 | 4 | Foundation, Phase 1, and Phase 3 | Proposals can reach human-approved, non-retrievable canary state; no proposal can become active automatically. |
 | 5 | Phases 1–4 and Foundation | Evidence attribution, deterministic routing, permitted Tier 0/1 replacement promotion, quarantine, repair, rollback, and retention gates pass. |
