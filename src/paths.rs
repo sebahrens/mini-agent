@@ -2123,6 +2123,23 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
             "staged directory and target do not share a parent",
         ));
     }
+    match std::fs::symlink_metadata(canonical) {
+        Ok(metadata) if portable::is_link_or_reparse(&metadata) || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "migration target is not a real directory",
+            ));
+        }
+        Ok(_) => {
+            // Windows cannot rename a directory over even an empty directory.
+            // Root initialization may have created this exact empty target;
+            // remove_dir is intentionally non-recursive, so a concurrent
+            // writer makes this fail without losing any content.
+            std::fs::remove_dir(canonical)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     // Let Rust's Windows path layer normalize verbatim/short path forms before
     // issuing the native rename. Windows does not replace an existing
     // directory target, preserving create-if-absent publication for this

@@ -73,7 +73,19 @@ fn same_open_file_identity(
     #[cfg(target_os = "macos")]
     {
         let _ = (left, right);
-        Ok(super::macos_file_identity(left_file)? == super::macos_file_identity(right_file)?)
+        let left = super::macos_file_identity(left_file)?;
+        let right = super::macos_file_identity(right_file)?;
+        if left != right {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "macOS file identity changed: volume_match={} file_match={}",
+                    left.volume_uuid == right.volume_uuid,
+                    left.file_id == right.file_id
+                ),
+            ));
+        }
+        Ok(true)
     }
     #[cfg(not(target_os = "macos"))]
     {

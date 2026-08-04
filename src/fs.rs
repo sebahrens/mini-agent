@@ -25,8 +25,8 @@ pub(crate) struct WindowsFileIdentity {
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MacOsFileIdentity {
-    volume_uuid: [u8; 16],
-    file_id: u64,
+    pub(crate) volume_uuid: [u8; 16],
+    pub(crate) file_id: u64,
 }
 
 #[cfg(target_os = "macos")]
