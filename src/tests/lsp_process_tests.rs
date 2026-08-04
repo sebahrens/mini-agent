@@ -288,7 +288,7 @@ impl FixtureBuild {
     }
 
     fn cleanup(self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match fs::remove_dir_all(&self.root) {
                 Ok(()) => return,

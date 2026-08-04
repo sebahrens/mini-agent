@@ -378,7 +378,10 @@ impl Drop for WorkerConnection {
 
 impl JsWorkerSupervisor {
     pub(crate) fn shared() -> Arc<Self> {
-        const WATCHDOG_GRACE: Duration = Duration::from_secs(5);
+        // The worker owns the semantic deadline. Leave enough transport grace
+        // for a CPU-starved hosted runner to observe the QuickJS interrupt and
+        // encode the resulting closed diagnostic before the parent reaps it.
+        const WATCHDOG_GRACE: Duration = Duration::from_secs(30);
         static SHARED: OnceLock<Arc<JsWorkerSupervisor>> = OnceLock::new();
         SHARED
             .get_or_init(|| {

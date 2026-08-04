@@ -2422,6 +2422,8 @@ mod protocol_tests {
                     is_async: true,
                     condition: None,
                     once: false,
+                    trust: Default::default(),
+                    env: Default::default(),
                 }],
             }],
         );

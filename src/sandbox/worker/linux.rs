@@ -748,10 +748,12 @@ fn run_cpu_limit_probe(bwrap: &Path, executable: &Path) -> io::Result<()> {
         .take()
         .ok_or_else(|| io::Error::other("CPU probe stderr pipe missing"))?
         .read_to_string(&mut stderr)?;
-    if status.signal() != Some(libc::SIGXCPU)
-        || !stdout.contains(CPU_LIMIT_ARMED)
-        || !stderr.is_empty()
-    {
+    // A direct child reports SIGXCPU through `signal()`. Bubblewrap and some
+    // hosted-runner process wrappers normalize the same termination to the
+    // shell-compatible 128 + signal exit code.
+    let cpu_limit_observed =
+        status.signal() == Some(libc::SIGXCPU) || status.code() == Some(128 + libc::SIGXCPU);
+    if !cpu_limit_observed || !stdout.contains(CPU_LIMIT_ARMED) || !stderr.is_empty() {
         return Err(io::Error::other(format!(
             "CPU limit probe had the wrong outcome: status={status}, signal={:?}, armed={}, stderr={stderr:?}",
             status.signal(),

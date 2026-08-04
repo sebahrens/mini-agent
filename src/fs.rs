@@ -1314,11 +1314,7 @@ fn atomic_write_platform(
         };
     }
 
-    fn rename_open_file(
-        file: &std::fs::File,
-        directory: &std::fs::File,
-        name: &std::ffi::OsStr,
-    ) -> std::io::Result<()> {
+    fn rename_open_file(file: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<()> {
         let name: Vec<u16> = name.encode_wide().collect();
         if name.is_empty() || name.len() > (u32::MAX as usize / 2) {
             return Err(std::io::Error::new(
@@ -1332,14 +1328,16 @@ fn atomic_write_platform(
         let mut storage = vec![0usize; words];
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         // FileRenameInfo with ReplaceIfExists=false provides create-only
-        // publication across supported Windows versions. RootDirectory binds
-        // the destination to the already-open approved directory even if its
+        // publication across supported Windows versions. For a simple leaf
+        // name, a null RootDirectory resolves the destination relative to the
+        // source file's current parent directory. The descriptor-relative
+        // create above therefore remains authoritative even if that directory's
         // pathname is concurrently replaced.
         // SAFETY: `storage` is aligned, large enough for the header and UTF-16
         // name, and both handles remain live for the call.
         let renamed = unsafe {
             (*information).Anonymous.ReplaceIfExists = false;
-            (*information).RootDirectory = directory.as_raw_handle().cast();
+            (*information).RootDirectory = std::ptr::null_mut();
             (*information).FileNameLength = name_bytes as u32;
             std::ptr::copy_nonoverlapping(
                 name.as_ptr(),
@@ -1530,7 +1528,7 @@ fn atomic_write_platform(
 
     // When the directory is still reachable at its approved path, preserve
     // the same-target check used by the Unix implementation. If the directory
-    // itself was renamed, the held RootDirectory handle remains authoritative.
+    // itself was renamed, the created file's current parent remains authoritative.
     let parent_still_reachable = checked_path_metadata(&parent)
         .is_ok_and(|current| current.identity == parent_metadata.identity);
     if parent_still_reachable {
@@ -1553,7 +1551,7 @@ fn atomic_write_platform(
         }
     }
 
-    let publish_result = cancellation.publish(|| rename_open_file(&file, &directory, leaf));
+    let publish_result = cancellation.publish(|| rename_open_file(&file, leaf));
     if let Err(error) = publish_result {
         delete_open_file(&file);
         return Err(error);

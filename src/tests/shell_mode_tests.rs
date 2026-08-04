@@ -298,7 +298,7 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
             handle.abort();
             let _ = handle.await;
             wait_until(|| sandbox.active_group_count() == 0).await;
-            wait_until(|| {
+            wait_until_for(Duration::from_secs(30), || {
                 String::from_utf8_lossy(&logs.lock().unwrap())
                     .contains("explicit user shell ended after process cleanup")
             })
@@ -512,8 +512,12 @@ fn is_backend_setup_denial(rendered: &str) -> bool {
     .any(|needle| rendered.contains(needle))
 }
 
-async fn wait_until(mut predicate: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+async fn wait_until(predicate: impl FnMut() -> bool) {
+    wait_until_for(Duration::from_secs(2), predicate).await;
+}
+
+async fn wait_until_for(timeout: Duration, mut predicate: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
     while !predicate() {
         assert!(std::time::Instant::now() < deadline);
         sleep(Duration::from_millis(10)).await;

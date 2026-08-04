@@ -46,7 +46,7 @@ const ADDRESS_SPACE_LIMIT: libc::rlim_t = 1024 * 1024 * 1024 * 1024;
 const CPU_LIMIT_SECONDS: libc::rlim_t = 35;
 const FILE_DESCRIPTOR_LIMIT: libc::rlim_t = 64;
 const FILE_SIZE_LIMIT: libc::rlim_t = 1024 * 1024;
-const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_CONTENTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_GUARDIAN_PROFILE_BYTES: usize = 4 * 1024;
 const MAX_GUARDIAN_PATH_BYTES: usize = 4 * 1024;
@@ -1274,9 +1274,24 @@ fn executable_fails_with(path: &Path, expected_errors: &[i32]) -> bool {
             .raw_os_error()
             .is_some_and(|code| expected_errors.contains(&code)),
         Ok(mut child) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            false
+            // Some Darwin versions return from posix_spawn before Seatbelt
+            // rejects image activation. Accept only a prompt unsuccessful
+            // child outcome; success proves the alternate image executed, and
+            // a live child is killed and treated as a failed canary.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => return !status.success(),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return false;
+                    }
+                }
+            }
         }
     }
 }

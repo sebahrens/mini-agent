@@ -1827,6 +1827,20 @@ mod feasibility {
         }
 
         #[cfg(test)]
+        pub(super) fn fail_at_with_executable(
+            point: ProductionFailurePoint,
+            executable: PathBuf,
+        ) -> Self {
+            Self {
+                fail_at: Some(point),
+                deadline: None,
+                child: ProductionChild::FailureTest,
+                containment: None,
+                executable_override: Some(executable),
+            }
+        }
+
+        #[cfg(test)]
         pub(super) fn containment(
             configuration: ContainmentProbeConfiguration,
             executable: PathBuf,
@@ -3009,6 +3023,24 @@ mod feasibility {
     pub(super) static LAST_PRODUCTION_TEST_PID: std::sync::atomic::AtomicU32 =
         std::sync::atomic::AtomicU32::new(0);
 
+    #[cfg(test)]
+    pub(super) fn privatize_hosted_gate_inputs() -> Result<(), GateError> {
+        let mut executables = vec![std::env::current_exe().map_err(|error| {
+            GateError(format!("resolve Windows gate test executable: {error}"))
+        })?];
+        if let Some(installed) = std::env::var_os(INSTALLED_EXE_ENV) {
+            executables.push(PathBuf::from(installed));
+        }
+        for executable in executables {
+            drop(crate::fs::open_private_file(&executable).map_err(|error| {
+                GateError(format!(
+                    "apply exact private ACL to Windows gate executable: {error}"
+                ))
+            })?);
+        }
+        Ok(())
+    }
+
     pub(super) fn run_artifact_matrix() -> Result<(), GateError> {
         let profile = AppContainerProfile::stable_zero_capability()?;
         let result = (|| {
@@ -4109,6 +4141,7 @@ pub(super) fn attest_containment(probe: &crate::extras::js::protocol::Containmen
 
 #[cfg(test)]
 fn run_lpac_image_loading_gate() -> Result<(), feasibility::GateError> {
+    feasibility::privatize_hosted_gate_inputs()?;
     feasibility::run_artifact_matrix()
 }
 
@@ -4116,6 +4149,7 @@ fn run_lpac_image_loading_gate() -> Result<(), feasibility::GateError> {
 pub(super) fn run_containment_probe() -> io::Result<()> {
     feasibility::run_protected_install_negative_control()
         .map_err(|error| io::Error::other(error.0))?;
+    feasibility::privatize_hosted_gate_inputs().map_err(|error| io::Error::other(error.0))?;
     feasibility::run_production_containment_probe().map_err(|error| io::Error::other(error.0))
 }
 
@@ -4137,6 +4171,37 @@ mod tests {
         GetCurrentProcess, GetProcessHandleCount, OpenProcess, PROCESS_SYNCHRONIZE,
         WaitForSingleObject,
     };
+
+    struct PrivateFailureExecutable {
+        path: std::path::PathBuf,
+        root: std::path::PathBuf,
+    }
+
+    impl PrivateFailureExecutable {
+        fn copy_current() -> Self {
+            let root = std::path::PathBuf::from(
+                std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must exist on Windows"),
+            )
+            .join("mini-agent")
+            .join("launcher-failure-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+            crate::fs::ensure_private_directory(&root)
+                .expect("create private launcher failure-test directory");
+            let path = root.join("mini-agent-failure-test.exe");
+            let source = std::fs::read(std::env::current_exe().expect("resolve current test exe"))
+                .expect("read current test exe");
+            crate::fs::private_atomic_write_sync(&path, &source)
+                .expect("create private launcher failure-test executable");
+            Self { path, root }
+        }
+    }
+
+    impl Drop for PrivateFailureExecutable {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.root);
+        }
+    }
 
     #[test]
     #[ignore = "requires a real Windows AppContainer backend"]
@@ -4470,6 +4535,12 @@ mod tests {
         .expect_err("profile warmup must stop at the injected checkpoint");
         assert!(warmup.to_string().contains("PrepareExecutableAcl"));
 
+        // GitHub-hosted build directories intentionally grant broad write
+        // access to runner principals. Preserve the production rejection of
+        // that unsafe ACL and exercise post-ACL failure points with an exact
+        // private copy owned by the current user instead.
+        let executable = PrivateFailureExecutable::copy_current();
+
         let points = [
             ProductionFailurePoint::CreateProfile,
             ProductionFailurePoint::PrepareExecutableAcl,
@@ -4499,8 +4570,11 @@ mod tests {
             let baseline = super::LIVE_WIN_HANDLES.load(Ordering::Acquire);
             let os_handle_baseline = current_process_handle_count();
             LAST_PRODUCTION_TEST_PID.store(0, Ordering::Release);
-            let error = launch_production(ProductionLaunchHooks::fail_at(point))
-                .expect_err("each injected launcher failure must fail closed");
+            let error = launch_production(ProductionLaunchHooks::fail_at_with_executable(
+                point,
+                executable.path.clone(),
+            ))
+            .expect_err("each injected launcher failure must fail closed");
             assert!(
                 error.to_string().contains(&format!("{point:?}")),
                 "launcher failed before injected point {point:?}: {error}"

@@ -2372,10 +2372,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/extras/hooks/dispatcher.rs",
-        &[((
+        &[(
             "4455fff110b3f344a84e2da4538deb7323313eafb4e100e51a659498ebf49077",
             1,
-        ))],
+        )],
     ),
     (
         "src/sandbox.rs",

@@ -393,20 +393,23 @@ fn build_helper_with_ready_and_roots(
     configured_read_roots: &[PathBuf],
     configured_write_roots: &[PathBuf],
 ) -> Result<tokio::process::Command, String> {
+    let cwd = canonical_root(cwd, "workspace")?;
+    let cache = canonical_root(cache, "application cache")?;
+    let program = canonical_file(&program, "sandbox executable")?;
     let program_proof = prove_executable(&program)?;
     // The workspace is the sole implicit write root. The application cache and toolchain/cache
     // roots are read/execute only; adding another writable root requires explicit future config
     // plumbing rather than silently broadening this policy.
     let configured_read_roots =
-        canonicalize_access_roots(configured_read_roots.iter().map(PathBuf::as_path), cwd)?;
+        canonicalize_access_roots(configured_read_roots.iter().map(PathBuf::as_path), &cwd)?;
     let configured_write_roots =
-        canonicalize_access_roots(configured_write_roots.iter().map(PathBuf::as_path), cwd)?;
-    let write_roots = collect_write_roots(cwd, &configured_write_roots)?;
-    let read_roots = collect_read_roots(&program, cwd, cache, &configured_read_roots)?;
+        canonicalize_access_roots(configured_write_roots.iter().map(PathBuf::as_path), &cwd)?;
+    let write_roots = collect_write_roots(&cwd, &configured_write_roots)?;
+    let read_roots = collect_read_roots(&program, &cwd, &cache, &configured_read_roots)?;
     validate_explicit_root_policy(
         &program,
-        cwd,
-        cache,
+        &cwd,
+        &cache,
         &configured_read_roots,
         &configured_write_roots,
         &read_roots,
@@ -417,8 +420,8 @@ fn build_helper_with_ready_and_roots(
         program,
         program_proof,
         arguments,
-        cwd: cwd.to_path_buf(),
-        cache: cache.to_path_buf(),
+        cwd,
+        cache,
         read_roots,
         write_roots,
         configured_read_roots,
