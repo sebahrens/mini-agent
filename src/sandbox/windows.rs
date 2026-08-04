@@ -2580,11 +2580,33 @@ fn run_runtime_probe() -> Result<i32, String> {
         &cache,
         Some(cleanup_ready.clone()),
     )?;
-    let output = command
+    let mut output = command
         .as_std_mut()
         .output_guarded()
         .map_err(|e| format!("run write-boundary probe: {e}"))?;
     if !output.status.success() || !inside_file.exists() || outside_file.exists() {
+        if output.stderr.is_empty() {
+            let mut diagnostic = String::from("status=");
+            diagnostic.push_str(
+                &output
+                    .status
+                    .code()
+                    .map_or_else(|| String::from("none"), |code| code.to_string()),
+            );
+            diagnostic.push_str(" inside=");
+            diagnostic.push_str(if inside_file.exists() {
+                "true"
+            } else {
+                "false"
+            });
+            diagnostic.push_str(" outside=");
+            diagnostic.push_str(if outside_file.exists() {
+                "true"
+            } else {
+                "false"
+            });
+            output.stderr = diagnostic.into_bytes();
+        }
         return Err(format!(
             "explicit read/write boundary probe failed: {}",
             String::from_utf8_lossy(&output.stderr)

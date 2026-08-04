@@ -2110,11 +2110,7 @@ fn copy_directory_verified(
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
 fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-
     let stage_parent = stage
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stage has no parent"))?;
@@ -2127,22 +2123,11 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
             "staged directory and target do not share a parent",
         ));
     }
-    let source: Vec<u16> = stage.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
-    // The paths were constructed as siblings beneath the private canonical
-    // parent. Omitting MOVEFILE_REPLACE_EXISTING makes publication
-    // create-if-absent. A zero-flag MoveFileExW is the atomic same-volume
-    // directory rename; WRITE_THROUGH instead selects copy/delete durability
-    // behavior and can report ERROR_NOT_SAME_DEVICE for this directory case.
-    // The caller syncs the parent immediately after this publication boundary.
-    // SAFETY: both buffers are live, NUL-terminated UTF-16 paths and the API
-    // retains neither pointer after returning.
-    let renamed = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
-    if renamed == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    // Let Rust's Windows path layer normalize verbatim/short path forms before
+    // issuing the native rename. Windows does not replace an existing
+    // directory target, preserving create-if-absent publication for this
+    // directory-only migration. The caller syncs the parent immediately after.
+    std::fs::rename(stage, canonical)
 }
 
 #[cfg(not(windows))]
