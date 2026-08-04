@@ -12,6 +12,11 @@ use crate::sandbox::{
 
 use super::settings::HookTrust;
 
+enum HookLaunchError {
+    InvalidRoot(String),
+    Spawn(std::io::Error),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HookDiagnostics {
     pub containment: &'static str,
@@ -294,6 +299,7 @@ pub(crate) async fn run_hook(
         project_dir,
         &policy,
         DEFAULT_HOOK_LIMITS,
+        None,
     )
     .await
 }
@@ -306,6 +312,7 @@ async fn run_hook_with_policy_and_limits(
     project_dir: &str,
     policy: &HookPolicy,
     limits: HookLimits,
+    execution_root: Option<&super::dispatcher::HookExecutionRootLease>,
 ) -> HookOutput {
     let (program, args) = match build_hook_invocation(command, args) {
         Ok(invocation) => invocation,
@@ -407,14 +414,31 @@ async fn run_hook_with_policy_and_limits(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = match cmd.spawn_guarded() {
+    let spawn = match execution_root {
+        Some(execution_root) => execution_root
+            .with_validated_root(&project_dir, || cmd.spawn_guarded())
+            .map_err(HookLaunchError::InvalidRoot)
+            .and_then(|spawn| spawn.map_err(HookLaunchError::Spawn)),
+        None => cmd.spawn_guarded().map_err(HookLaunchError::Spawn),
+    };
+    let mut child = match spawn {
         Ok(child) => child,
-        Err(e) => {
+        Err(HookLaunchError::InvalidRoot(message)) => {
             return HookOutput {
                 started: false,
                 exit_code: None,
                 stdout: Vec::new(),
-                stderr: format!("failed to spawn hook: {e}").into_bytes(),
+                stderr: message.into_bytes(),
+                status: HookStatus::PolicyDenied,
+                diagnostics: policy.launch_denied_diagnostics(),
+            };
+        }
+        Err(HookLaunchError::Spawn(error)) => {
+            return HookOutput {
+                started: false,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: format!("failed to spawn hook: {error}").into_bytes(),
                 status: policy.spawn_failure_status(),
                 diagnostics: policy.launch_denied_diagnostics(),
             };
@@ -566,6 +590,29 @@ pub(crate) async fn run_hook_with_policy(
         project_dir,
         policy,
         DEFAULT_HOOK_LIMITS,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_hook_with_policy_at_root(
+    command: &str,
+    args: Option<&[String]>,
+    stdin_json: &[u8],
+    timeout: std::time::Duration,
+    project_dir: &str,
+    policy: &HookPolicy,
+    execution_root: &super::dispatcher::HookExecutionRootLease,
+) -> HookOutput {
+    run_hook_with_policy_and_limits(
+        command,
+        args,
+        stdin_json,
+        timeout,
+        project_dir,
+        policy,
+        DEFAULT_HOOK_LIMITS,
+        Some(execution_root),
     )
     .await
 }
@@ -592,6 +639,7 @@ pub(crate) async fn run_hook_with_limits(
         project_dir,
         &policy,
         limits,
+        None,
     )
     .await
 }
@@ -611,4 +659,30 @@ pub(crate) async fn run_shell_condition(
     };
     let args = vec![flag.to_string(), condition.to_string()];
     run_hook_with_policy(shell, Some(&args), stdin_json, timeout, project_dir, policy).await
+}
+
+pub(crate) async fn run_shell_condition_at_root(
+    condition: &str,
+    stdin_json: &[u8],
+    timeout: std::time::Duration,
+    project_dir: &str,
+    policy: &HookPolicy,
+    execution_root: &super::dispatcher::HookExecutionRootLease,
+) -> HookOutput {
+    let (shell, flag) = if cfg!(windows) {
+        ("powershell", "-Command")
+    } else {
+        ("sh", "-c")
+    };
+    let args = vec![flag.to_string(), condition.to_string()];
+    run_hook_with_policy_at_root(
+        shell,
+        Some(&args),
+        stdin_json,
+        timeout,
+        project_dir,
+        policy,
+        execution_root,
+    )
+    .await
 }

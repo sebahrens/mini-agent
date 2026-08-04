@@ -304,7 +304,7 @@ pub struct Cli {
     #[cfg(feature = "git-worktree")]
     #[arg(
         long = "wt-force",
-        help = "Force worktree remove and branch delete even if dirty"
+        help = "Deprecated compatibility flag; cleanup always preserves dirty worktrees"
     )]
     pub wt_force: bool,
 

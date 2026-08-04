@@ -318,8 +318,6 @@ impl AgentRunState {
     }
 }
 
-/// What happens when the current run finishes: chained prompts, dot-prompt
-/// restore, /loop iterations, and worktree-merge returns.
 #[derive(Default)]
 pub(crate) struct ChainState {
     pub pending: Option<crate::extras::chain::ChainPhase>,
@@ -328,8 +326,6 @@ pub(crate) struct ChainState {
     pub loop_label: Option<String>,
     #[cfg(feature = "loop")]
     pub loop_state: Option<crate::extras::r#loop::LoopState>,
-    #[cfg(feature = "git-worktree")]
-    pub wt_return_path: Option<(String, String, String, bool)>,
 }
 
 /// User-facing feature toggles owned by slash commands.
@@ -392,14 +388,4 @@ mod validation_generation_tests {
         assert!(!run.validation_active());
         assert!(!run.complete_validation(current));
     }
-}
-
-/// Parameters for a worktree merge-and-return run.
-#[cfg(feature = "git-worktree")]
-pub(crate) struct MergeRequest<'a> {
-    pub branch: &'a str,
-    pub target: &'a str,
-    pub main_path: &'a str,
-    pub wt_path: &'a str,
-    pub force: bool,
 }

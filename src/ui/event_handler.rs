@@ -15,10 +15,8 @@ use crate::ui::renderer::Renderer;
 use crate::ui::slash::handle_compress;
 use crate::ui::state::{AgentRunState, ChainState, SlashState, UiContext};
 
-#[cfg(any(feature = "git-worktree", feature = "loop"))]
+#[cfg(feature = "loop")]
 use super::C_AGENT;
-#[cfg(feature = "git-worktree")]
-use super::apply_current_prompt_mode;
 use super::{C_ERROR, C_TOOL};
 
 /// Build the main agent on first use, lazily connecting MCP as well. Callers
@@ -32,7 +30,7 @@ pub async fn ensure_agent(
         return;
     }
     #[cfg(feature = "mcp")]
-    crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg).await;
+    crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.context.workspace_root).await;
     *agent = Some(
         ui.agent_build_ctx()
             .rebuild_agent(&ui.session.model, reasoning_enabled)
@@ -303,8 +301,8 @@ async fn handle_agent_done(
     chain: &mut ChainState,
     #[cfg(feature = "loop")] validation_tx: &tokio::sync::mpsc::Sender<UserEvent>,
 ) -> anyhow::Result<()> {
-    // `chain` is only read by the /loop-respawn and worktree-return paths.
-    #[cfg(not(any(feature = "loop", feature = "git-worktree")))]
+    // `chain` is only read by the /loop-respawn path.
+    #[cfg(not(feature = "loop"))]
     let _ = &chain;
     run.was_reasoning = false;
 
@@ -399,9 +397,6 @@ async fn handle_agent_done(
         finish_loop_iteration(response.as_str(), summary, None, renderer, run, ui, chain).await?;
     }
 
-    #[cfg(feature = "git-worktree")]
-    finish_worktree_return(renderer, run, ui, chain).await?;
-
     Ok(())
 }
 
@@ -432,8 +427,6 @@ pub(crate) async fn handle_loop_validation_event(
     )
     .await?;
 
-    #[cfg(feature = "git-worktree")]
-    finish_worktree_return(renderer, run, ui, chain).await?;
     Ok(true)
 }
 
@@ -516,45 +509,6 @@ async fn finish_loop_iteration(
         &format!("[loop] launching {}", ls.iteration_label()),
         C_AGENT,
     )?;
-    Ok(())
-}
-
-#[cfg(feature = "git-worktree")]
-async fn finish_worktree_return(
-    renderer: &mut Renderer,
-    run: &mut AgentRunState,
-    ui: &mut UiContext<'_>,
-    chain: &mut ChainState,
-) -> anyhow::Result<()> {
-    if let Some((main_path, wt_path, branch, force)) = chain.wt_return_path.take() {
-        crate::extras::git_worktree::cleanup_worktree(&wt_path, &branch, &main_path, force);
-        match std::env::set_current_dir(&main_path) {
-            Ok(()) => {
-                ui.session.working_dir = compact_str::CompactString::new(&main_path);
-                ui.context.reload();
-                apply_current_prompt_mode(ui.context, &ui.permission);
-                run.agent = Some(
-                    ui.agent_build_ctx()
-                        .rebuild_agent(&ui.session.model, true)
-                        .await,
-                );
-                crate::ui::events::render_session(
-                    renderer, ui.session, ui.cli, ui.cfg, ui.context,
-                )?;
-                renderer.write_line(
-                    &format!("merged and returned to main repo at {}", main_path),
-                    C_AGENT,
-                )?;
-            }
-            Err(e) => {
-                renderer.write_line(
-                    &format!("warning: failed to change back to main repo: {}", e),
-                    C_ERROR,
-                )?;
-            }
-        }
-    }
-
     Ok(())
 }
 

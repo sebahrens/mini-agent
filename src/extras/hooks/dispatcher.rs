@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use regex::Regex;
 
@@ -9,7 +9,7 @@ use super::envelope::{EventFields, build_envelope};
 use super::normalize::canonical_tool_name;
 use super::settings::{HookHandler, HooksConfig};
 use super::subprocess::{
-    HookOutput, HookPolicy, HookStatus, run_hook_with_policy, run_shell_condition,
+    HookOutput, HookPolicy, HookStatus, run_hook_with_policy_at_root, run_shell_condition_at_root,
 };
 use super::{Decision, HookCtx, PreDecision, Verdict};
 
@@ -59,15 +59,131 @@ struct MatcherEntry {
     handlers: Vec<HookHandler>,
 }
 
+#[derive(Clone)]
+struct ValidatedExecutionRoot {
+    configured: PathBuf,
+    canonical: PathBuf,
+    identity: crate::fs::CheckedMetadata,
+}
+
+impl ValidatedExecutionRoot {
+    fn capture(path: &Path) -> Result<Self, String> {
+        let canonical = std::fs::canonicalize(path).map_err(|error| {
+            format!(
+                "hooks: execution workspace '{}' is unavailable: {error}",
+                path.display()
+            )
+        })?;
+        if canonical.parent().is_none() {
+            return Err("hooks: execution workspace cannot be the filesystem root".to_string());
+        }
+        let identity = crate::fs::checked_path_metadata(&canonical).map_err(|error| {
+            format!(
+                "hooks: execution workspace '{}' cannot be identified: {error}",
+                canonical.display()
+            )
+        })?;
+        if !identity.is_dir() {
+            return Err("hooks: execution workspace is not a directory".to_string());
+        }
+        Ok(Self {
+            configured: path.to_path_buf(),
+            canonical,
+            identity,
+        })
+    }
+
+    fn revalidate(&self) -> Result<&Path, String> {
+        let canonical = std::fs::canonicalize(&self.configured).map_err(|error| {
+            format!(
+                "hooks: execution workspace '{}' is unavailable: {error}",
+                self.configured.display()
+            )
+        })?;
+        if canonical != self.canonical {
+            return Err("hooks: execution workspace changed after selection".to_string());
+        }
+        let current = crate::fs::checked_path_metadata(&canonical).map_err(|error| {
+            format!(
+                "hooks: execution workspace '{}' cannot be revalidated: {error}",
+                canonical.display()
+            )
+        })?;
+        crate::fs::ensure_same_file(&canonical, &self.identity, &current).map_err(|_| {
+            "hooks: execution workspace identity changed after selection".to_string()
+        })?;
+        if !current.is_dir() {
+            return Err("hooks: execution workspace is no longer a directory".to_string());
+        }
+        Ok(&self.canonical)
+    }
+}
+
+enum ExecutionRootBinding {
+    /// Unit-test and explicitly unbound dispatchers validate each supplied context.
+    Unbound,
+    Valid(ValidatedExecutionRoot),
+    /// A failed rebind must disable execution instead of retaining stale authority.
+    Invalid(String),
+}
+
+struct ExecutionRootState {
+    generation: u64,
+    binding: ExecutionRootBinding,
+}
+
+/// A dispatch-local proof that remains bound to the exact selected directory
+/// identity and selection generation until each child has been created.
+#[derive(Clone)]
+pub(crate) struct HookExecutionRootLease {
+    state: Arc<RwLock<ExecutionRootState>>,
+    generation: u64,
+    root: ValidatedExecutionRoot,
+}
+
+impl HookExecutionRootLease {
+    fn revalidate_locked<'a>(&'a self, state: &ExecutionRootState) -> Result<&'a Path, String> {
+        if state.generation != self.generation {
+            return Err("hooks: execution workspace changed during dispatch".to_string());
+        }
+        match &state.binding {
+            ExecutionRootBinding::Invalid(error) => return Err(error.clone()),
+            ExecutionRootBinding::Unbound | ExecutionRootBinding::Valid(_) => {}
+        }
+        self.root.revalidate()
+    }
+
+    /// Revalidates the selected path and keeps rebinding serialized through
+    /// synchronous child creation. A completed rebind invalidates this lease;
+    /// one already holding the read lock linearizes its spawn before rebind.
+    pub(crate) fn with_validated_root<T>(
+        &self,
+        expected_project_dir: &Path,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let canonical = self.revalidate_locked(&state)?;
+        if canonical != expected_project_dir {
+            return Err("hooks: execution workspace changed before child creation".to_string());
+        }
+        Ok(operation())
+    }
+}
+
 /// The rig-free dispatcher seam: accepts only strings/JSON and returns only
 /// zerostack-owned `Decision`/`PreDecision` values. See hook-dispatch spec's
 /// "rig-free dispatcher seam" requirement.
 pub(crate) struct HookDispatcher {
     events: HashMap<String, Vec<MatcherEntry>>,
     sandbox_backend: String,
-    /// Canonical startup project root. Production dispatch binds both the
-    /// hook envelope and subprocess policy to this immutable directory.
-    project_root: Option<String>,
+    /// Immutable root used to hash and approve project-local hook bindings.
+    /// Worktree selection never changes this trust decision.
+    _trust_binding_root: Option<PathBuf>,
+    /// Separately validated workspace used by envelopes and hook children.
+    execution_root: Arc<RwLock<ExecutionRootState>>,
     /// Full handler bindings with `once: true` that have already run, keyed by
     /// event so distinct argv, conditions, environments, and trust policies
     /// never consume one another's once slot.
@@ -99,14 +215,14 @@ impl HookDispatcher {
         Self::from_config_with_backend_and_optional_root(
             config,
             sandbox_backend,
-            Some(project_root.to_string_lossy().into_owned()),
+            Some(project_root.to_path_buf()),
         )
     }
 
     fn from_config_with_backend_and_optional_root(
         config: &HooksConfig,
         sandbox_backend: &str,
-        project_root: Option<String>,
+        project_root: Option<PathBuf>,
     ) -> Result<Self, String> {
         let mut events = HashMap::new();
         for (event, groups) in config {
@@ -120,20 +236,72 @@ impl HookDispatcher {
             }
             events.insert(event.clone(), entries);
         }
+        let execution_root = match project_root.as_deref() {
+            Some(root) => match ValidatedExecutionRoot::capture(root) {
+                Ok(root) => ExecutionRootBinding::Valid(root),
+                Err(error) => ExecutionRootBinding::Invalid(error),
+            },
+            None => ExecutionRootBinding::Unbound,
+        };
         Ok(Self {
             events,
             sandbox_backend: sandbox_backend.to_string(),
-            project_root,
+            _trust_binding_root: project_root,
+            execution_root: Arc::new(RwLock::new(ExecutionRootState {
+                generation: 0,
+                binding: execution_root,
+            })),
             once_ran: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
-    fn policy_context(&self, ctx: &HookCtx) -> HookCtx {
-        let mut ctx = ctx.clone();
-        if let Some(project_root) = &self.project_root {
-            ctx.cwd.clone_from(project_root);
+    /// Rebind hook execution after a validated UI/session workspace switch.
+    /// Failure is sticky and fail-closed until a later valid rebind succeeds.
+    pub(crate) fn rebind_execution_root(&self, workspace: &Path) -> Result<(), String> {
+        let mut state = self
+            .execution_root
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(next_generation) = state.generation.checked_add(1) else {
+            let error = "hooks: execution workspace generation exhausted".to_string();
+            state.binding = ExecutionRootBinding::Invalid(error.clone());
+            return Err(error);
+        };
+        state.generation = next_generation;
+        state.binding = ExecutionRootBinding::Invalid(
+            "hooks: execution workspace revalidation is incomplete".to_string(),
+        );
+        match ValidatedExecutionRoot::capture(workspace) {
+            Ok(root) => {
+                state.binding = ExecutionRootBinding::Valid(root);
+                Ok(())
+            }
+            Err(error) => {
+                state.binding = ExecutionRootBinding::Invalid(error.clone());
+                Err(error)
+            }
         }
-        ctx
+    }
+
+    fn policy_context(&self, ctx: &HookCtx) -> Result<(HookCtx, HookExecutionRootLease), String> {
+        let mut ctx = ctx.clone();
+        let state = self
+            .execution_root
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = match &state.binding {
+            ExecutionRootBinding::Unbound => ValidatedExecutionRoot::capture(Path::new(&ctx.cwd))?,
+            ExecutionRootBinding::Valid(root) => root.clone(),
+            ExecutionRootBinding::Invalid(error) => return Err(error.clone()),
+        };
+        let lease = HookExecutionRootLease {
+            state: Arc::clone(&self.execution_root),
+            generation: state.generation,
+            root,
+        };
+        let canonical = lease.revalidate_locked(&state)?.to_path_buf();
+        ctx.cwd = canonical.to_string_lossy().into_owned();
+        Ok((ctx, lease))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -211,10 +379,16 @@ impl HookDispatcher {
         if handlers.is_empty() {
             return Decision::Continue;
         }
-        let ctx = self.policy_context(ctx);
+        let (ctx, execution_root) = match self.policy_context(ctx) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(event, error = %error, "hooks: refusing dispatch in invalid workspace");
+                return Decision::Block { reason: error };
+            }
+        };
         let envelope = build_envelope(&ctx, event, fields);
         let outputs = self
-            .run_handlers(event, &handlers, &envelope, &ctx.cwd)
+            .run_handlers(event, &handlers, &envelope, &ctx.cwd, &execution_root)
             .await;
         merge_decisions(event, &outputs)
     }
@@ -235,7 +409,17 @@ impl HookDispatcher {
                 updated_input: None,
             };
         }
-        let ctx = self.policy_context(ctx);
+        let (ctx, execution_root) = match self.policy_context(ctx) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(error = %error, "hooks: refusing PreToolUse dispatch in invalid workspace");
+                return PreDecision {
+                    verdict: Verdict::Deny,
+                    reason: Some(error),
+                    updated_input: None,
+                };
+            }
+        };
         let envelope = build_envelope(
             &ctx,
             "PreToolUse",
@@ -245,7 +429,13 @@ impl HookDispatcher {
             },
         );
         let outputs = self
-            .run_handlers("PreToolUse", &handlers, &envelope, &ctx.cwd)
+            .run_handlers(
+                "PreToolUse",
+                &handlers,
+                &envelope,
+                &ctx.cwd,
+                &execution_root,
+            )
             .await;
         let parts: Vec<PreDecisionPart> = outputs.iter().map(parse_pre_decision_part).collect();
         merge_pre_decisions(&tool_input, &parts)
@@ -265,7 +455,13 @@ impl HookDispatcher {
         if handlers.is_empty() {
             return Decision::Continue;
         }
-        let ctx = self.policy_context(ctx);
+        let (ctx, execution_root) = match self.policy_context(ctx) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(error = %error, "hooks: skipping PostToolUse dispatch in invalid workspace");
+                return Decision::Continue;
+            }
+        };
         let envelope = build_envelope(
             &ctx,
             "PostToolUse",
@@ -276,7 +472,13 @@ impl HookDispatcher {
             },
         );
         let outputs = self
-            .run_handlers("PostToolUse", &handlers, &envelope, &ctx.cwd)
+            .run_handlers(
+                "PostToolUse",
+                &handlers,
+                &envelope,
+                &ctx.cwd,
+                &execution_root,
+            )
             .await;
         merge_post_tool_use_decisions(&outputs, tool_response)
     }
@@ -294,7 +496,13 @@ impl HookDispatcher {
         if handlers.is_empty() {
             return;
         }
-        let ctx = self.policy_context(ctx);
+        let (ctx, execution_root) = match self.policy_context(ctx) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(error = %error, "hooks: skipping PostToolUseFailure dispatch in invalid workspace");
+                return;
+            }
+        };
         let envelope = build_envelope(
             &ctx,
             "PostToolUseFailure",
@@ -305,7 +513,13 @@ impl HookDispatcher {
             },
         );
         let _ = self
-            .run_handlers("PostToolUseFailure", &handlers, &envelope, &ctx.cwd)
+            .run_handlers(
+                "PostToolUseFailure",
+                &handlers,
+                &envelope,
+                &ctx.cwd,
+                &execution_root,
+            )
             .await;
     }
 
@@ -318,6 +532,7 @@ impl HookDispatcher {
         handlers: &[&HookHandler],
         envelope: &serde_json::Value,
         project_dir: &str,
+        execution_root: &HookExecutionRootLease,
     ) -> Vec<HookOutput> {
         let stdin = serde_json::to_vec(envelope).unwrap_or_default();
         let mut futures = Vec::new();
@@ -332,9 +547,15 @@ impl HookDispatcher {
                     HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone());
                 let cond_timeout =
                     std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
-                let cond_output =
-                    run_shell_condition(condition, &stdin, cond_timeout, project_dir, &policy)
-                        .await;
+                let cond_output = run_shell_condition_at_root(
+                    condition,
+                    &stdin,
+                    cond_timeout,
+                    project_dir,
+                    &policy,
+                    execution_root,
+                )
+                .await;
                 audit_hook_outcome(event, &command, "condition", handler.trust, &cond_output);
                 match cond_output.status {
                     HookStatus::TimedOut => {
@@ -377,6 +598,7 @@ impl HookDispatcher {
                 std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
             let stdin = stdin.clone();
             let project_dir = project_dir.to_string();
+            let execution_root = execution_root.clone();
             let args = handler.args.clone();
             let policy = HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone());
             let diagnostics = policy.diagnostics();
@@ -393,13 +615,14 @@ impl HookDispatcher {
             );
             if handler.is_async {
                 async_futures.push(async move {
-                    let output = run_hook_with_policy(
+                    let output = run_hook_with_policy_at_root(
                         &command,
                         args.as_deref(),
                         &stdin,
                         timeout,
                         &project_dir,
                         &policy,
+                        &execution_root,
                     )
                     .await;
                     once_reservation.consume_if_started(&output);
@@ -407,13 +630,14 @@ impl HookDispatcher {
                 });
             } else {
                 futures.push(async move {
-                    let output = run_hook_with_policy(
+                    let output = run_hook_with_policy_at_root(
                         &command,
                         args.as_deref(),
                         &stdin,
                         timeout,
                         &project_dir,
                         &policy,
+                        &execution_root,
                     )
                     .await;
                     once_reservation.consume_if_started(&output);

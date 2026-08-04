@@ -683,6 +683,7 @@ pub struct FindFilesTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub max_results: u64,
+    workspace: std::path::PathBuf,
 }
 
 impl FindFilesTool {
@@ -691,7 +692,13 @@ impl FindFilesTool {
             permission,
             ask_tx,
             max_results,
+            workspace: std::env::current_dir().unwrap_or_default(),
         }
+    }
+
+    pub(crate) fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = workspace.into();
+        self
     }
 }
 
@@ -739,7 +746,7 @@ impl Tool for FindFilesTool {
         if requested_path.is_empty() {
             return Err(ToolError::Msg("Search path cannot be empty".to_string()));
         }
-        let search_path = crate::fs::expand_tilde(requested_path);
+        let search_path = crate::fs::resolve_workspace_path(&self.workspace, requested_path);
         let traversal_root = tokio::fs::canonicalize(&search_path).await?;
         let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
         let bound_directory = BoundDirectory::open(&traversal_root, &authorized_metadata)?;

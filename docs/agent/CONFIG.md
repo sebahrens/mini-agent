@@ -365,7 +365,7 @@ Accepted top-level keys:
 | `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux and `seatbelt` on macOS; Windows has no supported Phase 2 general-command backend and JS `spawn` remains disabled there. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
 | `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
 | `js-fetch-allow-http`     | boolean | Permit public-address HTTP origins for JS `fetch()` in addition to HTTPS. Default: `false`. Private, loopback, link-local, metadata, multicast, and reserved destinations remain denied. |
-| `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `guarded`, `yolo`.                                          |
+| `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`.                               |
 | `show_tool_details`       | boolean or integer | Show tool-result previews in the TUI. `false` hides output, `true` shows all lines, an integer limits to that many lines (e.g. `3`). Default: `3`. |
 | `show_reasoning`          | boolean | Show streamed reasoning text in the TUI. Can still be toggled at runtime with `Ctrl+R` or `/reasoning`. Default: `false`. |
 | `statusline`              | table   | Configurable status bar (up to 3 lines of colored segments). When absent, a built-in default layout is used. See Status bar below. |
@@ -920,6 +920,15 @@ start with `echo`. Bash `ask` and `deny` entries remain pattern-based so broad
 safeguards still work. An unmatched Bash script asks in `guarded` and
 `standard`; `yolo` remains the explicit allow-all mode subject to deny rules.
 
+`planwrite` is read-only except for the narrow built-in plan-file exception:
+`write`, `edit`, and `js/write_file` may modify `PLAN*.md` only when the
+canonical target is component-contained beneath the startup workspace. A
+matching basename outside that workspace, a sibling-prefix path, `..` escape,
+or a final/parent symlink escape receives no exception and follows the ordinary
+configured permission policy. New plan files require an existing stable parent
+directory; publication uses the same no-follow atomic-write checks as ordinary
+file tools so a path replacement after authorization fails closed.
+
 Bash commands have a mandatory 30-second deadline. A tool call's optional
 `timeout` value is milliseconds and can only lower that deadline. Captured raw
 output is limited to 1 MiB of stdout, 1 MiB of stderr, and 1.5 MiB combined;
@@ -1293,7 +1302,7 @@ Custom prompt `.md` files may include a `%%mode=<mode>` directive on the
 **first line** to automatically switch the security mode when the prompt
 is activated (via `/prompt <name>` or as the `default_prompt`).
 
-Valid modes: `standard`, `restrictive`, `readonly`, `guarded`, `yolo`.
+Valid modes: `standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`.
 
 Use `%%mode=last_user_mode` to keep (or restore) the mode the user last
 set explicitly via `/mode` or startup config — useful when a prompt wants

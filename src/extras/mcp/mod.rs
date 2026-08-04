@@ -20,12 +20,21 @@ pub struct McpClientManager {
 }
 
 impl McpClientManager {
-    pub async fn connect_all(configs: &HashMap<String, config::McpServerConfig>) -> Self {
+    pub(crate) async fn connect_all_in(
+        configs: &HashMap<String, config::McpServerConfig>,
+        workspace: &std::path::Path,
+    ) -> Self {
         tracing::debug!("MCP connecting to {} servers", configs.len());
         let mut handles = Vec::new();
         let mut notices = Vec::new();
         for (name, cfg) in configs {
-            match client::McpClientHandle::connect(CompactString::new(name.clone()), cfg).await {
+            match client::McpClientHandle::connect_in(
+                CompactString::new(name.clone()),
+                cfg,
+                workspace,
+            )
+            .await
+            {
                 Ok(handle) => {
                     tracing::info!("Connected to MCP server '{}'", name);
                     handles.push(handle);
@@ -85,10 +94,11 @@ impl McpClientManager {
     /// (Re)connect a single server, replacing any existing handle for it.
     /// Used after an interactive OAuth login so the server's tools become
     /// available without restarting the session.
-    pub async fn reconnect(
+    pub(crate) async fn reconnect_in(
         &mut self,
         name: &str,
         cfg: &config::McpServerConfig,
+        workspace: &std::path::Path,
     ) -> anyhow::Result<()> {
         tracing::info!("MCP reconnecting server '{}'", name);
         // Command servers commonly own an exclusive local resource. Stop and
@@ -105,7 +115,8 @@ impl McpClientManager {
             let mut previous = self.handles.remove(index);
             let _ = previous.running_service.close().await;
         }
-        let handle = client::McpClientHandle::connect(CompactString::new(name), cfg).await?;
+        let handle =
+            client::McpClientHandle::connect_in(CompactString::new(name), cfg, workspace).await?;
         self.handles.retain(|h| h.server_name != name);
         self.handles.push(handle);
         Ok(())

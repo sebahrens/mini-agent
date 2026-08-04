@@ -34,6 +34,7 @@ pub struct ListDirTool {
     /// `None` = no truncation (matches the historical behaviour).
     /// `Some(n)` = show the first `n` entries with a recovery hint.
     pub max_entries: Option<u64>,
+    workspace: std::path::PathBuf,
 }
 
 impl ListDirTool {
@@ -46,7 +47,13 @@ impl ListDirTool {
             permission,
             ask_tx,
             max_entries,
+            workspace: std::env::current_dir().unwrap_or_default(),
         }
+    }
+
+    pub(crate) fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = workspace.into();
+        self
     }
 }
 
@@ -75,10 +82,11 @@ impl Tool for ListDirTool {
     }
 
     async fn call(&self, args: ListDirArgs) -> Result<String, ToolError> {
-        let path = crate::fs::expand_tilde(args.path.as_deref().unwrap_or("."));
+        let path =
+            crate::fs::resolve_workspace_path(&self.workspace, args.path.as_deref().unwrap_or("."));
         let resolved = tokio::fs::canonicalize(&path).await?;
         let permission_path = resolved.to_string_lossy();
-        tracing::debug!("tool list_dir start: path={}", path);
+        tracing::debug!("tool list_dir start: path={}", path.display());
         let coaching =
             check_perm_path(&self.permission, &self.ask_tx, "list_dir", &permission_path).await?;
         let checked_metadata = crate::fs::stable_path_metadata(&resolved).await?;
@@ -149,7 +157,7 @@ impl Tool for ListDirTool {
         });
 
         if entries.is_empty() {
-            let msg = format!("Listing {}:\n(empty directory)", path);
+            let msg = format!("Listing {}:\n(empty directory)", path.display());
             return Ok(match coaching {
                 Some(c) => format!("{}\n\n{}", c, msg),
                 None => msg,
@@ -164,7 +172,7 @@ impl Tool for ListDirTool {
             .map(|e| e.0.len())
             .max()
             .unwrap_or(0);
-        let mut result = format!("Listing {}:\n", path);
+        let mut result = format!("Listing {}:\n", path.display());
         for (name, kind, size) in &entries[..shown] {
             let padded = format!("{:width$}", name, width = max_name);
             let size_str = if size.is_empty() {
@@ -185,7 +193,7 @@ impl Tool for ListDirTool {
         }
         tracing::debug!(
             "tool list_dir done: path={}, entries={}",
-            path,
+            path.display(),
             total_entries,
         );
         if let Some(msg) = coaching {

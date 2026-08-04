@@ -260,12 +260,13 @@ fn apply_startup_prompt_model(
 #[cfg(feature = "mcp")]
 pub(crate) async fn connect_headless_mcp(
     cfg: &Config,
+    workspace: &std::path::Path,
 ) -> Option<crate::extras::mcp::McpClientManager> {
     let servers = cfg.mcp_servers.as_ref()?;
     if servers.is_empty() {
         return None;
     }
-    let manager = crate::extras::mcp::McpClientManager::connect_all(servers).await;
+    let manager = crate::extras::mcp::McpClientManager::connect_all_in(servers, workspace).await;
     for notice in &manager.notices {
         eprintln!("{}", notice);
     }
@@ -778,9 +779,9 @@ impl Startup {
         // ARCHITECTURE.md prompt
         #[cfg(feature = "archmd")]
         let arch_created = if !self.cli.resolve_no_context_files(&self.cfg) {
-            let cwd = std::env::current_dir().ok();
-            if let Some(ref cwd) = cwd {
-                crate::extras::archmd::ask_and_create(cwd).unwrap_or_else(|e| {
+            let workspace = std::path::Path::new(self.session.working_dir.as_str());
+            if workspace.exists() {
+                crate::extras::archmd::ask_and_create(workspace).unwrap_or_else(|e| {
                     tracing::warn!("Architecture.md prompt failed: {e}");
                     false
                 })
@@ -794,7 +795,9 @@ impl Startup {
         // Reload context after potential ARCHITECTURE.md creation
         #[cfg(feature = "archmd")]
         if arch_created {
-            self.context.architecture = crate::context::load_architecture();
+            self.context.architecture = crate::context::load_architecture_from(
+                std::path::Path::new(self.session.working_dir.as_str()),
+            );
         }
 
         // Default prompt resolution (after prompts may have been regenerated)
@@ -950,6 +953,10 @@ impl Startup {
 
     /// Phase 4: mode dispatch — print, loop, or interactive.
     pub(crate) async fn dispatch(mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "hooks")]
+        crate::extras::hooks::set_active_workspace(std::path::Path::new(
+            self.session.working_dir.as_str(),
+        ));
         if self.resume_override_pending {
             // All fallible startup validation has completed. Persist the
             // identity/audit update atomically before any agent can receive
@@ -978,6 +985,8 @@ impl Startup {
             {
                 let run = self
                     .sandbox
+                    .clone()
+                    .with_working_dir(std::path::PathBuf::from(self.session.working_dir.as_str()))
                     .run_explicit_shell(&msg, DEFAULT_COMMAND_LIMITS, None)
                     .await?;
                 let result = run.rendered_output();
@@ -1004,7 +1013,11 @@ impl Startup {
             let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
             let completion_model = self.client.completion_model(self.model.to_string());
             #[cfg(feature = "mcp")]
-            let mcp_manager = connect_headless_mcp(&self.cfg).await;
+            let mcp_manager = connect_headless_mcp(
+                &self.cfg,
+                std::path::Path::new(self.session.working_dir.as_str()),
+            )
+            .await;
             let agent = provider::build_agent(
                 completion_model,
                 &self.cli,
@@ -1079,7 +1092,11 @@ impl Startup {
         let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
         let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
         #[cfg(feature = "mcp")]
-        let mcp_manager = connect_headless_mcp(&self.cfg).await;
+        let mcp_manager = connect_headless_mcp(
+            &self.cfg,
+            std::path::Path::new(self.session.working_dir.as_str()),
+        )
+        .await;
         let agent = provider::build_agent(
             model_completion,
             &self.cli,

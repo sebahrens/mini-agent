@@ -97,13 +97,32 @@ impl McpClientHandle {
         server_name: CompactString,
         config: &McpServerConfig,
     ) -> anyhow::Result<Self> {
-        Self::connect_with_timeout(server_name, config, MCP_INITIALIZE_TIMEOUT).await
+        let workspace = std::env::current_dir().unwrap_or_default();
+        Self::connect_in(server_name, config, &workspace).await
+    }
+
+    pub(crate) async fn connect_in(
+        server_name: CompactString,
+        config: &McpServerConfig,
+        workspace: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_timeout_in(server_name, config, MCP_INITIALIZE_TIMEOUT, workspace).await
     }
 
     pub(crate) async fn connect_with_timeout(
         server_name: CompactString,
         config: &McpServerConfig,
         initialize_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        let workspace = std::env::current_dir().unwrap_or_default();
+        Self::connect_with_timeout_in(server_name, config, initialize_timeout, &workspace).await
+    }
+
+    pub(crate) async fn connect_with_timeout_in(
+        server_name: CompactString,
+        config: &McpServerConfig,
+        initialize_timeout: Duration,
+        workspace: &std::path::Path,
     ) -> anyhow::Result<Self> {
         match config {
             McpServerConfig::Command {
@@ -124,6 +143,7 @@ impl McpClientHandle {
                 let cmd = stdio_command(
                     command,
                     args,
+                    workspace,
                     cwd.as_deref(),
                     env,
                     inherit_env,
@@ -329,6 +349,7 @@ fn append_bounded(rendered: &mut String, value: &str, limit: usize) {
 fn stdio_command(
     command: &str,
     args: &[String],
+    workspace: &Path,
     configured_cwd: Option<&Path>,
     env: &HashMap<String, String>,
     inherit_env: &[String],
@@ -342,8 +363,8 @@ fn stdio_command(
     let program = PathBuf::from(resolved.as_std().get_program());
     let cwd = match configured_cwd {
         Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
-        Some(cwd) => std::env::current_dir()?.join(cwd),
-        None => std::env::current_dir()?,
+        Some(cwd) => workspace.join(cwd),
+        None => workspace.to_path_buf(),
     };
     let cwd = cwd.canonicalize().map_err(|error| {
         anyhow::anyhow!(
@@ -568,6 +589,7 @@ mod tests {
         let command = stdio_command(
             "rustc",
             &[],
+            std::path::Path::new("."),
             None,
             &HashMap::new(),
             &[],

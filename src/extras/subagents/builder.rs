@@ -17,11 +17,21 @@ use rig::completion::CompletionModel;
 pub(crate) struct SubagentAuthorization {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    workspace: std::path::PathBuf,
 }
 
 impl SubagentAuthorization {
     pub(crate) fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self { permission, ask_tx }
+        Self {
+            permission,
+            ask_tx,
+            workspace: std::env::current_dir().unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = workspace.into();
+        self
     }
 
     fn filesystem_tools(
@@ -33,27 +43,39 @@ impl SubagentAuthorization {
         max_list_dir_entries: Option<u64>,
     ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
         vec![
-            Box::new(tools::ReadTool::new(
-                self.permission.clone(),
-                self.ask_tx.clone(),
-                Some(max_text_file_size),
-                max_read_lines,
-            )),
-            Box::new(tools::GrepTool::new(
-                self.permission.clone(),
-                self.ask_tx.clone(),
-                max_grep_results,
-            )),
-            Box::new(tools::FindFilesTool::new(
-                self.permission.clone(),
-                self.ask_tx.clone(),
-                max_find_results,
-            )),
-            Box::new(tools::ListDirTool::new(
-                self.permission.clone(),
-                self.ask_tx.clone(),
-                max_list_dir_entries,
-            )),
+            Box::new(
+                tools::ReadTool::new(
+                    self.permission.clone(),
+                    self.ask_tx.clone(),
+                    Some(max_text_file_size),
+                    max_read_lines,
+                )
+                .with_workspace(self.workspace.clone()),
+            ),
+            Box::new(
+                tools::GrepTool::new(
+                    self.permission.clone(),
+                    self.ask_tx.clone(),
+                    max_grep_results,
+                )
+                .with_workspace(self.workspace.clone()),
+            ),
+            Box::new(
+                tools::FindFilesTool::new(
+                    self.permission.clone(),
+                    self.ask_tx.clone(),
+                    max_find_results,
+                )
+                .with_workspace(self.workspace.clone()),
+            ),
+            Box::new(
+                tools::ListDirTool::new(
+                    self.permission.clone(),
+                    self.ask_tx.clone(),
+                    max_list_dir_entries,
+                )
+                .with_workspace(self.workspace.clone()),
+            ),
         ]
     }
 }
@@ -322,6 +344,7 @@ mod tests {
             Some(vec!["standard".to_string()]),
         );
         SubagentAuthorization::new(Some(Arc::new(Mutex::new(checker))), ask_tx)
+            .with_workspace(working_dir)
     }
 
     fn filesystem_tools(authorization: &SubagentAuthorization) -> Vec<Box<dyn rig::tool::ToolDyn>> {
@@ -375,6 +398,25 @@ mod tests {
                 tool.name(),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn subagent_relative_filesystem_tools_use_the_selected_workspace() {
+        let container = TempDir::new("relative-workspace");
+        let workspace = container.path().join("selected");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("child.txt"), "selected child workspace").unwrap();
+        let authorization = parent_authorization(&workspace, None);
+        let tools = filesystem_tools(&authorization);
+        let list = tools
+            .into_iter()
+            .find(|tool| tool.name() == "list_dir")
+            .unwrap()
+            .call(serde_json::json!({ "path": "." }).to_string())
+            .await
+            .unwrap();
+
+        assert!(list.contains("child.txt"));
     }
 
     #[cfg(unix)]

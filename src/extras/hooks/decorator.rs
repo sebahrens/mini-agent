@@ -21,9 +21,7 @@ pub(crate) struct HookedTool {
 impl HookedTool {
     fn build_ctx(&self) -> HookCtx {
         let (session_id, session_path) = session_context();
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
+        let cwd = super::active_workspace().display().to_string();
         let permission_mode = self
             .permission
             .as_ref()

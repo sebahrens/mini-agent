@@ -24,7 +24,7 @@ fn ctx() -> HookCtx {
     HookCtx {
         session_id: "corpus-sess".into(),
         session_path: "".into(),
-        cwd: env!("CARGO_MANIFEST_DIR").into(),
+        cwd: super::TEST_WORKING_DIR.into(),
         permission_mode: "standard".into(),
     }
 }

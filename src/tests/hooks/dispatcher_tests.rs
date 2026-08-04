@@ -50,7 +50,7 @@ fn ctx() -> HookCtx {
     HookCtx {
         session_id: "sess-1".into(),
         session_path: "/tmp/sess.json".into(),
-        cwd: env!("CARGO_MANIFEST_DIR").into(),
+        cwd: super::TEST_WORKING_DIR.into(),
         permission_mode: "default".into(),
     }
 }
@@ -146,6 +146,17 @@ fn identical_commands_are_deduplicated() {
     );
     let dispatcher = HookDispatcher::from_config(&config).unwrap();
     assert_eq!(dispatcher.handlers_for("PreToolUse", "bash").len(), 1);
+}
+
+#[test]
+fn same_executable_with_distinct_arguments_is_not_deduplicated() {
+    let config = config_with(
+        "PreToolUse",
+        None,
+        vec![handler("echo first"), handler("echo second")],
+    );
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    assert_eq!(dispatcher.handlers_for("PreToolUse", "bash").len(), 2);
 }
 
 #[tokio::test]
@@ -588,6 +599,150 @@ async fn immutable_policy_root_prevents_cwd_retargeting() {
 
     assert!(marker_a.exists());
     assert!(!marker_b.exists());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn failed_execution_root_rebind_is_sticky_until_an_explicit_valid_rebind() {
+    let base = std::env::temp_dir().join(format!(
+        "zerostack-hooks-sticky-invalid-root-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let initial = base.join("initial");
+    let missing = base.join("missing");
+    std::fs::create_dir_all(&initial).unwrap();
+    let config = config_with("PreToolUse", None, vec![handler("touch ran")]);
+    let dispatcher =
+        HookDispatcher::from_config_with_backend_and_root(&config, "unused", &initial).unwrap();
+
+    assert!(dispatcher.rebind_execution_root(&missing).is_err());
+    std::fs::create_dir_all(&missing).unwrap();
+    let denied = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+        .await;
+    assert_eq!(denied.verdict, Verdict::Deny);
+    assert!(
+        !missing.join("ran").exists(),
+        "creating the failed path later must not revive stale execution authority"
+    );
+
+    dispatcher.rebind_execution_root(&missing).unwrap();
+    let allowed = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+        .await;
+    assert_eq!(allowed.verdict, Verdict::Defer);
+    assert!(missing.join("ran").exists());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn rebind_during_condition_invalidates_handler_launch_lease() {
+    let base = std::env::temp_dir().join(format!(
+        "zerostack-hooks-concurrent-rebind-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let initial = base.join("initial");
+    let selected = base.join("selected");
+    let ready = base.join("condition-ready");
+    let release = base.join("condition-release");
+    std::fs::create_dir_all(&initial).unwrap();
+    std::fs::create_dir_all(&selected).unwrap();
+    let mut configured = handler_with_condition(
+        "touch ran",
+        "touch \"$READY\"; while [ ! -f \"$RELEASE\" ]; do sleep 0.01; done",
+    );
+    configured
+        .env
+        .insert("READY".to_string(), ready.to_string_lossy().into_owned());
+    configured.env.insert(
+        "RELEASE".to_string(),
+        release.to_string_lossy().into_owned(),
+    );
+    let config = config_with("PreToolUse", None, vec![configured]);
+    let dispatcher = std::sync::Arc::new(
+        HookDispatcher::from_config_with_backend_and_root(&config, "unused", &initial).unwrap(),
+    );
+    let running = {
+        let dispatcher = std::sync::Arc::clone(&dispatcher);
+        tokio::spawn(async move {
+            dispatcher
+                .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+                .await
+        })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !ready.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("condition child must reach the launch barrier");
+    dispatcher.rebind_execution_root(&selected).unwrap();
+    std::fs::write(&release, b"go").unwrap();
+
+    let decision = running.await.unwrap();
+    assert_eq!(decision.verdict, Verdict::Deny);
+    assert!(
+        !selected.join("ran").exists(),
+        "a handler from the old dispatch must not launch in the rebound workspace"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn directory_identity_replacement_after_condition_denies_handler_launch() {
+    let base = std::env::temp_dir().join(format!(
+        "zerostack-hooks-root-replacement-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let selected = base.join("selected");
+    let original = base.join("original");
+    let ready = base.join("condition-ready");
+    let release = base.join("condition-release");
+    std::fs::create_dir_all(&selected).unwrap();
+    let mut configured = handler_with_condition(
+        "touch ran",
+        "touch \"$READY\"; while [ ! -f \"$RELEASE\" ]; do sleep 0.01; done",
+    );
+    configured
+        .env
+        .insert("READY".to_string(), ready.to_string_lossy().into_owned());
+    configured.env.insert(
+        "RELEASE".to_string(),
+        release.to_string_lossy().into_owned(),
+    );
+    let config = config_with("PreToolUse", None, vec![configured]);
+    let dispatcher = std::sync::Arc::new(
+        HookDispatcher::from_config_with_backend_and_root(&config, "unused", &selected).unwrap(),
+    );
+    let running = {
+        let dispatcher = std::sync::Arc::clone(&dispatcher);
+        tokio::spawn(async move {
+            dispatcher
+                .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+                .await
+        })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !ready.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("condition child must reach the launch barrier");
+    std::fs::rename(&selected, &original).unwrap();
+    std::fs::create_dir(&selected).unwrap();
+    std::fs::write(&release, b"go").unwrap();
+
+    let decision = running.await.unwrap();
+    assert_eq!(decision.verdict, Verdict::Deny);
+    assert!(
+        !selected.join("ran").exists(),
+        "replacement directory identity must not inherit hook execution authority"
+    );
     let _ = std::fs::remove_dir_all(base);
 }
 

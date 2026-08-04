@@ -1911,13 +1911,13 @@ struct ResolvedWriteTarget {
     mode: WriteMode,
 }
 
-fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
+fn absolute_lexical(base: &Path, path: &Path) -> PathBuf {
     use std::path::Component;
 
     let source = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()?.join(path)
+        base.join(path)
     };
     let mut normalized = PathBuf::new();
     for component in source.components() {
@@ -1931,7 +1931,7 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
             Component::Normal(part) => normalized.push(part),
         }
     }
-    Ok(normalized)
+    normalized
 }
 
 fn file_path_error(error: std::io::Error) -> EffectServiceError {
@@ -1953,9 +1953,12 @@ fn permission_path(path: &Path) -> Result<String, EffectServiceError> {
         .ok_or(EffectServiceError::InvalidTarget)
 }
 
-async fn resolve_read_target(path: &str) -> Result<ResolvedReadTarget, EffectServiceError> {
+async fn resolve_read_target(
+    base: &Path,
+    path: &str,
+) -> Result<ResolvedReadTarget, EffectServiceError> {
     let expanded = crate::fs::expand_tilde(path);
-    let absolute = absolute_lexical(Path::new(&expanded)).map_err(file_path_error)?;
+    let absolute = absolute_lexical(base, Path::new(&expanded));
     let canonical = tokio::fs::canonicalize(absolute)
         .await
         .map_err(file_path_error)?;
@@ -2002,11 +2005,14 @@ async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, Effect
     String::from_utf8(bytes).map_err(|_| EffectServiceError::InvalidBody)
 }
 
-async fn resolve_write_target(path: &str) -> Result<ResolvedWriteTarget, EffectServiceError> {
+async fn resolve_write_target(
+    base: &Path,
+    path: &str,
+) -> Result<ResolvedWriteTarget, EffectServiceError> {
     use std::path::Component;
 
     let expanded = crate::fs::expand_tilde(path);
-    let absolute = absolute_lexical(Path::new(&expanded)).map_err(file_path_error)?;
+    let absolute = absolute_lexical(base, Path::new(&expanded));
     let (path, mode) = match tokio::fs::symlink_metadata(&absolute).await {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -2149,7 +2155,7 @@ impl FileEffectService {
         bridge: PermissionBridge,
     ) -> Result<PreparedReadEffect, EffectServiceError> {
         let call = async {
-            let target = resolve_read_target(path).await?;
+            let target = resolve_read_target(&self.allow_config.base, path).await?;
             if let AuthorizationDecision::Denied(reason) =
                 self.allow_config.authorize_read(&target.path)
             {
@@ -2200,7 +2206,7 @@ impl FileEffectService {
         bridge: PermissionBridge,
     ) -> Result<PreparedWriteEffect, EffectServiceError> {
         let call = async {
-            let target = resolve_write_target(path).await?;
+            let target = resolve_write_target(&self.allow_config.base, path).await?;
             if let AuthorizationDecision::Denied(reason) =
                 self.allow_config.authorize_write(&target.path)
             {
@@ -3287,7 +3293,10 @@ impl ParentEffectService for ParentHostEffectService {
             match operation {
                 EffectOperation::ReadFile { path } => {
                     let target = tokio::select! {
-                        result = timeout(self.file.timeout, resolve_read_target(path)) => {
+                        result = timeout(
+                            self.file.timeout,
+                            resolve_read_target(&self.file.allow_config.base, path),
+                        ) => {
                             result.map_err(|_| HostEffectError::EffectTimedOut)?
                                 .map_err(HostEffectError::from)?
                         }
@@ -3302,7 +3311,10 @@ impl ParentEffectService for ParentHostEffectService {
                 }
                 EffectOperation::WriteFile { path, content } => {
                     let target = tokio::select! {
-                        result = timeout(self.file.timeout, resolve_write_target(path)) => {
+                        result = timeout(
+                            self.file.timeout,
+                            resolve_write_target(&self.file.allow_config.base, path),
+                        ) => {
                             result.map_err(|_| HostEffectError::EffectTimedOut)?
                                 .map_err(HostEffectError::from)?
                         }
@@ -6781,6 +6793,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn js_file_hosts_resolve_relative_paths_against_the_selected_workspace() {
+        let temp = TempDir::new();
+        let workspace = temp.path().join("selected-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("source.txt"), "selected").unwrap();
+        let policy = AllowConfig::unrestricted(&workspace);
+
+        let contents = call_read_file_with_policy(
+            standard_permission(workspace.clone()),
+            None,
+            PathBuf::from("source.txt"),
+            policy.clone(),
+        )
+        .await
+        .expect("relative read should use the selected workspace");
+        assert_eq!(contents, "selected");
+
+        call_write_file_with_policy(
+            standard_permission(workspace.clone()),
+            None,
+            PathBuf::from("created.txt"),
+            "created",
+            policy,
+        )
+        .await
+        .expect("relative write should use the selected workspace");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("created.txt")).unwrap(),
+            "created"
+        );
+    }
+
+    #[tokio::test]
     async fn js_file_host_permissions_read_ask_uses_exact_canonical_permission_key() {
         let temp = TempDir::new();
         let working_dir = temp.path().join("workspace");
@@ -7342,7 +7387,7 @@ mod tests {
         let source = workspace.join("source.txt");
         let original = workspace.join("original.txt");
         std::fs::write(&source, "approved identity").unwrap();
-        let approved_read = resolve_read_target(source.to_str().unwrap())
+        let approved_read = resolve_read_target(&workspace, source.to_str().unwrap())
             .await
             .expect("resolve read target");
         std::fs::rename(&source, &original).unwrap();
@@ -7359,7 +7404,7 @@ mod tests {
 
         let target = parent.join("created.txt");
         let external_target = external.join("created.txt");
-        let approved_write = resolve_write_target(target.to_str().unwrap())
+        let approved_write = resolve_write_target(&workspace, target.to_str().unwrap())
             .await
             .expect("resolve write target");
         let original_parent = workspace.join("original-parent");

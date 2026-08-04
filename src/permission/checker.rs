@@ -19,6 +19,46 @@ pub enum CheckResult {
     Denied(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanWritePathDecision {
+    Authorized,
+    NotPlanFile,
+    OutsideWorkspace,
+    Unresolvable,
+}
+
+#[derive(Clone, Debug)]
+struct PlanWriteRoot {
+    configured: PathBuf,
+    canonical: PathBuf,
+    identity: std::fs::Metadata,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlanWriteAuthorization {
+    root: PlanWriteRoot,
+}
+
+impl PlanWriteAuthorization {
+    pub(crate) fn revalidate(&self) -> std::io::Result<()> {
+        let current_root = std::fs::canonicalize(&self.root.configured)?;
+        if current_root != self.root.canonical {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "PlanWrite workspace changed after authorization",
+            ));
+        }
+        let current_identity = std::fs::metadata(&current_root)?;
+        if !current_identity.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "PlanWrite workspace is no longer a directory",
+            ));
+        }
+        crate::fs::ensure_same_file(&current_root, &self.root.identity, &current_identity)
+    }
+}
+
 impl CheckResult {
     pub fn allowed_with_coaching(tool: &str, _input: &str, count: usize) -> Self {
         CheckResult::AllowedWithCoaching(format!(
@@ -34,6 +74,7 @@ pub struct PermissionChecker {
     ext_dir_rules: Vec<(Pattern, Action)>,
     doom_loop_action: Action,
     working_dir: String,
+    plan_write_root: Option<PlanWriteRoot>,
     session_allowlist: Vec<(String, Pattern)>,
     last_call: Option<(String, String)>,
     consecutive_repeat_count: usize,
@@ -53,6 +94,22 @@ pub struct PermissionChecker {
 }
 
 impl PermissionChecker {
+    /// Rebind relative path authorization to an explicitly selected workspace.
+    /// Worktree switching uses this instead of mutating process-global CWD.
+    pub(crate) fn rebind_working_dir(&mut self, working_dir: &Path) {
+        self.plan_write_root = std::fs::canonicalize(working_dir)
+            .ok()
+            .and_then(|canonical| {
+                let identity = std::fs::metadata(&canonical).ok()?;
+                identity.is_dir().then_some(PlanWriteRoot {
+                    configured: working_dir.to_path_buf(),
+                    canonical,
+                    identity,
+                })
+            });
+        self.working_dir = working_dir.to_string_lossy().into_owned();
+    }
+
     fn compile_config(
         config: &PermissionConfig,
         is_regex: bool,
@@ -174,10 +231,19 @@ impl PermissionChecker {
             })
             .unwrap_or_default();
 
-        let working_dir = working_dir
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-            .to_string_lossy()
-            .to_string();
+        let working_dir =
+            working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let plan_write_root = std::fs::canonicalize(&working_dir)
+            .ok()
+            .and_then(|canonical| {
+                let identity = std::fs::metadata(&canonical).ok()?;
+                identity.is_dir().then_some(PlanWriteRoot {
+                    configured: working_dir.clone(),
+                    canonical,
+                    identity,
+                })
+            });
+        let working_dir = working_dir.to_string_lossy().to_string();
 
         let resolved_modes: Vec<SecurityMode> = {
             let raw = permission_modes.unwrap_or_else(|| {
@@ -206,6 +272,7 @@ impl PermissionChecker {
             ext_dir_rules,
             doom_loop_action,
             working_dir,
+            plan_write_root,
             session_allowlist: Vec::new(),
             last_call: None,
             consecutive_repeat_count: 0,
@@ -302,7 +369,8 @@ impl PermissionChecker {
             SecurityMode::PlanWrite => base.unwrap_or_else(|| {
                 if self.is_read_tool(tool)
                     || (matches!(tool, "write" | "edit" | "js/write_file")
-                        && is_plan_file(abs_path))
+                        && self.plan_write_path_decision(abs_path)
+                            == PlanWritePathDecision::Authorized)
                 {
                     Action::Allow
                 } else {
@@ -503,6 +571,55 @@ impl PermissionChecker {
 
         let action = self.resolve_path_action(tool, &matched, &abs_path);
         self.doom_loop_check(tool, &expanded, action)
+    }
+
+    /// Whether `path` is eligible for the narrow PlanWrite exception.
+    ///
+    /// Callers that mutate the filesystem use this to retain stable path
+    /// identity across permission handling. Explicit permission rules still
+    /// decide the final result in [`Self::check_path`].
+    pub(crate) fn plan_write_authorization(
+        &self,
+        tool: &str,
+        path: &str,
+    ) -> Option<PlanWriteAuthorization> {
+        (self.mode == SecurityMode::PlanWrite
+            && matches!(tool, "write" | "edit" | "js/write_file")
+            && self.plan_write_path_decision(path) == PlanWritePathDecision::Authorized)
+            .then(|| PlanWriteAuthorization {
+                root: self
+                    .plan_write_root
+                    .clone()
+                    .expect("authorized root exists"),
+            })
+    }
+
+    fn plan_write_path_decision(&self, path: &str) -> PlanWritePathDecision {
+        if !is_plan_file(path) {
+            return PlanWritePathDecision::NotPlanFile;
+        }
+
+        // The workspace is the authorization root. Its startup identity is
+        // retained and revalidated at decision time so replacing the path
+        // cannot redefine what PlanWrite is allowed to modify.
+        let Some(root) = &self.plan_write_root else {
+            return PlanWritePathDecision::Unresolvable;
+        };
+        if (PlanWriteAuthorization { root: root.clone() })
+            .revalidate()
+            .is_err()
+        {
+            return PlanWritePathDecision::Unresolvable;
+        }
+        let Some(target) = resolve_path_allow_missing(Path::new(path)) else {
+            return PlanWritePathDecision::Unresolvable;
+        };
+
+        if target.starts_with(&root.canonical) {
+            PlanWritePathDecision::Authorized
+        } else {
+            PlanWritePathDecision::OutsideWorkspace
+        }
     }
 
     /// Check whether any deny rule matches the given inputs. Deny rules are
@@ -803,6 +920,185 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn plan_write_checker(
+        workspace: &Path,
+        config: PermissionConfig,
+        apply_rules: bool,
+    ) -> PermissionChecker {
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::PlanWrite,
+            Some(workspace.to_path_buf()),
+            apply_rules.then(|| vec!["planwrite".to_string()]),
+        )
+    }
+
+    #[test]
+    fn plan_write_path_authorization_allows_workspace_plan_files() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let plans = workspace.join("docs/plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let mut checker = plan_write_checker(&workspace, PermissionConfig::default(), false);
+
+        for path in [
+            workspace.join("PLAN.md"),
+            plans.join("PLAN-security.md"),
+            plans.join("PLAN-nonexistent.md"),
+        ] {
+            assert_eq!(
+                checker.check_path("write", &path.to_string_lossy()),
+                CheckResult::Allowed,
+                "workspace-contained plan should be eligible: {}",
+                path.display()
+            );
+        }
+        assert!(matches!(
+            checker.check_path("write", &plans.join("notes.md").to_string_lossy()),
+            CheckResult::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn plan_write_path_authorization_rejects_external_lookalikes() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let sibling = temp.0.join("workspace-sibling");
+        let external = temp.0.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let mut checker = plan_write_checker(&workspace, PermissionConfig::default(), false);
+
+        let home_lookalike = PathBuf::from(crate::fs::expand_tilde("~/PLAN-private.md"));
+        let temp_lookalike = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("PLAN-outside-{}.md", std::process::id()));
+        for path in [
+            sibling.join("PLAN.md"),
+            external.join("PLAN.md"),
+            workspace.join("../external/PLAN-via-dotdot.md"),
+            home_lookalike,
+            temp_lookalike,
+        ] {
+            assert!(
+                matches!(
+                    checker.check_path("write", &path.to_string_lossy()),
+                    CheckResult::Denied(_)
+                ),
+                "external plan lookalike must not receive PlanWrite privilege: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn plan_write_path_authorization_preserves_explicit_external_prompt_policy() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let external = temp.0.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let config = PermissionConfig {
+            write: Some(ToolPerm::Simple(Action::Ask)),
+            ..PermissionConfig::default()
+        };
+        let mut checker = plan_write_checker(&workspace, config, true);
+
+        assert_eq!(
+            checker.check_path("write", &external.join("PLAN.md").to_string_lossy()),
+            CheckResult::Ask,
+            "an ineligible lookalike must continue through ordinary configured policy"
+        );
+    }
+
+    #[test]
+    fn plan_write_path_authorization_never_overrides_explicit_deny() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = PermissionConfig {
+            write: Some(ToolPerm::Simple(Action::Deny)),
+            ..PermissionConfig::default()
+        };
+        let mut checker = plan_write_checker(&workspace, config, true);
+
+        assert!(matches!(
+            checker.check_path("write", &workspace.join("PLAN.md").to_string_lossy()),
+            CheckResult::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn plan_write_path_authorization_rejects_symlink_escapes() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let external = temp.0.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let external_plan = external.join("PLAN.md");
+        std::fs::write(&external_plan, "sentinel").unwrap();
+        symlink(&external, workspace.join("linked-parent")).unwrap();
+        symlink(&external_plan, workspace.join("PLAN-linked.md")).unwrap();
+        let mut checker = plan_write_checker(&workspace, PermissionConfig::default(), false);
+
+        for path in [
+            workspace.join("linked-parent/PLAN.md"),
+            workspace.join("PLAN-linked.md"),
+        ] {
+            assert!(
+                matches!(
+                    checker.check_path("write", &path.to_string_lossy()),
+                    CheckResult::Denied(_)
+                ),
+                "symlink escape must not receive PlanWrite privilege: {}",
+                path.display()
+            );
+        }
+        assert_eq!(std::fs::read_to_string(external_plan).unwrap(), "sentinel");
+    }
+
+    #[test]
+    fn plan_write_path_authorization_rejects_workspace_root_replacement() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let original_workspace = temp.0.join("original-workspace");
+        let external = temp.0.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let mut checker = plan_write_checker(&workspace, PermissionConfig::default(), false);
+
+        std::fs::rename(&workspace, &original_workspace).unwrap();
+        symlink(&external, &workspace).unwrap();
+
+        for tool in ["write", "edit", "js/write_file"] {
+            assert!(
+                matches!(
+                    checker.check_path(tool, &workspace.join("PLAN.md").to_string_lossy()),
+                    CheckResult::Denied(_)
+                ),
+                "{tool} must reject a replaced workspace root"
+            );
+        }
+        assert!(!external.join("PLAN.md").exists());
+    }
+
+    #[test]
+    fn plan_write_path_authorization_accepts_originally_symlinked_workspace() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let workspace_link = temp.0.join("workspace-link");
+        std::fs::create_dir_all(&workspace).unwrap();
+        symlink(&workspace, &workspace_link).unwrap();
+        let mut checker = plan_write_checker(&workspace_link, PermissionConfig::default(), false);
+
+        assert_eq!(
+            checker.check_path("write", &workspace_link.join("PLAN.md").to_string_lossy()),
+            CheckResult::Allowed
+        );
     }
 
     #[test]

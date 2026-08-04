@@ -139,11 +139,21 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
 pub struct TaskTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    workspace: std::path::PathBuf,
 }
 
 impl TaskTool {
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self { permission, ask_tx }
+        Self {
+            permission,
+            ask_tx,
+            workspace: std::env::current_dir().unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn with_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = workspace.into();
+        self
     }
 }
 
@@ -214,7 +224,8 @@ editing in a known location, grepping for a literal you will act on immediately.
             .map_err(|err| ToolError::Msg(err.to_string()))?;
 
         let authorization =
-            SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone());
+            SubagentAuthorization::new(self.permission.clone(), self.ask_tx.clone())
+                .with_workspace(self.workspace.clone());
         let executor: TaskExecutor = Arc::new(move |_index, prompt_text| {
             let client = client.clone();
             let model_name = model_name.clone();
@@ -257,7 +268,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                     ),
                 )
                 .await;
-                let run = match result {
+                #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+                let mut run = match result {
                     Ok(run) => run,
                     Err(observed_usage) => {
                         let output = Err("timeout: subagent exceeded 300s".to_string());

@@ -26,20 +26,16 @@ use crate::ui::permission_handler::handle_permission_request;
 use crate::ui::pickers::rewind::RewindOutcome;
 use crate::ui::renderer::{self as renderer_mod, ChainPrompt, Renderer, copy_to_clipboard};
 use crate::ui::slash::{apply_prompt_model, handle_compress, handle_slash};
-#[cfg(feature = "git-worktree")]
-use crate::ui::state::MergeRequest;
 use crate::ui::state::{
     AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
 };
 use crate::ui::terminal::TerminalGuard;
 use crate::ui::utils::{parse_color, to_ansi_256};
 
-#[cfg(all(feature = "mcp", feature = "git-worktree"))]
-use super::ensure_mcp_manager;
 #[cfg(feature = "advisor")]
 use super::handle_human_handoff;
-#[cfg(feature = "git-worktree")]
-use super::spawn_merge_agent;
+#[cfg(all(feature = "mcp", feature = "git-worktree"))]
+use super::rebind_mcp_manager;
 use super::{
     C_AGENT, C_BTW, C_ERROR, C_TOOL, PrebuildPayload, apply_prompt_mode, classify_submission,
     mid_turn_compact_and_respawn, record_started_main_turn, refresh_display,
@@ -215,15 +211,19 @@ impl<'a> App<'a> {
         #[cfg(feature = "git-worktree")]
         if let Some(name) = &ui.cli.worktree {
             let wt_base_dir = ui.cli.resolve_wt_base_dir(ui.cfg);
-            match crate::extras::git_worktree::create(name, wt_base_dir.as_deref()) {
+            match crate::extras::git_worktree::create(
+                std::path::Path::new(ui.session.working_dir.as_str()),
+                name,
+                wt_base_dir.as_deref(),
+            )
+            .await
+            {
                 Ok((path, _info)) => {
-                    std::env::set_current_dir(&path).ok();
-                    ui.session.working_dir =
-                        compact_str::CompactString::new(path.to_string_lossy());
-                    ui.context.reload();
+                    super::rebind_worktree_workspace(ui.session, ui.context, &ui.permission, &path);
                     apply_current_prompt_mode(ui.context, &ui.permission);
                     #[cfg(feature = "mcp")]
-                    ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg).await;
+                    rebind_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.context.workspace_root)
+                        .await;
                     run.agent = Some(
                         ui.agent_build_ctx()
                             .rebuild_agent(&ui.session.model, slash.reasoning_enabled)
@@ -248,15 +248,19 @@ impl<'a> App<'a> {
                 .unwrap_or(0);
             let name = ts.to_string();
             let wt_base_dir = ui.cli.resolve_wt_base_dir(ui.cfg);
-            match crate::extras::git_worktree::create(&name, wt_base_dir.as_deref()) {
+            match crate::extras::git_worktree::create(
+                std::path::Path::new(ui.session.working_dir.as_str()),
+                &name,
+                wt_base_dir.as_deref(),
+            )
+            .await
+            {
                 Ok((path, _info)) => {
-                    std::env::set_current_dir(&path).ok();
-                    ui.session.working_dir =
-                        compact_str::CompactString::new(path.to_string_lossy());
-                    ui.context.reload();
+                    super::rebind_worktree_workspace(ui.session, ui.context, &ui.permission, &path);
                     apply_current_prompt_mode(ui.context, &ui.permission);
                     #[cfg(feature = "mcp")]
-                    ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg).await;
+                    rebind_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.context.workspace_root)
+                        .await;
                     run.agent = Some(
                         ui.agent_build_ctx()
                             .rebuild_agent(&ui.session.model, slash.reasoning_enabled)
@@ -326,7 +330,13 @@ impl<'a> App<'a> {
                 #[cfg(feature = "mcp")]
                 let mcp = if let Some(ref servers) = cfg_clone.mcp_servers {
                     if !servers.is_empty() {
-                        Some(McpClientManager::connect_all(servers).await)
+                        Some(
+                            McpClientManager::connect_all_in(
+                                servers,
+                                &context_clone.workspace_root,
+                            )
+                            .await,
+                        )
                     } else {
                         None
                     }
@@ -1552,35 +1562,45 @@ impl<'a> App<'a> {
                     .downcast_ref::<crate::extras::git_worktree::DeferredWorktreeAction>()
                     .unwrap();
                 match action {
-                    crate::extras::git_worktree::DeferredWorktreeAction::Merge {
+                    crate::extras::git_worktree::DeferredWorktreeAction::Switch {
+                        path,
                         branch,
-                        target,
-                        main_path,
-                        wt_path,
                     } => {
-                        let force_flag = self.ui.cli.resolve_wt_force(self.ui.cfg);
-                        spawn_merge_agent(
-                            MergeRequest {
+                        super::rebind_worktree_workspace(
+                            self.ui.session,
+                            self.ui.context,
+                            &self.ui.permission,
+                            path,
+                        );
+                        self.refresh_worktree_workspace_context().await?;
+                        self.renderer.write_line(
+                            &format!(
+                                "worktree created: branch '{}' at {}",
                                 branch,
-                                target,
-                                main_path,
-                                wt_path,
-                                force: force_flag,
-                            },
-                            &mut self.run,
-                            &mut self.ui,
-                            &mut self.chain,
-                        )
-                        .await;
+                                path.display()
+                            ),
+                            C_AGENT,
+                        )?;
+                    }
+                    crate::extras::git_worktree::DeferredWorktreeAction::Merge { info, target } => {
+                        self.handle_worktree_merge(info.clone(), target.clone(), true)
+                            .await?;
                     }
                     crate::extras::git_worktree::DeferredWorktreeAction::Exit { main_path } => {
-                        std::env::set_current_dir(main_path)
-                            .map_err(|e| anyhow::anyhow!("failed to change directory: {}", e))?;
-                        self.ui.session.working_dir = compact_str::CompactString::new(main_path);
-                        self.ui.context.reload();
+                        super::rebind_worktree_workspace(
+                            self.ui.session,
+                            self.ui.context,
+                            &self.ui.permission,
+                            main_path,
+                        );
                         apply_current_prompt_mode(self.ui.context, &self.ui.permission);
                         #[cfg(feature = "mcp")]
-                        ensure_mcp_manager(&mut self.ui.mcp_manager, self.ui.cfg).await;
+                        rebind_mcp_manager(
+                            &mut self.ui.mcp_manager,
+                            self.ui.cfg,
+                            &self.ui.context.workspace_root,
+                        )
+                        .await;
                         let new_agent = self
                             .ui
                             .agent_build_ctx()
@@ -1595,7 +1615,7 @@ impl<'a> App<'a> {
                             self.ui.context,
                         )?;
                         self.renderer.write_line(
-                            &format!("returned to main repo at {}", main_path),
+                            &format!("returned to main repo at {}", main_path.display()),
                             C_AGENT,
                         )?;
                     }
@@ -1759,7 +1779,13 @@ impl<'a> App<'a> {
         self.renderer.write_line("", Color::White)?;
 
         let cancellation = CommandCancellation::new();
-        let sandbox = self.ui.sandbox.clone();
+        let sandbox = self
+            .ui
+            .sandbox
+            .clone()
+            .with_working_dir(std::path::PathBuf::from(
+                self.ui.session.working_dir.as_str(),
+            ));
         let operation =
             sandbox.run_explicit_shell(text, DEFAULT_COMMAND_LIMITS, Some(&cancellation));
         tokio::pin!(operation);
@@ -1916,7 +1942,10 @@ impl<'a> App<'a> {
                 .as_ref()
                 .and_then(|m| m.get(&server).cloned());
             match (self.ui.mcp_manager.as_mut(), server_cfg) {
-                (Some(mgr), Some(scfg)) => match mgr.reconnect(&server, &scfg).await {
+                (Some(mgr), Some(scfg)) => match mgr
+                    .reconnect_in(&server, &scfg, &self.ui.context.workspace_root)
+                    .await
+                {
                     Ok(()) => {
                         let new_agent = self
                             .ui
@@ -2040,10 +2069,15 @@ impl<'a> App<'a> {
         let _ = stdout.execute(crossterm::event::DisableMouseCapture);
         let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
         let _ = stdout.flush();
-        let command = tokio::process::Command::new("lazygit");
+        let mut command = tokio::process::Command::new("lazygit");
+        command.current_dir(std::path::Path::new(self.ui.session.working_dir.as_str()));
         let result = self
             .ui
             .sandbox
+            .clone()
+            .with_working_dir(std::path::PathBuf::from(
+                self.ui.session.working_dir.as_str(),
+            ))
             .status_support_command(
                 command,
                 INTERACTIVE_LIMITS,
@@ -2117,22 +2151,46 @@ impl<'a> App<'a> {
         if !self.ui.cli.resolve_wt_auto_merge(self.ui.cfg) {
             return Ok(());
         }
-        let info = match crate::extras::git_worktree::detect() {
+        let info = match crate::extras::git_worktree::detect(std::path::Path::new(
+            self.ui.session.working_dir.as_str(),
+        ))
+        .await
+        {
             Some(i) => i,
             None => return Ok(()),
         };
         let target = crate::extras::git_worktree::default_branch(&info.main_repo_path)
+            .await
             .unwrap_or_else(|| "main".to_string());
 
+        self.handle_worktree_merge(info, target, false).await
+    }
+
+    #[cfg(feature = "git-worktree")]
+    async fn handle_worktree_merge(
+        &mut self,
+        info: crate::extras::git_worktree::WorktreeInfo,
+        target: String,
+        refresh_ui: bool,
+    ) -> anyhow::Result<()> {
         let _ = self.renderer.write_line(
-            &format!(
-                "auto-merging worktree '{}' into '{}'...",
-                info.branch, target
-            ),
+            &format!("merging worktree '{}' into '{}'...", info.branch, target),
             C_AGENT,
         );
         let mut proceed = true;
-        if crate::extras::git_worktree::worktree_has_uncommitted(&info.worktree_path) {
+        let dirty = match crate::extras::git_worktree::worktree_has_uncommitted(&info.worktree_path)
+            .await
+        {
+            Ok(dirty) => dirty,
+            Err(error) => {
+                let _ = self.renderer.write_line(
+                    &format!("cannot verify worktree status; merge aborted: {error}"),
+                    C_ERROR,
+                );
+                return Ok(());
+            }
+        };
+        if dirty {
             let _ = self.renderer.write_line(
                 "worktree has uncommitted changes. [c]ommit all and continue  [a]bort merge",
                 C_PERM,
@@ -2158,16 +2216,41 @@ impl<'a> App<'a> {
                 'c' => {
                     if let Err(e) =
                         crate::extras::git_worktree::worktree_auto_commit_all(&info.worktree_path)
+                            .await
                     {
                         let _ = self
                             .renderer
                             .write_line(&format!("auto-commit failed: {}", e), C_ERROR);
                         proceed = false;
                     } else {
-                        let _ = self.renderer.write_line(
-                            "committed all worktree changes, proceeding with merge",
-                            C_AGENT,
-                        );
+                        match crate::extras::git_worktree::worktree_has_uncommitted(
+                            &info.worktree_path,
+                        )
+                        .await
+                        {
+                            Ok(false) => {
+                                let _ = self.renderer.write_line(
+                                    "committed all worktree changes, proceeding with merge",
+                                    C_AGENT,
+                                );
+                            }
+                            Ok(true) => {
+                                let _ = self.renderer.write_line(
+                                    "worktree remained dirty after auto-commit; merge aborted",
+                                    C_ERROR,
+                                );
+                                proceed = false;
+                            }
+                            Err(error) => {
+                                let _ = self.renderer.write_line(
+                                    &format!(
+                                        "cannot verify worktree status after auto-commit; merge aborted: {error}"
+                                    ),
+                                    C_ERROR,
+                                );
+                                proceed = false;
+                            }
+                        }
                     }
                 }
                 'a' => {
@@ -2179,26 +2262,29 @@ impl<'a> App<'a> {
                 _ => unreachable!(),
             }
         }
-        let (state, outcome) = if proceed {
-            crate::extras::git_worktree::try_merge(&info, &target)
-        } else {
-            (
-                crate::extras::git_worktree::MergeState {
-                    info: info.clone(),
-                    original_branch: String::new(),
-                    orig_dir: std::path::PathBuf::new(),
-                    stashed: false,
-                },
-                crate::extras::git_worktree::MergeOutcome::Error("aborted by user".into()),
-            )
-        };
+        if !proceed {
+            return Ok(());
+        }
+        let (state, outcome) = crate::extras::git_worktree::try_merge(&info, &target).await;
+        let mut state = state;
         match outcome {
             crate::extras::git_worktree::MergeOutcome::Success => {
-                let merge_result = if self.ui.cli.resolve_wt_force(self.ui.cfg) {
-                    crate::extras::git_worktree::complete_merge_force(&state)
-                } else {
-                    crate::extras::git_worktree::complete_merge(&state)
-                };
+                super::rebind_worktree_workspace(
+                    self.ui.session,
+                    self.ui.context,
+                    &self.ui.permission,
+                    &info.main_repo_path,
+                );
+                if self.ui.cli.resolve_wt_force(self.ui.cfg) {
+                    let _ = self.renderer.write_line(
+                        "--wt-force is deprecated; cleanup still preserves dirty worktrees",
+                        C_AGENT,
+                    );
+                }
+                let merge_result = crate::extras::git_worktree::complete_merge(&mut state).await;
+                if refresh_ui {
+                    self.refresh_worktree_workspace_context().await?;
+                }
                 match merge_result {
                     Ok(()) => {
                         let _ = self.renderer.write_line(
@@ -2225,10 +2311,9 @@ impl<'a> App<'a> {
                 if let Some(ss) = self.ui.status_signals.as_ref() {
                     ss.send_git_conflict();
                 }
-                let _ = self.renderer.write_line(
-                    "[a]bort  [l]eave for manual resolution  [h]elp (agent resolves)",
-                    C_PERM,
-                );
+                let _ = self
+                    .renderer
+                    .write_line("[a]bort  [l]eave for manual resolution", C_PERM);
 
                 let action = loop {
                     tokio::select! {
@@ -2237,7 +2322,6 @@ impl<'a> App<'a> {
                                 match key.code {
                                     KeyCode::Char('a') | KeyCode::Char('A') => break 'a',
                                     KeyCode::Char('l') | KeyCode::Char('L') => break 'l',
-                                    KeyCode::Char('h') | KeyCode::Char('H') => break 'h',
                                     KeyCode::Enter | KeyCode::Esc => break 'a',
                                     _ => {}
                                 }
@@ -2248,108 +2332,46 @@ impl<'a> App<'a> {
 
                 match action {
                     'a' => {
-                        let _ = crate::extras::git_worktree::cancel_merge(&state);
-                        crate::extras::git_worktree::cleanup_worktree(
-                            &info.worktree_path.to_string_lossy(),
-                            &info.branch,
-                            &info.main_repo_path.to_string_lossy(),
-                            self.ui.cli.resolve_wt_force(self.ui.cfg),
+                        if let Err(error) =
+                            crate::extras::git_worktree::cancel_merge(&mut state).await
+                        {
+                            let _ = self.renderer.write_line(
+                                &format!("merge cancellation failed; cleanup skipped: {error}"),
+                                C_ERROR,
+                            );
+                            return Ok(());
+                        }
+                        super::rebind_worktree_workspace(
+                            self.ui.session,
+                            self.ui.context,
+                            &self.ui.permission,
+                            &info.main_repo_path,
                         );
-                        let _ = self
-                            .renderer
-                            .write_line("merge aborted, restored original state", C_AGENT);
+                        if refresh_ui {
+                            self.refresh_worktree_workspace_context().await?;
+                        }
+                        let _ = self.renderer.write_line(
+                            "merge aborted, restored original state; worktree and branch retained",
+                            C_AGENT,
+                        );
                     }
                     'l' => {
+                        super::rebind_worktree_workspace(
+                            self.ui.session,
+                            self.ui.context,
+                            &self.ui.permission,
+                            &info.main_repo_path,
+                        );
+                        if refresh_ui {
+                            self.refresh_worktree_workspace_context().await?;
+                        }
                         let _ = self.renderer.write_line(
                             &format!(
-                                "conflict state left in {} for manual resolution",
+                                "conflict state left in {} for manual resolution; source worktree, branch, and any pre-merge stash retained",
                                 info.main_repo_path.display()
                             ),
                             C_AGENT,
                         );
-                    }
-                    'h' => {
-                        let _ = crate::extras::git_worktree::cancel_merge(&state);
-                        let _ = self
-                            .renderer
-                            .write_line("agent resolving merge...", C_AGENT);
-                        let main_path = info.main_repo_path.display().to_string();
-                        let wt_path = info.worktree_path.display().to_string();
-                        let force_flag = self.ui.cli.resolve_wt_force(self.ui.cfg);
-                        spawn_merge_agent(
-                            MergeRequest {
-                                branch: &info.branch,
-                                target: &target,
-                                main_path: &main_path,
-                                wt_path: &wt_path,
-                                force: force_flag,
-                            },
-                            &mut self.run,
-                            &mut self.ui,
-                            &mut self.chain,
-                        )
-                        .await;
-
-                        // The merge agent streams through the main run state; reset
-                        // the streaming scratch so no stale partial line leaks in.
-                        self.run.agent_line_started = false;
-                        self.run.response_buf.clear();
-                        self.run.response_start_block = None;
-                        self.run.was_reasoning = false;
-                        let mut merge_rx = self.run.agent_rx.take();
-                        while self.run.is_running {
-                            let ev = match merge_rx.as_mut() {
-                                Some(rx) => {
-                                    tokio::select! {
-                                        Some(e) = rx.recv() => Some(e),
-                                        Some(ev) = self.user_rx.recv() => {
-                                            if let UserEvent::Key(key) = ev {
-                                                let is_ctrl_c = key.code == KeyCode::Char('c')
-                                                    && key.modifiers.contains(KeyModifiers::CONTROL);
-                                                if is_ctrl_c {
-                                                    self.abort_main_run()?;
-                                                }
-                                            }
-                                            None
-                                        }
-                                        Some(ask_req) = async {
-                                            if let Some(rx) = self.ask_rx.as_mut() {
-                                                rx.recv().await
-                                            } else {
-                                                std::future::pending().await
-                                            }
-                                        } => {
-                                            let _ = handle_permission_request(
-                                                ask_req,
-                                                &mut self.renderer,
-                                                &mut self.ui,
-                                                &mut self.run,
-                                                &mut self.user_rx,
-                                            ).await;
-                                            None
-                                        }
-                                    }
-                                }
-                                None => {
-                                    if let Some(replacement) = self.run.agent_rx.take() {
-                                        merge_rx = Some(replacement);
-                                        continue;
-                                    }
-                                    break;
-                                }
-                            };
-                            if let Some(ev) = ev {
-                                self.handle_agent_event(ev).await?;
-                                // Mid-turn compaction aborts the current runner
-                                // and installs a replacement receiver. This
-                                // nested driver owns the receiver while the
-                                // auto-merge agent runs, so adopt that handoff
-                                // before polling again.
-                                if let Some(replacement) = self.run.agent_rx.take() {
-                                    merge_rx = Some(replacement);
-                                }
-                            }
-                        }
                     }
                     _ => unreachable!(),
                 }
@@ -2360,6 +2382,32 @@ impl<'a> App<'a> {
                     .write_line(&format!("merge failed: {}", e), C_ERROR);
             }
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "git-worktree")]
+    async fn refresh_worktree_workspace_context(&mut self) -> anyhow::Result<()> {
+        apply_current_prompt_mode(self.ui.context, &self.ui.permission);
+        #[cfg(feature = "mcp")]
+        rebind_mcp_manager(
+            &mut self.ui.mcp_manager,
+            self.ui.cfg,
+            &self.ui.context.workspace_root,
+        )
+        .await;
+        self.run.agent = Some(
+            self.ui
+                .agent_build_ctx()
+                .rebuild_agent(&self.ui.session.model, self.slash.reasoning_enabled)
+                .await,
+        );
+        render_session(
+            &mut self.renderer,
+            self.ui.session,
+            self.ui.cli,
+            self.ui.cfg,
+            self.ui.context,
+        )?;
         Ok(())
     }
 
