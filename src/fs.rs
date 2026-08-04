@@ -1386,10 +1386,14 @@ fn atomic_write_platform(
                 return Err(error);
             }
         };
-    if directory_metadata.identity != current_directory_metadata.identity {
+    if let Err(error) = ensure_same_file(
+        &target_path,
+        &directory_metadata,
+        &current_directory_metadata,
+    ) {
         drop(temp);
         unlink_owned_temp(&directory, &temp_name, &temp_identity);
-        return Err(path_changed_error(&target_path));
+        return Err(error);
     }
 
     let temp_still_ours = open_at(
@@ -1399,10 +1403,10 @@ fn atomic_write_platform(
         0,
     )
     .and_then(|file| checked_file_metadata(&file))
-    .is_ok_and(|metadata| temp_identity.identity == metadata.identity);
-    if !temp_still_ours {
+    .and_then(|metadata| ensure_same_file(&target_path, &temp_identity, &metadata));
+    if let Err(error) = temp_still_ours {
         drop(temp);
-        return Err(path_changed_error(&target_path));
+        return Err(error);
     }
 
     #[cfg(test)]

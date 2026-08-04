@@ -2110,7 +2110,18 @@ fn copy_directory_verified(
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo,
+        SetFileInformationByHandle,
+    };
+
     let stage_parent = stage
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stage has no parent"))?;
@@ -2140,11 +2151,76 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    // Let Rust's Windows path layer normalize verbatim/short path forms before
-    // issuing the native rename. Windows does not replace an existing
-    // directory target, preserving create-if-absent publication for this
-    // directory-only migration. The caller syncs the parent immediately after.
-    std::fs::rename(stage, canonical)
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let source = std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(stage)?;
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(canonical_parent)?;
+    let target_name = canonical
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no filename"))?
+        .encode_wide()
+        .collect::<Vec<_>>();
+    let name_bytes = target_name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "migration target name is too long",
+            )
+        })?;
+    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let total_bytes = header_bytes
+        .checked_add(name_bytes)
+        .and_then(|bytes| bytes.checked_add(size_of::<u16>()))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "migration rename buffer is too large",
+            )
+        })?;
+    let mut storage = vec![0usize; total_bytes.div_ceil(size_of::<usize>())];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `storage` is pointer-aligned and sized for the fixed header, the
+    // complete UTF-16 target name, and its trailing zero. Both directory
+    // handles and the buffer remain live for the synchronous system call.
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = parent.as_raw_handle().cast();
+        (*information).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "migration target name is too long",
+            )
+        })?;
+        std::ptr::copy_nonoverlapping(
+            target_name.as_ptr(),
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            target_name.len(),
+        );
+        if SetFileInformationByHandle(
+            source.as_raw_handle().cast(),
+            FileRenameInfo,
+            information.cast(),
+            u32::try_from(total_bytes).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "migration rename buffer is too large",
+                )
+            })?,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
