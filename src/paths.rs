@@ -2117,7 +2117,7 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, FileRenameInfo, SetFileInformationByHandle,
+        FILE_SHARE_WRITE, FileRenameInfo, SetFileInformationByHandle,
     };
 
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -2152,26 +2152,20 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
         .share_mode(share)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(stage)?;
-    let parent = std::fs::OpenOptions::new()
-        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
-        .share_mode(share)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(canonical_parent)?;
-
     let name_bytes = name.len() * std::mem::size_of::<u16>();
-    let required = std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes;
+    let required = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name_bytes;
     let words = required.div_ceil(std::mem::size_of::<usize>());
     let mut storage = vec![0usize; words];
     let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
 
-    // Rename the opened directory relative to its already-opened parent. This
-    // keeps the publication on one volume and avoids path-namespace ambiguity
-    // in MoveFileExW for verbatim hosted-runner paths.
+    // A null RootDirectory with a leaf name requests a rename within the
+    // opened source's current directory. Supplying the same parent as a root
+    // is treated as a cross-device move by hosted Windows filesystems.
     // SAFETY: storage is aligned and large enough for the header plus the
-    // UTF-16 leaf, and both directory handles remain live for the call.
+    // UTF-16 leaf, and the source directory handle remains live for the call.
     let renamed = unsafe {
         (*information).Anonymous.ReplaceIfExists = false;
-        (*information).RootDirectory = parent.as_raw_handle().cast();
+        (*information).RootDirectory = std::ptr::null_mut();
         (*information).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),

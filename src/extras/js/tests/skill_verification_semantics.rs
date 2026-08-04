@@ -364,10 +364,14 @@ mod tests {
             CapabilityTier::Pure,
             vec![],
         );
-        assert!(matches!(
-            verify_skill(&s),
-            Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
-        ));
+        let result = verify_skill(&s);
+        assert!(
+            matches!(
+                &result,
+                Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
+            ),
+            "unexpected verification result: {result:?}"
+        );
     }
 
     #[test]
@@ -551,10 +555,11 @@ mod tests {
             CapabilityTier::Pure,
             vec![],
         );
-        assert!(matches!(
-            verify_skill(&s),
-            Err(VerificationError::SourceEvaluationFailed(_))
-        ));
+        let result = verify_skill(&s);
+        assert!(
+            matches!(&result, Err(VerificationError::SourceEvaluationFailed(_))),
+            "unexpected verification result: {result:?}"
+        );
     }
 
     #[test]

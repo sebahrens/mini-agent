@@ -7,7 +7,6 @@ use crate::sandbox::{
     Sandbox, SupportCommandAudit, SupportCommandLimits,
 };
 use tokio::time::{Duration, sleep, timeout};
-use tracing::instrument::WithSubscriber;
 
 const SHORT_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_millis(300),
@@ -258,69 +257,61 @@ async fn explicit_shell_operation_cancellation_kills_and_reaps_tree() {
 
 #[test]
 fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let writer = BufferWriter(logs.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(move || writer.clone())
-        .finish();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let expected_cwd = std::env::current_dir().unwrap();
 
-    tracing::subscriber::with_default(subscriber, || {
-        runtime.block_on(async {
-            let marker = unique_marker("shell-drop-descendant");
-            let started = unique_marker("shell-drop-started");
-            let sandbox = Sandbox::new(false, "bwrap");
-            let interaction = format!(
-                "!trap '' TERM; sh -c 'printf started > {}; sleep 1; printf leaked > {}' & wait",
-                started.display(),
-                marker.display()
-            );
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            let handle = tokio::spawn(
-                {
-                    let sandbox = sandbox.clone();
-                    async move {
-                        sandbox
-                            .run_explicit_shell(&interaction, SHORT_LIMITS, None)
-                            .await
-                    }
-                }
-                .with_subscriber(dispatch),
-            );
-
-            wait_until(|| sandbox.active_group_count() == 1 && started.exists()).await;
-            handle.abort();
-            let _ = handle.await;
-            wait_until(|| sandbox.active_group_count() == 0).await;
-            wait_until_for(Duration::from_secs(30), || {
-                String::from_utf8_lossy(&logs.lock().unwrap())
-                    .contains("explicit user shell ended after process cleanup")
-            })
-            .await;
-            sleep(Duration::from_millis(1200)).await;
-            assert!(!marker.exists());
-            let _ = std::fs::remove_file(started);
+    let (audit_receipts, marker) = runtime.block_on(async {
+        let marker = unique_marker("shell-drop-descendant");
+        let started = unique_marker("shell-drop-started");
+        let mut sandbox = Sandbox::new(false, "bwrap");
+        let audit_receipts = sandbox.observe_explicit_shell_audits();
+        let interaction = format!(
+            "!trap '' TERM; sh -c 'printf started > {}; sleep 1; printf leaked > {}' & wait",
+            started.display(),
+            marker.display()
+        );
+        let handle = tokio::spawn({
+            let sandbox = sandbox.clone();
+            async move {
+                sandbox
+                    .run_explicit_shell(&interaction, SHORT_LIMITS, None)
+                    .await
+            }
         });
+
+        wait_until_named("explicit shell process group to start", || {
+            sandbox.active_group_count() == 1 && started.exists()
+        })
+        .await;
+        handle.abort();
+        let _ = handle.await;
+        wait_until_named("explicit shell process group cleanup", || {
+            sandbox.active_group_count() == 0
+        })
+        .await;
+        wait_until_for_named(
+            Duration::from_secs(30),
+            "explicit shell terminal audit",
+            || !audit_receipts.lock().unwrap().is_empty(),
+        )
+        .await;
+        sleep(Duration::from_millis(1200)).await;
+        assert!(!marker.exists());
+        let _ = std::fs::remove_file(started);
+        (audit_receipts, marker)
     });
 
-    let logs = logs.lock().unwrap();
-    let logs = String::from_utf8_lossy(&logs);
-    assert!(logs.contains("TC-EXPLICIT-USER-SHELL"), "{logs}");
-    assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
-    assert!(
-        logs.contains(&format!("cwd={}", expected_cwd.display())),
-        "{logs}"
-    );
-    assert!(
-        logs.contains("explicit user shell ended after process cleanup"),
-        "{logs}"
-    );
+    let receipts = audit_receipts.lock().unwrap();
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    let (audit, status) = &receipts[0];
+    assert_eq!(*status, CommandStatus::Cancelled);
+    assert_eq!(audit.cwd, expected_cwd);
+    assert!(audit.command.starts_with("trap '' TERM;"));
+    assert_eq!(audit.boundary, ExplicitShellBoundary::UserTrustedBypass);
+    assert!(!marker.exists());
 }
 
 #[tokio::test]
@@ -513,13 +504,20 @@ fn is_backend_setup_denial(rendered: &str) -> bool {
 }
 
 async fn wait_until(predicate: impl FnMut() -> bool) {
-    wait_until_for(Duration::from_secs(30), predicate).await;
+    wait_until_for_named(Duration::from_secs(30), "condition", predicate).await;
 }
 
-async fn wait_until_for(timeout: Duration, mut predicate: impl FnMut() -> bool) {
+async fn wait_until_named(label: &str, predicate: impl FnMut() -> bool) {
+    wait_until_for_named(Duration::from_secs(30), label, predicate).await;
+}
+
+async fn wait_until_for_named(timeout: Duration, label: &str, mut predicate: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + timeout;
     while !predicate() {
-        assert!(std::time::Instant::now() < deadline);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {label}"
+        );
         sleep(Duration::from_millis(10)).await;
     }
 }

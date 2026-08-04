@@ -2433,9 +2433,15 @@ fn inheritable_omitted_canary() -> Result<Handle, String> {
 fn appcontainer_environment(cache: &Path, private_storage: &Path) -> Vec<u16> {
     let mut entries = essential_windows_environment();
     let private_storage = private_storage.as_os_str().to_string_lossy().into_owned();
+    let private_temp = Path::new(&private_storage)
+        .join("Temp")
+        .as_os_str()
+        .to_string_lossy()
+        .into_owned();
     let cache = cache.as_os_str().to_string_lossy().into_owned();
-    entries.push(("TEMP".into(), private_storage.clone()));
-    entries.push(("TMP".into(), private_storage));
+    entries.push(("LOCALAPPDATA".into(), private_storage));
+    entries.push(("TEMP".into(), private_temp.clone()));
+    entries.push(("TMP".into(), private_temp));
     entries.push(("ZS_CACHE_DIR".into(), cache));
     entries.sort_by(|a, b| a.0.to_ascii_uppercase().cmp(&b.0.to_ascii_uppercase()));
     let mut block = Vec::new();
@@ -3542,6 +3548,33 @@ mod tests {
         assert_eq!(quote_windows_argument("a b"), "\"a b\"");
         assert_eq!(quote_windows_argument("a\\\"b"), "\"a\\\\\\\"b\"");
         assert_eq!(quote_windows_argument("a b\\"), "\"a b\\\\\"");
+    }
+
+    #[test]
+    fn appcontainer_environment_uses_container_local_profile_and_temp() {
+        let storage = Path::new(r"C:\Users\runner\AppData\Local\Packages\mini-agent\AC");
+        let block = appcontainer_environment(Path::new(r"C:\cache"), storage);
+        let entries = String::from_utf16(&block)
+            .expect("environment UTF-16")
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert!(entries.iter().any(|entry| {
+            entry == r"LOCALAPPDATA=C:\Users\runner\AppData\Local\Packages\mini-agent\AC"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry == r"TEMP=C:\Users\runner\AppData\Local\Packages\mini-agent\AC\Temp"
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry == r"TMP=C:\Users\runner\AppData\Local\Packages\mini-agent\AC\Temp"
+        }));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry == r"ZS_CACHE_DIR=C:\cache")
+        );
     }
 
     #[test]

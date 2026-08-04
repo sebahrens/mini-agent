@@ -42,6 +42,8 @@ pub struct Sandbox {
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
     #[cfg(test)]
     complete_process_tree_for_test: bool,
+    #[cfg(test)]
+    explicit_shell_audit_receipts: Option<ExplicitShellAuditReceipts>,
 }
 
 /// Transfers a direct-exec workspace service and every descendant into one
@@ -176,18 +178,38 @@ pub(crate) struct ExplicitShellAudit {
 struct OwnedExplicitShellAudit {
     metadata: ExplicitShellAudit,
     dispatch: tracing::Dispatch,
+    #[cfg(test)]
+    receipts: Option<ExplicitShellAuditReceipts>,
 }
 
+#[cfg(test)]
+pub(crate) type ExplicitShellAuditReceipts = Arc<Mutex<Vec<(ExplicitShellAudit, CommandStatus)>>>;
+
 impl OwnedExplicitShellAudit {
-    fn capture(metadata: ExplicitShellAudit) -> Self {
+    fn capture(
+        metadata: ExplicitShellAudit,
+        #[cfg(test)] receipts: Option<ExplicitShellAuditReceipts>,
+    ) -> Self {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        Self { metadata, dispatch }
+        Self {
+            metadata,
+            dispatch,
+            #[cfg(test)]
+            receipts,
+        }
     }
 
     fn emit(&self, output: &CommandOutput) {
         tracing::dispatcher::with_default(&self.dispatch, || {
             audit_explicit_shell(&self.metadata, output);
         });
+        #[cfg(test)]
+        if let Some(receipts) = &self.receipts {
+            receipts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((self.metadata.clone(), output.status));
+        }
     }
 }
 
@@ -458,6 +480,11 @@ pub(crate) struct ProcessGroupGuard {
     active_groups: Arc<Mutex<HashSet<u32>>>,
 }
 
+struct OutputCommandLifecycleGuard {
+    process: ProcessGroupGuard,
+    audit: Option<OwnedExplicitShellAudit>,
+}
+
 /// Gives an interactive child process group foreground terminal ownership and
 /// restores mini-agent's group before the TUI resumes drawing.
 #[cfg(unix)]
@@ -541,6 +568,12 @@ impl ProcessGroupGuard {
                 .remove(&pid);
         }
     }
+
+    fn terminate_owned_group(&self) {
+        if let Some(pid) = self.pid {
+            kill_process_group(pid);
+        }
+    }
 }
 
 impl Drop for ProcessGroupGuard {
@@ -552,6 +585,43 @@ impl Drop for ProcessGroupGuard {
                 .remove(&pid);
             kill_process_group(pid);
         }
+    }
+}
+
+impl OutputCommandLifecycleGuard {
+    fn new(process: ProcessGroupGuard, audit: Option<OwnedExplicitShellAudit>) -> Self {
+        Self { process, audit }
+    }
+
+    fn finish(&mut self, output: &CommandOutput) {
+        if let Some(audit) = self.audit.take() {
+            audit.emit(output);
+        }
+        // Keep the group accounted as active until its terminal audit has
+        // been emitted. Observers can then treat a zero group count as the
+        // completed lifecycle boundary, including cleanup and accounting.
+        self.process.disarm();
+    }
+}
+
+impl Drop for OutputCommandLifecycleGuard {
+    fn drop(&mut self) {
+        if self.process.pid.is_none() {
+            return;
+        }
+        // A detached runner can itself be cancelled while its caller is being
+        // torn down. Close that otherwise-unobservable lifecycle in the same
+        // cleanup-before-audit-before-accounting order as the normal path.
+        self.process.terminate_owned_group();
+        if let Some(audit) = self.audit.take() {
+            audit.emit(&CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: CommandStatus::Cancelled,
+            });
+        }
+        self.process.disarm();
     }
 }
 
@@ -638,7 +708,16 @@ impl Sandbox {
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             complete_process_tree_for_test: false,
+            #[cfg(test)]
+            explicit_shell_audit_receipts: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_explicit_shell_audits(&mut self) -> ExplicitShellAuditReceipts {
+        let receipts = Arc::new(Mutex::new(Vec::new()));
+        self.explicit_shell_audit_receipts = Some(receipts.clone());
+        receipts
     }
 
     pub fn with_windows_appcontainer_roots(
@@ -1526,7 +1605,11 @@ impl Sandbox {
                 cmd,
                 limits,
                 cancellation,
-                Some(OwnedExplicitShellAudit::capture(audit.clone())),
+                Some(OwnedExplicitShellAudit::capture(
+                    audit.clone(),
+                    #[cfg(test)]
+                    self.explicit_shell_audit_receipts.clone(),
+                )),
                 None,
             )
             .await?;
@@ -1753,7 +1836,10 @@ impl Sandbox {
                 let _ = stdin.write_all(&input).await;
             });
         }
-        let mut guard = ProcessGroupGuard::new(child.id(), self.active_groups.clone());
+        let mut lifecycle = OutputCommandLifecycleGuard::new(
+            ProcessGroupGuard::new(child.id(), self.active_groups.clone()),
+            audit,
+        );
         let captured = Arc::new(Mutex::new(CapturedCommandOutput::default()));
         let (reader_error_tx, mut reader_error_rx) = mpsc::unbounded_channel();
         let stdout_handle = spawn_bounded_pipe_reader(
@@ -1858,13 +1944,7 @@ impl Sandbox {
             status: command_status,
         };
         drop(captured);
-        if let Some(audit) = &audit {
-            audit.emit(&output);
-        }
-        // Keep the group accounted as active until its terminal audit has
-        // been emitted. Observers can then treat a zero group count as the
-        // completed lifecycle boundary, including cleanup and accounting.
-        guard.disarm();
+        lifecycle.finish(&output);
         let _ = response_tx.send(output);
     }
 

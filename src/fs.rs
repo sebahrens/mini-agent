@@ -101,7 +101,7 @@ enum FileIdentity {
     #[cfg(all(unix, not(target_os = "macos")))]
     Unix { device: u64, inode: u64 },
     #[cfg(target_os = "macos")]
-    MacOs { inode: u64, generation: u32 },
+    MacOs { inode: u64 },
     #[cfg(windows)]
     Windows {
         volume_serial_number: u64,
@@ -142,14 +142,14 @@ fn checked_owned_file(
     };
     #[cfg(target_os = "macos")]
     let identity = {
-        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::fs::MetadataExt;
 
         // APFS firmlinks can give two handles for one object different
-        // synthetic device IDs. Inode plus the kernel generation number is
-        // stable across those views and still rejects inode reuse.
+        // synthetic device and generation metadata. The retained open handle
+        // pins the selected inode, so comparing that stable object identifier
+        // rejects replacement without relying on either synthetic field.
         FileIdentity::MacOs {
-            inode: metadata.st_ino(),
-            generation: metadata.st_gen(),
+            inode: metadata.ino(),
         }
     };
     #[cfg(windows)]
