@@ -1053,6 +1053,8 @@ const OPEN_CLOEXEC: std::os::raw::c_int = 0x100_0000;
 const OPEN_CREATE: std::os::raw::c_int = 0x200;
 #[cfg(target_os = "macos")]
 const OPEN_EXCLUSIVE: std::os::raw::c_int = 0x800;
+#[cfg(target_os = "macos")]
+const OPEN_EVENT_ONLY: std::os::raw::c_int = 0x8000;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments, unsafe_code)]
@@ -1396,10 +1398,14 @@ fn atomic_write_platform(
         return Err(error);
     }
 
+    #[cfg(target_os = "macos")]
+    let temp_verify_flags = OPEN_EVENT_ONLY | OPEN_NOFOLLOW | OPEN_CLOEXEC;
+    #[cfg(target_os = "linux")]
+    let temp_verify_flags = OPEN_NOFOLLOW | OPEN_CLOEXEC;
     let temp_still_ours = open_at(
         &directory,
         OsStr::from_bytes(temp_name.as_bytes()),
-        OPEN_NOFOLLOW | OPEN_CLOEXEC,
+        temp_verify_flags,
         0,
     )
     .and_then(|file| checked_file_metadata(&file))
