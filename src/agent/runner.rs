@@ -1,5 +1,6 @@
 use compact_str::CompactString;
 use futures::StreamExt;
+use rig::OneOrMany;
 use rig::agent::{Agent, MultiTurnStreamItem, StreamingResult};
 use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
@@ -7,7 +8,7 @@ use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType
 use rig::completion::{CompletionModel, Message};
 use rig::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
 use crate::event::{AgentEvent, BtwEvent, UsageDelta};
@@ -53,16 +54,30 @@ fn warn_unknown_stream_item<R: serde::Serialize>(item: &MultiTurnStreamItem<R>) 
 }
 
 const MAX_PENDING_TOOL_CALLS: usize = 256;
+const UNKNOWN_TOOL_OUTCOME: &str =
+    "[Tool execution outcome is unknown because the agent stream ended before a result.]";
+const UNRESOLVED_TOOL_CALLS_ERROR: &str =
+    "Agent stream ended with unresolved tool calls; execution outcome is unknown.";
 
 #[derive(Debug)]
 struct PendingToolCall {
     provider_id: String,
+    provider_call_id: Option<String>,
     name: String,
 }
 
 #[derive(Default)]
 struct ToolCallTracker {
     pending: HashMap<String, PendingToolCall>,
+    order: VecDeque<String>,
+}
+
+#[derive(Debug)]
+struct FinalizedToolCall {
+    internal_call_id: String,
+    name: String,
+    #[cfg(test)]
+    tool_result: ToolResult,
 }
 
 impl ToolCallTracker {
@@ -100,9 +115,11 @@ impl ToolCallTracker {
             internal_call_id.to_owned(),
             PendingToolCall {
                 provider_id: tool_call.id.clone(),
+                provider_call_id: tool_call.call_id.clone(),
                 name: tool_call.function.name.clone(),
             },
         );
+        self.order.push_back(internal_call_id.to_owned());
         Ok(())
     }
 
@@ -126,27 +143,55 @@ impl ToolCallTracker {
             );
             return None;
         };
-        if call.provider_id != tool_result.id {
+        if call.provider_id != tool_result.id || call.provider_call_id != tool_result.call_id {
             tracing::error!(
                 internal_call_id,
                 provider_tool_call_id = %call.provider_id,
                 provider_tool_result_id = %tool_result.id,
-                "provider tool IDs differ for an internally correlated call/result pair; preserving the pending call"
+                provider_tool_call_call_id = ?call.provider_call_id,
+                provider_tool_result_call_id = ?tool_result.call_id,
+                "provider tool correlation IDs differ for an internally correlated call/result pair; preserving the pending call"
             );
             return None;
         }
-        self.pending.remove(internal_call_id)
+        let call = self.pending.remove(internal_call_id)?;
+        if let Some(position) = self.order.iter().position(|id| id == internal_call_id) {
+            self.order.remove(position);
+        } else {
+            tracing::error!(
+                internal_call_id,
+                "tool-call correlation order was missing a pending ID"
+            );
+        }
+        Some(call)
     }
 
-    fn finish_stream(&mut self) {
-        if self.pending.is_empty() {
-            return;
+    fn finalize_unresolved(&mut self, interactions: &mut Vec<Message>) -> Vec<FinalizedToolCall> {
+        let mut finalized = Vec::with_capacity(self.pending.len());
+        while let Some(internal_call_id) = self.order.pop_front() {
+            let Some(call) = self.pending.remove(&internal_call_id) else {
+                continue;
+            };
+            let tool_result = ToolResult {
+                id: call.provider_id,
+                call_id: call.provider_call_id,
+                content: OneOrMany::one(ToolResultContent::text(UNKNOWN_TOOL_OUTCOME)),
+            };
+            interactions.push(tool_result.clone().into());
+            finalized.push(FinalizedToolCall {
+                internal_call_id,
+                name: call.name,
+                #[cfg(test)]
+                tool_result,
+            });
         }
-        tracing::warn!(
-            pending_tool_calls = self.pending.len(),
-            "agent stream ended with unresolved tool calls; discarding pending correlations"
-        );
-        self.pending.clear();
+        if !finalized.is_empty() {
+            tracing::warn!(
+                pending_tool_calls = finalized.len(),
+                "agent stream ended with unresolved tool calls; appended explicit unknown-outcome results"
+            );
+        }
+        finalized
     }
 }
 
@@ -195,6 +240,25 @@ fn attributed_tool_result(
     }
 
     Some((CompactString::new(call.name), output))
+}
+
+async fn finalize_interactive_tool_calls(
+    tracker: &mut ToolCallTracker,
+    interactions: &mut Vec<Message>,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) -> usize {
+    let finalized = tracker.finalize_unresolved(interactions);
+    let count = finalized.len();
+    for call in finalized {
+        let _ = event_tx
+            .send(AgentEvent::ToolResult {
+                id: CompactString::from(call.internal_call_id),
+                name: CompactString::from(call.name),
+                output: CompactString::from(UNKNOWN_TOOL_OUTCOME),
+            })
+            .await;
+    }
+    count
 }
 
 impl From<Usage> for UsageDelta {
@@ -390,11 +454,14 @@ fn append_streamed_text(interactions: &mut Vec<Message>, text: &str) {
         return;
     }
 
-    if let Some(Message::Assistant { content, .. }) = interactions.last_mut()
-        && let AssistantContent::Text(previous) = content.last_mut()
-        && previous.additional_params.is_none()
-    {
-        previous.text.push_str(text);
+    if let Some(Message::Assistant { content, .. }) = interactions.last_mut() {
+        if let AssistantContent::Text(previous) = content.last_mut()
+            && previous.additional_params.is_none()
+        {
+            previous.text.push_str(text);
+        } else {
+            content.push(AssistantContent::text(text));
+        }
         return;
     }
 
@@ -423,6 +490,8 @@ struct RunnerStreamPolicy {
     drop_terminal_responses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     drop_completion_calls: bool,
+    #[cfg(test)]
+    drop_tool_results: bool,
 }
 
 impl RunnerStreamPolicy {
@@ -433,6 +502,7 @@ impl RunnerStreamPolicy {
                 count,
             )),
             drop_completion_calls: false,
+            drop_tool_results: false,
         }
     }
 
@@ -440,6 +510,23 @@ impl RunnerStreamPolicy {
     fn without_completion_calls() -> Self {
         Self {
             drop_completion_calls: true,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn without_tool_results() -> Self {
+        Self {
+            drop_tool_results: true,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn tool_call_text_eof() -> Self {
+        Self {
+            drop_terminal_responses: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            drop_tool_results: true,
             ..Self::default()
         }
     }
@@ -459,15 +546,23 @@ impl RunnerStreamPolicy {
                 )
                 .is_ok();
             let drop_completion_calls = self.drop_completion_calls;
-            if drop_terminal || drop_completion_calls {
+            let drop_tool_results = self.drop_tool_results;
+            if drop_terminal || drop_completion_calls || drop_tool_results {
                 return stream
                     .filter(move |item| {
                         let is_terminal = matches!(item, Ok(MultiTurnStreamItem::FinalResponse(_)));
                         let is_completion =
                             matches!(item, Ok(MultiTurnStreamItem::CompletionCall(_)));
+                        let is_tool_result = matches!(
+                            item,
+                            Ok(MultiTurnStreamItem::StreamUserItem(
+                                StreamedUserContent::ToolResult { .. }
+                            ))
+                        );
                         std::future::ready(
                             !(drop_terminal && is_terminal)
-                                && !(drop_completion_calls && is_completion),
+                                && !(drop_completion_calls && is_completion)
+                                && !(drop_tool_results && is_tool_result),
                         )
                     })
                     .boxed();
@@ -917,6 +1012,12 @@ where
                                 internal_call_id,
                             } => {
                                 if let Some((used, budget)) = exhausted_budget_after_completion {
+                                    finalize_interactive_tool_calls(
+                                        &mut tool_calls,
+                                        &mut interactions,
+                                        &event_tx,
+                                    )
+                                    .await;
                                     let _ = event_tx
                                         .send(AgentEvent::Error(CompactString::from(
                                             token_budget_exhaustion_message(used, budget),
@@ -933,7 +1034,12 @@ where
                                 );
                                 if let Err(error) = tool_calls.record(&internal_call_id, &tool_call)
                                 {
-                                    tool_calls.finish_stream();
+                                    finalize_interactive_tool_calls(
+                                        &mut tool_calls,
+                                        &mut interactions,
+                                        &event_tx,
+                                    )
+                                    .await;
                                     let _ = event_tx
                                         .send(AgentEvent::Error(CompactString::new(
                                             error.to_string(),
@@ -971,7 +1077,12 @@ where
                         internal_call_id,
                     }) => {
                         if let Some((used, budget)) = exhausted_budget_after_completion {
-                            tool_calls.finish_stream();
+                            finalize_interactive_tool_calls(
+                                &mut tool_calls,
+                                &mut interactions,
+                                &event_tx,
+                            )
+                            .await;
                             let _ = event_tx
                                 .send(AgentEvent::Error(CompactString::from(
                                     token_budget_exhaustion_message(used, budget),
@@ -990,7 +1101,12 @@ where
                         internal_call_id,
                     })) => {
                         if let Some((used, budget)) = exhausted_budget_after_completion {
-                            tool_calls.finish_stream();
+                            finalize_interactive_tool_calls(
+                                &mut tool_calls,
+                                &mut interactions,
+                                &event_tx,
+                            )
+                            .await;
                             let _ = event_tx
                                 .send(AgentEvent::Error(CompactString::from(
                                     token_budget_exhaustion_message(used, budget),
@@ -1046,6 +1162,22 @@ where
                             usage.cache_creation_input_tokens,
                         );
 
+                        if finalize_interactive_tool_calls(
+                            &mut tool_calls,
+                            &mut interactions,
+                            &event_tx,
+                        )
+                        .await
+                            > 0
+                        {
+                            let _ = event_tx
+                                .send(AgentEvent::Error(CompactString::from(
+                                    UNRESOLVED_TOOL_CALLS_ERROR,
+                                )))
+                                .await;
+                            return;
+                        }
+
                         if !response_text.is_empty() {
                             #[cfg(feature = "hooks")]
                             if let crate::extras::hooks::StopGate::Continue { reason } =
@@ -1074,7 +1206,6 @@ where
                                     response: CompactString::from(response.clone()),
                                 })
                                 .await;
-                            tool_calls.finish_stream();
                             return;
                         }
                         empty_response_count += 1;
@@ -1118,7 +1249,12 @@ where
                                     budget,
                                     "agent cumulative token budget exhausted before the next provider call"
                                 );
-                                tool_calls.finish_stream();
+                                finalize_interactive_tool_calls(
+                                    &mut tool_calls,
+                                    &mut interactions,
+                                    &event_tx,
+                                )
+                                .await;
                                 let _ = event_tx
                                     .send(AgentEvent::Error(CompactString::from(
                                         token_budget_exhaustion_message(used, budget),
@@ -1132,7 +1268,12 @@ where
                     }
                     Err(e) => {
                         tracing::error!("agent stream error: {e}");
-                        tool_calls.finish_stream();
+                        finalize_interactive_tool_calls(
+                            &mut tool_calls,
+                            &mut interactions,
+                            &event_tx,
+                        )
+                        .await;
                         let _ = event_tx
                             .send(AgentEvent::Error(CompactString::new(e.to_string())))
                             .await;
@@ -1142,7 +1283,7 @@ where
                 }
             }
 
-            tool_calls.finish_stream();
+            finalize_interactive_tool_calls(&mut tool_calls, &mut interactions, &event_tx).await;
 
             if !terminal_response_seen
                 && let Err(error) =
@@ -1335,12 +1476,14 @@ where
                     },
                 )) => {
                     if let Some((used, budget)) = exhausted_budget_after_completion {
+                        tool_calls.finalize_unresolved(&mut interactions);
                         anyhow::bail!(token_budget_exhaustion_message(used, budget));
                     }
                     let name = &tool_call.function.name;
-                    tool_calls
-                        .record(&internal_call_id, &tool_call)
-                        .map_err(|error| anyhow::anyhow!(error))?;
+                    if let Err(error) = tool_calls.record(&internal_call_id, &tool_call) {
+                        tool_calls.finalize_unresolved(&mut interactions);
+                        return Err(anyhow::anyhow!(error));
+                    }
                     completion_had_tool_call = true;
                     if pure_stdout {
                         let summary = format_tool_args_summary(&tool_call.function.arguments);
@@ -1351,7 +1494,7 @@ where
                 }
                 Ok(MultiTurnStreamItem::ToolExecutionStart { .. }) => {
                     if let Some((used, budget)) = exhausted_budget_after_completion {
-                        tool_calls.finish_stream();
+                        tool_calls.finalize_unresolved(&mut interactions);
                         anyhow::bail!(token_budget_exhaustion_message(used, budget));
                     }
                 }
@@ -1360,7 +1503,7 @@ where
                     internal_call_id,
                 })) => {
                     if let Some((used, budget)) = exhausted_budget_after_completion {
-                        tool_calls.finish_stream();
+                        tool_calls.finalize_unresolved(&mut interactions);
                         anyhow::bail!(token_budget_exhaustion_message(used, budget));
                     }
                     let Some((name, output)) =
@@ -1395,7 +1538,7 @@ where
                         exhausted_token_budget(usage_ledger.total, agent.max_tokens)
                     {
                         if completion_had_tool_call {
-                            tool_calls.finish_stream();
+                            tool_calls.finalize_unresolved(&mut interactions);
                             anyhow::bail!(token_budget_exhaustion_message(used, budget));
                         }
                         exhausted_budget_after_completion = Some((used, budget));
@@ -1410,6 +1553,9 @@ where
                         response_len_at_stream_start,
                         &res.output,
                     );
+                    if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
+                        anyhow::bail!(UNRESOLVED_TOOL_CALLS_ERROR);
+                    }
                     #[cfg(feature = "hooks")]
                     if let crate::extras::hooks::StopGate::Continue { reason } =
                         crate::extras::hooks::dispatch_stop(
@@ -1441,13 +1587,13 @@ where
                     // with a truncated/empty response: dispatch must exit
                     // non-zero and must never persist an empty assistant turn
                     // (which would then be replayed as history on `--continue`).
-                    tool_calls.finish_stream();
+                    tool_calls.finalize_unresolved(&mut interactions);
                     return Err(anyhow::anyhow!("{e}"));
                 }
             }
         }
 
-        tool_calls.finish_stream();
+        tool_calls.finalize_unresolved(&mut interactions);
 
         if !terminal_response_seen {
             charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
@@ -1637,14 +1783,16 @@ where
 mod tests {
     use super::{
         MAX_PENDING_TOOL_CALLS, NonTerminalStreamExhausted, RunnerStreamPolicy, ToolCallTracker,
-        ToolCallTrackerError, UsageLedger, attributed_tool_result, charge_nonterminal_eof,
-        streamed_reasoning_text, warn_unknown_stream_item,
+        ToolCallTrackerError, UNKNOWN_TOOL_OUTCOME, UNRESOLVED_TOOL_CALLS_ERROR, UsageLedger,
+        attributed_tool_result, charge_nonterminal_eof, streamed_reasoning_text,
+        warn_unknown_stream_item,
     };
     use rig::OneOrMany;
     use rig::agent::{AgentBuilder, MultiTurnStreamItem};
     use rig::completion::{Message, Usage};
     use rig::message::{
         AssistantContent, Image, Text, ToolCall, ToolFunction, ToolResult, ToolResultContent,
+        UserContent,
     };
     use rig::streaming::StreamedAssistantContent;
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
@@ -2389,6 +2537,242 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_tool_call_text_eof_preserves_one_assistant_turn_on_both_surfaces() {
+        fn assert_recovery_history(history: Vec<Message>) -> ToolResult {
+            assert_eq!(history.len(), 5);
+            assert_eq!(history[0], Message::user("start"));
+            let Message::Assistant { content, .. } = &history[1] else {
+                panic!("tool call and following text must share one assistant turn")
+            };
+            assert_eq!(content.len(), 2);
+            assert!(matches!(
+                content.first(),
+                AssistantContent::ToolCall(call) if call.id == "eof-provider-id"
+            ));
+            assert!(matches!(
+                content.last(),
+                AssistantContent::Text(text) if text.text == "between"
+            ));
+            let Message::User { content } = &history[2] else {
+                panic!("synthetic tool result immediately follows the assistant turn")
+            };
+            let UserContent::ToolResult(result) = content.first() else {
+                panic!("expected synthetic tool result")
+            };
+            assert_eq!(result.id, "eof-provider-id");
+            assert!(result.content.iter().any(
+                |part| matches!(part, ToolResultContent::Text(text) if text.text == UNKNOWN_TOOL_OUTCOME)
+            ));
+            assert!(matches!(
+                &history[3],
+                Message::Assistant { content, .. }
+                    if matches!(content.first(), AssistantContent::Text(text) if text.text.is_empty())
+            ));
+            assert_eq!(history[4], Message::user("Please continue."));
+            result.clone()
+        }
+
+        async fn run_interactive() -> (ToolResult, String, String) {
+            let model = MockCompletionModel::from_stream_turns(vec![
+                vec![
+                    MockStreamEvent::tool_call(
+                        "eof-provider-id",
+                        CountingTool::NAME,
+                        serde_json::json!({}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+                vec![
+                    MockStreamEvent::text("between"),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+                vec![
+                    MockStreamEvent::text("recovered"),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+            ]);
+            let agent = AgentBuilder::new(model.clone())
+                .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+                .default_max_turns(3)
+                .build();
+            let mut runner = super::spawn_agent_with_stream_policy(
+                agent,
+                "start".to_string(),
+                Vec::new(),
+                crate::retry::RetryConfig::default(),
+                RunnerStreamPolicy::tool_call_text_eof(),
+                #[cfg(feature = "skills")]
+                None,
+                #[cfg(feature = "hooks")]
+                None,
+            );
+            let mut call_id = None;
+            let mut synthetic = None;
+            while let Some(event) = runner.event_rx.recv().await {
+                match event {
+                    crate::event::AgentEvent::ToolCall { id, name, .. } => {
+                        assert_eq!(name, CountingTool::NAME);
+                        call_id = Some(id.to_string());
+                    }
+                    crate::event::AgentEvent::ToolResult { id, name, output } => {
+                        assert_eq!(name, CountingTool::NAME);
+                        assert_eq!(output, UNKNOWN_TOOL_OUTCOME);
+                        synthetic = Some(id.to_string());
+                    }
+                    crate::event::AgentEvent::Done { response } => {
+                        assert_eq!(response, "betweenrecovered");
+                        break;
+                    }
+                    crate::event::AgentEvent::Error(error) => {
+                        panic!("unexpected interactive error: {error}")
+                    }
+                    _ => {}
+                }
+            }
+            let requests = model.requests();
+            assert_eq!(requests.len(), 3);
+            let result = assert_recovery_history(
+                requests[2].chat_history.iter().cloned().collect::<Vec<_>>(),
+            );
+            (result, call_id.unwrap(), synthetic.unwrap_or_default())
+        }
+
+        async fn run_headless() -> ToolResult {
+            let model = MockCompletionModel::from_stream_turns(vec![
+                vec![
+                    MockStreamEvent::tool_call(
+                        "eof-provider-id",
+                        CountingTool::NAME,
+                        serde_json::json!({}),
+                    ),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+                vec![
+                    MockStreamEvent::text("between"),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+                vec![
+                    MockStreamEvent::text("recovered"),
+                    MockStreamEvent::final_response_with_default_usage(),
+                ],
+            ]);
+            let agent = AgentBuilder::new(model.clone())
+                .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+                .default_max_turns(3)
+                .build();
+            let (response, _) = super::run_print_with_stream_policy(
+                &agent,
+                "start",
+                false,
+                &crate::retry::RetryConfig::default(),
+                Vec::new(),
+                RunnerStreamPolicy::tool_call_text_eof(),
+                #[cfg(feature = "hooks")]
+                None,
+            )
+            .await
+            .expect("headless EOF recovery completes after synthesizing a result");
+            assert_eq!(response, "betweenrecovered");
+            let requests = model.requests();
+            assert_eq!(requests.len(), 3);
+            assert_recovery_history(requests[2].chat_history.iter().cloned().collect::<Vec<_>>())
+        }
+
+        let (interactive_result, call_id, result_id) = run_interactive().await;
+        let headless_result = run_headless().await;
+        assert_eq!(call_id, result_id);
+        assert_eq!(interactive_result, headless_result);
+        assert_eq!(interactive_result.id, "eof-provider-id");
+        assert!(interactive_result.content.iter().any(
+            |part| matches!(part, ToolResultContent::Text(text) if text.text == UNKNOWN_TOOL_OUTCOME)
+        ));
+    }
+
+    #[tokio::test]
+    async fn runner_final_response_with_pending_call_fails_closed_on_both_surfaces() {
+        let interactive_model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "terminal-provider-id",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("must not succeed"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let interactive_agent = AgentBuilder::new(interactive_model)
+            .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+            .default_max_turns(2)
+            .build();
+        let mut runner = super::spawn_agent_with_stream_policy(
+            interactive_agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            RunnerStreamPolicy::without_tool_results(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut call_id = None;
+        let mut result_id = None;
+        let interactive_error = loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::ToolCall { id, .. } => call_id = Some(id.to_string()),
+                crate::event::AgentEvent::ToolResult { id, name, output } => {
+                    assert_eq!(name, CountingTool::NAME);
+                    assert_eq!(output, UNKNOWN_TOOL_OUTCOME);
+                    result_id = Some(id.to_string());
+                }
+                crate::event::AgentEvent::Error(error) => break error.to_string(),
+                crate::event::AgentEvent::Done { .. } => {
+                    panic!("pending calls must never produce interactive success")
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(call_id, result_id);
+        assert_eq!(interactive_error, UNRESOLVED_TOOL_CALLS_ERROR);
+
+        let headless_model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "terminal-provider-id",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("must not succeed"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let headless_agent = AgentBuilder::new(headless_model)
+            .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+            .default_max_turns(2)
+            .build();
+        let headless_error = super::run_print_with_stream_policy(
+            &headless_agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            Vec::new(),
+            RunnerStreamPolicy::without_tool_results(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect_err("pending calls must never produce headless success");
+        assert_eq!(headless_error.to_string(), interactive_error);
+    }
+
+    #[tokio::test]
     async fn text_and_tool_eof_history_is_causal_and_protocol_complete() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = MockCompletionModel::from_stream_turns(vec![
@@ -2782,9 +3166,13 @@ mod tests {
     }
 
     fn text_result(id: &str, output: &str) -> ToolResult {
+        text_result_with_call_id(id, None, output)
+    }
+
+    fn text_result_with_call_id(id: &str, call_id: Option<&str>, output: &str) -> ToolResult {
         ToolResult {
             id: id.to_string(),
-            call_id: None,
+            call_id: call_id.map(str::to_string),
             content: OneOrMany::one(ToolResultContent::Text(Text::new(output))),
         }
     }
@@ -2867,6 +3255,7 @@ mod tests {
     #[test]
     fn mismatched_provider_result_id_preserves_the_valid_pending_call() {
         let mut tracker = ToolCallTracker::default();
+        let mut interactions = Vec::new();
         tracker
             .record("stable-internal", &tool_call("expected-provider", "read"))
             .unwrap();
@@ -2880,14 +3269,94 @@ mod tests {
             .is_none()
         );
         assert_eq!(tracker.pending.len(), 1);
+        let finalized = tracker.finalize_unresolved(&mut interactions);
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].internal_call_id, "stable-internal");
+        assert_eq!(finalized[0].name, "read");
+        assert_eq!(finalized[0].tool_result.id, "expected-provider");
+        assert!(
+            finalized[0]
+                .tool_result
+                .content
+                .iter()
+                .any(|part| matches!(part, ToolResultContent::Text(text) if text.text.contains("outcome is unknown")))
+        );
+    }
 
-        let valid = attributed_tool_result(
+    #[test]
+    fn provider_call_id_is_strict_for_duplicate_provider_ids_and_optional_values() {
+        let mut tracker = ToolCallTracker::default();
+        let mut first = tool_call("duplicate-provider", "first");
+        first.call_id = Some("call-a".to_string());
+        let mut second = tool_call("duplicate-provider", "second");
+        second.call_id = Some("call-b".to_string());
+        tracker.record("internal-a", &first).unwrap();
+        tracker.record("internal-b", &second).unwrap();
+        tracker
+            .record("internal-none", &tool_call("optional-provider", "third"))
+            .unwrap();
+
+        assert!(
+            attributed_tool_result(
+                &mut tracker,
+                "internal-a",
+                &text_result_with_call_id("duplicate-provider", Some("call-b"), "swapped",),
+            )
+            .is_none()
+        );
+        assert!(
+            attributed_tool_result(
+                &mut tracker,
+                "internal-b",
+                &text_result_with_call_id("duplicate-provider", Some("call-a"), "swapped",),
+            )
+            .is_none()
+        );
+        assert!(
+            attributed_tool_result(
+                &mut tracker,
+                "internal-none",
+                &text_result_with_call_id("optional-provider", Some("unexpected"), "mismatch",),
+            )
+            .is_none()
+        );
+
+        let mut interactions = Vec::new();
+        let finalized = tracker.finalize_unresolved(&mut interactions);
+        assert_eq!(
+            finalized
+                .iter()
+                .map(|call| (
+                    call.internal_call_id.as_str(),
+                    call.tool_result.id.as_str(),
+                    call.tool_result.call_id.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("internal-a", "duplicate-provider", Some("call-a")),
+                ("internal-b", "duplicate-provider", Some("call-b")),
+                ("internal-none", "optional-provider", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_provider_call_id_resolves_normally() {
+        let mut tracker = ToolCallTracker::default();
+        let mut call = tool_call("provider", "read");
+        call.call_id = Some("provider-call".to_string());
+        tracker.record("internal", &call).unwrap();
+
+        let result = attributed_tool_result(
             &mut tracker,
-            "stable-internal",
-            &text_result("expected-provider", "valid"),
+            "internal",
+            &text_result_with_call_id("provider", Some("provider-call"), "done"),
         )
-        .expect("a malformed result must not consume the valid correlation");
-        assert_eq!((valid.0.as_str(), valid.1.as_str()), ("read", "valid"));
+        .expect("matching provider id and call_id resolve the exact call");
+
+        assert_eq!((result.0.as_str(), result.1.as_str()), ("read", "done"));
+        assert!(tracker.pending.is_empty());
+        assert!(tracker.order.is_empty());
     }
 
     #[test]
@@ -2930,15 +3399,41 @@ mod tests {
     }
 
     #[test]
-    fn runner_pending_tool_calls_are_discarded_at_stream_termination() {
+    fn resolved_tool_call_churn_keeps_pending_order_bounded() {
         let mut tracker = ToolCallTracker::default();
+        for index in 0..(MAX_PENDING_TOOL_CALLS * 4) {
+            let internal_id = format!("internal-{index}");
+            let provider_id = format!("provider-{index}");
+            tracker
+                .record(&internal_id, &tool_call(&provider_id, "read"))
+                .unwrap();
+            attributed_tool_result(
+                &mut tracker,
+                &internal_id,
+                &text_result(&provider_id, "done"),
+            )
+            .expect("each sequential result resolves its exact call");
+            assert!(tracker.pending.is_empty());
+            assert!(tracker.order.is_empty());
+        }
+    }
+
+    #[test]
+    fn runner_pending_tool_calls_are_finalized_at_stream_termination() {
+        let mut tracker = ToolCallTracker::default();
+        let mut interactions = Vec::new();
         tracker
             .record("pending-internal", &tool_call("pending-provider", "read"))
             .unwrap();
 
-        tracker.finish_stream();
+        let finalized = tracker.finalize_unresolved(&mut interactions);
 
         assert!(tracker.pending.is_empty());
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].internal_call_id, "pending-internal");
+        assert_eq!(finalized[0].name, "read");
+        assert_eq!(finalized[0].tool_result.id, "pending-provider");
+        assert_eq!(interactions.len(), 1);
         assert!(
             attributed_tool_result(
                 &mut tracker,
@@ -2948,6 +3443,46 @@ mod tests {
             .is_none(),
             "a late result must not attach to a correlation from a terminated stream"
         );
+    }
+
+    #[test]
+    fn unresolved_tool_calls_finalize_in_original_call_order_with_provider_metadata() {
+        let mut tracker = ToolCallTracker::default();
+        let mut first = tool_call("provider-a", "first");
+        first.call_id = Some("provider-call-a".to_string());
+        tracker.record("internal-a", &first).unwrap();
+        tracker
+            .record("internal-b", &tool_call("provider-b", "second"))
+            .unwrap();
+        tracker
+            .record("internal-c", &tool_call("provider-c", "third"))
+            .unwrap();
+        attributed_tool_result(
+            &mut tracker,
+            "internal-b",
+            &text_result("provider-b", "finished"),
+        )
+        .expect("the middle call resolves normally");
+        let mut interactions = Vec::new();
+
+        let finalized = tracker.finalize_unresolved(&mut interactions);
+
+        assert_eq!(
+            finalized
+                .iter()
+                .map(|call| (
+                    call.internal_call_id.as_str(),
+                    call.name.as_str(),
+                    call.tool_result.id.as_str(),
+                    call.tool_result.call_id.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("internal-a", "first", "provider-a", Some("provider-call-a")),
+                ("internal-c", "third", "provider-c", None),
+            ]
+        );
+        assert_eq!(interactions.len(), 2);
     }
 
     fn usage(
