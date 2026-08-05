@@ -4084,7 +4084,7 @@ mod feasibility {
             TokenIsLessPrivilegedAppContainer,
             "read TokenIsLessPrivilegedAppContainer",
         )
-        .map_err(|_| 0x2103u16)?
+        .map_err(|_| 0x2107u16)?
             == 0
         {
             return Err(0x2103);
