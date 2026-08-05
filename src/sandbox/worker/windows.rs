@@ -4089,7 +4089,7 @@ mod feasibility {
     /// property observable through the supported access-check API.  It mirrors Chromium's native
     /// LPAC regression test: a regular AppContainer receives bits 1 and 2, while an LPAC receives
     /// only the ALL_RESTRICTED_APPLICATION_PACKAGES bit (2).
-    fn lpac_all_packages_access_matches(process: HANDLE) -> Result<(), GateError> {
+    pub(super) fn lpac_all_packages_access_matches(process: HANDLE) -> Result<(), GateError> {
         let mut raw_primary = null_mut();
         // SAFETY: `process` is the live, directly-owned worker process handle. The returned
         // primary-token handle transfers immediately to WinHandle on success.
