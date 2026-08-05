@@ -3545,10 +3545,18 @@ mod feasibility {
                 reader.join().map_err(|_| {
                     GateError("Windows containment readiness reader panicked".to_string())
                 })?;
-                let exit_code = process
-                    .try_wait()
-                    .map_err(|wait| GateError(format!("poll failed containment child: {wait}")))?
-                    .and_then(|status| status.code());
+                let exit_deadline = Instant::now() + Duration::from_secs(1);
+                let exit_code = loop {
+                    if let Some(status) = process.try_wait().map_err(|wait| {
+                        GateError(format!("poll failed containment child: {wait}"))
+                    })? {
+                        break status.code();
+                    }
+                    if Instant::now() >= exit_deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
                 return Err(GateError(format!(
                     "{error}; child_exit_code={}",
                     exit_code

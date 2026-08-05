@@ -294,6 +294,7 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "failed closed checks code=",
         "failure_stream.flush()?",
         "child_exit_code=",
+        "exit_deadline",
         "emit_containment_failure(0x8001)",
     ] {
         assert!(
