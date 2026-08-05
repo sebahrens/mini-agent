@@ -529,6 +529,7 @@ mod feasibility {
     const CONTAINMENT_MARKER_VALUE: &str = "windows-containment-probe-v1";
     const CONTAINMENT_READY: &[u8] = b"MINI_AGENT_WINDOWS_CONTAINMENT_PASS_V1\n";
     const CONTAINMENT_FAILURE_PREFIX: &[u8] = b"MINI_AGENT_WINDOWS_CONTAINMENT_FAIL_V1:";
+    const CONTAINMENT_STAGE_PREFIX: &[u8] = b"MINI_AGENT_WINDOWS_CONTAINMENT_STAGE_V1:";
     const PROBE_WORKSPACE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_WORKSPACE";
     const PROBE_SKILL_DATABASE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE";
     const PROBE_FILE_HANDLE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE";
@@ -3686,15 +3687,19 @@ mod feasibility {
     fn read_fixed_containment_ready(output: File) -> Result<&'static [u8], GateError> {
         let mut reader = BufReader::new(output);
         let mut observed = 0usize;
+        let mut last_stage = None;
         loop {
             let mut line = Vec::new();
             let read = reader
                 .read_until(b'\n', &mut line)
                 .map_err(|error| GateError(format!("read containment readiness: {error}")))?;
             if read == 0 {
-                return Err(GateError(
-                    "Windows containment child exited before readiness".to_string(),
-                ));
+                return Err(GateError(match last_stage {
+                    Some(stage) => format!(
+                        "Windows containment child exited before readiness stage={stage:04X}"
+                    ),
+                    None => "Windows containment child exited before readiness".to_string(),
+                }));
             }
             observed = observed.saturating_add(read);
             if observed > 64 * 1024 {
@@ -3714,6 +3719,16 @@ mod feasibility {
                 return Err(GateError(format!(
                     "Windows containment child failed closed checks code={code:04X}"
                 )));
+            }
+            let stage = line
+                .strip_prefix(CONTAINMENT_STAGE_PREFIX)
+                .and_then(|value| value.strip_suffix(b"\n"))
+                .filter(|value| value.len() == 4)
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| u16::from_str_radix(value, 16).ok());
+            if stage.is_some() {
+                last_stage = stage;
+                continue;
             }
             if line
                 .windows(CONTAINMENT_READY.len())
@@ -4373,6 +4388,14 @@ mod feasibility {
     }
 
     #[cfg(test)]
+    fn emit_containment_stage(code: u16) {
+        let frame = format!("MINI_AGENT_WINDOWS_CONTAINMENT_STAGE_V1:{code:04X}\n");
+        if !write_containment_frame(frame.as_bytes()) {
+            emit_containment_failure(0x4002);
+        }
+    }
+
+    #[cfg(test)]
     fn containment_check(code: u16, check: impl FnOnce() -> bool) -> bool {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)) {
             Ok(passed) => passed,
@@ -4446,27 +4469,35 @@ mod feasibility {
         // and exactly one active process before it accepts the child's readiness frame.
         // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle with process lifetime and no
         // ownership obligation.
+        emit_containment_stage(0x2007);
         let current_process = unsafe { GetCurrentProcess() };
         let child_process_restriction_effective =
             containment_check(0x2007, || child_process_policy_matches(current_process));
+        emit_containment_stage(0x2008);
         let unlisted_file_handle_denied = containment_check(0x2008, || {
             inherited_handle_is_invalid(PROBE_FILE_HANDLE_ENV)
         });
+        emit_containment_stage(0x2009);
         let unlisted_socket_handle_denied = containment_check(0x2009, || {
             inherited_handle_is_invalid(PROBE_SOCKET_HANDLE_ENV)
         });
+        emit_containment_stage(0x200A);
         let protocol_handles_exact = containment_check(0x200A, exact_protocol_std_handles);
+        emit_containment_stage(0x200B);
         let token_is_zero_capability_lpac = containment_check(0x200B, || {
             child_token_is_zero_capability_lpac().unwrap_or(false)
         });
+        emit_containment_stage(0x200C);
         let no_console = containment_check(0x200C, no_console_devices);
         let mut in_job = 0;
+        emit_containment_stage(0x200D);
         let creation_time_job_membership = containment_check(0x200D, || {
             // SAFETY: `current_process` is the live borrowed pseudo-handle above, null queries any
             // Job, and the initialized BOOL output lives for the call.
             (unsafe { IsProcessInJob(current_process, null_mut(), &mut in_job) }) != 0
                 && in_job != 0
         });
+        emit_containment_stage(0x200E);
         let mitigation_policy_matches = containment_check(0x200E, mitigation_policy_matches);
 
         let failure_code = [
@@ -4496,6 +4527,7 @@ mod feasibility {
         if failure_code != 0 {
             emit_containment_failure(failure_code);
         }
+        emit_containment_stage(0x3000);
         if !write_containment_frame(CONTAINMENT_READY) {
             emit_containment_failure(0x4001);
         }
