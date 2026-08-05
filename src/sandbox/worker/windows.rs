@@ -4072,9 +4072,9 @@ mod feasibility {
             return Err(0x2101);
         }
         let token =
-            WinHandle::from_created(raw_token, "own LPAC child token").map_err(|_| 0x2101)?;
+            WinHandle::from_created(raw_token, "own LPAC child token").map_err(|_| 0x2101u16)?;
         if token_u32(token.raw(), TokenIsAppContainer, "read TokenIsAppContainer")
-            .map_err(|_| 0x2102)?
+            .map_err(|_| 0x2102u16)?
             != 1
         {
             return Err(0x2102);
@@ -4084,7 +4084,7 @@ mod feasibility {
             TokenIsLessPrivilegedAppContainer,
             "read TokenIsLessPrivilegedAppContainer",
         )
-        .map_err(|_| 0x2103)?
+        .map_err(|_| 0x2103u16)?
             != 1
         {
             return Err(0x2103);
@@ -4202,7 +4202,7 @@ mod feasibility {
     pub(super) fn attest_containment(
         _probe: &crate::extras::js::protocol::ContainmentProbe,
     ) -> bool {
-        child_token_is_zero_capability_lpac().unwrap_or(false)
+        child_token_is_zero_capability_lpac().is_ok()
             && exact_protocol_std_handles()
             && no_console_devices()
     }
@@ -4598,7 +4598,7 @@ mod feasibility {
             // SAFETY: GetLastError has no pointer or ownership effects and is
             // read immediately after the failed handle query.
             && unsafe { GetLastError() } == ERROR_INVALID_HANDLE;
-        let token_is_lpac = child_token_is_zero_capability_lpac().unwrap_or(false);
+        let token_is_lpac = child_token_is_zero_capability_lpac().is_ok();
         let detached = no_console_devices();
         let protocol_handles = exact_protocol_std_handles();
         let frame = if denied && canary_excluded && token_is_lpac && detached && protocol_handles {
