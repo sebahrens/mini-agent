@@ -293,13 +293,14 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "CONTAINMENT_FAILURE_PREFIX",
         "failed closed checks code=",
         ".windows(CONTAINMENT_FAILURE_PREFIX.len())",
-        "let _ = failure_stream.flush()",
+        "write_containment_frame",
+        "WriteFile(",
         "child_exit_code=",
         "exit_deadline",
         "std::process::exit(0x1_0000 | i32::from(code))",
         "emit_containment_failure(0x8001)",
         "emit_containment_failure(0x4001)",
-        "emit_containment_failure(0x4002)",
+        "std::thread::sleep(Duration::from_secs(60))",
     ] {
         assert!(
             source.contains(required),

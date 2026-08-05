@@ -447,8 +447,6 @@ mod feasibility {
         WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid, WinBuiltinUsersSid,
         WinLocalSystemSid, WinWorldSid,
     };
-    #[cfg(test)]
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS,
         FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
@@ -456,6 +454,8 @@ mod feasibility {
         FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, GetDriveTypeW, OPEN_EXISTING,
         WRITE_DAC, WRITE_OWNER,
     };
+    #[cfg(test)]
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, WriteFile};
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::System::Console::{
         GetConsoleCP, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
@@ -4301,16 +4301,31 @@ mod feasibility {
     }
 
     #[cfg(test)]
+    fn write_containment_frame(frame: &[u8]) -> bool {
+        let Ok(length) = u32::try_from(frame.len()) else {
+            return false;
+        };
+        // SAFETY: GetStdHandle returns a borrowed process handle and has no pointer arguments.
+        let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        if output.is_null() || output == (-1isize as HANDLE) {
+            return false;
+        }
+        let mut written = 0u32;
+        // SAFETY: `frame` remains live for the synchronous write, `written` is an initialized
+        // output slot, the exact inherited pipe handle is borrowed, and no OVERLAPPED is used.
+        let result = unsafe { WriteFile(output, frame.as_ptr(), length, &mut written, null_mut()) };
+        result != 0 && written as usize == frame.len()
+    }
+
+    #[cfg(test)]
     fn emit_containment_failure(code: u16) -> ! {
-        let mut failure_stream = std::io::stdout().lock();
-        let _ = writeln!(
-            failure_stream,
-            "{}{:04X}",
+        let frame = format!(
+            "{}{:04X}\n",
             std::str::from_utf8(CONTAINMENT_FAILURE_PREFIX)
                 .expect("containment failure prefix is ASCII"),
             code
         );
-        let _ = failure_stream.flush();
+        let _ = write_containment_frame(frame.as_bytes());
         std::process::exit(0x1_0000 | i32::from(code));
     }
 
@@ -4427,20 +4442,12 @@ mod feasibility {
         if failure_code != 0 {
             return emit_containment_failure(failure_code);
         }
-        let mut ready_stream = std::io::stdout().lock();
-        if ready_stream.write_all(CONTAINMENT_READY).is_err() {
-            drop(ready_stream);
+        if !write_containment_frame(CONTAINMENT_READY) {
             emit_containment_failure(0x4001);
         }
-        if ready_stream.flush().is_err() {
-            drop(ready_stream);
-            emit_containment_failure(0x4002);
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
         }
-        drop(ready_stream);
-        std::thread::park_timeout(Duration::from_secs(30));
-        Err(io::Error::other(
-            "Windows containment Job did not terminate the probe child",
-        ))
     }
 
     pub(super) fn run_child() {
