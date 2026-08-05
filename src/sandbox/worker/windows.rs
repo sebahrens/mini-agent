@@ -528,6 +528,8 @@ mod feasibility {
         "extras::js::tests::worker_runtime::worker_bootstrap_test_child";
     const CONTAINMENT_MARKER_VALUE: &str = "windows-containment-probe-v1";
     const CONTAINMENT_READY: &[u8] = b"MINI_AGENT_WINDOWS_CONTAINMENT_PASS_V1\n";
+    #[cfg(test)]
+    const CONTAINMENT_FAILURE_PREFIX: &[u8] = b"MINI_AGENT_WINDOWS_CONTAINMENT_FAIL_V1:";
     const PROBE_WORKSPACE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_WORKSPACE";
     const PROBE_SKILL_DATABASE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE";
     const PROBE_FILE_HANDLE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE";
@@ -3619,6 +3621,16 @@ mod feasibility {
                     "Windows containment readiness preamble exceeded 64 KiB".to_string(),
                 ));
             }
+            if let Some(code) = line
+                .strip_prefix(CONTAINMENT_FAILURE_PREFIX)
+                .and_then(|value| value.strip_suffix(b"\n"))
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| u16::from_str_radix(value, 16).ok())
+            {
+                return Err(GateError(format!(
+                    "Windows containment child failed closed checks code={code:04X}"
+                )));
+            }
             if line
                 .windows(CONTAINMENT_READY.len())
                 .any(|window| window == CONTAINMENT_READY)
@@ -4334,21 +4346,38 @@ mod feasibility {
                 && in_job != 0;
         let mitigation_policy_matches = mitigation_policy_matches();
 
-        let passed = workspace_read_denied
-            && workspace_write_denied
-            && skill_database_read_denied
-            && skill_database_write_denied
-            && credential_environment_absent
-            && network_denied
-            && child_process_denied
-            && unlisted_file_handle_denied
-            && unlisted_socket_handle_denied
-            && protocol_handles_exact
-            && token_is_zero_capability_lpac
-            && no_console
-            && creation_time_job_membership
-            && mitigation_policy_matches;
-        if !passed {
+        let failure_code = [
+            workspace_read_denied,
+            workspace_write_denied,
+            skill_database_read_denied,
+            skill_database_write_denied,
+            credential_environment_absent,
+            network_denied,
+            child_process_denied,
+            unlisted_file_handle_denied,
+            unlisted_socket_handle_denied,
+            protocol_handles_exact,
+            token_is_zero_capability_lpac,
+            no_console,
+            creation_time_job_membership,
+            mitigation_policy_matches,
+        ]
+        .into_iter()
+        .enumerate()
+        .fold(
+            0u16,
+            |code, (index, passed)| {
+                if passed { code } else { code | (1u16 << index) }
+            },
+        );
+        if failure_code != 0 {
+            writeln!(
+                std::io::stdout().lock(),
+                "{}{:04X}",
+                std::str::from_utf8(CONTAINMENT_FAILURE_PREFIX)
+                    .expect("containment failure prefix is ASCII"),
+                failure_code
+            )?;
             return Err(io::Error::other("Windows containment child probe failed"));
         }
         std::io::stdout().lock().write_all(CONTAINMENT_READY)?;
