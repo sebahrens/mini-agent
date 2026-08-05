@@ -92,6 +92,14 @@ use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 const HELPER_ARG: &str = "--mini-agent-windows-sandbox-helper-v1";
 const PROBE_ARG: &str = "--mini-agent-windows-sandbox-runtime-check";
 const PARENT_PROBE_ARG: &str = "--mini-agent-windows-sandbox-parent-probe";
+const TARGET_PROBE_ARG: &str = "--mini-agent-windows-sandbox-target-probe";
+const TARGET_BOUNDARY_ARG: &str = "boundary";
+const TARGET_CONFIGURED_ARG: &str = "configured";
+const TARGET_NOOP_ARG: &str = "noop";
+const TARGET_SLEEP_ARG: &str = "sleep";
+const TARGET_WRITE_ARG: &str = "write";
+const TARGET_PARENT_ARG: &str = "parent";
+const TARGET_DESCENDANT_ARG: &str = "descendant";
 const AUTHORITY_PROBE_ARG: &str = "--mini-agent-windows-sandbox-authority-probe";
 const DESCENDANT_PROBE_ARG: &str = "--mini-agent-windows-appcontainer-descendant-probe";
 const HELPER_PID_PLACEHOLDER: &str = "helper-pid";
@@ -753,6 +761,9 @@ pub(crate) fn maybe_run_from_args() -> Option<i32> {
                 1
             }))
         }
+        Some(value) if value == OsStr::new(TARGET_PROBE_ARG) => {
+            Some(run_target_probe(args).unwrap_or(96))
+        }
         Some(value) if value == OsStr::new(AUTHORITY_PROBE_ARG) => {
             Some(run_authority_probe(args).unwrap_or(97))
         }
@@ -760,6 +771,107 @@ pub(crate) fn maybe_run_from_args() -> Option<i32> {
             Some(run_descendant_probe(args).unwrap_or(98))
         }
         _ => None,
+    }
+}
+
+fn target_probe_path(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    label: &str,
+) -> Result<PathBuf, String> {
+    args.next()
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("missing Windows sandbox target-probe {label}"))
+}
+
+fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
+    let operation = args
+        .next()
+        .ok_or("missing Windows sandbox target-probe operation")?;
+    match operation.as_os_str() {
+        value if value == OsStr::new(TARGET_BOUNDARY_ARG) => {
+            let inside = target_probe_path(&mut args, "inside path")?;
+            let readable = target_probe_path(&mut args, "readable path")?;
+            let denied_read = target_probe_path(&mut args, "denied-read path")?;
+            let denied_write = target_probe_path(&mut args, "denied-write path")?;
+            std::fs::write(inside, b"inside").map_err(|error| error.to_string())?;
+            if std::fs::read(readable).map_err(|error| error.to_string())? != b"cache-readable" {
+                return Ok(40);
+            }
+            if std::fs::read(denied_read).is_ok() {
+                return Ok(41);
+            }
+            Ok(if std::fs::write(denied_write, b"outside").is_ok() {
+                42
+            } else {
+                0
+            })
+        }
+        value if value == OsStr::new(TARGET_CONFIGURED_ARG) => {
+            let readable = target_probe_path(&mut args, "configured read path")?;
+            let tool = target_probe_path(&mut args, "configured tool path")?;
+            let writable = target_probe_path(&mut args, "configured write path")?;
+            if std::fs::read(readable).map_err(|error| error.to_string())? != b"configured-read" {
+                return Ok(51);
+            }
+            if !Command::new(tool)
+                .args(["/c", "exit", "0"])
+                .status_guarded()
+                .map_err(|error| error.to_string())?
+                .success()
+            {
+                return Ok(52);
+            }
+            std::fs::write(writable, b"configured-write").map_err(|error| error.to_string())?;
+            Ok(0)
+        }
+        value if value == OsStr::new(TARGET_NOOP_ARG) => Ok(0),
+        value if value == OsStr::new(TARGET_SLEEP_ARG) => {
+            let seconds = args
+                .next()
+                .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
+                .ok_or("invalid Windows sandbox target-probe sleep duration")?;
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            Ok(0)
+        }
+        value if value == OsStr::new(TARGET_WRITE_ARG) => {
+            let path = target_probe_path(&mut args, "write path")?;
+            std::fs::write(path, b"concurrent").map_err(|error| error.to_string())?;
+            Ok(0)
+        }
+        value if value == OsStr::new(TARGET_PARENT_ARG) => {
+            let tree_ready = target_probe_path(&mut args, "tree-ready path")?;
+            let marker = target_probe_path(&mut args, "parent-death marker")?;
+            let mut child = Command::new(
+                std::env::current_exe()
+                    .map_err(|error| format!("locate target-probe executable: {error}"))?,
+            );
+            child
+                .arg(TARGET_PROBE_ARG)
+                .arg(TARGET_DESCENDANT_ARG)
+                .arg(tree_ready)
+                .arg(marker)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            child
+                .spawn_guarded()
+                .map_err(|error| format!("spawn target-probe descendant: {error}"))?;
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            Ok(0)
+        }
+        value if value == OsStr::new(TARGET_DESCENDANT_ARG) => {
+            let tree_ready = target_probe_path(&mut args, "tree-ready path")?;
+            let marker = target_probe_path(&mut args, "parent-death marker")?;
+            let mut ready = File::create(tree_ready).map_err(|error| error.to_string())?;
+            ready
+                .write_all(b"TARGET_READY\n")
+                .and_then(|()| ready.sync_all())
+                .map_err(|error| error.to_string())?;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::fs::write(marker, b"leaked").map_err(|error| error.to_string())?;
+            Ok(0)
+        }
+        _ => Err("unknown Windows sandbox target-probe operation".into()),
     }
 }
 
@@ -2582,27 +2694,20 @@ fn run_runtime_probe() -> Result<i32, String> {
     let cache_fixture = cache.join("read-only-cache.txt");
     std::fs::write(&outside_secret, b"outside-secret").map_err(|e| e.to_string())?;
     std::fs::write(&cache_fixture, b"cache-readable").map_err(|e| e.to_string())?;
-    let script = format!(
-        "$ErrorActionPreference='Stop'; Set-Content -LiteralPath {} -Value inside; if ((Get-Content -LiteralPath {}).Trim() -ne 'cache-readable') {{ exit 40 }}; try {{ Get-Content -LiteralPath {} | Out-Null; exit 41 }} catch {{}}; try {{ Set-Content -LiteralPath {} -Value outside; exit 42 }} catch {{ exit 0 }}",
-        powershell_literal(&inside_file)?,
-        powershell_literal(&cache_fixture)?,
-        powershell_literal(&outside_secret)?,
-        powershell_literal(&outside_file)?
-    );
-    // Windows PowerShell 5.1 is not AppContainer-compatible: its .NET
-    // Framework startup can fail while initializing ServicePointManager even
-    // after the window-station and desktop ACLs are correct. PowerShell 7.6+
-    // explicitly supports AppContainer hosts, so use the supported shell for
-    // the native containment probe without granting a network capability.
-    let powershell = resolve_program("pwsh.exe", &workspace)?;
+    let probe_executable = canonical_file(
+        &std::env::current_exe().map_err(|error| error.to_string())?,
+        "sandbox target-probe executable",
+    )?;
     let cleanup_ready = workspace.join("cleanup-ready.txt");
     let mut command = build_helper_with_ready(
-        powershell.clone(),
+        probe_executable.clone(),
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            script,
+            TARGET_PROBE_ARG.into(),
+            TARGET_BOUNDARY_ARG.into(),
+            inside_file.to_string_lossy().into_owned(),
+            cache_fixture.to_string_lossy().into_owned(),
+            outside_secret.to_string_lossy().into_owned(),
+            outside_file.to_string_lossy().into_owned(),
         ],
         &workspace,
         &cache,
@@ -2640,7 +2745,10 @@ fn run_runtime_probe() -> Result<i32, String> {
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    attest_completed_cleanup(&cleanup_ready, [&workspace, &cache, powershell.as_path()])?;
+    attest_completed_cleanup(
+        &cleanup_ready,
+        [&workspace, &cache, probe_executable.as_path()],
+    )?;
 
     let configured_tool = resolve_program("cmd.exe", &workspace)?;
     let configured_read = base.join("configured-read");
@@ -2651,19 +2759,14 @@ fn run_runtime_probe() -> Result<i32, String> {
     let configured_output = configured_write.join("output.txt");
     let configured_cleanup_ready = workspace.join("configured-cleanup-ready.txt");
     std::fs::write(&configured_fixture, b"configured-read").map_err(|e| e.to_string())?;
-    let configured_script = format!(
-        "$ErrorActionPreference='Stop'; if ((Get-Content -LiteralPath {}).Trim() -ne 'configured-read') {{ exit 51 }}; & {} /c exit 0; if ($LASTEXITCODE -ne 0) {{ exit 52 }}; Set-Content -LiteralPath {} -Value configured-write",
-        powershell_literal(&configured_fixture)?,
-        powershell_literal(&configured_tool)?,
-        powershell_literal(&configured_output)?,
-    );
     let mut configured_launch = build_helper_with_ready_and_roots(
-        powershell.clone(),
+        probe_executable.clone(),
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            configured_script,
+            TARGET_PROBE_ARG.into(),
+            TARGET_CONFIGURED_ARG.into(),
+            configured_fixture.to_string_lossy().into_owned(),
+            configured_tool.to_string_lossy().into_owned(),
+            configured_output.to_string_lossy().into_owned(),
         ],
         &workspace,
         &cache,
@@ -2686,7 +2789,7 @@ fn run_runtime_probe() -> Result<i32, String> {
         [
             workspace.as_path(),
             cache.as_path(),
-            powershell.as_path(),
+            probe_executable.as_path(),
             configured_read.as_path(),
             configured_write.as_path(),
             configured_tool.as_path(),
@@ -2698,8 +2801,8 @@ fn run_runtime_probe() -> Result<i32, String> {
     std::fs::write(&hardlink_source, b"hardlink").map_err(|e| e.to_string())?;
     std::fs::hard_link(&hardlink_source, &hardlink_alias).map_err(|e| e.to_string())?;
     let mut hardlink = build_helper(
-        powershell.clone(),
-        vec!["-NoProfile".into(), "-Command".into(), "exit 0".into()],
+        probe_executable.clone(),
+        vec![TARGET_PROBE_ARG.into(), TARGET_NOOP_ARG.into()],
         &workspace,
         &cache,
     )?;
@@ -2719,13 +2822,8 @@ fn run_runtime_probe() -> Result<i32, String> {
     let swap_ready = workspace.join("swap-ready.txt");
     std::fs::write(&swap_victim, b"stable").map_err(|e| e.to_string())?;
     let mut swap_command = build_helper_with_ready(
-        powershell.clone(),
-        vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            "Start-Sleep -Seconds 2; exit 0".into(),
-        ],
+        probe_executable.clone(),
+        vec![TARGET_PROBE_ARG.into(), TARGET_SLEEP_ARG.into(), "2".into()],
         &workspace,
         &cache,
         Some(swap_ready.clone()),
@@ -2748,12 +2846,11 @@ fn run_runtime_probe() -> Result<i32, String> {
     }
 
     let mut max_request = build_helper(
-        powershell.clone(),
+        probe_executable.clone(),
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            format!("exit 0; #{}", "x".repeat(18_000)),
+            TARGET_PROBE_ARG.into(),
+            TARGET_NOOP_ARG.into(),
+            "x".repeat(18_000),
         ],
         &workspace,
         &cache,
@@ -2776,30 +2873,22 @@ fn run_runtime_probe() -> Result<i32, String> {
     }
     let concurrent_a = concurrent_root.join("a.txt");
     let concurrent_b = concurrent_root.join("b.txt");
-    let concurrent_script = |path: &Path| -> Result<String, String> {
-        Ok(format!(
-            "Set-Content -LiteralPath {} -Value concurrent",
-            powershell_literal(path)?
-        ))
-    };
     let mut concurrent_a_command = build_helper(
-        powershell.clone(),
+        probe_executable.clone(),
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            concurrent_script(&concurrent_a)?,
+            TARGET_PROBE_ARG.into(),
+            TARGET_WRITE_ARG.into(),
+            concurrent_a.to_string_lossy().into_owned(),
         ],
         &workspace,
         &cache,
     )?;
     let mut concurrent_b_command = build_helper(
-        powershell.clone(),
+        probe_executable.clone(),
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            concurrent_script(&concurrent_b)?,
+            TARGET_PROBE_ARG.into(),
+            TARGET_WRITE_ARG.into(),
+            concurrent_b.to_string_lossy().into_owned(),
         ],
         &workspace,
         &cache,
@@ -2828,12 +2917,11 @@ fn run_runtime_probe() -> Result<i32, String> {
 
     let crash_ready = workspace.join("crash-ready.txt");
     let mut crashed_command = build_helper_with_ready(
-        powershell.clone(),
+        probe_executable.clone(),
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            "Start-Sleep -Seconds 10".into(),
+            TARGET_PROBE_ARG.into(),
+            TARGET_SLEEP_ARG.into(),
+            "10".into(),
         ],
         &workspace,
         &cache,
@@ -2855,18 +2943,15 @@ fn run_runtime_probe() -> Result<i32, String> {
 
     let workspace_b_file = workspace_b.join("inside-b.txt");
     let escaped_a = workspace.join("escaped-from-b.txt");
-    let script_b = format!(
-        "$ErrorActionPreference='Stop'; Set-Content -LiteralPath {} -Value inside; try {{ Set-Content -LiteralPath {} -Value escaped; exit 42 }} catch {{ exit 0 }}",
-        powershell_literal(&workspace_b_file)?,
-        powershell_literal(&escaped_a)?
-    );
     let mut second_launch = build_helper(
-        powershell.clone(),
+        probe_executable.clone(),
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            script_b,
+            TARGET_PROBE_ARG.into(),
+            TARGET_BOUNDARY_ARG.into(),
+            workspace_b_file.to_string_lossy().into_owned(),
+            cache_fixture.to_string_lossy().into_owned(),
+            outside_secret.to_string_lossy().into_owned(),
+            escaped_a.to_string_lossy().into_owned(),
         ],
         &workspace_b,
         &cache,
@@ -2882,7 +2967,8 @@ fn run_runtime_probe() -> Result<i32, String> {
     {
         return Err("a crashed launch SID authorized a later workspace".into());
     }
-    attest_cleanup_proof(&crash_proof, [&workspace, &cache, powershell.as_path()])?;
+    let crash_cleanup_roots = [&workspace, &cache, probe_executable.as_path()];
+    attest_cleanup_proof(&crash_proof, crash_cleanup_roots)?;
 
     let authority_escape = outside.join("authority-escape.txt");
     let mut authority_probe = build_helper(
@@ -3137,23 +3223,17 @@ fn run_parent_probe(marker: Option<&Path>) -> Result<i32, String> {
     let cache = base.join("cache");
     let ready_path = workspace.join("parent-target-ready.txt");
     let tree_ready = workspace.join("parent-tree-ready.txt");
-    let powershell = resolve_program("pwsh.exe", &workspace)?;
-    let child_script = format!(
-        "[System.IO.File]::WriteAllText({}, \"TARGET_READY`n\", [System.Text.UTF8Encoding]::new($false)); Start-Sleep -Seconds 2; Set-Content -LiteralPath {} -Value leaked",
-        powershell_literal(&tree_ready)?,
-        powershell_literal(marker)?
-    );
-    let script = format!(
-        "$exe=(Get-Process -Id $PID).Path; $child={}; $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child)); Start-Process -FilePath $exe -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded) | Out-Null; Start-Sleep -Seconds 10",
-        powershell_literal(Path::new(&child_script))?
-    );
+    let probe_executable = canonical_file(
+        &std::env::current_exe().map_err(|error| error.to_string())?,
+        "parent target-probe executable",
+    )?;
     let mut helper = build_helper_with_ready(
-        powershell,
+        probe_executable,
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            script,
+            TARGET_PROBE_ARG.into(),
+            TARGET_PARENT_ARG.into(),
+            tree_ready.to_string_lossy().into_owned(),
+            marker.to_string_lossy().into_owned(),
         ],
         &workspace,
         &cache,
@@ -3556,13 +3636,6 @@ fn bounded_probe_contents(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
         .read_to_end(&mut contents)
         .ok()?;
     (contents.len() <= max_bytes).then_some(contents)
-}
-
-fn powershell_literal(path: &Path) -> Result<String, String> {
-    let path = path
-        .to_str()
-        .ok_or("PowerShell probe path is not valid Unicode")?;
-    Ok(format!("'{}'", path.replace('\'', "''")))
 }
 
 fn wide_string(value: &str) -> Vec<u16> {

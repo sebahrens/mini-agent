@@ -2720,8 +2720,8 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn run_authority_probe(").next())
             .expect("parent-death probe implementation missing");
-        assert!(parent_probe.contains("[System.IO.File]::WriteAllText"));
-        assert!(parent_probe.contains("'-EncodedCommand'"));
+        assert!(parent_probe.contains("TARGET_PROBE_ARG"));
+        assert!(parent_probe.contains("TARGET_PARENT_ARG"));
         assert!(parent_probe.contains("wait_for_exact_probe_file(&tree_ready)?"));
         assert!(!parent_probe.contains("wait_for_probe_file(&tree_ready)?"));
 
@@ -2745,9 +2745,13 @@ mod sandbox_tests {
             .expect("Windows runtime probe implementation missing");
         assert!(runtime_probe.contains("configured_cleanup_ready"));
         assert!(runtime_probe.contains("build_helper_with_ready_and_roots("));
+        assert!(runtime_probe.contains("probe_executable.clone()"));
+        assert!(!runtime_probe.contains("resolve_program(\"pwsh.exe\""));
+        assert!(!runtime_probe.contains("resolve_program(\"powershell.exe\""));
         assert!(runtime_probe.contains(
             "configured_read.as_path(),\n            configured_write.as_path(),\n            configured_tool.as_path(),"
         ));
+        assert!(!source.contains("fn powershell_literal("));
 
         let journal_root = source
             .split("fn profile_journal_root(")
