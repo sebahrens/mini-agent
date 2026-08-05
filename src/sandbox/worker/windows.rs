@@ -292,6 +292,18 @@ impl WorkerChild {
         }
     }
 
+    fn lpac_all_packages_access_matches(&self) -> Result<(), feasibility::GateError> {
+        match &self.inner {
+            WorkerChildInner::Contained { process, .. } => {
+                feasibility::lpac_all_packages_access_matches(process.raw())
+            }
+            #[cfg(test)]
+            WorkerChildInner::Unconfined(_) => Err(feasibility::GateError(
+                "Windows containment probe received an uncontained child".to_string(),
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn process_observation_for_test(
         &self,
@@ -429,8 +441,9 @@ mod feasibility {
     };
     use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-        GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetEffectiveRightsFromAclW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetEntriesInAclW,
         SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
@@ -438,12 +451,13 @@ mod feasibility {
         DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-        AclSizeInformation, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
-        GetAce, GetAclInformation, GetLengthSid, GetTokenInformation, INHERIT_ONLY_ACE,
-        INHERITED_ACE, IsValidSid, NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenCapabilities, TokenIsAppContainer, TokenIsLessPrivilegedAppContainer, TokenUser,
+        ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AccessCheck,
+        AclSizeInformation, CreateWellKnownSid, DACL_SECURITY_INFORMATION, DuplicateToken,
+        EqualSid, FreeSid, GENERIC_MAPPING, GetAce, GetAclInformation, GetLengthSid,
+        GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE, IsValidSid, NO_INHERITANCE,
+        OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSID, SECURITY_ATTRIBUTES,
+        SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SecurityImpersonation, TOKEN_DUPLICATE,
+        TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenIsAppContainer, TokenUser,
         WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid,
         WinBuiltinUsersSid, WinLocalSystemSid, WinWorldSid,
     };
@@ -478,7 +492,7 @@ mod feasibility {
     use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
     use windows_sys::Win32::System::SystemServices::JOB_OBJECT_UILIMIT_ALL;
     use windows_sys::Win32::System::SystemServices::{
-        PROCESS_MITIGATION_ASLR_POLICY, PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
+        MAXIMUM_ALLOWED, PROCESS_MITIGATION_ASLR_POLICY, PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
         PROCESS_MITIGATION_DYNAMIC_CODE_POLICY, PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY,
         PROCESS_MITIGATION_IMAGE_LOAD_POLICY, PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY,
     };
@@ -3001,6 +3015,7 @@ mod feasibility {
                 ));
             }
             process.process.runtime_controls_match()?;
+            process.process.lpac_all_packages_access_matches()?;
             run_authenticated_round_trip(&mut process, |process| {
                 read_worker_frame_exact_bounded(process, deadline)
             })?;
@@ -3647,6 +3662,7 @@ mod feasibility {
             .map_err(|_| GateError("Windows containment readiness reader panicked".to_string()))?;
 
         process.process.runtime_controls_match()?;
+        process.process.lpac_all_packages_access_matches()?;
         process.process.close_job_for_probe()?;
         let status = wait_for_worker_exit_after_job_close(&mut process)?;
         let job_close_kills_worker = !status.success();
@@ -3842,6 +3858,7 @@ mod feasibility {
     fn run_production_protocol_round_trip(hooks: ProductionLaunchHooks) -> Result<(), GateError> {
         let mut process = launch_production(hooks)?;
         process.process.runtime_controls_match()?;
+        process.process.lpac_all_packages_access_matches()?;
         run_authenticated_round_trip(&mut process, |process| {
             read_worker_frame_bounded(&process.output)
         })?;
@@ -3966,6 +3983,7 @@ mod feasibility {
                 "LPAC process was not created in the requested Job".to_string(),
             ));
         }
+        lpac_all_packages_access_matches(process.raw())?;
 
         let ProtocolPipes {
             parent_input,
@@ -4065,6 +4083,83 @@ mod feasibility {
         Ok(value)
     }
 
+    /// Proves the token's effective LPAC semantics without relying on the optional
+    /// `TokenIsLessPrivilegedAppContainer` information class.  Windows documents LPAC as an
+    /// AppContainer that is disregarded by ALL_APPLICATION_PACKAGES; this descriptor makes that
+    /// property observable through the supported access-check API.  It mirrors Chromium's native
+    /// LPAC regression test: a regular AppContainer receives bits 1 and 2, while an LPAC receives
+    /// only the ALL_RESTRICTED_APPLICATION_PACKAGES bit (2).
+    fn lpac_all_packages_access_matches(process: HANDLE) -> Result<(), GateError> {
+        let mut raw_primary = null_mut();
+        // SAFETY: `process` is the live, directly-owned worker process handle. The returned
+        // primary-token handle transfers immediately to WinHandle on success.
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw_primary) }
+            == 0
+        {
+            return Err(last_error("open LPAC worker token for access semantics"));
+        }
+        let primary = WinHandle::from_created(raw_primary, "own LPAC worker primary token")?;
+        let mut raw_impersonation = null_mut();
+        // SAFETY: the primary token has TOKEN_DUPLICATE, and DuplicateToken creates the
+        // impersonation token that AccessCheck requires. Ownership transfers below on success.
+        if unsafe { DuplicateToken(primary.raw(), SecurityImpersonation, &mut raw_impersonation) }
+            == 0
+        {
+            return Err(last_error(
+                "duplicate LPAC worker token for access semantics",
+            ));
+        }
+        let impersonation =
+            WinHandle::from_created(raw_impersonation, "own LPAC worker impersonation token")?;
+
+        let descriptor_sddl =
+            wide_string("O:SYG:SYD:(A;;0x3;;;WD)(A;;0x1;;;AC)(A;;0x2;;;S-1-15-2-2)");
+        let mut raw_descriptor = null_mut();
+        // SAFETY: the SDDL buffer is NUL-terminated and lives through the synchronous parser;
+        // LocalMemory releases the LocalAlloc descriptor after AccessCheck returns.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                descriptor_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut raw_descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("construct LPAC access-semantics descriptor"));
+        }
+        let descriptor = LocalMemory(raw_descriptor);
+        let mapping = GENERIC_MAPPING::default();
+        let mut privilege_set = PRIVILEGE_SET::default();
+        let mut privilege_set_bytes = size_of::<PRIVILEGE_SET>() as u32;
+        let mut granted_access = 0u32;
+        let mut access_status = 0i32;
+        // SAFETY: every input points to initialized storage that remains live for this synchronous
+        // access check. The desired mask contains no generic bits, and the duplicated token is an
+        // impersonation token with TOKEN_QUERY as required by AccessCheck.
+        if unsafe {
+            AccessCheck(
+                descriptor.0,
+                impersonation.raw(),
+                MAXIMUM_ALLOWED,
+                &mapping,
+                &mut privilege_set,
+                &mut privilege_set_bytes,
+                &mut granted_access,
+                &mut access_status,
+            )
+        } == 0
+        {
+            return Err(last_error("evaluate LPAC ALL_APPLICATION_PACKAGES access"));
+        }
+        if access_status == 0 || granted_access != 0x2 {
+            return Err(GateError(format!(
+                "expected LPAC restricted-packages access 0x2, got status={access_status} granted=0x{granted_access:x}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Returns only closed diagnostic codes because this runs inside the contained child.
     fn child_token_is_zero_capability_lpac() -> Result<(), u16> {
         let mut raw_token = null_mut();
@@ -4079,17 +4174,6 @@ mod feasibility {
         {
             return Err(0x2102);
         }
-        if token_u32(
-            token.raw(),
-            TokenIsLessPrivilegedAppContainer,
-            "read TokenIsLessPrivilegedAppContainer",
-        )
-        .map_err(|_| 0x2107u16)?
-            == 0
-        {
-            return Err(0x2103);
-        }
-
         let mut required = 0u32;
         let first = unsafe {
             GetTokenInformation(token.raw(), TokenCapabilities, null_mut(), 0, &mut required)
