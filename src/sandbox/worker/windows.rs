@@ -399,7 +399,7 @@ fn process_exit_status(process: &WinHandle) -> io::Result<ExitStatus> {
 #[allow(dead_code)]
 mod feasibility {
     use super::{WinHandle, WorkerChild, close_unowned_handle};
-    use crate::process_creation::{CreationGuard, StdCommandCreationExt};
+    use crate::process_creation::CreationGuard;
     use crate::sandbox::worker::{
         INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, WorkerBackend, WorkerProcess,
     };
@@ -419,7 +419,7 @@ mod feasibility {
     #[cfg(test)]
     use std::os::windows::io::AsRawSocket;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, ExitStatus};
+    use std::process::ExitStatus;
     use std::ptr::{null, null_mut};
     use std::time::{Duration, Instant};
 
@@ -4319,18 +4319,24 @@ mod feasibility {
 
     #[cfg(test)]
     fn emit_containment_failure(code: u16) -> ! {
-        let frame = format!(
-            "{}{:04X}\n",
-            std::str::from_utf8(CONTAINMENT_FAILURE_PREFIX)
-                .expect("containment failure prefix is ASCII"),
-            code
-        );
+        let frame = format!("MINI_AGENT_WINDOWS_CONTAINMENT_FAIL_V1:{code:04X}\n");
         let _ = write_containment_frame(frame.as_bytes());
         std::process::exit(0x1_0000 | i32::from(code));
     }
 
     #[cfg(test)]
+    fn containment_check(code: u16, check: impl FnOnce() -> bool) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)) {
+            Ok(passed) => passed,
+            Err(_) => emit_containment_failure(code),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn run_containment_child_probe() -> io::Result<()> {
+        // The child reports only fixed failure codes. Suppress Rust's default source-bearing panic
+        // text; `containment_check` converts every ambient probe panic into its closed stage code.
+        std::panic::set_hook(Box::new(|_| {}));
         let Some(workspace) = std::env::var_os(PROBE_WORKSPACE_ENV) else {
             return emit_containment_failure(0x8001);
         };
@@ -4352,46 +4358,56 @@ mod feasibility {
             return emit_containment_failure(0x8004);
         };
 
-        let workspace_read_denied =
-            File::open(&workspace).is_err_and(|error| access_was_denied(&error));
-        let workspace_write_denied = OpenOptions::new()
-            .append(true)
-            .open(&workspace)
-            .is_err_and(|error| access_was_denied(&error));
-        let skill_database_read_denied =
-            File::open(&skill_database).is_err_and(|error| access_was_denied(&error));
-        let skill_database_write_denied = OpenOptions::new()
-            .append(true)
-            .open(&skill_database)
-            .is_err_and(|error| access_was_denied(&error));
-        let credential_environment_absent = [
-            "PATH",
-            "OPENROUTER_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AZURE_CLIENT_SECRET",
-            "GITHUB_TOKEN",
-            "MINI_AGENT_CONFIG",
-            "MINI_AGENT_WORKSPACE",
-        ]
-        .into_iter()
-        .all(|name| std::env::var_os(name).is_none());
+        let workspace_read_denied = containment_check(0x2001, || {
+            File::open(&workspace).is_err_and(|error| access_was_denied(&error))
+        });
+        let workspace_write_denied = containment_check(0x2002, || {
+            OpenOptions::new()
+                .append(true)
+                .open(&workspace)
+                .is_err_and(|error| access_was_denied(&error))
+        });
+        let skill_database_read_denied = containment_check(0x2003, || {
+            File::open(&skill_database).is_err_and(|error| access_was_denied(&error))
+        });
+        let skill_database_write_denied = containment_check(0x2004, || {
+            OpenOptions::new()
+                .append(true)
+                .open(&skill_database)
+                .is_err_and(|error| access_was_denied(&error))
+        });
+        let credential_environment_absent = containment_check(0x2005, || {
+            [
+                "PATH",
+                "OPENROUTER_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AZURE_CLIENT_SECRET",
+                "GITHUB_TOKEN",
+                "MINI_AGENT_CONFIG",
+                "MINI_AGENT_WORKSPACE",
+            ]
+            .into_iter()
+            .all(|name| std::env::var_os(name).is_none())
+        });
 
-        let tcp_address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_port));
-        let tcp_denied = TcpStream::connect_timeout(&tcp_address, Duration::from_secs(2))
-            .is_err_and(|error| access_was_denied(&error));
-        let udp_denied = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
-            Err(error) => access_was_denied(&error),
-            Ok(socket) => socket
-                .send_to(
-                    b"lpac-network-canary",
-                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_port),
-                )
-                .is_err_and(|error| access_was_denied(&error)),
-        };
-        let network_denied = tcp_denied && udp_denied;
+        let network_denied = containment_check(0x2006, || {
+            let tcp_address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_port));
+            let tcp_denied = TcpStream::connect_timeout(&tcp_address, Duration::from_secs(2))
+                .is_err_and(|error| access_was_denied(&error));
+            let udp_denied = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
+                Err(error) => access_was_denied(&error),
+                Ok(socket) => socket
+                    .send_to(
+                        b"lpac-network-canary",
+                        SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_port),
+                    )
+                    .is_err_and(|error| access_was_denied(&error)),
+            };
+            tcp_denied && udp_denied
+        });
 
         // Query the effective native policy instead of deliberately invoking Rust's process
         // launcher under PROCESS_CREATION_CHILD_PROCESS_RESTRICTED. Some Windows runtimes panic
@@ -4402,18 +4418,27 @@ mod feasibility {
         // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle with process lifetime and no
         // ownership obligation.
         let current_process = unsafe { GetCurrentProcess() };
-        let child_process_restriction_effective = child_process_policy_matches(current_process);
-        let unlisted_file_handle_denied = inherited_handle_is_invalid(PROBE_FILE_HANDLE_ENV);
-        let unlisted_socket_handle_denied = inherited_handle_is_invalid(PROBE_SOCKET_HANDLE_ENV);
-        let protocol_handles_exact = exact_protocol_std_handles();
-        let token_is_zero_capability_lpac = child_token_is_zero_capability_lpac().unwrap_or(false);
-        let no_console = no_console_devices();
+        let child_process_restriction_effective =
+            containment_check(0x2007, || child_process_policy_matches(current_process));
+        let unlisted_file_handle_denied = containment_check(0x2008, || {
+            inherited_handle_is_invalid(PROBE_FILE_HANDLE_ENV)
+        });
+        let unlisted_socket_handle_denied = containment_check(0x2009, || {
+            inherited_handle_is_invalid(PROBE_SOCKET_HANDLE_ENV)
+        });
+        let protocol_handles_exact = containment_check(0x200A, exact_protocol_std_handles);
+        let token_is_zero_capability_lpac = containment_check(0x200B, || {
+            child_token_is_zero_capability_lpac().unwrap_or(false)
+        });
+        let no_console = containment_check(0x200C, no_console_devices);
         let mut in_job = 0;
-        // SAFETY: `current_process` is the live borrowed pseudo-handle above, null queries any Job,
-        // and the initialized BOOL output lives for the call.
-        let creation_time_job_membership =
-            unsafe { IsProcessInJob(current_process, null_mut(), &mut in_job) } != 0 && in_job != 0;
-        let mitigation_policy_matches = mitigation_policy_matches();
+        let creation_time_job_membership = containment_check(0x200D, || {
+            // SAFETY: `current_process` is the live borrowed pseudo-handle above, null queries any
+            // Job, and the initialized BOOL output lives for the call.
+            (unsafe { IsProcessInJob(current_process, null_mut(), &mut in_job) }) != 0
+                && in_job != 0
+        });
+        let mitigation_policy_matches = containment_check(0x200E, mitigation_policy_matches);
 
         let failure_code = [
             workspace_read_denied,
@@ -4446,7 +4471,10 @@ mod feasibility {
             emit_containment_failure(0x4001);
         }
         loop {
-            std::thread::sleep(Duration::from_secs(60));
+            containment_check(0x2010, || {
+                std::thread::sleep(Duration::from_secs(60));
+                true
+            });
         }
     }
 
