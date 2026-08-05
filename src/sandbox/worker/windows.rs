@@ -4370,13 +4370,15 @@ mod feasibility {
             },
         );
         if failure_code != 0 {
+            let mut output = std::io::stdout().lock();
             writeln!(
-                std::io::stdout().lock(),
+                output,
                 "{}{:04X}",
                 std::str::from_utf8(CONTAINMENT_FAILURE_PREFIX)
                     .expect("containment failure prefix is ASCII"),
                 failure_code
             )?;
+            output.flush()?;
             return Err(io::Error::other("Windows containment child probe failed"));
         }
         std::io::stdout().lock().write_all(CONTAINMENT_READY)?;

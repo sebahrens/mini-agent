@@ -290,6 +290,9 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "verify_current_user_cannot_modify",
         "snapshot_file_security",
         "protected machine-wide negative-control owner or DACL changed",
+        "CONTAINMENT_FAILURE_PREFIX",
+        "failed closed checks code=",
+        "output.flush()?",
     ] {
         assert!(
             source.contains(required),
