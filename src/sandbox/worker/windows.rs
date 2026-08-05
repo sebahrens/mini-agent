@@ -2293,12 +2293,14 @@ mod feasibility {
     }
 
     impl DisposableArtifact {
+        #[cfg(test)]
         fn copy_into(
             source: &Path,
             source_lock: WinHandle,
             directory: PathBuf,
             destination_expected: InstallLocation,
             probe: ProbeKind,
+            policy: &SidPolicy,
         ) -> Result<Self, GateError> {
             crate::fs::ensure_private_directory(&directory).map_err(|error| {
                 GateError(format!("create private artifact directory: {error}"))
@@ -2314,7 +2316,7 @@ mod feasibility {
                     ))),
                 };
             }
-            if let Err(error) = crate::fs::open_private_file(&executable) {
+            if let Err(error) = repair_hosted_gate_executable(&executable, policy) {
                 let file_cleanup = std::fs::remove_file(&executable);
                 let directory_cleanup = std::fs::remove_dir(&directory);
                 return match file_cleanup.and(directory_cleanup) {
@@ -3327,6 +3329,7 @@ mod feasibility {
                     specification.directory,
                     specification.destination_expected,
                     specification.probe,
+                    &policy,
                 )?;
                 eprintln!(
                     "LPAC artifact destination: {:?}; evidence: {:?}",
@@ -3459,6 +3462,7 @@ mod feasibility {
                 specification.directory,
                 specification.destination_expected,
                 specification.probe,
+                &policy,
             )?;
             let probe = match artifact.probe {
                 ProbeKind::Harness => {
