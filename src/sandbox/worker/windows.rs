@@ -528,7 +528,6 @@ mod feasibility {
         "extras::js::tests::worker_runtime::worker_bootstrap_test_child";
     const CONTAINMENT_MARKER_VALUE: &str = "windows-containment-probe-v1";
     const CONTAINMENT_READY: &[u8] = b"MINI_AGENT_WINDOWS_CONTAINMENT_PASS_V1\n";
-    #[cfg(test)]
     const CONTAINMENT_FAILURE_PREFIX: &[u8] = b"MINI_AGENT_WINDOWS_CONTAINMENT_FAIL_V1:";
     const PROBE_WORKSPACE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_WORKSPACE";
     const PROBE_SKILL_DATABASE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE";
