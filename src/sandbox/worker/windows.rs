@@ -411,8 +411,7 @@ mod feasibility {
     use std::io::{BufRead, BufReader};
     use std::mem::{size_of, size_of_val};
     #[cfg(test)]
-    use std::net::TcpListener;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::AsRawHandle;
@@ -427,6 +426,12 @@ mod feasibility {
         ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, GENERIC_ALL,
         GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, GetLastError, HANDLE,
         LocalFree, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    #[cfg(test)]
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM,
+        SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET_ERROR, WSACleanup, WSADATA, WSAEACCES,
+        WSAGetLastError, WSAStartup, closesocket, connect, sendto, socket,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -4333,29 +4338,94 @@ mod feasibility {
     }
 
     #[cfg(test)]
+    fn winsock_operation_denied(socket_type: i32, protocol: i32, port: u16, udp: bool) -> bool {
+        // SAFETY: Winsock has been initialized by the caller; the returned socket is either the
+        // invalid sentinel or is owned here until the unconditional closesocket below.
+        let socket_handle = unsafe { socket(i32::from(AF_INET), socket_type, protocol) };
+        if socket_handle == INVALID_SOCKET {
+            // SAFETY: WSAGetLastError has no arguments and reads the calling thread's Winsock code.
+            return (unsafe { WSAGetLastError() }) == WSAEACCES;
+        }
+
+        let address = SOCKADDR_IN {
+            sin_family: AF_INET,
+            sin_port: port.to_be(),
+            sin_addr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+            },
+            sin_zero: [0; 8],
+        };
+        let address = (&address as *const SOCKADDR_IN).cast::<SOCKADDR>();
+        let address_length = size_of::<SOCKADDR_IN>() as i32;
+        // SAFETY: `socket_handle` is live, `address` points to an initialized IPv4 sockaddr for
+        // the synchronous call, and the fixed UDP canary remains live when supplied.
+        let result = unsafe {
+            if udp {
+                let canary = b"lpac-network-canary";
+                sendto(
+                    socket_handle,
+                    canary.as_ptr(),
+                    canary.len() as i32,
+                    0,
+                    address,
+                    address_length,
+                )
+            } else {
+                connect(socket_handle, address, address_length)
+            }
+        };
+        let denied = if result == SOCKET_ERROR {
+            // SAFETY: read the operation's thread-local error before closesocket can replace it.
+            (unsafe { WSAGetLastError() }) == WSAEACCES
+        } else {
+            false
+        };
+        // SAFETY: this function exclusively owns the valid socket returned above.
+        let _ = unsafe { closesocket(socket_handle) };
+        denied
+    }
+
+    #[cfg(test)]
+    fn winsock_network_denied(tcp_port: u16, udp_port: u16) -> bool {
+        let mut data = WSADATA::default();
+        // SAFETY: `data` is an initialized writable WSADATA output for the requested Winsock 2.2.
+        let startup = unsafe { WSAStartup(0x0202, &mut data) };
+        if startup != 0 {
+            return startup == WSAEACCES;
+        }
+        let tcp_denied = winsock_operation_denied(SOCK_STREAM, IPPROTO_TCP, tcp_port, false);
+        let udp_denied = winsock_operation_denied(SOCK_DGRAM, IPPROTO_UDP, udp_port, true);
+        // SAFETY: the successful WSAStartup above owns exactly one matching cleanup obligation.
+        let _ = unsafe { WSACleanup() };
+        tcp_denied && udp_denied
+    }
+
+    #[cfg(test)]
     pub(super) fn run_containment_child_probe() -> io::Result<()> {
         // The child reports only fixed failure codes. Suppress Rust's default source-bearing panic
         // text; `containment_check` converts every ambient probe panic into its closed stage code.
         std::panic::set_hook(Box::new(|_| {}));
         let Some(workspace) = std::env::var_os(PROBE_WORKSPACE_ENV) else {
-            return emit_containment_failure(0x8001);
+            emit_containment_failure(0x8001);
         };
         let workspace = PathBuf::from(workspace);
         let Some(skill_database) = std::env::var_os(PROBE_SKILL_DATABASE_ENV) else {
-            return emit_containment_failure(0x8002);
+            emit_containment_failure(0x8002);
         };
         let skill_database = PathBuf::from(skill_database);
         let Some(tcp_port) = std::env::var(PROBE_TCP_PORT_ENV)
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
         else {
-            return emit_containment_failure(0x8003);
+            emit_containment_failure(0x8003);
         };
         let Some(udp_port) = std::env::var(PROBE_UDP_PORT_ENV)
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
         else {
-            return emit_containment_failure(0x8004);
+            emit_containment_failure(0x8004);
         };
 
         let workspace_read_denied = containment_check(0x2001, || {
@@ -4393,21 +4463,11 @@ mod feasibility {
             .all(|name| std::env::var_os(name).is_none())
         });
 
-        let network_denied = containment_check(0x2006, || {
-            let tcp_address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_port));
-            let tcp_denied = TcpStream::connect_timeout(&tcp_address, Duration::from_secs(2))
-                .is_err_and(|error| access_was_denied(&error));
-            let udp_denied = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
-                Err(error) => access_was_denied(&error),
-                Ok(socket) => socket
-                    .send_to(
-                        b"lpac-network-canary",
-                        SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_port),
-                    )
-                    .is_err_and(|error| access_was_denied(&error)),
-            };
-            tcp_denied && udp_denied
-        });
+        // Rust's std networking initialization can panic when a zero-capability AppContainer is
+        // denied Winsock catalog access. Probe Winsock directly so denial remains an ordinary,
+        // source-free WSAEACCES result rather than a libtest panic.
+        let network_denied =
+            containment_check(0x2006, || winsock_network_denied(tcp_port, udp_port));
 
         // Query the effective native policy instead of deliberately invoking Rust's process
         // launcher under PROCESS_CREATION_CHILD_PROCESS_RESTRICTED. Some Windows runtimes panic
@@ -4465,7 +4525,7 @@ mod feasibility {
             },
         );
         if failure_code != 0 {
-            return emit_containment_failure(failure_code);
+            emit_containment_failure(failure_code);
         }
         if !write_containment_frame(CONTAINMENT_READY) {
             emit_containment_failure(0x4001);
