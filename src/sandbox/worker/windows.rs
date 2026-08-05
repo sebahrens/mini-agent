@@ -447,6 +447,8 @@ mod feasibility {
         WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid, WinBuiltinUsersSid,
         WinLocalSystemSid, WinWorldSid,
     };
+    #[cfg(test)]
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS,
         FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
@@ -512,6 +514,8 @@ mod feasibility {
         | (1u64 << 60); // prefer System32 image resolution
     const CHILD_TEST_NAME: &str = "sandbox::worker::platform::tests::windows_lpac_gate_child";
     const INSTALLED_EXE_ENV: &str = "MINI_AGENT_LPAC_CARGO_INSTALL_EXE";
+    #[cfg(test)]
+    const HOSTED_CARGO_ROOT_PREFIX: &str = ".mini-agent-lpac-contained-root-";
     const PROTECTED_EXE_ENV: &str = "MINI_AGENT_LPAC_PROTECTED_EXE";
     const SENTINEL_ENV: &str = "MINI_AGENT_LPAC_SENTINEL";
     const CANARY_HANDLE_ENV: &str = "MINI_AGENT_LPAC_OMITTED_HANDLE";
@@ -1438,12 +1442,22 @@ mod feasibility {
 
     fn supported_root(path: &Path, location: InstallLocation) -> Result<PathBuf, GateError> {
         match location {
-            InstallLocation::CargoInstall => std::env::var_os("CARGO_HOME")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".cargo"))
-                })
-                .ok_or_else(|| GateError("Cargo home is unavailable".to_string())),
+            InstallLocation::CargoInstall => {
+                #[cfg(test)]
+                if let Some(root) = path.ancestors().find(|ancestor| {
+                    ancestor.file_name().is_some_and(|name| {
+                        name.to_string_lossy().starts_with(HOSTED_CARGO_ROOT_PREFIX)
+                    })
+                }) {
+                    return Ok(root.to_path_buf());
+                }
+                std::env::var_os("CARGO_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".cargo"))
+                    })
+                    .ok_or_else(|| GateError("Cargo home is unavailable".to_string()))
+            }
             InstallLocation::CargoBuild => {
                 let mut cursor = path.parent();
                 while let Some(candidate) = cursor {
@@ -2199,6 +2213,28 @@ mod feasibility {
         cleaned: bool,
     }
 
+    #[cfg(test)]
+    pub(super) struct HostedGateInputs {
+        build: PathBuf,
+        installed: PathBuf,
+        root_locks: Vec<WinHandle>,
+        cleanup_files: Vec<PathBuf>,
+        cleanup_directories: Vec<PathBuf>,
+    }
+
+    #[cfg(test)]
+    impl Drop for HostedGateInputs {
+        fn drop(&mut self) {
+            self.root_locks.clear();
+            for file in &self.cleanup_files {
+                let _ = std::fs::remove_file(file);
+            }
+            for directory in &self.cleanup_directories {
+                let _ = std::fs::remove_dir(directory);
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum ArtifactSource {
         Harness,
@@ -2264,7 +2300,7 @@ mod feasibility {
             destination_expected: InstallLocation,
             probe: ProbeKind,
         ) -> Result<Self, GateError> {
-            std::fs::create_dir(&directory).map_err(|error| {
+            crate::fs::ensure_private_directory(&directory).map_err(|error| {
                 GateError(format!("create private artifact directory: {error}"))
             })?;
             let executable = directory.join("mini-agent-lpac-gate.exe");
@@ -2275,6 +2311,18 @@ mod feasibility {
                     ))),
                     Err(cleanup) => Err(GateError(format!(
                         "copy real artifact for LPAC gate: {error}; directory cleanup also failed: {cleanup}"
+                    ))),
+                };
+            }
+            if let Err(error) = crate::fs::open_private_file(&executable) {
+                let file_cleanup = std::fs::remove_file(&executable);
+                let directory_cleanup = std::fs::remove_dir(&directory);
+                return match file_cleanup.and(directory_cleanup) {
+                    Ok(()) => Err(GateError(format!(
+                        "privatize copied LPAC executable: {error}"
+                    ))),
+                    Err(cleanup) => Err(GateError(format!(
+                        "privatize copied LPAC executable: {error}; cleanup also failed: {cleanup}"
                     ))),
                 };
             }
@@ -2326,9 +2374,9 @@ mod feasibility {
         }
     }
 
-    fn artifact_matrix() -> Result<Vec<ArtifactSpec>, GateError> {
-        let build = std::env::current_exe()
-            .map_err(|error| GateError(format!("resolve Cargo build harness: {error}")))?;
+    #[cfg(test)]
+    fn artifact_matrix(hosted: &HostedGateInputs) -> Result<Vec<ArtifactSpec>, GateError> {
+        let build = hosted.build.clone();
         reject_unc_or_remote_syntax(&build)?;
         reject_reparse_components(&build)?;
         let build = std::fs::canonicalize(build)
@@ -2339,13 +2387,7 @@ mod feasibility {
             ));
         }
 
-        let installed = std::env::var_os(INSTALLED_EXE_ENV)
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                GateError(format!(
-                    "{INSTALLED_EXE_ENV} must name a real locked debug install with only the js feature"
-                ))
-            })?;
+        let installed = hosted.installed.clone();
         reject_unc_or_remote_syntax(&installed)?;
         reject_reparse_components(&installed)?;
         let installed = std::fs::canonicalize(installed)
@@ -3108,69 +3150,172 @@ mod feasibility {
         std::sync::atomic::AtomicU32::new(0);
 
     #[cfg(test)]
-    pub(super) fn privatize_hosted_gate_inputs() -> Result<(), GateError> {
-        let policy = SidPolicy::current()?;
-        let mut executables = vec![std::env::current_exe().map_err(|error| {
-            GateError(format!("resolve Windows gate test executable: {error}"))
-        })?];
-        if let Some(installed) = std::env::var_os(INSTALLED_EXE_ENV) {
-            executables.push(PathBuf::from(installed));
+    fn repair_hosted_gate_executable(path: &Path, policy: &SidPolicy) -> Result<(), GateError> {
+        let security = read_file_security(path)?;
+        if !policy.trusted_writer(security.owner) {
+            return Err(GateError(
+                "an untrusted principal owns a Windows gate path".to_string(),
+            ));
         }
-        for executable in executables {
-            let security = read_file_security(&executable)?;
-            if !policy.trusted_writer(security.owner) {
-                return Err(GateError(
-                    "an untrusted principal owns a Windows gate executable".to_string(),
+        if !sid_equal(security.owner, policy.user.as_psid()) {
+            let mut wide_path = wide_null(path.as_os_str())?;
+            let result = unsafe {
+                SetNamedSecurityInfoW(
+                    wide_path.as_mut_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    policy.user.as_psid(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                )
+            };
+            if result != 0 {
+                return Err(win32_error(
+                    "assign Windows gate path to the token user",
+                    result,
                 ));
             }
-            // These are test-owned build/install artifacts whose inherited
-            // hosted-runner ACL is precisely what this setup repairs. Do not
-            // apply the production source-artifact ACL gate before repairing
-            // it: GitHub's build directories intentionally grant Users write
-            // access. Ownership is still restricted to the same trusted
-            // principals as production validation, and open_private_file
-            // reopens the exact non-reparse file, verifies ownership and file
-            // identity, then commits and attests a protected user-only DACL.
-            if !sid_equal(security.owner, policy.user.as_psid()) {
-                let mut path = wide_null(executable.as_os_str())?;
-                // Hosted Windows runners can create Cargo outputs with the
-                // Administrators SID as owner even though the token user owns
-                // the build. This test-only preflight first admits only the
-                // same trusted owners accepted by source validation, then
-                // makes the exact token user the owner before private.rs
-                // applies and attests its user-only DACL.
-                let result = unsafe {
-                    SetNamedSecurityInfoW(
-                        path.as_mut_ptr(),
-                        SE_FILE_OBJECT,
-                        OWNER_SECURITY_INFORMATION,
-                        policy.user.as_psid(),
-                        null_mut(),
-                        null_mut(),
-                        null_mut(),
-                    )
-                };
-                if result != 0 {
-                    return Err(win32_error(
-                        "assign Windows gate executable to the token user",
-                        result,
-                    ));
-                }
-            }
-            drop(crate::fs::open_private_file(&executable).map_err(|error| {
-                GateError(format!(
-                    "apply exact private ACL to Windows gate executable: {error}"
-                ))
-            })?);
         }
+        drop(crate::fs::open_private_file(path).map_err(|error| {
+            GateError(format!(
+                "apply exact private ACL to Windows gate executable: {error}"
+            ))
+        })?);
         Ok(())
     }
 
-    pub(super) fn run_artifact_matrix() -> Result<(), GateError> {
+    #[cfg(test)]
+    fn lock_hosted_gate_root(path: &Path) -> Result<WinHandle, GateError> {
+        let wide_path = wide_null(path.as_os_str())?;
+        WinHandle::from_created(
+            unsafe {
+                CreateFileW(
+                    wide_path.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    null_mut(),
+                )
+            },
+            "lock hosted gate trust root against replacement",
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn privatize_hosted_gate_inputs() -> Result<HostedGateInputs, GateError> {
+        let policy = SidPolicy::current()?;
+        let current = std::env::current_exe()
+            .map_err(|error| GateError(format!("resolve Windows gate test executable: {error}")))?;
+        let installed_source = std::env::var_os(INSTALLED_EXE_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                GateError(format!(
+                    "{INSTALLED_EXE_ENV} must name a real locked debug install with only the js feature"
+                ))
+            })?;
+        reject_unc_or_remote_syntax(&installed_source)?;
+        reject_reparse_components(&installed_source)?;
+        let installed_source = std::fs::canonicalize(installed_source)
+            .map_err(|error| GateError(format!("canonicalize hosted Cargo install: {error}")))?;
+        if classify_install_location(&installed_source) != InstallLocation::CargoInstall
+            || !installed_source
+                .metadata()
+                .map_err(|error| GateError(format!("stat hosted Cargo install: {error}")))?
+                .is_file()
+        {
+            return Err(GateError(format!(
+                "{INSTALLED_EXE_ENV} is not an exact file beneath the active Cargo home"
+            )));
+        }
+        let installed_security = read_file_security(&installed_source)?;
+        if !policy.trusted_writer(installed_security.owner) {
+            return Err(GateError(
+                "an untrusted principal owns the hosted Cargo install".to_string(),
+            ));
+        }
+        let installed_wide = wide_null(installed_source.as_os_str())?;
+        let installed_lock = WinHandle::from_created(
+            unsafe {
+                CreateFileW(
+                    installed_wide.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null_mut(),
+                )
+            },
+            "lock hosted Cargo install while staging",
+        )?;
+        let cargo_home = supported_root(&installed_source, InstallLocation::CargoInstall)?;
+
+        // The production gate must reject broadly writable image-path
+        // ancestors. Hosted checkouts deliberately have such ancestors, so
+        // copy the already-running test harness into a private synthetic Cargo
+        // build tree instead of weakening that production validation.
+        let staging_root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| GateError("LOCALAPPDATA is required for hosted staging".to_string()))?
+            .join("mini-agent")
+            .join("lpac-hosted-inputs")
+            .join(uuid::Uuid::new_v4().to_string());
+        let project_root = staging_root.join("project");
+        let target_root = project_root.join("target");
+        let build_parent = target_root.join("debug");
+        let build = build_parent.join("mini-agent-worker-gate.exe");
+        let installed_root = cargo_home.join(format!(
+            "{HOSTED_CARGO_ROOT_PREFIX}{}",
+            uuid::Uuid::new_v4()
+        ));
+        let installed_parent = installed_root.join("bin");
+        let installed = installed_parent.join("mini-agent.exe");
+        let mut hosted = HostedGateInputs {
+            build: build.clone(),
+            installed: installed.clone(),
+            root_locks: Vec::with_capacity(2),
+            cleanup_files: vec![build.clone(), installed.clone()],
+            cleanup_directories: vec![
+                build_parent.clone(),
+                target_root,
+                project_root.clone(),
+                staging_root,
+                installed_parent.clone(),
+                installed_root.clone(),
+            ],
+        };
+
+        crate::fs::ensure_private_directory(&build_parent).map_err(|error| {
+            GateError(format!("create private hosted Cargo build tree: {error}"))
+        })?;
+        crate::fs::ensure_private_directory(&installed_parent).map_err(|error| {
+            GateError(format!("create private hosted Cargo install tree: {error}"))
+        })?;
+        hosted
+            .root_locks
+            .push(lock_hosted_gate_root(&project_root)?);
+        hosted
+            .root_locks
+            .push(lock_hosted_gate_root(&installed_root)?);
+        std::fs::copy(&current, &build)
+            .map_err(|error| GateError(format!("stage hosted Cargo build harness: {error}")))?;
+        repair_hosted_gate_executable(&build, &policy)?;
+        std::fs::copy(&installed_source, &installed)
+            .map_err(|error| GateError(format!("stage hosted Cargo install artifact: {error}")))?;
+        drop(installed_lock);
+        repair_hosted_gate_executable(&installed, &policy)?;
+        Ok(hosted)
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_artifact_matrix(hosted: &HostedGateInputs) -> Result<(), GateError> {
         let profile = AppContainerProfile::stable_zero_capability()?;
         let result = (|| {
             let policy = SidPolicy::current()?;
-            for specification in artifact_matrix()? {
+            for specification in artifact_matrix(hosted)? {
                 let source_lock = validate_source_artifact(
                     &specification.source,
                     specification.source_expected,
@@ -3296,10 +3441,12 @@ mod feasibility {
     }
 
     #[cfg(test)]
-    pub(super) fn run_production_containment_probe() -> Result<(), GateError> {
+    pub(super) fn run_production_containment_probe(
+        hosted: &HostedGateInputs,
+    ) -> Result<(), GateError> {
         let _nested_parent_job = ensure_compatible_parent_job()?;
 
-        for specification in artifact_matrix()? {
+        for specification in artifact_matrix(hosted)? {
             let policy = SidPolicy::current()?;
             let source_lock = validate_source_artifact(
                 &specification.source,
@@ -4266,16 +4413,18 @@ pub(super) fn attest_containment(probe: &crate::extras::js::protocol::Containmen
 
 #[cfg(test)]
 fn run_lpac_image_loading_gate() -> Result<(), feasibility::GateError> {
-    feasibility::privatize_hosted_gate_inputs()?;
-    feasibility::run_artifact_matrix()
+    let hosted = feasibility::privatize_hosted_gate_inputs()?;
+    feasibility::run_artifact_matrix(&hosted)
 }
 
 #[cfg(test)]
 pub(super) fn run_containment_probe() -> io::Result<()> {
     feasibility::run_protected_install_negative_control()
         .map_err(|error| io::Error::other(error.0))?;
-    feasibility::privatize_hosted_gate_inputs().map_err(|error| io::Error::other(error.0))?;
-    feasibility::run_production_containment_probe().map_err(|error| io::Error::other(error.0))
+    let hosted =
+        feasibility::privatize_hosted_gate_inputs().map_err(|error| io::Error::other(error.0))?;
+    feasibility::run_production_containment_probe(&hosted)
+        .map_err(|error| io::Error::other(error.0))
 }
 
 #[cfg(test)]
