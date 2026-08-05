@@ -3557,6 +3557,14 @@ mod feasibility {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 };
+                if let Some(code) = exit_code
+                    .filter(|code| (0x1_0000..=0x1_FFFF).contains(code))
+                    .map(|code| code - 0x1_0000)
+                {
+                    return Err(GateError(format!(
+                        "Windows containment child failed closed checks code={code:04X}"
+                    )));
+                }
                 return Err(GateError(format!(
                     "{error}; child_exit_code={}",
                     exit_code
@@ -4292,19 +4300,21 @@ mod feasibility {
         Ok(accounting.BasicInfo.ActiveProcesses)
     }
 
-    fn emit_containment_failure(code: u16) -> io::Result<()> {
+    #[cfg(test)]
+    fn emit_containment_failure(code: u16) -> ! {
         let mut failure_stream = std::io::stdout().lock();
-        writeln!(
+        let _ = writeln!(
             failure_stream,
             "{}{:04X}",
             std::str::from_utf8(CONTAINMENT_FAILURE_PREFIX)
                 .expect("containment failure prefix is ASCII"),
             code
-        )?;
-        failure_stream.flush()?;
-        Err(io::Error::other("Windows containment child probe failed"))
+        );
+        let _ = failure_stream.flush();
+        std::process::exit(0x1_0000 | i32::from(code));
     }
 
+    #[cfg(test)]
     pub(super) fn run_containment_child_probe() -> io::Result<()> {
         let Some(workspace) = std::env::var_os(PROBE_WORKSPACE_ENV) else {
             return emit_containment_failure(0x8001);
