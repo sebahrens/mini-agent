@@ -298,6 +298,8 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "exit_deadline",
         "std::process::exit(0x1_0000 | i32::from(code))",
         "emit_containment_failure(0x8001)",
+        "emit_containment_failure(0x4001)",
+        "emit_containment_failure(0x4002)",
     ] {
         assert!(
             source.contains(required),

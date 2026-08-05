@@ -4427,8 +4427,16 @@ mod feasibility {
         if failure_code != 0 {
             return emit_containment_failure(failure_code);
         }
-        std::io::stdout().lock().write_all(CONTAINMENT_READY)?;
-        std::io::stdout().lock().flush()?;
+        let mut ready_stream = std::io::stdout().lock();
+        if ready_stream.write_all(CONTAINMENT_READY).is_err() {
+            drop(ready_stream);
+            emit_containment_failure(0x4001);
+        }
+        if ready_stream.flush().is_err() {
+            drop(ready_stream);
+            emit_containment_failure(0x4002);
+        }
+        drop(ready_stream);
         std::thread::park_timeout(Duration::from_secs(30));
         Err(io::Error::other(
             "Windows containment Job did not terminate the probe child",
