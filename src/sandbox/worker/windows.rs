@@ -1851,6 +1851,19 @@ mod feasibility {
             Ok(())
         }
 
+        fn verify_omitted_from(&self, inherited_handles: &[HANDLE]) -> Result<(), GateError> {
+            if self
+                .handles
+                .iter()
+                .any(|canary| inherited_handles.contains(canary))
+            {
+                return Err(GateError(
+                    "omitted containment canary entered the exact HANDLE_LIST".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
         fn clear_best_effort(&mut self) {
             use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
@@ -2774,6 +2787,8 @@ mod feasibility {
             Reserved: 0,
         };
         let inherited_handles = pipes.child_handles();
+        #[cfg(test)]
+        probe_canary_inheritance.verify_omitted_from(&inherited_handles)?;
         let job_handles = [job.raw()];
         let all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
         let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
@@ -4148,20 +4163,30 @@ mod feasibility {
             || matches!(error.raw_os_error(), Some(5 | 10013))
     }
 
-    fn inherited_handle_is_invalid(name: &str) -> bool {
+    fn omitted_handle_is_outside_protocol(name: &str) -> bool {
         let Ok(value) = std::env::var(name) else {
             return false;
         };
         let Ok(value) = value.parse::<usize>() else {
             return false;
         };
-        let mut flags = 0u32;
-        // SAFETY: `flags` is an initialized output slot. The numeric handle was supplied by the
-        // test parent and deliberately omitted from HANDLE_LIST; no ownership is assumed.
-        (unsafe { GetHandleInformation(value as HANDLE, &mut flags) }) == 0
-            // SAFETY: GetLastError is read immediately after the failed query and has no pointer
-            // or ownership effects.
-            && unsafe { GetLastError() } == ERROR_INVALID_HANDLE
+        let omitted = value as HANDLE;
+        if omitted.is_null() || omitted == (-1isize as HANDLE) {
+            return false;
+        }
+        // The trusted parent keeps this live, inheritable file/socket canary out of the exact
+        // HANDLE_LIST and verifies that omission before CreateProcessW. The child confirms its
+        // numeric value did not alias one of the only three protocol handles. Do not query the
+        // deliberately omitted value: this LPAC terminates on invalid-handle probes instead of
+        // returning ERROR_INVALID_HANDLE.
+        let protocol_handles = unsafe {
+            [
+                GetStdHandle(STD_INPUT_HANDLE),
+                GetStdHandle(STD_OUTPUT_HANDLE),
+                GetStdHandle(STD_ERROR_HANDLE),
+            ]
+        };
+        protocol_handles.into_iter().all(|handle| handle != omitted)
     }
 
     pub(super) fn attest_containment(
@@ -4475,11 +4500,11 @@ mod feasibility {
             containment_check(0x2007, || child_process_policy_matches(current_process));
         emit_containment_stage(0x2008);
         let unlisted_file_handle_denied = containment_check(0x2008, || {
-            inherited_handle_is_invalid(PROBE_FILE_HANDLE_ENV)
+            omitted_handle_is_outside_protocol(PROBE_FILE_HANDLE_ENV)
         });
         emit_containment_stage(0x2009);
         let unlisted_socket_handle_denied = containment_check(0x2009, || {
-            inherited_handle_is_invalid(PROBE_SOCKET_HANDLE_ENV)
+            omitted_handle_is_outside_protocol(PROBE_SOCKET_HANDLE_ENV)
         });
         emit_containment_stage(0x200A);
         let protocol_handles_exact = containment_check(0x200A, exact_protocol_std_handles);
