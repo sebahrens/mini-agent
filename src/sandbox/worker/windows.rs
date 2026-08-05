@@ -4399,18 +4399,20 @@ mod feasibility {
         // containment control into an unclassified libtest exit. The trusted parent separately
         // verifies this same policy, exact creation-time Job membership, active-process limit one,
         // and exactly one active process before it accepts the child's readiness frame.
-        let child_process_restriction_effective = child_process_policy_matches(GetCurrentProcess());
+        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle with process lifetime and no
+        // ownership obligation.
+        let current_process = unsafe { GetCurrentProcess() };
+        let child_process_restriction_effective = child_process_policy_matches(current_process);
         let unlisted_file_handle_denied = inherited_handle_is_invalid(PROBE_FILE_HANDLE_ENV);
         let unlisted_socket_handle_denied = inherited_handle_is_invalid(PROBE_SOCKET_HANDLE_ENV);
         let protocol_handles_exact = exact_protocol_std_handles();
         let token_is_zero_capability_lpac = child_token_is_zero_capability_lpac().unwrap_or(false);
         let no_console = no_console_devices();
         let mut in_job = 0;
-        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle, null queries any Job, and
-        // the initialized BOOL output lives for the call.
+        // SAFETY: `current_process` is the live borrowed pseudo-handle above, null queries any Job,
+        // and the initialized BOOL output lives for the call.
         let creation_time_job_membership =
-            unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } != 0
-                && in_job != 0;
+            unsafe { IsProcessInJob(current_process, null_mut(), &mut in_job) } != 0 && in_job != 0;
         let mitigation_policy_matches = mitigation_policy_matches();
 
         let failure_code = [
