@@ -3188,7 +3188,7 @@ mod feasibility {
     #[cfg(test)]
     fn lock_hosted_gate_root(path: &Path) -> Result<WinHandle, GateError> {
         let wide_path = wide_null(path.as_os_str())?;
-        WinHandle::from_created(
+        Ok(WinHandle::from_created(
             unsafe {
                 CreateFileW(
                     wide_path.as_ptr(),
@@ -3201,7 +3201,7 @@ mod feasibility {
                 )
             },
             "lock hosted gate trust root against replacement",
-        )
+        )?)
     }
 
     #[cfg(test)]
