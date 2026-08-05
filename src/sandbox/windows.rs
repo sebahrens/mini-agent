@@ -2833,7 +2833,7 @@ fn run_runtime_probe() -> Result<i32, String> {
         vec![
             TARGET_PROBE_ARG.into(),
             TARGET_WAIT_FOR_FILE_ARG.into(),
-            swap_release.clone().into_os_string(),
+            swap_release.to_string_lossy().into_owned(),
         ],
         &workspace,
         &cache,
