@@ -292,18 +292,6 @@ impl WorkerChild {
         }
     }
 
-    fn lpac_all_packages_access_matches(&self) -> Result<(), feasibility::GateError> {
-        match &self.inner {
-            WorkerChildInner::Contained { process, .. } => {
-                feasibility::lpac_all_packages_access_matches(process.raw())
-            }
-            #[cfg(test)]
-            WorkerChildInner::Unconfined(_) => Err(feasibility::GateError(
-                "Windows containment probe received an uncontained child".to_string(),
-            )),
-        }
-    }
-
     #[cfg(test)]
     pub(super) fn process_observation_for_test(
         &self,
@@ -2928,6 +2916,7 @@ mod feasibility {
                 "LPAC worker escaped its requested creation-time Job".to_string(),
             ));
         }
+        lpac_all_packages_access_matches(process.raw())?;
 
         let ProtocolPipes {
             parent_input,
@@ -3015,7 +3004,6 @@ mod feasibility {
                 ));
             }
             process.process.runtime_controls_match()?;
-            process.process.lpac_all_packages_access_matches()?;
             run_authenticated_round_trip(&mut process, |process| {
                 read_worker_frame_exact_bounded(process, deadline)
             })?;
@@ -3662,7 +3650,6 @@ mod feasibility {
             .map_err(|_| GateError("Windows containment readiness reader panicked".to_string()))?;
 
         process.process.runtime_controls_match()?;
-        process.process.lpac_all_packages_access_matches()?;
         process.process.close_job_for_probe()?;
         let status = wait_for_worker_exit_after_job_close(&mut process)?;
         let job_close_kills_worker = !status.success();
@@ -3858,7 +3845,6 @@ mod feasibility {
     fn run_production_protocol_round_trip(hooks: ProductionLaunchHooks) -> Result<(), GateError> {
         let mut process = launch_production(hooks)?;
         process.process.runtime_controls_match()?;
-        process.process.lpac_all_packages_access_matches()?;
         run_authenticated_round_trip(&mut process, |process| {
             read_worker_frame_bounded(&process.output)
         })?;
