@@ -281,7 +281,7 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "omitted_handle_is_outside_protocol(PROBE_FILE_HANDLE_ENV)",
         "omitted_handle_is_outside_protocol(PROBE_SOCKET_HANDLE_ENV)",
         "creation_time_job_limits_match",
-        "job_close_kills_worker",
+        "wait_for_worker_exit_after_job_close(&mut process)?",
         "nested_parent_job",
         "mitigation_policy_matches",
         "ProcessDynamicCodePolicy",

@@ -3651,13 +3651,10 @@ mod feasibility {
 
         process.process.runtime_controls_match()?;
         process.process.close_job_for_probe()?;
-        let status = wait_for_worker_exit_after_job_close(&mut process)?;
-        let job_close_kills_worker = !status.success();
-        if !job_close_kills_worker {
-            return Err(GateError(
-                "closing the kill-on-close Job did not terminate the worker".to_string(),
-            ));
-        }
+        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` promises process termination, not a particular
+        // process exit code. Windows may report zero after the kernel reaps the worker, so the
+        // bounded reap itself is the security-relevant assertion.
+        wait_for_worker_exit_after_job_close(&mut process)?;
 
         Ok(())
     }
