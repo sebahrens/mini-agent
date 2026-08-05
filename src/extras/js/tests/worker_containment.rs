@@ -316,9 +316,10 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "containment_check(0x200E",
         "containment_check(0x2010",
         "std::panic::set_hook(Box::new(|_| {}))",
-        "winsock_network_denied(tcp_port, udp_port)",
-        "WSAStartup(0x0202, &mut data)",
-        "unsafe { WSAGetLastError() }) == WSAEACCES",
+        "ensure_appcontainer_network_isolated(profile.sid)?",
+        "NetworkIsolationGetAppContainerConfig(&mut count, &mut entries)",
+        "zero-capability AppContainer has a loopback exemption",
+        "std::env::var(PROBE_NETWORK_POLICY_ENV).as_deref()",
         "std::thread::sleep(Duration::from_secs(60))",
     ] {
         assert!(

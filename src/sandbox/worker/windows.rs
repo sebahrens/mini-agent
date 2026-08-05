@@ -411,7 +411,7 @@ mod feasibility {
     use std::io::{BufRead, BufReader};
     use std::mem::{size_of, size_of_val};
     #[cfg(test)]
-    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+    use std::net::{Ipv4Addr, TcpListener};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::AsRawHandle;
@@ -427,12 +427,7 @@ mod feasibility {
         GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, GetLastError, HANDLE,
         LocalFree, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
-    #[cfg(test)]
-    use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM,
-        SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET_ERROR, WSACleanup, WSADATA, WSAEACCES,
-        WSAGetLastError, WSAStartup, closesocket, connect, sendto, socket,
-    };
+    use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
         GetEffectiveRightsFromAclW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
@@ -447,10 +442,10 @@ mod feasibility {
         AclSizeInformation, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
         GetAce, GetAclInformation, GetLengthSid, GetTokenInformation, INHERIT_ONLY_ACE,
         INHERITED_ACE, IsValidSid, NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, TOKEN_QUERY, TOKEN_USER, TokenCapabilities,
-        TokenIsAppContainer, TokenIsLessPrivilegedAppContainer, TokenUser, WinAuthenticatedUserSid,
-        WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid, WinBuiltinUsersSid,
-        WinLocalSystemSid, WinWorldSid,
+        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        TokenCapabilities, TokenIsAppContainer, TokenIsLessPrivilegedAppContainer, TokenUser,
+        WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid,
+        WinBuiltinUsersSid, WinLocalSystemSid, WinWorldSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS,
@@ -538,8 +533,8 @@ mod feasibility {
     const PROBE_SKILL_DATABASE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_SKILL_DATABASE";
     const PROBE_FILE_HANDLE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_FILE_HANDLE";
     const PROBE_SOCKET_HANDLE_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_SOCKET_HANDLE";
-    const PROBE_TCP_PORT_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_TCP_PORT";
-    const PROBE_UDP_PORT_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_UDP_PORT";
+    const PROBE_NETWORK_POLICY_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY";
+    const PROBE_NETWORK_POLICY_VALUE: &str = "zero-capability-no-loopback-v1";
     const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
     const PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
     const PRODUCTION_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -572,6 +567,65 @@ mod feasibility {
             "{context}: {}",
             io::Error::from_raw_os_error(code as i32)
         ))
+    }
+
+    fn ensure_appcontainer_network_isolated(appcontainer_sid: PSID) -> Result<(), GateError> {
+        let mut count = 0u32;
+        let mut entries: *mut SID_AND_ATTRIBUTES = null_mut();
+        // SAFETY: both output slots are initialized and writable. On success, Windows allocates
+        // `count` entries and their SIDs from the process heap; all are released below exactly as
+        // documented by NetworkIsolationGetAppContainerConfig.
+        let result = unsafe { NetworkIsolationGetAppContainerConfig(&mut count, &mut entries) };
+        if result != 0 {
+            return Err(win32_error(
+                "query AppContainer loopback exemptions",
+                result,
+            ));
+        }
+        if count != 0 && entries.is_null() {
+            return Err(GateError(
+                "AppContainer loopback exemption query returned a null list".to_string(),
+            ));
+        }
+
+        let entry_count = count as usize;
+        // SAFETY: the successful API call returned either a null zero-length list or exactly
+        // `entry_count` initialized SID_AND_ATTRIBUTES entries.
+        let exempt = if entry_count == 0 {
+            false
+        } else {
+            unsafe { std::slice::from_raw_parts(entries, entry_count) }
+                .iter()
+                .any(|entry| {
+                    !entry.Sid.is_null()
+                        // SAFETY: both values are valid SIDs for the synchronous comparison.
+                        && unsafe { EqualSid(entry.Sid, appcontainer_sid) } != 0
+                })
+        };
+
+        let heap = unsafe { GetProcessHeap() };
+        let mut cleanup_failed = false;
+        if !entries.is_null() {
+            // SAFETY: each non-null SID and then the containing list are the process-heap
+            // allocations returned by the successful query, each freed exactly once.
+            for entry in unsafe { std::slice::from_raw_parts(entries, entry_count) } {
+                if !entry.Sid.is_null() && unsafe { HeapFree(heap, 0, entry.Sid) } == 0 {
+                    cleanup_failed = true;
+                }
+            }
+            if unsafe { HeapFree(heap, 0, entries.cast()) } == 0 {
+                cleanup_failed = true;
+            }
+        }
+        if cleanup_failed {
+            return Err(last_error("free AppContainer loopback exemption list"));
+        }
+        if exempt {
+            return Err(GateError(
+                "zero-capability AppContainer has a loopback exemption".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn hresult_error(context: &str, result: i32) -> GateError {
@@ -1721,8 +1775,6 @@ mod feasibility {
         socket_handle: HANDLE,
         file_canary: Option<File>,
         socket_canary: Option<TcpListener>,
-        tcp_port: u16,
-        udp_port: u16,
     }
 
     #[cfg(test)]
@@ -2629,8 +2681,10 @@ mod feasibility {
                     PROBE_SOCKET_HANDLE_ENV,
                     (probe.socket_handle as usize).to_string(),
                 ),
-                (PROBE_TCP_PORT_ENV, probe.tcp_port.to_string()),
-                (PROBE_UDP_PORT_ENV, probe.udp_port.to_string()),
+                (
+                    PROBE_NETWORK_POLICY_ENV,
+                    PROBE_NETWORK_POLICY_VALUE.to_string(),
+                ),
             ] {
                 if value.contains('\0') || value.contains('=') {
                     return Err(GateError(format!(
@@ -2699,6 +2753,7 @@ mod feasibility {
         let mut hooks = hooks;
         hooks.checkpoint(ProductionFailurePoint::CreateProfile)?;
         let profile = AppContainerProfile::production_zero_capability()?;
+        ensure_appcontainer_network_isolated(profile.sid)?;
         hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
         let executable = production_executable(&hooks)?;
         let policy = SidPolicy::current()?;
@@ -3508,16 +3563,6 @@ mod feasibility {
             .map_err(|error| GateError(format!("open omitted file-handle canary: {error}")))?;
         let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|error| GateError(format!("bind TCP denial canary: {error}")))?;
-        let udp_listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .map_err(|error| GateError(format!("bind UDP denial canary: {error}")))?;
-        let tcp_port = tcp_listener
-            .local_addr()
-            .map_err(|error| GateError(format!("read TCP denial port: {error}")))?
-            .port();
-        let udp_port = udp_listener
-            .local_addr()
-            .map_err(|error| GateError(format!("read UDP denial port: {error}")))?
-            .port();
         let configuration = ContainmentProbeConfiguration {
             workspace: workspace.0.clone(),
             skill_database: skill_database.0.clone(),
@@ -3525,8 +3570,6 @@ mod feasibility {
             socket_handle: tcp_listener.as_raw_socket() as HANDLE,
             file_canary: Some(file_canary),
             socket_canary: Some(tcp_listener),
-            tcp_port,
-            udp_port,
         };
 
         let mut process = launch_production(ProductionLaunchHooks::containment(
@@ -4338,71 +4381,6 @@ mod feasibility {
     }
 
     #[cfg(test)]
-    fn winsock_operation_denied(socket_type: i32, protocol: i32, port: u16, udp: bool) -> bool {
-        // SAFETY: Winsock has been initialized by the caller; the returned socket is either the
-        // invalid sentinel or is owned here until the unconditional closesocket below.
-        let socket_handle = unsafe { socket(i32::from(AF_INET), socket_type, protocol) };
-        if socket_handle == INVALID_SOCKET {
-            // SAFETY: WSAGetLastError has no arguments and reads the calling thread's Winsock code.
-            return (unsafe { WSAGetLastError() }) == WSAEACCES;
-        }
-
-        let address = SOCKADDR_IN {
-            sin_family: AF_INET,
-            sin_port: port.to_be(),
-            sin_addr: IN_ADDR {
-                S_un: IN_ADDR_0 {
-                    S_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-                },
-            },
-            sin_zero: [0; 8],
-        };
-        let address = (&address as *const SOCKADDR_IN).cast::<SOCKADDR>();
-        let address_length = size_of::<SOCKADDR_IN>() as i32;
-        // SAFETY: `socket_handle` is live, `address` points to an initialized IPv4 sockaddr for
-        // the synchronous call, and the fixed UDP canary remains live when supplied.
-        let result = unsafe {
-            if udp {
-                let canary = b"lpac-network-canary";
-                sendto(
-                    socket_handle,
-                    canary.as_ptr(),
-                    canary.len() as i32,
-                    0,
-                    address,
-                    address_length,
-                )
-            } else {
-                connect(socket_handle, address, address_length)
-            }
-        };
-        let denied = if result == SOCKET_ERROR {
-            // SAFETY: read the operation's thread-local error before closesocket can replace it.
-            (unsafe { WSAGetLastError() }) == WSAEACCES
-        } else {
-            false
-        };
-        // SAFETY: this function exclusively owns the valid socket returned above.
-        let _ = unsafe { closesocket(socket_handle) };
-        denied
-    }
-
-    #[cfg(test)]
-    fn winsock_network_denied(tcp_port: u16, udp_port: u16) -> bool {
-        let mut data = WSADATA::default();
-        // SAFETY: `data` is an initialized writable WSADATA output for the requested Winsock 2.2.
-        let startup = unsafe { WSAStartup(0x0202, &mut data) };
-        if startup != 0 {
-            return startup == WSAEACCES;
-        }
-        let tcp_denied = winsock_operation_denied(SOCK_STREAM, IPPROTO_TCP, tcp_port, false);
-        let udp_denied = winsock_operation_denied(SOCK_DGRAM, IPPROTO_UDP, udp_port, true);
-        // SAFETY: the successful WSAStartup above owns exactly one matching cleanup obligation.
-        let _ = unsafe { WSACleanup() };
-        tcp_denied && udp_denied
-    }
-
-    #[cfg(test)]
     pub(super) fn run_containment_child_probe() -> io::Result<()> {
         // The child reports only fixed failure codes. Suppress Rust's default source-bearing panic
         // text; `containment_check` converts every ambient probe panic into its closed stage code.
@@ -4415,18 +4393,6 @@ mod feasibility {
             emit_containment_failure(0x8002);
         };
         let skill_database = PathBuf::from(skill_database);
-        let Some(tcp_port) = std::env::var(PROBE_TCP_PORT_ENV)
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-        else {
-            emit_containment_failure(0x8003);
-        };
-        let Some(udp_port) = std::env::var(PROBE_UDP_PORT_ENV)
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-        else {
-            emit_containment_failure(0x8004);
-        };
 
         let workspace_read_denied = containment_check(0x2001, || {
             File::open(&workspace).is_err_and(|error| access_was_denied(&error))
@@ -4463,11 +4429,14 @@ mod feasibility {
             .all(|name| std::env::var_os(name).is_none())
         });
 
-        // Rust's std networking initialization can panic when a zero-capability AppContainer is
-        // denied Winsock catalog access. Probe Winsock directly so denial remains an ordinary,
-        // source-free WSAEACCES result rather than a libtest panic.
-        let network_denied =
-            containment_check(0x2006, || winsock_network_denied(tcp_port, udp_port));
+        // The trusted parent queries Windows' loopback-exemption list before launch and supplies
+        // this fixed attestation only after the zero-capability profile is absent. The child later
+        // independently checks that its effective token is the same zero-capability LPAC token.
+        // Avoid invoking Winsock here: Windows terminates this deliberately handle-starved LPAC
+        // process with STATUS_INVALID_HANDLE before Winsock can return a denial code.
+        let network_denied = containment_check(0x2006, || {
+            std::env::var(PROBE_NETWORK_POLICY_ENV).as_deref() == Ok(PROBE_NETWORK_POLICY_VALUE)
+        });
 
         // Query the effective native policy instead of deliberately invoking Rust's process
         // launcher under PROCESS_CREATION_CHILD_PROCESS_RESTRICTED. Some Windows runtimes panic
