@@ -2157,14 +2157,11 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
         .share_mode(share)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(stage)?;
-    let parent = std::fs::OpenOptions::new()
-        .read(true)
-        // Denying delete sharing pins the absolute parent path while Windows
-        // resolves the target name supplied to FileRenameInfo below.
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(canonical_parent)?;
-    let target_name = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
+    let target_name = canonical
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no filename"))?
+        .encode_wide()
+        .collect::<Vec<_>>();
     let name_bytes = target_name
         .len()
         .checked_mul(size_of::<u16>())
@@ -2187,12 +2184,13 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     let mut storage = vec![0usize; total_bytes.div_ceil(size_of::<usize>())];
     let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: `storage` is pointer-aligned and sized for the fixed header, the
-    // complete UTF-16 target name, and its trailing zero. Both directory
-    // handles and the buffer remain live for the synchronous system call.
+    // complete UTF-16 target name, and its trailing zero. The source handle and
+    // buffer remain live for the synchronous system call.
     unsafe {
         (*information).Anonymous.ReplaceIfExists = false;
-        // SetFileInformationByHandle documents NULL as the common Win32 form;
-        // the pinned parent above keeps this absolute target bound meanwhile.
+        // A simple name with a null RootDirectory renames within the source's
+        // current directory. This avoids re-resolving hosted-runner absolute
+        // path namespaces as a destination on another Windows device.
         (*information).RootDirectory = std::ptr::null_mut();
         (*information).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
             io::Error::new(
@@ -2217,26 +2215,7 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
             })?,
         ) == 0
         {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(17) {
-                let source_identity = crate::fs::windows_file_identity(&source);
-                let parent_identity = crate::fs::windows_file_identity(&parent);
-                let volume_match = match (&source_identity, &parent_identity) {
-                    (Ok(source), Ok(parent)) => {
-                        Some(source.volume_serial_number == parent.volume_serial_number)
-                    }
-                    _ => None,
-                };
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "Windows directory publication crossed devices: volume_match={volume_match:?} source_identity={} parent_identity={}",
-                        source_identity.is_ok(),
-                        parent_identity.is_ok(),
-                    ),
-                ));
-            }
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())
@@ -2785,6 +2764,23 @@ mod tests {
             project_dir: Some(root.join("workspace/.zerostack")),
         };
         (root, paths)
+    }
+
+    #[test]
+    fn windows_directory_publication_uses_a_same_parent_leaf_rename() {
+        let source = include_str!("paths.rs");
+        let windows_publication = source
+            .split("#[cfg(windows)]\n#[allow(unsafe_code)]\nfn publish_staged_directory")
+            .nth(1)
+            .expect("Windows directory publication implementation");
+        let windows_publication = windows_publication
+            .split("#[cfg(not(windows))]")
+            .next()
+            .expect("end of Windows directory publication implementation");
+
+        assert!(windows_publication.contains(".file_name()"));
+        assert!(windows_publication.contains("RootDirectory = std::ptr::null_mut()"));
+        assert!(!windows_publication.contains("canonical.as_os_str().encode_wide()"));
     }
 
     #[test]
