@@ -4393,15 +4393,13 @@ mod feasibility {
         };
         let network_denied = tcp_denied && udp_denied;
 
-        let child_process_denied = std::env::current_exe()
-            .ok()
-            .and_then(|executable| {
-                Command::new(executable)
-                    .arg("--version")
-                    .status_guarded()
-                    .err()
-            })
-            .is_some_and(|error| access_was_denied(&error));
+        // Query the effective native policy instead of deliberately invoking Rust's process
+        // launcher under PROCESS_CREATION_CHILD_PROCESS_RESTRICTED. Some Windows runtimes panic
+        // inside that launcher rather than returning ERROR_ACCESS_DENIED, which turns a valid
+        // containment control into an unclassified libtest exit. The trusted parent separately
+        // verifies this same policy, exact creation-time Job membership, active-process limit one,
+        // and exactly one active process before it accepts the child's readiness frame.
+        let child_process_restriction_effective = child_process_policy_matches(GetCurrentProcess());
         let unlisted_file_handle_denied = inherited_handle_is_invalid(PROBE_FILE_HANDLE_ENV);
         let unlisted_socket_handle_denied = inherited_handle_is_invalid(PROBE_SOCKET_HANDLE_ENV);
         let protocol_handles_exact = exact_protocol_std_handles();
@@ -4422,7 +4420,7 @@ mod feasibility {
             skill_database_write_denied,
             credential_environment_absent,
             network_denied,
-            child_process_denied,
+            child_process_restriction_effective,
             unlisted_file_handle_denied,
             unlisted_socket_handle_denied,
             protocol_handles_exact,

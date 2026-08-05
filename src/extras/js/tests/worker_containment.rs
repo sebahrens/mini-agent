@@ -270,7 +270,7 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "skill_database_write_denied",
         "credential_environment_absent",
         "network_denied",
-        "child_process_denied",
+        "child_process_restriction_effective",
         "unlisted_file_handle_denied",
         "unlisted_socket_handle_denied",
         "file_canary: Option<File>",
