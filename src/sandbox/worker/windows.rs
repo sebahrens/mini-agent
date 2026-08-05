@@ -3646,12 +3646,15 @@ mod feasibility {
                     "Windows containment readiness preamble exceeded 64 KiB".to_string(),
                 ));
             }
-            if let Some(code) = line
-                .strip_prefix(CONTAINMENT_FAILURE_PREFIX)
+            let failure_code = line
+                .windows(CONTAINMENT_FAILURE_PREFIX.len())
+                .position(|window| window == CONTAINMENT_FAILURE_PREFIX)
+                .and_then(|offset| line.get(offset + CONTAINMENT_FAILURE_PREFIX.len()..))
                 .and_then(|value| value.strip_suffix(b"\n"))
+                .filter(|value| value.len() == 4)
                 .and_then(|value| std::str::from_utf8(value).ok())
-                .and_then(|value| u16::from_str_radix(value, 16).ok())
-            {
+                .and_then(|value| u16::from_str_radix(value, 16).ok());
+            if let Some(code) = failure_code {
                 return Err(GateError(format!(
                     "Windows containment child failed closed checks code={code:04X}"
                 )));
