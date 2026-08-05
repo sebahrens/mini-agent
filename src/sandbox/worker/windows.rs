@@ -3538,7 +3538,25 @@ mod feasibility {
         });
         let readiness = receiver
             .recv_timeout(CHILD_TIMEOUT)
-            .map_err(|_| GateError("Windows containment readiness timed out".to_string()))??;
+            .map_err(|_| GateError("Windows containment readiness timed out".to_string()))?;
+        let readiness = match readiness {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                reader.join().map_err(|_| {
+                    GateError("Windows containment readiness reader panicked".to_string())
+                })?;
+                let exit_code = process
+                    .try_wait()
+                    .map_err(|wait| GateError(format!("poll failed containment child: {wait}")))?
+                    .and_then(|status| status.code());
+                return Err(GateError(format!(
+                    "{error}; child_exit_code={}",
+                    exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "active-or-signal".to_string())
+                )));
+            }
+        };
         if readiness != CONTAINMENT_READY {
             return Err(GateError(
                 "Windows containment child emitted no fixed pass frame".to_string(),
@@ -4263,23 +4281,40 @@ mod feasibility {
         Ok(accounting.BasicInfo.ActiveProcesses)
     }
 
+    fn emit_containment_failure(code: u16) -> io::Result<()> {
+        let mut failure_stream = std::io::stdout().lock();
+        writeln!(
+            failure_stream,
+            "{}{:04X}",
+            std::str::from_utf8(CONTAINMENT_FAILURE_PREFIX)
+                .expect("containment failure prefix is ASCII"),
+            code
+        )?;
+        failure_stream.flush()?;
+        Err(io::Error::other("Windows containment child probe failed"))
+    }
+
     pub(super) fn run_containment_child_probe() -> io::Result<()> {
-        let workspace = PathBuf::from(
-            std::env::var_os(PROBE_WORKSPACE_ENV)
-                .ok_or_else(|| io::Error::other("missing workspace sentinel probe metadata"))?,
-        );
-        let skill_database =
-            PathBuf::from(std::env::var_os(PROBE_SKILL_DATABASE_ENV).ok_or_else(|| {
-                io::Error::other("missing skill-database sentinel probe metadata")
-            })?);
-        let tcp_port = std::env::var(PROBE_TCP_PORT_ENV)
-            .map_err(|_| io::Error::other("missing TCP probe metadata"))?
-            .parse::<u16>()
-            .map_err(|_| io::Error::other("invalid TCP probe metadata"))?;
-        let udp_port = std::env::var(PROBE_UDP_PORT_ENV)
-            .map_err(|_| io::Error::other("missing UDP probe metadata"))?
-            .parse::<u16>()
-            .map_err(|_| io::Error::other("invalid UDP probe metadata"))?;
+        let Some(workspace) = std::env::var_os(PROBE_WORKSPACE_ENV) else {
+            return emit_containment_failure(0x8001);
+        };
+        let workspace = PathBuf::from(workspace);
+        let Some(skill_database) = std::env::var_os(PROBE_SKILL_DATABASE_ENV) else {
+            return emit_containment_failure(0x8002);
+        };
+        let skill_database = PathBuf::from(skill_database);
+        let Some(tcp_port) = std::env::var(PROBE_TCP_PORT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+        else {
+            return emit_containment_failure(0x8003);
+        };
+        let Some(udp_port) = std::env::var(PROBE_UDP_PORT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+        else {
+            return emit_containment_failure(0x8004);
+        };
 
         let workspace_read_denied =
             File::open(&workspace).is_err_and(|error| access_was_denied(&error));
@@ -4334,8 +4369,7 @@ mod feasibility {
         let unlisted_file_handle_denied = inherited_handle_is_invalid(PROBE_FILE_HANDLE_ENV);
         let unlisted_socket_handle_denied = inherited_handle_is_invalid(PROBE_SOCKET_HANDLE_ENV);
         let protocol_handles_exact = exact_protocol_std_handles();
-        let token_is_zero_capability_lpac =
-            child_token_is_zero_capability_lpac().map_err(|error| io::Error::other(error.0))?;
+        let token_is_zero_capability_lpac = child_token_is_zero_capability_lpac().unwrap_or(false);
         let no_console = no_console_devices();
         let mut in_job = 0;
         // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle, null queries any Job, and
@@ -4370,16 +4404,7 @@ mod feasibility {
             },
         );
         if failure_code != 0 {
-            let mut output = std::io::stdout().lock();
-            writeln!(
-                output,
-                "{}{:04X}",
-                std::str::from_utf8(CONTAINMENT_FAILURE_PREFIX)
-                    .expect("containment failure prefix is ASCII"),
-                failure_code
-            )?;
-            output.flush()?;
-            return Err(io::Error::other("Windows containment child probe failed"));
+            return emit_containment_failure(failure_code);
         }
         std::io::stdout().lock().write_all(CONTAINMENT_READY)?;
         std::io::stdout().lock().flush()?;

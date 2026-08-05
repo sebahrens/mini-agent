@@ -292,7 +292,9 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "protected machine-wide negative-control owner or DACL changed",
         "CONTAINMENT_FAILURE_PREFIX",
         "failed closed checks code=",
-        "output.flush()?",
+        "failure_stream.flush()?",
+        "child_exit_code=",
+        "emit_containment_failure(0x8001)",
     ] {
         assert!(
             source.contains(required),
