@@ -338,6 +338,15 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
             "missing Windows real-containment evidence: {required}"
         );
     }
+    for strict_boolean_comparison in [
+        "TokenIsAppContainer\")\n            .map_err(|_| 0x2102u16)?\n            != 1",
+        "TokenIsLessPrivilegedAppContainer\",\n        )\n        .map_err(|_| 0x2103u16)?\n            != 1",
+    ] {
+        assert!(
+            !source.contains(strict_boolean_comparison),
+            "Windows token booleans must accept every nonzero value: {strict_boolean_comparison}"
+        );
+    }
 }
 
 #[test]

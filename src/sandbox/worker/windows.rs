@@ -4075,7 +4075,7 @@ mod feasibility {
             WinHandle::from_created(raw_token, "own LPAC child token").map_err(|_| 0x2101u16)?;
         if token_u32(token.raw(), TokenIsAppContainer, "read TokenIsAppContainer")
             .map_err(|_| 0x2102u16)?
-            != 1
+            == 0
         {
             return Err(0x2102);
         }
@@ -4085,7 +4085,7 @@ mod feasibility {
             "read TokenIsLessPrivilegedAppContainer",
         )
         .map_err(|_| 0x2103u16)?
-            != 1
+            == 0
         {
             return Err(0x2103);
         }
