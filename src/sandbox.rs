@@ -2574,6 +2574,8 @@ mod sandbox_tests {
             "outside_write=denied",
             "hardlink=denied",
             "stable_handle_swap=denied",
+            "TARGET_WAIT_FOR_FILE_ARG",
+            "swap-release.txt",
             "unique_profile_crash=pass",
             "authority_escape=denied",
             "bounded_pipe=pass",
