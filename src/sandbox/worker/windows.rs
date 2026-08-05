@@ -4065,20 +4065,29 @@ mod feasibility {
         Ok(value)
     }
 
-    fn child_token_is_zero_capability_lpac() -> Result<bool, GateError> {
+    /// Returns only closed diagnostic codes because this runs inside the contained child.
+    fn child_token_is_zero_capability_lpac() -> Result<(), u16> {
         let mut raw_token = null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
-            return Err(last_error("open LPAC child token"));
+            return Err(0x2101);
         }
-        let token = WinHandle::from_created(raw_token, "own LPAC child token")?;
-        if token_u32(token.raw(), TokenIsAppContainer, "read TokenIsAppContainer")? != 1
-            || token_u32(
-                token.raw(),
-                TokenIsLessPrivilegedAppContainer,
-                "read TokenIsLessPrivilegedAppContainer",
-            )? != 1
+        let token =
+            WinHandle::from_created(raw_token, "own LPAC child token").map_err(|_| 0x2101)?;
+        if token_u32(token.raw(), TokenIsAppContainer, "read TokenIsAppContainer")
+            .map_err(|_| 0x2102)?
+            != 1
         {
-            return Ok(false);
+            return Err(0x2102);
+        }
+        if token_u32(
+            token.raw(),
+            TokenIsLessPrivilegedAppContainer,
+            "read TokenIsLessPrivilegedAppContainer",
+        )
+        .map_err(|_| 0x2103)?
+            != 1
+        {
+            return Err(0x2103);
         }
 
         let mut required = 0u32;
@@ -4086,12 +4095,10 @@ mod feasibility {
             GetTokenInformation(token.raw(), TokenCapabilities, null_mut(), 0, &mut required)
         };
         if first != 0 || required < size_of::<u32>() as u32 {
-            return Err(GateError(
-                "invalid TokenCapabilities size probe".to_string(),
-            ));
+            return Err(0x2104);
         }
         if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
-            return Err(last_error("size TokenCapabilities"));
+            return Err(0x2105);
         }
         let mut storage = vec![0usize; (required as usize).div_ceil(size_of::<usize>())];
         if unsafe {
@@ -4104,10 +4111,13 @@ mod feasibility {
             )
         } == 0
         {
-            return Err(last_error("read TokenCapabilities"));
+            return Err(0x2106);
         }
         let group_count = unsafe { *storage.as_ptr().cast::<u32>() };
-        Ok(group_count == 0)
+        if group_count != 0 {
+            return Err(0x2106);
+        }
+        Ok(())
     }
 
     fn no_console_devices() -> bool {
@@ -4509,9 +4519,11 @@ mod feasibility {
         emit_containment_stage(0x200A);
         let protocol_handles_exact = containment_check(0x200A, exact_protocol_std_handles);
         emit_containment_stage(0x200B);
-        let token_is_zero_capability_lpac = containment_check(0x200B, || {
-            child_token_is_zero_capability_lpac().unwrap_or(false)
-        });
+        let token_is_zero_capability_lpac =
+            containment_check(0x200B, || match child_token_is_zero_capability_lpac() {
+                Ok(()) => true,
+                Err(code) => emit_containment_failure(code),
+            });
         emit_containment_stage(0x200C);
         let no_console = containment_check(0x200C, no_console_devices);
         let mut in_job = 0;
