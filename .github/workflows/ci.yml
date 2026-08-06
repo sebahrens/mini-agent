@@ -1024,10 +1024,18 @@ jobs:
             cpu = '(?m)^  native CPU limit[^\S\r\n]+35 seconds\r?$'
             spawn = '(?m)^  parent-brokered spawn[^\S\r\n]+disabled on Windows\r?$'
           }
+          $missingStatus = @()
           foreach ($entry in $requiredStatus.GetEnumerator()) {
             if ($statusText -notmatch $entry.Value) {
-              exit 24
+              $missingStatus += $entry.Key
             }
+          }
+          if ($missingStatus.Count -ne 0) {
+            # Preserve only fixed public field names. The status text may include
+            # environment-specific paths, so it must never leave this account.
+            @{ missing_public_status_fields = $missingStatus } |
+              ConvertTo-Json | Set-Content (Join-Path $EvidenceRoot 'phase6-standard-user-diagnostic.json')
+            exit 24
           }
           $probeLog = Join-Path $EvidenceRoot 'probe.raw'
           & $CargoExe test --locked --no-default-features --features js windows_js_worker_containment -- --ignored --nocapture --test-threads=1 *> $probeLog
@@ -1091,6 +1099,10 @@ jobs:
           $credential = [System.Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$userName", $password)
           $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $standardRoot -Wait -PassThru
           if ($process.ExitCode -ne 0) {
+            $diagnostic = Join-Path $evidenceRoot 'phase6-standard-user-diagnostic.json'
+            if (Test-Path -LiteralPath $diagnostic -PathType Leaf) {
+              Copy-Item -LiteralPath $diagnostic -Destination .
+            }
             throw "standard-user containment gate failed closed with exit code $($process.ExitCode)"
           }
           Copy-Item -LiteralPath (Join-Path $evidenceRoot 'phase6-standard-user-evidence.json') -Destination .
@@ -1212,6 +1224,7 @@ jobs:
             phase6-gate-evidence.log
             phase6-standard-user-evidence.json
             phase6-standard-user-evidence.log
+            phase6-standard-user-diagnostic.json
           if-no-files-found: error
 
       - name: Remove the temporary Phase 6 standard-user account
