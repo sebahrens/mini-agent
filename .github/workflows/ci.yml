@@ -985,6 +985,11 @@ jobs:
           [Environment]::SetEnvironmentVariable('USERPROFILE', $UserHome, 'Process')
           [Environment]::SetEnvironmentVariable('TEMP', $UserTemp, 'Process')
           [Environment]::SetEnvironmentVariable('TMP', $UserTemp, 'Process')
+          $localAppData = Join-Path $UserHome 'AppData\\Local'
+          $roamingAppData = Join-Path $UserHome 'AppData\\Roaming'
+          New-Item -ItemType Directory -Path $localAppData, $roamingAppData -Force | Out-Null
+          [Environment]::SetEnvironmentVariable('LOCALAPPDATA', $localAppData, 'Process')
+          [Environment]::SetEnvironmentVariable('APPDATA', $roamingAppData, 'Process')
           $buildVariables = Get-Content -LiteralPath $BuildEnvironment -Raw | ConvertFrom-Json
           foreach ($property in $buildVariables.PSObject.Properties) {
             if ($null -ne $property.Value) {
