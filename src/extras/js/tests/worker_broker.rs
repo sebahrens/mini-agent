@@ -2676,20 +2676,23 @@ fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fa
 
     let hash_root = AuditTempRoot::new("hash-mismatch");
     let hash_owner = hash_root.owner();
-    // Match the production-owned audit layout before replacing its contents.
-    // In particular, Windows validates private state files before replaying the
-    // copied hash chain.
-    EffectAudit::open_with_options(hash_owner.clone(), options.clone()).unwrap();
-    for segment in audit_segments(&hash_owner) {
-        std::fs::remove_file(segment).unwrap();
-    }
-    std::fs::copy(owner.target_key_file(), hash_owner.target_key_file()).unwrap();
-    for segment in &segments {
-        std::fs::copy(
-            segment,
-            hash_owner.directory().join(segment.file_name().unwrap()),
-        )
-        .unwrap();
+    {
+        let mut audit =
+            EffectAudit::open_with_options(hash_owner.clone(), options.clone()).unwrap();
+        for index in 0..12 {
+            let effect_id = format!("hash-effect-{index}");
+            let target = audit.file_target(&format!("safe/hash/{index}"));
+            let mut intent = audit_intent(&effect_id, target);
+            intent.sequence = index + 1;
+            audit.append_intent(intent).unwrap();
+            audit
+                .append_completion(EffectCompletion {
+                    effect_id,
+                    result_code: AuditResultCode::Succeeded,
+                })
+                .unwrap();
+        }
+        assert!(audit.rotation_anchor_count() >= 2);
     }
     let last = audit_segments(&hash_owner).pop().unwrap();
     let mut bytes = std::fs::read(&last).unwrap();
