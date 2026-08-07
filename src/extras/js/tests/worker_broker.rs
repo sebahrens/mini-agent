@@ -2647,7 +2647,14 @@ fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fa
 
     let missing_root = AuditTempRoot::new("missing-segment");
     let missing_owner = missing_root.owner();
-    std::fs::create_dir_all(missing_owner.directory()).unwrap();
+    // Initialize the copied audit through the production path. In particular,
+    // Windows requires the state directory, marker, and private files to have
+    // the same ownership setup as a real audit before replay reaches segment
+    // continuity validation.
+    EffectAudit::open_with_options(missing_owner.clone(), options.clone()).unwrap();
+    for segment in audit_segments(&missing_owner) {
+        std::fs::remove_file(segment).unwrap();
+    }
     std::fs::copy(owner.target_key_file(), missing_owner.target_key_file()).unwrap();
     for segment in &segments {
         std::fs::copy(
