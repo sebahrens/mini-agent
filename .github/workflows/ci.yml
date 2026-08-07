@@ -822,13 +822,36 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'could not grant the standard user read/execute access to the Rust toolchain'
           }
+          $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+          $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+          $none = [System.Security.AccessControl.InheritanceFlags]::None
+          $propagation = [System.Security.AccessControl.PropagationFlags]::None
+          $allow = [System.Security.AccessControl.AccessControlType]::Allow
+          function Set-StandardUserPrivateDirectoryAcl([string] $Path) {
+            $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+            # The worker launcher permits only the current user, SYSTEM, and the
+            # Administrators group to retain write authority over a per-user image.
+            # Do not leave inherited runner-user ACEs on this installation tree.
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.SetOwner($user.SID)
+            foreach ($sid in @($user.SID, $systemSid, $administratorsSid)) {
+              [void] $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                  [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+                $propagation,
+                $allow
+              ))
+            }
+            Set-Acl -LiteralPath $Path -AclObject $acl
+          }
           & icacls.exe $standardRoot /setowner $userName /T /C /Q | Out-Null
           if ($LASTEXITCODE -ne 0) {
             throw 'could not assign the isolated checkout to the standard user'
           }
-          & icacls.exe $standardRoot /grant "${userName}:(OI)(CI)M" /T /Q | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-            throw 'could not grant the standard user access to its isolated checkout'
+          foreach ($privateDirectory in @($standardRoot, $sourceRoot, $cargoHome, $userHome, $userTemp, $evidenceRoot)) {
+            Set-StandardUserPrivateDirectoryAcl -Path $privateDirectory
           }
           $sensitivePathRoots = @(
             $env:HOME,
@@ -878,10 +901,6 @@ jobs:
           New-Item -ItemType Directory -Path $protectedRoot -Force | Out-Null
           $protected = Join-Path $protectedRoot 'mini-agent.exe'
           Copy-Item -LiteralPath $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE -Destination $protected -Force
-          $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-          $none = [System.Security.AccessControl.InheritanceFlags]::None
-          $propagation = [System.Security.AccessControl.PropagationFlags]::None
-          $allow = [System.Security.AccessControl.AccessControlType]::Allow
           $deny = [System.Security.AccessControl.AccessControlType]::Deny
           function Protect-StandardUserControl([string] $Path, [bool] $Directory) {
             if ($Directory) {
