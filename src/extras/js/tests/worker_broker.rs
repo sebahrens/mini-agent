@@ -2676,7 +2676,13 @@ fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fa
 
     let hash_root = AuditTempRoot::new("hash-mismatch");
     let hash_owner = hash_root.owner();
-    std::fs::create_dir_all(hash_owner.directory()).unwrap();
+    // Match the production-owned audit layout before replacing its contents.
+    // In particular, Windows validates private state files before replaying the
+    // copied hash chain.
+    EffectAudit::open_with_options(hash_owner.clone(), options.clone()).unwrap();
+    for segment in audit_segments(&hash_owner) {
+        std::fs::remove_file(segment).unwrap();
+    }
     std::fs::copy(owner.target_key_file(), hash_owner.target_key_file()).unwrap();
     for segment in &segments {
         std::fs::copy(
