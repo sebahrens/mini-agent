@@ -812,18 +812,25 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             let readable = target_probe_path(&mut args, "configured read path")?;
             let tool = target_probe_path(&mut args, "configured tool path")?;
             let writable = target_probe_path(&mut args, "configured write path")?;
-            if std::fs::read(readable).map_err(|error| error.to_string())? != b"configured-read" {
+            let Ok(contents) = std::fs::read(readable) else {
+                return Ok(53);
+            };
+            if contents != b"configured-read" {
                 return Ok(51);
             }
-            if !Command::new(tool)
+            let status = match Command::new(tool)
                 .args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])
                 .status_guarded()
-                .map_err(|error| error.to_string())?
-                .success()
             {
+                Ok(status) => status,
+                Err(_) => return Ok(54),
+            };
+            if !status.success() {
                 return Ok(52);
             }
-            std::fs::write(writable, b"configured-write").map_err(|error| error.to_string())?;
+            if std::fs::write(writable, b"configured-write").is_err() {
+                return Ok(55);
+            }
             Ok(0)
         }
         value if value == OsStr::new(TARGET_NOOP_ARG) => Ok(0),
@@ -2770,7 +2777,7 @@ fn run_runtime_probe() -> Result<i32, String> {
 
     let configured_read = base.join("configured-read");
     let configured_write = base.join("configured-write");
-    let configured_tool = base.join("configured-tool.exe");
+    let configured_tool = configured_read.join("configured-tool.exe");
     std::fs::create_dir_all(&configured_read).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&configured_write).map_err(|e| e.to_string())?;
     std::fs::copy(&probe_executable, &configured_tool).map_err(|e| e.to_string())?;
@@ -2790,18 +2797,22 @@ fn run_runtime_probe() -> Result<i32, String> {
         &workspace,
         &cache,
         Some(configured_cleanup_ready.clone()),
-        &[configured_read.clone(), configured_tool.clone()],
+        std::slice::from_ref(&configured_read),
         std::slice::from_ref(&configured_write),
     )?;
-    if !configured_launch
+    let configured_result = configured_launch
         .as_std_mut()
         .output_guarded()
-        .map_err(|e| format!("run configured AppContainer tool/root probe: {e}"))?
-        .status
-        .success()
-        || !configured_output.exists()
-    {
-        return Err("configured AppContainer tool/root probe failed".into());
+        .map_err(|e| format!("run configured AppContainer tool/root probe: {e}"))?;
+    if !configured_result.status.success() || !configured_output.exists() {
+        return Err(format!(
+            "configured AppContainer tool/root probe failed: status={} output={}",
+            configured_result
+                .status
+                .code()
+                .map_or_else(|| String::from("none"), |code| code.to_string()),
+            configured_output.exists()
+        ));
     }
     attest_completed_cleanup(
         &configured_cleanup_ready,

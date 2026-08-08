@@ -2756,7 +2756,18 @@ mod sandbox_tests {
         assert!(!runtime_probe.contains("resolve_program(\"pwsh.exe\""));
         assert!(!runtime_probe.contains("resolve_program(\"powershell.exe\""));
         assert!(!runtime_probe.contains("resolve_program(\"cmd.exe\""));
+        assert!(
+            runtime_probe
+                .contains("let configured_tool = configured_read.join(\"configured-tool.exe\")")
+        );
+        assert!(
+            !runtime_probe.contains("let configured_tool = base.join(\"configured-tool.exe\")")
+        );
         assert!(runtime_probe.contains("std::fs::copy(&probe_executable, &configured_tool)"));
+        assert!(runtime_probe.contains("configured AppContainer tool/root probe failed: status="));
+        assert!(source.contains("return Ok(53);"));
+        assert!(source.contains("Err(_) => return Ok(54),"));
+        assert!(source.contains("return Ok(55);"));
         assert!(source.contains(".args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])"));
         assert!(runtime_probe.contains(
             "configured_read.as_path(),\n            configured_write.as_path(),\n            configured_tool.as_path(),"

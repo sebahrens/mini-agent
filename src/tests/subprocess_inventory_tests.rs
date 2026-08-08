@@ -1278,7 +1278,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        "if !Command::new(tool)",
+        "let status = match Command::new(tool)",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
@@ -2941,7 +2941,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        "if !Command::new(tool)",
+        "let status = match Command::new(tool)",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
