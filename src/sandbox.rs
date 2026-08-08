@@ -2581,6 +2581,7 @@ mod sandbox_tests {
             "HELPER_STAGE_VERIFY_DESCENDANT",
             "helper_failure_status()",
             "AUTHORITY_DESCENDANT_SPAWN_FAILED",
+            "AUTHORITY_LOOPBACK_QUERY_ERROR",
             "completed_process_exit_code(&child)?",
             "bounded_pipe=pass",
             "acl_serialization=pass",
@@ -2611,6 +2612,7 @@ mod sandbox_tests {
         assert!(!source.contains("PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY"));
         assert!(!source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
         assert!(!source.contains("GetHandleInformation(omitted_handle as HANDLE"));
+        assert!(!source.contains("run_authority_probe(args).unwrap_or(97)"));
         assert!(source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
         assert!(source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
         assert!(

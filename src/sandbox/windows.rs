@@ -116,6 +116,14 @@ const TARGET_SELF_TOKEN_OPEN_ERROR_BASE: i32 = 0xC_0000;
 const AUTHORITY_DESCENDANT_SPAWN_FAILED: i32 = 103;
 const AUTHORITY_DESCENDANT_WAIT_FAILED: i32 = 104;
 const AUTHORITY_DESCENDANT_NO_EXIT_CODE: i32 = 105;
+const AUTHORITY_ARGUMENT_ERROR: i32 = 106;
+const AUTHORITY_DESKTOP_QUERY_ERROR: i32 = 107;
+const AUTHORITY_TOKEN_QUERY_ERROR: i32 = 108;
+const AUTHORITY_CURRENT_EXE_ERROR: i32 = 109;
+const AUTHORITY_BREAKAWAY_EXE_ERROR: i32 = 110;
+const AUTHORITY_BREAKAWAY_RESULT_ERROR: i32 = 111;
+const AUTHORITY_CAPABILITY_QUERY_ERROR: i32 = 112;
+const AUTHORITY_LOOPBACK_QUERY_ERROR: i32 = 113;
 // The regular AppContainer supplies the Windows system-resource access required for descendant
 // creation, so retain the Job's complete UI lockdown in addition to the private desktop.
 const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_ALL;
@@ -820,9 +828,7 @@ pub(crate) fn maybe_run_from_args() -> Option<i32> {
         Some(value) if value == OsStr::new(TARGET_PROBE_ARG) => {
             Some(run_target_probe(args).unwrap_or(96))
         }
-        Some(value) if value == OsStr::new(AUTHORITY_PROBE_ARG) => {
-            Some(run_authority_probe(args).unwrap_or(97))
-        }
+        Some(value) if value == OsStr::new(AUTHORITY_PROBE_ARG) => Some(run_authority_probe(args)),
         Some(value) if value == OsStr::new(DESCENDANT_PROBE_ARG) => {
             Some(run_descendant_probe(args).unwrap_or(98))
         }
@@ -3598,50 +3604,57 @@ fn run_parent_probe(marker: Option<&Path>) -> Result<i32, String> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn run_authority_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
-    let helper_pid = parse_probe_pid(args.next(), "helper")?;
-    let parent_pid = parse_probe_pid(args.next(), "parent")?;
-    let outside = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("outside marker missing")?;
-    let expected_desktop = args
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .ok_or("expected private desktop name missing")?;
-    let omitted_handle = args
+fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
+    let Some(helper_pid) = parse_probe_pid(args.next(), "helper").ok() else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
+    let Some(parent_pid) = parse_probe_pid(args.next(), "parent").ok() else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
+    let Some(outside) = args.next().map(PathBuf::from) else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
+    let Some(expected_desktop) = args.next().and_then(|value| value.into_string().ok()) else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
+    let Some(omitted_handle) = args
         .next()
         .and_then(|value| value.into_string().ok())
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value != 0)
-        .ok_or("omitted handle missing")?;
-    let descendant_ready = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("descendant readiness path missing")?;
-    let control_root = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("AppContainer control root missing")?;
-    let descendant_release = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("descendant release path missing")?;
+    else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
+    let Some(descendant_ready) = args.next().map(PathBuf::from) else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
+    let Some(control_root) = args.next().map(PathBuf::from) else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
+    let Some(descendant_release) = args.next().map(PathBuf::from) else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
     if args.next().is_some() || outside.exists() {
-        return Err("invalid authority-probe arguments".into());
+        return AUTHORITY_ARGUMENT_ERROR;
     }
     let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
-    if desktop.is_null()
-        || user_object_name(desktop, "authority-probe desktop")? != expected_desktop
-        || !expected_desktop.starts_with("mini-agent-")
-    {
-        return Ok(93);
+    if desktop.is_null() {
+        return AUTHORITY_DESKTOP_QUERY_ERROR;
+    }
+    let Ok(desktop_name) = user_object_name(desktop, "authority-probe desktop") else {
+        return AUTHORITY_DESKTOP_QUERY_ERROR;
+    };
+    if desktop_name != expected_desktop || !expected_desktop.starts_with("mini-agent-") {
+        return 93;
     }
     if try_probe_write(&outside) {
-        return Ok(91);
+        return 91;
     }
-    if !current_token_is_regular_appcontainer()? {
-        return Ok(102);
+    let Ok(is_regular_appcontainer) = current_token_is_regular_appcontainer() else {
+        return AUTHORITY_TOKEN_QUERY_ERROR;
+    };
+    if !is_regular_appcontainer {
+        return 102;
     }
     // Handle values are process-local. Signaling the candidate proves object identity to the
     // helper without treating an unrelated child handle at the same numeric value as inherited.
@@ -3653,14 +3666,16 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             .open(control_root.join("child-access-canary"))
             .is_ok()
     {
-        return Ok(100);
+        return 100;
     }
     if process_token_is_acquirable(helper_pid, &outside)
         || process_token_is_acquirable(parent_pid, &outside)
     {
-        return Ok(90);
+        return 90;
     }
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let Ok(executable) = std::env::current_exe() else {
+        return AUTHORITY_CURRENT_EXE_ERROR;
+    };
     let mut command = Command::new(executable);
     command
         .arg(DESCENDANT_PROBE_ARG)
@@ -3668,53 +3683,56 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
         .arg(&descendant_release);
     let mut descendant = match command.spawn_guarded() {
         Ok(descendant) => descendant,
-        Err(_) => return Ok(AUTHORITY_DESCENDANT_SPAWN_FAILED),
+        Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
     };
     let descendant = match descendant.wait() {
         Ok(status) => status,
-        Err(_) => return Ok(AUTHORITY_DESCENDANT_WAIT_FAILED),
+        Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,
     };
     if !descendant.success() {
-        return Ok(descendant
+        return descendant
             .code()
-            .unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE));
+            .unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE);
     }
-    let mut breakaway = Command::new(
-        std::env::current_exe().map_err(|error| format!("locate breakaway probe: {error}"))?,
-    );
+    let Ok(breakaway_executable) = std::env::current_exe() else {
+        return AUTHORITY_BREAKAWAY_EXE_ERROR;
+    };
+    let mut breakaway = Command::new(breakaway_executable);
     breakaway
         .arg("--help")
         .creation_flags(CREATE_BREAKAWAY_FROM_JOB);
     match breakaway.status_guarded() {
         Err(error) if error.raw_os_error() == Some(5) => {}
-        Ok(_) => return Ok(101),
-        Err(error) => {
-            return Err(format!(
-                "breakaway denial returned unexpected error: {error}"
-            ));
-        }
+        Ok(_) => return 101,
+        Err(_) => return AUTHORITY_BREAKAWAY_RESULT_ERROR,
     }
-    if !current_token_has_zero_capabilities()? {
-        return Ok(92);
+    let Ok(has_zero_capabilities) = current_token_has_zero_capabilities() else {
+        return AUTHORITY_CAPABILITY_QUERY_ERROR;
+    };
+    if !has_zero_capabilities {
+        return 92;
     }
-    if !current_appcontainer_has_no_loopback_exemption()? {
-        return Ok(96);
+    let Ok(has_no_loopback_exemption) = current_appcontainer_has_no_loopback_exemption() else {
+        return AUTHORITY_LOOPBACK_QUERY_ERROR;
+    };
+    if !has_no_loopback_exemption {
+        return 96;
     }
     if !tcp_attempt_denied("127.0.0.1:9")
         || !tcp_attempt_denied("1.1.1.1:9")
         || !tcp_attempt_denied("[::1]:9")
         || !tcp_attempt_denied("[2606:4700:4700::1111]:9")
     {
-        return Ok(94);
+        return 94;
     }
     if !udp_attempt_denied("127.0.0.1:9")
         || !udp_attempt_denied("1.1.1.1:9")
         || !udp_attempt_denied("[::1]:9")
         || !udp_attempt_denied("[2606:4700:4700::1111]:9")
     {
-        return Ok(95);
+        return 95;
     }
-    Ok(0)
+    0
 }
 
 fn run_descendant_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
