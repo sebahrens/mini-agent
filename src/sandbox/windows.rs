@@ -1263,6 +1263,7 @@ fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> R
         grants,
         parent,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        FILE_SHARE_READ,
     )
 }
 
@@ -1284,6 +1285,7 @@ fn grant_write_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> 
         grants,
         parent,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
     )
 }
 
@@ -1292,6 +1294,7 @@ fn grant_access_root(
     grants: &mut AccessGrants,
     parent: &Handle,
     permissions: u32,
+    share: u32,
 ) -> Result<(), String> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
@@ -1325,7 +1328,7 @@ fn grant_access_root(
             &resolved,
             directory,
             READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share,
         )?;
         if !directory
             && crate::fs::windows_file_link_count(&file)
@@ -2824,7 +2827,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     std::fs::remove_file(&hardlink_alias).map_err(|e| e.to_string())?;
     std::fs::remove_file(&hardlink_source).map_err(|e| e.to_string())?;
 
-    let swap_victim = workspace.join("swap-victim.txt");
+    let swap_victim = cache.join("swap-victim.txt");
     let swap_ready = workspace.join("swap-ready.txt");
     let swap_release = workspace.join("swap-release.txt");
     std::fs::write(&swap_victim, b"stable").map_err(|e| e.to_string())?;
@@ -2844,9 +2847,9 @@ fn run_runtime_probe() -> Result<i32, String> {
         .spawn_guarded()
         .map_err(|e| format!("start stable-handle swap probe: {e}"))?;
     wait_for_probe_file(&swap_ready)?;
-    if std::fs::rename(&swap_victim, workspace.join("swap-moved.txt")).is_ok() {
+    if std::fs::rename(&swap_victim, cache.join("swap-moved.txt")).is_ok() {
         let _ = swap.kill();
-        return Err("stable ACL handle allowed an in-flight path swap".into());
+        return Err("stable read-only ACL handle allowed an in-flight path swap".into());
     }
     std::fs::write(&swap_release, b"TARGET_READY\n").map_err(|e| e.to_string())?;
     if !swap
@@ -2856,6 +2859,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     {
         return Err("stable-handle swap probe target failed".into());
     }
+    std::fs::remove_file(&swap_victim).map_err(|error| error.to_string())?;
 
     let mut max_request = build_helper(
         probe_executable.clone(),

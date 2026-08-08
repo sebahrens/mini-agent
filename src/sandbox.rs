@@ -2624,6 +2624,13 @@ mod sandbox_tests {
         assert!(!root_policy.contains("RUSTUP_HOME"));
         assert!(source.contains("build_helper_with_ready_and_roots"));
         assert!(source.contains("configured writable root overlaps a read-only root"));
+        assert!(source.contains("fn grant_access_root(\n    root: &Path,\n    grants: &mut AccessGrants,\n    parent: &Handle,\n    permissions: u32,\n    share: u32,"));
+        assert!(
+            source.contains("FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,\n        FILE_SHARE_READ,")
+        );
+        assert!(source.contains(
+            "FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,\n        FILE_SHARE_READ | FILE_SHARE_WRITE,"
+        ));
         assert!(!source.contains("CreateRestrictedToken"));
         assert!(!source.contains("WRITE_RESTRICTED"));
         assert!(!source.contains("RegOverridePredefKey"));
