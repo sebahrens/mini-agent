@@ -186,6 +186,13 @@ const HELPER_STAGE_WAIT: u8 = 16;
 const HELPER_STAGE_EXIT_CODE: u8 = 17;
 const HELPER_STAGE_DRAIN: u8 = 18;
 const HELPER_STAGE_CLEANUP: u8 = 19;
+const HELPER_STAGE_SUSPENDED_JOB: u8 = 20;
+const HELPER_STAGE_REGULAR_TOKEN_OPEN: u8 = 21;
+const HELPER_STAGE_REGULAR_TOKEN_SID: u8 = 22;
+const HELPER_STAGE_REGULAR_TOKEN_DUPLICATE: u8 = 23;
+const HELPER_STAGE_REGULAR_TOKEN_DESCRIPTOR: u8 = 24;
+const HELPER_STAGE_REGULAR_TOKEN_ACCESS: u8 = 25;
+const HELPER_STAGE_RESUME: u8 = 26;
 
 static ACTIVE_REQUEST_FEEDERS: AtomicUsize = AtomicUsize::new(0);
 static HELPER_STAGE: AtomicU8 = AtomicU8::new(HELPER_STAGE_REQUEST);
@@ -2919,6 +2926,7 @@ fn launch_appcontainer(
     }
     let process = Handle::created(information.hProcess, "own AppContainer process")?;
     let thread = Handle::created(information.hThread, "own suspended AppContainer thread")?;
+    mark_helper_stage(HELPER_STAGE_SUSPENDED_JOB);
     if let Err(error) = verify_job_membership_and_limits(job, &process) {
         unsafe { TerminateProcess(process.raw(), 126) };
         let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
@@ -2937,6 +2945,7 @@ fn launch_appcontainer(
             return Err(error);
         }
     }
+    mark_helper_stage(HELPER_STAGE_RESUME);
     if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
         let error = last_error("resume attested AppContainer process");
         unsafe { TerminateProcess(process.raw(), 126) };
@@ -4017,11 +4026,13 @@ fn try_probe_write(path: &Path) -> bool {
 }
 
 fn process_token_is_regular_appcontainer(process: HANDLE) -> Result<bool, String> {
+    mark_helper_stage(HELPER_STAGE_REGULAR_TOKEN_OPEN);
     let mut raw_token = null_mut();
     if unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw_token) } == 0 {
         return Err(last_error("open restricted process token"));
     }
     let token = Handle::created(raw_token, "restricted process token")?;
+    mark_helper_stage(HELPER_STAGE_REGULAR_TOKEN_SID);
     let mut appcontainer = TOKEN_APPCONTAINER_INFORMATION::default();
     let mut returned = 0u32;
     if unsafe {
@@ -4042,6 +4053,7 @@ fn process_token_is_regular_appcontainer(process: HANDLE) -> Result<bool, String
     if appcontainer.TokenAppContainer.is_null() {
         return Ok(false);
     }
+    mark_helper_stage(HELPER_STAGE_REGULAR_TOKEN_DUPLICATE);
     let mut raw_impersonation = null_mut();
     if unsafe { DuplicateToken(token.raw(), SecurityImpersonation, &mut raw_impersonation) } == 0 {
         return Err(last_error(
@@ -4055,6 +4067,7 @@ fn process_token_is_regular_appcontainer(process: HANDLE) -> Result<bool, String
     // RESTRICTED APPLICATION PACKAGES; LPAC deliberately ignores AC. AccessCheck therefore
     // distinguishes the effective token semantics without relying on the optional LPAC token
     // information class.
+    mark_helper_stage(HELPER_STAGE_REGULAR_TOKEN_DESCRIPTOR);
     let descriptor_sddl = wide_string("O:SYG:SYD:(A;;0x3;;;WD)(A;;0x1;;;AC)(A;;0x2;;;S-1-15-2-2)");
     let mut raw_descriptor = null_mut();
     if unsafe {
@@ -4076,6 +4089,7 @@ fn process_token_is_regular_appcontainer(process: HANDLE) -> Result<bool, String
     let mut privilege_set_bytes = size_of::<PRIVILEGE_SET>() as u32;
     let mut granted_access = 0u32;
     let mut access_status = 0i32;
+    mark_helper_stage(HELPER_STAGE_REGULAR_TOKEN_ACCESS);
     if unsafe {
         AccessCheck(
             descriptor.0,

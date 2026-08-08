@@ -2579,6 +2579,7 @@ mod sandbox_tests {
             "authority probe failed: status=",
             "HELPER_FAILURE_STATUS_BASE",
             "HELPER_STAGE_VERIFY_DESCENDANT",
+            "HELPER_STAGE_REGULAR_TOKEN_ACCESS",
             "helper_failure_status()",
             "AUTHORITY_DESCENDANT_SPAWN_FAILED",
             "AUTHORITY_LOOPBACK_QUERY_ERROR",
