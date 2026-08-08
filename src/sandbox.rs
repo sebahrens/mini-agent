@@ -2592,14 +2592,15 @@ mod sandbox_tests {
             "PROTECTED_DACL_SECURITY_INFORMATION",
             "network=denied",
             "registry=not_isolated",
+            "TokenIsLessPrivilegedAppContainer",
         ] {
             assert!(
                 source.contains(required),
                 "missing Windows contract: {required}"
             );
         }
-        assert!(!source.contains("PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY"));
-        assert!(!source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
+        assert!(source.contains("PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY"));
+        assert!(source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
         assert!(
             source.contains(".stdin(Stdio::from"),
             "helper requests must use inherited stdin, not argv/env/temp files"

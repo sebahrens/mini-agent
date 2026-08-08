@@ -598,7 +598,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Windows AppContainer runtime probe failed with exit code $LASTEXITCODE"
           }
-          $expected = 'WINDOWS_GENERAL_SANDBOX_PASS appcontainer=pass explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated'
+          $expected = 'WINDOWS_GENERAL_SANDBOX_PASS lpac=pass explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated'
           if (-not (($output -join "`n").Contains($expected))) {
             throw 'Windows AppContainer runtime probe emitted no exact fixed pass evidence'
           }

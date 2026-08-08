@@ -4,9 +4,9 @@
 //!
 //! This is deliberately separate from the broker-only LPAC worker launcher. A small copy of the
 //! current executable receives an authenticated-by-inheritance request on stdin, creates a
-//! workspace-capable AppContainer, and starts the requested program in a creation-time Job. The
+//! workspace-capable LPAC AppContainer, and starts the requested program in a creation-time Job. The
 //! request never appears in a command line, environment variable, or temporary file. The
-//! AppContainer receives no capabilities: in particular, network access is denied by default.
+//! LPAC AppContainer receives no capabilities: in particular, network access is denied by default.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,7 +46,7 @@ use windows_sys::Win32::Security::{
     SecurityImpersonation, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
     TOKEN_APPCONTAINER_INFORMATION, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
     TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenImpersonation,
-    TokenUser,
+    TokenIsLessPrivilegedAppContainer, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
@@ -79,15 +79,17 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId,
     GetCurrentThreadId, GetExitCodeProcess, GetProcessId, GetProcessTimes,
     InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ReleaseMutex, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
-    WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ReleaseMutex,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
-use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+use windows_sys::Win32::System::WindowsProgramming::{
+    DRIVE_REMOTE, PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
+};
 
 const HELPER_ARG: &str = "--mini-agent-windows-sandbox-helper-v1";
 const PROBE_ARG: &str = "--mini-agent-windows-sandbox-runtime-check";
@@ -2393,13 +2395,13 @@ fn launch_appcontainer(
     let handles = [stdin.raw(), stdout.raw(), stderr.raw()];
     let jobs = [job.raw()];
     let mut bytes = 0usize;
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 3, 0, &mut bytes) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 4, 0, &mut bytes) };
     if bytes == 0 {
         return Err(last_error("size restricted process attribute list"));
     }
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let list = storage.as_mut_ptr().cast();
-    if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &mut bytes) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, 4, 0, &mut bytes) } == 0 {
         return Err(last_error("initialize restricted process attribute list"));
     }
     struct DeleteList(windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -2459,13 +2461,25 @@ fn launch_appcontainer(
     {
         return Err(last_error("set AppContainer security capabilities"));
     }
-    // This general launcher deliberately uses a standard zero-capability
-    // AppContainer. LPAC's ALL APPLICATION PACKAGES opt-out is reserved for
-    // the dedicated Rust JS worker: arbitrary configured Windows tools can
-    // depend on DLLs (notably the CLR) that are readable only through the
-    // normal packaged-application identity. Network still requires an
-    // explicit capability, and filesystem mutation remains limited to the
-    // exact ACL grants above.
+    // LPAC removes the ambient ALL APPLICATION PACKAGES identity. General
+    // Windows tools therefore receive only the explicit filesystem grants
+    // above; a tool whose runtime dependencies need broader access fails
+    // closed instead of inheriting the launcher's same-user authority.
+    let all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+    if unsafe {
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
+            (&all_packages_policy as *const u32).cast_mut().cast(),
+            size_of::<u32>(),
+            null_mut(),
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error("set LPAC all-application-packages policy"));
+    }
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -3007,7 +3021,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     }
     let _ = std::fs::remove_dir_all(&base);
     println!(
-        "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=pass explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated"
+        "WINDOWS_GENERAL_SANDBOX_PASS lpac=pass explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated"
     );
     Ok(0)
 }
@@ -3271,6 +3285,9 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
     if try_probe_write(&outside) {
         return Ok(91);
     }
+    if !current_token_is_lpac()? {
+        return Ok(102);
+    }
     let mut flags = 0u32;
     if unsafe { GetHandleInformation(omitted_handle as HANDLE, &mut flags) } != 0 {
         return Ok(97);
@@ -3531,6 +3548,32 @@ fn try_probe_write(path: &Path) -> bool {
         .open(path)
         .and_then(|mut file| file.write_all(b"denied\n"))
         .is_ok()
+}
+
+fn current_token_is_lpac() -> Result<bool, String> {
+    let mut raw_token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
+        return Err(last_error("open authority-probe token"));
+    }
+    let token = Handle::created(raw_token, "authority-probe token")?;
+    let mut value = 0u32;
+    let mut returned = 0u32;
+    if unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenIsLessPrivilegedAppContainer,
+            (&mut value as *mut u32).cast(),
+            size_of::<u32>() as u32,
+            &mut returned,
+        )
+    } == 0
+    {
+        return Err(last_error("read TokenIsLessPrivilegedAppContainer"));
+    }
+    if returned != size_of::<u32>() as u32 {
+        return Err("TokenIsLessPrivilegedAppContainer returned an invalid size".into());
+    }
+    Ok(value != 0)
 }
 
 fn process_token_is_acquirable(pid: u32, outside: &Path) -> bool {
