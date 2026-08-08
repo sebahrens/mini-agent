@@ -2600,8 +2600,8 @@ mod sandbox_tests {
             "PROTECTED_DACL_SECURITY_INFORMATION",
             "network=denied",
             "registry=not_isolated",
-            "TokenIsLessPrivilegedAppContainer",
             "current_token_is_regular_appcontainer",
+            "regular AppContainer ALL_APPLICATION_PACKAGES access",
             "appcontainer=regular",
         ] {
             assert!(
@@ -2613,6 +2613,7 @@ mod sandbox_tests {
         assert!(!source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
         assert!(!source.contains("GetHandleInformation(omitted_handle as HANDLE"));
         assert!(!source.contains("run_authority_probe(args).unwrap_or(97)"));
+        assert!(!source.contains("TokenIsLessPrivilegedAppContainer"));
         assert!(source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
         assert!(source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
         assert!(
@@ -2648,8 +2649,10 @@ mod sandbox_tests {
         assert!(!source.contains("CreateRestrictedToken"));
         assert!(!source.contains("WRITE_RESTRICTED"));
         assert!(!source.contains("RegOverridePredefKey"));
-        assert!(source.contains("Keep it unavailable until a"));
-        assert!(source.contains("cached production preflight exists"));
+        assert!(source.contains("static GENERAL_SANDBOX_AVAILABLE: OnceLock<bool>"));
+        assert!(source.contains("GENERAL_SANDBOX_AVAILABLE.get_or_init"));
+        assert!(source.contains("fn run_production_preflight() -> Result<(), String>"));
+        assert!(source.contains("if !is_available() || !is_available()"));
 
         let update = source
             .split("fn update_handle_ace(")

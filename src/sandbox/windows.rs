@@ -21,6 +21,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::ptr::{null, null_mut};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
@@ -30,8 +31,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetExplicitEntriesFromAclW, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_OBJECT_TYPE,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetExplicitEntriesFromAclW,
+    GetSecurityInfo, REVOKE_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT, SE_OBJECT_TYPE,
     SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID,
     TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
@@ -40,14 +42,15 @@ use windows_sys::Win32::Security::Isolation::{
     DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
 };
 use windows_sys::Win32::Security::{
-    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DuplicateTokenEx, EqualSid, FreeSid,
-    GetTokenInformation, ImpersonateLoggedOnUser, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, RevertToSelf,
-    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES,
-    SecurityImpersonation, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
-    TOKEN_APPCONTAINER_INFORMATION, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
-    TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenImpersonation,
-    TokenIsLessPrivilegedAppContainer, TokenUser,
+    AccessCheck, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DuplicateToken,
+    DuplicateTokenEx, EqualSid, FreeSid, GENERIC_MAPPING, GetTokenInformation,
+    ImpersonateLoggedOnUser, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+    RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR,
+    SID_AND_ATTRIBUTES, SecurityImpersonation, SetSecurityDescriptorDacl,
+    SetSecurityDescriptorOwner, TOKEN_APPCONTAINER_INFORMATION, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid,
+    TokenCapabilities, TokenImpersonation, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
@@ -73,7 +76,7 @@ use windows_sys::Win32::System::StationsAndDesktops::{
     GetUserObjectInformationW, HDESK, HWINSTA, UOI_NAME,
 };
 use windows_sys::Win32::System::SystemServices::{
-    JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE, JOB_OBJECT_UILIMIT_ALL,
+    JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE, JOB_OBJECT_UILIMIT_ALL, MAXIMUM_ALLOWED,
     PROCESS_MITIGATION_CHILD_PROCESS_POLICY, SECURITY_DESCRIPTOR_REVISION,
 };
 use windows_sys::Win32::System::Threading::{
@@ -186,6 +189,7 @@ const HELPER_STAGE_CLEANUP: u8 = 19;
 
 static ACTIVE_REQUEST_FEEDERS: AtomicUsize = AtomicUsize::new(0);
 static HELPER_STAGE: AtomicU8 = AtomicU8::new(HELPER_STAGE_REQUEST);
+static GENERAL_SANDBOX_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 fn mark_helper_stage(stage: u8) {
     HELPER_STAGE.store(stage, Ordering::Release);
@@ -378,11 +382,62 @@ impl Drop for PrivateDesktop {
 }
 
 pub(crate) fn is_available() -> bool {
-    // Availability is an operational claim, not a compile-time one. The current backend needs a
-    // real restricted launch to prove its token, desktop, and creation-time Job boundary, and the
-    // production startup path has no side-effect-free way to do that. Keep it unavailable until a
-    // cached production preflight exists; the hidden hosted probe remains directly invokable.
-    false
+    *GENERAL_SANDBOX_AVAILABLE.get_or_init(|| run_production_preflight().is_ok())
+}
+
+struct TemporaryPreflightRoot(PathBuf);
+
+impl Drop for TemporaryPreflightRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run_production_preflight() -> Result<(), String> {
+    let root = TemporaryPreflightRoot(std::env::temp_dir().join(format!(
+        "mini-agent-windows-sandbox-preflight-{}",
+        uuid::Uuid::new_v4()
+    )));
+    let workspace = root.0.join("workspace");
+    let cache = root.0.join("cache");
+    let outside = root.0.join("outside");
+    std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&outside).map_err(|error| error.to_string())?;
+
+    let inside_file = workspace.join("inside.txt");
+    let cache_fixture = cache.join("read-only-cache.txt");
+    let outside_secret = outside.join("secret.txt");
+    let outside_file = outside.join("outside.txt");
+    std::fs::write(&cache_fixture, b"cache-readable").map_err(|error| error.to_string())?;
+    std::fs::write(&outside_secret, b"outside-secret").map_err(|error| error.to_string())?;
+    let executable = canonical_file(
+        &std::env::current_exe().map_err(|error| error.to_string())?,
+        "production preflight executable",
+    )?;
+    let cleanup_ready = workspace.join("cleanup-ready.txt");
+    let mut command = build_helper_with_ready(
+        executable.clone(),
+        vec![
+            TARGET_PROBE_ARG.into(),
+            TARGET_BOUNDARY_ARG.into(),
+            inside_file.to_string_lossy().into_owned(),
+            cache_fixture.to_string_lossy().into_owned(),
+            outside_secret.to_string_lossy().into_owned(),
+            outside_file.to_string_lossy().into_owned(),
+        ],
+        &workspace,
+        &cache,
+        Some(cleanup_ready.clone()),
+    )?;
+    let output = command
+        .as_std_mut()
+        .output_guarded()
+        .map_err(|error| format!("run production AppContainer preflight: {error}"))?;
+    if !output.status.success() || !inside_file.exists() || outside_file.exists() {
+        return Err("production AppContainer preflight denied its declared boundary".into());
+    }
+    attest_completed_cleanup(&cleanup_ready, [&workspace, &cache, executable.as_path()])
 }
 
 pub(crate) fn build_shell_helper(
@@ -3381,6 +3436,9 @@ fn run_runtime_probe() -> Result<i32, String> {
         return Err("parent death did not kill the restricted Job tree".into());
     }
     let _ = std::fs::remove_dir_all(&base);
+    if !is_available() || !is_available() {
+        return Err("cached production AppContainer preflight failed".into());
+    }
     println!(
         "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated"
     );
@@ -3936,28 +3994,68 @@ fn current_token_is_regular_appcontainer() -> Result<bool, String> {
         return Ok(false);
     }
     let mut raw_token = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
-        return Err(last_error("open authority-probe token"));
-    }
-    let token = Handle::created(raw_token, "authority-probe token")?;
-    let mut value = 0u32;
-    let mut returned = 0u32;
     if unsafe {
-        GetTokenInformation(
-            token.raw(),
-            TokenIsLessPrivilegedAppContainer,
-            (&mut value as *mut u32).cast(),
-            size_of::<u32>() as u32,
-            &mut returned,
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut raw_token,
         )
     } == 0
     {
-        return Err(last_error("read TokenIsLessPrivilegedAppContainer"));
+        return Err(last_error("open authority-probe token"));
     }
-    if returned != size_of::<u32>() as u32 {
-        return Err("TokenIsLessPrivilegedAppContainer returned an invalid size".into());
+    let token = Handle::created(raw_token, "authority-probe token")?;
+    let mut raw_impersonation = null_mut();
+    if unsafe { DuplicateToken(token.raw(), SecurityImpersonation, &mut raw_impersonation) } == 0 {
+        return Err(last_error(
+            "duplicate authority-probe token for access semantics",
+        ));
     }
-    Ok(value == 0)
+    let impersonation = Handle::created(raw_impersonation, "authority-probe impersonation token")?;
+
+    // A regular AppContainer participates in both ALL APPLICATION PACKAGES (AC) and ALL
+    // RESTRICTED APPLICATION PACKAGES; LPAC deliberately ignores AC. AccessCheck therefore
+    // distinguishes the effective token semantics without relying on the optional LPAC token
+    // information class.
+    let descriptor_sddl = wide_string("O:SYG:SYD:(A;;0x3;;;WD)(A;;0x1;;;AC)(A;;0x2;;;S-1-15-2-2)");
+    let mut raw_descriptor = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut raw_descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "construct regular AppContainer ALL_APPLICATION_PACKAGES access descriptor",
+        ));
+    }
+    let descriptor = Local(raw_descriptor);
+    let mapping = GENERIC_MAPPING::default();
+    let mut privilege_set = PRIVILEGE_SET::default();
+    let mut privilege_set_bytes = size_of::<PRIVILEGE_SET>() as u32;
+    let mut granted_access = 0u32;
+    let mut access_status = 0i32;
+    if unsafe {
+        AccessCheck(
+            descriptor.0,
+            impersonation.raw(),
+            MAXIMUM_ALLOWED,
+            &mapping,
+            &mut privilege_set,
+            &mut privilege_set_bytes,
+            &mut granted_access,
+            &mut access_status,
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "evaluate regular AppContainer ALL_APPLICATION_PACKAGES access",
+        ));
+    }
+    Ok(access_status != 0 && granted_access == 0x3)
 }
 
 fn process_token_is_acquirable(pid: u32, outside: &Path) -> bool {
