@@ -2772,10 +2772,17 @@ mod sandbox_tests {
         assert!(source.contains("TARGET_CONFIGURED_WAIT_ERROR_BASE: i32 = 0x2_0000"));
         assert!(source.contains("TARGET_CONFIGURED_STDIN_DUPLICATE_ERROR_BASE: i32 = 0x3_0000"));
         assert!(source.contains("TARGET_CONFIGURED_RAW_SPAWN_ERROR_BASE: i32 = 0x7_0000"));
+        assert!(source.contains("TARGET_CONFIGURED_EXECUTABLE_OPEN_ERROR_BASE: i32 = 0x8_0000"));
+        assert!(source.contains("TARGET_SELF_RAW_SPAWN_ERROR_BASE: i32 = 0x9_0000"));
+        assert!(source.contains("TARGET_JOB_LIMIT_QUERY_ERROR_BASE: i32 = 0xA_0000"));
+        assert!(source.contains("TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE: i32 = 0xB_0000"));
         assert!(source.contains("fn target_probe_os_error_code("));
         assert!(source.contains("fn target_probe_duplicate_handle("));
+        assert!(source.contains("fn target_probe_executable_access("));
+        assert!(source.contains("fn target_probe_job_status("));
         assert!(source.contains("fn target_probe_raw_spawn("));
         assert!(source.contains("GetProcessMitigationPolicy("));
+        assert!(source.contains("QueryInformationJobObject(\n            null_mut(),"));
         assert!(source.contains("let status = match child.wait()"));
         assert!(source.contains("return Ok(55);"));
         assert!(source.contains(".args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])"));

@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME, GENERIC_ALL,
-    GENERIC_READ, GetHandleInformation, HANDLE, LocalFree, TRUE, WAIT_ABANDONED_0, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    GENERIC_READ, GetHandleInformation, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE,
+    WAIT_ABANDONED_0, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
@@ -109,6 +109,10 @@ const TARGET_CONFIGURED_STDOUT_DUPLICATE_ERROR_BASE: i32 = 0x4_0000;
 const TARGET_CONFIGURED_STDERR_DUPLICATE_ERROR_BASE: i32 = 0x5_0000;
 const TARGET_CONFIGURED_POLICY_QUERY_ERROR_BASE: i32 = 0x6_0000;
 const TARGET_CONFIGURED_RAW_SPAWN_ERROR_BASE: i32 = 0x7_0000;
+const TARGET_CONFIGURED_EXECUTABLE_OPEN_ERROR_BASE: i32 = 0x8_0000;
+const TARGET_SELF_RAW_SPAWN_ERROR_BASE: i32 = 0x9_0000;
+const TARGET_JOB_LIMIT_QUERY_ERROR_BASE: i32 = 0xA_0000;
+const TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE: i32 = 0xB_0000;
 const TARGET_SLEEP_ARG: &str = "sleep";
 const TARGET_WRITE_ARG: &str = "write";
 const TARGET_PARENT_ARG: &str = "parent";
@@ -825,7 +829,73 @@ fn target_probe_duplicate_handle(source: *mut c_void, error_base: i32) -> Result
     Ok(())
 }
 
-fn target_probe_raw_spawn(tool: &Path) -> Result<i32, String> {
+fn target_probe_executable_access(tool: &Path) -> Result<i32, String> {
+    let path = wide_null(tool.as_os_str())?;
+    let raw = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        return Ok(target_probe_os_error_code(
+            TARGET_CONFIGURED_EXECUTABLE_OPEN_ERROR_BASE,
+            &error,
+        ));
+    }
+    unsafe { CloseHandle(raw) };
+    Ok(0)
+}
+
+fn target_probe_job_status() -> i32 {
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    if unsafe {
+        QueryInformationJobObject(
+            null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of_val(&limits) as u32,
+            null_mut(),
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return target_probe_os_error_code(TARGET_JOB_LIMIT_QUERY_ERROR_BASE, &error);
+    }
+    if limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS == 0 {
+        return 62;
+    }
+    if limits.BasicLimitInformation.ActiveProcessLimit < 2 {
+        return 63;
+    }
+
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    if unsafe {
+        QueryInformationJobObject(
+            null_mut(),
+            JobObjectBasicAccountingInformation,
+            (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            size_of_val(&accounting) as u32,
+            null_mut(),
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return target_probe_os_error_code(TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE, &error);
+    }
+    if accounting.ActiveProcesses >= limits.BasicLimitInformation.ActiveProcessLimit {
+        return 64;
+    }
+    0
+}
+
+fn target_probe_raw_spawn(tool: &Path, error_base: i32) -> Result<i32, String> {
     let application = wide_null(tool.as_os_str())?;
     let arguments = [TARGET_PROBE_ARG.to_string(), TARGET_NOOP_ARG.to_string()];
     let mut command_line = wide_string(&windows_command_line(tool, &arguments));
@@ -850,10 +920,7 @@ fn target_probe_raw_spawn(tool: &Path) -> Result<i32, String> {
     } == 0
     {
         let error = std::io::Error::last_os_error();
-        return Ok(target_probe_os_error_code(
-            TARGET_CONFIGURED_RAW_SPAWN_ERROR_BASE,
-            &error,
-        ));
+        return Ok(target_probe_os_error_code(error_base, &error));
     }
     unsafe { CloseHandle(information.hThread) };
     let process = Handle::created(information.hProcess, "own raw target-probe child")?;
@@ -941,7 +1008,22 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             if unsafe { policy.Anonymous.Flags } & 0b1 != 0 {
                 return Ok(58);
             }
-            let raw_status = target_probe_raw_spawn(&tool)?;
+            let job_status = target_probe_job_status();
+            if job_status != 0 {
+                return Ok(job_status);
+            }
+            let executable_status = target_probe_executable_access(&tool)?;
+            if executable_status != 0 {
+                return Ok(executable_status);
+            }
+            let current_executable = std::env::current_exe()
+                .map_err(|error| format!("resolve current target-probe executable: {error}"))?;
+            let self_status =
+                target_probe_raw_spawn(&current_executable, TARGET_SELF_RAW_SPAWN_ERROR_BASE)?;
+            if self_status != 0 {
+                return Ok(self_status);
+            }
+            let raw_status = target_probe_raw_spawn(&tool, TARGET_CONFIGURED_RAW_SPAWN_ERROR_BASE)?;
             if raw_status != 0 {
                 return Ok(raw_status);
             }
