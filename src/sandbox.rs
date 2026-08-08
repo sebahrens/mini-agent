@@ -2576,6 +2576,7 @@ mod sandbox_tests {
             "hardlink=denied",
             "unique_profile_crash=pass",
             "authority_escape=denied",
+            "authority probe failed: status=",
             "bounded_pipe=pass",
             "acl_serialization=pass",
             "parent_death_job=pass",

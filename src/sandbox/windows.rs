@@ -3247,16 +3247,20 @@ fn run_runtime_probe() -> Result<i32, String> {
         &workspace_b,
         &cache,
     )?;
-    if !authority_probe
+    let authority_result = authority_probe
         .as_std_mut()
         .output_guarded()
-        .map_err(|e| format!("run restricted authority probe: {e}"))?
-        .status
-        .success()
-        || authority_escape.exists()
-        || escaped_a.exists()
-    {
-        return Err("AppContainer target acquired launcher authority".into());
+        .map_err(|e| format!("run restricted authority probe: {e}"))?;
+    if !authority_result.status.success() || authority_escape.exists() || escaped_a.exists() {
+        return Err(format!(
+            "authority probe failed: status={} outside={} prior_workspace={}",
+            authority_result
+                .status
+                .code()
+                .map_or_else(|| String::from("none"), |code| code.to_string()),
+            authority_escape.exists(),
+            escaped_a.exists()
+        ));
     }
 
     let marker = workspace.join("parent-death-marker.txt");
