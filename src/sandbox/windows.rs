@@ -81,9 +81,9 @@ use windows_sys::Win32::System::Threading::{
     InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ReleaseMutex,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForMultipleObjects, WaitForSingleObject,
+    PROCESS_DUP_HANDLE, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
@@ -2421,6 +2421,91 @@ fn launch_appcontainer(
 ) -> Result<Handle, String> {
     let _creation = crate::process_creation::creation_guard()
         .map_err(|error| format!("lock Windows process creation: {error}"))?;
+    // Rust and other ordinary Windows runtimes prepare inherited standard handles by calling
+    // DuplicateHandle with GetCurrentProcess() as both the source and target process. The process
+    // object DACL produced from the launcher's primary token does not authorize the newly added
+    // AppContainer principal, so that otherwise routine self-duplication fails with access denied.
+    // Grant only PROCESS_DUP_HANDLE to this launch's unique package SID. Descendants share the
+    // sandbox identity and Job; no helper, parent, token, VM, or process-creation authority is
+    // added.
+    let user = current_user_sid_buffer()?;
+    let user_sid = token_user_sid(&user);
+    if user_sid.is_null() {
+        return Err("sandbox: current token user SID was null".into());
+    }
+    let process_entries = [
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: 0,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: user_sid.cast(),
+            },
+        },
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: PROCESS_DUP_HANDLE,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: 0,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: appcontainer_sid.cast(),
+            },
+        },
+    ];
+    let mut process_dacl = null_mut();
+    let result = unsafe {
+        SetEntriesInAclW(
+            process_entries.len() as u32,
+            process_entries.as_ptr(),
+            null(),
+            &mut process_dacl,
+        )
+    };
+    if result != 0 || process_dacl.is_null() {
+        return Err(format!(
+            "sandbox: construct AppContainer target process DACL: code {result}"
+        ));
+    }
+    let _process_dacl = Local(process_dacl.cast());
+    let mut process_descriptor = SECURITY_DESCRIPTOR::default();
+    if unsafe {
+        InitializeSecurityDescriptor(
+            (&mut process_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+            SECURITY_DESCRIPTOR_REVISION,
+        )
+    } == 0
+        || unsafe {
+            SetSecurityDescriptorOwner(
+                (&mut process_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                user_sid,
+                0,
+            )
+        } == 0
+        || unsafe {
+            SetSecurityDescriptorDacl(
+                (&mut process_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                TRUE,
+                process_dacl,
+                0,
+            )
+        } == 0
+    {
+        return Err(last_error(
+            "construct AppContainer target process security descriptor",
+        ));
+    }
+    let process_attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: (&mut process_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+        bInheritHandle: 0,
+    };
     let stdout = inheritable_duplicate(std::io::stdout().as_raw_handle())?;
     let stderr = inheritable_duplicate(std::io::stderr().as_raw_handle())?;
     let stdin = inheritable_null_input()?;
@@ -2536,7 +2621,7 @@ fn launch_appcontainer(
             token.raw(),
             application.as_ptr(),
             command_line.as_mut_ptr(),
-            null(),
+            &process_attributes,
             null(),
             TRUE,
             CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,

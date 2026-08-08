@@ -290,7 +290,10 @@ only duplicated stdout/stderr plus a `NUL` stdin through an explicit handle list
 Job attribute closes the assignment race. `CreateProcessAsUserW` combines the caller's primary
 token with the AppContainer security-capabilities attribute and does not elevate or configure
 machine-wide firewall policy. General commands retain descendant authority inside the bounded Job;
-no child-process-restricted flag is set.
+no child-process-restricted flag is set. The target process object's DACL grants its unique
+per-launch AppContainer SID only `PROCESS_DUP_HANDLE`, which lets ordinary Windows runtimes prepare
+inherited standard handles for descendants without granting token, VM, helper-process, or
+out-of-Job creation authority.
 
 ## Acceptance criteria
 
