@@ -2580,6 +2580,8 @@ mod sandbox_tests {
             "HELPER_FAILURE_STATUS_BASE",
             "HELPER_STAGE_VERIFY_DESCENDANT",
             "helper_failure_status()",
+            "AUTHORITY_DESCENDANT_SPAWN_FAILED",
+            "completed_process_exit_code(&child)?",
             "bounded_pipe=pass",
             "acl_serialization=pass",
             "parent_death_job=pass",

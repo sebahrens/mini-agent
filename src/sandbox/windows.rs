@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME, GENERIC_ALL,
     GENERIC_READ, GetHandleInformation, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE,
-    WAIT_ABANDONED_0, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WAIT_ABANDONED_0, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
@@ -113,6 +113,9 @@ const TARGET_SELF_RAW_SPAWN_ERROR_BASE: i32 = 0x9_0000;
 const TARGET_JOB_LIMIT_QUERY_ERROR_BASE: i32 = 0xA_0000;
 const TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE: i32 = 0xB_0000;
 const TARGET_SELF_TOKEN_OPEN_ERROR_BASE: i32 = 0xC_0000;
+const AUTHORITY_DESCENDANT_SPAWN_FAILED: i32 = 103;
+const AUTHORITY_DESCENDANT_WAIT_FAILED: i32 = 104;
+const AUTHORITY_DESCENDANT_NO_EXIT_CODE: i32 = 105;
 // The regular AppContainer supplies the Windows system-resource access required for descendant
 // creation, so retain the Job's complete UI lockdown in addition to the private desktop.
 const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_ALL;
@@ -1303,9 +1306,14 @@ fn run_helper() -> Result<i32, String> {
     if let Some((ready, release)) = descendant_rendezvous {
         mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
         if let Err(error) = verify_descendant_rendezvous(&job, &child, &ready, &release) {
+            let target_exit = completed_process_exit_code(&child)?;
             terminate_and_drain_job(&job, 126)?;
             grants.mark_job_quiescent();
             grants.cleanup()?;
+            if let Some(code) = target_exit.filter(|code| *code != 0) {
+                return i32::try_from(code)
+                    .map_err(|_| "sandbox target returned an invalid exit code".to_string());
+            }
             return Err(error);
         }
     }
@@ -3631,14 +3639,23 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
         return Ok(90);
     }
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let descendant = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg(DESCENDANT_PROBE_ARG)
         .arg(&descendant_ready)
-        .arg(&descendant_release)
-        .status_guarded()
-        .map_err(|error| format!("run AppContainer descendant probe: {error}"))?;
+        .arg(&descendant_release);
+    let mut descendant = match command.spawn_guarded() {
+        Ok(descendant) => descendant,
+        Err(_) => return Ok(AUTHORITY_DESCENDANT_SPAWN_FAILED),
+    };
+    let descendant = match descendant.wait() {
+        Ok(status) => status,
+        Err(_) => return Ok(AUTHORITY_DESCENDANT_WAIT_FAILED),
+    };
     if !descendant.success() {
-        return Ok(99);
+        return Ok(descendant
+            .code()
+            .unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE));
     }
     let mut breakaway = Command::new(
         std::env::current_exe().map_err(|error| format!("locate breakaway probe: {error}"))?,
@@ -3942,6 +3959,21 @@ fn process_token_is_acquirable(pid: u32, outside: &Path) -> bool {
     // Obtaining TOKEN_DUPLICATE authority over a trusted token is itself a containment failure,
     // even if a later API happens to reject this particular impersonation attempt.
     true
+}
+
+fn completed_process_exit_code(process: &Handle) -> Result<Option<u32>, String> {
+    match unsafe { WaitForSingleObject(process.raw(), 0) } {
+        WAIT_OBJECT_0 => {
+            let mut code = 0u32;
+            if unsafe { GetExitCodeProcess(process.raw(), &mut code) } == 0 {
+                return Err(last_error("read completed sandbox target exit code"));
+            }
+            Ok(Some(code))
+        }
+        WAIT_TIMEOUT => Ok(None),
+        WAIT_FAILED => Err(last_error("query sandbox target completion")),
+        _ => Err("sandbox: target completion returned an invalid wait result".into()),
+    }
 }
 
 fn wait_for_probe_file(path: &Path) -> Result<(), String> {
