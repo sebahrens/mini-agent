@@ -1366,6 +1366,21 @@ fn run_helper() -> Result<i32, String> {
         grants.cleanup()?;
         return Err(error);
     }
+    match process_token_is_regular_appcontainer(child.raw()) {
+        Ok(true) => {}
+        Ok(false) => {
+            terminate_and_drain_job(&job, 126)?;
+            grants.mark_job_quiescent();
+            grants.cleanup()?;
+            return Err("sandbox: restricted process token was not a regular AppContainer".into());
+        }
+        Err(error) => {
+            terminate_and_drain_job(&job, 126)?;
+            grants.mark_job_quiescent();
+            grants.cleanup()?;
+            return Err(error);
+        }
+    }
     if let Some((ready, release)) = descendant_rendezvous {
         mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
         if let Err(error) = verify_descendant_rendezvous(&job, &child, &ready, &release) {
@@ -3708,10 +3723,10 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     if try_probe_write(&outside) {
         return 91;
     }
-    let Ok(is_regular_appcontainer) = current_token_is_regular_appcontainer() else {
+    let Ok(is_appcontainer) = current_token_is_appcontainer() else {
         return AUTHORITY_TOKEN_QUERY_ERROR;
     };
-    if !is_regular_appcontainer {
+    if !is_appcontainer {
         return 102;
     }
     // Handle values are process-local. Signaling the candidate proves object identity to the
@@ -3805,7 +3820,7 @@ fn run_descendant_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
     if args.next().is_some() {
         return Err("unexpected descendant probe argument".into());
     }
-    if !current_token_has_zero_capabilities()? || !current_token_is_regular_appcontainer()? {
+    if !current_token_has_zero_capabilities()? || !current_token_is_appcontainer()? {
         return Ok(2);
     }
     let proof = format!(
@@ -3989,29 +4004,40 @@ fn try_probe_write(path: &Path) -> bool {
         .is_ok()
 }
 
-fn current_token_is_regular_appcontainer() -> Result<bool, String> {
-    if !current_token_is_appcontainer()? {
-        return Ok(false);
-    }
+fn process_token_is_regular_appcontainer(process: HANDLE) -> Result<bool, String> {
     let mut raw_token = null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw_token) } == 0 {
+        return Err(last_error("open restricted process token"));
+    }
+    let token = Handle::created(raw_token, "restricted process token")?;
+    let mut appcontainer = TOKEN_APPCONTAINER_INFORMATION::default();
+    let mut returned = 0u32;
     if unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_QUERY | TOKEN_DUPLICATE,
-            &mut raw_token,
+        GetTokenInformation(
+            token.raw(),
+            TokenAppContainerSid,
+            (&mut appcontainer as *mut TOKEN_APPCONTAINER_INFORMATION).cast(),
+            size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32,
+            &mut returned,
         )
     } == 0
     {
-        return Err(last_error("open authority-probe token"));
+        return Err(last_error("read restricted process AppContainer SID"));
     }
-    let token = Handle::created(raw_token, "authority-probe token")?;
+    if returned != size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32 {
+        return Err("restricted process AppContainer SID returned an invalid size".into());
+    }
+    if appcontainer.TokenAppContainer.is_null() {
+        return Ok(false);
+    }
     let mut raw_impersonation = null_mut();
     if unsafe { DuplicateToken(token.raw(), SecurityImpersonation, &mut raw_impersonation) } == 0 {
         return Err(last_error(
-            "duplicate authority-probe token for access semantics",
+            "duplicate restricted process token for access semantics",
         ));
     }
-    let impersonation = Handle::created(raw_impersonation, "authority-probe impersonation token")?;
+    let impersonation =
+        Handle::created(raw_impersonation, "restricted process impersonation token")?;
 
     // A regular AppContainer participates in both ALL APPLICATION PACKAGES (AC) and ALL
     // RESTRICTED APPLICATION PACKAGES; LPAC deliberately ignores AC. AccessCheck therefore

@@ -2600,7 +2600,7 @@ mod sandbox_tests {
             "PROTECTED_DACL_SECURITY_INFORMATION",
             "network=denied",
             "registry=not_isolated",
-            "current_token_is_regular_appcontainer",
+            "process_token_is_regular_appcontainer(child.raw())",
             "regular AppContainer ALL_APPLICATION_PACKAGES access",
             "appcontainer=regular",
         ] {
