@@ -2694,7 +2694,12 @@ fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fa
         }
         assert!(audit.rotation_anchor_count() >= 2);
     }
-    let last = audit_segments(&hash_owner).pop().unwrap();
+    let hash_segments = audit_segments(&hash_owner);
+    assert!(
+        hash_segments.len() >= 3,
+        "hash fixture did not create linked segments"
+    );
+    let last = hash_segments.last().unwrap();
     let mut bytes = std::fs::read(&last).unwrap();
     let marker = b"record_hash";
     let offset = bytes
