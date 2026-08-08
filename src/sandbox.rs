@@ -2568,7 +2568,10 @@ mod sandbox_tests {
             "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
             "JOB_OBJECT_LIMIT_ACTIVE_PROCESS",
             "JOB_OBJECT_LIMIT_PROCESS_MEMORY",
-            "JOB_OBJECT_UILIMIT_ALL",
+            "GENERAL_JOB_UI_RESTRICTIONS",
+            "JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS",
+            "JOB_OBJECT_UILIMIT_DESKTOP",
+            "JOB_OBJECT_UILIMIT_EXITWINDOWS",
             "env_clear()",
             "reject_reparse_components",
             "outside_write=denied",
@@ -2603,6 +2606,9 @@ mod sandbox_tests {
         assert!(source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
         assert!(source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
         assert!(source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
+        assert!(source.contains(
+            "const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS\n    | JOB_OBJECT_UILIMIT_DESKTOP\n    | JOB_OBJECT_UILIMIT_EXITWINDOWS;"
+        ));
         assert!(
             source.contains(".stdin(Stdio::from"),
             "helper requests must use inherited stdin, not argv/env/temp files"
@@ -2612,7 +2618,6 @@ mod sandbox_tests {
         assert!(!source.contains("S-1-5-21-3380456832"));
         assert!(!source.contains("SECURITY_CAPABILITY_INTERNET_CLIENT"));
         assert!(!source.contains("PROCESS_CREATION_CHILD_PROCESS_RESTRICTED"));
-        assert!(source.contains("SE_KERNEL_OBJECT"));
         assert!(!source.contains("DESKTOP_WRITEOBJECTS"));
         let root_policy = source
             .split("fn collect_read_roots(")
@@ -2666,24 +2671,6 @@ mod sandbox_tests {
         assert!(disarm < launch);
         assert!(helper.contains("verify_descendant_rendezvous(&job, &child"));
         assert!(helper.contains("terminate_and_drain_job(&job, 126)?;\n        grants.mark_job_quiescent();\n        grants.cleanup()?;"));
-
-        let appcontainer_launch = source
-            .split("fn launch_appcontainer(")
-            .nth(1)
-            .and_then(|source| source.split("fn inheritable_duplicate(").next())
-            .expect("AppContainer launch implementation missing");
-        let suspended = appcontainer_launch
-            .find("CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT")
-            .expect("AppContainer target must start suspended");
-        let token_grant = appcontainer_launch
-            .find("grant_descendant_token_access(&process, appcontainer_sid)?")
-            .expect("AppContainer token self-reproduction grant missing");
-        let resume = appcontainer_launch
-            .find("ResumeThread(thread.raw())")
-            .expect("AppContainer target resume missing");
-        assert!(suspended < token_grant && token_grant < resume);
-        assert!(appcontainer_launch.contains("READ_CONTROL | WRITE_DAC"));
-        assert!(appcontainer_launch.contains("TOKEN_DUPLICATE | TOKEN_IMPERSONATE"));
 
         let profile_creation = source
             .split("fn create_appcontainer_profile(")

@@ -278,7 +278,7 @@ closed.
 | Environment | The helper request travels only through inherited stdin. The target environment is cleared and rebuilt from `PATH`, `PATHEXT`, Windows system/shell variables, and non-credential locale/terminal variables. API keys, agent sockets, and credential variables are not forwarded. |
 | Network | No capability is supplied. Hosted proof requires zero `TokenCapabilities`, no current-SID loopback exemption, and AccessDenied for IPv4/IPv6 TCP and UDP against loopback and an external address. |
 | Registry | Host registry visibility is inherited. No registry virtualization or isolation is claimed. |
-| Devices/UI | Host-readable devices remain visible. The target receives a private per-launch desktop and the Job's full UI restriction mask. No broader Windows session, named-object, or broker-channel isolation is claimed. |
+| Devices/UI | Host-readable devices remain visible. The target receives a private per-launch desktop. The Job prevents creating/switching desktops, changing system parameters, and exiting Windows. Clipboard, global-atom, display-setting, and cross-Job USER-handle restrictions are not claimed because Windows' full UI lockdown rejects ordinary descendant creation. No broader Windows session, named-object, or broker-channel isolation is claimed. |
 
 The same-executable helper is fixed-function trusted code. Program, arguments, roots, and parent
 identity are length-bounded JSON on an anonymous pipe wired to helper stdin; a capped feeder starts
@@ -291,11 +291,9 @@ Job attribute closes the assignment race. `CreateProcessAsUserW` combines the ca
 token with the AppContainer security-capabilities attribute and does not elevate or configure
 machine-wide firewall policy. General commands retain descendant authority inside the bounded Job;
 the unrestricted helper sets `PROCESS_CREATION_CHILD_PROCESS_OVERRIDE` on the initial token rather
-than a child-process-restricted flag. The target starts suspended while the helper grants its unique
-package SID only `TOKEN_DUPLICATE | TOKEN_IMPERSONATE` on the synthesized LPAC primary-token object,
-then resumes it. This permits the Windows child-creation path to reproduce that same contained token
-without granting the package access to the helper token or another host process. Descendants still
-inherit the LPAC identity and the exact non-breakaway Job.
+than a child-process-restricted flag. The Job uses the descendant-compatible interactive UI mask
+(`SYSTEMPARAMETERS | DESKTOP | EXITWINDOWS`) used by Chromium for an LPAC process that must create a
+child. Descendants inherit the LPAC identity and the exact non-breakaway Job.
 
 ## Acceptance criteria
 

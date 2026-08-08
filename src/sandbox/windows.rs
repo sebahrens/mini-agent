@@ -31,9 +31,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetExplicitEntriesFromAclW, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
-    SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo,
-    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    GetExplicitEntriesFromAclW, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_OBJECT_TYPE,
+    SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -60,7 +60,8 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOB_OBJECT_LIMIT_PROCESS_TIME, JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
     JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
@@ -73,21 +74,20 @@ use windows_sys::Win32::System::StationsAndDesktops::{
     GetUserObjectInformationW, HDESK, HWINSTA, UOI_NAME,
 };
 use windows_sys::Win32::System::SystemServices::{
-    JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE, JOB_OBJECT_UILIMIT_ALL,
-    PROCESS_MITIGATION_CHILD_PROCESS_POLICY, SECURITY_DESCRIPTOR_REVISION,
+    JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE, PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
+    SECURITY_DESCRIPTOR_REVISION,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW,
-    CreateMutexW, CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexW,
+    CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
     GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
     OpenProcessToken, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    ProcessChildProcessPolicy, ReleaseMutex, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
-    WaitForSingleObject,
+    ProcessChildProcessPolicy, ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
@@ -115,6 +115,13 @@ const TARGET_SELF_RAW_SPAWN_ERROR_BASE: i32 = 0x9_0000;
 const TARGET_JOB_LIMIT_QUERY_ERROR_BASE: i32 = 0xA_0000;
 const TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE: i32 = 0xB_0000;
 const TARGET_SELF_TOKEN_OPEN_ERROR_BASE: i32 = 0xC_0000;
+// Chromium uses this exact "interactive" Job mask for its LPAC Media Foundation process when it
+// must create a contained child. The private desktop remains mandatory; this mask additionally
+// prevents creating/switching desktops, changing system parameters, and exiting Windows without
+// applying the UI-only lockdown flags that make Windows reject ordinary descendant creation.
+const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+    | JOB_OBJECT_UILIMIT_DESKTOP
+    | JOB_OBJECT_UILIMIT_EXITWINDOWS;
 const TARGET_SLEEP_ARG: &str = "sleep";
 const TARGET_WRITE_ARG: &str = "write";
 const TARGET_PARENT_ARG: &str = "parent";
@@ -2402,7 +2409,7 @@ fn bounded_job() -> Result<(Handle, String), String> {
         return Err(last_error("configure bounded sandbox Job"));
     }
     let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
-        UIRestrictionsClass: JOB_OBJECT_UILIMIT_ALL,
+        UIRestrictionsClass: GENERAL_JOB_UI_RESTRICTIONS,
     };
     if unsafe {
         SetInformationJobObject(
@@ -2570,7 +2577,7 @@ fn verify_job_limits(job: &Handle) -> Result<(), String> {
     {
         return Err(last_error("query restricted process Job UI limits"));
     }
-    if ui.UIRestrictionsClass != JOB_OBJECT_UILIMIT_ALL {
+    if ui.UIRestrictionsClass != GENERAL_JOB_UI_RESTRICTIONS {
         return Err("sandbox: restricted process Job UI limits differ from policy".into());
     }
     Ok(())
@@ -2786,7 +2793,7 @@ fn launch_appcontainer(
             null(),
             null(),
             TRUE,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_ptr().cast(),
             cwd.as_ptr(),
             &startup.StartupInfo,
@@ -2796,37 +2803,8 @@ fn launch_appcontainer(
     {
         return Err(last_error("launch creation-time-Job AppContainer process"));
     }
-    let thread = Handle::created(information.hThread, "own suspended AppContainer thread")?;
-    let process = Handle::created(information.hProcess, "own AppContainer process")?;
-    grant_descendant_token_access(&process, appcontainer_sid)?;
-    if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
-        let error = last_error("resume AppContainer process after token DACL grant");
-        unsafe { TerminateProcess(process.raw(), 126) };
-        return Err(error);
-    }
-    Ok(process)
-}
-
-fn grant_descendant_token_access(process: &Handle, appcontainer_sid: PSID) -> Result<(), String> {
-    let mut raw = null_mut();
-    if unsafe { OpenProcessToken(process.raw(), READ_CONTROL | WRITE_DAC, &mut raw) } == 0 {
-        return Err(last_error(
-            "open suspended AppContainer token for descendant authority",
-        ));
-    }
-    let token = Handle::created(raw, "own suspended AppContainer primary token")?;
-    // Windows process creation must be able to duplicate/impersonate the caller's primary token.
-    // LPAC's package SID is absent from the synthesized token object's default DACL, so grant the
-    // unique per-launch SID only those self-reproduction rights before untrusted code can run.
-    // This token is already LPAC and the grant does not apply to the helper or any host process.
-    update_handle_ace(
-        token.raw(),
-        SE_KERNEL_OBJECT,
-        appcontainer_sid,
-        GRANT_ACCESS,
-        TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
-        0,
-    )
+    unsafe { CloseHandle(information.hThread) };
+    Handle::created(information.hProcess, "own AppContainer process")
 }
 
 fn inheritable_duplicate(source: *mut c_void) -> Result<Handle, String> {
