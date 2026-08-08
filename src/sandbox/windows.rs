@@ -79,16 +79,18 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId,
     GetCurrentThreadId, GetExitCodeProcess, GetProcessId, GetProcessTimes,
     InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_DUP_HANDLE, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ReleaseMutex,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
 use windows_sys::Win32::System::WindowsProgramming::{
     DRIVE_REMOTE, PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
+    PROCESS_CREATION_CHILD_PROCESS_OVERRIDE,
 };
 
 const HELPER_ARG: &str = "--mini-agent-windows-sandbox-helper-v1";
@@ -2421,104 +2423,19 @@ fn launch_appcontainer(
 ) -> Result<Handle, String> {
     let _creation = crate::process_creation::creation_guard()
         .map_err(|error| format!("lock Windows process creation: {error}"))?;
-    // Rust and other ordinary Windows runtimes prepare inherited standard handles by calling
-    // DuplicateHandle with GetCurrentProcess() as both the source and target process. The process
-    // object DACL produced from the launcher's primary token does not authorize the newly added
-    // AppContainer principal, so that otherwise routine self-duplication fails with access denied.
-    // Grant only PROCESS_DUP_HANDLE to this launch's unique package SID. Descendants share the
-    // sandbox identity and Job; no helper, parent, token, VM, or process-creation authority is
-    // added.
-    let user = current_user_sid_buffer()?;
-    let user_sid = token_user_sid(&user);
-    if user_sid.is_null() {
-        return Err("sandbox: current token user SID was null".into());
-    }
-    let process_entries = [
-        EXPLICIT_ACCESS_W {
-            grfAccessPermissions: GENERIC_ALL,
-            grfAccessMode: SET_ACCESS,
-            grfInheritance: 0,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: null_mut(),
-                MultipleTrusteeOperation: 0,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_UNKNOWN,
-                ptstrName: user_sid.cast(),
-            },
-        },
-        EXPLICIT_ACCESS_W {
-            grfAccessPermissions: PROCESS_DUP_HANDLE,
-            grfAccessMode: SET_ACCESS,
-            grfInheritance: 0,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: null_mut(),
-                MultipleTrusteeOperation: 0,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_UNKNOWN,
-                ptstrName: appcontainer_sid.cast(),
-            },
-        },
-    ];
-    let mut process_dacl = null_mut();
-    let result = unsafe {
-        SetEntriesInAclW(
-            process_entries.len() as u32,
-            process_entries.as_ptr(),
-            null(),
-            &mut process_dacl,
-        )
-    };
-    if result != 0 || process_dacl.is_null() {
-        return Err(format!(
-            "sandbox: construct AppContainer target process DACL: code {result}"
-        ));
-    }
-    let _process_dacl = Local(process_dacl.cast());
-    let mut process_descriptor = SECURITY_DESCRIPTOR::default();
-    if unsafe {
-        InitializeSecurityDescriptor(
-            (&mut process_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-            SECURITY_DESCRIPTOR_REVISION,
-        )
-    } == 0
-        || unsafe {
-            SetSecurityDescriptorOwner(
-                (&mut process_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                user_sid,
-                0,
-            )
-        } == 0
-        || unsafe {
-            SetSecurityDescriptorDacl(
-                (&mut process_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                TRUE,
-                process_dacl,
-                0,
-            )
-        } == 0
-    {
-        return Err(last_error(
-            "construct AppContainer target process security descriptor",
-        ));
-    }
-    let process_attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: (&mut process_descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-        bInheritHandle: 0,
-    };
     let stdout = inheritable_duplicate(std::io::stdout().as_raw_handle())?;
     let stderr = inheritable_duplicate(std::io::stderr().as_raw_handle())?;
     let stdin = inheritable_null_input()?;
     let handles = [stdin.raw(), stdout.raw(), stderr.raw()];
     let jobs = [job.raw()];
     let mut bytes = 0usize;
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 4, 0, &mut bytes) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 5, 0, &mut bytes) };
     if bytes == 0 {
         return Err(last_error("size restricted process attribute list"));
     }
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let list = storage.as_mut_ptr().cast();
-    if unsafe { InitializeProcThreadAttributeList(list, 4, 0, &mut bytes) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, 5, 0, &mut bytes) } == 0 {
         return Err(last_error("initialize restricted process attribute list"));
     }
     struct DeleteList(windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -2597,6 +2514,25 @@ fn launch_appcontainer(
     {
         return Err(last_error("set LPAC all-application-packages policy"));
     }
+    // General tools are expected to create descendants. Make that authority explicit on the
+    // initial token: otherwise Windows may preserve an effective restricted-child policy and
+    // reject ordinary CreateProcess calls with ERROR_ACCESS_DENIED. The override is set by this
+    // unrestricted helper; descendants still inherit the LPAC identity and the non-breakaway Job.
+    let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_OVERRIDE;
+    if unsafe {
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
+            (&child_process_policy as *const u32).cast_mut().cast(),
+            size_of::<u32>(),
+            null_mut(),
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error("set general AppContainer child-process policy"));
+    }
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -2621,7 +2557,7 @@ fn launch_appcontainer(
             token.raw(),
             application.as_ptr(),
             command_line.as_mut_ptr(),
-            &process_attributes,
+            null(),
             null(),
             TRUE,
             CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,

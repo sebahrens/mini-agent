@@ -2601,11 +2601,8 @@ mod sandbox_tests {
         }
         assert!(source.contains("PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY"));
         assert!(source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
-        assert!(source.contains("PROCESS_DUP_HANDLE"));
-        assert!(source.contains("construct AppContainer target process DACL"));
-        assert!(source.contains("&process_attributes,"));
-        assert!(!source.contains("PROCESS_CREATE_PROCESS"));
-        assert!(!source.contains("PROCESS_VM_WRITE"));
+        assert!(source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
+        assert!(source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
         assert!(
             source.contains(".stdin(Stdio::from"),
             "helper requests must use inherited stdin, not argv/env/temp files"
