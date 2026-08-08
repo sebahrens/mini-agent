@@ -80,15 +80,15 @@ use windows_sys::Win32::System::SystemServices::{
     PROCESS_MITIGATION_CHILD_PROCESS_POLICY, SECURITY_DESCRIPTOR_REVISION,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexW,
-    CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW,
+    CreateMutexW, CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
     GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
     OpenProcessToken, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ProcessChildProcessPolicy, ReleaseMutex,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
     UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
@@ -1348,7 +1348,7 @@ fn run_helper() -> Result<i32, String> {
     }
     grants.disarm_for_launch();
     mark_helper_stage(HELPER_STAGE_LAUNCH);
-    let child = launch_appcontainer(
+    let child = match launch_appcontainer(
         &token,
         &job,
         &desktop,
@@ -1358,29 +1358,16 @@ fn run_helper() -> Result<i32, String> {
         &cwd,
         &cache,
         &grants.profile.storage,
-    )?;
-    mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
-    if let Err(error) = verify_job_membership_and_limits(&job, &child) {
-        terminate_and_drain_job(&job, 126)?;
-        grants.mark_job_quiescent();
-        grants.cleanup()?;
-        return Err(error);
-    }
-    match process_token_is_regular_appcontainer(child.raw()) {
-        Ok(true) => {}
-        Ok(false) => {
-            terminate_and_drain_job(&job, 126)?;
-            grants.mark_job_quiescent();
-            grants.cleanup()?;
-            return Err("sandbox: restricted process token was not a regular AppContainer".into());
-        }
+    ) {
+        Ok(child) => child,
         Err(error) => {
             terminate_and_drain_job(&job, 126)?;
             grants.mark_job_quiescent();
             grants.cleanup()?;
             return Err(error);
         }
-    }
+    };
+    mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
     if let Some((ready, release)) = descendant_rendezvous {
         mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
         if let Err(error) = verify_descendant_rendezvous(&job, &child, &ready, &release) {
@@ -2920,7 +2907,7 @@ fn launch_appcontainer(
             null(),
             null(),
             TRUE,
-            CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_ptr().cast(),
             cwd.as_ptr(),
             &startup.StartupInfo,
@@ -2930,8 +2917,33 @@ fn launch_appcontainer(
     {
         return Err(last_error("launch creation-time-Job AppContainer process"));
     }
-    unsafe { CloseHandle(information.hThread) };
-    Handle::created(information.hProcess, "own AppContainer process")
+    let process = Handle::created(information.hProcess, "own AppContainer process")?;
+    let thread = Handle::created(information.hThread, "own suspended AppContainer thread")?;
+    if let Err(error) = verify_job_membership_and_limits(job, &process) {
+        unsafe { TerminateProcess(process.raw(), 126) };
+        let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+        return Err(error);
+    }
+    match process_token_is_regular_appcontainer(process.raw()) {
+        Ok(true) => {}
+        Ok(false) => {
+            unsafe { TerminateProcess(process.raw(), 126) };
+            let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+            return Err("sandbox: restricted process token was not a regular AppContainer".into());
+        }
+        Err(error) => {
+            unsafe { TerminateProcess(process.raw(), 126) };
+            let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+            return Err(error);
+        }
+    }
+    if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
+        let error = last_error("resume attested AppContainer process");
+        unsafe { TerminateProcess(process.raw(), 126) };
+        let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+        return Err(error);
+    }
+    Ok(process)
 }
 
 fn inheritable_duplicate(source: *mut c_void) -> Result<Handle, String> {
