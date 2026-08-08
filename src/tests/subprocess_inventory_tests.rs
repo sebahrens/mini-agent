@@ -1267,7 +1267,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".spawn()",
-        6,
+        7,
         "TC-INTERNAL-VERIFICATION",
     ),
     (
@@ -1278,7 +1278,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        "let status = match Command::new(tool)",
+        "let mut child = match Command::new(tool)",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
@@ -1315,7 +1315,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".status()",
-        2,
+        1,
         "TC-INTERNAL-VERIFICATION",
     ),
     ("src/session/mod.rs", ".output()", 1, "TC-INTERNAL-GIT"),
@@ -2930,7 +2930,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".spawn()",
-        6,
+        7,
         "TC-INTERNAL-VERIFICATION",
     ),
     (
@@ -2941,7 +2941,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        "let status = match Command::new(tool)",
+        "let mut child = match Command::new(tool)",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
@@ -2978,7 +2978,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".status()",
-        2,
+        1,
         "TC-INTERNAL-VERIFICATION",
     ),
     (

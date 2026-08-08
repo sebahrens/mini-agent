@@ -2766,7 +2766,10 @@ mod sandbox_tests {
         assert!(runtime_probe.contains("std::fs::copy(&probe_executable, &configured_tool)"));
         assert!(runtime_probe.contains("configured AppContainer tool/root probe failed: status="));
         assert!(source.contains("return Ok(53);"));
-        assert!(source.contains("Err(_) => return Ok(54),"));
+        assert!(source.contains("TARGET_CONFIGURED_SPAWN_ERROR_BASE: i32 = 0x1_0000"));
+        assert!(source.contains("TARGET_CONFIGURED_WAIT_ERROR_BASE: i32 = 0x2_0000"));
+        assert!(source.contains("fn target_probe_os_error_code("));
+        assert!(source.contains("let status = match child.wait()"));
         assert!(source.contains("return Ok(55);"));
         assert!(source.contains(".args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])"));
         assert!(runtime_probe.contains(

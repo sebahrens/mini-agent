@@ -98,6 +98,8 @@ const TARGET_PROBE_ARG: &str = "--mini-agent-windows-sandbox-target-probe";
 const TARGET_BOUNDARY_ARG: &str = "boundary";
 const TARGET_CONFIGURED_ARG: &str = "configured";
 const TARGET_NOOP_ARG: &str = "noop";
+const TARGET_CONFIGURED_SPAWN_ERROR_BASE: i32 = 0x1_0000;
+const TARGET_CONFIGURED_WAIT_ERROR_BASE: i32 = 0x2_0000;
 const TARGET_SLEEP_ARG: &str = "sleep";
 const TARGET_WRITE_ARG: &str = "write";
 const TARGET_PARENT_ARG: &str = "parent";
@@ -785,6 +787,14 @@ fn target_probe_path(
         .ok_or_else(|| format!("missing Windows sandbox target-probe {label}"))
 }
 
+fn target_probe_os_error_code(base: i32, error: &std::io::Error) -> i32 {
+    let raw = error
+        .raw_os_error()
+        .and_then(|code| u16::try_from(code).ok())
+        .unwrap_or(u16::MAX);
+    base | i32::from(raw)
+}
+
 fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
     let operation = args
         .next()
@@ -818,12 +828,26 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             if contents != b"configured-read" {
                 return Ok(51);
             }
-            let status = match Command::new(tool)
+            let mut child = match Command::new(tool)
                 .args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])
-                .status_guarded()
+                .spawn_guarded()
             {
+                Ok(child) => child,
+                Err(error) => {
+                    return Ok(target_probe_os_error_code(
+                        TARGET_CONFIGURED_SPAWN_ERROR_BASE,
+                        &error,
+                    ));
+                }
+            };
+            let status = match child.wait() {
                 Ok(status) => status,
-                Err(_) => return Ok(54),
+                Err(error) => {
+                    return Ok(target_probe_os_error_code(
+                        TARGET_CONFIGURED_WAIT_ERROR_BASE,
+                        &error,
+                    ));
+                }
             };
             if !status.success() {
                 return Ok(52);
