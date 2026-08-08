@@ -50,7 +50,7 @@ use windows_sys::Win32::Security::{
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetSecurityDescriptorDacl,
     SetSecurityDescriptorOwner, TOKEN_APPCONTAINER_INFORMATION, TOKEN_ASSIGN_PRIMARY,
     TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid,
-    TokenCapabilities, TokenImpersonation, TokenUser,
+    TokenCapabilities, TokenImpersonation, TokenIsAppContainer, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
@@ -3865,27 +3865,83 @@ fn run_descendant_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
     Ok(0)
 }
 
+fn token_is_appcontainer(token: &Handle, context: &str) -> Result<bool, String> {
+    let mut value = 0u32;
+    let mut returned = 0u32;
+    if unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenIsAppContainer,
+            (&mut value as *mut u32).cast(),
+            size_of::<u32>() as u32,
+            &mut returned,
+        )
+    } == 0
+    {
+        return Err(last_error(context));
+    }
+    if returned != size_of::<u32>() as u32 {
+        return Err(format!("{context}: invalid token value size"));
+    }
+    Ok(value != 0)
+}
+
+struct TokenAppContainerInformation {
+    storage: Vec<usize>,
+}
+
+impl TokenAppContainerInformation {
+    fn sid(&self) -> PSID {
+        let information = unsafe {
+            &*(self
+                .storage
+                .as_ptr()
+                .cast::<TOKEN_APPCONTAINER_INFORMATION>())
+        };
+        information.TokenAppContainer
+    }
+}
+
+fn token_appcontainer_information(token: &Handle) -> Result<TokenAppContainerInformation, String> {
+    let mut bytes = 0u32;
+    unsafe {
+        GetTokenInformation(token.raw(), TokenAppContainerSid, null_mut(), 0, &mut bytes);
+    }
+    if bytes < size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32 || bytes > 64 * 1024 {
+        return Err("sandbox: invalid TokenAppContainerSid size".into());
+    }
+    let mut storage = vec![0usize; (bytes as usize).div_ceil(size_of::<usize>())];
+    let capacity = (storage.len() * size_of::<usize>()) as u32;
+    let mut returned = capacity;
+    if unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenAppContainerSid,
+            storage.as_mut_ptr().cast(),
+            capacity,
+            &mut returned,
+        )
+    } == 0
+    {
+        return Err(last_error("read current AppContainer SID"));
+    }
+    if returned < size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32 || returned > capacity {
+        return Err("sandbox: invalid returned TokenAppContainerSid size".into());
+    }
+    let information = TokenAppContainerInformation { storage };
+    if information.sid().is_null() {
+        return Err("sandbox: current token had no AppContainer SID".into());
+    }
+    Ok(information)
+}
+
 fn current_token_is_appcontainer() -> Result<bool, String> {
     let mut raw = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
         return Err(last_error("open descendant AppContainer token"));
     }
     let token = Handle::created(raw, "open descendant AppContainer token")?;
-    let mut information = TOKEN_APPCONTAINER_INFORMATION::default();
-    let mut bytes = 0u32;
-    if unsafe {
-        GetTokenInformation(
-            token.raw(),
-            TokenAppContainerSid,
-            (&mut information as *mut TOKEN_APPCONTAINER_INFORMATION).cast(),
-            size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32,
-            &mut bytes,
-        )
-    } == 0
-    {
-        return Err(last_error("read descendant AppContainer SID"));
-    }
-    Ok(!information.TokenAppContainer.is_null())
+    token_is_appcontainer(&token, "read descendant TokenIsAppContainer")
 }
 
 fn current_appcontainer_has_no_loopback_exemption() -> Result<bool, String> {
@@ -3894,21 +3950,7 @@ fn current_appcontainer_has_no_loopback_exemption() -> Result<bool, String> {
         return Err(last_error("open AppContainer token for loopback proof"));
     }
     let token = Handle::created(raw, "open AppContainer token for loopback proof")?;
-    let mut information = TOKEN_APPCONTAINER_INFORMATION::default();
-    let mut bytes = 0u32;
-    if unsafe {
-        GetTokenInformation(
-            token.raw(),
-            TokenAppContainerSid,
-            (&mut information as *mut TOKEN_APPCONTAINER_INFORMATION).cast(),
-            size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32,
-            &mut bytes,
-        )
-    } == 0
-        || information.TokenAppContainer.is_null()
-    {
-        return Err(last_error("read current AppContainer SID"));
-    }
+    let appcontainer = token_appcontainer_information(&token)?;
     let mut count = 0u32;
     let mut entries: *mut SID_AND_ATTRIBUTES = null_mut();
     let result = unsafe { NetworkIsolationGetAppContainerConfig(&mut count, &mut entries) };
@@ -3938,9 +3980,7 @@ fn current_appcontainer_has_no_loopback_exemption() -> Result<bool, String> {
     let entries = LoopbackEntries { count, entries };
     for index in 0..count as usize {
         let candidate = unsafe { (*entries.entries.add(index)).Sid };
-        if !candidate.is_null()
-            && unsafe { EqualSid(information.TokenAppContainer, candidate) } != 0
-        {
+        if !candidate.is_null() && unsafe { EqualSid(appcontainer.sid(), candidate) } != 0 {
             return Ok(false);
         }
     }
@@ -4033,24 +4073,7 @@ fn process_token_is_regular_appcontainer(process: HANDLE) -> Result<bool, String
     }
     let token = Handle::created(raw_token, "restricted process token")?;
     mark_helper_stage(HELPER_STAGE_REGULAR_TOKEN_SID);
-    let mut appcontainer = TOKEN_APPCONTAINER_INFORMATION::default();
-    let mut returned = 0u32;
-    if unsafe {
-        GetTokenInformation(
-            token.raw(),
-            TokenAppContainerSid,
-            (&mut appcontainer as *mut TOKEN_APPCONTAINER_INFORMATION).cast(),
-            size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32,
-            &mut returned,
-        )
-    } == 0
-    {
-        return Err(last_error("read restricted process AppContainer SID"));
-    }
-    if returned != size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32 {
-        return Err("restricted process AppContainer SID returned an invalid size".into());
-    }
-    if appcontainer.TokenAppContainer.is_null() {
+    if !token_is_appcontainer(&token, "read restricted process TokenIsAppContainer")? {
         return Ok(false);
     }
     mark_helper_stage(HELPER_STAGE_REGULAR_TOKEN_DUPLICATE);

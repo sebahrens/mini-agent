@@ -2605,6 +2605,7 @@ mod sandbox_tests {
             "process_token_is_regular_appcontainer(process.raw())",
             "ResumeThread(thread.raw())",
             "regular AppContainer ALL_APPLICATION_PACKAGES access",
+            "TokenIsAppContainer",
             "appcontainer=regular",
         ] {
             assert!(
