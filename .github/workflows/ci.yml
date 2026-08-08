@@ -2,6 +2,15 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Jobs to run
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - windows-general-sandbox
   push:
     branches:
       - main
@@ -27,7 +36,7 @@ concurrency:
 
 jobs:
   fmt:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,7 +71,7 @@ jobs:
           python3 scripts/check_workspace_boundaries.py
 
   clippy:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -94,7 +103,7 @@ jobs:
         run: cargo clippy --locked ${{ matrix.features }} -- -D warnings -A dead-code
 
   test:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -160,7 +169,7 @@ jobs:
   # and downloading the runtime makes the job slow and network-dependent. Failure
   # here signals that `skills-embed` needs attention; it does not block the build.
   skills-embed-optional:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
@@ -173,7 +182,7 @@ jobs:
         run: cargo test --locked --no-default-features --features skills-embed
 
   linux-sandbox-policy:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -351,7 +360,7 @@ jobs:
           if-no-files-found: error
 
   macos-worker-containment-gate:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -513,7 +522,7 @@ jobs:
           if-no-files-found: error
 
   windows-worker-launcher-unit:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -563,7 +572,7 @@ jobs:
           windows_production_ -- --nocapture --test-threads=1
 
   windows-general-sandbox-policy:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -604,7 +613,7 @@ jobs:
           }
 
   windows-worker-containment-gate:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1255,7 +1264,7 @@ jobs:
           }
 
   phase6-cross-platform-gate:
-    if: always() && github.event_name != 'schedule'
+    if: always() && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs:
       - linux-sandbox-policy
       - macos-worker-containment-gate
@@ -1316,7 +1325,7 @@ jobs:
           if-no-files-found: error
 
   platform-paths:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1406,7 +1415,7 @@ jobs:
           if-no-files-found: error
 
   platform-path-negative-controls:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1458,7 +1467,7 @@ jobs:
           if-no-files-found: error
 
   platform-path-install-smoke:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1566,7 +1575,7 @@ jobs:
           if-no-files-found: error
 
   mcp-stdio:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1593,7 +1602,7 @@ jobs:
         run: cargo test --locked --no-default-features --features mcp mcp_stdio_failure_cleanup
 
   lsp-lifecycle:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1609,7 +1618,7 @@ jobs:
         run: cargo test --locked --no-default-features --features lsp lsp_process
 
   install:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1630,7 +1639,7 @@ jobs:
         run: cargo install --locked --path . --debug
 
   package:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1654,6 +1663,7 @@ jobs:
           "$tmpdir/install/bin/mini-agent" --version | grep -Fq "mini-agent "
 
   dependency-policy:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

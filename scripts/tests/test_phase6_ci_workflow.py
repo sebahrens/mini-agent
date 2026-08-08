@@ -50,6 +50,24 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("      - main\n", push_header)
         self.assertIn("      - phase6-integration\n", push_header)
 
+    def test_manual_windows_general_probe_dispatch_skips_every_other_job(self) -> None:
+        dispatch_header = self.workflow.split("  push:", 1)[0]
+        self.assertIn("scope:", dispatch_header)
+        self.assertIn("windows-general-sandbox", dispatch_header)
+
+        jobs = re.findall(
+            r"(?m)^  ([a-zA-Z0-9_-]+):$",
+            self.workflow.split("jobs:\n", 1)[1],
+        )
+        self.assertIn("windows-general-sandbox-policy", jobs)
+        for job in jobs:
+            condition = job_body(self.workflow, job).splitlines()[0].strip()
+            with self.subTest(job=job):
+                if job == "windows-general-sandbox-policy":
+                    self.assertIn("inputs.scope == 'windows-general-sandbox'", condition)
+                else:
+                    self.assertIn("inputs.scope != 'windows-general-sandbox'", condition)
+
     def test_each_platform_gate_runs_real_probe_and_both_feature_rows(self) -> None:
         requirements = {
             "linux-sandbox-policy": (
