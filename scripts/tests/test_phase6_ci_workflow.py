@@ -68,6 +68,12 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 else:
                     self.assertIn("inputs.scope != 'windows-general-sandbox'", condition)
 
+        windows_job = job_body(self.workflow, "windows-general-sandbox-policy")
+        source_step = windows_job.split(
+            "name: Test AppContainer source and capability policy", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("inputs.scope != 'windows-general-sandbox'", source_step)
+
     def test_each_platform_gate_runs_real_probe_and_both_feature_rows(self) -> None:
         requirements = {
             "linux-sandbox-policy": (

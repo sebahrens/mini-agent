@@ -21,7 +21,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME, GENERIC_ALL,
@@ -152,8 +152,37 @@ const ACL_MUTEX_WAIT_MS: u32 = 5_000;
 // transaction. The object manager applies the creator token's default DACL; a pre-created object
 // that we cannot open therefore fails the launch closed.
 const ACL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-acl-v1";
+const HELPER_FAILURE_STATUS_BASE: i32 = 160;
+const HELPER_STAGE_REQUEST: u8 = 1;
+const HELPER_STAGE_SETUP: u8 = 2;
+const HELPER_STAGE_LAUNCH: u8 = 3;
+const HELPER_STAGE_VERIFY_JOB: u8 = 4;
+const HELPER_STAGE_VERIFY_DESCENDANT: u8 = 5;
+const HELPER_STAGE_DESCENDANT_METADATA: u8 = 6;
+const HELPER_STAGE_DESCENDANT_PROOF_OPEN: u8 = 7;
+const HELPER_STAGE_DESCENDANT_LINK_COUNT: u8 = 8;
+const HELPER_STAGE_DESCENDANT_PROOF_PARSE: u8 = 9;
+const HELPER_STAGE_DESCENDANT_PROCESS_OPEN: u8 = 10;
+const HELPER_STAGE_DESCENDANT_PROCESS_IDENTITY: u8 = 11;
+const HELPER_STAGE_DESCENDANT_JOB: u8 = 12;
+const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 13;
+const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 14;
+const HELPER_STAGE_READY: u8 = 15;
+const HELPER_STAGE_WAIT: u8 = 16;
+const HELPER_STAGE_EXIT_CODE: u8 = 17;
+const HELPER_STAGE_DRAIN: u8 = 18;
+const HELPER_STAGE_CLEANUP: u8 = 19;
 
 static ACTIVE_REQUEST_FEEDERS: AtomicUsize = AtomicUsize::new(0);
+static HELPER_STAGE: AtomicU8 = AtomicU8::new(HELPER_STAGE_REQUEST);
+
+fn mark_helper_stage(stage: u8) {
+    HELPER_STAGE.store(stage, Ordering::Release);
+}
+
+fn helper_failure_status() -> i32 {
+    HELPER_FAILURE_STATUS_BASE + i32::from(HELPER_STAGE.load(Ordering::Acquire))
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchRequest {
@@ -764,9 +793,13 @@ pub(crate) fn maybe_run_from_args() -> Option<i32> {
     let mut args = std::env::args_os();
     let _ = args.next();
     match args.next().as_deref() {
-        Some(value) if value == OsStr::new(HELPER_ARG) => Some(run_helper().unwrap_or_else(|e| {
-            eprintln!("Windows AppContainer sandbox helper failed: {e}");
-            126
+        Some(value) if value == OsStr::new(HELPER_ARG) => Some(run_helper().unwrap_or_else(|_| {
+            let status = helper_failure_status();
+            eprintln!(
+                "Windows AppContainer sandbox helper failed at closed stage {}",
+                status - HELPER_FAILURE_STATUS_BASE
+            );
+            status
         })),
         Some(value) if value == OsStr::new(PROBE_ARG) => {
             Some(run_runtime_probe().unwrap_or_else(|e| {
@@ -1138,6 +1171,7 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
 }
 
 fn run_helper() -> Result<i32, String> {
+    mark_helper_stage(HELPER_STAGE_REQUEST);
     let request = read_request()?;
     if request.version != REQUEST_VERSION {
         return Err("unsupported Windows sandbox request version".into());
@@ -1175,6 +1209,7 @@ fn run_helper() -> Result<i32, String> {
         .as_deref()
         .map(|path| validate_ready_path(path, &cwd))
         .transpose()?;
+    mark_helper_stage(HELPER_STAGE_SETUP);
     let parent = open_and_verify_parent(request.parent_pid, request.parent_created)?;
     ensure_parent_alive(&parent)?;
     let (job, job_name) = bounded_job()?;
@@ -1246,6 +1281,7 @@ fn run_helper() -> Result<i32, String> {
         descendant_rendezvous = Some((ready, release));
     }
     grants.disarm_for_launch();
+    mark_helper_stage(HELPER_STAGE_LAUNCH);
     let child = launch_appcontainer(
         &token,
         &job,
@@ -1257,20 +1293,23 @@ fn run_helper() -> Result<i32, String> {
         &cache,
         &grants.profile.storage,
     )?;
+    mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
     if let Err(error) = verify_job_membership_and_limits(&job, &child) {
         terminate_and_drain_job(&job, 126)?;
         grants.mark_job_quiescent();
         grants.cleanup()?;
         return Err(error);
     }
-    if let Some((ready, release)) = descendant_rendezvous
-        && let Err(error) = verify_descendant_rendezvous(&job, &child, &ready, &release)
-    {
-        terminate_and_drain_job(&job, 126)?;
-        grants.mark_job_quiescent();
-        grants.cleanup()?;
-        return Err(error);
+    if let Some((ready, release)) = descendant_rendezvous {
+        mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
+        if let Err(error) = verify_descendant_rendezvous(&job, &child, &ready, &release) {
+            terminate_and_drain_job(&job, 126)?;
+            grants.mark_job_quiescent();
+            grants.cleanup()?;
+            return Err(error);
+        }
     }
+    mark_helper_stage(HELPER_STAGE_READY);
     if let Some(path) = ready_path
         && let Err(error) = std::fs::OpenOptions::new()
             .write(true)
@@ -1294,6 +1333,7 @@ fn run_helper() -> Result<i32, String> {
         grants.cleanup()?;
         return Err(format!("publish AppContainer target readiness: {error}"));
     }
+    mark_helper_stage(HELPER_STAGE_WAIT);
     let waits = [child.raw(), parent.raw()];
     let result = unsafe { WaitForMultipleObjects(waits.len() as u32, waits.as_ptr(), 0, u32::MAX) };
     if result == WAIT_OBJECT_0 + 1 {
@@ -1308,6 +1348,7 @@ fn run_helper() -> Result<i32, String> {
         grants.cleanup()?;
         return Err(last_error("wait for restricted child or parent death"));
     }
+    mark_helper_stage(HELPER_STAGE_EXIT_CODE);
     let mut code = 0u32;
     if unsafe { GetExitCodeProcess(child.raw(), &mut code) } == 0 {
         terminate_and_drain_job(&job, 126)?;
@@ -1315,8 +1356,10 @@ fn run_helper() -> Result<i32, String> {
         grants.cleanup()?;
         return Err(last_error("read restricted child exit code"));
     }
+    mark_helper_stage(HELPER_STAGE_DRAIN);
     terminate_and_drain_job(&job, code)?;
     grants.mark_job_quiescent();
+    mark_helper_stage(HELPER_STAGE_CLEANUP);
     grants.cleanup()?;
     Ok(code as i32)
 }
@@ -2437,7 +2480,9 @@ fn verify_descendant_rendezvous(
     ready: &Path,
     release: &Path,
 ) -> Result<(), String> {
+    mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
     wait_for_descendant_identity(ready)?;
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_METADATA);
     let metadata = std::fs::symlink_metadata(ready)
         .map_err(|error| format!("inspect descendant identity proof: {error}"))?;
     if !metadata.is_file()
@@ -2446,18 +2491,21 @@ fn verify_descendant_rendezvous(
     {
         return Err("sandbox: descendant identity proof object was invalid".into());
     }
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROOF_OPEN);
     let mut proof_file = open_stable_path(
         ready,
         false,
         GENERIC_READ | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ,
     )?;
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_LINK_COUNT);
     if crate::fs::windows_file_link_count(&proof_file)
         .map_err(|error| format!("inspect descendant identity proof links: {error}"))?
         != 1
     {
         return Err("sandbox: descendant identity proof was multiply linked".into());
     }
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROOF_PARSE);
     let mut proof = Vec::with_capacity(DESCENDANT_IDENTITY_MAX_BYTES + 1);
     Read::by_ref(&mut proof_file)
         .take((DESCENDANT_IDENTITY_MAX_BYTES + 1) as u64)
@@ -2470,18 +2518,23 @@ fn verify_descendant_rendezvous(
     if pid == unsafe { GetProcessId(target.raw()) } {
         return Err("descendant identity proof did not identify a distinct process".into());
     }
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROCESS_OPEN);
     let descendant = Handle::created(
         unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) },
         "open exact descendant identity",
     )?;
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROCESS_IDENTITY);
     if process_creation_time(descendant.raw())? != created {
         return Err("descendant process identity changed before exact Job proof".into());
     }
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB);
     let mut in_job = 0;
     if unsafe { IsProcessInJob(descendant.raw(), job.raw(), &mut in_job) } == 0 || in_job == 0 {
         return Err("sandbox: descendant escaped the exact launcher Job".into());
     }
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_LIMITS);
     verify_job_limits(job)?;
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_RELEASE);
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

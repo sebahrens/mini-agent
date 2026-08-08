@@ -583,6 +583,7 @@ jobs:
           rustflags: ''
 
       - name: Test AppContainer source and capability policy
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'
         run: cargo test --locked windows_appcontainer_source -- --test-threads=1
 
       - name: Install the debug binary used by the native sandbox probe
