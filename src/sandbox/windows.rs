@@ -24,8 +24,9 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, GENERIC_ALL, GENERIC_READ,
-    GetHandleInformation, HANDLE, LocalFree, TRUE, WAIT_ABANDONED_0, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME, GENERIC_ALL,
+    GENERIC_READ, GetHandleInformation, HANDLE, LocalFree, TRUE, WAIT_ABANDONED_0, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
@@ -76,15 +77,16 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexW,
-    CreateProcessAsUserW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId,
-    GetCurrentThreadId, GetExitCodeProcess, GetProcessId, GetProcessTimes,
-    InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+    CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
+    GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
+    OpenProcessToken, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ReleaseMutex,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForMultipleObjects, WaitForSingleObject,
+    PROCESS_INFORMATION, PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ProcessChildProcessPolicy, ReleaseMutex,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
@@ -102,6 +104,11 @@ const TARGET_CONFIGURED_ARG: &str = "configured";
 const TARGET_NOOP_ARG: &str = "noop";
 const TARGET_CONFIGURED_SPAWN_ERROR_BASE: i32 = 0x1_0000;
 const TARGET_CONFIGURED_WAIT_ERROR_BASE: i32 = 0x2_0000;
+const TARGET_CONFIGURED_STDIN_DUPLICATE_ERROR_BASE: i32 = 0x3_0000;
+const TARGET_CONFIGURED_STDOUT_DUPLICATE_ERROR_BASE: i32 = 0x4_0000;
+const TARGET_CONFIGURED_STDERR_DUPLICATE_ERROR_BASE: i32 = 0x5_0000;
+const TARGET_CONFIGURED_POLICY_QUERY_ERROR_BASE: i32 = 0x6_0000;
+const TARGET_CONFIGURED_RAW_SPAWN_ERROR_BASE: i32 = 0x7_0000;
 const TARGET_SLEEP_ARG: &str = "sleep";
 const TARGET_WRITE_ARG: &str = "write";
 const TARGET_PARENT_ARG: &str = "parent";
@@ -797,6 +804,69 @@ fn target_probe_os_error_code(base: i32, error: &std::io::Error) -> i32 {
     base | i32::from(raw)
 }
 
+fn target_probe_duplicate_handle(source: *mut c_void, error_base: i32) -> Result<(), i32> {
+    let mut duplicate = null_mut();
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            source,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return Err(target_probe_os_error_code(error_base, &error));
+    }
+    unsafe { CloseHandle(duplicate) };
+    Ok(())
+}
+
+fn target_probe_raw_spawn(tool: &Path) -> Result<i32, String> {
+    let application = wide_null(tool.as_os_str())?;
+    let arguments = [TARGET_PROBE_ARG.to_string(), TARGET_NOOP_ARG.to_string()];
+    let mut command_line = wide_string(&windows_command_line(tool, &arguments));
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..STARTUPINFOW::default()
+    };
+    let mut information = PROCESS_INFORMATION::default();
+    if unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            FALSE,
+            CREATE_UNICODE_ENVIRONMENT,
+            null(),
+            null(),
+            &startup,
+            &mut information,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return Ok(target_probe_os_error_code(
+            TARGET_CONFIGURED_RAW_SPAWN_ERROR_BASE,
+            &error,
+        ));
+    }
+    unsafe { CloseHandle(information.hThread) };
+    let process = Handle::created(information.hProcess, "own raw target-probe child")?;
+    if unsafe { WaitForSingleObject(process.raw(), u32::MAX) } != WAIT_OBJECT_0 {
+        return Ok(59);
+    }
+    let mut code = 0u32;
+    if unsafe { GetExitCodeProcess(process.raw(), &mut code) } == 0 {
+        return Ok(60);
+    }
+    Ok(if code == 0 { 0 } else { 61 })
+}
+
 fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
     let operation = args
         .next()
@@ -829,6 +899,51 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             };
             if contents != b"configured-read" {
                 return Ok(51);
+            }
+            for (handle, error_base) in [
+                (
+                    std::io::stdin().as_raw_handle(),
+                    TARGET_CONFIGURED_STDIN_DUPLICATE_ERROR_BASE,
+                ),
+                (
+                    std::io::stdout().as_raw_handle(),
+                    TARGET_CONFIGURED_STDOUT_DUPLICATE_ERROR_BASE,
+                ),
+                (
+                    std::io::stderr().as_raw_handle(),
+                    TARGET_CONFIGURED_STDERR_DUPLICATE_ERROR_BASE,
+                ),
+            ] {
+                if let Err(code) = target_probe_duplicate_handle(handle, error_base) {
+                    return Ok(code);
+                }
+            }
+            let mut policy = PROCESS_MITIGATION_CHILD_PROCESS_POLICY {
+                Anonymous: windows_sys::Win32::System::SystemServices::PROCESS_MITIGATION_CHILD_PROCESS_POLICY_0 {
+                    Flags: 0,
+                },
+            };
+            if unsafe {
+                GetProcessMitigationPolicy(
+                    GetCurrentProcess(),
+                    ProcessChildProcessPolicy,
+                    (&mut policy as *mut PROCESS_MITIGATION_CHILD_PROCESS_POLICY).cast(),
+                    size_of::<PROCESS_MITIGATION_CHILD_PROCESS_POLICY>(),
+                )
+            } == 0
+            {
+                let error = std::io::Error::last_os_error();
+                return Ok(target_probe_os_error_code(
+                    TARGET_CONFIGURED_POLICY_QUERY_ERROR_BASE,
+                    &error,
+                ));
+            }
+            if unsafe { policy.Anonymous.Flags } & 0b1 != 0 {
+                return Ok(58);
+            }
+            let raw_status = target_probe_raw_spawn(&tool)?;
+            if raw_status != 0 {
+                return Ok(raw_status);
             }
             let mut child = match Command::new(tool)
                 .args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])

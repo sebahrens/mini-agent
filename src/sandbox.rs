@@ -2770,7 +2770,12 @@ mod sandbox_tests {
         assert!(source.contains("return Ok(53);"));
         assert!(source.contains("TARGET_CONFIGURED_SPAWN_ERROR_BASE: i32 = 0x1_0000"));
         assert!(source.contains("TARGET_CONFIGURED_WAIT_ERROR_BASE: i32 = 0x2_0000"));
+        assert!(source.contains("TARGET_CONFIGURED_STDIN_DUPLICATE_ERROR_BASE: i32 = 0x3_0000"));
+        assert!(source.contains("TARGET_CONFIGURED_RAW_SPAWN_ERROR_BASE: i32 = 0x7_0000"));
         assert!(source.contains("fn target_probe_os_error_code("));
+        assert!(source.contains("fn target_probe_duplicate_handle("));
+        assert!(source.contains("fn target_probe_raw_spawn("));
+        assert!(source.contains("GetProcessMitigationPolicy("));
         assert!(source.contains("let status = match child.wait()"));
         assert!(source.contains("return Ok(55);"));
         assert!(source.contains(".args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])"));
