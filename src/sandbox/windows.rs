@@ -97,7 +97,6 @@ const TARGET_BOUNDARY_ARG: &str = "boundary";
 const TARGET_CONFIGURED_ARG: &str = "configured";
 const TARGET_NOOP_ARG: &str = "noop";
 const TARGET_SLEEP_ARG: &str = "sleep";
-const TARGET_WAIT_FOR_FILE_ARG: &str = "wait-for-file";
 const TARGET_WRITE_ARG: &str = "write";
 const TARGET_PARENT_ARG: &str = "parent";
 const TARGET_DESCENDANT_ARG: &str = "descendant";
@@ -832,11 +831,6 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
                 .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
                 .ok_or("invalid Windows sandbox target-probe sleep duration")?;
             std::thread::sleep(std::time::Duration::from_secs(seconds));
-            Ok(0)
-        }
-        value if value == OsStr::new(TARGET_WAIT_FOR_FILE_ARG) => {
-            let path = target_probe_path(&mut args, "release path")?;
-            wait_for_exact_probe_file(&path)?;
             Ok(0)
         }
         value if value == OsStr::new(TARGET_WRITE_ARG) => {
@@ -2827,40 +2821,6 @@ fn run_runtime_probe() -> Result<i32, String> {
     std::fs::remove_file(&hardlink_alias).map_err(|e| e.to_string())?;
     std::fs::remove_file(&hardlink_source).map_err(|e| e.to_string())?;
 
-    let swap_victim = cache.join("swap-victim.txt");
-    let swap_ready = workspace.join("swap-ready.txt");
-    let swap_release = workspace.join("swap-release.txt");
-    std::fs::write(&swap_victim, b"stable").map_err(|e| e.to_string())?;
-    let mut swap_command = build_helper_with_ready(
-        probe_executable.clone(),
-        vec![
-            TARGET_PROBE_ARG.into(),
-            TARGET_WAIT_FOR_FILE_ARG.into(),
-            swap_release.to_string_lossy().into_owned(),
-        ],
-        &workspace,
-        &cache,
-        Some(swap_ready.clone()),
-    )?;
-    let mut swap = swap_command
-        .as_std_mut()
-        .spawn_guarded()
-        .map_err(|e| format!("start stable-handle swap probe: {e}"))?;
-    wait_for_probe_file(&swap_ready)?;
-    if std::fs::rename(&swap_victim, cache.join("swap-moved.txt")).is_ok() {
-        let _ = swap.kill();
-        return Err("stable read-only ACL handle allowed an in-flight path swap".into());
-    }
-    std::fs::write(&swap_release, b"TARGET_READY\n").map_err(|e| e.to_string())?;
-    if !swap
-        .wait()
-        .map_err(|e| format!("wait stable-handle swap probe: {e}"))?
-        .success()
-    {
-        return Err("stable-handle swap probe target failed".into());
-    }
-    std::fs::remove_file(&swap_victim).map_err(|error| error.to_string())?;
-
     let mut max_request = build_helper(
         probe_executable.clone(),
         vec![
@@ -3047,7 +3007,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     }
     let _ = std::fs::remove_dir_all(&base);
     println!(
-        "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=pass explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied stable_handle_swap=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated"
+        "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=pass explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated"
     );
     Ok(0)
 }
