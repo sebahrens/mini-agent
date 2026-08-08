@@ -809,8 +809,8 @@ impl Sandbox {
                 SandboxCapabilityMatrix {
                     backend: self.backend.clone(),
                     status: "required-and-available",
-                    filesystem_reads: "explicit workspace, executable/toolchain, and required cache roots only",
-                    filesystem_writes: "AppContainer writes are granted only to the canonical workspace; additional roots require explicit configuration",
+                    filesystem_reads: "explicit user-file roots plus pre-existing resources readable to ALL APPLICATION PACKAGES; read confidentiality is not claimed",
+                    filesystem_writes: "the sandbox adds write access only for the canonical workspace and explicit roots; pre-existing ALL APPLICATION PACKAGES grants remain ambient",
                     process_namespace: "no namespace isolation; a creation-time bounded Job owns the complete descendant tree",
                     devices: "host-readable devices remain visible; no device isolation is claimed",
                     environment: "cleared, then populated from a narrow non-credential Windows allow-list",
@@ -2569,9 +2569,7 @@ mod sandbox_tests {
             "JOB_OBJECT_LIMIT_ACTIVE_PROCESS",
             "JOB_OBJECT_LIMIT_PROCESS_MEMORY",
             "GENERAL_JOB_UI_RESTRICTIONS",
-            "JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS",
-            "JOB_OBJECT_UILIMIT_DESKTOP",
-            "JOB_OBJECT_UILIMIT_EXITWINDOWS",
+            "JOB_OBJECT_UILIMIT_ALL",
             "env_clear()",
             "reject_reparse_components",
             "outside_write=denied",
@@ -2596,19 +2594,21 @@ mod sandbox_tests {
             "network=denied",
             "registry=not_isolated",
             "TokenIsLessPrivilegedAppContainer",
+            "current_token_is_regular_appcontainer",
+            "appcontainer=regular",
         ] {
             assert!(
                 source.contains(required),
                 "missing Windows contract: {required}"
             );
         }
-        assert!(source.contains("PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY"));
-        assert!(source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
+        assert!(!source.contains("PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY"));
+        assert!(!source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
         assert!(source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
         assert!(source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
-        assert!(source.contains(
-            "const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS\n    | JOB_OBJECT_UILIMIT_DESKTOP\n    | JOB_OBJECT_UILIMIT_EXITWINDOWS;"
-        ));
+        assert!(
+            source.contains("const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_ALL;")
+        );
         assert!(
             source.contains(".stdin(Stdio::from"),
             "helper requests must use inherited stdin, not argv/env/temp files"
@@ -2832,11 +2832,12 @@ mod sandbox_tests {
         assert!(source.contains(
             "AppContainer network capabilities are empty; IP network access is denied by default"
         ));
-        assert!(
-            source.contains(
-                "explicit workspace, executable/toolchain, and required cache roots only"
-            )
-        );
+        assert!(source.contains(
+            "explicit user-file roots plus pre-existing resources readable to ALL APPLICATION PACKAGES; read confidentiality is not claimed"
+        ));
+        assert!(source.contains(
+            "the sandbox adds write access only for the canonical workspace and explicit roots; pre-existing ALL APPLICATION PACKAGES grants remain ambient"
+        ));
         assert!(source.contains("default-deny AppContainer with no network capability"));
         let forbidden_registry_claim = ["registry isolation", " is enforced"].concat();
         assert!(!source.contains(&forbidden_registry_claim));

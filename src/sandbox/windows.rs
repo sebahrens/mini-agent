@@ -4,9 +4,9 @@
 //!
 //! This is deliberately separate from the broker-only LPAC worker launcher. A small copy of the
 //! current executable receives an authenticated-by-inheritance request on stdin, creates a
-//! workspace-capable LPAC AppContainer, and starts the requested program in a creation-time Job. The
-//! request never appears in a command line, environment variable, or temporary file. The
-//! LPAC AppContainer receives no capabilities: in particular, network access is denied by default.
+//! workspace-capable regular AppContainer, and starts the requested program in a creation-time Job.
+//! The request never appears in a command line, environment variable, or temporary file. The
+//! AppContainer receives no capabilities: in particular, network access is denied by default.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -60,8 +60,7 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOB_OBJECT_LIMIT_PROCESS_TIME, JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_EXITWINDOWS,
-    JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
     JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
@@ -74,26 +73,25 @@ use windows_sys::Win32::System::StationsAndDesktops::{
     GetUserObjectInformationW, HDESK, HWINSTA, UOI_NAME,
 };
 use windows_sys::Win32::System::SystemServices::{
-    JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE, PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
-    SECURITY_DESCRIPTOR_REVISION,
+    JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE, JOB_OBJECT_UILIMIT_ALL,
+    PROCESS_MITIGATION_CHILD_PROCESS_POLICY, SECURITY_DESCRIPTOR_REVISION,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexW,
     CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
     GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
-    OpenProcessToken, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    ProcessChildProcessPolicy, ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    OpenProcessToken, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ProcessChildProcessPolicy, ReleaseMutex,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
 use windows_sys::Win32::System::WindowsProgramming::{
-    DRIVE_REMOTE, PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
-    PROCESS_CREATION_CHILD_PROCESS_OVERRIDE,
+    DRIVE_REMOTE, PROCESS_CREATION_CHILD_PROCESS_OVERRIDE,
 };
 
 const HELPER_ARG: &str = "--mini-agent-windows-sandbox-helper-v1";
@@ -115,13 +113,9 @@ const TARGET_SELF_RAW_SPAWN_ERROR_BASE: i32 = 0x9_0000;
 const TARGET_JOB_LIMIT_QUERY_ERROR_BASE: i32 = 0xA_0000;
 const TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE: i32 = 0xB_0000;
 const TARGET_SELF_TOKEN_OPEN_ERROR_BASE: i32 = 0xC_0000;
-// Chromium uses this exact "interactive" Job mask for its LPAC Media Foundation process when it
-// must create a contained child. The private desktop remains mandatory; this mask additionally
-// prevents creating/switching desktops, changing system parameters, and exiting Windows without
-// applying the UI-only lockdown flags that make Windows reject ordinary descendant creation.
-const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
-    | JOB_OBJECT_UILIMIT_DESKTOP
-    | JOB_OBJECT_UILIMIT_EXITWINDOWS;
+// The regular AppContainer supplies the Windows system-resource access required for descendant
+// creation, so retain the Job's complete UI lockdown in addition to the private desktop.
+const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_ALL;
 const TARGET_SLEEP_ARG: &str = "sleep";
 const TARGET_WRITE_ARG: &str = "write";
 const TARGET_PARENT_ARG: &str = "parent";
@@ -1502,9 +1496,9 @@ fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> R
     if trusted_system_read_file(root)? {
         // Windows system executables are commonly owned by TrustedInstaller,
         // so an unelevated helper must not try to rewrite their DACL. Keep a
-        // non-share-write/delete handle live to bind identity. LPAC ignores
-        // ordinary ALL APPLICATION PACKAGES grants, so an inaccessible system
-        // image still fails closed during process creation.
+        // non-share-write/delete handle live to bind identity. A regular
+        // AppContainer receives only the system image access Windows grants to
+        // ALL APPLICATION PACKAGES; an inaccessible image still fails closed.
         let file = open_stable_path(
             root,
             false,
@@ -2662,13 +2656,13 @@ fn launch_appcontainer(
     let handles = [stdin.raw(), stdout.raw(), stderr.raw()];
     let jobs = [job.raw()];
     let mut bytes = 0usize;
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 5, 0, &mut bytes) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 4, 0, &mut bytes) };
     if bytes == 0 {
         return Err(last_error("size restricted process attribute list"));
     }
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let list = storage.as_mut_ptr().cast();
-    if unsafe { InitializeProcThreadAttributeList(list, 5, 0, &mut bytes) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, 4, 0, &mut bytes) } == 0 {
         return Err(last_error("initialize restricted process attribute list"));
     }
     struct DeleteList(windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -2728,29 +2722,11 @@ fn launch_appcontainer(
     {
         return Err(last_error("set AppContainer security capabilities"));
     }
-    // LPAC removes the ambient ALL APPLICATION PACKAGES identity. General
-    // Windows tools therefore receive only the explicit filesystem grants
-    // above; a tool whose runtime dependencies need broader access fails
-    // closed instead of inheriting the launcher's same-user authority.
-    let all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-    if unsafe {
-        UpdateProcThreadAttribute(
-            list,
-            0,
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
-            (&all_packages_policy as *const u32).cast_mut().cast(),
-            size_of::<u32>(),
-            null_mut(),
-            null_mut(),
-        )
-    } == 0
-    {
-        return Err(last_error("set LPAC all-application-packages policy"));
-    }
     // General tools are expected to create descendants. Make that authority explicit on the
     // initial token: otherwise Windows may preserve an effective restricted-child policy and
     // reject ordinary CreateProcess calls with ERROR_ACCESS_DENIED. The override is set by this
-    // unrestricted helper; descendants still inherit the LPAC identity and the non-breakaway Job.
+    // unrestricted helper; descendants still inherit the regular AppContainer identity and the
+    // non-breakaway Job.
     let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_OVERRIDE;
     if unsafe {
         UpdateProcThreadAttribute(
@@ -3312,7 +3288,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     }
     let _ = std::fs::remove_dir_all(&base);
     println!(
-        "WINDOWS_GENERAL_SANDBOX_PASS lpac=pass explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated"
+        "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated"
     );
     Ok(0)
 }
@@ -3576,7 +3552,7 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
     if try_probe_write(&outside) {
         return Ok(91);
     }
-    if !current_token_is_lpac()? {
+    if !current_token_is_regular_appcontainer()? {
         return Ok(102);
     }
     let mut flags = 0u32;
@@ -3657,7 +3633,7 @@ fn run_descendant_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
     if args.next().is_some() {
         return Err("unexpected descendant probe argument".into());
     }
-    if !current_token_has_zero_capabilities()? || !current_token_is_appcontainer()? {
+    if !current_token_has_zero_capabilities()? || !current_token_is_regular_appcontainer()? {
         return Ok(2);
     }
     let proof = format!(
@@ -3841,7 +3817,10 @@ fn try_probe_write(path: &Path) -> bool {
         .is_ok()
 }
 
-fn current_token_is_lpac() -> Result<bool, String> {
+fn current_token_is_regular_appcontainer() -> Result<bool, String> {
+    if !current_token_is_appcontainer()? {
+        return Ok(false);
+    }
     let mut raw_token = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
         return Err(last_error("open authority-probe token"));
@@ -3864,7 +3843,7 @@ fn current_token_is_lpac() -> Result<bool, String> {
     if returned != size_of::<u32>() as u32 {
         return Err("TokenIsLessPrivilegedAppContainer returned an invalid size".into());
     }
-    Ok(value != 0)
+    Ok(value == 0)
 }
 
 fn process_token_is_acquirable(pid: u32, outside: &Path) -> bool {

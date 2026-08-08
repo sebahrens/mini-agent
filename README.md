@@ -125,8 +125,10 @@ probe exercises explicit package-SID access: the workspace is read/write, while 
 cache and exact selected executable are read/execute only. No ambient `PATH`, home, Cargo, or
 Rustup root is inferred. Operators may add bounded AppContainer-only read or write roots explicitly;
 relative values resolve from the workspace, and remote, reparse, hard-link, or permission-widening
-overlaps fail closed. A unique
-zero-capability AppContainer identity, handle-bound recursive ACL updates, bounded crash-stale
+overlaps fail closed. The regular AppContainer retains standard Windows system resources and any
+pre-existing object accessible to `ALL APPLICATION PACKAGES`; such an existing host ACL can also
+retain write authority, so universal filesystem read/write isolation is not claimed.
+A unique zero-capability AppContainer identity, handle-bound recursive ACL updates, bounded crash-stale
 cleanup journal outside every granted tree, private OS-managed temporary storage, locked executable
 proof, private desktop, and creation-time bounded Job all fail closed. ACL/profile removal starts
 only after the exact Job reports zero active processes. Crash recovery records a unique parent-only

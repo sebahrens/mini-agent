@@ -175,9 +175,10 @@ permission for an uncontained JS worker.
 
 The Windows general-process AppContainer candidate is not the Phase 6 LPAC worker profile.
 Subject to the pending native hosted attestation required for production availability, its
-contract claims AppContainer identity, scoped filesystem reads and writes, zero-capability network
-denial, a private desktop with Job UI restrictions, and bounded Job lifetime. It does not claim
-registry isolation, host-readable device isolation, or broader Windows session isolation.
+contract claims AppContainer identity, scoped filesystem grants and writes, zero-capability network
+denial, a private desktop with Job UI restrictions, and bounded Job lifetime. Regular AppContainer
+system/AAP visibility means it does not claim read confidentiality, registry isolation,
+host-readable device isolation, or broader Windows session isolation.
 
 The implementation must not add a parallel raw `std::process::Command` path for JS. Any blocking
 adapter remains behind the shared wrapper and preserves Phase 1 permission, argument, timeout,
@@ -246,12 +247,16 @@ backend as a compatibility alias. It remains production-unavailable until native
 attestation succeeds, so requested launch fails closed unless `--no-sandbox` is explicit. This
 workspace-capable boundary is separate from Phase 6's workspace-invisible LPAC worker.
 
-Every launch creates a unique AppContainer profile with zero capabilities. Its package SID is
-passed through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, with ambient `ALL APPLICATION
-PACKAGES` authority opted out. The bounded explicit root policy grants the canonical workspace
-read/write, grants the application cache read/execute, and grants the exact selected executable
-read/execute. It never recursively grants an executable parent, ambient `PATH`, home, Cargo, or
-Rustup root. The AppContainer-scoped `windows-appcontainer-read-roots` and
+Every launch creates a unique regular AppContainer profile with zero capabilities. Its package SID
+is passed through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`. Unlike LPAC, the regular
+AppContainer retains Windows' standard `ALL APPLICATION PACKAGES` access to system files and common
+registry/COM services required to start tools and their descendants. That ambient system-resource
+access is not a claim of read confidentiality: any pre-existing host object whose ACL already grants
+`ALL APPLICATION PACKAGES` remains visible. For additional user-controlled host paths, the bounded
+explicit root policy grants the canonical workspace read/write, grants the application cache
+read/execute, and grants the exact selected executable read/execute. It never recursively grants an
+executable parent, ambient `PATH`, home, Cargo, or Rustup root. The AppContainer-scoped
+`windows-appcontainer-read-roots` and
 `windows-appcontainer-write-roots` settings add bounded explicit roots; relative paths resolve
 from the canonical workspace. There is no implicit writable cache root. Remote/UNC, reparse,
 multi-link, read/write-overlapping, or otherwise unsafe roots fail closed.
@@ -271,14 +276,14 @@ closed.
 
 | Capability | Enforced Windows policy |
 |------------|-------------------------|
-| Filesystem reads | Canonical workspace and application cache, exact selected executable, and bounded explicit `windows-appcontainer-read-roots`. Ambient `PATH`, home, Cargo, and Rustup roots are not inferred. |
-| Filesystem writes | Canonical workspace plus bounded explicit `windows-appcontainer-write-roots`. The unique profile's OS-managed storage is private ephemeral sandbox storage. |
+| Filesystem reads | The sandbox adds access only for the canonical workspace and application cache, exact selected executable, and bounded explicit `windows-appcontainer-read-roots`; ambient `PATH`, home, Cargo, and Rustup roots are not inferred. Standard Windows system resources and any pre-existing host object readable to `ALL APPLICATION PACKAGES` remain readable, so read confidentiality is not claimed. |
+| Filesystem writes | The sandbox adds package-SID write access only for the canonical workspace plus bounded explicit `windows-appcontainer-write-roots`. A pre-existing host object that already grants write access to `ALL APPLICATION PACKAGES` remains writable; the hosted outside-write canary proves the reference runner boundary but is not a universal write-confidentiality claim. The unique profile's OS-managed storage is private ephemeral sandbox storage. |
 | Executable | The parent supplies stable identity plus SHA-256. The helper reopens and hashes the executable, denies write/delete sharing, verifies the proof, and retains that handle through `CreateProcessAsUserW`. |
 | Process lifetime | The target enters a kill-on-close Job at creation time. The Job limits active processes, per-process memory, aggregate Job memory, process CPU time, and UI operations. Descendants retain the AppContainer SID and exact Job without breakaway. Helper cancellation and parent death terminate the exact Job and wait for `ActiveProcesses == 0` before ACL/profile cleanup. |
 | Environment | The helper request travels only through inherited stdin. The target environment is cleared and rebuilt from `PATH`, `PATHEXT`, Windows system/shell variables, and non-credential locale/terminal variables. API keys, agent sockets, and credential variables are not forwarded. |
 | Network | No capability is supplied. Hosted proof requires zero `TokenCapabilities`, no current-SID loopback exemption, and AccessDenied for IPv4/IPv6 TCP and UDP against loopback and an external address. |
-| Registry | Host registry visibility is inherited. No registry virtualization or isolation is claimed. |
-| Devices/UI | Host-readable devices remain visible. The target receives a private per-launch desktop. The Job prevents creating/switching desktops, changing system parameters, and exiting Windows. Clipboard, global-atom, display-setting, and cross-Job USER-handle restrictions are not claimed because Windows' full UI lockdown rejects ordinary descendant creation. No broader Windows session, named-object, or broker-channel isolation is claimed. |
+| Registry | AppContainer-visible common registry/COM resources are inherited through `ALL APPLICATION PACKAGES`. No registry confidentiality or isolation is claimed. |
+| Devices/UI | Host-readable devices remain visible. The target receives a private per-launch desktop and the Job's full UI restriction mask. No broader Windows session, named-object, or broker-channel isolation is claimed. |
 
 The same-executable helper is fixed-function trusted code. Program, arguments, roots, and parent
 identity are length-bounded JSON on an anonymous pipe wired to helper stdin; a capped feeder starts
@@ -291,9 +296,10 @@ Job attribute closes the assignment race. `CreateProcessAsUserW` combines the ca
 token with the AppContainer security-capabilities attribute and does not elevate or configure
 machine-wide firewall policy. General commands retain descendant authority inside the bounded Job;
 the unrestricted helper sets `PROCESS_CREATION_CHILD_PROCESS_OVERRIDE` on the initial token rather
-than a child-process-restricted flag. The Job uses the descendant-compatible interactive UI mask
-(`SYSTEMPARAMETERS | DESKTOP | EXITWINDOWS`) used by Chromium for an LPAC process that must create a
-child. Descendants inherit the LPAC identity and the exact non-breakaway Job.
+than a child-process-restricted flag. The regular AppContainer retains the standard Windows system
+resource access needed for process creation while receiving no explicit or network capabilities.
+Descendants inherit that regular AppContainer identity and the exact non-breakaway Job under the
+full Job UI restriction mask.
 
 ## Acceptance criteria
 
