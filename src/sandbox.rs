@@ -2539,7 +2539,7 @@ mod sandbox_tests {
             "reject_remote_access_path",
             "GetDriveTypeW",
             "DRIVE_REMOTE",
-            "GetHandleInformation",
+            "SetEvent(omitted_handle as HANDLE)",
             "GetAppContainerFolderPath",
             "NetworkIsolationGetAppContainerConfig",
             "FILE_GENERIC_READ",
@@ -2610,6 +2610,7 @@ mod sandbox_tests {
         }
         assert!(!source.contains("PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY"));
         assert!(!source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
+        assert!(!source.contains("GetHandleInformation(omitted_handle as HANDLE"));
         assert!(source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
         assert!(source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
         assert!(

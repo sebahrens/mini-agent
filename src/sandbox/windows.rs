@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME, GENERIC_ALL,
-    GENERIC_READ, GetHandleInformation, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE,
-    WAIT_ABANDONED_0, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE, WAIT_ABANDONED_0, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
@@ -85,7 +85,7 @@ use windows_sys::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ProcessChildProcessPolicy, ReleaseMutex,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
     UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
@@ -1235,8 +1235,10 @@ fn run_helper() -> Result<i32, String> {
     let desktop = private_desktop(grants.sid())?;
     let omitted_handle = inheritable_omitted_canary()?;
     let mut arguments = request.arguments;
+    let authority_probe_requested =
+        arguments.first().map(String::as_str) == Some(AUTHORITY_PROBE_ARG);
     let mut descendant_rendezvous = None;
-    if arguments.first().map(String::as_str) == Some(AUTHORITY_PROBE_ARG) {
+    if authority_probe_requested {
         let helper_pid = arguments
             .get_mut(1)
             .filter(|value| value.as_str() == HELPER_PID_PLACEHOLDER)
@@ -1363,6 +1365,18 @@ fn run_helper() -> Result<i32, String> {
         grants.mark_job_quiescent();
         grants.cleanup()?;
         return Err(last_error("read restricted child exit code"));
+    }
+    if authority_probe_requested {
+        match omitted_canary_was_signaled(&omitted_handle) {
+            Ok(true) => code = 97,
+            Ok(false) => {}
+            Err(error) => {
+                terminate_and_drain_job(&job, 126)?;
+                grants.mark_job_quiescent();
+                grants.cleanup()?;
+                return Err(error);
+            }
+        }
     }
     mark_helper_stage(HELPER_STAGE_DRAIN);
     terminate_and_drain_job(&job, code)?;
@@ -2898,6 +2912,15 @@ fn inheritable_omitted_canary() -> Result<Handle, String> {
     )
 }
 
+fn omitted_canary_was_signaled(canary: &Handle) -> Result<bool, String> {
+    match unsafe { WaitForSingleObject(canary.raw(), 0) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(last_error("inspect omitted inheritable-handle canary")),
+        _ => Err("sandbox: omitted-handle canary returned an invalid wait result".into()),
+    }
+}
+
 fn appcontainer_environment(cache: &Path, private_storage: &Path) -> Vec<u16> {
     let mut entries = essential_windows_environment();
     let private_storage = private_storage.as_os_str().to_string_lossy().into_owned();
@@ -3620,10 +3643,9 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
     if !current_token_is_regular_appcontainer()? {
         return Ok(102);
     }
-    let mut flags = 0u32;
-    if unsafe { GetHandleInformation(omitted_handle as HANDLE, &mut flags) } != 0 {
-        return Ok(97);
-    }
+    // Handle values are process-local. Signaling the candidate proves object identity to the
+    // helper without treating an unrelated child handle at the same numeric value as inherited.
+    let _ = unsafe { SetEvent(omitted_handle as HANDLE) };
     if std::fs::read_dir(&control_root).is_ok()
         || std::fs::OpenOptions::new()
             .write(true)
