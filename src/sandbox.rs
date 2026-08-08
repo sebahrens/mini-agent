@@ -2748,13 +2748,16 @@ mod sandbox_tests {
         let runtime_probe = source
             .split("fn run_runtime_probe(")
             .nth(1)
-            .and_then(|source| source.split("fn attest_completed_cleanup(").next())
+            .and_then(|source| source.split("fn attest_completed_cleanup").next())
             .expect("Windows runtime probe implementation missing");
         assert!(runtime_probe.contains("configured_cleanup_ready"));
         assert!(runtime_probe.contains("build_helper_with_ready_and_roots("));
         assert!(runtime_probe.contains("probe_executable.clone()"));
         assert!(!runtime_probe.contains("resolve_program(\"pwsh.exe\""));
         assert!(!runtime_probe.contains("resolve_program(\"powershell.exe\""));
+        assert!(!runtime_probe.contains("resolve_program(\"cmd.exe\""));
+        assert!(runtime_probe.contains("std::fs::copy(&probe_executable, &configured_tool)"));
+        assert!(source.contains(".args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])"));
         assert!(runtime_probe.contains(
             "configured_read.as_path(),\n            configured_write.as_path(),\n            configured_tool.as_path(),"
         ));

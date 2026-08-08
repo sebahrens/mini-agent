@@ -816,7 +816,7 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
                 return Ok(51);
             }
             if !Command::new(tool)
-                .args(["/c", "exit", "0"])
+                .args([TARGET_PROBE_ARG, TARGET_NOOP_ARG])
                 .status_guarded()
                 .map_err(|error| error.to_string())?
                 .success()
@@ -1234,10 +1234,11 @@ impl Drop for AccessGrants {
 
 fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> Result<(), String> {
     if trusted_system_read_file(root)? {
-        // Windows system executables already carry the application-package
-        // read/execute grant and are commonly owned by TrustedInstaller. Keep
-        // a non-share-write/delete handle live to bind their identity without
-        // attempting an unauthorized DACL mutation.
+        // Windows system executables are commonly owned by TrustedInstaller,
+        // so an unelevated helper must not try to rewrite their DACL. Keep a
+        // non-share-write/delete handle live to bind identity. LPAC ignores
+        // ordinary ALL APPLICATION PACKAGES grants, so an inaccessible system
+        // image still fails closed during process creation.
         let file = open_stable_path(
             root,
             false,
@@ -2767,11 +2768,12 @@ fn run_runtime_probe() -> Result<i32, String> {
         [&workspace, &cache, probe_executable.as_path()],
     )?;
 
-    let configured_tool = resolve_program("cmd.exe", &workspace)?;
     let configured_read = base.join("configured-read");
     let configured_write = base.join("configured-write");
+    let configured_tool = base.join("configured-tool.exe");
     std::fs::create_dir_all(&configured_read).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&configured_write).map_err(|e| e.to_string())?;
+    std::fs::copy(&probe_executable, &configured_tool).map_err(|e| e.to_string())?;
     let configured_fixture = configured_read.join("fixture.txt");
     let configured_output = configured_write.join("output.txt");
     let configured_cleanup_ready = workspace.join("configured-cleanup-ready.txt");
@@ -3713,7 +3715,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_system_executables_use_the_preexisting_package_acl() {
+    fn windows_system_executables_are_not_mutated_by_the_unelevated_helper() {
         let cwd = std::env::current_dir().expect("current directory");
         let command = resolve_program("cmd.exe", &cwd).expect("resolve system command");
         assert!(

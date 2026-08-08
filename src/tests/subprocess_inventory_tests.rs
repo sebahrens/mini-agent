@@ -1267,7 +1267,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".spawn()",
-        7,
+        6,
         "TC-INTERNAL-VERIFICATION",
     ),
     (
@@ -2930,7 +2930,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".spawn()",
-        7,
+        6,
         "TC-INTERNAL-VERIFICATION",
     ),
     (
