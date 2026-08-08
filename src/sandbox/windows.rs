@@ -31,9 +31,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetExplicitEntriesFromAclW, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_OBJECT_TYPE,
-    SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    GetExplicitEntriesFromAclW, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo,
+    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -77,16 +77,17 @@ use windows_sys::Win32::System::SystemServices::{
     PROCESS_MITIGATION_CHILD_PROCESS_POLICY, SECURITY_DESCRIPTOR_REVISION,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexW,
-    CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW,
+    CreateMutexW, CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
     GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
     OpenProcessToken, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    ProcessChildProcessPolicy, ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    ProcessChildProcessPolicy, ReleaseMutex, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
@@ -113,6 +114,7 @@ const TARGET_CONFIGURED_EXECUTABLE_OPEN_ERROR_BASE: i32 = 0x8_0000;
 const TARGET_SELF_RAW_SPAWN_ERROR_BASE: i32 = 0x9_0000;
 const TARGET_JOB_LIMIT_QUERY_ERROR_BASE: i32 = 0xA_0000;
 const TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE: i32 = 0xB_0000;
+const TARGET_SELF_TOKEN_OPEN_ERROR_BASE: i32 = 0xC_0000;
 const TARGET_SLEEP_ARG: &str = "sleep";
 const TARGET_WRITE_ARG: &str = "write";
 const TARGET_PARENT_ARG: &str = "parent";
@@ -895,6 +897,23 @@ fn target_probe_job_status() -> i32 {
     0
 }
 
+fn target_probe_self_token_access() -> i32 {
+    let mut token = null_mut();
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
+            &mut token,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return target_probe_os_error_code(TARGET_SELF_TOKEN_OPEN_ERROR_BASE, &error);
+    }
+    unsafe { CloseHandle(token) };
+    0
+}
+
 fn target_probe_raw_spawn(tool: &Path, error_base: i32) -> Result<i32, String> {
     let application = wide_null(tool.as_os_str())?;
     let arguments = [TARGET_PROBE_ARG.to_string(), TARGET_NOOP_ARG.to_string()];
@@ -1007,6 +1026,16 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             }
             if unsafe { policy.Anonymous.Flags } & 0b1 != 0 {
                 return Ok(58);
+            }
+            if unsafe { policy.Anonymous.Flags } & 0b100 != 0 {
+                return Ok(65);
+            }
+            if unsafe { policy.Anonymous.Flags } & !0b111 != 0 {
+                return Ok(66);
+            }
+            let token_status = target_probe_self_token_access();
+            if token_status != 0 {
+                return Ok(token_status);
             }
             let job_status = target_probe_job_status();
             if job_status != 0 {
@@ -2757,7 +2786,7 @@ fn launch_appcontainer(
             null(),
             null(),
             TRUE,
-            CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_ptr().cast(),
             cwd.as_ptr(),
             &startup.StartupInfo,
@@ -2767,8 +2796,37 @@ fn launch_appcontainer(
     {
         return Err(last_error("launch creation-time-Job AppContainer process"));
     }
-    unsafe { CloseHandle(information.hThread) };
-    Handle::created(information.hProcess, "own AppContainer process")
+    let thread = Handle::created(information.hThread, "own suspended AppContainer thread")?;
+    let process = Handle::created(information.hProcess, "own AppContainer process")?;
+    grant_descendant_token_access(&process, appcontainer_sid)?;
+    if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
+        let error = last_error("resume AppContainer process after token DACL grant");
+        unsafe { TerminateProcess(process.raw(), 126) };
+        return Err(error);
+    }
+    Ok(process)
+}
+
+fn grant_descendant_token_access(process: &Handle, appcontainer_sid: PSID) -> Result<(), String> {
+    let mut raw = null_mut();
+    if unsafe { OpenProcessToken(process.raw(), READ_CONTROL | WRITE_DAC, &mut raw) } == 0 {
+        return Err(last_error(
+            "open suspended AppContainer token for descendant authority",
+        ));
+    }
+    let token = Handle::created(raw, "own suspended AppContainer primary token")?;
+    // Windows process creation must be able to duplicate/impersonate the caller's primary token.
+    // LPAC's package SID is absent from the synthesized token object's default DACL, so grant the
+    // unique per-launch SID only those self-reproduction rights before untrusted code can run.
+    // This token is already LPAC and the grant does not apply to the helper or any host process.
+    update_handle_ace(
+        token.raw(),
+        SE_KERNEL_OBJECT,
+        appcontainer_sid,
+        GRANT_ACCESS,
+        TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
+        0,
+    )
 }
 
 fn inheritable_duplicate(source: *mut c_void) -> Result<Handle, String> {

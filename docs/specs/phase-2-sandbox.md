@@ -291,8 +291,11 @@ Job attribute closes the assignment race. `CreateProcessAsUserW` combines the ca
 token with the AppContainer security-capabilities attribute and does not elevate or configure
 machine-wide firewall policy. General commands retain descendant authority inside the bounded Job;
 the unrestricted helper sets `PROCESS_CREATION_CHILD_PROCESS_OVERRIDE` on the initial token rather
-than a child-process-restricted flag. Descendants still inherit the LPAC identity and the exact
-non-breakaway Job.
+than a child-process-restricted flag. The target starts suspended while the helper grants its unique
+package SID only `TOKEN_DUPLICATE | TOKEN_IMPERSONATE` on the synthesized LPAC primary-token object,
+then resumes it. This permits the Windows child-creation path to reproduce that same contained token
+without granting the package access to the helper token or another host process. Descendants still
+inherit the LPAC identity and the exact non-breakaway Job.
 
 ## Acceptance criteria
 

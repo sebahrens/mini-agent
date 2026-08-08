@@ -2612,7 +2612,7 @@ mod sandbox_tests {
         assert!(!source.contains("S-1-5-21-3380456832"));
         assert!(!source.contains("SECURITY_CAPABILITY_INTERNET_CLIENT"));
         assert!(!source.contains("PROCESS_CREATION_CHILD_PROCESS_RESTRICTED"));
-        assert!(!source.contains("SE_KERNEL_OBJECT"));
+        assert!(source.contains("SE_KERNEL_OBJECT"));
         assert!(!source.contains("DESKTOP_WRITEOBJECTS"));
         let root_policy = source
             .split("fn collect_read_roots(")
@@ -2666,6 +2666,24 @@ mod sandbox_tests {
         assert!(disarm < launch);
         assert!(helper.contains("verify_descendant_rendezvous(&job, &child"));
         assert!(helper.contains("terminate_and_drain_job(&job, 126)?;\n        grants.mark_job_quiescent();\n        grants.cleanup()?;"));
+
+        let appcontainer_launch = source
+            .split("fn launch_appcontainer(")
+            .nth(1)
+            .and_then(|source| source.split("fn inheritable_duplicate(").next())
+            .expect("AppContainer launch implementation missing");
+        let suspended = appcontainer_launch
+            .find("CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT")
+            .expect("AppContainer target must start suspended");
+        let token_grant = appcontainer_launch
+            .find("grant_descendant_token_access(&process, appcontainer_sid)?")
+            .expect("AppContainer token self-reproduction grant missing");
+        let resume = appcontainer_launch
+            .find("ResumeThread(thread.raw())")
+            .expect("AppContainer target resume missing");
+        assert!(suspended < token_grant && token_grant < resume);
+        assert!(appcontainer_launch.contains("READ_CONTROL | WRITE_DAC"));
+        assert!(appcontainer_launch.contains("TOKEN_DUPLICATE | TOKEN_IMPERSONATE"));
 
         let profile_creation = source
             .split("fn create_appcontainer_profile(")
@@ -2776,12 +2794,16 @@ mod sandbox_tests {
         assert!(source.contains("TARGET_SELF_RAW_SPAWN_ERROR_BASE: i32 = 0x9_0000"));
         assert!(source.contains("TARGET_JOB_LIMIT_QUERY_ERROR_BASE: i32 = 0xA_0000"));
         assert!(source.contains("TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE: i32 = 0xB_0000"));
+        assert!(source.contains("TARGET_SELF_TOKEN_OPEN_ERROR_BASE: i32 = 0xC_0000"));
         assert!(source.contains("fn target_probe_os_error_code("));
         assert!(source.contains("fn target_probe_duplicate_handle("));
         assert!(source.contains("fn target_probe_executable_access("));
         assert!(source.contains("fn target_probe_job_status("));
+        assert!(source.contains("fn target_probe_self_token_access("));
         assert!(source.contains("fn target_probe_raw_spawn("));
         assert!(source.contains("GetProcessMitigationPolicy("));
+        assert!(source.contains("TOKEN_DUPLICATE | TOKEN_IMPERSONATE"));
+        assert!(source.contains("policy.Anonymous.Flags } & 0b100 != 0"));
         assert!(source.contains("QueryInformationJobObject(\n            null_mut(),"));
         assert!(source.contains("let status = match child.wait()"));
         assert!(source.contains("return Ok(55);"));
