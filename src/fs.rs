@@ -1313,7 +1313,7 @@ fn atomic_write_platform(
     }
 
     #[cfg(target_os = "macos")]
-    fn unlink_owned_temp(directory: &File, name: &CString, identity: &std::fs::Metadata) {
+    fn unlink_owned_temp(directory: &File, name: &CString, identity: &CheckedMetadata) {
         if temp_entry_matches(directory, name, identity).unwrap_or(false) {
             // SAFETY: both the directory descriptor and C string are valid,
             // and the descriptor-relative identity check selected this entry.
@@ -1325,23 +1325,20 @@ fn atomic_write_platform(
     fn temp_entry_matches(
         directory: &File,
         name: &CString,
-        identity: &std::fs::Metadata,
+        identity: &CheckedMetadata,
     ) -> std::io::Result<bool> {
-        use std::os::unix::fs::MetadataExt;
-
-        // APFS firmlinks can expose a different device view through `fstatat`
-        // than through a descriptor opened relative to the same directory.
-        // Reopen the entry without following links so both observations use
-        // the same descriptor view. The original temp descriptor remains live,
-        // preventing its identity from being recycled during this comparison.
+        // APFS firmlinks can expose different `st_dev` views for the same file.
+        // Reopen without following links and compare the live filesystem ID plus
+        // inode instead. The original temp descriptor remains live, preventing
+        // its identity from being recycled during this comparison.
         let entry = open_at(
             directory,
             OsStr::from_bytes(name.as_bytes()),
             OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK,
             0,
         )?;
-        let entry = entry.metadata()?;
-        Ok(entry.is_file() && entry.dev() == identity.dev() && entry.ino() == identity.ino())
+        let entry = checked_file_metadata(&entry)?;
+        Ok(entry.is_file() && entry.identity == identity.identity)
     }
 
     fn rename_entry(
@@ -1431,7 +1428,8 @@ fn atomic_write_platform(
             ) {
                 Ok(file) => {
                     #[cfg(target_os = "macos")]
-                    let identity = atomic_write_stage("platform_temp_metadata", file.metadata())?;
+                    let identity =
+                        atomic_write_stage("platform_temp_metadata", checked_file_metadata(&file))?;
                     #[cfg(target_os = "linux")]
                     let identity = checked_file_metadata(&file)?;
                     result = Some((candidate, file, identity));
