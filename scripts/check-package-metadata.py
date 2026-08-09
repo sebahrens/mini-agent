@@ -140,6 +140,22 @@ REMOVED_NIX_ENTRYPOINTS = (
     "nix/package/dev-shell.nix",
     "nix/package/zerostack.nix",
 )
+EXPECTED_RELEASE_ARCHIVES = (
+    "mini-agent-x86_64-unknown-linux-gnu.tar.gz",
+    "mini-agent-aarch64-unknown-linux-gnu.tar.gz",
+    "mini-agent-x86_64-apple-darwin.tar.gz",
+    "mini-agent-aarch64-apple-darwin.tar.gz",
+    "mini-agent-x86_64-unknown-linux-musl.tar.gz",
+    "mini-agent-aarch64-unknown-linux-musl.tar.gz",
+    "mini-agent-x86_64-pc-windows-msvc.tar.gz",
+    "mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz",
+    "mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz",
+    "mini-agent-lite-x86_64-apple-darwin.tar.gz",
+    "mini-agent-lite-aarch64-apple-darwin.tar.gz",
+    "mini-agent-lite-x86_64-unknown-linux-musl.tar.gz",
+    "mini-agent-lite-aarch64-unknown-linux-musl.tar.gz",
+    "mini-agent-lite-x86_64-pc-windows-msvc.tar.gz",
+)
 
 
 def cargo_metadata(root: Path) -> dict[str, Any]:
@@ -288,6 +304,14 @@ def validate_workflow(text: str, binary: str) -> list[str]:
             errors.append(
                 ".github/workflows/release.yml must not reference "
                 f"noncanonical binary path {fragment!r}"
+            )
+    for archive in EXPECTED_RELEASE_ARCHIVES:
+        observed_count = text.count(archive)
+        if observed_count != 2:
+            errors.append(
+                ".github/workflows/release.yml must list expected archive "
+                f"{archive!r} exactly twice (checksum and publication gates), "
+                f"found {observed_count}"
             )
     errors.extend(validate_release_action_pins(text))
     return errors

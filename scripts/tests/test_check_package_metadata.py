@@ -273,6 +273,20 @@ steps:
 
         self.assertTrue(any("release identity" in error for error in errors))
 
+    def test_duplicate_expected_release_archive_is_rejected(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            "mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz",
+            "mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz",
+            1,
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("exactly twice" in error for error in errors))
+
     def test_tag_recipes_require_committed_metadata_before_tagging(self) -> None:
         justfile = (SCRIPT.parents[1] / "justfile").read_text(encoding="utf-8")
         add_tag = justfile[justfile.index("add-tag:") : justfile.index("remove-tag")]
