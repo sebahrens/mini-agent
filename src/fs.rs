@@ -1329,21 +1329,28 @@ fn atomic_write_platform(
     ) -> std::io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
 
-        // APFS can expose different device and filesystem-ID views even for two
-        // descriptors opened relative to the same directory. The random temp was
-        // created directly in this retained directory and cannot cross a mount,
-        // so its inode is sufficient here. The original descriptor remains live,
-        // preventing that inode from being recycled during this comparison.
-        let entry = open_at(
-            directory,
-            OsStr::from_bytes(name.as_bytes()),
-            OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK,
-            0,
-        )?;
-        // The retained original handle supplies the anti-recycling guarantee;
-        // do not ask this second macOS view for another filesystem identity.
-        let entry = entry.metadata()?;
-        Ok(entry.is_file() && entry.ino() == identity.ino())
+        let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // APFS can expose different device and filesystem-ID views for this
+        // descriptor-relative lookup, while opening the private entry again may
+        // be denied. `fstatat` with NOFOLLOW still observes its type and inode.
+        // The random temp was created in this retained directory, so it cannot
+        // cross a mount, and the retained original handle prevents inode reuse.
+        // SAFETY: `directory` and `name` remain live for the call, and `entry`
+        // points to writable storage of the exact stat structure.
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                entry.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatat initialized the complete structure.
+        let entry = unsafe { entry.assume_init() };
+        Ok(entry.st_mode & libc::S_IFMT == libc::S_IFREG && entry.st_ino == identity.ino())
     }
 
     fn rename_entry(
