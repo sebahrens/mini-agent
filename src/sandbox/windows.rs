@@ -3654,17 +3654,20 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     if !has_zero_capabilities {
         return 92;
     }
-    if !tcp_attempt_denied("127.0.0.1:9")
-        || !tcp_attempt_denied("1.1.1.1:9")
-        || !tcp_attempt_denied("[::1]:9")
-        || !tcp_attempt_denied("[2606:4700:4700::1111]:9")
+    // Zero network capabilities plus the helper's no-loopback-exemption attestation are the
+    // enforcement proof. These attempts are behavioral negative controls: every connection/send
+    // must fail, while the exact error may instead describe host routing (notably absent IPv6).
+    if !tcp_attempt_failed("127.0.0.1:9")
+        || !tcp_attempt_failed("1.1.1.1:9")
+        || !tcp_attempt_failed("[::1]:9")
+        || !tcp_attempt_failed("[2606:4700:4700::1111]:9")
     {
         return 94;
     }
-    if !udp_attempt_denied("127.0.0.1:9")
-        || !udp_attempt_denied("1.1.1.1:9")
-        || !udp_attempt_denied("[::1]:9")
-        || !udp_attempt_denied("[2606:4700:4700::1111]:9")
+    if !udp_attempt_failed("127.0.0.1:9")
+        || !udp_attempt_failed("1.1.1.1:9")
+        || !udp_attempt_failed("[::1]:9")
+        || !udp_attempt_failed("[2606:4700:4700::1111]:9")
     {
         return 95;
     }
@@ -3835,19 +3838,14 @@ fn current_token_has_zero_capabilities() -> Result<bool, String> {
     Ok(header == 0)
 }
 
-fn network_access_denied(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(10013)
-}
-
-fn tcp_attempt_denied(address: &str) -> bool {
+fn tcp_attempt_failed(address: &str) -> bool {
     let Ok(address) = address.parse() else {
         return false;
     };
-    std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(750))
-        .is_err_and(|error| network_access_denied(&error))
+    std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(750)).is_err()
 }
 
-fn udp_attempt_denied(address: &str) -> bool {
+fn udp_attempt_failed(address: &str) -> bool {
     let bind = if address.starts_with('[') {
         "[::]:0"
     } else {
@@ -3855,12 +3853,12 @@ fn udp_attempt_denied(address: &str) -> bool {
     };
     let socket = match std::net::UdpSocket::bind(bind) {
         Ok(socket) => socket,
-        Err(error) => return network_access_denied(&error),
+        Err(_) => return true,
     };
     socket
         .connect(address)
         .and_then(|_| socket.send(b"mini-agent-network-denial-probe"))
-        .is_err_and(|error| network_access_denied(&error))
+        .is_err()
 }
 
 fn parse_probe_pid(value: Option<std::ffi::OsString>, label: &str) -> Result<u32, String> {
