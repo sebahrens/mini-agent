@@ -366,7 +366,9 @@ async fn atomic_write_cancellation_serializes_with_final_publication() {
 fn windows_atomic_temp_creation_is_relative_to_verified_directory_handle() {
     let source = include_str!("../fs.rs");
     assert!(source.contains("NtCreateFile"));
+    assert!(source.contains("NtSetInformationFile"));
     assert!(source.contains("RootDirectory: directory.as_raw_handle().cast()"));
+    assert!(source.contains("RootDirectory = directory.as_raw_handle().cast()"));
     assert!(source.contains("FILE_TRAVERSE | FILE_READ_ATTRIBUTES"));
     assert!(source.contains("ensure_same_file(path, expected, &opened)"));
     assert!(source.contains("FILE_CREATE"));

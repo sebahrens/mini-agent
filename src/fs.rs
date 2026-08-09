@@ -1702,16 +1702,16 @@ fn atomic_write_platform(
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+        FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_WRITE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES,
-        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        FileDispositionInfo, FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
+        SYNCHRONIZE, SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1745,20 +1745,20 @@ fn atomic_write_platform(
             ));
         }
         let name_bytes = name.len() * std::mem::size_of::<u16>();
-        let required = std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes;
+        let required = std::mem::size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
         let words = required.div_ceil(std::mem::size_of::<usize>());
         let mut storage = vec![0usize; words];
-        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        // FileRenameInfo with ReplaceIfExists=false provides create-only
-        // publication across supported Windows versions. A relative name with
-        // an explicit RootDirectory is resolved against the same retained,
-        // identity-verified directory handle used for temp creation. A null
-        // RootDirectory would instead bind the leaf to the process cwd and can
-        // fail with ERROR_NOT_SAME_DEVICE when cwd and storage use different
-        // volumes.
+        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        // FileRenameInformation with ReplaceIfExists=false provides create-only
+        // publication. The native API accepts a relative leaf together with the
+        // same retained, identity-verified directory handle used for temp
+        // creation. The Win32 SetFileInformationByHandle wrapper does not
+        // preserve this native RootDirectory contract consistently.
         // SAFETY: `storage` is aligned, large enough for the header and UTF-16
-        // name, and both handles remain live for the call.
-        let renamed = unsafe {
+        // name, both handles remain live for the call, and `io_status` is valid
+        // writable storage for the synchronous result.
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = unsafe {
             (*information).Anonymous.ReplaceIfExists = false;
             (*information).RootDirectory = directory.as_raw_handle().cast();
             (*information).FileNameLength = name_bytes as u32;
@@ -1767,15 +1767,19 @@ fn atomic_write_platform(
                 (*information).FileName.as_mut_ptr(),
                 name.len(),
             );
-            SetFileInformationByHandle(
+            NtSetInformationFile(
                 file.as_raw_handle().cast(),
-                FileRenameInfo,
+                &mut io_status,
                 information.cast(),
                 required as u32,
+                FileRenameInformation,
             )
         };
-        if renamed == 0 {
-            Err(std::io::Error::last_os_error())
+        if status < 0 {
+            // SAFETY: the conversion accepts any NTSTATUS returned by
+            // NtSetInformationFile.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            Err(std::io::Error::from_raw_os_error(code as i32))
         } else {
             Ok(())
         }
