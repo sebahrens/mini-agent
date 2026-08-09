@@ -92,15 +92,12 @@ fn same_open_file_identity(
 ) -> std::io::Result<bool> {
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::MetadataExt;
-
-        // Both descriptors were opened independently through the same exact
-        // path, so they share the same APFS/firmlink metadata view. Comparing
-        // their descriptor metadata detects replacement without querying the
-        // protected volume root for ATTR_VOL_UUID, which hosted macOS runners
-        // can deny even though the selected file itself is accessible.
-        let _ = (left_file, right_file);
-        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+        // APFS can present different logical device/file IDs even to two
+        // independently opened descriptors for the same path. Compare the
+        // physical filesystem and 64-bit file identity instead.
+        let _ = (left, right);
+        Ok(super::macos_real_file_identity(left_file)?
+            == super::macos_real_file_identity(right_file)?)
     }
     #[cfg(not(target_os = "macos"))]
     {
