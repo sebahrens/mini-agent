@@ -448,20 +448,26 @@ impl EffectAudit {
         if options.max_segment_bytes < 512 || options.max_segments == 0 {
             return Err(AuditError::InvalidMetadata);
         }
-        prepare_owner_directory(&owner, options.failure)?;
-        let lock = AuditLock::acquire(&owner.lock_file())?;
+        prepare_owner_directory(&owner, options.failure)
+            .map_err(|error| report_open_stage("prepare_owner_directory", error))?;
+        let lock = AuditLock::acquire(&owner.lock_file())
+            .map_err(|error| report_open_stage("acquire_lock", error))?;
 
-        let indices = segment_indices(&owner)?;
-        let initialized = initialization_marker_exists(&owner)?;
+        let indices =
+            segment_indices(&owner).map_err(|error| report_open_stage("segment_indices", error))?;
+        let initialized = initialization_marker_exists(&owner)
+            .map_err(|error| report_open_stage("initialization_marker_exists", error))?;
         if initialized && indices.is_empty() {
             return Err(AuditError::MissingSegment);
         }
         if indices.len() as u64 > options.max_segments {
             return Err(AuditError::RetentionLimit);
         }
-        let target_key = load_or_create_target_key(&owner, indices.is_empty(), options.failure)?;
+        let target_key = load_or_create_target_key(&owner, indices.is_empty(), options.failure)
+            .map_err(|error| report_open_stage("target_key", error))?;
         let mut audit = if indices.is_empty() {
-            let file = create_private_segment(&owner.segment_file(0))?;
+            let file = create_private_segment(&owner.segment_file(0))
+                .map_err(|error| report_open_stage("create_segment", error))?;
             let mut audit = Self {
                 owner,
                 options,
@@ -514,8 +520,12 @@ impl EffectAudit {
         if !indices.is_empty() {
             audit.validate_existing(&indices)?;
         }
-        audit.ensure_initialization_marker()?;
-        audit.recover_unknown_outcomes()?;
+        audit
+            .ensure_initialization_marker()
+            .map_err(|error| report_open_stage("ensure_initialization_marker", error))?;
+        audit
+            .recover_unknown_outcomes()
+            .map_err(|error| report_open_stage("recover_unknown_outcomes", error))?;
         Ok(audit)
     }
 
@@ -875,6 +885,14 @@ impl EffectAudit {
         sync_file(&marker, self.options.failure)?;
         sync_directory(&self.owner.state_root(), self.options.failure)
     }
+}
+
+fn report_open_stage(stage: &'static str, error: AuditError) -> AuditError {
+    #[cfg(test)]
+    eprintln!("EFFECT_AUDIT_OPEN_FAILED={stage}");
+    #[cfg(not(test))]
+    let _ = stage;
+    error
 }
 
 fn body_from_record(

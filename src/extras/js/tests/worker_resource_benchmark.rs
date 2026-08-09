@@ -38,6 +38,8 @@ const IDLE_RUNTIME_OBSERVATION_KIND: &str = "protocol_lifecycle_proof";
 const IDLE_RUNTIME_PROOF: &str = "authenticated StepResult is emitted only after execute_fresh_step returns and drops its request-local QuickJS Runtime";
 const LINUX_PROCESS_OBSERVATION_KIND: &str = "linux_proc_exact_executable_tree";
 const LINUX_PROCESS_PROOF: &str = "bounded /proc descendant traversal after authenticated Ready; exact worker matched by the configured installed debug executable device and inode; helpers counted separately";
+const MACOS_PROCESS_OBSERVATION_KIND: &str = "macos_guardian_process_group";
+const MACOS_PROCESS_PROOF: &str = "bounded libproc enumeration after authenticated Ready; the authenticated guardian owns its dedicated process group; exactly one live non-guardian member is the worker and the guardian is counted separately";
 const WINDOWS_PROCESS_OBSERVATION_KIND: &str = "windows_owned_job_direct_process_proof";
 const WINDOWS_PROCESS_PROOF: &str = "direct CreateProcessW application PID from WorkerChild::contained; active process count queried from the owned creation-time Job; Job handle is not a helper process";
 const MAX_CONTAINMENT_TREE_PROCESSES: usize = 64;
@@ -531,31 +533,10 @@ fn validate_report(value: &Value) -> Result<(), String> {
         {
             return Err("idle-runtime claim lacks the exact lifecycle proof".into());
         }
-        let process_proof_matches = match run.machine.os.as_str() {
-            "linux" => {
-                run.counts.worker_process_observation_kind == LINUX_PROCESS_OBSERVATION_KIND
-                    && run.counts.worker_process_observation == LINUX_PROCESS_PROOF
-            }
-            "windows" => {
-                run.counts.worker_process_observation_kind == WINDOWS_PROCESS_OBSERVATION_KIND
-                    && run.counts.worker_process_observation == WINDOWS_PROCESS_PROOF
-            }
-            // macOS has no measured variant until its reusable-exec blocker is resolved.
-            "macos" => false,
-            _ => false,
-        };
-        if !process_proof_matches {
+        if !process_proof_matches(&run.machine.os, &run.counts) {
             return Err("worker-process claim lacks its platform observation proof".into());
         }
-        let helper_count_is_sane = match run.machine.os.as_str() {
-            "linux" => {
-                run.counts.maximum_observed_containment_helper_processes
-                    < MAX_CONTAINMENT_TREE_PROCESSES as u32
-            }
-            "windows" => run.counts.maximum_observed_containment_helper_processes == 0,
-            _ => false,
-        };
-        if !helper_count_is_sane {
+        if !helper_count_is_sane(&run.machine.os, &run.counts) {
             return Err("containment-helper count contradicts its observation method".into());
         }
         let derived_count_target = run.counts.maximum_observed_worker_processes == 1
@@ -601,6 +582,36 @@ fn validate_report(value: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn process_proof_matches(os: &str, counts: &CountMeasurements) -> bool {
+    match os {
+        "linux" => {
+            counts.worker_process_observation_kind == LINUX_PROCESS_OBSERVATION_KIND
+                && counts.worker_process_observation == LINUX_PROCESS_PROOF
+        }
+        "macos" => {
+            counts.worker_process_observation_kind == MACOS_PROCESS_OBSERVATION_KIND
+                && counts.worker_process_observation == MACOS_PROCESS_PROOF
+        }
+        "windows" => {
+            counts.worker_process_observation_kind == WINDOWS_PROCESS_OBSERVATION_KIND
+                && counts.worker_process_observation == WINDOWS_PROCESS_PROOF
+        }
+        _ => false,
+    }
+}
+
+fn helper_count_is_sane(os: &str, counts: &CountMeasurements) -> bool {
+    match os {
+        "linux" => {
+            counts.maximum_observed_containment_helper_processes
+                < MAX_CONTAINMENT_TREE_PROCESSES as u32
+        }
+        "macos" => counts.maximum_observed_containment_helper_processes == 1,
+        "windows" => counts.maximum_observed_containment_helper_processes == 0,
+        _ => false,
+    }
 }
 
 fn validate_comparison(run: &BenchmarkRun, comparison: &RunComparison) -> Result<(), String> {
@@ -865,13 +876,118 @@ async fn observe_worker_processes(
 
 #[cfg(target_os = "macos")]
 async fn observe_worker_processes(
-    _supervisor: &JsWorkerSupervisor,
+    supervisor: &JsWorkerSupervisor,
     _worker_executable: &Path,
 ) -> Result<ProcessObservation, Box<dyn std::error::Error>> {
-    Err(
-        "macOS resource measurement is unavailable until production containment is available"
-            .into(),
-    )
+    let guardian_pid = supervisor
+        .process_id_for_test()
+        .await
+        .ok_or("supervisor has no authenticated idle worker connection")?;
+    observe_macos_guardian_group(guardian_pid)
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacosProcBsdShortInfo {
+    pid: u32,
+    parent_pid: u32,
+    process_group: u32,
+    status: u32,
+    command: [std::os::raw::c_char; 16],
+    flags: u32,
+    uid: u32,
+    gid: u32,
+    real_uid: u32,
+    real_gid: u32,
+    saved_uid: u32,
+    saved_gid: u32,
+    reserved: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn observe_macos_guardian_group(
+    guardian_pid: u32,
+) -> Result<ProcessObservation, Box<dyn std::error::Error>> {
+    use std::collections::BTreeSet;
+
+    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
+    const ZOMBIE_STATUS: u32 = 5;
+    unsafe extern "C" {
+        fn proc_listpgrppids(group: libc::pid_t, buffer: *mut libc::c_void, size: i32) -> i32;
+        fn proc_pidinfo(
+            pid: libc::pid_t,
+            flavor: i32,
+            argument: u64,
+            buffer: *mut libc::c_void,
+            size: i32,
+        ) -> i32;
+    }
+
+    let group = libc::pid_t::try_from(guardian_pid)?;
+    let required = unsafe { proc_listpgrppids(group, std::ptr::null_mut(), 0) };
+    if required <= 0 {
+        return Err(if required == 0 {
+            "authenticated macOS guardian process group is empty".into()
+        } else {
+            io::Error::last_os_error().into()
+        });
+    }
+    if required as usize > MAX_CONTAINMENT_TREE_PROCESSES {
+        return Err("macOS guardian process group exceeded the benchmark observation bound".into());
+    }
+    let mut pids = vec![0; required as usize + 8];
+    let bytes = pids
+        .len()
+        .checked_mul(std::mem::size_of::<libc::pid_t>())
+        .and_then(|size| i32::try_from(size).ok())
+        .ok_or("macOS guardian process group buffer exceeded its bound")?;
+    let read = unsafe { proc_listpgrppids(group, pids.as_mut_ptr().cast(), bytes) };
+    if read < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if read as usize > MAX_CONTAINMENT_TREE_PROCESSES {
+        return Err("macOS guardian process group changed beyond the observation bound".into());
+    }
+    pids.truncate(read as usize);
+
+    let mut live = BTreeSet::new();
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let mut info = std::mem::MaybeUninit::<MacosProcBsdShortInfo>::uninit();
+        let received = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDT_SHORTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<MacosProcBsdShortInfo>() as i32,
+            )
+        };
+        if received != std::mem::size_of::<MacosProcBsdShortInfo>() as i32 {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        if info.status != ZOMBIE_STATUS && info.process_group == guardian_pid {
+            live.insert(pid as u32);
+        }
+    }
+    if !live.remove(&guardian_pid) {
+        return Err("authenticated macOS guardian is absent from its process group".into());
+    }
+    if live.len() != 1 {
+        return Err(format!(
+            "authenticated macOS guardian process group has {} live non-guardian members",
+            live.len()
+        )
+        .into());
+    }
+    Ok(ProcessObservation {
+        exact_worker_pid: *live.first().expect("one live worker was established"),
+        worker_processes: 1,
+        containment_helper_processes: 1,
+        observation_kind: MACOS_PROCESS_OBSERVATION_KIND,
+        observation: MACOS_PROCESS_PROOF,
+    })
 }
 
 async fn pure_call(supervisor: &JsWorkerSupervisor) -> Result<(), WorkerError> {
@@ -1490,6 +1606,26 @@ fn worker_resource_memory_units_are_parsed_deterministically() {
     assert_eq!(parse_scaled_bytes("12.5M"), Some(13_107_200));
     assert_eq!(parse_scaled_bytes(" 1024 K "), Some(1_048_576));
     assert_eq!(parse_scaled_bytes("unavailable"), None);
+}
+
+#[test]
+fn worker_resource_macos_process_proof_requires_one_guardian_helper() {
+    let counts = CountMeasurements {
+        maximum_observed_worker_processes: 1,
+        maximum_observed_containment_helper_processes: 1,
+        idle_worker_processes: 1,
+        worker_process_observation_kind: MACOS_PROCESS_OBSERVATION_KIND.into(),
+        worker_process_observation: MACOS_PROCESS_PROOF.into(),
+        idle_runtimes: 0,
+        idle_runtime_observation_kind: IDLE_RUNTIME_OBSERVATION_KIND.into(),
+        idle_runtime_observation: IDLE_RUNTIME_PROOF.into(),
+    };
+    assert!(process_proof_matches("macos", &counts));
+    assert!(helper_count_is_sane("macos", &counts));
+
+    let mut missing_guardian = counts;
+    missing_guardian.maximum_observed_containment_helper_processes = 0;
+    assert!(!helper_count_is_sane("macos", &missing_guardian));
 }
 
 #[test]
