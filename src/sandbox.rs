@@ -2581,7 +2581,6 @@ mod sandbox_tests {
             "HELPER_STAGE_REGULAR_TOKEN_ACCESS",
             "helper_failure_status()",
             "AUTHORITY_DESCENDANT_SPAWN_FAILED",
-            "AUTHORITY_LOOPBACK_QUERY_ERROR",
             "bounded_pipe=pass",
             "acl_serialization=pass",
             "parent_death_job=pass",
@@ -2681,10 +2680,13 @@ mod sandbox_tests {
         let disarm = helper
             .find("grants.disarm_for_launch()")
             .expect("cleanup must disarm before launch");
+        let loopback_attestation = helper
+            .find("appcontainer_has_no_loopback_exemption(grants.sid())")
+            .expect("trusted-helper loopback exemption attestation missing");
         let launch = helper
             .find("launch_appcontainer(")
             .expect("AppContainer launch missing");
-        assert!(disarm < launch);
+        assert!(loopback_attestation < disarm && disarm < launch);
         assert!(helper.contains("terminate_and_drain_job(&job, 126)?;\n        grants.mark_job_quiescent();\n        grants.cleanup()?;"));
 
         let appcontainer_launch = source

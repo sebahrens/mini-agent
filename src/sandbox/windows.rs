@@ -48,9 +48,8 @@ use windows_sys::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
     RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorOwner, TOKEN_APPCONTAINER_INFORMATION, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid,
-    TokenCapabilities, TokenImpersonation, TokenIsAppContainer, TokenUser,
+    SetSecurityDescriptorOwner, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
+    TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenImpersonation, TokenIsAppContainer, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
@@ -125,7 +124,6 @@ const AUTHORITY_CURRENT_EXE_ERROR: i32 = 109;
 const AUTHORITY_BREAKAWAY_EXE_ERROR: i32 = 110;
 const AUTHORITY_BREAKAWAY_RESULT_ERROR: i32 = 111;
 const AUTHORITY_CAPABILITY_QUERY_ERROR: i32 = 112;
-const AUTHORITY_LOOPBACK_QUERY_ERROR: i32 = 113;
 const DESCENDANT_ARGUMENT_ERROR: i32 = 119;
 const DESCENDANT_CAPABILITY_QUERY_ERROR: i32 = 120;
 const DESCENDANT_APPCONTAINER_QUERY_ERROR: i32 = 121;
@@ -1282,6 +1280,12 @@ fn run_helper() -> Result<i32, String> {
         {
             grant_read_root(&root, &mut grants, &parent)?;
         }
+    }
+    // This desktop-only firewall API reads host configuration and is intentionally unavailable
+    // inside AppContainer. Attest the freshly-created profile SID from the trusted helper before
+    // launch; the contained authority probe separately verifies actual TCP/UDP denial.
+    if !appcontainer_has_no_loopback_exemption(grants.sid())? {
+        return Err("sandbox: AppContainer profile has a loopback exemption".into());
     }
     ensure_parent_alive(&parent)?;
     let token = primary_token()?;
@@ -3650,12 +3654,6 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     if !has_zero_capabilities {
         return 92;
     }
-    let Ok(has_no_loopback_exemption) = current_appcontainer_has_no_loopback_exemption() else {
-        return AUTHORITY_LOOPBACK_QUERY_ERROR;
-    };
-    if !has_no_loopback_exemption {
-        return 96;
-    }
     if !tcp_attempt_denied("127.0.0.1:9")
         || !tcp_attempt_denied("1.1.1.1:9")
         || !tcp_attempt_denied("[::1]:9")
@@ -3753,55 +3751,6 @@ fn token_is_appcontainer(token: &Handle, context: &str) -> Result<bool, String> 
     Ok(value != 0)
 }
 
-struct TokenAppContainerInformation {
-    storage: Vec<usize>,
-}
-
-impl TokenAppContainerInformation {
-    fn sid(&self) -> PSID {
-        let information = unsafe {
-            &*(self
-                .storage
-                .as_ptr()
-                .cast::<TOKEN_APPCONTAINER_INFORMATION>())
-        };
-        information.TokenAppContainer
-    }
-}
-
-fn token_appcontainer_information(token: &Handle) -> Result<TokenAppContainerInformation, String> {
-    let mut bytes = 0u32;
-    unsafe {
-        GetTokenInformation(token.raw(), TokenAppContainerSid, null_mut(), 0, &mut bytes);
-    }
-    if bytes < size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32 || bytes > 64 * 1024 {
-        return Err("sandbox: invalid TokenAppContainerSid size".into());
-    }
-    let mut storage = vec![0usize; (bytes as usize).div_ceil(size_of::<usize>())];
-    let capacity = (storage.len() * size_of::<usize>()) as u32;
-    let mut returned = capacity;
-    if unsafe {
-        GetTokenInformation(
-            token.raw(),
-            TokenAppContainerSid,
-            storage.as_mut_ptr().cast(),
-            capacity,
-            &mut returned,
-        )
-    } == 0
-    {
-        return Err(last_error("read current AppContainer SID"));
-    }
-    if returned < size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32 || returned > capacity {
-        return Err("sandbox: invalid returned TokenAppContainerSid size".into());
-    }
-    let information = TokenAppContainerInformation { storage };
-    if information.sid().is_null() {
-        return Err("sandbox: current token had no AppContainer SID".into());
-    }
-    Ok(information)
-}
-
 fn current_token_is_appcontainer() -> Result<bool, String> {
     let mut raw = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
@@ -3811,13 +3760,10 @@ fn current_token_is_appcontainer() -> Result<bool, String> {
     token_is_appcontainer(&token, "read descendant TokenIsAppContainer")
 }
 
-fn current_appcontainer_has_no_loopback_exemption() -> Result<bool, String> {
-    let mut raw = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
-        return Err(last_error("open AppContainer token for loopback proof"));
+fn appcontainer_has_no_loopback_exemption(appcontainer_sid: PSID) -> Result<bool, String> {
+    if appcontainer_sid.is_null() {
+        return Err("sandbox: missing AppContainer SID for loopback proof".into());
     }
-    let token = Handle::created(raw, "open AppContainer token for loopback proof")?;
-    let appcontainer = token_appcontainer_information(&token)?;
     let mut count = 0u32;
     let mut entries: *mut SID_AND_ATTRIBUTES = null_mut();
     let result = unsafe { NetworkIsolationGetAppContainerConfig(&mut count, &mut entries) };
@@ -3847,7 +3793,7 @@ fn current_appcontainer_has_no_loopback_exemption() -> Result<bool, String> {
     let entries = LoopbackEntries { count, entries };
     for index in 0..count as usize {
         let candidate = unsafe { (*entries.entries.add(index)).Sid };
-        if !candidate.is_null() && unsafe { EqualSid(appcontainer.sid(), candidate) } != 0 {
+        if !candidate.is_null() && unsafe { EqualSid(appcontainer_sid, candidate) } != 0 {
             return Ok(false);
         }
     }
