@@ -2529,11 +2529,9 @@ mod sandbox_tests {
             "job_name",
             "wait_for_stale_job_quiescence",
             "verify_descendant_membership",
-            "read_descendant_process_proof",
-            "DESCENDANT_PROOF_HANDLE_PLACEHOLDER",
-            "descendant_proof_pipe",
-            "PeekNamedPipe",
-            "process_creation_time(descendant.raw())?",
+            "wait_for_suspended_descendant",
+            "JobObjectBasicProcessIdList",
+            "JOBOBJECT_BASIC_PROCESS_ID_LIST",
             "active_job_processes",
             "wait_for_exact_probe_file",
             "creation-time Job did not contain exactly its suspended target",
@@ -2584,7 +2582,6 @@ mod sandbox_tests {
             "authority probe failed: status=",
             "HELPER_FAILURE_STATUS_BASE",
             "HELPER_STAGE_VERIFY_DESCENDANT",
-            "HELPER_STAGE_DESCENDANT_PROCESS_OPEN",
             "HELPER_STAGE_DESCENDANT_JOB_QUERY",
             "HELPER_STAGE_DESCENDANT_JOB_RESULT",
             "HELPER_STAGE_REGULAR_TOKEN_ACCESS",
@@ -2719,7 +2716,6 @@ mod sandbox_tests {
         );
         assert!(!appcontainer_launch.contains("PROC_THREAD_ATTRIBUTE_JOB_LIST"));
         assert!(appcontainer_launch.contains("startup.StartupInfo.hStdOutput = stdout.raw()"));
-        assert!(appcontainer_launch.contains("handles.push(proof)"));
 
         let profile_creation = source
             .split("fn create_appcontainer_profile(")
@@ -2773,14 +2769,25 @@ mod sandbox_tests {
         let descendant_verification = source
             .split("fn verify_descendant_membership(")
             .nth(1)
-            .and_then(|source| source.split("fn read_descendant_process_proof(").next())
+            .and_then(|source| source.split("fn wait_for_suspended_descendant(").next())
             .expect("descendant membership implementation missing");
-        assert!(descendant_verification.contains("OpenProcess("));
-        assert!(descendant_verification.contains("GetProcessId(descendant.raw())"));
-        assert!(descendant_verification.contains("IsProcessInJob("));
+        assert!(descendant_verification.contains("wait_for_suspended_descendant(job, target)?"));
         assert!(descendant_verification.contains("verify_job_limits(job)?"));
         assert!(descendant_verification.contains("active_job_processes(job)? != 2"));
-        assert!(descendant_verification.contains("escaped its exact bounded Job"));
+
+        let descendant_discovery = source
+            .split("fn wait_for_suspended_descendant(")
+            .nth(1)
+            .and_then(|source| source.split("fn active_job_processes(").next())
+            .expect("suspended descendant discovery implementation missing");
+        assert!(descendant_discovery.contains("JobObjectBasicProcessIdList"));
+        assert!(descendant_discovery.contains("NumberOfAssignedProcesses != 2"));
+        assert!(descendant_discovery.contains("NumberOfProcessIdsInList != 2"));
+        assert!(descendant_discovery.contains("GetProcessId(target.raw())"));
+        assert!(
+            descendant_discovery
+                .contains("timed out waiting for suspended AppContainer descendant")
+        );
 
         let authority_probe = source
             .split("fn run_authority_probe(")
@@ -2789,10 +2796,13 @@ mod sandbox_tests {
             .expect("authority descendant implementation missing");
         assert!(authority_probe.contains("CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT"));
         assert!(authority_probe.contains("ResumeThread(descendant_thread.raw())"));
-        assert!(authority_probe.contains("DESCENDANT_PROOF_MAGIC.to_le_bytes()"));
-        assert!(authority_probe.contains("File::from_raw_handle(descendant_proof_handle)"));
-        assert!(!authority_probe.contains("std::io::stdout().lock()"));
-        assert!(!authority_probe.contains(".open(&descendant_proof)"));
+        let descendant_release_wait = authority_probe
+            .find("while !descendant_release.exists()")
+            .expect("suspended descendant release wait missing");
+        let descendant_resume = authority_probe
+            .find("ResumeThread(descendant_thread.raw())")
+            .expect("suspended descendant resume missing");
+        assert!(descendant_release_wait < descendant_resume);
 
         let parent_probe = source
             .split("fn run_parent_probe(")
