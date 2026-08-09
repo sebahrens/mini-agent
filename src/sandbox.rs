@@ -2780,6 +2780,16 @@ mod sandbox_tests {
         assert!(descendant_verification.contains("verify_job_limits(job)?"));
         assert!(descendant_verification.contains("escaped its exact bounded Job"));
 
+        let authority_probe = source
+            .split("fn run_authority_probe(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_descendant_probe(").next())
+            .expect("authority descendant implementation missing");
+        assert!(authority_probe.contains("CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT"));
+        assert!(authority_probe.contains("ResumeThread(descendant_thread.raw())"));
+        assert!(authority_probe.contains("DESCENDANT_PROOF_MAGIC.to_le_bytes()"));
+        assert!(!authority_probe.contains("command.spawn_guarded()"));
+
         let parent_probe = source
             .split("fn run_parent_probe(")
             .nth(1)

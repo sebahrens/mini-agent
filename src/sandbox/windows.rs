@@ -126,6 +126,7 @@ const AUTHORITY_BREAKAWAY_RESULT_ERROR: i32 = 111;
 const AUTHORITY_CAPABILITY_QUERY_ERROR: i32 = 112;
 const AUTHORITY_LOOPBACK_QUERY_ERROR: i32 = 113;
 const AUTHORITY_DESCENDANT_PROOF_ERROR: i32 = 114;
+const AUTHORITY_DESCENDANT_RESUME_ERROR: i32 = 115;
 const DESCENDANT_ARGUMENT_ERROR: i32 = 119;
 const DESCENDANT_CAPABILITY_QUERY_ERROR: i32 = 120;
 const DESCENDANT_APPCONTAINER_QUERY_ERROR: i32 = 121;
@@ -3791,29 +3792,76 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     let Ok(executable) = std::env::current_exe() else {
         return AUTHORITY_CURRENT_EXE_ERROR;
     };
-    let mut command = Command::new(executable);
-    command.arg(DESCENDANT_PROBE_ARG).arg(&descendant_release);
-    let mut descendant = match command.spawn_guarded() {
-        Ok(descendant) => descendant,
+    let application = match wide_null(executable.as_os_str()) {
+        Ok(application) => application,
         Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
     };
+    let descendant_arguments = [
+        DESCENDANT_PROBE_ARG.to_string(),
+        descendant_release.to_string_lossy().into_owned(),
+    ];
+    let mut command_line = wide_string(&windows_command_line(&executable, &descendant_arguments));
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..STARTUPINFOW::default()
+    };
+    let mut information = PROCESS_INFORMATION::default();
+    if unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            FALSE,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            null(),
+            null(),
+            &startup,
+            &mut information,
+        )
+    } == 0
+    {
+        return AUTHORITY_DESCENDANT_SPAWN_FAILED;
+    }
+    let descendant = match Handle::created(information.hProcess, "own authority descendant") {
+        Ok(descendant) => descendant,
+        Err(_) => {
+            unsafe { CloseHandle(information.hThread) };
+            return AUTHORITY_DESCENDANT_SPAWN_FAILED;
+        }
+    };
+    let descendant_thread =
+        match Handle::created(information.hThread, "own authority descendant thread") {
+            Ok(thread) => thread,
+            Err(_) => {
+                unsafe { TerminateProcess(descendant.raw(), 126) };
+                return AUTHORITY_DESCENDANT_SPAWN_FAILED;
+            }
+        };
     let mut proof_writer = std::io::stdout().lock();
     if proof_writer
         .write_all(&DESCENDANT_PROOF_MAGIC.to_le_bytes())
-        .and_then(|()| proof_writer.write_all(&(descendant.as_raw_handle() as usize).to_le_bytes()))
+        .and_then(|()| proof_writer.write_all(&(descendant.raw() as usize).to_le_bytes()))
         .and_then(|()| proof_writer.flush())
         .is_err()
     {
+        unsafe { TerminateProcess(descendant.raw(), 126) };
         return AUTHORITY_DESCENDANT_PROOF_ERROR;
     }
-    let descendant = match descendant.wait() {
-        Ok(status) => status,
-        Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,
-    };
-    if !descendant.success() {
-        return descendant
-            .code()
-            .unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE);
+    if unsafe { ResumeThread(descendant_thread.raw()) } == u32::MAX {
+        unsafe { TerminateProcess(descendant.raw(), 126) };
+        return AUTHORITY_DESCENDANT_RESUME_ERROR;
+    }
+    drop(descendant_thread);
+    if unsafe { WaitForSingleObject(descendant.raw(), u32::MAX) } != WAIT_OBJECT_0 {
+        return AUTHORITY_DESCENDANT_WAIT_FAILED;
+    }
+    let mut descendant_code = 0u32;
+    if unsafe { GetExitCodeProcess(descendant.raw(), &mut descendant_code) } == 0 {
+        return AUTHORITY_DESCENDANT_NO_EXIT_CODE;
+    }
+    if descendant_code != 0 {
+        return i32::try_from(descendant_code).unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE);
     }
     let Ok(breakaway_executable) = std::env::current_exe() else {
         return AUTHORITY_BREAKAWAY_EXE_ERROR;
