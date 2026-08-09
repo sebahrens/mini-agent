@@ -298,6 +298,22 @@ def validate_workflow(text: str, binary: str) -> list[str]:
                 f"{observed_count}"
             )
 
+    static_start = text.find("\n  build-static:")
+    static_end = text.find("\n  build-windows:", static_start + 1)
+    static_job = (
+        text[static_start:static_end]
+        if static_start >= 0 and static_end > static_start
+        else ""
+    )
+    if (
+        static_job.count("          - os: ubuntu-latest") != 2
+        or "ubuntu-24.04-arm" in static_job
+    ):
+        errors.append(
+            ".github/workflows/release.yml musl builds must run cross from "
+            "ubuntu-latest x86_64 hosts"
+        )
+
     forbidden = (
         "target/${{ matrix.target }}/release/zerostack",
         "zerostack-${{ matrix.target }}.tar.gz",
@@ -517,6 +533,8 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f'name = "{binary}"',
             f'repository = "{CANONICAL_REPOSITORY_URL}"',
             f'homepage = "{CANONICAL_REPOSITORY_URL}"',
+            "[target.'cfg(target_env = \"musl\")'.dependencies]",
+            'openssl = { version = "0.10", features = ["vendored"] }',
         ),
         "src/cli.rs": (f'#[command(name = "{binary}"',),
         "install.sh": (

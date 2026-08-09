@@ -256,6 +256,22 @@ steps:
 
         self.assertTrue(any("RUSTFLAGS" in error for error in errors))
 
+    def test_static_release_matrix_rejects_arm_cross_host(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            "          - os: ubuntu-latest\n"
+            "            target: aarch64-unknown-linux-musl",
+            "          - os: ubuntu-24.04-arm\n"
+            "            target: aarch64-unknown-linux-musl",
+            1,
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("x86_64 hosts" in error for error in errors))
+
     def test_manual_release_dispatch_is_rejected(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github/workflows/release.yml"
