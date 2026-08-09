@@ -168,10 +168,10 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 
 Sandboxing and memory support are compiled into the default build. The general-process sandbox is
 enabled by default: Linux uses `bwrap` when installed and trusted, supported macOS hosts use the
-system-provided Seatbelt backend at `/usr/bin/sandbox-exec`, and Windows selects the AppContainer
-candidate (`restricted-token` remains a compatibility alias). That Windows candidate currently
-reports unavailable pending native hosted attestation, so startup fails closed unless
-`--no-sandbox` explicitly opts out. Other implicitly selected unavailable defaults warn and start
+system-provided Seatbelt backend at `/usr/bin/sandbox-exec`, and Windows selects the attested
+AppContainer backend (`restricted-token` remains a compatibility alias). Windows availability
+requires its cached native production preflight; failure remains closed unless `--no-sandbox`
+explicitly opts out. Other implicitly selected unavailable defaults warn and start
 unsandboxed. While sandboxing remains enabled, explicit `--sandbox`, `sandbox = true`, or selecting
 a backend through `--sandbox-backend` or `sandbox-backend` remains fail-closed. This general
 subprocess policy is distinct from the mandatory, stricter JavaScript worker containment below.
@@ -190,7 +190,8 @@ On Windows, ordinary startup and `--print-config` evaluate worker status. That c
 reuses a persistent AppContainer profile and may add a persistent read/execute ACE for that
 profile to a supported, user-owned installed executable. It has no automatic cleanup, ACL rollback,
 or separate consent prompt. The local attestation does not test general host filesystem/network
-denial; broader canaries are pending hosted reference-runner evidence.
+denial; the delivered hosted canaries record those broader observations only for their reference
+runner and do not prove identical ACL visibility on every Windows host.
 
 Everything else above ships in the default build. A few extras are compiled in
 only when you ask for them: lifecycle hooks (`--features hooks`), a

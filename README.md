@@ -89,7 +89,7 @@ The default general-process backend is platform-specific:
 |----------|-----------------|
 | Linux | `bwrap`, when an installed trusted binary passes the real preflight |
 | macOS | System-provided Seatbelt at `/usr/bin/sandbox-exec` on supported macOS hosts |
-| Windows | `appcontainer` candidate; selected by default but production-unavailable pending native hosted attestation (`restricted-token` is a compatibility alias) |
+| Windows | Attested regular `appcontainer` backend (`restricted-token` is a compatibility alias); unavailable or failed preflight remains fail-closed |
 
 With the Linux `bwrap` backend, mini-agent applies this capability matrix:
 
@@ -119,10 +119,11 @@ Use `mini-agent --sandbox-backend bwrap --print-config` to see the configured ba
 availability, and effective capability report. Parent-brokered, permission-gated HTTP fetches are
 a separate boundary; subprocess network isolation does not bypass or replace fetch permissions.
 
-On Windows, `appcontainer` is currently a hosted candidate, not an available production
-backend. Startup fails closed unless the operator explicitly selects `--no-sandbox`. The native
-probe exercises explicit package-SID access: the workspace is read/write, while the application
-cache and exact selected executable are read/execute only. No ambient `PATH`, home, Cargo, or
+On Windows, `appcontainer` is available only after its cached native production preflight passes;
+an unavailable or failed preflight remains fail-closed unless the operator explicitly selects
+`--no-sandbox`. The hosted reference-runner gate exercises explicit package-SID access: the
+workspace is read/write, while the application cache and exact selected executable are
+read/execute only. No ambient `PATH`, home, Cargo, or
 Rustup root is inferred. Operators may add bounded AppContainer-only read or write roots explicitly;
 relative values resolve from the workspace, and remote, reparse, hard-link, or permission-widening
 overlaps fail closed. The regular AppContainer retains standard Windows system resources and any
@@ -148,7 +149,7 @@ The worker boundary is mandatory and independent of the optional general subproc
 |----------|----------------------|
 | Linux | Available only after a real empty-root `bwrap` preflight proves trusted runtime mounts, isolated namespaces/network, rlimits, non-dumpability, `no_new_privs`, and seccomp process/exec denial. The workspace, cache, configuration, credentials, and ambient environment are absent. |
 | macOS | Available on validated macOS 26 hosts with typed `DeprecatedBestEffort` assurance. A trusted guardian launches an exact one-time image under deny-default Seatbelt, the parent unlinks that image after authenticated Ready, and every startup repeats the full denial, limit, lifecycle, and parent-death preflight. Other macOS majors remain unavailable. |
-| Windows | Available only after a process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, protocol probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots; the full hosted canary records those observations only for its reference runner, and its final artifact remains pending. Model-authored JS `spawn` uses the separate general AppContainer backend; learned-skill spawn still requires an immutable-executable backend and remains disabled. |
+| Windows | Available only after a process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, protocol probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots; the full hosted canary records those observations only for its reference runner and does not prove every host has identical ACL visibility. Model-authored JS `spawn` uses the separately attested general AppContainer backend; learned-skill spawn still requires an immutable-executable backend and remains disabled. |
 
 Hooks, MCP servers, LSPs, loop validation, and the explicit interactive shell are separate trust
 classes with different workspace, credential, and lifecycle needs. They never inherit the
@@ -165,11 +166,11 @@ prompt is provided.
 |-------|-------|--------|
 | Foundation | Typed paths, ownership, migration, platform security | In progress |
 | 1 | Core JS engine, host globals, permissions, process wrapper | Delivered |
-| 2 | `fetch`, narrowing allow-lists, Linux/macOS process isolation | Delivered |
+| 2 | `fetch`, narrowing allow-lists, Linux/macOS/Windows process isolation | Delivered |
 | 3 | Agent Skills, immutable learned skills, and prompt-time retrieval | Delivered |
 | 4 | Agent proposals, held-out evaluation, human-gated canary | Delivered |
 | 5 | Evidence, promotion, quarantine, repair, rollback | Delivered |
-| 6 | Contained worker, protocol, parent broker/audit, private realms | Implementation complete; final evidence pending |
+| 6 | Contained worker, protocol, parent broker/audit, private realms | Delivered |
 
 ## Cargo features
 
@@ -177,7 +178,7 @@ prompt is provided.
 |---------|---------|------|
 | `memory` | — | Project memory loading, editing, and context injection |
 | `js` | — | Brokered QuickJS worker plus parent-owned effect globals (`rquickjs`) |
-| `sandbox` | — | Shared Linux/macOS general-process isolation; with `js`, enables parent-brokered `spawn` where complete descendant containment exists and the permission-gated `fetch` global |
+| `sandbox` | — | Shared Linux/macOS/Windows general-process isolation; with `js`, enables parent-brokered `spawn` where complete descendant containment and executable preparation exist, plus the permission-gated `fetch` global |
 | `skills` | `js` | Agent Skills catalog plus learned-skill store, hybrid retrieval, and no-effect verifier |
 | `skills-embed` | `skills` | Local BGE embedding inference (`fastembed` → ONNX Runtime) |
 | `skills-embed-dynamic` | `skills-embed` | Links ONNX Runtime at run time via `ORT_DYLIB_PATH`, for hosts without prebuilt `ort-sys` binaries |

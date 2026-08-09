@@ -1,18 +1,20 @@
 # Phase 6 — Brokered Cross-Platform JavaScript Runtime
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.0.0-rc.1
-- **Delivery status**: implementation complete; final cross-platform evidence pending
+- **Specification version**: 1.0.0
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-02
+- **Last reconciled**: 2026-08-09
 - **Entry dependency**: the indexed Phase 1–5 contracts whose behavior Phase 6 preserves
 - **Exit dependency**: every gate and acceptance requirement in this document
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). This document is the authority for JavaScript worker containment,
 worker protocol, runtime ownership, brokered effects, effect audit, and production/verification
-realm parity. The implementation follows this contract. The final delivery claim remains pending
-until the required cross-platform CI artifacts and reviewed resource record are available.
+realm parity. The implementation and dedicated cross-platform containment gates and platform
+records from CI run 31319107422 satisfy this contract. The checked-in resource baseline was
+independently aggregated by the final validator at commit `9c6f164` and remains observational
+rather than a security boundary.
 
 Phase 1 remains the authority for the JavaScript language surface, resource limits, stable error
 categories, and permission semantics that this phase preserves. Its exception text/stack
@@ -268,9 +270,11 @@ limit belong to the whole fresh worker runtime request, not to individual nested
 capability tokens, and reset only when that disposable runtime is recycled.
 
 File, fetch, proposal, and command operations retain their owning Phase 1–4 validation and limits.
-Parent-brokered JS `spawn` remains disabled on Windows until a separate general command sandbox
-owns and verifies the complete descendant lifetime. LPAC worker containment never serves as
-containment for a brokered command.
+On Windows, model-authored JS `spawn` uses the separately attested regular-AppContainer general
+command sandbox, which owns and verifies the complete descendant lifetime. LPAC worker containment
+never serves as containment for a brokered command. Learned-skill spawn remains disabled on
+Windows because its stronger executable-manifest contract requires an immutable-executable
+snapshot backend that Windows does not provide.
 
 ## Persistence boundary
 
@@ -488,9 +492,10 @@ completed Hello/Ready handshake and valid contained `RunStep`,
 and disappearance of the exact controlled sleeper PID/start-time after process-group teardown.
 
 Containment availability and the real backend are probed before JS is advertised. An available
-Linux or Windows worker denies process creation/exec. macOS reports the weaker scoped assurance as
-typed unavailable until the hosted matrix below closes. A backend that is absent, untrusted,
-misconfigured, unverifiable, or unable to apply every required restriction makes JS unavailable.
+Linux or Windows worker denies process creation/exec. Validated macOS 26 reports the weaker scoped
+`DeprecatedBestEffort` assurance only after the complete live matrix below passes. A backend that
+is absent, untrusted, misconfigured, unverifiable, or unable to apply every required restriction
+makes JS unavailable.
 
 ### macOS standalone-CLI containment gate
 
@@ -788,10 +793,11 @@ the worker runtime, and invokes the installed binary's `--print-config`. Its sep
 lane also installs the binary and requires that identity's own `--print-config` to report the same
 cached available/enforced status before it may emit pass evidence. Raw standard-user output is
 deleted rather than archived.
-The final CI result and artifact are still pending and must be inserted here before Phase 6 is
-marked delivered. Hosted reference-runner evidence does not prove every current host has identical
-ACL visibility. No restricted-token or unconfined fallback is allowed, and this gate does not
-satisfy the separate general-command sandbox.
+CI run 31319107422 records the cached production attestation, full canary, supported user-owned
+install locations, protected-location negative control, and standard-user `--print-config` result.
+Hosted reference-runner evidence does not prove every current host has identical ACL visibility.
+No restricted-token or unconfined fallback is allowed, and this gate does not satisfy the separate
+general-command sandbox, whose own native gate passed independently in the same run.
 
 ## Failure semantics
 
@@ -887,9 +893,11 @@ invocation. Callers must not replay that proposal automatically.
 
 ## Acceptance matrix
 
-The matrix defines required evidence. Implementation is complete, but the final delivery status
-remains pending until the index exit rule is satisfied. The platform and resource rows below are
-intentional last-mile placeholders; replace them only with reviewed CI artifacts, never estimates.
+The matrix defines required evidence. Phase 6 is delivered under the index exit rule using the
+dedicated containment gates and three platform records from CI run 31319107422 plus the checked-in
+aggregate independently revalidated at commit `9c6f164`. Reference-runner observations are
+recorded with their platform and residual-risk qualifications; they are never generalized into
+unmeasured host guarantees.
 
 | Contract area | Required acceptance evidence |
 |---------------|------------------------------|
@@ -900,7 +908,7 @@ intentional last-mile placeholders; replace them only with reviewed CI artifacts
 | Persistence boundary | Tests prove no worker database/path authority, pure initialization, no writer in stored realms, identity-v1 quarantine, and parent-only canonical persistence. |
 | Verification parity | The QuickJS realm gate passes; production and all verifier modes use one loader/ABI path with only declared deterministic fake capabilities and the same sanitized typed diagnostic contract. |
 | Effect audit | Recovery and failure-injection tests prove durable intent before every real effect, bounded completion, hash-chain integrity, fixed version-1 HMAC target correlation/redaction, version-1 key failure, segment rotation/anchors, bounded retention, machine-wide single-writer exclusion, process-restart retry semantics, and no replay. Key rotation remains out of scope. |
-| Platform containment | **PENDING FINAL CI EVIDENCE.** Linux must publish its real empty-root bwrap probe; macOS must publish the production-binary authenticated live-preflight plus denial/guardian observations on every validated major; Windows must publish the cached-attestation and hosted reference-runner full-canary/supported-install-location observations before those results are recorded. |
-| Resource baseline | **PENDING EXTERNAL RUNS.** The schema and methodology are delivered in [`../benchmarks/js-worker.md`](../benchmarks/js-worker.md); [`../benchmarks/results/js-worker-baseline.json`](../benchmarks/results/js-worker-baseline.json) remains an explicit empty observation record until the reviewed aggregate is checked in. Target misses are recorded, not blocking, unless a miss is reproduced on a matched quiet host and explicitly promoted to a blocking acceptance issue. |
+| Platform containment | CI run 31319107422 passes the dedicated real empty-root Linux probe, the macOS 15 fail-closed probe, the validated macOS 26 production-binary denial/guardian live matrix, the Windows cached-attestation/full-canary/supported-install-location matrix, and the separate Windows general-AppContainer gate. The macOS 26 and Windows hosted results apply to their reference runners only. |
+| Resource baseline | The three platform records from CI run 31319107422 were independently aggregated and schema-validated by the final validator at commit `9c6f164`; the reviewed result is checked in at [`../benchmarks/results/js-worker-baseline.json`](../benchmarks/results/js-worker-baseline.json) under the method in [`../benchmarks/js-worker.md`](../benchmarks/js-worker.md). It records one worker and zero idle runtimes per measured platform. Timing and memory target booleans remain informational unless a matched-host repeat is explicitly promoted; the enforced native ceilings are verified separately. |
 | Failure semantics | Crash, OOM, timeout, cancellation, audit failure, backend absence, parent death, ambiguous-effect, and secret-in-thrown-value tests all fail closed with only stable class/code and source-free location metadata. |
-| Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded and records implementation-complete/evidence-pending status consistently. Final delivery wording is inserted only after the two pending rows above close. |
+| Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded, removes stale platform and path claims from current documentation, and records delivered status consistently. Superseded dated blueprints and implementation plans remain explicitly historical. |

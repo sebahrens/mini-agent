@@ -1,10 +1,10 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.2.0
+- **Specification version**: 1.3.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-01
+- **Last reconciled**: 2026-08-09
 
 ## Authority and conflict resolution
 
@@ -38,11 +38,12 @@ planning context only; it cannot override the cited section.
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Delivered | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Delivered | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
-| 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Implementation complete; final evidence pending | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
+| 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Delivered | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
 
 Prior research artifacts superseded by this index:
 
 - `docs/specs/2026-07-27-js-engine-blueprint.md`
+- `docs/superpowers/specs/2026-07-27-js-engine-blueprint.md`
 
 ### Explicit Phase 6 supersession map
 
@@ -97,7 +98,7 @@ Cargo features are not phase-completion claims:
 |-------|------------------|--------------|
 | Foundation | None | The resolver, ownership matrix, migration, secure creation, and platform tests in `platform-paths.md` pass. |
 | 1 | None for the non-persistent engine; Foundation for any persistent artifact or unqualified platform-storage claim | The Phase 1 acceptance criteria pass, including mandatory permissions, bounded host calls, fresh runtimes, and `Sandbox::wrap_command` routing. |
-| 2 | Phase 1 | Phase 2 acceptance criteria pass on Linux and macOS; the later Windows AppContainer candidate remains production-unavailable until native hosted attestation proves its explicit roots, zero-capability network denial, private storage, and Job boundary. |
+| 2 | Phase 1 | Phase 2 acceptance criteria pass on Linux and macOS; Windows general-process availability additionally requires its cached native AppContainer preflight. Hosted reference-runner evidence proves the explicit-root, zero-capability network, private-storage, and Job observations recorded by the gate, not universal host ACL visibility. |
 | 3 | Foundation and Phase 1; Phase 2 is optional | Manual admission, full artifact identity, no-effect verification, prompt-time retrieval, and turn binding pass. |
 | 4 | Foundation, Phase 1, and Phase 3 | Proposals can reach human-approved, non-retrievable canary state; no proposal can become active automatically. |
 | 5 | Phases 1–4 and Foundation | Evidence attribution, deterministic routing, permitted Tier 0/1 replacement promotion, quarantine, repair, rollback, and retention gates pass. |
@@ -137,8 +138,9 @@ catalog in `src/extras/skills/`. Phase 6 moved production and verification Quick
 the contained same-executable worker in `worker.rs`/`realm.rs`; `engine.rs` is retained only for
 historical regression tests. `tool.rs`, `supervisor.rs`, `broker.rs`, and `audit.rs` remain in the
 trusted parent and own invocation policy, transport, effects, and durable audit. Phase 5 is
-delivered. Phase 6 implementation is complete, but its delivery row remains evidence-pending until
-the required cross-platform CI artifacts and reviewed resource record are available. Source line
+delivered. Phase 6 is delivered with the dedicated cross-platform containment gates and platform
+resource records from CI run 31319107422. The final validator at commit `9c6f164` independently
+aggregated those records into the reviewed baseline in `docs/benchmarks/results/`. Source line
 numbers are intentionally omitted here because they drift; tracker tasks must resolve current
 symbols before editing.
 

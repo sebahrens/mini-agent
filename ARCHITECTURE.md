@@ -2,9 +2,9 @@
 
 - **Document role**: non-normative architecture overview
 - **Overview version**: 2.0.0
-- **Delivery status**: Phase 6 implementation complete; final evidence pending
+- **Delivery status**: Phase 6 delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-02
+- **Last reconciled**: 2026-08-09
 
 The sole normative JS corpus is
 [`docs/specs/00-index.md`](docs/specs/00-index.md) and the phase specifications it indexes. If this
@@ -101,13 +101,14 @@ workspace-visible profile; it has a dedicated broker-only launcher.
 | Platform | Broker-only worker guarantee |
 |----------|------------------------------|
 | Linux | Availability is cached only after a real preflight of a trusted empty-root `bwrap` profile. It maps the exact worker/runtime files, no workspace/cache/configuration, a private proc/dev/tmp, cleared environment, user/PID/network/IPC/UTS namespaces, dropped capabilities, rlimits, non-dumpability, `no_new_privs`, and seccomp process/exec/socket denial. Any failure is unavailable with no uncontained retry. |
-| macOS | Production JS is unavailable. The real deprecated-Seatbelt probe proves the stable worker image cannot be permitted for initial execution and denied for later re-exec. A weaker best-effort profile, descriptor-only restriction, or process-group cleanup is not an accepted fallback. |
-| Windows | A process-wide `OnceLock` reports available only after one sacrificial same-launcher attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, closed containment probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots. The full hosted standard-user canary records those observations only for its reference runner, and its final artifact remains pending. LPAC contains the evaluator only; parent-brokered general `spawn` remains disabled. |
+| macOS | Available only on validated macOS 26 hosts, with typed `DeprecatedBestEffort` assurance. A trusted guardian launches an exact one-time image under deny-default Seatbelt, authenticated Ready unlinks that image, and every status check repeats the denial, limit, lifecycle, and guardian parent-death preflight. Other majors, including the macOS 15 CI probe, remain unavailable. |
+| Windows | A process-wide `OnceLock` reports available only after one sacrificial same-launcher attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, closed containment probe, fresh runtime, and clean shutdown. The hosted full canary records ambient-denial and install-location observations only for its reference runner; it does not prove identical ACL visibility on every Windows host. LPAC contains only the evaluator. Model-authored `spawn` uses the separately attested general AppContainer backend; learned-skill spawn remains disabled because Windows has no immutable-executable snapshot backend. |
 
 Platform status is typed and source-free. Backend absence or failed attestation disables JS; it
 never selects the historical in-parent engine or an uncontained worker. The reproducible resource
-methodology is in [`docs/benchmarks/js-worker.md`](docs/benchmarks/js-worker.md); its checked-in
-aggregate remains explicitly pending external runs.
+methodology and reviewed three-platform aggregate are in
+[`docs/benchmarks/js-worker.md`](docs/benchmarks/js-worker.md). Measurements are observational;
+the native memory and CPU ceilings remain independently enforced security controls.
 
 On Windows the OS creation call runs on an owned helper thread behind a five-second caller-side
 deadline; the call itself is not cancellable. A late return remains owned and is torn down, but a
@@ -172,7 +173,7 @@ src/extras/js/
 
 src/sandbox/worker/
 ├── linux.rs          # empty-root broker-only bubblewrap
-├── macos.rs          # fail-closed reusable-exec blocker
+├── macos.rs          # macOS 26 one-time image, Seatbelt, and guardian
 └── windows.rs        # LPAC, Job, attestation, full canary gate
 ```
 

@@ -1,10 +1,10 @@
 # Phase 2 — Sandbox Hardening
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.2.0
+- **Specification version**: 1.3.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-02
+- **Last reconciled**: 2026-08-09
 - **Entry dependency**: Phase 1 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 2 blocker
 
@@ -161,7 +161,7 @@ whose broker-only containment has no workspace/cache visibility and fails closed
 |----------|---------------------------|
 | Linux | Effective configured isolation using the supported Linux backend, verified by escape/denial tests |
 | macOS | Seatbelt denies network and writes outside the workspace/cache/temp boundary; host-readable files, devices, and process namespaces are explicitly not claimed as isolated |
-| Windows | `appcontainer` candidate: explicit package-SID roots, zero network capabilities, private profile storage, and Job lifetime are implemented, but production availability remains fail-closed pending successful native hosted attestation |
+| Windows | `appcontainer`: available only after cached native production preflight; explicit package-SID roots, zero network capabilities, private profile storage, and Job lifetime fail closed |
 
 The general subprocess sandbox is enabled by default. `--no-sandbox` disables it;
 `--sandbox` overrides configuration and explicitly requires it; otherwise `sandbox = false`
@@ -173,9 +173,9 @@ fails closed, and Windows always fails closed while its enabled backend is unava
 absence or setup failure never masquerades as isolation, and this fallback policy is never
 permission for an uncontained JS worker.
 
-The Windows general-process AppContainer candidate is not the Phase 6 LPAC worker profile.
-Subject to the pending native hosted attestation required for production availability, its
-contract claims AppContainer identity, scoped filesystem grants and writes, zero-capability network
+The Windows general-process AppContainer backend is not the Phase 6 LPAC worker profile.
+Its cached production preflight and hosted reference-runner gate establish the recorded
+AppContainer identity, scoped filesystem grants and writes, zero-capability network
 denial, a private desktop with Job UI restrictions, and bounded Job lifetime. Regular AppContainer
 system/AAP visibility means it does not claim read confidentiality, registry isolation,
 host-readable device isolation, or broader Windows session isolation.
@@ -243,8 +243,8 @@ no requested child and is never retried unsandboxed.
 ## Windows general-process `appcontainer` capability matrix
 
 Windows selects `appcontainer` by default; persisted `restricted-token` values normalize to that
-backend as a compatibility alias. It remains production-unavailable until native hosted
-attestation succeeds, so requested launch fails closed unless `--no-sandbox` is explicit. This
+backend as a compatibility alias. It is available only after its cached native production
+preflight succeeds; requested launch otherwise fails closed unless `--no-sandbox` is explicit. This
 workspace-capable boundary is separate from Phase 6's workspace-invisible LPAC worker.
 
 Every launch creates a unique regular AppContainer profile with zero capabilities. Its package SID

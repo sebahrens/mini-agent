@@ -124,9 +124,9 @@ pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
     // Use lstat only to reject an initial symlink before opening. On APFS,
     // especially across the /Users firmlink, path and descriptor metadata can
     // legitimately report different device IDs for the same inode. The final
-    // identity proof therefore compares two independently opened descriptors,
-    // which use the same metadata view while `file` keeps the selected inode
-    // alive throughout the check.
+    // identity proof therefore compares the physical filesystem and 64-bit
+    // file identity of two independently opened descriptors while `file`
+    // keeps the selected inode alive throughout the check.
     let before = open_existing_stage("initial_metadata", std::fs::symlink_metadata(path))?;
     if before.file_type().is_symlink() || !before.is_file() || before.uid() != current_uid() {
         return Err(std::io::Error::new(

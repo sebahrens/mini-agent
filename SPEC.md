@@ -2,9 +2,9 @@
 
 - **Document role**: non-normative implementation overview
 - **Overview version**: 2.0.0
-- **Delivery status**: Phase 6 implementation complete; final evidence pending
+- **Delivery status**: Phase 6 delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-02
+- **Last reconciled**: 2026-08-09
 
 The sole normative JS corpus is
 [`docs/specs/00-index.md`](docs/specs/00-index.md) and the specifications it indexes. This file maps
@@ -48,10 +48,11 @@ Normative specification: [`phase-2-sandbox.md`](docs/specs/phase-2-sandbox.md)
   deadline-limited, but now executes in the parent.
 - File allow-lists narrow the exact securely resolved target and never grant permission.
 - A parent-brokered model command reaches `Sandbox::wrap_command` with structural argv identity.
-- The Linux/macOS general-process profiles remain workspace-visible and must never launch the JS
-  worker.
-- General Windows command isolation is not delivered. LPAC worker containment does not authorize
-  JS `spawn`, which remains disabled there.
+- The Linux/macOS/Windows general-process profiles remain workspace-visible and must never launch
+  the JS worker.
+- Windows model-authored `spawn` uses the separately attested regular-AppContainer command
+  backend. LPAC worker containment never authorizes that command; learned-skill spawn remains
+  disabled because Windows has no immutable-executable snapshot backend.
 
 ## Phase 3 — skill library and identity v2
 
@@ -126,7 +127,7 @@ the parent before initialization is attempted again.
 | Same-executable bootstrap and fresh runtimes | `src/extras/js/worker.rs` |
 | Private realms, export wrappers, verifier loader | `src/extras/js/realm.rs` |
 | Linux empty-root containment | `src/sandbox/worker/linux.rs` |
-| macOS unavailable blocker | `src/sandbox/worker/macos.rs` |
+| macOS one-time-image/Seatbelt/guardian launcher | `src/sandbox/worker/macos.rs` |
 | Windows LPAC/Job and attestation | `src/sandbox/worker/windows.rs` |
 
 The process may remain warm after a safe result, but every `RunStep` and whole `VerifyArtifact`
@@ -148,8 +149,8 @@ revokes the invocation, recycles the complete worker boundary, and never automat
 | Platform | Status |
 |----------|--------|
 | Linux | Enforced only after the real trusted empty-root `bwrap`/namespace/rlimit/seccomp preflight succeeds; otherwise unavailable. |
-| macOS | Unavailable because deprecated Seatbelt cannot permit the stable initial image while denying its later reuse for exec. No best-effort fallback. |
-| Windows | A process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, closed protocol probe, fresh runtime, and clean shutdown. It does not test ambient filesystem/network/credential/actual-child denial or install roots. The full hosted canary records those observations only for its reference runner; final evidence is pending. General JS `spawn` remains disabled. |
+| macOS | Available only on validated macOS 26 hosts with typed `DeprecatedBestEffort` assurance after the one-time-image Seatbelt and guardian live preflight succeeds. Other majors, including macOS 15, remain unavailable. |
+| Windows | A process-wide cached minimal production attestation observes the LPAC/token shape, exact protocol handles, selected Job/mitigation state, closed protocol probe, fresh runtime, and clean shutdown. The hosted full canary records ambient-denial and install-location observations only for its reference runner, not every host's ACL visibility. Model-authored `spawn` uses the separately attested general AppContainer backend; learned-skill spawn remains disabled without immutable executable snapshots. |
 
 The Windows OS creation call itself is not cancellable. It runs on one owned helper thread behind a
 five-second caller-side deadline; a late result is torn down, while a permanently blocked call is
@@ -159,8 +160,11 @@ package identity. Normal startup and `--print-config` status evaluation create o
 persistent AppContainer profile and may add a persistent exact read/execute ACE to a supported,
 user-owned installed executable. There is no automatic cleanup, ACL rollback, or consent prompt.
 
-The Phase 6 delivery line remains evidence-pending until the required CI artifacts and reviewed
-[`js-worker` resource aggregate](docs/benchmarks/js-worker.md) are checked in.
+Run 31319107422 supplies the dedicated Linux, macOS 15/26, Windows worker, and Windows
+general-sandbox gates plus the three platform resource records. The final validator at commit
+`9c6f164` independently aggregated those records into the reviewed
+[`js-worker` resource baseline](docs/benchmarks/js-worker.md), which records measured
+reference-host behavior without converting noisy timing targets into security controls.
 
 ## Separate process trust classes
 
@@ -174,7 +178,7 @@ needs, and lifecycle guarantees. None inherits the broker-only worker profile.
 | Capability | Owning phase | Cargo relationship |
 |------------|--------------|--------------------|
 | Preserved bounded JavaScript semantics | Phase 1 | `js` |
-| General Linux/macOS command hardening and parent fetch | Phase 2 | `sandbox` independent; integration uses `js,sandbox` |
+| General Linux/macOS/Windows command hardening and parent fetch | Phase 2 | `sandbox` independent; integration uses `js,sandbox` |
 | Manual learned-skill retrieval | Phase 3 + Foundation | `skills` implies `js` |
 | Agent proposal to human-approved canary | Phase 4 | extends `skills` |
 | Evidence-based lifecycle automation | Phase 5 | extends `skills` |
@@ -197,4 +201,5 @@ the specification index.
 - No source-only/short identity, inferred identity-v2 scope, or identity-v1 execution.
 - No truthy-value verifier semantics; only exact JavaScript boolean `true` passes.
 - No claim that LPAC worker containment provides Windows general-command containment.
-- No Phase 6 delivery claim before final cross-platform and resource evidence is reviewed.
+- No claim that reference-runner resource or ambient-denial observations prove every host has the
+  same performance or Windows ACL visibility.
