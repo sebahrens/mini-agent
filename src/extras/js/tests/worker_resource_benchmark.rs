@@ -650,16 +650,29 @@ fn validate_comparison(run: &BenchmarkRun, comparison: &RunComparison) -> Result
         } else {
             (metric.current_p95_us - metric.previous_p95_us).abs() / metric.previous_p95_us
         };
-        if !metric.previous_p95_us.is_finite()
-            || metric.previous_p95_us < 0.0
-            || metric.current_p95_us != expected_current
-            || metric.p95_relative_delta != expected_delta
-            || metric.allowed_relative_delta != DOCUMENTED_P95_VARIANCE_RATIO
-            || metric.within_documented_variance
-                != (expected_delta <= DOCUMENTED_P95_VARIANCE_RATIO)
-        {
+        if !metric.previous_p95_us.is_finite() || metric.previous_p95_us < 0.0 {
+            return Err(format!(
+                "repeatability comparison for {name} has an invalid prior p95"
+            ));
+        }
+        if metric.current_p95_us != expected_current {
+            return Err(format!(
+                "repeatability comparison for {name} does not match the recorded current p95"
+            ));
+        }
+        if !derived_float_matches(metric.p95_relative_delta, expected_delta) {
             return Err(format!(
                 "repeatability comparison for {name} is not derived from its p95 values"
+            ));
+        }
+        if metric.allowed_relative_delta != DOCUMENTED_P95_VARIANCE_RATIO {
+            return Err(format!(
+                "repeatability comparison for {name} uses the wrong variance policy"
+            ));
+        }
+        if metric.within_documented_variance != (expected_delta <= DOCUMENTED_P95_VARIANCE_RATIO) {
+            return Err(format!(
+                "repeatability comparison for {name} has an invalid variance verdict"
             ));
         }
     }
@@ -672,6 +685,14 @@ fn validate_comparison(run: &BenchmarkRun, comparison: &RunComparison) -> Result
         return Err("aggregate repeatability verdict is not derived from metric verdicts".into());
     }
     Ok(())
+}
+
+fn derived_float_matches(recorded: f64, derived: f64) -> bool {
+    if recorded == derived {
+        return true;
+    }
+    let scale = recorded.abs().max(derived.abs()).max(1.0);
+    (recorded - derived).abs() <= 8.0 * f64::EPSILON * scale
 }
 
 fn containment_matches_platform(os: &str, containment: &Containment) -> bool {
@@ -1583,6 +1604,11 @@ fn worker_resource_comparison_records_variance_without_becoming_a_latency_gate()
         &summarize_microseconds(&[140.0; 100]),
     );
     assert!(!noisy.within_documented_variance);
+
+    let serialized_delta = 0.422_649_046_144_946_36;
+    let recomputed_delta = (1_892.292_f64 - 3_277.542_f64).abs() / 3_277.542_f64;
+    assert_ne!(serialized_delta, recomputed_delta);
+    assert!(derived_float_matches(serialized_delta, recomputed_delta));
 }
 
 #[tokio::test]
