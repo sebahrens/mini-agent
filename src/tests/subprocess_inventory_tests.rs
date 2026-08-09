@@ -1261,7 +1261,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".output()",
-        6,
+        7,
         "TC-INTERNAL-VERIFICATION",
     ),
     (
@@ -1296,25 +1296,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        "let descendant = Command::new(executable)",
-        1,
-        "TC-INTERNAL-VERIFICATION",
-    ),
-    (
-        "src/sandbox/windows.rs",
-        "let mut breakaway = Command::new(",
+        "let mut breakaway = Command::new(breakaway_executable);",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
     (
         "src/sandbox/windows.rs",
         "match breakaway.status() {",
-        1,
-        "TC-INTERNAL-VERIFICATION",
-    ),
-    (
-        "src/sandbox/windows.rs",
-        ".status()",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
@@ -2924,7 +2912,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".output()",
-        6,
+        7,
         "TC-INTERNAL-VERIFICATION",
     ),
     (
@@ -2959,25 +2947,13 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        "let descendant = Command::new(executable)",
-        1,
-        "TC-INTERNAL-VERIFICATION",
-    ),
-    (
-        "src/sandbox/windows.rs",
-        "let mut breakaway = Command::new(",
+        "let mut breakaway = Command::new(breakaway_executable);",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
     (
         "src/sandbox/windows.rs",
         "match breakaway.status() {",
-        1,
-        "TC-INTERNAL-VERIFICATION",
-    ),
-    (
-        "src/sandbox/windows.rs",
-        ".status()",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),

@@ -60,7 +60,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -143,6 +142,7 @@ const HELPER_PID_PLACEHOLDER: &str = "helper-pid";
 const DESKTOP_NAME_PLACEHOLDER: &str = "desktop-name";
 const OMITTED_HANDLE_PLACEHOLDER: &str = "omitted-handle";
 const DESCENDANT_RELEASE_PLACEHOLDER: &str = "descendant-release";
+const DESCENDANT_PROOF_PLACEHOLDER: &str = "descendant-proof";
 const CONTROL_ROOT_PLACEHOLDER: &str = "control-root";
 const REQUEST_VERSION: u32 = 1;
 // This stays below the requested anonymous-pipe buffer, so request creation cannot block before
@@ -174,7 +174,7 @@ const HELPER_STAGE_SETUP: u8 = 2;
 const HELPER_STAGE_LAUNCH: u8 = 3;
 const HELPER_STAGE_VERIFY_JOB: u8 = 4;
 const HELPER_STAGE_VERIFY_DESCENDANT: u8 = 5;
-const HELPER_STAGE_DESCENDANT_HANDLE_DUPLICATE: u8 = 6;
+const HELPER_STAGE_DESCENDANT_PROCESS_OPEN: u8 = 6;
 const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 7;
 const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 8;
 const HELPER_STAGE_DESCENDANT_JOB_QUERY: u8 = 9;
@@ -865,12 +865,12 @@ pub(crate) fn maybe_run_from_args() -> Option<i32> {
     let _ = args.next();
     match args.next().as_deref() {
         Some(value) if value == OsStr::new(HELPER_ARG) => Some(run_helper().unwrap_or_else(|_| {
-            let status = helper_failure_status();
+            let helper_code = helper_failure_status();
             eprintln!(
                 "Windows AppContainer sandbox helper failed at closed stage {}",
-                status - HELPER_FAILURE_STATUS_BASE
+                helper_code - HELPER_FAILURE_STATUS_BASE
             );
-            status
+            helper_code
         })),
         Some(value) if value == OsStr::new(PROBE_ARG) => {
             Some(run_runtime_probe().unwrap_or_else(|e| {
@@ -1340,8 +1340,16 @@ fn run_helper() -> Result<i32, String> {
             .filter(|value| value.as_str() == DESCENDANT_RELEASE_PLACEHOLDER)
             .ok_or("invalid descendant-release placeholder")?;
         *descendant_release = release.to_string_lossy().into_owned();
-        let (proof_reader, proof_writer) = descendant_proof_pipe(grants.sid())?;
-        descendant_attestation = Some((release, proof_reader, proof_writer));
+        let proof = cwd.join(format!(
+            ".mini-agent-descendant-proof-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let descendant_proof = arguments
+            .get_mut(8)
+            .filter(|value| value.as_str() == DESCENDANT_PROOF_PLACEHOLDER)
+            .ok_or("invalid descendant-proof placeholder")?;
+        *descendant_proof = proof.to_string_lossy().into_owned();
+        descendant_attestation = Some((release, proof));
     }
     grants.disarm_for_launch();
     mark_helper_stage(HELPER_STAGE_LAUNCH);
@@ -1355,9 +1363,6 @@ fn run_helper() -> Result<i32, String> {
         &cwd,
         &cache,
         &grants.profile.storage,
-        descendant_attestation
-            .as_ref()
-            .map(|(_, _, writer)| writer.raw()),
     ) {
         Ok(child) => child,
         Err(error) => {
@@ -1368,10 +1373,9 @@ fn run_helper() -> Result<i32, String> {
         }
     };
     mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
-    if let Some((release, proof_reader, proof_writer)) = descendant_attestation {
-        drop(proof_writer);
+    if let Some((release, proof)) = descendant_attestation {
         mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-        if let Err(error) = verify_descendant_membership(&job, &child, proof_reader, &release) {
+        if let Err(error) = verify_descendant_membership(&job, &child, &proof, &release) {
             let target_exit = completed_process_exit_code(&child)?;
             terminate_and_drain_job(&job, 126)?;
             grants.mark_job_quiescent();
@@ -2573,30 +2577,30 @@ fn verify_job_membership_and_limits(job: &Handle, child: &Handle) -> Result<(), 
 fn verify_descendant_membership(
     job: &Handle,
     target: &Handle,
-    proof_reader: File,
+    proof: &Path,
     release: &Path,
 ) -> Result<(), String> {
     mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-    let descendant_handle = read_descendant_handle_proof(proof_reader)?;
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_HANDLE_DUPLICATE);
-    let mut duplicate = null_mut();
-    if unsafe {
-        DuplicateHandle(
-            target.raw(),
-            descendant_handle,
-            GetCurrentProcess(),
-            &mut duplicate,
-            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-            FALSE,
-            0,
-        )
-    } == 0
-    {
-        return Err(last_error(
-            "duplicate attested AppContainer descendant process handle",
-        ));
+    let (descendant_pid, descendant_created) = read_descendant_process_proof(proof)?;
+    if descendant_pid == unsafe { GetProcessId(target.raw()) } {
+        return Err("sandbox: descendant proof named the AppContainer target".into());
     }
-    let descendant = Handle::created(duplicate, "own attested AppContainer descendant")?;
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROCESS_OPEN);
+    let descendant = Handle::created(
+        unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                FALSE,
+                descendant_pid,
+            )
+        },
+        "open attested AppContainer descendant",
+    )?;
+    if unsafe { GetProcessId(descendant.raw()) } != descendant_pid
+        || process_creation_time(descendant.raw())? != descendant_created
+    {
+        return Err("sandbox: descendant process identity changed before Job proof".into());
+    }
     mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_QUERY);
     let mut in_job = 0;
     if unsafe { IsProcessInJob(descendant.raw(), job.raw(), &mut in_job) } == 0 {
@@ -2608,6 +2612,13 @@ fn verify_descendant_membership(
     }
     mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_LIMITS);
     verify_job_limits(job)?;
+    if active_job_processes(job)? != 2 {
+        return Err(
+            "sandbox: exact Job did not contain only target and suspended descendant".into(),
+        );
+    }
+    std::fs::remove_file(proof)
+        .map_err(|error| format!("remove descendant process proof: {error}"))?;
     mark_helper_stage(HELPER_STAGE_DESCENDANT_RELEASE);
     std::fs::OpenOptions::new()
         .write(true)
@@ -2618,46 +2629,33 @@ fn verify_descendant_membership(
     Ok(())
 }
 
-fn read_descendant_handle_proof(mut reader: File) -> Result<HANDLE, String> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let read = std::thread::Builder::new()
-        .name("windows-descendant-proof".into())
-        .spawn(move || {
-            let mut magic = [0u8; size_of::<u64>()];
-            let mut handle = [0u8; size_of::<usize>()];
-            let result = reader
-                .read_exact(&mut magic)
-                .and_then(|()| reader.read_exact(&mut handle))
-                .map(|()| (magic, handle));
-            let _ = sender.send(result);
-        })
-        .map_err(|error| format!("start descendant-handle proof reader: {error}"))?;
-    let (magic, handle) = match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(proof)) => proof,
-        Ok(Err(error)) => return Err(format!("read descendant-handle proof: {error}")),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // Cancel the one pending fixed-size read before the caller terminates and drains the
-            // exact Job. A racing completed read needs no cancellation and its thread exits on
-            // its own; a successfully cancelled read is joined here.
-            if unsafe { CancelSynchronousIo(read.as_raw_handle()) } != 0 {
-                let _ = read.join();
-            }
-            return Err("timed out waiting for descendant-handle proof".into());
+fn read_descendant_process_proof(path: &Path) -> Result<(u32, u64), String> {
+    const PROOF_BYTES: usize = size_of::<u64>() + size_of::<u32>() + size_of::<u64>();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let contents = loop {
+        if let Some(contents) = bounded_probe_contents(path, PROOF_BYTES)
+            && contents.len() == PROOF_BYTES
+        {
+            break contents;
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            return Err("sandbox: descendant-handle proof reader disconnected".into());
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out waiting for descendant process proof".into());
         }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    read.join()
-        .map_err(|_| "sandbox: descendant-handle proof reader panicked".to_string())?;
-    if u64::from_le_bytes(magic) != DESCENDANT_PROOF_MAGIC {
-        return Err("sandbox: invalid descendant-handle proof marker".into());
+    let mut magic_bytes = [0u8; size_of::<u64>()];
+    magic_bytes.copy_from_slice(&contents[0..8]);
+    let mut pid_bytes = [0u8; size_of::<u32>()];
+    pid_bytes.copy_from_slice(&contents[8..12]);
+    let mut created_bytes = [0u8; size_of::<u64>()];
+    created_bytes.copy_from_slice(&contents[12..20]);
+    let magic = u64::from_le_bytes(magic_bytes);
+    let pid = u32::from_le_bytes(pid_bytes);
+    let created = u64::from_le_bytes(created_bytes);
+    if magic != DESCENDANT_PROOF_MAGIC || pid == 0 || created == 0 {
+        return Err("sandbox: invalid descendant process proof".into());
     }
-    let handle = usize::from_le_bytes(handle) as HANDLE;
-    if handle.is_null() || handle == (-1isize as HANDLE) {
-        return Err("sandbox: invalid descendant process handle proof".into());
-    }
-    Ok(handle)
+    Ok((pid, created))
 }
 
 fn active_job_processes(job: &Handle) -> Result<u32, String> {
@@ -2794,15 +2792,13 @@ fn launch_appcontainer(
     cwd: &Path,
     cache: &Path,
     private_storage: &Path,
-    proof_stdout: Option<HANDLE>,
 ) -> Result<Handle, String> {
     let _creation = crate::process_creation::creation_guard()
         .map_err(|error| format!("lock Windows process creation: {error}"))?;
     let stdout = inheritable_duplicate(std::io::stdout().as_raw_handle())?;
     let stderr = inheritable_duplicate(std::io::stderr().as_raw_handle())?;
     let stdin = inheritable_null_input()?;
-    let stdout_handle = proof_stdout.unwrap_or_else(|| stdout.raw());
-    let handles = [stdin.raw(), stdout_handle, stderr.raw()];
+    let handles = [stdin.raw(), stdout.raw(), stderr.raw()];
     let mut bytes = 0usize;
     unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes) };
     if bytes == 0 {
@@ -2860,7 +2856,7 @@ fn launch_appcontainer(
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = stdin.raw();
-    startup.StartupInfo.hStdOutput = stdout_handle;
+    startup.StartupInfo.hStdOutput = stdout.raw();
     startup.StartupInfo.hStdError = stderr.raw();
     startup.StartupInfo.lpDesktop = desktop.startup_name.as_ptr().cast_mut();
     startup.lpAttributeList = list;
@@ -2957,47 +2953,6 @@ fn inheritable_duplicate(source: *mut c_void) -> Result<Handle, String> {
         return Err(last_error("duplicate restricted child standard handle"));
     }
     Handle::created(duplicate, "duplicate restricted child standard handle")
-}
-
-fn descendant_proof_pipe(appcontainer_sid: PSID) -> Result<(File, Handle), String> {
-    let user = current_user_sid_buffer()?;
-    let user_sid = token_user_sid(&user);
-    if user_sid.is_null() || appcontainer_sid.is_null() {
-        return Err("sandbox: descendant-proof pipe SID was null".into());
-    }
-    let descriptor_sddl = wide_string(&format!(
-        "D:P(A;;GA;;;{})(A;;GW;;;{})S:(ML;;NW;;;LW)",
-        sid_text(user_sid)?,
-        sid_text(appcontainer_sid)?,
-    ));
-    let mut raw_descriptor = null_mut();
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            descriptor_sddl.as_ptr(),
-            SDDL_REVISION_1,
-            &mut raw_descriptor,
-            null_mut(),
-        )
-    } == 0
-    {
-        return Err(last_error(
-            "construct AppContainer descendant-proof pipe descriptor",
-        ));
-    }
-    let descriptor = Local(raw_descriptor);
-    let mut attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: TRUE,
-    };
-    let mut read = null_mut();
-    let mut write = null_mut();
-    if unsafe { CreatePipe(&mut read, &mut write, &mut attributes, 64) } == 0 {
-        return Err(last_error("create descendant-handle proof pipe"));
-    }
-    let reader = unsafe { File::from_raw_handle(read) };
-    let writer = Handle::created(write, "own descendant-handle proof writer")?;
-    Ok((reader, writer))
 }
 
 fn inheritable_null_input() -> Result<Handle, String> {
@@ -3449,6 +3404,7 @@ fn run_runtime_probe() -> Result<i32, String> {
             OMITTED_HANDLE_PLACEHOLDER.into(),
             CONTROL_ROOT_PLACEHOLDER.into(),
             DESCENDANT_RELEASE_PLACEHOLDER.into(),
+            DESCENDANT_PROOF_PLACEHOLDER.into(),
         ],
         &workspace_b,
         &cache,
@@ -3750,6 +3706,9 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     let Some(descendant_release) = args.next().map(PathBuf::from) else {
         return AUTHORITY_ARGUMENT_ERROR;
     };
+    let Some(descendant_proof) = args.next().map(PathBuf::from) else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
     if args.next().is_some() || outside.exists() {
         return AUTHORITY_ARGUMENT_ERROR;
     }
@@ -3806,7 +3765,10 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
         ..STARTUPINFOW::default()
     };
     let mut information = PROCESS_INFORMATION::default();
-    if unsafe {
+    let Ok(creation) = crate::process_creation::creation_guard() else {
+        return AUTHORITY_DESCENDANT_SPAWN_FAILED;
+    };
+    let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
             command_line.as_mut_ptr(),
@@ -3819,8 +3781,9 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
             &startup,
             &mut information,
         )
-    } == 0
-    {
+    };
+    drop(creation);
+    if created == 0 {
         return AUTHORITY_DESCENDANT_SPAWN_FAILED;
     }
     let descendant = match Handle::created(information.hProcess, "own authority descendant") {
@@ -3838,13 +3801,27 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
                 return AUTHORITY_DESCENDANT_SPAWN_FAILED;
             }
         };
-    let mut proof_writer = std::io::stdout().lock();
-    if proof_writer
-        .write_all(&DESCENDANT_PROOF_MAGIC.to_le_bytes())
-        .and_then(|()| proof_writer.write_all(&(descendant.raw() as usize).to_le_bytes()))
-        .and_then(|()| proof_writer.flush())
-        .is_err()
-    {
+    let descendant_pid = unsafe { GetProcessId(descendant.raw()) };
+    let descendant_created = match process_creation_time(descendant.raw()) {
+        Ok(created) => created,
+        Err(_) => {
+            unsafe { TerminateProcess(descendant.raw(), 126) };
+            return AUTHORITY_DESCENDANT_PROOF_ERROR;
+        }
+    };
+    let mut proof_contents = Vec::with_capacity(20);
+    proof_contents.extend_from_slice(&DESCENDANT_PROOF_MAGIC.to_le_bytes());
+    proof_contents.extend_from_slice(&descendant_pid.to_le_bytes());
+    proof_contents.extend_from_slice(&descendant_created.to_le_bytes());
+    let proof_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&descendant_proof)
+        .and_then(|mut proof| {
+            proof.write_all(&proof_contents)?;
+            proof.sync_all()
+        });
+    if proof_result.is_err() {
         unsafe { TerminateProcess(descendant.raw(), 126) };
         return AUTHORITY_DESCENDANT_PROOF_ERROR;
     }
