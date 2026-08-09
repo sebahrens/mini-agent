@@ -1307,22 +1307,34 @@ fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Resu
         && let Err(error) = crate::fs::private_atomic_create_sync(path, b"")
         && error.kind() != std::io::ErrorKind::AlreadyExists
     {
+        report_open_io_stage("rw_atomic_create", &error);
         return Err(error);
     }
     if create_new {
-        crate::fs::private_atomic_create_sync(path, b"")?;
+        crate::fs::private_atomic_create_sync(path, b"").inspect_err(|error| {
+            report_open_io_stage("rw_atomic_create_new", error);
+        })?;
     } else if path.exists() {
-        drop(crate::fs::open_private_file(path)?);
+        drop(crate::fs::open_private_file(path).inspect_err(|error| {
+            report_open_io_stage("rw_initial_private_open", error);
+        })?);
     }
     #[cfg(target_os = "macos")]
-    let before = crate::fs::open_private_file(path)?;
+    let before = crate::fs::open_private_file(path).inspect_err(|error| {
+        report_open_io_stage("rw_before_private_open", error);
+    })?;
     #[cfg(not(target_os = "macos"))]
     let before = crate::fs::checked_path_metadata(path)?;
     #[cfg(target_os = "macos")]
-    let before_is_file = before.metadata()?.is_file();
+    let before_is_file = before
+        .metadata()
+        .inspect_err(|error| report_open_io_stage("rw_before_metadata", error))?
+        .is_file();
     #[cfg(not(target_os = "macos"))]
     let before_is_file = !before.file_type().is_symlink() && before.is_file();
     if !before_is_file {
+        #[cfg(test)]
+        eprintln!("EFFECT_AUDIT_OPEN_FAILED=rw_not_regular");
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "audit file is not a regular file",
@@ -1340,19 +1352,31 @@ fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Resu
         };
         options.custom_flags(NOFOLLOW);
     }
-    let file = options.open(path)?;
+    let file = options
+        .open(path)
+        .inspect_err(|error| report_open_io_stage("rw_write_open", error))?;
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::MetadataExt;
 
-        let before = before.metadata()?;
-        let opened = file.metadata()?;
-        let after = crate::fs::open_private_file(path)?.metadata()?;
+        let before = before
+            .metadata()
+            .inspect_err(|error| report_open_io_stage("rw_revalidate_before_metadata", error))?;
+        let opened = file
+            .metadata()
+            .inspect_err(|error| report_open_io_stage("rw_opened_metadata", error))?;
+        let after_file = crate::fs::open_private_file(path)
+            .inspect_err(|error| report_open_io_stage("rw_after_private_open", error))?;
+        let after = after_file
+            .metadata()
+            .inspect_err(|error| report_open_io_stage("rw_after_metadata", error))?;
         if before.dev() != opened.dev()
             || before.ino() != opened.ino()
             || opened.dev() != after.dev()
             || opened.ino() != after.ino()
         {
+            #[cfg(test)]
+            eprintln!("EFFECT_AUDIT_OPEN_FAILED=rw_descriptor_identity");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "audit path changed during private open",
@@ -1369,7 +1393,8 @@ fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Resu
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .inspect_err(|error| report_open_io_stage("rw_permissions", error))?;
     }
     Ok(file)
 }
