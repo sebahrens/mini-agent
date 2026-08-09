@@ -286,14 +286,15 @@ steps:
 
         self.assertTrue(any("x86_64 hosts" in error for error in errors))
 
-    def test_static_arm_release_smokes_require_cross_runner(self) -> None:
+    def test_static_arm_release_archives_require_elf_validation(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github/workflows/release.yml"
         ).read_text(encoding="utf-8")
         commands = (
-            'cross run --release --target "${{ matrix.target }}" -- --version',
-            'cross run --release --no-default-features --target '
-            '"${{ matrix.target }}" -- --version',
+            'file "$smoke_dir/$CANONICAL_BINARY" | grep -Fq -- "ARM aarch64"',
+            'readelf -l "$smoke_dir/$CANONICAL_BINARY" > '
+            '"$smoke_dir/program-headers"',
+            'if grep -Fq -- "INTERP" "$smoke_dir/program-headers"; then',
         )
 
         for command in commands:

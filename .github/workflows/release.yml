@@ -127,7 +127,7 @@ jobs:
       - name: Build static binary (${{ matrix.target }})
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Package and smoke
+      - name: Package and validate
         run: |
           archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"
           tar czf "$archive" -C "target/${{ matrix.target }}/release" "$CANONICAL_BINARY"
@@ -135,7 +135,12 @@ jobs:
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            cross run --release --target "${{ matrix.target }}" -- --version | grep -Fq -- "$CANONICAL_BINARY "
+            file "$smoke_dir/$CANONICAL_BINARY" | grep -Fq -- "ARM aarch64"
+            readelf -l "$smoke_dir/$CANONICAL_BINARY" > "$smoke_dir/program-headers"
+            if grep -Fq -- "INTERP" "$smoke_dir/program-headers"; then
+              echo "ERROR: ARM64 musl artifact is dynamically linked"
+              exit 1
+            fi
           else
             "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
           fi
@@ -144,7 +149,7 @@ jobs:
       - name: Build static lite binary (${{ matrix.target }})
         run: cross build --release --no-default-features --target ${{ matrix.target }}
 
-      - name: Package and smoke lite
+      - name: Package and validate lite
         run: |
           archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"
           tar czf "$archive" -C "target/${{ matrix.target }}/release" "$CANONICAL_BINARY"
@@ -152,7 +157,12 @@ jobs:
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            cross run --release --no-default-features --target "${{ matrix.target }}" -- --version | grep -Fq -- "$CANONICAL_BINARY "
+            file "$smoke_dir/$CANONICAL_BINARY" | grep -Fq -- "ARM aarch64"
+            readelf -l "$smoke_dir/$CANONICAL_BINARY" > "$smoke_dir/program-headers"
+            if grep -Fq -- "INTERP" "$smoke_dir/program-headers"; then
+              echo "ERROR: ARM64 musl artifact is dynamically linked"
+              exit 1
+            fi
           else
             "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
           fi

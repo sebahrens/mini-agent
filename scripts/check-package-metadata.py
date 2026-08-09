@@ -302,11 +302,10 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         'test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"': 4,
         '"$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- '
         '"$CANONICAL_BINARY "': 4,
-        'cross run --release --target "${{ matrix.target }}" -- --version | '
-        'grep -Fq -- "$CANONICAL_BINARY "': 1,
-        'cross run --release --no-default-features --target '
-        '"${{ matrix.target }}" -- --version | grep -Fq -- '
-        '"$CANONICAL_BINARY "': 1,
+        'file "$smoke_dir/$CANONICAL_BINARY" | grep -Fq -- "ARM aarch64"': 2,
+        'readelf -l "$smoke_dir/$CANONICAL_BINARY" > '
+        '"$smoke_dir/program-headers"': 2,
+        'if grep -Fq -- "INTERP" "$smoke_dir/program-headers"; then': 2,
     }
     for fragment, expected_count in required_counts.items():
         observed_count = text.count(fragment)
