@@ -363,22 +363,20 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             self.assertIn(path, standard_user_step)
         self.assertNotIn("phase6 standard user λ", standard_user_step)
 
-    def test_windows_installed_status_requires_the_runtime_preflight_claims(self) -> None:
+    def test_windows_hosted_administrator_status_is_fail_closed(self) -> None:
         body = job_body(self.workflow, "windows-worker-containment-gate")
         status_step = body.split(
-            "name: Verify installed binary reports validated Windows containment",
+            "name: Verify the hosted administrator path remains fail closed",
             1,
         )[1].split("name: Archive Windows containment evidence", 1)[0]
         self.assertIn("--print-config", status_step)
         for claim in (
             "windows-lpac",
-            "available",
-            "enforced",
-            "enabled with validated containment",
-            "1 worker process",
-            "256 MiB",
-            "35 seconds",
-            "disabled on Windows",
+            "unavailable",
+            "enforced backend class; inactive",
+            "disabled; no worker process starts",
+            "not active; no worker process",
+            "unavailable; no JS worker",
         ):
             with self.subTest(claim=claim):
                 self.assertIn(claim, status_step)
@@ -405,13 +403,23 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 self.assertIn("-- --ignored --nocapture", body)
                 self.assertRegex(
                     body,
-                    r"js-worker-(?:\$\{RUNNER_OS\}|\$env:RUNNER_OS)-reference\.json",
+                    r"js-worker-(?:\$\{RUNNER_OS\}|\$env:RUNNER_OS|Windows)-reference\.json",
                 )
                 self.assertIn("js-worker-${{ runner.os }}.json", body)
                 self.assertIn("name: js-worker-resource-${{ runner.os }}", body)
                 self.assertIn("if-no-files-found: error", body)
                 self.assertNotIn("continue-on-error: true", body)
                 self.assertIn("PHASE6_RESOURCE=recorded", body)
+
+        windows = job_body(self.workflow, "windows-worker-containment-gate")
+        standard_user_step = windows.split(
+            "name: Validate the complete gate from a separate standard-user installation",
+            1,
+        )[1].split("name: Archive Windows JS worker resource measurements", 1)[0]
+        self.assertIn("MINI_AGENT_JS_WORKER_BENCH", standard_user_step)
+        self.assertIn("js-worker-Windows-reference.json", standard_user_step)
+        self.assertIn("js-worker-Windows.json", standard_user_step)
+        self.assertIn("Copy-Item", standard_user_step)
 
     def test_one_aggregate_job_requires_all_platform_results(self) -> None:
         body = job_body(self.workflow, "phase6-cross-platform-gate")

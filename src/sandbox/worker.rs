@@ -245,11 +245,11 @@ impl WorkerLauncher for BenchmarkWorkerLauncher {
     fn containment_status(&self) -> WorkerContainmentStatus {
         self.status
             .get_or_init(|| {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 {
                     platform::containment_status_for_benchmark(&self.executable)
                 }
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "macos")))]
                 {
                     platform::containment_status()
                 }
@@ -890,13 +890,17 @@ mod tests {
     }
 
     #[test]
-    fn windows_benchmark_preflights_the_configured_binary_without_production_status_pollution() {
+    fn resource_benchmarks_preflight_the_configured_binary_without_status_pollution() {
         let worker = include_str!("worker.rs");
+        let macos = include_str!("worker/macos.rs");
         let windows = include_str!("worker/windows.rs");
         let benchmark = include_str!("../extras/js/tests/worker_resource_benchmark.rs");
 
         assert!(worker.contains("status: Arc<OnceLock<WorkerContainmentStatus>>"));
         assert!(worker.contains("platform::containment_status_for_benchmark(&self.executable)"));
+        assert!(macos.contains("pub(super) fn containment_status_for_benchmark("));
+        assert!(macos.contains("run_installed_containment_preflight(executable.to_path_buf())"));
+        assert!(macos.contains("launch_executable_unchecked(executable, &[])"));
         assert!(windows.contains("installed_worker_runtime_preflight"));
         assert!(windows.contains("ProductionLaunchHooks::installed_worker("));
         assert!(benchmark.contains("let launcher = BenchmarkWorkerLauncher::new("));

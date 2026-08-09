@@ -193,6 +193,30 @@ pub(super) fn containment_status() -> WorkerContainmentStatus {
     STATUS.get_or_init(probe_containment).clone()
 }
 
+#[cfg(test)]
+pub(super) fn containment_status_for_benchmark(
+    executable: &std::path::Path,
+) -> WorkerContainmentStatus {
+    if let Some(reason) = availability_error() {
+        return WorkerContainmentStatus::Unavailable {
+            backend: BACKEND,
+            assurance: ASSURANCE,
+            reason,
+        };
+    }
+    match run_installed_containment_preflight(executable.to_path_buf()) {
+        Ok(()) => WorkerContainmentStatus::Available {
+            backend: BACKEND,
+            assurance: ASSURANCE,
+        },
+        Err(_) => WorkerContainmentStatus::Unavailable {
+            backend: BACKEND,
+            assurance: ASSURANCE,
+            reason: "the scoped one-time-image Seatbelt live preflight failed".into(),
+        },
+    }
+}
+
 fn probe_containment() -> WorkerContainmentStatus {
     // A libtest executable enters its generated test harness before mini-agent's synchronous main,
     // so it cannot serve as the trusted same-executable guardian used by production. Unit tests
@@ -245,7 +269,7 @@ pub(super) fn launch_executable_for_benchmark(
             backend: BACKEND,
             source,
         })?;
-    launch_executable(executable, &[])
+    launch_executable_unchecked(executable, &[])
 }
 
 fn availability_error() -> Option<String> {
@@ -511,6 +535,15 @@ pub(super) fn maybe_run_hosted_lifecycle() -> Option<ExitCode> {
 }
 
 fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
+    run_containment_preflight(executable, preflight_worker_args())
+}
+
+#[cfg(test)]
+fn run_installed_containment_preflight(executable: PathBuf) -> io::Result<()> {
+    run_containment_preflight(executable, &[])
+}
+
+fn run_containment_preflight(executable: PathBuf, worker_args: &[&str]) -> io::Result<()> {
     if !trusted_system_executable(Path::new("/usr/bin/true")) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -524,15 +557,12 @@ fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
         eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_precheck");
     })?;
     let result = (|| {
-        let mut process = launch_executable_unchecked_with_probe(
-            executable.clone(),
-            preflight_worker_args(),
-            Some(&probes),
-        )
-        .map_err(|error| {
-            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=launch");
-            io::Error::other(error.to_string())
-        })?;
+        let mut process =
+            launch_executable_unchecked_with_probe(executable.clone(), worker_args, Some(&probes))
+                .map_err(|error| {
+                    eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=launch");
+                    io::Error::other(error.to_string())
+                })?;
         let diagnostic_drain = spawn_closed_probe_diagnostic_drain(&process.stderr)?;
         let authentication = authenticate_ready_and_probe(&mut process, true);
         if authentication.is_err() {

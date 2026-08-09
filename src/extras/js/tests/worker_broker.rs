@@ -1840,7 +1840,14 @@ struct AuditTempRoot(PathBuf);
 
 impl AuditTempRoot {
     fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        // Hosted macOS 15 can reject the audit lock/open sequence beneath the shared
+        // system temporary directory even though the repository's APFS volume supports
+        // the durability contract. Keep this test-only state under Cargo's build tree.
+        let parent = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("worker-broker-audits");
+        let path = parent.join(format!(
             "mini-agent-js-effect-audit-{tag}-{}",
             uuid::Uuid::new_v4()
         ));
