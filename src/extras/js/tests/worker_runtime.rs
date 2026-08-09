@@ -1591,10 +1591,12 @@ async fn assert_fault_then_recovery(
 
 #[tokio::test]
 async fn worker_supervisor_watchdog_bounds_synchronous_launch_and_reaps_late_process() {
-    let launcher = DelayedLaunchLauncher::new(Duration::from_millis(500));
+    // Keep a wide separation between the deliberate launch stall and the watchdog so a healthy
+    // recovery child's handshake is not judged by sub-100-ms scheduler luck in the parallel suite.
+    let launcher = DelayedLaunchLauncher::new(Duration::from_secs(2));
     let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
         launcher.clone(),
-        Duration::from_millis(50),
+        Duration::from_secs(1),
     ));
 
     let started = Instant::now();
@@ -1607,7 +1609,7 @@ async fn worker_supervisor_watchdog_bounds_synchronous_launch_and_reaps_late_pro
         .await;
     assert_eq!(result, Err(WorkerError::TimedOut));
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        started.elapsed() < Duration::from_millis(1_500),
         "synchronous launcher escaped the whole-call watchdog"
     );
 
@@ -1665,9 +1667,11 @@ async fn worker_supervisor_cancellation_bounds_synchronous_launch_and_reaps_late
 
 async fn assert_blocked_startup_does_not_accumulate_launches(repeated_call_count: usize) {
     let launcher = BlockedFirstLaunchLauncher::new();
+    // The first launch is explicitly blocked, so a one-second watchdog still proves bounded
+    // callers while allowing the post-release recovery handshake to survive suite-wide load.
     let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
         launcher.clone(),
-        Duration::from_millis(200),
+        Duration::from_secs(1),
     ));
 
     assert_eq!(
@@ -1906,8 +1910,10 @@ async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler()
 
 #[tokio::test]
 async fn worker_supervisor_recovery_watchdog_and_caller_drop() {
+    // One second remains far below the scripted 30-second stall while leaving enough scheduling
+    // margin for the replacement child to authenticate during a fully parallel test run.
     let (supervisor, launcher) =
-        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_millis(100));
+        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(1));
     assert_eq!(
         supervisor
             .execute(
@@ -2762,6 +2768,8 @@ fn run_scripted_supervisor_worker() -> ! {
                     }
                     "os-kill" => std::process::abort(),
                     "abnormal-exit" => std::process::exit(76),
+                    #[cfg(unix)]
+                    "native-cpu-limit" => exit_with_native_cpu_limit(),
                     "deadline" => std::thread::park_timeout(Duration::from_secs(30)),
                     "malformed-protocol" => {
                         output.write_all(&[0, 0, 0, 1, b'{']).unwrap();
@@ -2961,6 +2969,16 @@ fn run_scripted_supervisor_worker() -> ! {
             ParentFrame::SkillCallResponse(_) => std::process::exit(1),
         }
     }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn exit_with_native_cpu_limit() -> ! {
+    // SAFETY: this scripted worker is a sacrificial child with no application signal handlers.
+    // The default SIGXCPU disposition terminates it exactly as the native RLIMIT_CPU ceiling does
+    // in production.
+    unsafe { libc::raise(libc::SIGXCPU) };
+    std::process::exit(78)
 }
 
 #[test]

@@ -6,6 +6,7 @@
 use std::future::Future;
 use std::io::{Read, Write};
 use std::pin::Pin;
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
@@ -80,6 +81,8 @@ pub(crate) enum WorkerError {
     Launch,
     #[error("JavaScript worker transport failed")]
     Transport,
+    #[error("JavaScript worker exhausted its native CPU allowance")]
+    NativeCpuLimit,
     #[error("JavaScript worker violated its protocol")]
     Protocol,
     #[error("JavaScript worker build identity differs from the parent")]
@@ -1535,8 +1538,8 @@ async fn run_invocation<H: InvocationEffectHandler>(
                         }
                         result = &mut effect => break EffectWait::Completed(result),
                         _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
-                            if connection.process.try_wait().map_err(|_| WorkerError::Transport)?.is_some() {
-                                return Err(WorkerError::Transport);
+                            if let Some(exit_status) = connection.process.try_wait().map_err(|_| WorkerError::Transport)? {
+                                return Err(classify_worker_exit(exit_status));
                             }
                         }
                     }
@@ -1734,22 +1737,33 @@ async fn read_worker(
             }
             tagged = &mut task => break tagged.map_err(|_| WorkerError::Transport)?,
             _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
-                if connection.process.try_wait().map_err(|_| WorkerError::Transport)?.is_some() {
-                    return Err(WorkerError::Transport);
+                if let Some(exit_status) = connection.process.try_wait().map_err(|_| WorkerError::Transport)? {
+                    return Err(classify_worker_exit(exit_status));
                 }
             }
         }
     };
     validate_generation(connection.generation, tagged.generation)?;
-    if connection
+    if let Some(status) = connection
         .process
         .try_wait()
         .map_err(|_| WorkerError::Transport)?
-        .is_some()
     {
-        return Err(WorkerError::Transport);
+        return Err(classify_worker_exit(status));
     }
     tagged.result.map_err(map_frame_error)
+}
+
+fn classify_worker_exit(status: ExitStatus) -> WorkerError {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if status.signal() == Some(libc::SIGXCPU) || status.code() == Some(128 + libc::SIGXCPU) {
+            return WorkerError::NativeCpuLimit;
+        }
+    }
+    WorkerError::Transport
 }
 
 struct TaggedIo<T> {

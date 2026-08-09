@@ -125,6 +125,12 @@ shutdown sends the closed `Shutdown` frame, waits within the same bound, and sti
 cleanup. The next independent request always receives a new generation, so delayed output from
 an old process cannot enter its protocol stream.
 
+On Unix, a worker exit caused by `SIGXCPU` (or its shell-compatible `128 + SIGXCPU` status) is a
+closed native-resource fault rather than a generic transport fault. The supervisor recycles the
+process, and skill verification maps it to source evaluation failure. This keeps an infinite source
+deterministic when the reused process reaches its cumulative 35-second native CPU ceiling before
+the request-local QuickJS interrupt can serialize its normal timeout diagnostic.
+
 Background skill verification enters one bounded FIFO queue owned by that same supervisor; it
 never starts a verifier process or worker pool. Interactive `RunStep` callers have priority while
 waiting or active. A whole `VerifyArtifact` already dispatched to the worker remains atomic, but
@@ -524,10 +530,17 @@ The production launcher closes that scoped transition with a fresh one-time path
 `DeprecatedBestEffort`.
 
 The production publisher creates an unguessable
-`0700` directory under a caller-supplied private root using descriptor-relative operations, copies
-the trusted source into a single-link `0600` file, verifies source and destination metadata plus
-SHA-256, changes the copy to `0500`, and retains close-on-exec descriptors so cleanup and unlink
-remain bound to the proven directory and inode. Under the approved scoped 2A boundary, the
+`0700` directory under a caller-supplied private root using descriptor-relative operations, then
+atomically creates a distinct single-link image from the pinned trusted source with Darwin
+`fclonefileat(..., CLONE_NOOWNERCOPY)`. The APFS copy-on-write path avoids rewriting and durably
+flushing the complete executable for every worker generation. If the pinned executable is on a
+different or non-cloning volume, only `EXDEV` or `ENOTSUP` selects the descriptor-relative,
+exclusive private-copy path; every other clone error fails closed. The publisher still independently
+hashes both pinned descriptors, verifies source and destination metadata and distinct inodes,
+changes the image to `0500`, and retains close-on-exec descriptors so cleanup and unlink remain
+bound to the proven directory and inode. The destination must not exist, and a clone, reopen, ACL,
+metadata, permission, synchronization, or hash failure cleans up or fails closed. Under the
+approved scoped 2A boundary, the
 parent-selected current executable and authenticated bootstrap are trusted; production therefore
 uses that exact descriptor/metadata/SHA-256 proof and does not claim Security.framework identity as
 an additional control. The stricter static-code test slice asks
@@ -539,7 +552,8 @@ one to eight distinct, exact 20-byte data values before any typed access; the ge
 is capped at 512 bytes before parsing. Candidate signing information is never accepted after a
 validation failure.
 
-Unit tests cover source/root rejection, publication permissions and identity, descriptor flags,
+Unit tests cover source/root rejection, exclusive copy-on-write cloning, secure cross-volume copy,
+source/image mutation independence, publication permissions and identity, descriptor flags,
 replacement detection, unlink refusal when an unexpected directory entry exists, and rejection of
 tampered or malformed executables. Positive source/copy and distinct-system-image identity probes
 exist but are ignored unless explicitly selected because macOS 26.5.2 on the development host

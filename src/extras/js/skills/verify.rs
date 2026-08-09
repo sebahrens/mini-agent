@@ -292,6 +292,9 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
             VerificationError::InfrastructureUnavailable("worker verification cancelled".into())
         }
         WorkerError::TimedOut => VerificationError::SourceEvaluationFailed("timeout".to_string()),
+        WorkerError::NativeCpuLimit => {
+            VerificationError::SourceEvaluationFailed("native CPU resource limit".to_string())
+        }
         WorkerError::UnexpectedVerificationEffect => {
             VerificationError::SourceEvaluationFailed("external effect denied".to_string())
         }

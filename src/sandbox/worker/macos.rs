@@ -2198,19 +2198,18 @@ mod one_time_image {
     }
 
     impl<'a> PartialPublicationGuard<'a> {
-        fn new(
+        fn new_before_image(
             root: &'a std::fs::File,
             directory: &'a std::fs::File,
             directory_metadata: &std::fs::Metadata,
             lease: std::fs::File,
-            image: std::fs::File,
         ) -> io::Result<Self> {
             let lease_identity = InodeIdentity::from_metadata(&lease.metadata()?);
             Ok(Self {
                 root,
                 directory,
                 directory_identity: InodeIdentity::from_metadata(directory_metadata),
-                image: Some(image),
+                image: None,
                 image_identity: None,
                 lease: Some(lease),
                 lease_identity,
@@ -2218,9 +2217,14 @@ mod one_time_image {
             })
         }
 
-        fn bind_image_identity(&mut self) -> io::Result<()> {
-            let metadata = self.image()?.metadata()?;
-            self.image_identity = Some(InodeIdentity::from_metadata(&metadata));
+        fn adopt_created_image(&mut self, image: std::fs::File) -> io::Result<()> {
+            if self.image.is_some() || self.image_identity.is_some() {
+                return Err(io::Error::other(
+                    "partial publication already owns a worker image",
+                ));
+            }
+            self.image = Some(image);
+            self.image_identity = Some(InodeIdentity::from_metadata(&self.image()?.metadata()?));
             Ok(())
         }
 
@@ -2272,47 +2276,38 @@ mod one_time_image {
             }
             self.active = false;
 
-            let image_identity = match self.image_identity {
-                Some(identity) => identity,
-                None => InodeIdentity::from_metadata(&self.image()?.metadata()?),
-            };
-            let mut removed_image = false;
-            for name in directory_entry_names(self.directory)? {
-                let name = OsStr::from_bytes(&name);
-                let Ok(candidate) = open_at(
-                    self.directory,
-                    name,
-                    OPEN_READ_ONLY | OPEN_NOFOLLOW | OPEN_CLOEXEC,
-                    0,
-                ) else {
-                    continue;
-                };
-                if image_identity.matches(&candidate.metadata()?) {
-                    unlink_at(self.directory, name, 0)?;
-                    removed_image = true;
-                    break;
+            if let Some(image) = self.image.as_ref() {
+                let image_identity = self
+                    .image_identity
+                    .unwrap_or(InodeIdentity::from_metadata(&image.metadata()?));
+                let mut removed_image = false;
+                for name in directory_entry_names(self.directory)? {
+                    let name = OsStr::from_bytes(&name);
+                    let Ok(candidate) = open_at(
+                        self.directory,
+                        name,
+                        OPEN_READ_ONLY | OPEN_NOFOLLOW | OPEN_CLOEXEC,
+                        0,
+                    ) else {
+                        continue;
+                    };
+                    if image_identity.matches(&candidate.metadata()?) {
+                        unlink_at(self.directory, name, 0)?;
+                        removed_image = true;
+                        break;
+                    }
                 }
-            }
 
-            if !removed_image {
-                let was_already_unlinked = self
-                    .image
-                    .as_ref()
-                    .map(|image| image.metadata())
-                    .transpose()?
-                    .is_some_and(|metadata| metadata.nlink() == 0);
-                if !was_already_unlinked {
+                if !removed_image && image.metadata()?.nlink() != 0 {
                     return Err(permission_denied(
                         "could not locate the created worker image inode during cleanup",
                     ));
                 }
-            }
-            if let Some(image) = self.image.as_ref()
-                && image.metadata()?.nlink() != 0
-            {
-                return Err(permission_denied(
-                    "created worker image retained a link after cleanup",
-                ));
+                if image.metadata()?.nlink() != 0 {
+                    return Err(permission_denied(
+                        "created worker image retained a link after cleanup",
+                    ));
+                }
             }
             self.image.take();
 
@@ -2452,28 +2447,29 @@ mod one_time_image {
             directory.sync_all()?;
 
             let image_path = directory_path.join(ONE_TIME_IMAGE_NAME);
-            let image_writer = open_at(
-                &directory,
-                OsStr::new(ONE_TIME_IMAGE_NAME),
-                OPEN_READ_WRITE | OPEN_CREATE | OPEN_EXCLUSIVE | OPEN_NOFOLLOW | OPEN_CLOEXEC,
-                0o600,
-            )?;
-            // Ownership begins immediately after the exclusive create succeeds. Every subsequent
-            // fallible stage is routed through an explicit cleanup result before returning.
-            let mut publication = PartialPublicationGuard::new(
+            // Ownership begins before the descriptor-relative clone. The clone is atomic; after
+            // it succeeds, the destination descriptor is adopted before any further proof work.
+            // Cleanup then removes it by inode identity rather than trusting its pathname.
+            let mut publication = PartialPublicationGuard::new_before_image(
                 &root,
                 &directory,
                 &directory_opened,
                 lease,
-                image_writer,
             )?;
             let result = (|| {
-                publication.bind_image_identity()?;
+                let image = clone_or_copy_and_open_file_at(
+                    &source_file,
+                    &directory,
+                    OsStr::new(ONE_TIME_IMAGE_NAME),
+                )?;
+                publication.adopt_created_image(image)?;
                 fault(PreparationFaultStage::Created, &image_path)?;
                 ensure_no_extended_acl(publication.image()?, "writable one-time worker image")?;
-                let source_sha256 = copy_and_hash(&mut source_file, publication.image_mut()?)?;
+                // APFS supplies an atomic copy-on-write snapshot with its own inode. Hashing both
+                // pinned descriptors below retains the original byte-for-byte proof without the
+                // full executable rewrite and durable data flush on every worker generation.
+                let source_sha256 = hash_file(&mut source_file)?;
                 fault(PreparationFaultStage::Copied, &image_path)?;
-                publication.image_mut()?.flush()?;
                 publication.image()?.sync_all()?;
                 fault(PreparationFaultStage::Synced, &image_path)?;
                 publication
@@ -2509,6 +2505,13 @@ mod one_time_image {
                 fault(PreparationFaultStage::Reopened, &image_path)?;
                 let image_opened = publication.image()?.metadata()?;
                 validate_published_image(&image_opened)?;
+                if source_opened.dev() == image_opened.dev()
+                    && source_opened.ino() == image_opened.ino()
+                {
+                    return Err(permission_denied(
+                        "one-time worker image did not receive a distinct inode",
+                    ));
+                }
                 ensure_no_extended_acl(publication.image()?, "sealed one-time worker image")?;
                 let image_sha256 = hash_file(publication.image_mut()?)?;
                 fault(PreparationFaultStage::Hashed, &image_path)?;
@@ -3266,22 +3269,92 @@ mod one_time_image {
         Ok(())
     }
 
-    fn copy_and_hash(
-        source: &mut std::fs::File,
-        target: &mut std::fs::File,
-    ) -> io::Result<[u8; 32]> {
-        source.seek(std::io::SeekFrom::Start(0))?;
-        let mut digest = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = source.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            digest.update(&buffer[..read]);
-            target.write_all(&buffer[..read])?;
+    #[allow(unsafe_code)]
+    fn clone_or_copy_and_open_file_at(
+        source: &std::fs::File,
+        directory: &std::fs::File,
+        name: &OsStr,
+    ) -> io::Result<std::fs::File> {
+        const CLONE_NOOWNERCOPY: u32 = 0x0002;
+        unsafe extern "C" {
+            fn fclonefileat(
+                source_descriptor: c_int,
+                destination_directory: c_int,
+                destination_name: *const c_char,
+                flags: u32,
+            ) -> c_int;
         }
-        Ok(digest.finalize().into())
+
+        let destination_name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "clone name contains NUL"))?;
+        // SAFETY: both descriptors remain live for the synchronous syscall and `name` is a
+        // NUL-terminated single component. fclonefileat atomically creates a distinct destination
+        // inode or creates nothing; CLONE_NOOWNERCOPY binds its owner to the current user.
+        let clone_result = unsafe {
+            fclonefileat(
+                source.as_raw_fd(),
+                directory.as_raw_fd(),
+                destination_name.as_ptr(),
+                CLONE_NOOWNERCOPY,
+            )
+        };
+        if clone_result != 0 {
+            let clone_error = io::Error::last_os_error();
+            if !matches!(
+                clone_error.raw_os_error(),
+                Some(libc::EXDEV) | Some(libc::ENOTSUP)
+            ) {
+                return Err(clone_error);
+            }
+            let mut image = open_at(
+                directory,
+                name,
+                OPEN_READ_WRITE | OPEN_CREATE | OPEN_EXCLUSIVE | OPEN_NOFOLLOW | OPEN_CLOEXEC,
+                0o600,
+            )?;
+            let copy_result = (|| {
+                let mut source = source.try_clone()?;
+                source.seek(std::io::SeekFrom::Start(0))?;
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = source.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    image.write_all(&buffer[..read])?;
+                }
+                Ok(())
+            })();
+            if let Err(copy_error) = copy_result {
+                return match unlink_at(directory, name, 0) {
+                    Ok(()) => Err(copy_error),
+                    Err(cleanup_error) => Err(io::Error::new(
+                        cleanup_error.kind(),
+                        format!(
+                            "worker image copy failed: {copy_error}; cleanup failed: {cleanup_error}"
+                        ),
+                    )),
+                };
+            }
+            return Ok(image);
+        }
+        match open_at(
+            directory,
+            name,
+            OPEN_READ_WRITE | OPEN_NOFOLLOW | OPEN_CLOEXEC,
+            0,
+        ) {
+            Ok(image) => Ok(image),
+            Err(open_error) => match unlink_at(directory, name, 0) {
+                Ok(()) => Err(open_error),
+                Err(cleanup_error) => Err(io::Error::new(
+                    cleanup_error.kind(),
+                    format!(
+                        "cloned worker image could not be opened: {open_error}; cleanup failed: {cleanup_error}"
+                    ),
+                )),
+            },
+        }
     }
 
     fn hash_file(file: &mut std::fs::File) -> io::Result<[u8; 32]> {
@@ -3539,6 +3612,33 @@ mod one_time_image {
             assert!(image.is_file());
             assert_eq!(image.nlink(), 1);
             assert_eq!(image.mode() & 0o777, 0o500);
+        }
+
+        #[test]
+        fn one_time_worker_image_clone_is_exclusive_and_copy_on_write() {
+            let root = TestRoot::new();
+            let source_path = root.source("source-worker", b"original worker image");
+            let source = open_read_only(&source_path).unwrap();
+            let directory_path = root.path.join("clone-target");
+            create_private_directory(&directory_path).unwrap();
+            let directory = open_directory(&directory_path).unwrap();
+            let name = OsStr::new("worker-image");
+
+            let clone = clone_or_copy_and_open_file_at(&source, &directory, name).unwrap();
+            let duplicate = clone_or_copy_and_open_file_at(&source, &directory, name).unwrap_err();
+            assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
+
+            let clone_path = directory_path.join(name);
+            assert!(descriptor_has_close_on_exec(clone.as_raw_fd()).unwrap());
+            assert_eq!(
+                std::fs::read(&clone_path).unwrap(),
+                b"original worker image"
+            );
+            std::fs::write(&clone_path, b"private mutation").unwrap();
+            assert_eq!(
+                std::fs::read(&source_path).unwrap(),
+                b"original worker image"
+            );
         }
 
         #[test]

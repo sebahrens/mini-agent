@@ -6,7 +6,10 @@ description: "Get started with mini-agent: install the minimal Rust coding agent
 
 Thanks for picking up mini-agent. This guide covers installation, model setup, and the basic commands.
 
-This tutorial is designed to work on any Linux, macOS and WSL environment; if you are using Windows, we recommned using WSL, as Windows support is not currently mantained.
+This tutorial applies to Linux, macOS, and Windows. The checksum-verified shell installer below
+targets Linux and macOS; on Windows, install with Cargo. JavaScript actions expose the same brokered
+feature contract on all three systems, while each platform uses and reports its own containment
+assurance; see the repository README and architecture overview for those guarantees.
 
 ## 1. Installation
 

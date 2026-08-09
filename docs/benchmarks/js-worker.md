@@ -41,21 +41,44 @@ pairwise variance; recovery and the faster warm/IPC observations are not, so the
 is explicitly recorded as noisy rather than rewritten to pass.
 
 The macOS cold and recovery measurements include the complete one-time-image Seatbelt and guardian
-preflight or teardown. For the first release, review accepts that reference-runner cost without
-weakening those security checks or changing the targets: the process remains warm for normal calls,
-shared-runner timings are informational, and a matched otherwise-quiet-host result has not been
-promoted to a release blocker. Follow-up `mini-agent-avx3` owns profiling and optimization with the
-same containment guarantees. The independently enforced native limits remain separate from this
-performance review.
+preflight or teardown. The original publisher rewrote and durably flushed the complete installed
+debug executable for every generation. Follow-up `mini-agent-avx3` replaces that stage with Darwin's
+atomic APFS copy-on-write clone, while retaining distinct-inode, metadata, ACL, permission,
+descriptor, and independent source/image SHA-256 proof. The checked-in three-platform baseline
+remains the release reference until the matched-host optimization record below is reviewed and
+promoted. The independently enforced native limits remain separate from this performance review.
+
+### Matched-host macOS publication optimization
+
+Issue `mini-agent-avx3` recorded a 100-sample before/after pair on the same otherwise-idle
+`x86_64` macOS 26 host (Darwin 25.5.0, Intel i7-1068NG7, 8 logical CPUs, 32 GiB RAM), using the
+same debug `js` feature set, Seatbelt assurance, sampling method, and stable runner label. Build
+identity differs intentionally because the second binary contains the optimization:
+
+| Record | Cold Ready p95 | Recovery p95 | Max private memory | Worker / helpers / idle runtimes |
+|---|---:|---:|---:|---:|
+| [copy + durable flush, before](results/js-worker-macos-x86_64-before.json) | 6,380.723 ms | 6,025.452 ms | 2.95 MiB | 1 / 1 / 0 |
+| [APFS clone, after](results/js-worker-macos-x86_64-after.json) | 3,794.123 ms | 3,676.008 ms | 3.01 MiB | 1 / 1 / 0 |
+
+The optimized p95 is 40.54% lower for cold Ready and 38.99% lower for cancel recovery. Mean latency
+fell 23.67% and 19.43%, respectively. Both timing targets remain false, so this review does not
+revise the 300 ms / 1 s goals or claim the remaining hash, guardian, Seatbelt, and process-launch
+cost is solved. It accepts the repeatable reduction while retaining both independent SHA-256 reads,
+the exact one-time-image lifecycle, the complete live preflight, and fail-closed availability.
 
 ## Reference method
 
-Install the production crate with `cargo install --path . --debug`, then use that installed debug
-application as the worker executable. The harness rejects its own libtest executable, so startup
+Install a feature-matched production crate with
+`cargo install --locked --path . --debug --no-default-features --features js --root <root>`, then
+use `<root>/bin/mini-agent` as the worker executable. The benchmark harness and installed worker
+must have the same exact build identity; a default-feature binary cannot authenticate to the
+focused `js` harness. The harness rejects its own libtest executable, so startup
 and private-memory evidence cover the real application worker entry point rather than Rust's test
 harness. A reference record identifies the host, OS,
 architecture, kernel, CPU, logical CPU count, RAM, package version, and exact build identity. Keep
 the machine otherwise idle and use the same runner image or physical host when comparing runs.
+Outside CI, set `RUNNER_NAME` to a stable nonempty label when the shell does not export `HOSTNAME`;
+the schema rejects an anonymous host after sampling rather than retaining ambiguous evidence.
 
 Every latency series discards 10 warmups and retains 100 samples. The harness reports the mean,
 nearest-rank p50 and p95, unbiased sample variance, standard deviation, minimum, and maximum in

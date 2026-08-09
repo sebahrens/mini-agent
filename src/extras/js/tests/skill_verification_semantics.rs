@@ -12,12 +12,13 @@
 #[cfg(test)]
 mod tests {
     use crate::extras::js::skills::verify::{
-        MutationOutcome, TestResult, VerificationError, verify_skill,
+        MutationOutcome, TestResult, VerificationError, verify_skill, worker_error,
     };
     use crate::extras::js::skills::{
         CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
         test_manifest,
     };
+    use crate::extras::js::supervisor::WorkerError;
 
     // Helper to create a skill.
     fn skill(
@@ -560,6 +561,15 @@ mod tests {
             matches!(&result, Err(VerificationError::SourceEvaluationFailed(_))),
             "unexpected verification result: {result:?}"
         );
+    }
+
+    #[test]
+    fn native_cpu_exhaustion_is_a_deterministic_source_failure() {
+        assert!(matches!(
+            worker_error(WorkerError::NativeCpuLimit),
+            VerificationError::SourceEvaluationFailed(message)
+                if message == "native CPU resource limit"
+        ));
     }
 
     #[test]

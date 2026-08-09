@@ -225,6 +225,8 @@ async fn worker_fault_matrix_recycles_resource_protocol_process_and_cancellation
         ("panic", Err(WorkerError::Transport)),
         ("os-kill", Err(WorkerError::Transport)),
         ("abnormal-exit", Err(WorkerError::Transport)),
+        #[cfg(unix)]
+        ("native-cpu-limit", Err(WorkerError::NativeCpuLimit)),
     ];
 
     for (code, expected) in rows {
