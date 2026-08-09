@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME, GENERIC_ALL,
-    GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE, WAIT_ABANDONED_0, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME,
+    GENERIC_ALL, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE, WAIT_ABANDONED_0,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
@@ -87,7 +87,7 @@ use windows_sys::Win32::System::Threading::{
     OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ProcessChildProcessPolicy, ReleaseMutex,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
@@ -140,7 +140,6 @@ const AUTHORITY_PROBE_ARG: &str = "--mini-agent-windows-sandbox-authority-probe"
 const DESCENDANT_PROBE_ARG: &str = "--mini-agent-windows-appcontainer-descendant-probe";
 const HELPER_PID_PLACEHOLDER: &str = "helper-pid";
 const DESKTOP_NAME_PLACEHOLDER: &str = "desktop-name";
-const OMITTED_HANDLE_PLACEHOLDER: &str = "omitted-handle";
 const CONTROL_ROOT_PLACEHOLDER: &str = "control-root";
 const REQUEST_VERSION: u32 = 1;
 // This stays below the requested anonymous-pipe buffer, so request creation cannot block before
@@ -1304,13 +1303,8 @@ fn run_helper() -> Result<i32, String> {
             .filter(|value| value.as_str() == DESKTOP_NAME_PLACEHOLDER)
             .ok_or("invalid authority-probe desktop placeholder")?;
         *desktop_name = desktop.name.clone();
-        let omitted = arguments
-            .get_mut(5)
-            .filter(|value| value.as_str() == OMITTED_HANDLE_PLACEHOLDER)
-            .ok_or("invalid omitted-handle placeholder")?;
-        *omitted = (omitted_handle.raw() as usize).to_string();
         let control_root = arguments
-            .get_mut(6)
+            .get_mut(5)
             .filter(|value| value.as_str() == CONTROL_ROOT_PLACEHOLDER)
             .ok_or("invalid control-root placeholder")?;
         *control_root = grants
@@ -1343,6 +1337,19 @@ fn run_helper() -> Result<i32, String> {
         }
     };
     mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
+    let omitted_canary_inherited = if authority_probe_requested {
+        match target_inherited_omitted_canary(&child, &omitted_handle) {
+            Ok(inherited) => inherited,
+            Err(error) => {
+                terminate_and_drain_job(&job, 126)?;
+                grants.mark_job_quiescent();
+                grants.cleanup()?;
+                return Err(error);
+            }
+        }
+    } else {
+        false
+    };
     mark_helper_stage(HELPER_STAGE_READY);
     if let Some(path) = ready_path
         && let Err(error) = std::fs::OpenOptions::new()
@@ -1390,17 +1397,8 @@ fn run_helper() -> Result<i32, String> {
         grants.cleanup()?;
         return Err(last_error("read restricted child exit code"));
     }
-    if authority_probe_requested {
-        match omitted_canary_was_signaled(&omitted_handle) {
-            Ok(true) => code = 97,
-            Ok(false) => {}
-            Err(error) => {
-                terminate_and_drain_job(&job, 126)?;
-                grants.mark_job_quiescent();
-                grants.cleanup()?;
-                return Err(error);
-            }
-        }
+    if omitted_canary_inherited {
+        code = 97;
     }
     mark_helper_stage(HELPER_STAGE_DRAIN);
     terminate_and_drain_job(&job, code)?;
@@ -2862,13 +2860,30 @@ fn inheritable_omitted_canary() -> Result<Handle, String> {
     )
 }
 
-fn omitted_canary_was_signaled(canary: &Handle) -> Result<bool, String> {
-    match unsafe { WaitForSingleObject(canary.raw(), 0) } {
-        WAIT_OBJECT_0 => Ok(true),
-        WAIT_TIMEOUT => Ok(false),
-        WAIT_FAILED => Err(last_error("inspect omitted inheritable-handle canary")),
-        _ => Err("sandbox: omitted-handle canary returned an invalid wait result".into()),
+fn target_inherited_omitted_canary(target: &Handle, canary: &Handle) -> Result<bool, String> {
+    let mut candidate = null_mut();
+    if unsafe {
+        DuplicateHandle(
+            target.raw(),
+            canary.raw(),
+            GetCurrentProcess(),
+            &mut candidate,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(6) {
+            return Ok(false);
+        }
+        return Err(format!(
+            "sandbox: inspect omitted target handle identity: {error}"
+        ));
     }
+    let candidate = Handle::created(candidate, "own target handle-identity candidate")?;
+    Ok(unsafe { CompareObjectHandles(canary.raw(), candidate.raw()) } != 0)
 }
 
 fn appcontainer_environment(cache: &Path, private_storage: &Path) -> Vec<u16> {
@@ -3273,7 +3288,6 @@ fn run_runtime_probe() -> Result<i32, String> {
             unsafe { GetCurrentProcessId() }.to_string(),
             authority_escape.to_string_lossy().into_owned(),
             DESKTOP_NAME_PLACEHOLDER.into(),
-            OMITTED_HANDLE_PLACEHOLDER.into(),
             CONTROL_ROOT_PLACEHOLDER.into(),
         ],
         &workspace_b,
@@ -3562,14 +3576,6 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     let Some(expected_desktop) = args.next().and_then(|value| value.into_string().ok()) else {
         return AUTHORITY_ARGUMENT_ERROR;
     };
-    let Some(omitted_handle) = args
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value != 0)
-    else {
-        return AUTHORITY_ARGUMENT_ERROR;
-    };
     let Some(control_root) = args.next().map(PathBuf::from) else {
         return AUTHORITY_ARGUMENT_ERROR;
     };
@@ -3595,9 +3601,6 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     if !is_appcontainer {
         return 102;
     }
-    // Handle values are process-local. Signaling the candidate proves object identity to the
-    // helper without treating an unrelated child handle at the same numeric value as inherited.
-    let _ = unsafe { SetEvent(omitted_handle as HANDLE) };
     if std::fs::read_dir(&control_root).is_ok()
         || std::fs::OpenOptions::new()
             .write(true)
