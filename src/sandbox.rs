@@ -2530,7 +2530,9 @@ mod sandbox_tests {
             "wait_for_stale_job_quiescence",
             "verify_descendant_membership",
             "read_descendant_process_proof",
-            "DESCENDANT_PROOF_PLACEHOLDER",
+            "DESCENDANT_PROOF_HANDLE_PLACEHOLDER",
+            "descendant_proof_pipe",
+            "PeekNamedPipe",
             "process_creation_time(descendant.raw())?",
             "active_job_processes",
             "wait_for_exact_probe_file",
@@ -2717,6 +2719,7 @@ mod sandbox_tests {
         );
         assert!(!appcontainer_launch.contains("PROC_THREAD_ATTRIBUTE_JOB_LIST"));
         assert!(appcontainer_launch.contains("startup.StartupInfo.hStdOutput = stdout.raw()"));
+        assert!(appcontainer_launch.contains("handles.push(proof)"));
 
         let profile_creation = source
             .split("fn create_appcontainer_profile(")
@@ -2787,6 +2790,9 @@ mod sandbox_tests {
         assert!(authority_probe.contains("CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT"));
         assert!(authority_probe.contains("ResumeThread(descendant_thread.raw())"));
         assert!(authority_probe.contains("DESCENDANT_PROOF_MAGIC.to_le_bytes()"));
+        assert!(authority_probe.contains("File::from_raw_handle(descendant_proof_handle)"));
+        assert!(!authority_probe.contains("std::io::stdout().lock()"));
+        assert!(!authority_probe.contains(".open(&descendant_proof)"));
 
         let parent_probe = source
             .split("fn run_parent_probe(")
