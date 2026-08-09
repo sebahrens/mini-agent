@@ -65,7 +65,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectBasicUIRestrictions,
     JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
@@ -127,8 +127,6 @@ const AUTHORITY_BREAKAWAY_EXE_ERROR: i32 = 110;
 const AUTHORITY_BREAKAWAY_RESULT_ERROR: i32 = 111;
 const AUTHORITY_CAPABILITY_QUERY_ERROR: i32 = 112;
 const AUTHORITY_LOOPBACK_QUERY_ERROR: i32 = 113;
-const AUTHORITY_DESCENDANT_IDENTITY_QUERY_ERROR: i32 = 114;
-const AUTHORITY_DESCENDANT_PROOF_WRITE_ERROR: i32 = 115;
 const DESCENDANT_ARGUMENT_ERROR: i32 = 119;
 const DESCENDANT_CAPABILITY_QUERY_ERROR: i32 = 120;
 const DESCENDANT_APPCONTAINER_QUERY_ERROR: i32 = 121;
@@ -144,7 +142,6 @@ const DESCENDANT_PROBE_ARG: &str = "--mini-agent-windows-appcontainer-descendant
 const HELPER_PID_PLACEHOLDER: &str = "helper-pid";
 const DESKTOP_NAME_PLACEHOLDER: &str = "desktop-name";
 const OMITTED_HANDLE_PLACEHOLDER: &str = "omitted-handle";
-const DESCENDANT_READY_PLACEHOLDER: &str = "descendant-ready";
 const DESCENDANT_RELEASE_PLACEHOLDER: &str = "descendant-release";
 const CONTROL_ROOT_PLACEHOLDER: &str = "control-root";
 const REQUEST_VERSION: u32 = 1;
@@ -160,7 +157,6 @@ const MAX_STALE_PROFILE_JOURNALS: usize = 64;
 const PROFILE_JOURNAL_VERSION: u32 = 2;
 const JOB_NAME_PREFIX: &str = "Global\\mini-agent-general-job-";
 const STALE_JOB_CLEANUP_EXIT_CODE: u32 = 126;
-const DESCENDANT_IDENTITY_MAX_BYTES: usize = 128;
 const MAX_JOB_PROCESSES: u32 = 64;
 const PROCESS_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const JOB_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
@@ -177,15 +173,11 @@ const HELPER_STAGE_SETUP: u8 = 2;
 const HELPER_STAGE_LAUNCH: u8 = 3;
 const HELPER_STAGE_VERIFY_JOB: u8 = 4;
 const HELPER_STAGE_VERIFY_DESCENDANT: u8 = 5;
-const HELPER_STAGE_DESCENDANT_METADATA: u8 = 6;
-const HELPER_STAGE_DESCENDANT_PROOF_OPEN: u8 = 7;
-const HELPER_STAGE_DESCENDANT_LINK_COUNT: u8 = 8;
-const HELPER_STAGE_DESCENDANT_PROOF_PARSE: u8 = 9;
-const HELPER_STAGE_DESCENDANT_PROCESS_OPEN: u8 = 10;
-const HELPER_STAGE_DESCENDANT_PROCESS_IDENTITY: u8 = 11;
-const HELPER_STAGE_DESCENDANT_JOB: u8 = 12;
-const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 13;
-const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 14;
+const HELPER_STAGE_DESCENDANT_JOB_QUERY: u8 = 6;
+const HELPER_STAGE_DESCENDANT_PROCESS_OPEN: u8 = 7;
+const HELPER_STAGE_DESCENDANT_JOB: u8 = 8;
+const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 9;
+const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 10;
 const HELPER_STAGE_READY: u8 = 15;
 const HELPER_STAGE_WAIT: u8 = 16;
 const HELPER_STAGE_EXIT_CODE: u8 = 17;
@@ -1327,21 +1319,12 @@ fn run_helper() -> Result<i32, String> {
             .filter(|value| value.as_str() == OMITTED_HANDLE_PLACEHOLDER)
             .ok_or("invalid omitted-handle placeholder")?;
         *omitted = (omitted_handle.raw() as usize).to_string();
-        let ready = cwd.join(format!(
-            ".mini-agent-descendant-ready-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
         let release = cwd.join(format!(
             ".mini-agent-descendant-release-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let descendant_ready = arguments
-            .get_mut(6)
-            .filter(|value| value.as_str() == DESCENDANT_READY_PLACEHOLDER)
-            .ok_or("invalid descendant-ready placeholder")?;
-        *descendant_ready = ready.to_string_lossy().into_owned();
         let control_root = arguments
-            .get_mut(7)
+            .get_mut(6)
             .filter(|value| value.as_str() == CONTROL_ROOT_PLACEHOLDER)
             .ok_or("invalid control-root placeholder")?;
         *control_root = grants
@@ -1352,17 +1335,11 @@ fn run_helper() -> Result<i32, String> {
             .to_string_lossy()
             .into_owned();
         let descendant_release = arguments
-            .get_mut(8)
+            .get_mut(7)
             .filter(|value| value.as_str() == DESCENDANT_RELEASE_PLACEHOLDER)
             .ok_or("invalid descendant-release placeholder")?;
         *descendant_release = release.to_string_lossy().into_owned();
-        let proof_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&ready)
-            .map_err(|error| format!("create descendant identity rendezvous: {error}"))?;
-        descendant_rendezvous = Some((ready, release, proof_file));
+        descendant_rendezvous = Some(release);
     }
     grants.disarm_for_launch();
     mark_helper_stage(HELPER_STAGE_LAUNCH);
@@ -1386,9 +1363,9 @@ fn run_helper() -> Result<i32, String> {
         }
     };
     mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
-    if let Some((ready, release, _proof_file)) = descendant_rendezvous {
+    if let Some(release) = descendant_rendezvous {
         mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-        if let Err(error) = verify_descendant_rendezvous(&job, &child, &ready, &release) {
+        if let Err(error) = verify_descendant_rendezvous(&job, &child, &release) {
             let target_exit = completed_process_exit_code(&child)?;
             terminate_and_drain_job(&job, 126)?;
             grants.mark_job_quiescent();
@@ -2580,56 +2557,10 @@ fn verify_job_membership_and_limits(job: &Handle, child: &Handle) -> Result<(), 
 fn verify_descendant_rendezvous(
     job: &Handle,
     target: &Handle,
-    ready: &Path,
     release: &Path,
 ) -> Result<(), String> {
     mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-    wait_for_descendant_identity(ready, target)?;
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_METADATA);
-    let metadata = std::fs::symlink_metadata(ready)
-        .map_err(|error| format!("inspect descendant identity proof: {error}"))?;
-    if !metadata.is_file()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || metadata.len() > DESCENDANT_IDENTITY_MAX_BYTES as u64
-    {
-        return Err("sandbox: descendant identity proof object was invalid".into());
-    }
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROOF_OPEN);
-    let mut proof_file = open_stable_path(
-        ready,
-        false,
-        GENERIC_READ | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ,
-    )?;
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_LINK_COUNT);
-    if crate::fs::windows_file_link_count(&proof_file)
-        .map_err(|error| format!("inspect descendant identity proof links: {error}"))?
-        != 1
-    {
-        return Err("sandbox: descendant identity proof was multiply linked".into());
-    }
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROOF_PARSE);
-    let mut proof = Vec::with_capacity(DESCENDANT_IDENTITY_MAX_BYTES + 1);
-    Read::by_ref(&mut proof_file)
-        .take((DESCENDANT_IDENTITY_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut proof)
-        .map_err(|error| format!("read descendant identity proof: {error}"))?;
-    if proof.len() > DESCENDANT_IDENTITY_MAX_BYTES {
-        return Err("sandbox: descendant identity proof exceeded bound".into());
-    }
-    let (pid, created) = parse_descendant_identity(&proof)?;
-    if pid == unsafe { GetProcessId(target.raw()) } {
-        return Err("descendant identity proof did not identify a distinct process".into());
-    }
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROCESS_OPEN);
-    let descendant = Handle::created(
-        unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) },
-        "open exact descendant identity",
-    )?;
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_PROCESS_IDENTITY);
-    if process_creation_time(descendant.raw())? != created {
-        return Err("descendant process identity changed before exact Job proof".into());
-    }
+    let descendant = wait_for_descendant_process(job, target)?;
     mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB);
     let mut in_job = 0;
     if unsafe { IsProcessInJob(descendant.raw(), job.raw(), &mut in_job) } == 0 || in_job == 0 {
@@ -2647,46 +2578,92 @@ fn verify_descendant_rendezvous(
     Ok(())
 }
 
-fn parse_descendant_identity(proof: &[u8]) -> Result<(u32, u64), String> {
-    if proof.len() > DESCENDANT_IDENTITY_MAX_BYTES {
-        return Err("sandbox: descendant identity proof exceeded bound".into());
-    }
-    let proof = std::str::from_utf8(proof)
-        .map_err(|_| "sandbox: descendant identity proof was not UTF-8".to_string())?;
-    let mut lines = proof.lines();
-    let pid = lines
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|pid| *pid != 0)
-        .ok_or("descendant identity PID was invalid")?;
-    let created = lines
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|created| *created != 0)
-        .ok_or("descendant creation identity was invalid")?;
-    if lines.next().is_some() {
-        return Err("descendant identity proof contained trailing data".into());
-    }
-    Ok((pid, created))
+#[repr(C)]
+struct JobProcessIdListBuffer {
+    number_of_assigned_processes: u32,
+    number_of_process_ids_in_list: u32,
+    process_ids: [usize; MAX_JOB_PROCESSES as usize],
 }
 
-fn wait_for_descendant_identity(path: &Path, target: &Handle) -> Result<(), String> {
+impl Default for JobProcessIdListBuffer {
+    fn default() -> Self {
+        Self {
+            number_of_assigned_processes: 0,
+            number_of_process_ids_in_list: 0,
+            process_ids: [0; MAX_JOB_PROCESSES as usize],
+        }
+    }
+}
+
+fn wait_for_descendant_process(job: &Handle, target: &Handle) -> Result<Handle, String> {
+    let target_pid = unsafe { GetProcessId(target.raw()) };
+    if target_pid == 0 {
+        return Err(last_error("query authority target process ID"));
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if bounded_probe_contents(path, DESCENDANT_IDENTITY_MAX_BYTES)
-            .is_some_and(|contents| parse_descendant_identity(&contents).is_ok())
+        mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_QUERY);
+        let mut process_ids = JobProcessIdListBuffer::default();
+        if unsafe {
+            QueryInformationJobObject(
+                job.raw(),
+                JobObjectBasicProcessIdList,
+                (&mut process_ids as *mut JobProcessIdListBuffer).cast(),
+                size_of_val(&process_ids) as u32,
+                null_mut(),
+            )
+        } == 0
         {
-            return Ok(());
+            return Err(last_error("query exact Job process identity list"));
+        }
+        let assigned = process_ids.number_of_assigned_processes as usize;
+        let returned = process_ids.number_of_process_ids_in_list as usize;
+        if assigned > MAX_JOB_PROCESSES as usize
+            || returned > MAX_JOB_PROCESSES as usize
+            || assigned != returned
+        {
+            return Err("sandbox: exact Job process identity list exceeded its bound".into());
+        }
+        let ids = &process_ids.process_ids[..returned];
+        if ids
+            .iter()
+            .filter(|pid| **pid == target_pid as usize)
+            .count()
+            != 1
+        {
+            return Err("sandbox: authority target was absent from its exact Job snapshot".into());
+        }
+        let mut descendants = ids
+            .iter()
+            .copied()
+            .filter(|pid| *pid != target_pid as usize);
+        if let Some(pid) = descendants.next() {
+            if returned != 2 || descendants.next().is_some() || pid == 0 || pid > u32::MAX as usize
+            {
+                return Err("sandbox: exact Job descendant identity was ambiguous".into());
+            }
+            mark_helper_stage(HELPER_STAGE_DESCENDANT_PROCESS_OPEN);
+            let descendant = Handle::created(
+                unsafe {
+                    OpenProcess(
+                        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                        0,
+                        pid as u32,
+                    )
+                },
+                "open exact Job descendant",
+            )?;
+            if unsafe { GetProcessId(descendant.raw()) } != pid as u32 {
+                return Err("sandbox: exact Job descendant identity changed while opening".into());
+            }
+            return Ok(descendant);
         }
         if completed_process_exit_code(target)?.is_some() {
-            return Err("sandbox: authority target exited before descendant identity proof".into());
+            return Err("sandbox: authority target exited before descendant Job proof".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    Err(format!(
-        "timed out waiting for descendant identity: {}",
-        path.display()
-    ))
+    Err("timed out waiting for descendant Job proof".into())
 }
 
 fn verify_job_limits(job: &Handle) -> Result<(), String> {
@@ -3435,7 +3412,6 @@ fn run_runtime_probe() -> Result<i32, String> {
             authority_escape.to_string_lossy().into_owned(),
             DESKTOP_NAME_PLACEHOLDER.into(),
             OMITTED_HANDLE_PLACEHOLDER.into(),
-            DESCENDANT_READY_PLACEHOLDER.into(),
             CONTROL_ROOT_PLACEHOLDER.into(),
             DESCENDANT_RELEASE_PLACEHOLDER.into(),
         ],
@@ -3733,9 +3709,6 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     else {
         return AUTHORITY_ARGUMENT_ERROR;
     };
-    let Some(descendant_ready) = args.next().map(PathBuf::from) else {
-        return AUTHORITY_ARGUMENT_ERROR;
-    };
     let Some(control_root) = args.next().map(PathBuf::from) else {
         return AUTHORITY_ARGUMENT_ERROR;
     };
@@ -3790,19 +3763,6 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
         Ok(descendant) => descendant,
         Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
     };
-    let Ok(created) = process_creation_time(descendant.as_raw_handle()) else {
-        return AUTHORITY_DESCENDANT_IDENTITY_QUERY_ERROR;
-    };
-    let proof = format!("{}\n{}\n", descendant.id(), created);
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&descendant_ready)
-        .and_then(|mut file| file.write_all(proof.as_bytes()))
-        .is_err()
-    {
-        return AUTHORITY_DESCENDANT_PROOF_WRITE_ERROR;
-    }
     let descendant = match descendant.wait() {
         Ok(status) => status,
         Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,

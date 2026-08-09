@@ -2529,9 +2529,9 @@ mod sandbox_tests {
             "job_name",
             "wait_for_stale_job_quiescence",
             "verify_descendant_rendezvous",
-            "create descendant identity rendezvous",
-            "wait_for_descendant_identity",
-            "parse_descendant_identity",
+            "JobObjectBasicProcessIdList",
+            "JobProcessIdListBuffer",
+            "wait_for_descendant_process",
             "wait_for_exact_probe_file",
             "IsProcessInJob(descendant.raw(), job.raw()",
             "CREATE_BREAKAWAY_FROM_JOB",
@@ -2584,7 +2584,6 @@ mod sandbox_tests {
             "helper_failure_status()",
             "AUTHORITY_DESCENDANT_SPAWN_FAILED",
             "AUTHORITY_LOOPBACK_QUERY_ERROR",
-            "AUTHORITY_DESCENDANT_PROOF_WRITE_ERROR",
             "completed_process_exit_code(&child)?",
             "bounded_pipe=pass",
             "acl_serialization=pass",
@@ -2688,7 +2687,7 @@ mod sandbox_tests {
             .find("launch_appcontainer(")
             .expect("AppContainer launch missing");
         assert!(disarm < launch);
-        assert!(helper.contains("verify_descendant_rendezvous(&job, &child"));
+        assert!(helper.contains("verify_descendant_rendezvous(&job, &child, &release)"));
         assert!(helper.contains("terminate_and_drain_job(&job, 126)?;\n        grants.mark_job_quiescent();\n        grants.cleanup()?;"));
 
         let profile_creation = source
@@ -2745,7 +2744,7 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn verify_job_limits(").next())
             .expect("descendant rendezvous implementation missing");
-        assert!(descendant_verification.contains("wait_for_descendant_identity(ready, target)?"));
+        assert!(descendant_verification.contains("wait_for_descendant_process(job, target)?"));
         assert!(!descendant_verification.contains("wait_for_probe_file(ready)?"));
 
         let parent_probe = source
