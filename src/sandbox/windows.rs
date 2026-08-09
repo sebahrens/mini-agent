@@ -2633,7 +2633,21 @@ fn read_descendant_handle_proof(target: &Handle, reader: &mut File) -> Result<HA
             )
         } == 0
         {
-            return Err(last_error("inspect descendant-handle proof pipe"));
+            let pipe_error = last_error("inspect descendant-handle proof pipe");
+            // A target-side spawn or proof-write failure closes the last writer just before
+            // Windows necessarily publishes the target's exit code. Give that publication a
+            // bounded grace period so the caller can preserve the specific closed target code
+            // instead of replacing it with the helper's generic proof-read stage.
+            let exit_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            loop {
+                if completed_process_exit_code(target)?.is_some() {
+                    return Err(pipe_error);
+                }
+                if std::time::Instant::now() >= exit_deadline {
+                    return Err(pipe_error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
         if usize::try_from(available).unwrap_or(usize::MAX) >= proof_bytes {
             break;

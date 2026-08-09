@@ -2530,6 +2530,8 @@ mod sandbox_tests {
             "wait_for_stale_job_quiescence",
             "verify_descendant_membership",
             "read_descendant_handle_proof",
+            "let exit_deadline = std::time::Instant::now()",
+            "completed_process_exit_code(target)?.is_some()",
             "S:(ML;;NW;;;LW)",
             "active_job_processes",
             "wait_for_exact_probe_file",
