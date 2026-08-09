@@ -2765,7 +2765,8 @@ mod sandbox_tests {
             .and_then(|source| source.split("fn run_descendant_probe(").next())
             .expect("authority descendant implementation missing");
         assert!(authority_probe.contains(&["descendant_command", "spawn_guarded()"].join(".")));
-        assert!(authority_probe.contains(".stdin(Stdio::null())"));
+        assert!(!authority_probe.contains(".stdin(Stdio::null())"));
+        assert!(authority_probe.contains("opening the denied Windows NUL device"));
 
         let descendant_probe = source
             .split("fn run_descendant_probe(")

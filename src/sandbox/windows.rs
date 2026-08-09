@@ -1200,10 +1200,10 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
                 .arg(TARGET_PROBE_ARG)
                 .arg(TARGET_DESCENDANT_ARG)
                 .arg(tree_ready)
-                .arg(marker)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .arg(marker);
+            // Keep the already-contained standard handles. Constructing `Stdio::null()` here
+            // asks this AppContainer process to open the denied Windows NUL device before
+            // CreateProcessW, so the child would never reach its stricter token proof.
             child
                 .spawn_guarded()
                 .map_err(|error| format!("spawn target-probe descendant: {error}"))?;
@@ -3679,11 +3679,9 @@ fn run_descendant_token_probe(executable: &Path) -> i32 {
     // Windows can place an AppContainer process tree in a system-managed Job whose descendants do
     // not appear as additional processes in this launcher's private Job accounting.
     let mut descendant_command = Command::new(executable);
-    descendant_command
-        .arg(DESCENDANT_PROBE_ARG)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    descendant_command.arg(DESCENDANT_PROBE_ARG);
+    // Inherit the target's already-contained handles: opening the denied Windows NUL device via
+    // `Stdio::null()` would fail before CreateProcessW and would not test descendant containment.
     let mut descendant = match descendant_command.spawn_guarded() {
         Ok(descendant) => descendant,
         Err(error) => {
