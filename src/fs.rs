@@ -1732,7 +1732,11 @@ fn atomic_write_platform(
         };
     }
 
-    fn rename_open_file(file: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<()> {
+    fn rename_open_file(
+        directory: &std::fs::File,
+        file: &std::fs::File,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
         let name: Vec<u16> = name.encode_wide().collect();
         if name.is_empty() || name.len() > (u32::MAX as usize / 2) {
             return Err(std::io::Error::new(
@@ -1746,16 +1750,17 @@ fn atomic_write_platform(
         let mut storage = vec![0usize; words];
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         // FileRenameInfo with ReplaceIfExists=false provides create-only
-        // publication across supported Windows versions. For a simple leaf
-        // name, a null RootDirectory resolves the destination relative to the
-        // source file's current parent directory. The descriptor-relative
-        // create above therefore remains authoritative even if that directory's
-        // pathname is concurrently replaced.
+        // publication across supported Windows versions. A relative name with
+        // an explicit RootDirectory is resolved against the same retained,
+        // identity-verified directory handle used for temp creation. A null
+        // RootDirectory would instead bind the leaf to the process cwd and can
+        // fail with ERROR_NOT_SAME_DEVICE when cwd and storage use different
+        // volumes.
         // SAFETY: `storage` is aligned, large enough for the header and UTF-16
         // name, and both handles remain live for the call.
         let renamed = unsafe {
             (*information).Anonymous.ReplaceIfExists = false;
-            (*information).RootDirectory = std::ptr::null_mut();
+            (*information).RootDirectory = directory.as_raw_handle().cast();
             (*information).FileNameLength = name_bytes as u32;
             std::ptr::copy_nonoverlapping(
                 name.as_ptr(),
@@ -1969,7 +1974,7 @@ fn atomic_write_platform(
         }
     }
 
-    let publish_result = cancellation.publish(|| rename_open_file(&file, leaf));
+    let publish_result = cancellation.publish(|| rename_open_file(&directory, &file, leaf));
     if let Err(error) = publish_result {
         delete_open_file(&file);
         return Err(error);

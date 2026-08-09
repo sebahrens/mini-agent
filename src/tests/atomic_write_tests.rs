@@ -118,6 +118,26 @@ fn atomic_write_security_create_only_never_replaces_existing_target() {
     assert_eq!(temp_residue(dir.path()), 0);
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_atomic_create_publishes_only_in_the_approved_directory() {
+    let dir = TempDir::new("windows_directory_bound_create");
+    let leaf = format!(
+        ".zswrite-directory-bound-{}-{}.txt",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    );
+    let target = dir.join(&leaf);
+    let cwd_target = std::env::current_dir().unwrap().join(&leaf);
+    assert!(!cwd_target.exists());
+
+    atomic_create_sync(&target, b"directory-bound").unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"directory-bound");
+    assert!(!cwd_target.exists());
+    assert_eq!(temp_residue(dir.path()), 0);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn preserves_permissions_on_overwrite() {
