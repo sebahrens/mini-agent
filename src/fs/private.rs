@@ -32,6 +32,8 @@ const OPEN_CLOEXEC: std::os::raw::c_int = 0;
 
 #[cfg(unix)]
 fn stage_error(stage: &'static str, error: std::io::Error) -> std::io::Error {
+    #[cfg(test)]
+    eprintln!("PRIVATE_PERSISTENCE_FAILED={stage}");
     std::io::Error::new(
         error.kind(),
         format!("private persistence failed at {stage}: {error}"),
