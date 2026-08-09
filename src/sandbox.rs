@@ -2783,6 +2783,8 @@ mod sandbox_tests {
             .expect("parent-death probe implementation missing");
         assert!(parent_probe.contains("TARGET_PROBE_ARG"));
         assert!(parent_probe.contains("TARGET_PARENT_ARG"));
+        assert!(parent_probe.contains("build_helper_with_ready_and_roots("));
+        assert!(parent_probe.contains("std::slice::from_ref(&descendant_read)"));
         assert!(parent_probe.contains("wait_for_exact_probe_file(&tree_ready)?"));
         assert!(!parent_probe.contains("wait_for_probe_file(&tree_ready)?"));
 
@@ -2822,6 +2824,8 @@ mod sandbox_tests {
             .expect("Windows runtime probe implementation missing");
         assert!(runtime_probe.contains("configured_cleanup_ready"));
         assert!(runtime_probe.contains("build_helper_with_ready_and_roots("));
+        assert!(runtime_probe.contains("std::slice::from_ref(&authority_read)"));
+        assert!(source.contains("run_descendant_token_probe(&descendant_executable)"));
         assert!(runtime_probe.contains("probe_executable.clone()"));
         assert!(!runtime_probe.contains("resolve_program(\"pwsh.exe\""));
         assert!(!runtime_probe.contains("resolve_program(\"powershell.exe\""));

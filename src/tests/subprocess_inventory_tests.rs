@@ -1284,7 +1284,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        "let mut child = Command::new(",
+        "let mut child = Command::new(descendant_executable);",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
@@ -2947,7 +2947,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        "let mut child = Command::new(",
+        "let mut child = Command::new(descendant_executable);",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),

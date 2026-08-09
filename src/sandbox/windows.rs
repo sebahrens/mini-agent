@@ -1192,12 +1192,10 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             Ok(0)
         }
         value if value == OsStr::new(TARGET_PARENT_ARG) => {
+            let descendant_executable = target_probe_path(&mut args, "descendant executable")?;
             let tree_ready = target_probe_path(&mut args, "tree-ready path")?;
             let marker = target_probe_path(&mut args, "parent-death marker")?;
-            let mut child = Command::new(
-                std::env::current_exe()
-                    .map_err(|error| format!("locate target-probe executable: {error}"))?,
-            );
+            let mut child = Command::new(descendant_executable);
             child
                 .arg(TARGET_PROBE_ARG)
                 .arg(TARGET_DESCENDANT_ARG)
@@ -3277,11 +3275,12 @@ fn run_runtime_probe() -> Result<i32, String> {
     attest_cleanup_proof(&crash_proof, crash_cleanup_roots)?;
 
     let authority_escape = outside.join("authority-escape.txt");
-    let mut authority_probe = build_helper(
-        canonical_file(
-            &std::env::current_exe().map_err(|e| e.to_string())?,
-            "authority-probe executable",
-        )?,
+    let authority_read = base.join("authority-descendant-read");
+    let authority_descendant = authority_read.join("authority-descendant.exe");
+    std::fs::create_dir_all(&authority_read).map_err(|e| e.to_string())?;
+    std::fs::copy(&probe_executable, &authority_descendant).map_err(|e| e.to_string())?;
+    let mut authority_probe = build_helper_with_ready_and_roots(
+        probe_executable.clone(),
         vec![
             AUTHORITY_PROBE_ARG.into(),
             HELPER_PID_PLACEHOLDER.into(),
@@ -3289,9 +3288,13 @@ fn run_runtime_probe() -> Result<i32, String> {
             authority_escape.to_string_lossy().into_owned(),
             DESKTOP_NAME_PLACEHOLDER.into(),
             CONTROL_ROOT_PLACEHOLDER.into(),
+            authority_descendant.to_string_lossy().into_owned(),
         ],
         &workspace_b,
         &cache,
+        None,
+        std::slice::from_ref(&authority_read),
+        &[],
     )?;
     let authority_result = authority_probe
         .as_std_mut()
@@ -3537,17 +3540,24 @@ fn run_parent_probe(marker: Option<&Path>) -> Result<i32, String> {
         &std::env::current_exe().map_err(|error| error.to_string())?,
         "parent target-probe executable",
     )?;
-    let mut helper = build_helper_with_ready(
+    let descendant_read = base.join("parent-descendant-read");
+    let descendant_executable = descendant_read.join("parent-descendant.exe");
+    std::fs::create_dir_all(&descendant_read).map_err(|error| error.to_string())?;
+    std::fs::copy(&probe_executable, &descendant_executable).map_err(|error| error.to_string())?;
+    let mut helper = build_helper_with_ready_and_roots(
         probe_executable,
         vec![
             TARGET_PROBE_ARG.into(),
             TARGET_PARENT_ARG.into(),
+            descendant_executable.to_string_lossy().into_owned(),
             tree_ready.to_string_lossy().into_owned(),
             marker.to_string_lossy().into_owned(),
         ],
         &workspace,
         &cache,
         Some(ready_path.clone()),
+        std::slice::from_ref(&descendant_read),
+        &[],
     )?;
     let mut child = helper
         .as_std_mut()
@@ -3577,6 +3587,9 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
         return AUTHORITY_ARGUMENT_ERROR;
     };
     let Some(control_root) = args.next().map(PathBuf::from) else {
+        return AUTHORITY_ARGUMENT_ERROR;
+    };
+    let Some(descendant_executable) = args.next().map(PathBuf::from) else {
         return AUTHORITY_ARGUMENT_ERROR;
     };
     if args.next().is_some() || outside.exists() {
@@ -3615,7 +3628,7 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     {
         return 90;
     }
-    let descendant_status = run_descendant_token_probe();
+    let descendant_status = run_descendant_token_probe(&descendant_executable);
     if descendant_status != 0 {
         return descendant_status;
     }
@@ -3660,10 +3673,7 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     0
 }
 
-fn run_descendant_token_probe() -> i32 {
-    let Ok(executable) = std::env::current_exe() else {
-        return AUTHORITY_CURRENT_EXE_ERROR;
-    };
+fn run_descendant_token_probe(executable: &Path) -> i32 {
     // The child independently proves that ordinary tool descendants retain the zero-capability
     // AppContainer token. Lifetime containment is attested separately by the parent-death probe:
     // Windows can place an AppContainer process tree in a system-managed Job whose descendants do
