@@ -2529,11 +2529,10 @@ mod sandbox_tests {
             "job_name",
             "wait_for_stale_job_quiescence",
             "verify_descendant_rendezvous",
-            "JobObjectBasicProcessIdList",
-            "JobProcessIdListBuffer",
-            "wait_for_descendant_process",
+            "active_job_processes",
+            "wait_for_descendant_membership",
             "wait_for_exact_probe_file",
-            "IsProcessInJob(descendant.raw(), job.raw()",
+            "creation-time Job did not contain exactly its suspended target",
             "CREATE_BREAKAWAY_FROM_JOB",
             "JobObjectBasicAccountingInformation",
             "ActiveProcesses == 0",
@@ -2744,7 +2743,7 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn verify_job_limits(").next())
             .expect("descendant rendezvous implementation missing");
-        assert!(descendant_verification.contains("wait_for_descendant_process(job, target)?"));
+        assert!(descendant_verification.contains("wait_for_descendant_membership(job, target)?"));
         assert!(!descendant_verification.contains("wait_for_probe_file(ready)?"));
 
         let parent_probe = source

@@ -65,7 +65,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectBasicUIRestrictions,
+    JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
     JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
@@ -173,11 +173,9 @@ const HELPER_STAGE_SETUP: u8 = 2;
 const HELPER_STAGE_LAUNCH: u8 = 3;
 const HELPER_STAGE_VERIFY_JOB: u8 = 4;
 const HELPER_STAGE_VERIFY_DESCENDANT: u8 = 5;
-const HELPER_STAGE_DESCENDANT_JOB_QUERY: u8 = 6;
-const HELPER_STAGE_DESCENDANT_PROCESS_OPEN: u8 = 7;
-const HELPER_STAGE_DESCENDANT_JOB: u8 = 8;
-const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 9;
-const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 10;
+const HELPER_STAGE_DESCENDANT_ACCOUNTING: u8 = 6;
+const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 7;
+const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 8;
 const HELPER_STAGE_READY: u8 = 15;
 const HELPER_STAGE_WAIT: u8 = 16;
 const HELPER_STAGE_EXIT_CODE: u8 = 17;
@@ -2551,7 +2549,13 @@ fn verify_job_membership_and_limits(job: &Handle, child: &Handle) -> Result<(), 
         return Err("sandbox: restricted process escaped its exact creation-time Job".into());
     }
 
-    verify_job_limits(job)
+    verify_job_limits(job)?;
+    if active_job_processes(job)? != 1 {
+        return Err(
+            "sandbox: creation-time Job did not contain exactly its suspended target".into(),
+        );
+    }
+    Ok(())
 }
 
 fn verify_descendant_rendezvous(
@@ -2560,12 +2564,7 @@ fn verify_descendant_rendezvous(
     release: &Path,
 ) -> Result<(), String> {
     mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-    let descendant = wait_for_descendant_process(job, target)?;
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB);
-    let mut in_job = 0;
-    if unsafe { IsProcessInJob(descendant.raw(), job.raw(), &mut in_job) } == 0 || in_job == 0 {
-        return Err("sandbox: descendant escaped the exact launcher Job".into());
-    }
+    wait_for_descendant_membership(job, target)?;
     mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_LIMITS);
     verify_job_limits(job)?;
     mark_helper_stage(HELPER_STAGE_DESCENDANT_RELEASE);
@@ -2578,85 +2577,18 @@ fn verify_descendant_rendezvous(
     Ok(())
 }
 
-#[repr(C)]
-struct JobProcessIdListBuffer {
-    number_of_assigned_processes: u32,
-    number_of_process_ids_in_list: u32,
-    process_ids: [usize; MAX_JOB_PROCESSES as usize],
-}
-
-impl Default for JobProcessIdListBuffer {
-    fn default() -> Self {
-        Self {
-            number_of_assigned_processes: 0,
-            number_of_process_ids_in_list: 0,
-            process_ids: [0; MAX_JOB_PROCESSES as usize],
-        }
-    }
-}
-
-fn wait_for_descendant_process(job: &Handle, target: &Handle) -> Result<Handle, String> {
-    let target_pid = unsafe { GetProcessId(target.raw()) };
-    if target_pid == 0 {
-        return Err(last_error("query authority target process ID"));
-    }
+fn wait_for_descendant_membership(job: &Handle, target: &Handle) -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_QUERY);
-        let mut process_ids = JobProcessIdListBuffer::default();
-        if unsafe {
-            QueryInformationJobObject(
-                job.raw(),
-                JobObjectBasicProcessIdList,
-                (&mut process_ids as *mut JobProcessIdListBuffer).cast(),
-                size_of_val(&process_ids) as u32,
-                null_mut(),
-            )
-        } == 0
-        {
-            return Err(last_error("query exact Job process identity list"));
-        }
-        let assigned = process_ids.number_of_assigned_processes as usize;
-        let returned = process_ids.number_of_process_ids_in_list as usize;
-        if assigned > MAX_JOB_PROCESSES as usize
-            || returned > MAX_JOB_PROCESSES as usize
-            || assigned != returned
-        {
-            return Err("sandbox: exact Job process identity list exceeded its bound".into());
-        }
-        let ids = &process_ids.process_ids[..returned];
-        if ids
-            .iter()
-            .filter(|pid| **pid == target_pid as usize)
-            .count()
-            != 1
-        {
-            return Err("sandbox: authority target was absent from its exact Job snapshot".into());
-        }
-        let mut descendants = ids
-            .iter()
-            .copied()
-            .filter(|pid| *pid != target_pid as usize);
-        if let Some(pid) = descendants.next() {
-            if returned != 2 || descendants.next().is_some() || pid == 0 || pid > u32::MAX as usize
-            {
-                return Err("sandbox: exact Job descendant identity was ambiguous".into());
-            }
-            mark_helper_stage(HELPER_STAGE_DESCENDANT_PROCESS_OPEN);
-            let descendant = Handle::created(
-                unsafe {
-                    OpenProcess(
-                        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-                        0,
-                        pid as u32,
-                    )
-                },
-                "open exact Job descendant",
-            )?;
-            if unsafe { GetProcessId(descendant.raw()) } != pid as u32 {
-                return Err("sandbox: exact Job descendant identity changed while opening".into());
-            }
-            return Ok(descendant);
+        mark_helper_stage(HELPER_STAGE_DESCENDANT_ACCOUNTING);
+        match active_job_processes(job)? {
+            // The owner-only Job was proved to contain exactly the suspended target before it
+            // ran. The trusted probe creates exactly one child and waits for it, so this transition
+            // is direct kernel proof that the descendant joined the exact Job.
+            2 => return Ok(()),
+            0 => return Err("sandbox: exact Job lost its authority target".into()),
+            1 => {}
+            _ => return Err("sandbox: exact Job descendant count was ambiguous".into()),
         }
         if completed_process_exit_code(target)?.is_some() {
             return Err("sandbox: authority target exited before descendant Job proof".into());
@@ -2664,6 +2596,23 @@ fn wait_for_descendant_process(job: &Handle, target: &Handle) -> Result<Handle, 
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Err("timed out waiting for descendant Job proof".into())
+}
+
+fn active_job_processes(job: &Handle) -> Result<u32, String> {
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    if unsafe {
+        QueryInformationJobObject(
+            job.raw(),
+            JobObjectBasicAccountingInformation,
+            (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            size_of_val(&accounting) as u32,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error("query exact Job active process accounting"));
+    }
+    Ok(accounting.ActiveProcesses)
 }
 
 fn verify_job_limits(job: &Handle) -> Result<(), String> {
