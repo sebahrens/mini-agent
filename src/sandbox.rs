@@ -2622,8 +2622,8 @@ mod sandbox_tests {
         assert!(!source.contains("run_authority_probe(args).unwrap_or(97)"));
         assert!(!source.contains("run_descendant_probe(args).unwrap_or(98)"));
         assert!(!source.contains("TokenIsLessPrivilegedAppContainer"));
-        assert!(source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
-        assert!(source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
+        assert!(!source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
+        assert!(!source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
         assert!(
             source.contains("const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_ALL;")
         );

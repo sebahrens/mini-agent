@@ -295,11 +295,10 @@ only duplicated stdout/stderr plus a `NUL` stdin through an explicit handle list
 Job attribute closes the assignment race. `CreateProcessAsUserW` combines the caller's primary
 token with the AppContainer security-capabilities attribute and does not elevate or configure
 machine-wide firewall policy. General commands retain descendant authority inside the bounded Job;
-the unrestricted helper sets `PROCESS_CREATION_CHILD_PROCESS_OVERRIDE` on the initial token rather
-than a child-process-restricted flag. The regular AppContainer retains the standard Windows system
-resource access needed for process creation while receiving no explicit or network capabilities.
-Descendants inherit that regular AppContainer identity and the exact non-breakaway Job under the
-full Job UI restriction mask.
+the regular AppContainer retains the standard Windows system-resource access needed for process
+creation without a child-process override or restricted-child flag. Descendants inherit that
+regular AppContainer identity, the explicit no-breakaway process-tree policy, and the exact bounded
+Job under the full Job UI restriction mask.
 
 ## Acceptance criteria
 

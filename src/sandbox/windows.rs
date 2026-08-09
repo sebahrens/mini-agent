@@ -84,8 +84,7 @@ use windows_sys::Win32::System::Threading::{
     CreateMutexW, CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
     GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
     GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
-    OpenProcessToken, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
-    PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    OpenProcessToken, PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     ProcessChildProcessPolicy, ReleaseMutex, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
@@ -95,8 +94,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::process_creation::StdCommandCreationExt;
 use windows_sys::Win32::System::WindowsProgramming::{
-    DRIVE_REMOTE, PROCESS_CREATION_CHILD_PROCESS_OVERRIDE,
-    PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE,
+    DRIVE_REMOTE, PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE,
 };
 
 const HELPER_ARG: &str = "--mini-agent-windows-sandbox-helper-v1";
@@ -2747,13 +2745,13 @@ fn launch_appcontainer(
     let handles = [stdin.raw(), stdout.raw(), stderr.raw()];
     let jobs = [job.raw()];
     let mut bytes = 0usize;
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 5, 0, &mut bytes) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 4, 0, &mut bytes) };
     if bytes == 0 {
         return Err(last_error("size restricted process attribute list"));
     }
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let list = storage.as_mut_ptr().cast();
-    if unsafe { InitializeProcThreadAttributeList(list, 5, 0, &mut bytes) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, 4, 0, &mut bytes) } == 0 {
         return Err(last_error("initialize restricted process attribute list"));
     }
     struct DeleteList(windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -2812,26 +2810,6 @@ fn launch_appcontainer(
     } == 0
     {
         return Err(last_error("set AppContainer security capabilities"));
-    }
-    // General tools are expected to create descendants. Make that authority explicit on the
-    // initial token: otherwise Windows may preserve an effective restricted-child policy and
-    // reject ordinary CreateProcess calls with ERROR_ACCESS_DENIED. The override is set by this
-    // unrestricted helper; descendants still inherit the regular AppContainer identity and the
-    // non-breakaway Job.
-    let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_OVERRIDE;
-    if unsafe {
-        UpdateProcThreadAttribute(
-            list,
-            0,
-            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
-            (&child_process_policy as *const u32).cast_mut().cast(),
-            size_of::<u32>(),
-            null_mut(),
-            null_mut(),
-        )
-    } == 0
-    {
-        return Err(last_error("set general AppContainer child-process policy"));
     }
     let desktop_app_policy = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
     if unsafe {
