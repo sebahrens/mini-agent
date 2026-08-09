@@ -65,6 +65,123 @@ struct MacOsAttrList {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MacOsRealFileIdentity {
+    filesystem: [i32; 2],
+    object_type: u32,
+    file_id: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_real_file_identity_attributes() -> MacOsAttrList {
+    const ATTRIBUTE_BITMAP_COUNT: u16 = 5;
+    MacOsAttrList {
+        bitmap_count: ATTRIBUTE_BITMAP_COUNT,
+        reserved: 0,
+        common_attributes: libc::ATTR_CMN_FSID | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_FILEID,
+        volume_attributes: 0,
+        directory_attributes: 0,
+        file_attributes: 0,
+        fork_attributes: 0,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_real_file_identity(buffer: &[u8]) -> std::io::Result<MacOsRealFileIdentity> {
+    const LENGTH_SIZE: usize = size_of::<u32>();
+    const FSID_SIZE: usize = size_of::<libc::fsid_t>();
+    const OBJECT_TYPE_SIZE: usize = size_of::<u32>();
+    const FILE_ID_SIZE: usize = size_of::<u64>();
+    const EXPECTED_SIZE: usize = LENGTH_SIZE + FSID_SIZE + OBJECT_TYPE_SIZE + FILE_ID_SIZE;
+    if FSID_SIZE != size_of::<[i32; 2]>()
+        || buffer.len() != EXPECTED_SIZE
+        || u32::from_ne_bytes(buffer[..LENGTH_SIZE].try_into().unwrap()) as usize != EXPECTED_SIZE
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS returned an invalid real file-identity attribute size",
+        ));
+    }
+    let fsid_end = LENGTH_SIZE + FSID_SIZE;
+    let object_type_end = fsid_end + OBJECT_TYPE_SIZE;
+    let filesystem = [
+        i32::from_ne_bytes(buffer[LENGTH_SIZE..LENGTH_SIZE + 4].try_into().unwrap()),
+        i32::from_ne_bytes(buffer[LENGTH_SIZE + 4..fsid_end].try_into().unwrap()),
+    ];
+    let object_type = u32::from_ne_bytes(buffer[fsid_end..object_type_end].try_into().unwrap());
+    let file_id = u64::from_ne_bytes(buffer[object_type_end..].try_into().unwrap());
+    if filesystem == [0; 2] || file_id == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the filesystem does not expose a stable real file identity",
+        ));
+    }
+    Ok(MacOsRealFileIdentity {
+        filesystem,
+        object_type,
+        file_id,
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_real_file_identity<T>(file: &T) -> std::io::Result<MacOsRealFileIdentity>
+where
+    T: std::os::fd::AsRawFd,
+{
+    const BUFFER_SIZE: usize =
+        size_of::<u32>() + size_of::<libc::fsid_t>() + size_of::<u32>() + size_of::<u64>();
+    let mut attributes = macos_real_file_identity_attributes();
+    let mut buffer = [0u8; BUFFER_SIZE];
+    // SAFETY: `file` owns a live descriptor and both buffers remain valid for
+    // the synchronous call. RETURN_REALDEV removes volume-group/firmlink aliases.
+    if unsafe {
+        libc::fgetattrlist(
+            file.as_raw_fd(),
+            (&mut attributes as *mut MacOsAttrList).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::FSOPT_RETURN_REALDEV,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    parse_macos_real_file_identity(&buffer)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_real_file_identity_at<T>(
+    directory: &T,
+    name: &std::ffi::CStr,
+) -> std::io::Result<MacOsRealFileIdentity>
+where
+    T: std::os::fd::AsRawFd,
+{
+    const BUFFER_SIZE: usize =
+        size_of::<u32>() + size_of::<libc::fsid_t>() + size_of::<u32>() + size_of::<u64>();
+    let mut attributes = macos_real_file_identity_attributes();
+    let mut buffer = [0u8; BUFFER_SIZE];
+    // SAFETY: the retained directory descriptor and C string remain live and
+    // both buffers have the exact fixed layout requested for this call.
+    if unsafe {
+        libc::getattrlistat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            (&mut attributes as *mut MacOsAttrList).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            (libc::FSOPT_NOFOLLOW | libc::FSOPT_RETURN_REALDEV).into(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    parse_macos_real_file_identity(&buffer)
+}
+
+#[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn macos_common_attribute<T, const N: usize>(
     file: &T,
@@ -213,33 +330,6 @@ where
     })
 }
 
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn macos_live_filesystem_id<T>(file: &T) -> std::io::Result<[i32; 2]>
-where
-    T: std::os::fd::AsRawFd,
-{
-    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: the descriptor remains live and `filesystem` points to writable
-    // storage of the exact structure expected by fstatfs.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: successful fstatfs initialized the complete structure. Darwin's
-    // fsid_t is exactly two i32 values, but libc intentionally keeps its field
-    // private, so transmute is the only way to copy the opaque value without
-    // querying the protected volume root.
-    let filesystem = unsafe { filesystem.assume_init() };
-    let identity = unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(filesystem.f_fsid) };
-    if identity == [0; 2] {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "the filesystem does not expose a stable live identity",
-        ));
-    }
-    Ok(identity)
-}
-
 #[cfg(windows)]
 fn validated_windows_file_identity(
     volume_serial_number: u64,
@@ -360,11 +450,11 @@ fn checked_owned_file(
     };
     #[cfg(target_os = "macos")]
     let identity = {
-        use std::os::unix::fs::MetadataExt;
+        let identity = macos_real_file_identity(&file)?;
 
         FileIdentity::MacOs {
-            filesystem: macos_live_filesystem_id(&file)?,
-            inode: metadata.ino(),
+            filesystem: identity.filesystem,
+            inode: identity.file_id,
         }
     };
     #[cfg(windows)]
@@ -1327,30 +1417,17 @@ fn atomic_write_platform(
         name: &CString,
         identity: &CheckedMetadata,
     ) -> std::io::Result<bool> {
-        use std::os::unix::fs::MetadataExt;
-
-        let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        // APFS can expose different device and filesystem-ID views for this
-        // descriptor-relative lookup, while opening the private entry again may
-        // be denied. `fstatat` with NOFOLLOW still observes its type and inode.
-        // The random temp was created in this retained directory, so it cannot
-        // cross a mount, and the retained original handle prevents inode reuse.
-        // SAFETY: `directory` and `name` remain live for the call, and `entry`
-        // points to writable storage of the exact stat structure.
-        if unsafe {
-            libc::fstatat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                entry.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: successful fstatat initialized the complete structure.
-        let entry = unsafe { entry.assume_init() };
-        Ok(entry.st_mode & libc::S_IFMT == libc::S_IFREG && entry.st_ino == identity.ino())
+        const VREG: u32 = 1;
+        // Request the physical filesystem and 64-bit file ID without reopening
+        // the private entry. This removes APFS firmlink/volume-group aliases;
+        // the retained original handle prevents the identity from being reused.
+        let entry = macos_real_file_identity_at(directory, name)?;
+        Ok(entry.object_type == VREG
+            && identity.identity
+                == FileIdentity::MacOs {
+                    filesystem: entry.filesystem,
+                    inode: entry.file_id,
+                })
     }
 
     fn rename_entry(
@@ -2225,6 +2302,29 @@ mod tests {
 
         ensure_same_file(&path, &path_metadata, &file_metadata)
             .expect("path and open handle must identify the same file");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_real_identity_parser_validates_fixed_attribute_layout() {
+        let mut buffer = vec![0u8; 24];
+        buffer[..4].copy_from_slice(&24u32.to_ne_bytes());
+        buffer[4..8].copy_from_slice(&11i32.to_ne_bytes());
+        buffer[8..12].copy_from_slice(&22i32.to_ne_bytes());
+        buffer[12..16].copy_from_slice(&1u32.to_ne_bytes());
+        buffer[16..24].copy_from_slice(&33u64.to_ne_bytes());
+
+        assert_eq!(
+            parse_macos_real_file_identity(&buffer).unwrap(),
+            MacOsRealFileIdentity {
+                filesystem: [11, 22],
+                object_type: 1,
+                file_id: 33,
+            }
+        );
+        buffer[..4].copy_from_slice(&23u32.to_ne_bytes());
+        assert!(parse_macos_real_file_identity(&buffer).is_err());
+        assert!(parse_macos_real_file_identity(&buffer[..20]).is_err());
     }
 
     #[cfg(target_os = "macos")]
