@@ -16,6 +16,7 @@ pub(crate) use private::{
 };
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 pub(crate) unsafe fn linux_renameat2(
     old_directory: libc::c_int,
     old_path: *const libc::c_char,
@@ -1304,7 +1305,7 @@ fn atomic_write_platform(
             // `RENAME_NOREPLACE` makes create-only publication atomic with the
             // non-existence check instead of relying on a racy final `stat`.
             unsafe {
-                super::linux_renameat2(
+                linux_renameat2(
                     directory.as_raw_fd(),
                     old_name.as_ptr(),
                     directory.as_raw_fd(),
