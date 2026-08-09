@@ -173,8 +173,11 @@ const HELPER_STAGE_SETUP: u8 = 2;
 const HELPER_STAGE_LAUNCH: u8 = 3;
 const HELPER_STAGE_VERIFY_JOB: u8 = 4;
 const HELPER_STAGE_VERIFY_DESCENDANT: u8 = 5;
+const HELPER_STAGE_DESCENDANT_HANDLE_DUPLICATE: u8 = 6;
 const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 7;
 const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 8;
+const HELPER_STAGE_DESCENDANT_JOB_QUERY: u8 = 9;
+const HELPER_STAGE_DESCENDANT_JOB_RESULT: u8 = 10;
 const HELPER_STAGE_READY: u8 = 15;
 const HELPER_STAGE_WAIT: u8 = 16;
 const HELPER_STAGE_EXIT_CODE: u8 = 17;
@@ -2580,6 +2583,7 @@ fn verify_descendant_membership(
 ) -> Result<(), String> {
     mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
     let descendant_handle = read_descendant_handle_proof(target, proof_reader)?;
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_HANDLE_DUPLICATE);
     let mut duplicate = null_mut();
     if unsafe {
         DuplicateHandle(
@@ -2598,10 +2602,12 @@ fn verify_descendant_membership(
         ));
     }
     let descendant = Handle::created(duplicate, "own attested AppContainer descendant")?;
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_QUERY);
     let mut in_job = 0;
     if unsafe { IsProcessInJob(descendant.raw(), job.raw(), &mut in_job) } == 0 {
         return Err(last_error("query exact descendant Job membership"));
     }
+    mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_RESULT);
     if in_job == 0 {
         return Err("sandbox: AppContainer descendant escaped its exact bounded Job".into());
     }
