@@ -2523,6 +2523,10 @@ fn bounded_job() -> Result<(Handle, String), String> {
     {
         return Err(last_error("configure bounded sandbox Job"));
     }
+    Ok((job, name))
+}
+
+fn configure_job_ui_restrictions(job: &Handle) -> Result<(), String> {
     let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
         UIRestrictionsClass: GENERAL_JOB_UI_RESTRICTIONS,
     };
@@ -2537,7 +2541,7 @@ fn bounded_job() -> Result<(Handle, String), String> {
     {
         return Err(last_error("configure sandbox Job UI restrictions"));
     }
-    Ok((job, name))
+    Ok(())
 }
 
 fn verify_job_membership_and_limits(job: &Handle, child: &Handle) -> Result<(), String> {
@@ -2867,6 +2871,14 @@ fn launch_appcontainer(
     let process = Handle::created(information.hProcess, "own AppContainer process")?;
     let thread = Handle::created(information.hThread, "own suspended AppContainer thread")?;
     mark_helper_stage(HELPER_STAGE_SUSPENDED_JOB);
+    // A Job hierarchy can only be formed while neither Job has UI limits. The helper itself can
+    // already be in a runner/service Job, so assign this suspended target first and lock down its
+    // now-established child Job before any target code can execute.
+    if let Err(error) = configure_job_ui_restrictions(job) {
+        unsafe { TerminateProcess(process.raw(), 126) };
+        let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+        return Err(error);
+    }
     if let Err(error) = verify_job_membership_and_limits(job, &process) {
         unsafe { TerminateProcess(process.raw(), 126) };
         let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };

@@ -2534,6 +2534,7 @@ mod sandbox_tests {
             "wait_for_exact_probe_file",
             "creation-time Job did not contain exactly its suspended target",
             "CREATE_BREAKAWAY_FROM_JOB",
+            "configure_job_ui_restrictions(job)",
             "JobObjectBasicAccountingInformation",
             "ActiveProcesses == 0",
             "reject_remote_access_path",
