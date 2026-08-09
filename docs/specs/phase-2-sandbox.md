@@ -297,8 +297,8 @@ token with the AppContainer security-capabilities attribute and does not elevate
 machine-wide firewall policy. General commands retain descendant authority inside the bounded Job;
 the regular AppContainer retains the standard Windows system-resource access needed for process
 creation without a child-process override or restricted-child flag. Descendants inherit that
-regular AppContainer identity, the explicit no-breakaway process-tree policy, and the exact bounded
-Job under the full Job UI restriction mask.
+regular AppContainer identity and the exact non-breakaway bounded Job under the full Job UI
+restriction mask.
 
 ## Acceptance criteria
 
