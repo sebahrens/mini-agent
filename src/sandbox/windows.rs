@@ -60,6 +60,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -70,7 +71,7 @@ use windows_sys::Win32::System::JobObjects::{
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
-use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, CreateDesktopW, GetProcessWindowStation, GetThreadDesktop,
     GetUserObjectInformationW, HDESK, HWINSTA, UOI_NAME,
@@ -1366,11 +1367,10 @@ fn run_helper() -> Result<i32, String> {
         }
     };
     mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
-    if let Some((release, mut proof_reader, proof_writer)) = descendant_attestation {
+    if let Some((release, proof_reader, proof_writer)) = descendant_attestation {
         drop(proof_writer);
         mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-        if let Err(error) = verify_descendant_membership(&job, &child, &mut proof_reader, &release)
-        {
+        if let Err(error) = verify_descendant_membership(&job, &child, proof_reader, &release) {
             let target_exit = completed_process_exit_code(&child)?;
             terminate_and_drain_job(&job, 126)?;
             grants.mark_job_quiescent();
@@ -2572,11 +2572,11 @@ fn verify_job_membership_and_limits(job: &Handle, child: &Handle) -> Result<(), 
 fn verify_descendant_membership(
     job: &Handle,
     target: &Handle,
-    proof_reader: &mut File,
+    proof_reader: File,
     release: &Path,
 ) -> Result<(), String> {
     mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-    let descendant_handle = read_descendant_handle_proof(target, proof_reader)?;
+    let descendant_handle = read_descendant_handle_proof(proof_reader)?;
     mark_helper_stage(HELPER_STAGE_DESCENDANT_HANDLE_DUPLICATE);
     let mut duplicate = null_mut();
     if unsafe {
@@ -2617,55 +2617,38 @@ fn verify_descendant_membership(
     Ok(())
 }
 
-fn read_descendant_handle_proof(target: &Handle, reader: &mut File) -> Result<HANDLE, String> {
-    let proof_bytes = size_of::<u64>() + size_of::<usize>();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let mut available = 0u32;
-        if unsafe {
-            PeekNamedPipe(
-                reader.as_raw_handle(),
-                null_mut(),
-                0,
-                null_mut(),
-                &mut available,
-                null_mut(),
-            )
-        } == 0
-        {
-            let pipe_error = last_error("inspect descendant-handle proof pipe");
-            // A target-side spawn or proof-write failure closes the last writer just before
-            // Windows necessarily publishes the target's exit code. Give that publication a
-            // bounded grace period so the caller can preserve the specific closed target code
-            // instead of replacing it with the helper's generic proof-read stage.
-            let exit_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-            loop {
-                if completed_process_exit_code(target)?.is_some() {
-                    return Err(pipe_error);
-                }
-                if std::time::Instant::now() >= exit_deadline {
-                    return Err(pipe_error);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+fn read_descendant_handle_proof(mut reader: File) -> Result<HANDLE, String> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let read = std::thread::Builder::new()
+        .name("windows-descendant-proof".into())
+        .spawn(move || {
+            let mut magic = [0u8; size_of::<u64>()];
+            let mut handle = [0u8; size_of::<usize>()];
+            let result = reader
+                .read_exact(&mut magic)
+                .and_then(|()| reader.read_exact(&mut handle))
+                .map(|()| (magic, handle));
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("start descendant-handle proof reader: {error}"))?;
+    let (magic, handle) = match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(proof)) => proof,
+        Ok(Err(error)) => return Err(format!("read descendant-handle proof: {error}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Cancel the one pending fixed-size read before the caller terminates and drains the
+            // exact Job. A racing completed read needs no cancellation and its thread exits on
+            // its own; a successfully cancelled read is joined here.
+            if unsafe { CancelSynchronousIo(read.as_raw_handle()) } != 0 {
+                let _ = read.join();
             }
-        }
-        if usize::try_from(available).unwrap_or(usize::MAX) >= proof_bytes {
-            break;
-        }
-        if completed_process_exit_code(target)?.is_some() {
-            return Err("sandbox: authority target exited before descendant-handle proof".into());
-        }
-        if std::time::Instant::now() >= deadline {
             return Err("timed out waiting for descendant-handle proof".into());
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let mut magic = [0u8; size_of::<u64>()];
-    let mut handle = [0u8; size_of::<usize>()];
-    reader
-        .read_exact(&mut magic)
-        .and_then(|()| reader.read_exact(&mut handle))
-        .map_err(|error| format!("read descendant-handle proof: {error}"))?;
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("sandbox: descendant-handle proof reader disconnected".into());
+        }
+    };
+    read.join()
+        .map_err(|_| "sandbox: descendant-handle proof reader panicked".to_string())?;
     if u64::from_le_bytes(magic) != DESCENDANT_PROOF_MAGIC {
         return Err("sandbox: invalid descendant-handle proof marker".into());
     }
