@@ -3071,16 +3071,22 @@ fn create_sealed_executable_snapshot(
     source: &mut std::fs::File,
     control: &ExecutablePreparationControl,
 ) -> Result<(std::fs::File, crate::extras::js::broker::ExecutableContent), EffectServiceError> {
+    create_sealed_executable_snapshot_named(source, control, c"mini-agent-spawn")
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn create_sealed_executable_snapshot_named(
+    source: &mut std::fs::File,
+    control: &ExecutablePreparationControl,
+    name: &std::ffi::CStr,
+) -> Result<(std::fs::File, crate::extras::js::broker::ExecutableContent), EffectServiceError> {
     use std::os::fd::FromRawFd;
 
-    // SAFETY: `memfd_create` receives a static NUL-terminated name. On success this function
+    // SAFETY: `memfd_create` receives a live NUL-terminated name. On success this function
     // immediately assumes ownership of the returned descriptor through `File`.
-    let raw_fd = unsafe {
-        libc::memfd_create(
-            c"mini-agent-spawn".as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
+    let raw_fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if raw_fd < 0 {
         return Err(EffectServiceError::BackendFailure);
     }
@@ -5532,13 +5538,13 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn open_spawn_snapshot_count() -> usize {
+    fn open_spawn_snapshot_count(name: &str) -> usize {
         std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
                 std::fs::read_link(entry.path())
-                    .map(|target| target.to_string_lossy().contains("memfd:mini-agent-spawn"))
+                    .map(|target| target.to_string_lossy().contains(name))
                     .unwrap_or(false)
             })
             .count()
@@ -5556,12 +5562,17 @@ mod tests {
         let mut source = std::fs::File::open(&executable).unwrap();
         let control =
             ExecutablePreparationControl::new_for_test(Instant::now() + Duration::from_secs(30));
-        let before = open_spawn_snapshot_count();
+        let name = "memfd:mini-agent-spawn-oversized-test";
+        let before = open_spawn_snapshot_count(name);
         assert!(matches!(
-            create_sealed_executable_snapshot(&mut source, &control),
+            create_sealed_executable_snapshot_named(
+                &mut source,
+                &control,
+                c"mini-agent-spawn-oversized-test"
+            ),
             Err(EffectServiceError::InvalidTarget)
         ));
-        let after = open_spawn_snapshot_count();
+        let after = open_spawn_snapshot_count(name);
         assert_eq!(after, before, "failed snapshot capture leaked a descriptor");
     }
 

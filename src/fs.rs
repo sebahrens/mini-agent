@@ -213,6 +213,33 @@ where
     })
 }
 
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_live_filesystem_id<T>(file: &T) -> std::io::Result<[i32; 2]>
+where
+    T: std::os::fd::AsRawFd,
+{
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: the descriptor remains live and `filesystem` points to writable
+    // storage of the exact structure expected by fstatfs.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful fstatfs initialized the complete structure. Darwin's
+    // fsid_t is exactly two i32 values, but libc intentionally keeps its field
+    // private, so transmute is the only way to copy the opaque value without
+    // querying the protected volume root.
+    let filesystem = unsafe { filesystem.assume_init() };
+    let identity = unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(filesystem.f_fsid) };
+    if identity == [0; 2] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the filesystem does not expose a stable live identity",
+        ));
+    }
+    Ok(identity)
+}
+
 #[cfg(windows)]
 fn validated_windows_file_identity(
     volume_serial_number: u64,
@@ -289,8 +316,10 @@ where
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileIdentity {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     Unix { device: u64, inode: u64 },
+    #[cfg(target_os = "macos")]
+    MacOs { filesystem: [i32; 2], inode: u64 },
     #[cfg(windows)]
     Windows {
         volume_serial_number: u64,
@@ -320,12 +349,21 @@ fn checked_owned_file(
     file: std::fs::File,
     metadata: std::fs::Metadata,
 ) -> std::io::Result<CheckedMetadata> {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     let identity = {
         use std::os::unix::fs::MetadataExt;
 
         FileIdentity::Unix {
             device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+
+        FileIdentity::MacOs {
+            filesystem: macos_live_filesystem_id(&file)?,
             inode: metadata.ino(),
         }
     };
@@ -2124,6 +2162,27 @@ mod tests {
 
         ensure_same_file(&path, &path_metadata, &file_metadata)
             .expect("path and open handle must identify the same file");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_checked_identity_accepts_the_data_volume_alias() {
+        let directory = TestDirectory::new("data_volume_alias");
+        let path = directory.path().join("checked.txt");
+        std::fs::write(&path, b"identity").expect("write checked file");
+        let relative = path
+            .strip_prefix("/")
+            .expect("temporary directory must be absolute");
+        let data_volume_path = Path::new("/System/Volumes/Data").join(relative);
+        if !data_volume_path.exists() {
+            return;
+        }
+
+        let lexical = checked_path_metadata(&path).expect("capture lexical identity");
+        let data_volume =
+            checked_path_metadata(&data_volume_path).expect("capture data-volume identity");
+        ensure_same_file(&path, &lexical, &data_volume)
+            .expect("firmlink aliases must preserve live filesystem and inode identity");
     }
 
     #[cfg(unix)]
