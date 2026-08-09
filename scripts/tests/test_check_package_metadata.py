@@ -372,6 +372,27 @@ class CleanTrackedWorktreeValidationTests(unittest.TestCase):
 
 
 class RepositoryCoordinateValidationTests(unittest.TestCase):
+    def test_default_scan_ignores_untracked_local_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+            tracked = root / "install.sh"
+            tracked.write_text(
+                "https://github.com/sebahrens/mini-agent/releases/latest",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "install.sh"], cwd=root, check=True)
+            local_plan = root / "docs/plans/historical.md"
+            local_plan.parent.mkdir(parents=True)
+            local_plan.write_text(
+                "https://github.com/" + "gi-" + "dellav/zerostack",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [], CHECK_PACKAGE_METADATA.validate_stale_coordinates(root)
+            )
+
     def test_stale_active_coordinate_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -387,6 +408,16 @@ class RepositoryCoordinateValidationTests(unittest.TestCase):
 
             self.assertEqual(1, len(errors))
             self.assertIn("stale active coordinate", errors[0])
+
+    def test_checked_in_release_fragments_are_assigned_to_their_owners(self) -> None:
+        repository = SCRIPT.parents[1]
+
+        self.assertEqual(
+            [],
+            CHECK_PACKAGE_METADATA.validate_file_fragments(
+                repository, "mini-agent"
+            ),
+        )
 
 
 class ReleaseChecksumUpdateTests(unittest.TestCase):

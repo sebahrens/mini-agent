@@ -512,6 +512,10 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         "justfile": (
             "bash scripts/update-release-checksums.sh all",
             "bash scripts/smoke-canonical-installer.sh",
+            '--release-tag "v${VERSION}"',
+            '--release-tag "v${NEW_VERSION}"',
+            "--require-clean",
+            "cargo metadata --format-version 1 --no-deps >/dev/null",
         ),
         "scripts/update-release-checksums.sh": (
             CANONICAL_REPOSITORY_URL,
@@ -520,10 +524,6 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"{binary}-aarch64-apple-darwin.tar.gz",
             f"{binary}-x86_64-unknown-linux-musl.tar.gz",
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
-            '--release-tag "v${VERSION}"',
-            '--release-tag "v${NEW_VERSION}"',
-            "--require-clean",
-            "cargo metadata --format-version 1 --no-deps >/dev/null",
         ),
         "README.md": (
             f"The Cargo package, installed CLI, and every release archive use the executable name\n`{binary}`.",
@@ -608,16 +608,6 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
     return errors
 
 
-def tracked_files(root: Path) -> list[str]:
-    result = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    )
-    return [entry.decode("utf-8") for entry in result.stdout.split(b"\0") if entry]
-
-
 def indexed_files(root: Path) -> list[str]:
     """Return only files in Git's release index, excluding developer-local files."""
     result = subprocess.run(
@@ -633,7 +623,7 @@ def validate_stale_coordinates(
     root: Path, relative_paths: list[str] | None = None
 ) -> list[str]:
     """Reject old active repository coordinates outside historical specs."""
-    paths = tracked_files(root) if relative_paths is None else relative_paths
+    paths = indexed_files(root) if relative_paths is None else relative_paths
     errors: list[str] = []
     for relative_path in paths:
         if relative_path.startswith(HISTORICAL_COORDINATE_ALLOWLIST):
