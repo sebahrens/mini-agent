@@ -407,8 +407,11 @@ struct AuditLock {
 
 impl AuditLock {
     fn acquire(path: &Path) -> Result<Self, AuditError> {
-        let file = open_private_rw(path, true, false).map_err(|_| AuditError::PathUnavailable)?;
-        try_lock_exclusive(&file)?;
+        let file = open_private_rw(path, true, false).map_err(|error| {
+            report_open_io_stage("lock_file_open", &error);
+            AuditError::PathUnavailable
+        })?;
+        try_lock_exclusive(&file).map_err(|error| report_open_stage("lock_file_flock", error))?;
         Ok(Self { file })
     }
 }
@@ -893,6 +896,16 @@ fn report_open_stage(stage: &'static str, error: AuditError) -> AuditError {
     #[cfg(not(test))]
     let _ = stage;
     error
+}
+
+fn report_open_io_stage(stage: &'static str, error: &std::io::Error) {
+    #[cfg(test)]
+    eprintln!(
+        "EFFECT_AUDIT_OPEN_IO_FAILED={stage}:errno_{}",
+        error.raw_os_error().unwrap_or(-1)
+    );
+    #[cfg(not(test))]
+    let _ = (stage, error);
 }
 
 fn body_from_record(
@@ -1415,6 +1428,7 @@ fn try_lock_exclusive(file: &File) -> Result<(), AuditError> {
         if error.kind() == std::io::ErrorKind::Interrupted {
             continue;
         }
+        report_open_io_stage("flock", &error);
         return if error.kind() == std::io::ErrorKind::WouldBlock {
             Err(AuditError::WriterLocked)
         } else {

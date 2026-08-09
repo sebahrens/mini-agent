@@ -925,18 +925,11 @@ fn observe_macos_guardian_group(
     }
 
     let group = libc::pid_t::try_from(guardian_pid)?;
-    let required = unsafe { proc_listpgrppids(group, std::ptr::null_mut(), 0) };
-    if required <= 0 {
-        return Err(if required == 0 {
-            "authenticated macOS guardian process group is empty".into()
-        } else {
-            io::Error::last_os_error().into()
-        });
-    }
-    if required as usize > MAX_CONTAINMENT_TREE_PROCESSES {
-        return Err("macOS guardian process group exceeded the benchmark observation bound".into());
-    }
-    let mut pids = vec![0; required as usize + 8];
+    // libproc's null-buffer sizing result is an allocation hint rather than a
+    // trustworthy live-member count on every supported macOS release. Use a
+    // fixed one-over-limit buffer so observation stays bounded and detects a
+    // saturated result as ambiguous instead of allocating from the hint.
+    let mut pids = vec![0; MAX_CONTAINMENT_TREE_PROCESSES + 1];
     let bytes = pids
         .len()
         .checked_mul(std::mem::size_of::<libc::pid_t>())
@@ -945,6 +938,9 @@ fn observe_macos_guardian_group(
     let read = unsafe { proc_listpgrppids(group, pids.as_mut_ptr().cast(), bytes) };
     if read < 0 {
         return Err(io::Error::last_os_error().into());
+    }
+    if read == 0 {
+        return Err("authenticated macOS guardian process group is empty".into());
     }
     if read as usize > MAX_CONTAINMENT_TREE_PROCESSES {
         return Err("macOS guardian process group changed beyond the observation bound".into());
