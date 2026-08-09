@@ -2714,6 +2714,8 @@ mod sandbox_tests {
             create_suspended < assign_job && assign_job < configure_ui && configure_ui < resume
         );
         assert!(!appcontainer_launch.contains("PROC_THREAD_ATTRIBUTE_JOB_LIST"));
+        assert!(appcontainer_launch.contains("let stdout_handle = proof_stdout.unwrap_or_else"));
+        assert!(appcontainer_launch.contains("startup.StartupInfo.hStdOutput = stdout_handle"));
 
         let profile_creation = source
             .split("fn create_appcontainer_profile(")

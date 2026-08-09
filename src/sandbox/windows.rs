@@ -141,7 +141,6 @@ const HELPER_PID_PLACEHOLDER: &str = "helper-pid";
 const DESKTOP_NAME_PLACEHOLDER: &str = "desktop-name";
 const OMITTED_HANDLE_PLACEHOLDER: &str = "omitted-handle";
 const DESCENDANT_RELEASE_PLACEHOLDER: &str = "descendant-release";
-const DESCENDANT_PROOF_HANDLE_PLACEHOLDER: &str = "descendant-proof-handle";
 const CONTROL_ROOT_PLACEHOLDER: &str = "control-root";
 const REQUEST_VERSION: u32 = 1;
 // This stays below the requested anonymous-pipe buffer, so request creation cannot block before
@@ -1340,11 +1339,6 @@ fn run_helper() -> Result<i32, String> {
             .ok_or("invalid descendant-release placeholder")?;
         *descendant_release = release.to_string_lossy().into_owned();
         let (proof_reader, proof_writer) = descendant_proof_pipe()?;
-        let descendant_proof_handle = arguments
-            .get_mut(8)
-            .filter(|value| value.as_str() == DESCENDANT_PROOF_HANDLE_PLACEHOLDER)
-            .ok_or("invalid descendant-proof handle placeholder")?;
-        *descendant_proof_handle = (proof_writer.raw() as usize).to_string();
         descendant_attestation = Some((release, proof_reader, proof_writer));
     }
     grants.disarm_for_launch();
@@ -2802,17 +2796,15 @@ fn launch_appcontainer(
     cwd: &Path,
     cache: &Path,
     private_storage: &Path,
-    additional_inherited_handle: Option<HANDLE>,
+    proof_stdout: Option<HANDLE>,
 ) -> Result<Handle, String> {
     let _creation = crate::process_creation::creation_guard()
         .map_err(|error| format!("lock Windows process creation: {error}"))?;
     let stdout = inheritable_duplicate(std::io::stdout().as_raw_handle())?;
     let stderr = inheritable_duplicate(std::io::stderr().as_raw_handle())?;
     let stdin = inheritable_null_input()?;
-    let mut handles = vec![stdin.raw(), stdout.raw(), stderr.raw()];
-    if let Some(handle) = additional_inherited_handle {
-        handles.push(handle);
-    }
+    let stdout_handle = proof_stdout.unwrap_or_else(|| stdout.raw());
+    let handles = [stdin.raw(), stdout_handle, stderr.raw()];
     let mut bytes = 0usize;
     unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes) };
     if bytes == 0 {
@@ -2836,7 +2828,7 @@ fn launch_appcontainer(
             0,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
             handles.as_ptr().cast_mut().cast(),
-            handles.len() * size_of::<HANDLE>(),
+            size_of_val(&handles),
             null_mut(),
             null_mut(),
         )
@@ -2870,7 +2862,7 @@ fn launch_appcontainer(
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = stdin.raw();
-    startup.StartupInfo.hStdOutput = stdout.raw();
+    startup.StartupInfo.hStdOutput = stdout_handle;
     startup.StartupInfo.hStdError = stderr.raw();
     startup.StartupInfo.lpDesktop = desktop.startup_name.as_ptr().cast_mut();
     startup.lpAttributeList = list;
@@ -3434,7 +3426,6 @@ fn run_runtime_probe() -> Result<i32, String> {
             OMITTED_HANDLE_PLACEHOLDER.into(),
             CONTROL_ROOT_PLACEHOLDER.into(),
             DESCENDANT_RELEASE_PLACEHOLDER.into(),
-            DESCENDANT_PROOF_HANDLE_PLACEHOLDER.into(),
         ],
         &workspace_b,
         &cache,
@@ -3736,14 +3727,6 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     let Some(descendant_release) = args.next().map(PathBuf::from) else {
         return AUTHORITY_ARGUMENT_ERROR;
     };
-    let Some(descendant_proof_handle) = args
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value != 0 && *value != usize::MAX)
-    else {
-        return AUTHORITY_ARGUMENT_ERROR;
-    };
     if args.next().is_some() || outside.exists() {
         return AUTHORITY_ARGUMENT_ERROR;
     }
@@ -3792,15 +3775,15 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
         Ok(descendant) => descendant,
         Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
     };
-    let mut proof_writer = unsafe { File::from_raw_handle(descendant_proof_handle as HANDLE) };
+    let mut proof_writer = std::io::stdout().lock();
     if proof_writer
         .write_all(&DESCENDANT_PROOF_MAGIC.to_le_bytes())
         .and_then(|()| proof_writer.write_all(&(descendant.as_raw_handle() as usize).to_le_bytes()))
+        .and_then(|()| proof_writer.flush())
         .is_err()
     {
         return AUTHORITY_DESCENDANT_PROOF_ERROR;
     }
-    drop(proof_writer);
     let descendant = match descendant.wait() {
         Ok(status) => status,
         Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,
