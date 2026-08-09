@@ -45,6 +45,7 @@ const WINDOWS_PROCESS_PROOF: &str = "direct CreateProcessW application PID from 
 const MAX_CONTAINMENT_TREE_PROCESSES: usize = 64;
 const LINUX_MEMORY_MEASUREMENT: &str =
     "/proc/<pid>/smaps_rollup Private_Clean + Private_Dirty + Private_Hugetlb";
+const MACOS_MEMORY_MEASUREMENT: &str = "vmmap -summary Physical footprint";
 const WINDOWS_MEMORY_MEASUREMENT: &str = "Get-Process PrivateMemorySize64";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -377,6 +378,7 @@ fn validate_statistics(statistics: &Statistics) -> Result<(), String> {
 fn validate_memory_measurement(os: &str, memory: &MemoryMeasurement) -> Result<(), String> {
     let expected_method = match os {
         "linux" => LINUX_MEMORY_MEASUREMENT,
+        "macos" => MACOS_MEMORY_MEASUREMENT,
         "windows" => WINDOWS_MEMORY_MEASUREMENT,
         _ => return Err("operating system has no reviewed private-memory method".into()),
     };
@@ -1417,7 +1419,7 @@ fn private_memory_bytes(pid: u32) -> io::Result<u64> {
 
 #[cfg(target_os = "macos")]
 fn private_memory_method() -> &'static str {
-    "vmmap -summary Physical footprint"
+    MACOS_MEMORY_MEASUREMENT
 }
 
 #[cfg(windows)]
@@ -1667,6 +1669,10 @@ fn worker_resource_schema_rejects_malformed_statistics_and_memory() {
         measurement: LINUX_MEMORY_MEASUREMENT.into(),
     };
     validate_memory_measurement("linux", &valid_memory).unwrap();
+
+    let mut valid_macos_memory = valid_memory.clone();
+    valid_macos_memory.measurement = MACOS_MEMORY_MEASUREMENT.into();
+    validate_memory_measurement("macos", &valid_macos_memory).unwrap();
 
     let mut wrong_method = valid_memory.clone();
     wrong_method.measurement = WINDOWS_MEMORY_MEASUREMENT.into();

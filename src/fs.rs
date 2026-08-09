@@ -1517,7 +1517,6 @@ fn atomic_write_platform(
                 ),
             ) {
                 Ok(file) => {
-                    #[cfg(unix)]
                     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                     #[cfg(target_os = "macos")]
                     let identity =
