@@ -367,7 +367,7 @@ fn exchange_relative(
     // SAFETY: the names and retained directory descriptor remain valid for
     // this syscall, which confines the exchange to the held directory.
     let result = unsafe {
-        libc::renameat2(
+        crate::fs::linux_renameat2(
             directory.as_raw_fd(),
             replacement.as_ptr(),
             directory.as_raw_fd(),
@@ -413,7 +413,7 @@ fn rename_no_replace_relative(
     // SAFETY: the names and retained directory descriptor remain valid for
     // this syscall, which confines the rename to the held directory.
     let result = unsafe {
-        libc::renameat2(
+        crate::fs::linux_renameat2(
             directory.as_raw_fd(),
             source.as_ptr(),
             directory.as_raw_fd(),

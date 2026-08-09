@@ -15,6 +15,28 @@ pub(crate) use private::{
     ensure_directory as ensure_private_directory, open_existing as open_private_file,
 };
 
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn linux_renameat2(
+    old_directory: libc::c_int,
+    old_path: *const libc::c_char,
+    new_directory: libc::c_int,
+    new_path: *const libc::c_char,
+    flags: libc::c_uint,
+) -> libc::c_int {
+    // Call the kernel directly: glibc exports renameat2, but musl does not
+    // provide that symbol even though Linux supports the syscall.
+    unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            old_directory,
+            old_path,
+            new_directory,
+            new_path,
+            flags,
+        ) as libc::c_int
+    }
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsFileIdentity {
@@ -1063,14 +1085,6 @@ fn atomic_write_platform(
             new_directory: c_int,
             new_path: *const c_char,
         ) -> c_int;
-        #[cfg(target_os = "linux")]
-        fn renameat2(
-            old_directory: c_int,
-            old_path: *const c_char,
-            new_directory: c_int,
-            new_path: *const c_char,
-            flags: c_uint,
-        ) -> c_int;
         #[cfg(target_os = "macos")]
         fn renameatx_np(
             old_directory: c_int,
@@ -1290,7 +1304,7 @@ fn atomic_write_platform(
             // `RENAME_NOREPLACE` makes create-only publication atomic with the
             // non-existence check instead of relying on a racy final `stat`.
             unsafe {
-                renameat2(
+                super::linux_renameat2(
                     directory.as_raw_fd(),
                     old_name.as_ptr(),
                     directory.as_raw_fd(),
