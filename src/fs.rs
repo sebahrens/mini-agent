@@ -1259,26 +1259,19 @@ fn atomic_write_platform(
     ) -> std::io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
 
-        let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        // SAFETY: `directory` and `name` remain live for the call, and `entry`
-        // points to writable storage of the exact stat structure. NOFOLLOW
-        // makes a substituted symlink observable instead of traversing it.
-        if unsafe {
-            libc::fstatat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                entry.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: successful fstatat initialized the complete structure.
-        let entry = unsafe { entry.assume_init() };
-        Ok(entry.st_mode & libc::S_IFMT == libc::S_IFREG
-            && u64::try_from(entry.st_dev).ok() == Some(identity.dev())
-            && entry.st_ino == identity.ino())
+        // APFS firmlinks can expose a different device view through `fstatat`
+        // than through a descriptor opened relative to the same directory.
+        // Reopen the entry without following links so both observations use
+        // the same descriptor view. The original temp descriptor remains live,
+        // preventing its identity from being recycled during this comparison.
+        let entry = open_at(
+            directory,
+            OsStr::from_bytes(name.as_bytes()),
+            OPEN_NOFOLLOW | OPEN_CLOEXEC,
+            0,
+        )?;
+        let entry = entry.metadata()?;
+        Ok(entry.is_file() && entry.dev() == identity.dev() && entry.ino() == identity.ino())
     }
 
     fn rename_entry(
