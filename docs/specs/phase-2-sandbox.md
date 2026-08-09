@@ -281,7 +281,7 @@ closed.
 | Executable | The parent supplies stable identity plus SHA-256. The helper reopens and hashes the executable, denies write/delete sharing, verifies the proof, and retains that handle through `CreateProcessAsUserW`. |
 | Process lifetime | The target enters a kill-on-close Job at creation time. The Job limits active processes, per-process memory, aggregate Job memory, process CPU time, and UI operations. Descendants retain the AppContainer SID and exact Job without breakaway. Helper cancellation and parent death terminate the exact Job and wait for `ActiveProcesses == 0` before ACL/profile cleanup. |
 | Environment | The helper request travels only through inherited stdin. The target environment is cleared and rebuilt from `PATH`, `PATHEXT`, Windows system/shell variables, and non-credential locale/terminal variables. API keys, agent sockets, and credential variables are not forwarded. |
-| Network | No capability is supplied. Hosted proof requires zero `TokenCapabilities`, no current-SID loopback exemption, and AccessDenied for IPv4/IPv6 TCP and UDP against loopback and an external address. |
+| Network | No capability is supplied. Hosted proof requires zero `TokenCapabilities`, no current-SID loopback exemption, and failed IPv4/IPv6 TCP connection attempts against loopback and an external address. The capability and exemption checks cover both TCP and UDP; a connectionless UDP `send` completion is not accepted as evidence of delivery or authority because Winsock may only have queued the datagram locally. |
 | Registry | AppContainer-visible common registry/COM resources are inherited through `ALL APPLICATION PACKAGES`. No registry confidentiality or isolation is claimed. |
 | Devices/UI | Host-readable devices remain visible. The target receives a private per-launch desktop and the Job's full UI restriction mask. No broader Windows session, named-object, or broker-channel isolation is claimed. |
 
@@ -313,7 +313,7 @@ restriction mask.
 - [ ] Windows can report the default AppContainer backend available only after hosted attestation
       proves explicit-root reads, workspace-only host writes, outside read/write denial,
       hard-link/path/executable stability, crash-stale cleanup, zero capabilities and absent
-      loopback exemptions, TCP/UDP loopback and external denial, private desktop, bounded request
+      loopback exemptions, TCP loopback and external denial, private desktop, bounded request
       transport, launcher-token denial, and parent-owned Job cleanup.
 - [x] The general command created for JS `spawn` still uses the one shared
       `Sandbox::wrap_command` path; this is not the Phase 6 worker-launch path.

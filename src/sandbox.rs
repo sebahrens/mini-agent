@@ -2514,10 +2514,7 @@ mod sandbox_tests {
             "TokenCapabilities",
             "tcp_attempt_failed(\"127.0.0.1:9\")",
             "tcp_attempt_failed(\"1.1.1.1:9\")",
-            "udp_attempt_failed(\"127.0.0.1:9\")",
-            "udp_attempt_failed(\"1.1.1.1:9\")",
             "tcp_attempt_failed(\"[::1]:9\")",
-            "udp_attempt_failed(\"[::1]:9\")",
             "grant_read_root",
             "grant_write_root",
             "sweep_stale_profiles",
@@ -2617,6 +2614,7 @@ mod sandbox_tests {
         assert!(!source.contains("run_authority_probe(args).unwrap_or(97)"));
         assert!(!source.contains("run_descendant_probe(args).unwrap_or(98)"));
         assert!(!source.contains("TokenIsLessPrivilegedAppContainer"));
+        assert!(!source.contains("udp_attempt_failed("));
         assert!(!source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
         assert!(!source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
         assert!(

@@ -1283,7 +1283,9 @@ fn run_helper() -> Result<i32, String> {
     }
     // This desktop-only firewall API reads host configuration and is intentionally unavailable
     // inside AppContainer. Attest the freshly-created profile SID from the trusted helper before
-    // launch; the contained authority probe separately verifies actual TCP/UDP denial.
+    // launch; the contained authority probe separately verifies that TCP connection attempts fail.
+    // Zero token capabilities are the protocol-independent proof that UDP is not authorized: a
+    // successful connectionless `send` only proves that Winsock queued a datagram locally.
     if !appcontainer_has_no_loopback_exemption(grants.sid())? {
         return Err("sandbox: AppContainer profile has a loopback exemption".into());
     }
@@ -3655,21 +3657,16 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
         return 92;
     }
     // Zero network capabilities plus the helper's no-loopback-exemption attestation are the
-    // enforcement proof. These attempts are behavioral negative controls: every connection/send
-    // must fail, while the exact error may instead describe host routing (notably absent IPv6).
+    // protocol-independent enforcement proof. TCP attempts are behavioral negative controls:
+    // every connection must fail, while the exact error may instead describe host routing
+    // (notably absent IPv6). Do not use UDP `send` as a negative control: Winsock may successfully
+    // queue a connectionless datagram even when AppContainer policy prevents network delivery.
     if !tcp_attempt_failed("127.0.0.1:9")
         || !tcp_attempt_failed("1.1.1.1:9")
         || !tcp_attempt_failed("[::1]:9")
         || !tcp_attempt_failed("[2606:4700:4700::1111]:9")
     {
         return 94;
-    }
-    if !udp_attempt_failed("127.0.0.1:9")
-        || !udp_attempt_failed("1.1.1.1:9")
-        || !udp_attempt_failed("[::1]:9")
-        || !udp_attempt_failed("[2606:4700:4700::1111]:9")
-    {
-        return 95;
     }
     0
 }
@@ -3843,22 +3840,6 @@ fn tcp_attempt_failed(address: &str) -> bool {
         return false;
     };
     std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(750)).is_err()
-}
-
-fn udp_attempt_failed(address: &str) -> bool {
-    let bind = if address.starts_with('[') {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = match std::net::UdpSocket::bind(bind) {
-        Ok(socket) => socket,
-        Err(_) => return true,
-    };
-    socket
-        .connect(address)
-        .and_then(|_| socket.send(b"mini-agent-network-denial-probe"))
-        .is_err()
 }
 
 fn parse_probe_pid(value: Option<std::ffi::OsString>, label: &str) -> Result<u32, String> {
