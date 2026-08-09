@@ -310,7 +310,7 @@ restriction mask.
 - [x] Linux and macOS process escape/denial tests prove their documented backend guarantees.
 - [x] Backend absence/failure and Windows residual non-isolation are visible and never reported as
       sandboxed.
-- [ ] Windows can report the default AppContainer backend available only after hosted attestation
+- [x] Windows can report the default AppContainer backend available only after hosted attestation
       proves explicit-root reads, workspace-only host writes, outside read/write denial,
       hard-link/path/executable stability, crash-stale cleanup, zero capabilities and absent
       loopback exemptions, TCP loopback and external denial, private desktop, bounded request
