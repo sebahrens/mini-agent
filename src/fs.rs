@@ -1327,10 +1327,13 @@ fn atomic_write_platform(
         name: &CString,
         identity: &CheckedMetadata,
     ) -> std::io::Result<bool> {
-        // APFS firmlinks can expose different `st_dev` views for the same file.
-        // Reopen without following links and compare the live filesystem ID plus
-        // inode instead. The original temp descriptor remains live, preventing
-        // its identity from being recycled during this comparison.
+        use std::os::unix::fs::MetadataExt;
+
+        // APFS can expose different device and filesystem-ID views even for two
+        // descriptors opened relative to the same directory. The random temp was
+        // created directly in this retained directory and cannot cross a mount,
+        // so its inode is sufficient here. The original descriptor remains live,
+        // preventing that inode from being recycled during this comparison.
         let entry = open_at(
             directory,
             OsStr::from_bytes(name.as_bytes()),
@@ -1338,7 +1341,7 @@ fn atomic_write_platform(
             0,
         )?;
         let entry = checked_file_metadata(&entry)?;
-        Ok(entry.is_file() && entry.identity == identity.identity)
+        Ok(entry.is_file() && entry.ino() == identity.ino())
     }
 
     fn rename_entry(
