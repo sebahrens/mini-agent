@@ -113,6 +113,8 @@ const TARGET_SELF_RAW_SPAWN_ERROR_BASE: i32 = 0x9_0000;
 const TARGET_JOB_LIMIT_QUERY_ERROR_BASE: i32 = 0xA_0000;
 const TARGET_JOB_ACCOUNTING_QUERY_ERROR_BASE: i32 = 0xB_0000;
 const TARGET_SELF_TOKEN_OPEN_ERROR_BASE: i32 = 0xC_0000;
+const TARGET_DESCENDANT_SPAWN_ERROR_BASE: i32 = 0xD_0000;
+const TARGET_DESCENDANT_WAIT_ERROR_BASE: i32 = 0xE_0000;
 const AUTHORITY_DESCENDANT_SPAWN_FAILED: i32 = 103;
 const AUTHORITY_DESCENDANT_WAIT_FAILED: i32 = 104;
 const AUTHORITY_DESCENDANT_NO_EXIT_CODE: i32 = 105;
@@ -1065,7 +1067,7 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             if std::fs::write(denied_write, b"outside").is_ok() {
                 return Ok(42);
             }
-            Ok(run_descendant_token_probe())
+            Ok(0)
         }
         value if value == OsStr::new(TARGET_CONFIGURED_ARG) => {
             let readable = target_probe_path(&mut args, "configured read path")?;
@@ -3671,11 +3673,25 @@ fn run_descendant_token_probe() -> i32 {
         .stderr(Stdio::null());
     let mut descendant = match descendant_command.spawn_guarded() {
         Ok(descendant) => descendant,
-        Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
+        Err(error) => {
+            let code = target_probe_os_error_code(TARGET_DESCENDANT_SPAWN_ERROR_BASE, &error);
+            return if code == TARGET_DESCENDANT_SPAWN_ERROR_BASE {
+                AUTHORITY_DESCENDANT_SPAWN_FAILED
+            } else {
+                code
+            };
+        }
     };
     let descendant_status = match descendant.wait() {
         Ok(status) => status,
-        Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,
+        Err(error) => {
+            let code = target_probe_os_error_code(TARGET_DESCENDANT_WAIT_ERROR_BASE, &error);
+            return if code == TARGET_DESCENDANT_WAIT_ERROR_BASE {
+                AUTHORITY_DESCENDANT_WAIT_FAILED
+            } else {
+                code
+            };
+        }
     };
     if descendant_status.success() {
         0

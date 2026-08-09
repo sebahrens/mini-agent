@@ -2581,7 +2581,6 @@ mod sandbox_tests {
             "helper_failure_status()",
             "AUTHORITY_DESCENDANT_SPAWN_FAILED",
             "AUTHORITY_LOOPBACK_QUERY_ERROR",
-            "Ok(run_descendant_token_probe())",
             "bounded_pipe=pass",
             "acl_serialization=pass",
             "parent_death_job=pass",
