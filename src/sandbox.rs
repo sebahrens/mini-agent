@@ -2583,6 +2583,7 @@ mod sandbox_tests {
             "helper_failure_status()",
             "AUTHORITY_DESCENDANT_SPAWN_FAILED",
             "AUTHORITY_LOOPBACK_QUERY_ERROR",
+            "DESCENDANT_PROOF_WRITE_ERROR",
             "completed_process_exit_code(&child)?",
             "bounded_pipe=pass",
             "acl_serialization=pass",
@@ -2617,6 +2618,7 @@ mod sandbox_tests {
         assert!(!source.contains("PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT"));
         assert!(!source.contains("GetHandleInformation(omitted_handle as HANDLE"));
         assert!(!source.contains("run_authority_probe(args).unwrap_or(97)"));
+        assert!(!source.contains("run_descendant_probe(args).unwrap_or(98)"));
         assert!(!source.contains("TokenIsLessPrivilegedAppContainer"));
         assert!(source.contains("PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY"));
         assert!(source.contains("PROCESS_CREATION_CHILD_PROCESS_OVERRIDE"));
@@ -2742,7 +2744,7 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn verify_job_limits(").next())
             .expect("descendant rendezvous implementation missing");
-        assert!(descendant_verification.contains("wait_for_descendant_identity(ready)?"));
+        assert!(descendant_verification.contains("wait_for_descendant_identity(ready, target)?"));
         assert!(!descendant_verification.contains("wait_for_probe_file(ready)?"));
 
         let parent_probe = source

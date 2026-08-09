@@ -127,6 +127,11 @@ const AUTHORITY_BREAKAWAY_EXE_ERROR: i32 = 110;
 const AUTHORITY_BREAKAWAY_RESULT_ERROR: i32 = 111;
 const AUTHORITY_CAPABILITY_QUERY_ERROR: i32 = 112;
 const AUTHORITY_LOOPBACK_QUERY_ERROR: i32 = 113;
+const DESCENDANT_ARGUMENT_ERROR: i32 = 119;
+const DESCENDANT_CAPABILITY_QUERY_ERROR: i32 = 120;
+const DESCENDANT_APPCONTAINER_QUERY_ERROR: i32 = 121;
+const DESCENDANT_IDENTITY_QUERY_ERROR: i32 = 122;
+const DESCENDANT_PROOF_WRITE_ERROR: i32 = 123;
 // The regular AppContainer supplies the Windows system-resource access required for descendant
 // creation, so retain the Job's complete UI lockdown in addition to the private desktop.
 const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_ALL;
@@ -892,7 +897,7 @@ pub(crate) fn maybe_run_from_args() -> Option<i32> {
         }
         Some(value) if value == OsStr::new(AUTHORITY_PROBE_ARG) => Some(run_authority_probe(args)),
         Some(value) if value == OsStr::new(DESCENDANT_PROBE_ARG) => {
-            Some(run_descendant_probe(args).unwrap_or(98))
+            Some(run_descendant_probe(args))
         }
         _ => None,
     }
@@ -2573,7 +2578,7 @@ fn verify_descendant_rendezvous(
     release: &Path,
 ) -> Result<(), String> {
     mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-    wait_for_descendant_identity(ready)?;
+    wait_for_descendant_identity(ready, target)?;
     mark_helper_stage(HELPER_STAGE_DESCENDANT_METADATA);
     let metadata = std::fs::symlink_metadata(ready)
         .map_err(|error| format!("inspect descendant identity proof: {error}"))?;
@@ -2659,13 +2664,16 @@ fn parse_descendant_identity(proof: &[u8]) -> Result<(u32, u64), String> {
     Ok((pid, created))
 }
 
-fn wait_for_descendant_identity(path: &Path) -> Result<(), String> {
+fn wait_for_descendant_identity(path: &Path, target: &Handle) -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if bounded_probe_contents(path, DESCENDANT_IDENTITY_MAX_BYTES)
             .is_some_and(|contents| parse_descendant_identity(&contents).is_ok())
         {
             return Ok(());
+        }
+        if completed_process_exit_code(target)?.is_some() {
+            return Err("sandbox: authority target exited before descendant identity proof".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -3829,40 +3837,49 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     0
 }
 
-fn run_descendant_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
-    let ready = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("descendant readiness path missing")?;
-    let release = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or("descendant release path missing")?;
+fn run_descendant_probe(mut args: std::env::ArgsOs) -> i32 {
+    let Some(ready) = args.next().map(PathBuf::from) else {
+        return DESCENDANT_ARGUMENT_ERROR;
+    };
+    let Some(release) = args.next().map(PathBuf::from) else {
+        return DESCENDANT_ARGUMENT_ERROR;
+    };
     if args.next().is_some() {
-        return Err("unexpected descendant probe argument".into());
+        return DESCENDANT_ARGUMENT_ERROR;
     }
-    if !current_token_has_zero_capabilities()? || !current_token_is_appcontainer()? {
-        return Ok(2);
+    let Ok(has_zero_capabilities) = current_token_has_zero_capabilities() else {
+        return DESCENDANT_CAPABILITY_QUERY_ERROR;
+    };
+    if !has_zero_capabilities {
+        return 2;
     }
-    let proof = format!(
-        "{}\n{}\n",
-        unsafe { GetCurrentProcessId() },
-        process_creation_time(unsafe { GetCurrentProcess() })?
-    );
-    std::fs::OpenOptions::new()
+    let Ok(is_appcontainer) = current_token_is_appcontainer() else {
+        return DESCENDANT_APPCONTAINER_QUERY_ERROR;
+    };
+    if !is_appcontainer {
+        return 2;
+    }
+    let Ok(created) = process_creation_time(unsafe { GetCurrentProcess() }) else {
+        return DESCENDANT_IDENTITY_QUERY_ERROR;
+    };
+    let proof = format!("{}\n{}\n", unsafe { GetCurrentProcessId() }, created);
+    if std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&ready)
         .and_then(|mut file| file.write_all(proof.as_bytes()))
-        .map_err(|error| format!("publish descendant process identity: {error}"))?;
+        .is_err()
+    {
+        return DESCENDANT_PROOF_WRITE_ERROR;
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !release.exists() {
         if std::time::Instant::now() >= deadline {
-            return Ok(3);
+            return 3;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    Ok(0)
+    0
 }
 
 fn token_is_appcontainer(token: &Handle, context: &str) -> Result<bool, String> {
@@ -4000,24 +4017,26 @@ fn current_token_has_zero_capabilities() -> Result<bool, String> {
     if bytes < size_of::<u32>() as u32 || bytes > 64 * 1024 {
         return Err("sandbox: invalid TokenCapabilities size".into());
     }
-    let mut storage = vec![0u8; bytes as usize];
+    let mut storage = vec![0usize; (bytes as usize).div_ceil(size_of::<usize>())];
+    let capacity = (storage.len() * size_of::<usize>()) as u32;
+    let mut returned = capacity;
     if unsafe {
         GetTokenInformation(
             token.raw(),
             TokenCapabilities,
             storage.as_mut_ptr().cast(),
-            bytes,
-            &mut bytes,
+            capacity,
+            &mut returned,
         )
     } == 0
     {
         return Err(last_error("read AppContainer TokenCapabilities"));
     }
-    Ok(u32::from_ne_bytes(
-        storage[..size_of::<u32>()]
-            .try_into()
-            .expect("bounded capability header"),
-    ) == 0)
+    if returned < size_of::<u32>() as u32 || returned > capacity {
+        return Err("sandbox: invalid returned TokenCapabilities size".into());
+    }
+    let header = unsafe { *storage.as_ptr().cast::<u32>() };
+    Ok(header == 0)
 }
 
 fn network_access_denied(error: &std::io::Error) -> bool {
