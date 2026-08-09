@@ -2583,7 +2583,7 @@ mod sandbox_tests {
             "helper_failure_status()",
             "AUTHORITY_DESCENDANT_SPAWN_FAILED",
             "AUTHORITY_LOOPBACK_QUERY_ERROR",
-            "DESCENDANT_PROOF_WRITE_ERROR",
+            "AUTHORITY_DESCENDANT_PROOF_WRITE_ERROR",
             "completed_process_exit_code(&child)?",
             "bounded_pipe=pass",
             "acl_serialization=pass",

@@ -127,11 +127,11 @@ const AUTHORITY_BREAKAWAY_EXE_ERROR: i32 = 110;
 const AUTHORITY_BREAKAWAY_RESULT_ERROR: i32 = 111;
 const AUTHORITY_CAPABILITY_QUERY_ERROR: i32 = 112;
 const AUTHORITY_LOOPBACK_QUERY_ERROR: i32 = 113;
+const AUTHORITY_DESCENDANT_IDENTITY_QUERY_ERROR: i32 = 114;
+const AUTHORITY_DESCENDANT_PROOF_WRITE_ERROR: i32 = 115;
 const DESCENDANT_ARGUMENT_ERROR: i32 = 119;
 const DESCENDANT_CAPABILITY_QUERY_ERROR: i32 = 120;
 const DESCENDANT_APPCONTAINER_QUERY_ERROR: i32 = 121;
-const DESCENDANT_IDENTITY_QUERY_ERROR: i32 = 122;
-const DESCENDANT_PROOF_WRITE_ERROR: i32 = 123;
 // The regular AppContainer supplies the Windows system-resource access required for descendant
 // creation, so retain the Job's complete UI lockdown in addition to the private desktop.
 const GENERAL_JOB_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_ALL;
@@ -3779,14 +3779,24 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
         return AUTHORITY_CURRENT_EXE_ERROR;
     };
     let mut command = Command::new(executable);
-    command
-        .arg(DESCENDANT_PROBE_ARG)
-        .arg(&descendant_ready)
-        .arg(&descendant_release);
+    command.arg(DESCENDANT_PROBE_ARG).arg(&descendant_release);
     let mut descendant = match command.spawn_guarded() {
         Ok(descendant) => descendant,
         Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
     };
+    let Ok(created) = process_creation_time(descendant.as_raw_handle()) else {
+        return AUTHORITY_DESCENDANT_IDENTITY_QUERY_ERROR;
+    };
+    let proof = format!("{}\n{}\n", descendant.id(), created);
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&descendant_ready)
+        .and_then(|mut file| file.write_all(proof.as_bytes()))
+        .is_err()
+    {
+        return AUTHORITY_DESCENDANT_PROOF_WRITE_ERROR;
+    }
     let descendant = match descendant.wait() {
         Ok(status) => status,
         Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,
@@ -3838,9 +3848,6 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
 }
 
 fn run_descendant_probe(mut args: std::env::ArgsOs) -> i32 {
-    let Some(ready) = args.next().map(PathBuf::from) else {
-        return DESCENDANT_ARGUMENT_ERROR;
-    };
     let Some(release) = args.next().map(PathBuf::from) else {
         return DESCENDANT_ARGUMENT_ERROR;
     };
@@ -3858,19 +3865,6 @@ fn run_descendant_probe(mut args: std::env::ArgsOs) -> i32 {
     };
     if !is_appcontainer {
         return 2;
-    }
-    let Ok(created) = process_creation_time(unsafe { GetCurrentProcess() }) else {
-        return DESCENDANT_IDENTITY_QUERY_ERROR;
-    };
-    let proof = format!("{}\n{}\n", unsafe { GetCurrentProcessId() }, created);
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&ready)
-        .and_then(|mut file| file.write_all(proof.as_bytes()))
-        .is_err()
-    {
-        return DESCENDANT_PROOF_WRITE_ERROR;
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !release.exists() {
