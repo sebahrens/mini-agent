@@ -256,6 +256,20 @@ steps:
 
         self.assertTrue(any("RUSTFLAGS" in error for error in errors))
 
+    def test_release_full_archives_reject_unsupported_all_features(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            "build --release --target",
+            "build --release --all-features --target",
+            1,
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("all-features" in error for error in errors))
+
     def test_static_release_matrix_rejects_arm_cross_host(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github/workflows/release.yml"
@@ -271,6 +285,30 @@ steps:
         errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
 
         self.assertTrue(any("x86_64 hosts" in error for error in errors))
+
+    def test_checked_in_cross_images_are_reviewed_and_immutable(self) -> None:
+        cross_config = (SCRIPT.parents[1] / "Cross.toml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(
+            [], CHECK_PACKAGE_METADATA.validate_cross_images(cross_config)
+        )
+
+    def test_mutable_cross_image_tag_is_rejected(self) -> None:
+        target, expected = next(
+            iter(CHECK_PACKAGE_METADATA.EXPECTED_CROSS_IMAGES.items())
+        )
+        cross_config = f'[target.{target}]\nimage = "{expected}"\n'
+        cross_config = cross_config.replace(
+            "@sha256:" + expected.rsplit("@sha256:", 1)[1], ":main"
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_cross_images(cross_config)
+
+        self.assertTrue(
+            any(target in error and "reviewed image" in error for error in errors)
+        )
 
     def test_manual_release_dispatch_is_rejected(self) -> None:
         workflow = (

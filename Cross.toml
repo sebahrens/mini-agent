@@ -1,0 +1,8 @@
+# cross 0.2.5's release images predate the Rust 1.96 host glibc requirement.
+# These reviewed cross-rs main images use Ubuntu 24.04 and are digest-pinned so
+# static release builds do not depend on a mutable container tag.
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:35b37736695ca86f2725c008f097195d4b954e3604c549e3bbd03dadc70ea790"
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:a3942dd42a4de523dc77977b15f7bfc9007c242fe84bfbc555007bdb16703b61"

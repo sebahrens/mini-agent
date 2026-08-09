@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
@@ -156,6 +157,16 @@ EXPECTED_RELEASE_ARCHIVES = (
     "mini-agent-lite-aarch64-unknown-linux-musl.tar.gz",
     "mini-agent-lite-x86_64-pc-windows-msvc.tar.gz",
 )
+EXPECTED_CROSS_IMAGES = {
+    "aarch64-unknown-linux-musl": (
+        "ghcr.io/cross-rs/aarch64-unknown-linux-musl@"
+        "sha256:35b37736695ca86f2725c008f097195d4b954e3604c549e3bbd03dadc70ea790"
+    ),
+    "x86_64-unknown-linux-musl": (
+        "ghcr.io/cross-rs/x86_64-unknown-linux-musl@"
+        "sha256:a3942dd42a4de523dc77977b15f7bfc9007c242fe84bfbc555007bdb16703b61"
+    ),
+}
 EXPECTED_ARCHIVE_ARRAY = re.compile(
     r"^\s*expected=\(\n(?P<body>(?:\s+[^\n]+\n)+?)\s*\)$", re.MULTILINE
 )
@@ -279,6 +290,9 @@ def validate_workflow(text: str, binary: str) -> list[str]:
     required_counts = {
         f"CANONICAL_BINARY: {binary}": 1,
         'RUSTFLAGS: ""': 1,
+        "tool: cross@0.2.5": 1,
+        "run: cargo build --release --target ${{ matrix.target }}": 2,
+        "run: cross build --release --target ${{ matrix.target }}": 1,
         # 3 jobs produce archives: build (Linux/macOS), build-static (musl), build-windows
         'archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"': 3,
         'archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"': 3,
@@ -314,6 +328,11 @@ def validate_workflow(text: str, binary: str) -> list[str]:
             "ubuntu-latest x86_64 hosts"
         )
 
+    if "build --release --all-features" in text:
+        errors.append(
+            ".github/workflows/release.yml full archives must use the "
+            "supported default feature set, not --all-features"
+        )
     forbidden = (
         "target/${{ matrix.target }}/release/zerostack",
         "zerostack-${{ matrix.target }}.tar.gz",
@@ -359,6 +378,25 @@ def validate_release_archive_gates(text: str) -> list[str]:
             errors.append(
                 f"release {gate_name} gate has an invalid archive set; "
                 f"missing={missing}, unexpected={unexpected}"
+            )
+    return errors
+
+
+def validate_cross_images(text: str) -> list[str]:
+    """Require reviewed, immutable cross images for static release targets."""
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        return [f"Cross.toml is invalid TOML: {error}"]
+    targets = document.get("target", {})
+    errors: list[str] = []
+    for target, image in EXPECTED_CROSS_IMAGES.items():
+        target_config = targets.get(target, {})
+        observed = target_config.get("image")
+        if observed != image:
+            errors.append(
+                f"Cross.toml must pin {target} to reviewed image {image!r} "
+                f"but found {observed!r}"
             )
     return errors
 
@@ -793,6 +831,13 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
     else:
         errors.extend(
             validate_workflow(workflow_path.read_text(encoding="utf-8"), binary)
+        )
+    cross_config_path = root / "Cross.toml"
+    if not cross_config_path.is_file():
+        errors.append("Cross.toml is required for immutable musl build images")
+    else:
+        errors.extend(
+            validate_cross_images(cross_config_path.read_text(encoding="utf-8"))
         )
     dependabot_path = root / ".github/dependabot.yml"
     if not dependabot_path.is_file():

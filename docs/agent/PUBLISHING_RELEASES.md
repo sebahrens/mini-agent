@@ -12,7 +12,9 @@ Cargo and every package channel install the public executable as `mini-agent`. F
 named `mini-agent-<target>.tar.gz`; lite archives are named
 `mini-agent-lite-<target>.tar.gz`. Every archive contains exactly one top-level executable named
 `mini-agent`, which the release workflow extracts into a clean directory and runs with
-`--version` before upload.
+`--version` before upload. Full archives use the supported default Cargo feature set; lite archives
+use `--no-default-features`. Opt-in native features such as `skills-embed` are not silently bundled
+into cross-platform archives and keep their platform-specific installation requirements.
 
 ## Product identity matrix
 
@@ -58,6 +60,10 @@ root `github-actions` updater advances the SHA and version comment together. The
 record the reviewed action, version, and SHA triple before the update can pass CI. Before changing
 an action manually, verify that the proposed version tag resolves to the pinned commit and review
 the upstream commit; never copy an unverified SHA from an issue or pull request.
+
+Static musl builds also pin the `cross` CLI version and both cross-rs container images by digest in
+`Cross.toml`. Update those digests only after reviewing the upstream image definition and resolving
+the intended published tag to its platform-specific immutable digest.
 
 The package metadata policy enforces both the release pins and the Dependabot configuration:
 

@@ -64,7 +64,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --all-features --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package and smoke binary
         run: |
@@ -122,10 +122,10 @@ jobs:
       - name: Install cross
         uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         with:
-          tool: cross
+          tool: cross@0.2.5
 
       - name: Build static binary (${{ matrix.target }})
-        run: cross build --release --all-features --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package and smoke
         run: |
@@ -183,7 +183,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --all-features --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package and smoke binary
         run: |
