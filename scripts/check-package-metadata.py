@@ -156,6 +156,9 @@ EXPECTED_RELEASE_ARCHIVES = (
     "mini-agent-lite-aarch64-unknown-linux-musl.tar.gz",
     "mini-agent-lite-x86_64-pc-windows-msvc.tar.gz",
 )
+EXPECTED_ARCHIVE_ARRAY = re.compile(
+    r"^\s*expected=\(\n(?P<body>(?:\s+[^\n]+\n)+?)\s*\)$", re.MULTILINE
+)
 
 
 def cargo_metadata(root: Path) -> dict[str, Any]:
@@ -305,15 +308,41 @@ def validate_workflow(text: str, binary: str) -> list[str]:
                 ".github/workflows/release.yml must not reference "
                 f"noncanonical binary path {fragment!r}"
             )
-    for archive in EXPECTED_RELEASE_ARCHIVES:
-        observed_count = text.count(archive)
-        if observed_count != 2:
-            errors.append(
-                ".github/workflows/release.yml must list expected archive "
-                f"{archive!r} exactly twice (checksum and publication gates), "
-                f"found {observed_count}"
-            )
+    errors.extend(validate_release_archive_gates(text))
     errors.extend(validate_release_action_pins(text))
+    return errors
+
+
+def validate_release_archive_gates(text: str) -> list[str]:
+    """Require exact, duplicate-free archive sets before checksum and release."""
+    matches = list(EXPECTED_ARCHIVE_ARRAY.finditer(text))
+    if len(matches) != 2:
+        return [
+            ".github/workflows/release.yml must contain exactly two expected "
+            f"archive gates, found {len(matches)}"
+        ]
+
+    expected_archives = set(EXPECTED_RELEASE_ARCHIVES)
+    gates = (
+        ("checksum", expected_archives),
+        ("publication", expected_archives | {"SHA256SUMS"}),
+    )
+    errors: list[str] = []
+    for match, (gate_name, expected) in zip(matches, gates, strict=True):
+        entries = [line.strip() for line in match.group("body").splitlines()]
+        observed = set(entries)
+        duplicates = sorted(entry for entry in observed if entries.count(entry) > 1)
+        if duplicates:
+            errors.append(
+                f"release {gate_name} gate contains duplicate entries: {duplicates}"
+            )
+        missing = sorted(expected - observed)
+        unexpected = sorted(observed - expected)
+        if missing or unexpected:
+            errors.append(
+                f"release {gate_name} gate has an invalid archive set; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
     return errors
 
 

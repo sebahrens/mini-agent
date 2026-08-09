@@ -285,7 +285,23 @@ steps:
 
         errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
 
-        self.assertTrue(any("exactly twice" in error for error in errors))
+        self.assertTrue(any("duplicate entries" in error for error in errors))
+        self.assertTrue(any("invalid archive set" in error for error in errors))
+
+    def test_unexpected_release_archive_is_rejected(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            "mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz",
+            "mini-agent-lite-riscv64-unknown-linux-gnu.tar.gz",
+            1,
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("missing=" in error for error in errors))
+        self.assertTrue(any("unexpected=" in error for error in errors))
 
     def test_tag_recipes_require_committed_metadata_before_tagging(self) -> None:
         justfile = (SCRIPT.parents[1] / "justfile").read_text(encoding="utf-8")
