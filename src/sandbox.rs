@@ -2530,6 +2530,7 @@ mod sandbox_tests {
             "wait_for_stale_job_quiescence",
             "verify_descendant_membership",
             "read_descendant_handle_proof",
+            "S:(ML;;NW;;;LW)",
             "active_job_processes",
             "wait_for_exact_probe_file",
             "creation-time Job did not contain exactly its suspended target",

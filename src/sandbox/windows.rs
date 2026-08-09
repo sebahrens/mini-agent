@@ -1338,7 +1338,7 @@ fn run_helper() -> Result<i32, String> {
             .filter(|value| value.as_str() == DESCENDANT_RELEASE_PLACEHOLDER)
             .ok_or("invalid descendant-release placeholder")?;
         *descendant_release = release.to_string_lossy().into_owned();
-        let (proof_reader, proof_writer) = descendant_proof_pipe()?;
+        let (proof_reader, proof_writer) = descendant_proof_pipe(grants.sid())?;
         descendant_attestation = Some((release, proof_reader, proof_writer));
     }
     grants.disarm_for_launch();
@@ -2961,10 +2961,35 @@ fn inheritable_duplicate(source: *mut c_void) -> Result<Handle, String> {
     Handle::created(duplicate, "duplicate restricted child standard handle")
 }
 
-fn descendant_proof_pipe() -> Result<(File, Handle), String> {
+fn descendant_proof_pipe(appcontainer_sid: PSID) -> Result<(File, Handle), String> {
+    let user = current_user_sid_buffer()?;
+    let user_sid = token_user_sid(&user);
+    if user_sid.is_null() || appcontainer_sid.is_null() {
+        return Err("sandbox: descendant-proof pipe SID was null".into());
+    }
+    let descriptor_sddl = wide_string(&format!(
+        "D:P(A;;GA;;;{})(A;;GW;;;{})S:(ML;;NW;;;LW)",
+        sid_text(user_sid)?,
+        sid_text(appcontainer_sid)?,
+    ));
+    let mut raw_descriptor = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut raw_descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "construct AppContainer descendant-proof pipe descriptor",
+        ));
+    }
+    let descriptor = Local(raw_descriptor);
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
+        lpSecurityDescriptor: descriptor.0,
         bInheritHandle: TRUE,
     };
     let mut read = null_mut();
