@@ -1340,7 +1340,9 @@ fn atomic_write_platform(
             OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK,
             0,
         )?;
-        let entry = checked_file_metadata(&entry)?;
+        // The retained original handle supplies the anti-recycling guarantee;
+        // do not ask this second macOS view for another filesystem identity.
+        let entry = entry.metadata()?;
         Ok(entry.is_file() && entry.ino() == identity.ino())
     }
 
