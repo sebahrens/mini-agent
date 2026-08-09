@@ -246,6 +246,16 @@ steps:
             [], CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
         )
 
+    def test_release_workflow_neutralizes_setup_rust_warning_denial(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace('  RUSTFLAGS: ""\n', "", 1)
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("RUSTFLAGS" in error for error in errors))
+
     def test_manual_release_dispatch_is_rejected(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github/workflows/release.yml"

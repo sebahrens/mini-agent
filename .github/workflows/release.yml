@@ -10,6 +10,8 @@ permissions:
 
 env:
   CANONICAL_BINARY: mini-agent
+  # setup-rust-toolchain otherwise injects -D warnings into release builds.
+  RUSTFLAGS: ""
 
 concurrency:
   group: release-${{ github.ref }}

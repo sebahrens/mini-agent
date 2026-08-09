@@ -278,6 +278,7 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         )
     required_counts = {
         f"CANONICAL_BINARY: {binary}": 1,
+        'RUSTFLAGS: ""': 1,
         # 3 jobs produce archives: build (Linux/macOS), build-static (musl), build-windows
         'archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"': 3,
         'archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"': 3,
