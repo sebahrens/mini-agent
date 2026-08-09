@@ -1267,7 +1267,7 @@ fn atomic_write_platform(
         let entry = open_at(
             directory,
             OsStr::from_bytes(name.as_bytes()),
-            OPEN_NOFOLLOW | OPEN_CLOEXEC,
+            OPEN_NOFOLLOW | OPEN_CLOEXEC | libc::O_NONBLOCK,
             0,
         )?;
         let entry = entry.metadata()?;
