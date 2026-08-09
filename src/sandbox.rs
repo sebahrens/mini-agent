@@ -2528,10 +2528,6 @@ mod sandbox_tests {
             "STALE_JOB_CLEANUP_EXIT_CODE",
             "job_name",
             "wait_for_stale_job_quiescence",
-            "verify_descendant_membership",
-            "wait_for_gated_descendant",
-            "JobObjectBasicProcessIdList",
-            "JOBOBJECT_BASIC_PROCESS_ID_LIST",
             "active_job_processes",
             "wait_for_exact_probe_file",
             "creation-time Job did not contain exactly its suspended target",
@@ -2581,17 +2577,11 @@ mod sandbox_tests {
             "authority_escape=denied",
             "authority probe failed: status=",
             "HELPER_FAILURE_STATUS_BASE",
-            "HELPER_STAGE_VERIFY_DESCENDANT",
-            "HELPER_STAGE_DESCENDANT_JOB_QUERY",
-            "HELPER_STAGE_DESCENDANT_JOB_RESULT",
-            "HELPER_STAGE_DESCENDANT_ACTIVE_ONE",
-            "HELPER_STAGE_DESCENDANT_ACTIVE_OVERBOUND",
-            "HELPER_STAGE_DESCENDANT_TARGET_EXIT",
             "HELPER_STAGE_REGULAR_TOKEN_ACCESS",
             "helper_failure_status()",
             "AUTHORITY_DESCENDANT_SPAWN_FAILED",
             "AUTHORITY_LOOPBACK_QUERY_ERROR",
-            "completed_process_exit_code(&child)?",
+            "Ok(run_descendant_token_probe())",
             "bounded_pipe=pass",
             "acl_serialization=pass",
             "parent_death_job=pass",
@@ -2694,7 +2684,6 @@ mod sandbox_tests {
             .find("launch_appcontainer(")
             .expect("AppContainer launch missing");
         assert!(disarm < launch);
-        assert!(helper.contains("verify_descendant_membership("));
         assert!(helper.contains("terminate_and_drain_job(&job, 126)?;\n        grants.mark_job_quiescent();\n        grants.cleanup()?;"));
 
         let appcontainer_launch = source
@@ -2769,45 +2758,22 @@ mod sandbox_tests {
                 && stale_job_terminate < stale_job_drain
         );
 
-        let descendant_verification = source
-            .split("fn verify_descendant_membership(")
-            .nth(1)
-            .and_then(|source| source.split("fn wait_for_gated_descendant(").next())
-            .expect("descendant membership implementation missing");
-        assert!(descendant_verification.contains("wait_for_gated_descendant(job, target)?"));
-        assert!(descendant_verification.contains("verify_job_limits(job)?"));
-        assert!(descendant_verification.contains("active_job_processes(job)? != 2"));
-
-        let descendant_discovery = source
-            .split("fn wait_for_gated_descendant(")
-            .nth(1)
-            .and_then(|source| source.split("fn active_job_processes(").next())
-            .expect("Job-gated descendant discovery implementation missing");
-        assert!(descendant_discovery.contains("JobObjectBasicProcessIdList"));
-        assert!(descendant_discovery.contains("NumberOfAssignedProcesses != 2"));
-        assert!(descendant_discovery.contains("NumberOfProcessIdsInList != 2"));
-        assert!(descendant_discovery.contains("GetProcessId(target.raw())"));
-        assert!(
-            descendant_discovery
-                .contains("timed out waiting for Job-gated AppContainer descendant")
-        );
-
         let authority_probe = source
             .split("fn run_authority_probe(")
             .nth(1)
             .and_then(|source| source.split("fn run_descendant_probe(").next())
             .expect("authority descendant implementation missing");
         assert!(authority_probe.contains(&["descendant_command", "spawn_guarded()"].join(".")));
-        assert!(authority_probe.contains(".arg(&descendant_release)"));
         assert!(authority_probe.contains(".stdin(Stdio::null())"));
 
         let descendant_probe = source
             .split("fn run_descendant_probe(")
             .nth(1)
             .and_then(|source| source.split("fn token_is_appcontainer(").next())
-            .expect("Job-gated descendant probe implementation missing");
-        assert!(descendant_probe.contains("let minimum_observation ="));
-        assert!(descendant_probe.contains("now >= minimum_observation && release.exists()"));
+            .expect("AppContainer descendant probe implementation missing");
+        assert!(descendant_probe.contains("current_token_has_zero_capabilities()"));
+        assert!(descendant_probe.contains("current_token_is_appcontainer()"));
+        assert!(!descendant_probe.contains("release.exists()"));
 
         let parent_probe = source
             .split("fn run_parent_probe(")
@@ -2818,6 +2784,22 @@ mod sandbox_tests {
         assert!(parent_probe.contains("TARGET_PARENT_ARG"));
         assert!(parent_probe.contains("wait_for_exact_probe_file(&tree_ready)?"));
         assert!(!parent_probe.contains("wait_for_probe_file(&tree_ready)?"));
+
+        let runtime_probe = source
+            .split("fn run_runtime_probe()")
+            .nth(1)
+            .and_then(|source| source.split("fn attest_completed_cleanup(").next())
+            .expect("runtime AppContainer proof missing");
+        let tree_ready = runtime_probe
+            .find("read_exact(&mut ready)")
+            .expect("parent-death descendant readiness missing");
+        let parent_kill = runtime_probe
+            .find("parent\n        .kill()")
+            .expect("parent-death termination missing");
+        let escaped_marker = runtime_probe
+            .find("if marker.exists()")
+            .expect("parent-death escape marker missing");
+        assert!(tree_ready < parent_kill && parent_kill < escaped_marker);
 
         let named_job = source
             .split("fn bounded_job(")

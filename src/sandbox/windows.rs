@@ -64,11 +64,10 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectBasicUIRestrictions,
-    JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, OpenJobObjectW,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -83,7 +82,7 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW,
     CreateMutexW, CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess,
     GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
     OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
@@ -140,7 +139,6 @@ const DESCENDANT_PROBE_ARG: &str = "--mini-agent-windows-appcontainer-descendant
 const HELPER_PID_PLACEHOLDER: &str = "helper-pid";
 const DESKTOP_NAME_PLACEHOLDER: &str = "desktop-name";
 const OMITTED_HANDLE_PLACEHOLDER: &str = "omitted-handle";
-const DESCENDANT_RELEASE_PLACEHOLDER: &str = "descendant-release";
 const CONTROL_ROOT_PLACEHOLDER: &str = "control-root";
 const REQUEST_VERSION: u32 = 1;
 // This stays below the requested anonymous-pipe buffer, so request creation cannot block before
@@ -170,15 +168,6 @@ const HELPER_STAGE_REQUEST: u8 = 1;
 const HELPER_STAGE_SETUP: u8 = 2;
 const HELPER_STAGE_LAUNCH: u8 = 3;
 const HELPER_STAGE_VERIFY_JOB: u8 = 4;
-const HELPER_STAGE_VERIFY_DESCENDANT: u8 = 5;
-const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 7;
-const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 8;
-const HELPER_STAGE_DESCENDANT_JOB_QUERY: u8 = 9;
-const HELPER_STAGE_DESCENDANT_JOB_RESULT: u8 = 10;
-const HELPER_STAGE_DESCENDANT_ACTIVE_ZERO: u8 = 11;
-const HELPER_STAGE_DESCENDANT_ACTIVE_ONE: u8 = 12;
-const HELPER_STAGE_DESCENDANT_ACTIVE_OVERBOUND: u8 = 13;
-const HELPER_STAGE_DESCENDANT_TARGET_EXIT: u8 = 14;
 const HELPER_STAGE_READY: u8 = 15;
 const HELPER_STAGE_WAIT: u8 = 16;
 const HELPER_STAGE_EXIT_CODE: u8 = 17;
@@ -1073,11 +1062,10 @@ fn run_target_probe(mut args: std::env::ArgsOs) -> Result<i32, String> {
             if std::fs::read(denied_read).is_ok() {
                 return Ok(41);
             }
-            Ok(if std::fs::write(denied_write, b"outside").is_ok() {
-                42
-            } else {
-                0
-            })
+            if std::fs::write(denied_write, b"outside").is_ok() {
+                return Ok(42);
+            }
+            Ok(run_descendant_token_probe())
         }
         value if value == OsStr::new(TARGET_CONFIGURED_ARG) => {
             let readable = target_probe_path(&mut args, "configured read path")?;
@@ -1303,7 +1291,6 @@ fn run_helper() -> Result<i32, String> {
     let mut arguments = request.arguments;
     let authority_probe_requested =
         arguments.first().map(String::as_str) == Some(AUTHORITY_PROBE_ARG);
-    let mut descendant_attestation = None;
     if authority_probe_requested {
         let helper_pid = arguments
             .get_mut(1)
@@ -1320,10 +1307,6 @@ fn run_helper() -> Result<i32, String> {
             .filter(|value| value.as_str() == OMITTED_HANDLE_PLACEHOLDER)
             .ok_or("invalid omitted-handle placeholder")?;
         *omitted = (omitted_handle.raw() as usize).to_string();
-        let release = cwd.join(format!(
-            ".mini-agent-descendant-release-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
         let control_root = arguments
             .get_mut(6)
             .filter(|value| value.as_str() == CONTROL_ROOT_PLACEHOLDER)
@@ -1335,12 +1318,6 @@ fn run_helper() -> Result<i32, String> {
             .ok_or("AppContainer journal control root missing")?
             .to_string_lossy()
             .into_owned();
-        let descendant_release = arguments
-            .get_mut(7)
-            .filter(|value| value.as_str() == DESCENDANT_RELEASE_PLACEHOLDER)
-            .ok_or("invalid descendant-release placeholder")?;
-        *descendant_release = release.to_string_lossy().into_owned();
-        descendant_attestation = Some(release);
     }
     grants.disarm_for_launch();
     mark_helper_stage(HELPER_STAGE_LAUNCH);
@@ -1364,20 +1341,6 @@ fn run_helper() -> Result<i32, String> {
         }
     };
     mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
-    if let Some(release) = descendant_attestation {
-        mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-        if let Err(error) = verify_descendant_membership(&job, &child, &release) {
-            let target_exit = completed_process_exit_code(&child)?;
-            terminate_and_drain_job(&job, 126)?;
-            grants.mark_job_quiescent();
-            grants.cleanup()?;
-            if let Some(code) = target_exit.filter(|code| *code != 0) {
-                return i32::try_from(code)
-                    .map_err(|_| "sandbox target returned an invalid exit code".to_string());
-            }
-            return Err(error);
-        }
-    }
     mark_helper_stage(HELPER_STAGE_READY);
     if let Some(path) = ready_path
         && let Err(error) = std::fs::OpenOptions::new()
@@ -2565,106 +2528,6 @@ fn verify_job_membership_and_limits(job: &Handle, child: &Handle) -> Result<(), 
     Ok(())
 }
 
-fn verify_descendant_membership(
-    job: &Handle,
-    target: &Handle,
-    release: &Path,
-) -> Result<(), String> {
-    mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-    wait_for_gated_descendant(job, target)?;
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_LIMITS);
-    verify_job_limits(job)?;
-    if active_job_processes(job)? != 2 {
-        return Err(
-            "sandbox: exact Job did not contain only target and suspended descendant".into(),
-        );
-    }
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_RELEASE);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(release)
-        .and_then(|mut file| file.write_all(b"release\n"))
-        .map_err(|error| format!("release exact-Job descendant probe: {error}"))?;
-    Ok(())
-}
-
-fn wait_for_gated_descendant(job: &Handle, target: &Handle) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let active = active_job_processes(job)?;
-        if active == 2 {
-            break;
-        }
-        if active > 2 {
-            mark_helper_stage(HELPER_STAGE_DESCENDANT_ACTIVE_OVERBOUND);
-            return Err(
-                "sandbox: exact Job exceeded the two-process descendant proof bound".into(),
-            );
-        }
-        mark_helper_stage(if active == 0 {
-            HELPER_STAGE_DESCENDANT_ACTIVE_ZERO
-        } else {
-            HELPER_STAGE_DESCENDANT_ACTIVE_ONE
-        });
-        if completed_process_exit_code(target)?.is_some() {
-            mark_helper_stage(HELPER_STAGE_DESCENDANT_TARGET_EXIT);
-            return Err("sandbox: authority target exited before creating its descendant".into());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err("timed out waiting for Job-gated AppContainer descendant".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    let bytes = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
-        + (MAX_JOB_PROCESSES as usize - 1) * size_of::<usize>();
-    let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_QUERY);
-    if unsafe {
-        QueryInformationJobObject(
-            job.raw(),
-            JobObjectBasicProcessIdList,
-            storage.as_mut_ptr().cast(),
-            bytes as u32,
-            null_mut(),
-        )
-    } == 0
-    {
-        return Err(last_error("query exact Job process identity list"));
-    }
-    let list = unsafe { &*storage.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-    if list.NumberOfAssignedProcesses != 2 || list.NumberOfProcessIdsInList != 2 {
-        return Err("sandbox: exact Job process identity list was not complete and bounded".into());
-    }
-    mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_RESULT);
-    let process_ids = unsafe {
-        std::slice::from_raw_parts(
-            list.ProcessIdList.as_ptr(),
-            list.NumberOfProcessIdsInList as usize,
-        )
-    };
-    let target_pid = unsafe { GetProcessId(target.raw()) } as usize;
-    let mut saw_target = false;
-    let mut descendant_pid = None;
-    for &pid in process_ids {
-        if pid == target_pid {
-            saw_target = true;
-        } else if pid != 0 && descendant_pid.replace(pid).is_some() {
-            return Err("sandbox: exact Job named multiple possible descendants".into());
-        }
-    }
-    if !saw_target {
-        return Err("sandbox: exact Job process list omitted the AppContainer target".into());
-    }
-    let descendant_pid =
-        descendant_pid.ok_or("sandbox: exact Job process list omitted the descendant")?;
-    if u32::try_from(descendant_pid).is_err() {
-        return Err("sandbox: exact Job descendant PID exceeded Windows bounds".into());
-    }
-    Ok(())
-}
-
 fn active_job_processes(job: &Handle) -> Result<u32, String> {
     let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
     if unsafe {
@@ -3410,7 +3273,6 @@ fn run_runtime_probe() -> Result<i32, String> {
             DESKTOP_NAME_PLACEHOLDER.into(),
             OMITTED_HANDLE_PLACEHOLDER.into(),
             CONTROL_ROOT_PLACEHOLDER.into(),
-            DESCENDANT_RELEASE_PLACEHOLDER.into(),
         ],
         &workspace_b,
         &cache,
@@ -3709,9 +3571,6 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     let Some(control_root) = args.next().map(PathBuf::from) else {
         return AUTHORITY_ARGUMENT_ERROR;
     };
-    let Some(descendant_release) = args.next().map(PathBuf::from) else {
-        return AUTHORITY_ARGUMENT_ERROR;
-    };
     if args.next().is_some() || outside.exists() {
         return AUTHORITY_ARGUMENT_ERROR;
     }
@@ -3751,28 +3610,9 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     {
         return 90;
     }
-    let Ok(executable) = std::env::current_exe() else {
-        return AUTHORITY_CURRENT_EXE_ERROR;
-    };
-    let mut descendant_command = Command::new(executable);
-    descendant_command
-        .arg(DESCENDANT_PROBE_ARG)
-        .arg(&descendant_release)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut descendant = match descendant_command.spawn_guarded() {
-        Ok(descendant) => descendant,
-        Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
-    };
-    let descendant_status = match descendant.wait() {
-        Ok(status) => status,
-        Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,
-    };
-    if !descendant_status.success() {
-        return descendant_status
-            .code()
-            .unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE);
+    let descendant_status = run_descendant_token_probe();
+    if descendant_status != 0 {
+        return descendant_status;
     }
     let Ok(breakaway_executable) = std::env::current_exe() else {
         return AUTHORITY_BREAKAWAY_EXE_ERROR;
@@ -3815,10 +3655,38 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     0
 }
 
-fn run_descendant_probe(mut args: std::env::ArgsOs) -> i32 {
-    let Some(release) = args.next().map(PathBuf::from) else {
-        return DESCENDANT_ARGUMENT_ERROR;
+fn run_descendant_token_probe() -> i32 {
+    let Ok(executable) = std::env::current_exe() else {
+        return AUTHORITY_CURRENT_EXE_ERROR;
     };
+    // The child independently proves that ordinary tool descendants retain the zero-capability
+    // AppContainer token. Lifetime containment is attested separately by the parent-death probe:
+    // Windows can place an AppContainer process tree in a system-managed Job whose descendants do
+    // not appear as additional processes in this launcher's private Job accounting.
+    let mut descendant_command = Command::new(executable);
+    descendant_command
+        .arg(DESCENDANT_PROBE_ARG)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut descendant = match descendant_command.spawn_guarded() {
+        Ok(descendant) => descendant,
+        Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
+    };
+    let descendant_status = match descendant.wait() {
+        Ok(status) => status,
+        Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,
+    };
+    if descendant_status.success() {
+        0
+    } else {
+        descendant_status
+            .code()
+            .unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE)
+    }
+}
+
+fn run_descendant_probe(mut args: std::env::ArgsOs) -> i32 {
     if args.next().is_some() {
         return DESCENDANT_ARGUMENT_ERROR;
     }
@@ -3833,19 +3701,6 @@ fn run_descendant_probe(mut args: std::env::ArgsOs) -> i32 {
     };
     if !is_appcontainer {
         return 2;
-    }
-    let started = std::time::Instant::now();
-    let minimum_observation = started + std::time::Duration::from_secs(1);
-    let deadline = started + std::time::Duration::from_secs(15);
-    loop {
-        let now = std::time::Instant::now();
-        if now >= minimum_observation && release.exists() {
-            break;
-        }
-        if now >= deadline {
-            return 3;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     0
 }
@@ -4159,21 +4014,6 @@ fn process_token_is_acquirable(pid: u32, outside: &Path) -> bool {
     // Obtaining TOKEN_DUPLICATE authority over a trusted token is itself a containment failure,
     // even if a later API happens to reject this particular impersonation attempt.
     true
-}
-
-fn completed_process_exit_code(process: &Handle) -> Result<Option<u32>, String> {
-    match unsafe { WaitForSingleObject(process.raw(), 0) } {
-        WAIT_OBJECT_0 => {
-            let mut code = 0u32;
-            if unsafe { GetExitCodeProcess(process.raw(), &mut code) } == 0 {
-                return Err(last_error("read completed sandbox target exit code"));
-            }
-            Ok(Some(code))
-        }
-        WAIT_TIMEOUT => Ok(None),
-        WAIT_FAILED => Err(last_error("query sandbox target completion")),
-        _ => Err("sandbox: target completion returned an invalid wait result".into()),
-    }
 }
 
 fn wait_for_probe_file(path: &Path) -> Result<(), String> {
