@@ -134,7 +134,11 @@ jobs:
           test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
-          "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            cross run --release --target "${{ matrix.target }}" -- --version | grep -Fq -- "$CANONICAL_BINARY "
+          else
+            "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
+          fi
           rm -rf "$smoke_dir"
 
       - name: Build static lite binary (${{ matrix.target }})
@@ -147,7 +151,11 @@ jobs:
           test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
-          "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            cross run --release --no-default-features --target "${{ matrix.target }}" -- --version | grep -Fq -- "$CANONICAL_BINARY "
+          else
+            "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
+          fi
           rm -rf "$smoke_dir"
 
       - name: Upload archives

@@ -286,6 +286,24 @@ steps:
 
         self.assertTrue(any("x86_64 hosts" in error for error in errors))
 
+    def test_static_arm_release_smokes_require_cross_runner(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        commands = (
+            'cross run --release --target "${{ matrix.target }}" -- --version',
+            'cross run --release --no-default-features --target '
+            '"${{ matrix.target }}" -- --version',
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                modified = workflow.replace(command, "true", 1)
+                errors = CHECK_PACKAGE_METADATA.validate_workflow(
+                    modified, "mini-agent"
+                )
+                self.assertTrue(any(command in error for error in errors))
+
     def test_checked_in_cross_images_are_reviewed_and_immutable(self) -> None:
         cross_config = (SCRIPT.parents[1] / "Cross.toml").read_text(
             encoding="utf-8"
