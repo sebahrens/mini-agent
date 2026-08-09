@@ -2528,9 +2528,9 @@ mod sandbox_tests {
             "STALE_JOB_CLEANUP_EXIT_CODE",
             "job_name",
             "wait_for_stale_job_quiescence",
-            "verify_descendant_rendezvous",
+            "verify_descendant_membership",
+            "read_descendant_handle_proof",
             "active_job_processes",
-            "wait_for_descendant_membership",
             "wait_for_exact_probe_file",
             "creation-time Job did not contain exactly its suspended target",
             "CREATE_BREAKAWAY_FROM_JOB",
@@ -2687,7 +2687,7 @@ mod sandbox_tests {
             .find("launch_appcontainer(")
             .expect("AppContainer launch missing");
         assert!(disarm < launch);
-        assert!(helper.contains("verify_descendant_rendezvous(&job, &child, &release)"));
+        assert!(helper.contains("verify_descendant_membership("));
         assert!(helper.contains("terminate_and_drain_job(&job, 126)?;\n        grants.mark_job_quiescent();\n        grants.cleanup()?;"));
 
         let profile_creation = source
@@ -2740,12 +2740,14 @@ mod sandbox_tests {
         );
 
         let descendant_verification = source
-            .split("fn verify_descendant_rendezvous(")
+            .split("fn verify_descendant_membership(")
             .nth(1)
-            .and_then(|source| source.split("fn verify_job_limits(").next())
-            .expect("descendant rendezvous implementation missing");
-        assert!(descendant_verification.contains("wait_for_descendant_membership(job, target)?"));
-        assert!(!descendant_verification.contains("wait_for_probe_file(ready)?"));
+            .and_then(|source| source.split("fn read_descendant_handle_proof(").next())
+            .expect("descendant membership implementation missing");
+        assert!(descendant_verification.contains("DuplicateHandle("));
+        assert!(descendant_verification.contains("IsProcessInJob("));
+        assert!(descendant_verification.contains("verify_job_limits(job)?"));
+        assert!(descendant_verification.contains("escaped its exact bounded Job"));
 
         let parent_probe = source
             .split("fn run_parent_probe(")
