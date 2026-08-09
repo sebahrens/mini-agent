@@ -1296,6 +1296,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
+        "let mut descendant_command = Command::new(executable);",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut descendant = match descendant_command.spawn() {",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
         "let mut breakaway = Command::new(breakaway_executable);",
         1,
         "TC-INTERNAL-VERIFICATION",
@@ -2942,6 +2954,18 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         "let mut parent = Command::new(executable)",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut descendant_command = Command::new(executable);",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "let mut descendant = match descendant_command.spawn() {",
         1,
         "TC-INTERNAL-VERIFICATION",
     ),

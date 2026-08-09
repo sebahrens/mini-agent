@@ -125,8 +125,6 @@ const AUTHORITY_BREAKAWAY_EXE_ERROR: i32 = 110;
 const AUTHORITY_BREAKAWAY_RESULT_ERROR: i32 = 111;
 const AUTHORITY_CAPABILITY_QUERY_ERROR: i32 = 112;
 const AUTHORITY_LOOPBACK_QUERY_ERROR: i32 = 113;
-const AUTHORITY_DESCENDANT_RELEASE_TIMEOUT: i32 = 114;
-const AUTHORITY_DESCENDANT_RESUME_ERROR: i32 = 115;
 const DESCENDANT_ARGUMENT_ERROR: i32 = 119;
 const DESCENDANT_CAPABILITY_QUERY_ERROR: i32 = 120;
 const DESCENDANT_APPCONTAINER_QUERY_ERROR: i32 = 121;
@@ -2569,7 +2567,7 @@ fn verify_descendant_membership(
     release: &Path,
 ) -> Result<(), String> {
     mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
-    wait_for_suspended_descendant(job, target)?;
+    wait_for_gated_descendant(job, target)?;
     mark_helper_stage(HELPER_STAGE_DESCENDANT_JOB_LIMITS);
     verify_job_limits(job)?;
     if active_job_processes(job)? != 2 {
@@ -2587,7 +2585,7 @@ fn verify_descendant_membership(
     Ok(())
 }
 
-fn wait_for_suspended_descendant(job: &Handle, target: &Handle) -> Result<(), String> {
+fn wait_for_gated_descendant(job: &Handle, target: &Handle) -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let active = active_job_processes(job)?;
@@ -2603,7 +2601,7 @@ fn wait_for_suspended_descendant(job: &Handle, target: &Handle) -> Result<(), St
             return Err("sandbox: authority target exited before creating its descendant".into());
         }
         if std::time::Instant::now() >= deadline {
-            return Err("timed out waiting for suspended AppContainer descendant".into());
+            return Err("timed out waiting for Job-gated AppContainer descendant".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -3745,78 +3743,25 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     let Ok(executable) = std::env::current_exe() else {
         return AUTHORITY_CURRENT_EXE_ERROR;
     };
-    let application = match wide_null(executable.as_os_str()) {
-        Ok(application) => application,
+    let mut descendant_command = Command::new(executable);
+    descendant_command
+        .arg(DESCENDANT_PROBE_ARG)
+        .arg(&descendant_release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut descendant = match descendant_command.spawn_guarded() {
+        Ok(descendant) => descendant,
         Err(_) => return AUTHORITY_DESCENDANT_SPAWN_FAILED,
     };
-    let descendant_arguments = [
-        DESCENDANT_PROBE_ARG.to_string(),
-        descendant_release.to_string_lossy().into_owned(),
-    ];
-    let mut command_line = wide_string(&windows_command_line(&executable, &descendant_arguments));
-    let startup = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        ..STARTUPINFOW::default()
+    let descendant_status = match descendant.wait() {
+        Ok(status) => status,
+        Err(_) => return AUTHORITY_DESCENDANT_WAIT_FAILED,
     };
-    let mut information = PROCESS_INFORMATION::default();
-    let Ok(creation) = crate::process_creation::creation_guard() else {
-        return AUTHORITY_DESCENDANT_SPAWN_FAILED;
-    };
-    let created = unsafe {
-        CreateProcessW(
-            application.as_ptr(),
-            command_line.as_mut_ptr(),
-            null(),
-            null(),
-            FALSE,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-            null(),
-            null(),
-            &startup,
-            &mut information,
-        )
-    };
-    drop(creation);
-    if created == 0 {
-        return AUTHORITY_DESCENDANT_SPAWN_FAILED;
-    }
-    let descendant = match Handle::created(information.hProcess, "own authority descendant") {
-        Ok(descendant) => descendant,
-        Err(_) => {
-            unsafe { CloseHandle(information.hThread) };
-            return AUTHORITY_DESCENDANT_SPAWN_FAILED;
-        }
-    };
-    let descendant_thread =
-        match Handle::created(information.hThread, "own authority descendant thread") {
-            Ok(thread) => thread,
-            Err(_) => {
-                unsafe { TerminateProcess(descendant.raw(), 126) };
-                return AUTHORITY_DESCENDANT_SPAWN_FAILED;
-            }
-        };
-    let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !descendant_release.exists() {
-        if std::time::Instant::now() >= release_deadline {
-            unsafe { TerminateProcess(descendant.raw(), 126) };
-            return AUTHORITY_DESCENDANT_RELEASE_TIMEOUT;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    if unsafe { ResumeThread(descendant_thread.raw()) } == u32::MAX {
-        unsafe { TerminateProcess(descendant.raw(), 126) };
-        return AUTHORITY_DESCENDANT_RESUME_ERROR;
-    }
-    drop(descendant_thread);
-    if unsafe { WaitForSingleObject(descendant.raw(), u32::MAX) } != WAIT_OBJECT_0 {
-        return AUTHORITY_DESCENDANT_WAIT_FAILED;
-    }
-    let mut descendant_code = 0u32;
-    if unsafe { GetExitCodeProcess(descendant.raw(), &mut descendant_code) } == 0 {
-        return AUTHORITY_DESCENDANT_NO_EXIT_CODE;
-    }
-    if descendant_code != 0 {
-        return i32::try_from(descendant_code).unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE);
+    if !descendant_status.success() {
+        return descendant_status
+            .code()
+            .unwrap_or(AUTHORITY_DESCENDANT_NO_EXIT_CODE);
     }
     let Ok(breakaway_executable) = std::env::current_exe() else {
         return AUTHORITY_BREAKAWAY_EXE_ERROR;

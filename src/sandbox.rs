@@ -2529,7 +2529,7 @@ mod sandbox_tests {
             "job_name",
             "wait_for_stale_job_quiescence",
             "verify_descendant_membership",
-            "wait_for_suspended_descendant",
+            "wait_for_gated_descendant",
             "JobObjectBasicProcessIdList",
             "JOBOBJECT_BASIC_PROCESS_ID_LIST",
             "active_job_processes",
@@ -2769,24 +2769,24 @@ mod sandbox_tests {
         let descendant_verification = source
             .split("fn verify_descendant_membership(")
             .nth(1)
-            .and_then(|source| source.split("fn wait_for_suspended_descendant(").next())
+            .and_then(|source| source.split("fn wait_for_gated_descendant(").next())
             .expect("descendant membership implementation missing");
-        assert!(descendant_verification.contains("wait_for_suspended_descendant(job, target)?"));
+        assert!(descendant_verification.contains("wait_for_gated_descendant(job, target)?"));
         assert!(descendant_verification.contains("verify_job_limits(job)?"));
         assert!(descendant_verification.contains("active_job_processes(job)? != 2"));
 
         let descendant_discovery = source
-            .split("fn wait_for_suspended_descendant(")
+            .split("fn wait_for_gated_descendant(")
             .nth(1)
             .and_then(|source| source.split("fn active_job_processes(").next())
-            .expect("suspended descendant discovery implementation missing");
+            .expect("Job-gated descendant discovery implementation missing");
         assert!(descendant_discovery.contains("JobObjectBasicProcessIdList"));
         assert!(descendant_discovery.contains("NumberOfAssignedProcesses != 2"));
         assert!(descendant_discovery.contains("NumberOfProcessIdsInList != 2"));
         assert!(descendant_discovery.contains("GetProcessId(target.raw())"));
         assert!(
             descendant_discovery
-                .contains("timed out waiting for suspended AppContainer descendant")
+                .contains("timed out waiting for Job-gated AppContainer descendant")
         );
 
         let authority_probe = source
@@ -2794,15 +2794,16 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn run_descendant_probe(").next())
             .expect("authority descendant implementation missing");
-        assert!(authority_probe.contains("CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT"));
-        assert!(authority_probe.contains("ResumeThread(descendant_thread.raw())"));
-        let descendant_release_wait = authority_probe
-            .find("while !descendant_release.exists()")
-            .expect("suspended descendant release wait missing");
-        let descendant_resume = authority_probe
-            .find("ResumeThread(descendant_thread.raw())")
-            .expect("suspended descendant resume missing");
-        assert!(descendant_release_wait < descendant_resume);
+        assert!(authority_probe.contains(&["descendant_command", "spawn_guarded()"].join(".")));
+        assert!(authority_probe.contains(".arg(&descendant_release)"));
+        assert!(authority_probe.contains(".stdin(Stdio::null())"));
+
+        let descendant_probe = source
+            .split("fn run_descendant_probe(")
+            .nth(1)
+            .and_then(|source| source.split("fn token_is_appcontainer(").next())
+            .expect("Job-gated descendant probe implementation missing");
+        assert!(descendant_probe.contains("while !release.exists()"));
 
         let parent_probe = source
             .split("fn run_parent_probe(")
