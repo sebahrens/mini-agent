@@ -2116,11 +2116,15 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo,
-        SetFileInformationByHandle,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
     };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     let stage_parent = stage
         .parent()
@@ -2132,6 +2136,31 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "staged directory and target do not share a parent",
+        ));
+    }
+    let parent_identity = crate::fs::checked_path_metadata(canonical_parent)?;
+    if portable::is_link_or_reparse(&parent_identity) || !parent_identity.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "migration parent is not a real directory",
+        ));
+    }
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    let destination_parent = std::fs::OpenOptions::new()
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(canonical_parent)?;
+    crate::fs::ensure_same_file(
+        canonical_parent,
+        &parent_identity,
+        &crate::fs::checked_file_metadata(&destination_parent)?,
+    )?;
+    let stage_identity = crate::fs::checked_path_metadata(stage)?;
+    if portable::is_link_or_reparse(&stage_identity) || !stage_identity.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "migration stage is not a real directory",
         ));
     }
     match std::fs::symlink_metadata(canonical) {
@@ -2151,12 +2180,16 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     let source = std::fs::OpenOptions::new()
         .access_mode(DELETE)
         .share_mode(share)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(stage)?;
+    crate::fs::ensure_same_file(
+        stage,
+        &stage_identity,
+        &crate::fs::checked_file_metadata(&source)?,
+    )?;
     let target_name = canonical
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no filename"))?
@@ -2171,7 +2204,7 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
                 "migration target name is too long",
             )
         })?;
-    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
     let total_bytes = header_bytes
         .checked_add(name_bytes)
         .and_then(|bytes| bytes.checked_add(size_of::<u16>()))
@@ -2182,16 +2215,20 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
             )
         })?;
     let mut storage = vec![0usize; total_bytes.div_ceil(size_of::<usize>())];
-    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    crate::fs::ensure_same_file(
+        canonical_parent,
+        &parent_identity,
+        &crate::fs::checked_path_metadata(canonical_parent)?,
+    )?;
     // SAFETY: `storage` is pointer-aligned and sized for the fixed header, the
-    // complete UTF-16 target name, and its trailing zero. The source handle and
-    // buffer remain live for the synchronous system call.
+    // complete UTF-16 target name, and its trailing zero. The source and
+    // identity-verified destination-parent handles and buffer remain live for
+    // the synchronous system call.
+    let mut io_status = IO_STATUS_BLOCK::default();
     unsafe {
         (*information).Anonymous.ReplaceIfExists = false;
-        // A simple name with a null RootDirectory renames within the source's
-        // current directory. This avoids re-resolving hosted-runner absolute
-        // path namespaces as a destination on another Windows device.
-        (*information).RootDirectory = std::ptr::null_mut();
+        (*information).RootDirectory = destination_parent.as_raw_handle().cast();
         (*information).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2203,9 +2240,9 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
             std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
             target_name.len(),
         );
-        if SetFileInformationByHandle(
+        let status = NtSetInformationFile(
             source.as_raw_handle().cast(),
-            FileRenameInfo,
+            &mut io_status,
             information.cast(),
             u32::try_from(total_bytes).map_err(|_| {
                 io::Error::new(
@@ -2213,9 +2250,12 @@ fn publish_staged_directory(stage: &Path, canonical: &Path) -> io::Result<()> {
                     "migration rename buffer is too large",
                 )
             })?,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
+            FileRenameInformation,
+        );
+        if status < 0 {
+            return Err(io::Error::from_raw_os_error(
+                RtlNtStatusToDosError(status) as i32
+            ));
         }
     }
     Ok(())
@@ -2779,7 +2819,11 @@ mod tests {
             .expect("end of Windows directory publication implementation");
 
         assert!(windows_publication.contains(".file_name()"));
-        assert!(windows_publication.contains("RootDirectory = std::ptr::null_mut()"));
+        assert!(windows_publication.contains("NtSetInformationFile"));
+        assert!(
+            windows_publication
+                .contains("RootDirectory = destination_parent.as_raw_handle().cast()")
+        );
         assert!(!windows_publication.contains("canonical.as_os_str().encode_wide()"));
     }
 
