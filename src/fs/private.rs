@@ -315,8 +315,8 @@ mod windows {
     const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
     const FILE_FLAG_WRITE_THROUGH: Dword = 0x8000_0000;
+    const MOVEFILE_REPLACE_EXISTING: Dword = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: Dword = 0x0000_0008;
-    const REPLACEFILE_WRITE_THROUGH: Dword = 0x0000_0001;
     const SDDL_REVISION_1: Dword = 1;
     const SE_FILE_OBJECT: Dword = 1;
     const OWNER_SECURITY_INFORMATION: Dword = 0x0000_0001;
@@ -437,14 +437,6 @@ mod windows {
         fn GetLastError() -> Dword;
         fn LocalFree(memory: LocalHandle) -> LocalHandle;
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: Dword) -> Bool;
-        fn ReplaceFileW(
-            replaced: *const u16,
-            replacement: *const u16,
-            backup: *const u16,
-            flags: Dword,
-            exclude: *mut c_void,
-            reserved: *mut c_void,
-        ) -> Bool;
     }
 
     struct SecurityDescriptor(*mut c_void);
@@ -830,26 +822,13 @@ mod windows {
 
             let target_wide = wide(path.as_os_str());
             let temp_wide = wide(temp.as_os_str());
-            let replaced = if !create_only && std::fs::symlink_metadata(path).is_ok() {
-                unsafe {
-                    ReplaceFileW(
-                        target_wide.as_ptr(),
-                        temp_wide.as_ptr(),
-                        null(),
-                        REPLACEFILE_WRITE_THROUGH,
-                        null_mut(),
-                        null_mut(),
-                    )
-                }
-            } else {
-                unsafe {
-                    MoveFileExW(
-                        temp_wide.as_ptr(),
-                        target_wide.as_ptr(),
-                        MOVEFILE_WRITE_THROUGH,
-                    )
-                }
-            };
+            let flags = MOVEFILE_WRITE_THROUGH
+                | if create_only {
+                    0
+                } else {
+                    MOVEFILE_REPLACE_EXISTING
+                };
+            let replaced = unsafe { MoveFileExW(temp_wide.as_ptr(), target_wide.as_ptr(), flags) };
             if replaced == 0 {
                 return Err(std::io::Error::last_os_error());
             }

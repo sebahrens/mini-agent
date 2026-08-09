@@ -81,7 +81,6 @@ async fn atomic_write_security_creates_new_file_with_restrictive_permissions() {
     assert_eq!(mode, 0o600);
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn overwrites_existing_file() {
     let dir = TempDir::new("overwrite");
@@ -89,21 +88,6 @@ async fn overwrites_existing_file() {
     std::fs::write(&f, b"old contents").unwrap();
     atomic_write(&f, b"new contents").await.unwrap();
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "new contents");
-    assert_eq!(temp_residue(dir.path()), 0);
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn windows_atomic_replace_fails_closed_and_preserves_existing_file() {
-    let dir = TempDir::new("windows_replace_unsupported");
-    let target = dir.join("target.txt");
-    std::fs::write(&target, b"prior contents").unwrap();
-
-    let error = atomic_write(&target, b"must-not-publish")
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-    assert_eq!(std::fs::read(&target).unwrap(), b"prior contents");
     assert_eq!(temp_residue(dir.path()), 0);
 }
 
@@ -369,6 +353,7 @@ fn windows_atomic_temp_creation_is_relative_to_verified_directory_handle() {
     assert!(source.contains("NtSetInformationFile"));
     assert!(source.contains("RootDirectory: directory.as_raw_handle().cast()"));
     assert!(source.contains("RootDirectory = directory.as_raw_handle().cast()"));
+    assert!(source.contains("ReplaceIfExists = replace"));
     assert!(source.contains("FILE_TRAVERSE | FILE_READ_ATTRIBUTES"));
     assert!(source.contains("ensure_same_file(path, expected, &opened)"));
     assert!(source.contains("FILE_CREATE"));
@@ -378,7 +363,7 @@ fn windows_atomic_temp_creation_is_relative_to_verified_directory_handle() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn windows_atomic_replace_fails_closed_after_parent_rename_and_leaf_swap() {
+async fn windows_atomic_replace_publishes_to_the_current_verified_target() {
     let container = TempDir::new("windows_replace_parent_swap");
     let approved_path = container.join("approved");
     let moved_approved_path = container.join("approved-held");
@@ -393,14 +378,9 @@ async fn windows_atomic_replace_fails_closed_after_parent_rename_and_leaf_swap()
     std::fs::rename(&moved_target, &displaced).unwrap();
     std::fs::rename(&attacker, &moved_target).unwrap();
 
-    assert!(
-        atomic_write(&moved_target, b"must-not-publish")
-            .await
-            .is_err()
-    );
-    let attacker_contents = std::fs::read(&moved_target).unwrap();
-    assert_eq!(attacker_contents, b"attacker-y");
-    assert_ne!(attacker_contents, b"must-not-publish");
+    atomic_write(&moved_target, b"replacement").await.unwrap();
+    assert_eq!(std::fs::read(&moved_target).unwrap(), b"replacement");
+    assert_eq!(std::fs::read(&displaced).unwrap(), b"approved-original");
 }
 
 #[cfg(windows)]

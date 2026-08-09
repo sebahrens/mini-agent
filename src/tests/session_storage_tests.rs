@@ -857,6 +857,13 @@ fn session_storage_permissions_windows_dacls_exclude_broad_principals() {
     let mut session = Session::new("openai", "gpt-4", 128000, "");
     session.id = SESSION_ID.into();
     save_session(&session).unwrap();
+    session.name = "private replacement".into();
+    save_session(&session).unwrap();
+    assert!(
+        std::fs::read_to_string(&session_path)
+            .unwrap()
+            .contains("private replacement")
+    );
     atomic_write(&lock_path, "private lock").unwrap();
     let output_path = save_tool_output(SESSION_ID, "bash", "private tool output").unwrap();
 

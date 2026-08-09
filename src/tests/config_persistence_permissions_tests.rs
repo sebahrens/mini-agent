@@ -225,6 +225,11 @@ fn config_persistence_permissions_windows_dacls_exclude_broad_principals() {
     let config_dir = root.path().join("config");
     for name in ["config.toml", "config.toml.lock", "config.toml.bak"] {
         atomic_config_write(&config_dir.join(name), "private").unwrap();
+        atomic_config_write(&config_dir.join(name), "replacement").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join(name)).unwrap(),
+            "replacement"
+        );
     }
 
     for (path, directory) in [

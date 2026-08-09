@@ -1736,6 +1736,7 @@ fn atomic_write_platform(
         directory: &std::fs::File,
         file: &std::fs::File,
         name: &std::ffi::OsStr,
+        replace: bool,
     ) -> std::io::Result<()> {
         let name: Vec<u16> = name.encode_wide().collect();
         if name.is_empty() || name.len() > (u32::MAX as usize / 2) {
@@ -1749,17 +1750,18 @@ fn atomic_write_platform(
         let words = required.div_ceil(std::mem::size_of::<usize>());
         let mut storage = vec![0usize; words];
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        // FileRenameInformation with ReplaceIfExists=false provides create-only
-        // publication. The native API accepts a relative leaf together with the
-        // same retained, identity-verified directory handle used for temp
-        // creation. The Win32 SetFileInformationByHandle wrapper does not
-        // preserve this native RootDirectory contract consistently.
+        // FileRenameInformation provides either atomic replacement or
+        // create-only publication through `ReplaceIfExists`. The native API
+        // accepts a relative leaf together with the same retained,
+        // identity-verified directory handle used for temp creation. The Win32
+        // SetFileInformationByHandle wrapper does not preserve this native
+        // RootDirectory contract consistently.
         // SAFETY: `storage` is aligned, large enough for the header and UTF-16
         // name, both handles remain live for the call, and `io_status` is valid
         // writable storage for the synchronous result.
         let mut io_status = IO_STATUS_BLOCK::default();
         let status = unsafe {
-            (*information).Anonymous.ReplaceIfExists = false;
+            (*information).Anonymous.ReplaceIfExists = replace;
             (*information).RootDirectory = directory.as_raw_handle().cast();
             (*information).FileNameLength = name_bytes as u32;
             std::ptr::copy_nonoverlapping(
@@ -1899,12 +1901,7 @@ fn atomic_write_platform(
                 "atomic create target already exists",
             ));
         }
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "atomic replacement is unsupported on Windows",
-            ));
-        }
+        Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
@@ -1978,7 +1975,8 @@ fn atomic_write_platform(
         }
     }
 
-    let publish_result = cancellation.publish(|| rename_open_file(&directory, &file, leaf));
+    let publish_result = cancellation
+        .publish(|| rename_open_file(&directory, &file, leaf, mode == AtomicWriteMode::Replace));
     if let Err(error) = publish_result {
         delete_open_file(&file);
         return Err(error);
