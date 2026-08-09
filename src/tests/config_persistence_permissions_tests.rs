@@ -92,6 +92,49 @@ fn config_persistence_permissions_ignore_permissive_umask() {
 
 #[cfg(unix)]
 #[test]
+fn config_persistence_permissions_restore_owner_read_after_restrictive_umask() {
+    const CHILD_PATH: &str = "ZS_CONFIG_RESTRICTIVE_UMASK_CHILD";
+    if let Some(config) = std::env::var_os(CHILD_PATH) {
+        atomic_config_write(Path::new(&config), "api_keys = { openai = \"secret\" }\n").unwrap();
+        return;
+    }
+
+    use std::os::unix::process::CommandExt;
+
+    let root = TempDir::new("restrictive-umask");
+    let config_dir = root.path().join("config");
+    std::fs::create_dir(&config_dir).unwrap();
+    let config = config_dir.join("config.toml");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "tests::config_persistence_permissions_tests::config_persistence_permissions_restore_owner_read_after_restrictive_umask",
+            "--nocapture",
+        ])
+        .env(CHILD_PATH, &config);
+    #[allow(unsafe_code)]
+    unsafe {
+        child.pre_exec(|| {
+            unsafe extern "C" {
+                fn umask(mask: std::os::raw::c_uint) -> std::os::raw::c_uint;
+            }
+            umask(0o400);
+            Ok(())
+        });
+    }
+    assert!(child.status().unwrap().success());
+
+    assert_eq!(mode(&config), 0o600);
+    assert_eq!(
+        read_config_content(&config).unwrap(),
+        "api_keys = { openai = \"secret\" }\n"
+    );
+    assert_eq!(atomic_temp_residue(&config_dir), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn config_persistence_permissions_repair_owned_regular_paths() {
     use std::os::unix::fs::PermissionsExt;
 

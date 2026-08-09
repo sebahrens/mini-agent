@@ -1228,6 +1228,7 @@ fn atomic_write_platform(
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::raw::{c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
 
     unsafe extern "C" {
         fn openat(directory: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
@@ -1516,6 +1517,8 @@ fn atomic_write_platform(
                 ),
             ) {
                 Ok(file) => {
+                    #[cfg(unix)]
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                     #[cfg(target_os = "macos")]
                     let identity =
                         atomic_write_stage("platform_temp_metadata", checked_file_metadata(&file))?;
