@@ -3834,9 +3834,15 @@ fn run_descendant_probe(mut args: std::env::ArgsOs) -> i32 {
     if !is_appcontainer {
         return 2;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !release.exists() {
-        if std::time::Instant::now() >= deadline {
+    let started = std::time::Instant::now();
+    let minimum_observation = started + std::time::Duration::from_secs(1);
+    let deadline = started + std::time::Duration::from_secs(15);
+    loop {
+        let now = std::time::Instant::now();
+        if now >= minimum_observation && release.exists() {
+            break;
+        }
+        if now >= deadline {
             return 3;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

@@ -2806,7 +2806,8 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn token_is_appcontainer(").next())
             .expect("Job-gated descendant probe implementation missing");
-        assert!(descendant_probe.contains("while !release.exists()"));
+        assert!(descendant_probe.contains("let minimum_observation ="));
+        assert!(descendant_probe.contains("now >= minimum_observation && release.exists()"));
 
         let parent_probe = source
             .split("fn run_parent_probe(")
