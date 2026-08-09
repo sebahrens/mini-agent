@@ -1356,7 +1356,13 @@ fn run_helper() -> Result<i32, String> {
             .filter(|value| value.as_str() == DESCENDANT_RELEASE_PLACEHOLDER)
             .ok_or("invalid descendant-release placeholder")?;
         *descendant_release = release.to_string_lossy().into_owned();
-        descendant_rendezvous = Some((ready, release));
+        let proof_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&ready)
+            .map_err(|error| format!("create descendant identity rendezvous: {error}"))?;
+        descendant_rendezvous = Some((ready, release, proof_file));
     }
     grants.disarm_for_launch();
     mark_helper_stage(HELPER_STAGE_LAUNCH);
@@ -1380,7 +1386,7 @@ fn run_helper() -> Result<i32, String> {
         }
     };
     mark_helper_stage(HELPER_STAGE_VERIFY_JOB);
-    if let Some((ready, release)) = descendant_rendezvous {
+    if let Some((ready, release, _proof_file)) = descendant_rendezvous {
         mark_helper_stage(HELPER_STAGE_VERIFY_DESCENDANT);
         if let Err(error) = verify_descendant_rendezvous(&job, &child, &ready, &release) {
             let target_exit = completed_process_exit_code(&child)?;
@@ -3790,7 +3796,7 @@ fn run_authority_probe(mut args: std::env::ArgsOs) -> i32 {
     let proof = format!("{}\n{}\n", descendant.id(), created);
     if std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .truncate(true)
         .open(&descendant_ready)
         .and_then(|mut file| file.write_all(proof.as_bytes()))
         .is_err()

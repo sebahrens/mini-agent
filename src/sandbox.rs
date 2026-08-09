@@ -2529,6 +2529,7 @@ mod sandbox_tests {
             "job_name",
             "wait_for_stale_job_quiescence",
             "verify_descendant_rendezvous",
+            "create descendant identity rendezvous",
             "wait_for_descendant_identity",
             "parse_descendant_identity",
             "wait_for_exact_probe_file",
