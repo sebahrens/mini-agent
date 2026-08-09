@@ -1046,32 +1046,55 @@ fn atomic_write_within_sync_impl(
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
-    cancellation.check()?;
-    let approved_root = absolute_lexical(approved_root)?;
-    let path = absolute_lexical(path)?;
-    let (relative_parent, leaf) = relative_target(&approved_root, &path)?;
-    let approved_root_metadata = checked_path_metadata(&approved_root)?;
+    atomic_write_stage("initial_cancellation", cancellation.check())?;
+    let approved_root = atomic_write_stage("absolute_root", absolute_lexical(approved_root))?;
+    let path = atomic_write_stage("absolute_path", absolute_lexical(path))?;
+    let (relative_parent, leaf) =
+        atomic_write_stage("relative_target", relative_target(&approved_root, &path))?;
+    let approved_root_metadata = atomic_write_stage(
+        "approved_root_metadata",
+        checked_path_metadata(&approved_root),
+    )?;
     if approved_root_metadata.file_type().is_symlink() || !approved_root_metadata.is_dir() {
         return Err(path_changed_error(&approved_root));
     }
-    let canonical_root = std::fs::canonicalize(&approved_root)?;
-    ensure_same_file(
-        &approved_root,
-        &approved_root_metadata,
-        &checked_path_metadata(&canonical_root)?,
+    let canonical_root =
+        atomic_write_stage("canonical_root", std::fs::canonicalize(&approved_root))?;
+    let canonical_root_metadata = atomic_write_stage(
+        "canonical_root_metadata",
+        checked_path_metadata(&canonical_root),
+    )?;
+    atomic_write_stage(
+        "canonical_root_identity",
+        ensure_same_file(
+            &approved_root,
+            &approved_root_metadata,
+            &canonical_root_metadata,
+        ),
     )?;
 
-    atomic_write_platform(
-        &canonical_root,
-        &relative_parent,
-        leaf,
-        contents,
-        &approved_root_metadata,
-        approved_parent,
-        mode,
-        failure,
-        cancellation,
+    atomic_write_stage(
+        "platform_publication",
+        atomic_write_platform(
+            &canonical_root,
+            &relative_parent,
+            leaf,
+            contents,
+            &approved_root_metadata,
+            approved_parent,
+            mode,
+            failure,
+            cancellation,
+        ),
     )
+}
+
+fn atomic_write_stage<T>(_stage: &'static str, result: std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(test)]
+    if result.is_err() {
+        eprintln!("ATOMIC_WRITE_FAILED={_stage}");
+    }
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -1217,11 +1240,17 @@ fn atomic_write_platform(
         relative_parent: &Path,
         approved_root: &CheckedMetadata,
     ) -> std::io::Result<File> {
-        let mut directory = open_absolute_directory(canonical_root)?;
-        ensure_same_file(
-            canonical_root,
-            approved_root,
-            &checked_file_metadata(&directory)?,
+        let mut directory = atomic_write_stage(
+            "platform_open_absolute_root",
+            open_absolute_directory(canonical_root),
+        )?;
+        let opened_root = atomic_write_stage(
+            "platform_opened_root_metadata",
+            checked_file_metadata(&directory),
+        )?;
+        atomic_write_stage(
+            "platform_opened_root_identity",
+            ensure_same_file(canonical_root, approved_root, &opened_root),
         )?;
         for component in relative_parent.components() {
             let std::path::Component::Normal(name) = component else {
@@ -1230,7 +1259,10 @@ fn atomic_write_platform(
                     "relative parent contains an invalid component",
                 ));
             };
-            directory = open_directory_at(&directory, name)?;
+            directory = atomic_write_stage(
+                "platform_open_relative_parent",
+                open_directory_at(&directory, name),
+            )?;
         }
         Ok(directory)
     }
@@ -1361,14 +1393,21 @@ fn atomic_write_platform(
     }
 
     cancellation.check()?;
-    let directory = open_parent(canonical_root, relative_parent, approved_root)?;
-    let directory_metadata = checked_file_metadata(&directory)?;
+    let directory = atomic_write_stage(
+        "platform_open_parent",
+        open_parent(canonical_root, relative_parent, approved_root),
+    )?;
+    let directory_metadata = atomic_write_stage(
+        "platform_directory_metadata",
+        checked_file_metadata(&directory),
+    )?;
     if let Some(approved) = approved_parent {
         ensure_same_file(canonical_root, approved, &directory_metadata)?;
     }
 
     let target_path = canonical_root.join(relative_parent).join(leaf);
-    let initial_target = inspect_target(&directory, leaf)?;
+    let initial_target =
+        atomic_write_stage("platform_initial_target", inspect_target(&directory, leaf))?;
     if mode == AtomicWriteMode::CreateNew && initial_target.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -1381,15 +1420,18 @@ fn atomic_write_platform(
         for _ in 0..128 {
             let candidate = CString::new(format!(".zswrite.{}.tmp", uuid::Uuid::new_v4().simple()))
                 .expect("UUID temp name never contains NUL");
-            match open_at(
-                &directory,
-                OsStr::from_bytes(candidate.as_bytes()),
-                1 | OPEN_CREATE | OPEN_EXCLUSIVE | OPEN_NOFOLLOW | OPEN_CLOEXEC,
-                0o600,
+            match atomic_write_stage(
+                "platform_temp_create",
+                open_at(
+                    &directory,
+                    OsStr::from_bytes(candidate.as_bytes()),
+                    1 | OPEN_CREATE | OPEN_EXCLUSIVE | OPEN_NOFOLLOW | OPEN_CLOEXEC,
+                    0o600,
+                ),
             ) {
                 Ok(file) => {
                     #[cfg(target_os = "macos")]
-                    let identity = file.metadata()?;
+                    let identity = atomic_write_stage("platform_temp_metadata", file.metadata())?;
                     #[cfg(target_os = "linux")]
                     let identity = checked_file_metadata(&file)?;
                     result = Some((candidate, file, identity));
@@ -1412,8 +1454,8 @@ fn atomic_write_platform(
         if failure == AtomicWriteFailure::Write {
             return Err(std::io::Error::other("injected atomic-write failure"));
         }
-        temp.write_all(contents)?;
-        temp.flush()
+        atomic_write_stage("platform_temp_write", temp.write_all(contents))?;
+        atomic_write_stage("platform_temp_flush", temp.flush())
     })();
     if let Err(error) = write_result {
         drop(temp);
@@ -1435,10 +1477,13 @@ fn atomic_write_platform(
             return Err(error);
         }
     };
-    if let Err(error) = same_optional_target(
-        &target_path,
-        initial_target.as_ref(),
-        current_target.as_ref(),
+    if let Err(error) = atomic_write_stage(
+        "platform_target_revalidation",
+        same_optional_target(
+            &target_path,
+            initial_target.as_ref(),
+            current_target.as_ref(),
+        ),
     ) {
         drop(temp);
         unlink_owned_temp(&directory, &temp_name, &temp_identity);
@@ -1456,10 +1501,13 @@ fn atomic_write_platform(
                 return Err(error);
             }
         };
-    if let Err(error) = ensure_same_file(
-        &target_path,
-        &directory_metadata,
-        &current_directory_metadata,
+    if let Err(error) = atomic_write_stage(
+        "platform_parent_revalidation",
+        ensure_same_file(
+            &target_path,
+            &directory_metadata,
+            &current_directory_metadata,
+        ),
     ) {
         drop(temp);
         unlink_owned_temp(&directory, &temp_name, &temp_identity);
@@ -1467,7 +1515,10 @@ fn atomic_write_platform(
     }
 
     #[cfg(target_os = "macos")]
-    match temp_entry_matches(&directory, &temp_name, &temp_identity) {
+    match atomic_write_stage(
+        "platform_temp_revalidation",
+        temp_entry_matches(&directory, &temp_name, &temp_identity),
+    ) {
         Ok(true) => {}
         Ok(false) => {
             drop(temp);
@@ -1527,6 +1578,8 @@ fn atomic_write_platform(
             }
         };
     if rename_result < 0 {
+        #[cfg(test)]
+        eprintln!("ATOMIC_WRITE_FAILED=platform_rename");
         let error = std::io::Error::last_os_error();
         #[cfg(unix)]
         {
