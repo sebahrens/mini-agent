@@ -2562,7 +2562,7 @@ mod sandbox_tests {
             "let desktop = private_desktop(grants.sid())?",
             "startup.StartupInfo.lpDesktop",
             "ImpersonateLoggedOnUser",
-            "PROC_THREAD_ATTRIBUTE_JOB_LIST",
+            "AssignProcessToJobObject(job.raw(), process.raw())",
             "IsProcessInJob",
             "QueryInformationJobObject",
             "if let Err(error) = verify_job_membership_and_limits(job, &process)",
@@ -2689,6 +2689,28 @@ mod sandbox_tests {
         assert!(disarm < launch);
         assert!(helper.contains("verify_descendant_membership("));
         assert!(helper.contains("terminate_and_drain_job(&job, 126)?;\n        grants.mark_job_quiescent();\n        grants.cleanup()?;"));
+
+        let appcontainer_launch = source
+            .split("fn launch_appcontainer(")
+            .nth(1)
+            .and_then(|source| source.split("fn inheritable_duplicate(").next())
+            .expect("AppContainer launch implementation missing");
+        let create_suspended = appcontainer_launch
+            .find("CreateProcessAsUserW(")
+            .expect("suspended AppContainer creation missing");
+        let assign_job = appcontainer_launch
+            .find("AssignProcessToJobObject(job.raw(), process.raw())")
+            .expect("suspended Job assignment missing");
+        let configure_ui = appcontainer_launch
+            .find("configure_job_ui_restrictions(job)")
+            .expect("post-assignment Job UI restrictions missing");
+        let resume = appcontainer_launch
+            .find("ResumeThread(thread.raw())")
+            .expect("attested AppContainer resume missing");
+        assert!(
+            create_suspended < assign_job && assign_job < configure_ui && configure_ui < resume
+        );
+        assert!(!appcontainer_launch.contains("PROC_THREAD_ATTRIBUTE_JOB_LIST"));
 
         let profile_creation = source
             .split("fn create_appcontainer_profile(")

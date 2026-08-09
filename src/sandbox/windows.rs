@@ -61,13 +61,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
-    JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, OpenJobObjectW,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
@@ -84,7 +84,7 @@ use windows_sys::Win32::System::Threading::{
     CreateMutexW, CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
     GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess, GetProcessId,
     GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
-    OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ProcessChildProcessPolicy, ReleaseMutex,
     ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
@@ -2807,15 +2807,14 @@ fn launch_appcontainer(
     if let Some(handle) = additional_inherited_handle {
         handles.push(handle);
     }
-    let jobs = [job.raw()];
     let mut bytes = 0usize;
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 3, 0, &mut bytes) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes) };
     if bytes == 0 {
         return Err(last_error("size restricted process attribute list"));
     }
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let list = storage.as_mut_ptr().cast();
-    if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &mut bytes) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut bytes) } == 0 {
         return Err(last_error("initialize restricted process attribute list"));
     }
     struct DeleteList(windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -2838,20 +2837,6 @@ fn launch_appcontainer(
     } == 0
     {
         return Err(last_error("set exact restricted process handle list"));
-    }
-    if unsafe {
-        UpdateProcThreadAttribute(
-            list,
-            0,
-            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-            jobs.as_ptr().cast_mut().cast(),
-            size_of_val(&jobs),
-            null_mut(),
-            null_mut(),
-        )
-    } == 0
-    {
-        return Err(last_error("set creation-time restricted process Job"));
     }
     // An empty capability list is intentional. Do not add internetClient (or any other network
     // capability): the AppContainer network boundary is default-deny.
@@ -2915,9 +2900,17 @@ fn launch_appcontainer(
     let process = Handle::created(information.hProcess, "own AppContainer process")?;
     let thread = Handle::created(information.hThread, "own suspended AppContainer thread")?;
     mark_helper_stage(HELPER_STAGE_SUSPENDED_JOB);
-    // A Job hierarchy can only be formed while neither Job has UI limits. The helper itself can
-    // already be in a runner/service Job, so assign this suspended target first and lock down its
-    // now-established child Job before any target code can execute.
+    // Explicitly associate the suspended target after Windows has placed it in any inherited
+    // runner/service Job. This makes our non-breakaway Job the immediate child in that hierarchy;
+    // no target code can run between creation and the verified association.
+    if unsafe { AssignProcessToJobObject(job.raw(), process.raw()) } == 0 {
+        let error = last_error("assign suspended AppContainer process to bounded Job");
+        unsafe { TerminateProcess(process.raw(), 126) };
+        let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+        return Err(error);
+    }
+    // A Job hierarchy can only be formed while neither Job has UI limits. Apply the complete UI
+    // lockdown only after the hierarchy exists and before resuming the target.
     if let Err(error) = configure_job_ui_restrictions(job) {
         unsafe { TerminateProcess(process.raw(), 126) };
         let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
