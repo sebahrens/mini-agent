@@ -175,6 +175,10 @@ const HELPER_STAGE_DESCENDANT_JOB_LIMITS: u8 = 7;
 const HELPER_STAGE_DESCENDANT_RELEASE: u8 = 8;
 const HELPER_STAGE_DESCENDANT_JOB_QUERY: u8 = 9;
 const HELPER_STAGE_DESCENDANT_JOB_RESULT: u8 = 10;
+const HELPER_STAGE_DESCENDANT_ACTIVE_ZERO: u8 = 11;
+const HELPER_STAGE_DESCENDANT_ACTIVE_ONE: u8 = 12;
+const HELPER_STAGE_DESCENDANT_ACTIVE_OVERBOUND: u8 = 13;
+const HELPER_STAGE_DESCENDANT_TARGET_EXIT: u8 = 14;
 const HELPER_STAGE_READY: u8 = 15;
 const HELPER_STAGE_WAIT: u8 = 16;
 const HELPER_STAGE_EXIT_CODE: u8 = 17;
@@ -2593,11 +2597,18 @@ fn wait_for_gated_descendant(job: &Handle, target: &Handle) -> Result<(), String
             break;
         }
         if active > 2 {
+            mark_helper_stage(HELPER_STAGE_DESCENDANT_ACTIVE_OVERBOUND);
             return Err(
                 "sandbox: exact Job exceeded the two-process descendant proof bound".into(),
             );
         }
+        mark_helper_stage(if active == 0 {
+            HELPER_STAGE_DESCENDANT_ACTIVE_ZERO
+        } else {
+            HELPER_STAGE_DESCENDANT_ACTIVE_ONE
+        });
         if completed_process_exit_code(target)?.is_some() {
+            mark_helper_stage(HELPER_STAGE_DESCENDANT_TARGET_EXIT);
             return Err("sandbox: authority target exited before creating its descendant".into());
         }
         if std::time::Instant::now() >= deadline {
