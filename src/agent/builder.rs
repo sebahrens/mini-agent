@@ -22,9 +22,7 @@ fn registered_shell_capability<'a>(
     cfg: &Config,
     sandbox: &'a Sandbox,
 ) -> Option<&'a crate::sandbox::ShellCapability> {
-    if cli.resolve_no_tools(cfg)
-        || (!cli.tools.is_empty() && !cli.tools.iter().any(|name| name == "bash"))
-    {
+    if !cli.tool_is_eligible(cfg, "bash") {
         return None;
     }
     sandbox.shell_capability()
@@ -197,7 +195,7 @@ pub fn estimate_overhead(
     sandbox: &Sandbox,
 ) -> u64 {
     #[cfg(feature = "lsp")]
-    let lsp_enabled = !cli.resolve_no_tools(cfg) && cfg.resolve_lsp().is_some();
+    let lsp_enabled = cli.tool_is_eligible(cfg, "lsp_diagnostics") && cfg.resolve_lsp().is_some();
     #[cfg(not(feature = "lsp"))]
     let lsp_enabled = false;
     let preamble = build_registered_preamble(
@@ -413,8 +411,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     let sandbox = sandbox.with_workspace_binding(workspace.clone());
     let tools_enabled = !cli.resolve_no_tools(cfg);
     let shell_tool_enabled = registered_shell_capability(cli, cfg, &sandbox).is_some();
+    #[cfg(feature = "js")]
+    let js_tool_enabled = cli.tool_is_eligible(cfg, "js");
     #[cfg(feature = "lsp")]
-    let lsp_manager = if cli.resolve_no_tools(cfg) {
+    let lsp_manager = if !cli.tool_is_eligible(cfg, "lsp_diagnostics") {
         None
     } else {
         cfg.resolve_lsp()
@@ -594,17 +594,19 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         }
 
         #[cfg(feature = "js")]
-        register_js_tool(
-            &mut all_tools,
-            sandbox,
-            permission.clone(),
-            ask_tx.clone(),
-            cfg,
-            js_worker_containment_status,
-            workspace,
-            #[cfg(feature = "skills")]
-            skill_turn_context,
-        );
+        if js_tool_enabled {
+            register_js_tool(
+                &mut all_tools,
+                sandbox,
+                permission.clone(),
+                ask_tx.clone(),
+                cfg,
+                js_worker_containment_status,
+                workspace,
+                #[cfg(feature = "skills")]
+                skill_turn_context,
+            );
+        }
 
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
 

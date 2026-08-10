@@ -30,7 +30,9 @@ pub async fn ensure_agent(
         return;
     }
     #[cfg(feature = "mcp")]
-    crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.workspace).await;
+    if ui.cli.mcp_is_eligible(ui.cfg) {
+        crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.workspace).await;
+    }
     *agent = Some(
         ui.agent_build_ctx()
             .rebuild_agent(&ui.session.model, reasoning_enabled)

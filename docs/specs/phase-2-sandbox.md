@@ -173,6 +173,11 @@ fails closed, and Windows always fails closed while its enabled backend is unava
 absence or setup failure never masquerades as isolation, and this fallback policy is never
 permission for an uncontained JS worker.
 
+Startup resolves intended model capabilities before probing this backend. `--no-tools` and a tool
+allowlist that omits both `bash` and `js` perform no general-process preflight or shell discovery.
+On Windows, an eligible general AppContainer preflight is cached once per process and owns a bounded
+run-and-cleanup lifecycle; timeout remains a cached fail-closed result.
+
 The Windows general-process AppContainer backend is not the Phase 6 LPAC worker profile.
 Its cached production preflight and hosted reference-runner gate establish the recorded
 AppContainer identity, scoped filesystem grants and writes, zero-capability network

@@ -75,8 +75,10 @@ parent to retry after the other process exits or the storage problem is repaired
 rotate by size while retaining one fixed version-1 private target-correlation key. Key rotation is
 not currently implemented.
 
-On Windows, normal startup and `--print-config` evaluate JavaScript worker containment status. The
-status preflight creates or reuses a persistent AppContainer profile and may add that profile's
+On Windows, normal startup and `--print-config` evaluate JavaScript worker containment status only
+when the `js` tool is eligible. `--no-tools` and a tool allowlist that omits `js` do not run this
+preflight or initialize the learned-skill runtime. An eligible status preflight creates or reuses a
+persistent AppContainer profile and may add that profile's
 exact read/execute ACE to a supported, user-owned installed executable. These changes persist after
 exit, and zerostack currently provides no automatic profile cleanup, ACL rollback, or separate
 consent prompt. LPAC is not a filesystem namespace; host objects readable through applicable ACLs
@@ -362,7 +364,7 @@ Accepted top-level keys:
 | `yolo`                    | boolean | Select yolo mode (allow all, ask for destructive bash commands).                                                                                                            |
 | `permission-modes`        | array   | List of mode names that apply config-based rules. Default: `["guarded", "standard", "yolo"]`. Modes excluded from this list skip config rule matching entirely.             |
 | `sandbox`                 | boolean | Enforce the configured **general subprocess** sandbox for Bash and parent-brokered JS `spawn`. Default: `true`. Precedence is `--no-sandbox` (disable) > `--sandbox` (explicitly require) > this config value > the default. On non-Windows hosts, an unavailable backend inherited only from the default warns and runs unsandboxed. While sandboxing remains enabled, `--sandbox`, `sandbox = true`, or selecting a backend through the CLI/config fails closed if that backend is unavailable. This setting never disables the mandatory broker-only JS worker containment. |
-| `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux, the system-provided `seatbelt` at `/usr/bin/sandbox-exec` on supported macOS hosts, and `appcontainer` on Windows (`restricted-token` is a compatibility alias). Setting this key or passing `--sandbox-backend` makes an enabled sandbox request explicit and fail-closed. Windows availability requires the cached native AppContainer production preflight; failure remains closed unless `--no-sandbox` explicitly opts out. The backend adds package-SID workspace read/write plus read/execute grants for the application cache, exact selected executable, and explicitly configured AppContainer roots; ambient `PATH`, home, Cargo, and Rustup roots are never inferred. As a regular AppContainer it retains standard Windows system resources and any pre-existing object accessible to `ALL APPLICATION PACKAGES`; such an existing ACL can include write authority, so universal filesystem isolation is not claimed. It uses private profile storage, grants no network capability, and retains the private desktop plus bounded creation-time Job. Hosted observations describe the reference runner, not every host's ACL visibility; broader registry/device/session isolation is not claimed. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
+| `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux, the system-provided `seatbelt` at `/usr/bin/sandbox-exec` on supported macOS hosts, and `appcontainer` on Windows (`restricted-token` is a compatibility alias). Setting this key or passing `--sandbox-backend` makes an enabled sandbox request explicit and fail-closed. Windows availability requires the cached native AppContainer production preflight; its run phase is limited to five seconds, whole-tree reaping receives up to five seconds, and profile/ACL recovery then receives a fresh five-second ceiling. Failure remains closed unless `--no-sandbox` explicitly opts out. The backend adds package-SID workspace read/write plus read/execute grants for the application cache, exact selected executable, and explicitly configured AppContainer roots; ambient `PATH`, home, Cargo, and Rustup roots are never inferred. As a regular AppContainer it retains standard Windows system resources and any pre-existing object accessible to `ALL APPLICATION PACKAGES`; such an existing ACL can include write authority, so universal filesystem isolation is not claimed. It uses private profile storage, grants no network capability, and retains the private desktop plus bounded creation-time Job. Hosted observations describe the reference runner, not every host's ACL visibility; broader registry/device/session isolation is not claimed. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
 | `windows-appcontainer-read-roots` | array of paths | Additional Windows AppContainer read/execute roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they are remote, reparse-based, multiply linked, or overlap a writable root. CLI: repeat `--windows-appcontainer-read-root PATH`. |
 | `windows-appcontainer-write-roots` | array of paths | Additional Windows AppContainer read/write roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they overlap the read-only cache/configured roots or another writable root. CLI: repeat `--windows-appcontainer-write-root PATH`. |
 | `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
@@ -1017,6 +1019,12 @@ URL-based servers. A local stdio entry launches `command` directly and passes
 `args` without shell parsing. `command` may be an executable available on
 `PATH` or an absolute executable path; zerostack resolves platform shims such
 as Windows `.cmd`/`.exe` launchers to an absolute identity before spawn.
+
+MCP connections are capability-driven. `--no-tools` never connects configured
+servers. An exact `--tools` allowlist containing only built-in tool names also
+skips MCP; an unrecognized name keeps MCP eligible because it may be a server
+tool. This avoids launching workspace services for runs that cannot expose any
+of their tools.
 
 The child environment is empty by default. `env` supplies explicit values and
 `inherit_env` names individual parent variables that the server is allowed to

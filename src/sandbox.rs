@@ -3040,8 +3040,83 @@ mod sandbox_tests {
         assert!(!source.contains("WRITE_RESTRICTED"));
         assert!(!source.contains("RegOverridePredefKey"));
         assert!(source.contains("static GENERAL_SANDBOX_AVAILABLE: OnceLock<bool>"));
-        assert!(source.contains("GENERAL_SANDBOX_AVAILABLE.get_or_init"));
+        assert!(source.contains("cached_general_sandbox_availability("));
+        assert!(source.contains("*cache.get_or_init(|| probe().is_ok())"));
         assert!(source.contains("fn run_production_preflight() -> Result<(), String>"));
+        assert!(source.contains("const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration"));
+        assert!(source.contains("const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration"));
+        assert!(source.contains(".spawn_guarded_until(run_deadline)"));
+        assert!(source.contains("terminate_and_reap_owned_helper"));
+        assert!(source.contains("sweep_stale_profiles_until(&journal_root, deadline)?"));
+        assert!(source.contains("let (intent_path, intent_lease) ="));
+        assert!(
+            source.contains("create_profile_intent(&journal_root, &name_text, &profile_control)?")
+        );
+        let production_preflight = source
+            .split("fn run_production_preflight_owned(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_bounded_preflight_helper(").next())
+            .expect("bounded Windows production preflight missing");
+        assert!(!production_preflight.contains("output_guarded"));
+        assert!(!production_preflight.contains("std::thread::"));
+        let recovery_deadline = production_preflight
+            .find("next_general_preflight_recovery_deadline(Instant::now())")
+            .expect("fresh post-reap recovery deadline missing");
+        let recovery = production_preflight
+            .find("let recovery = recover_preflight_profiles(&cache, recovery_deadline);")
+            .expect("preflight recovery missing");
+        let removal = production_preflight
+            .find("let removal = if recovery.is_ok()")
+            .expect("recovery-gated temporary-root removal missing");
+        let preserve = production_preflight
+            .find("root.retain_recovery_state();")
+            .expect("failed recovery must preserve durable state");
+        assert!(recovery_deadline < recovery && recovery < removal && removal < preserve);
+
+        let bounded_helper = source
+            .split("fn run_bounded_preflight_helper(")
+            .nth(1)
+            .and_then(|source| source.split("fn terminate_and_reap_owned_helper(").next())
+            .expect("bounded Windows production helper missing");
+        assert_eq!(
+            bounded_helper
+                .matches("terminate_and_reap_owned_helper(&mut child, cleanup_deadline)")
+                .count(),
+            2,
+            "deadline and poll failure must both clean up the owned helper"
+        );
+
+        let profile_creation = source
+            .split("fn create_appcontainer_profile(")
+            .nth(1)
+            .and_then(|source| source.split("fn create_profile_intent(").next())
+            .expect("AppContainer profile creation missing");
+        let profile_lock = profile_creation
+            .find("ProfileControlGuard::acquire_until(profile_control_deadline)?")
+            .expect("profile-control transition lock missing");
+        let intent_sync = profile_creation
+            .find("create_profile_intent(&journal_root, &name_text, &profile_control)?")
+            .expect("durable pre-profile intent missing");
+        let profile_create = profile_creation
+            .find("CreateAppContainerProfile(")
+            .expect("AppContainer creation missing");
+        assert!(profile_lock < intent_sync && intent_sync < profile_create);
+        assert!(
+            profile_creation
+                .contains("remove_profile_intent(&intent_path, intent_lease, &profile_control)")
+        );
+        let stale_sweep = source
+            .split("fn sweep_stale_profiles_until(")
+            .nth(1)
+            .and_then(|source| source.split("fn sweep_stale_profiles_until_locked(").next())
+            .expect("profile sweep lock wrapper missing");
+        assert!(stale_sweep.contains("ProfileControlGuard::acquire_until(deadline)?"));
+        let stale_journal = source
+            .split("fn sweep_stale_profile_journal(")
+            .nth(1)
+            .and_then(|source| source.split("fn sweep_stale_profile_intent(").next())
+            .expect("stale profile journal sweep missing");
+        assert!(stale_journal.contains("revoke_tree_until(&root, sid.0, deadline)?"));
         assert!(source.contains("if !is_available() || !is_available()"));
 
         let update = source
@@ -3113,7 +3188,7 @@ mod sandbox_tests {
         assert!(journal_sync < journal_publish);
 
         let stale_sweep = source
-            .split("fn sweep_stale_profiles(")
+            .split("fn sweep_stale_profiles_until_locked(")
             .nth(1)
             .and_then(|source| source.split("fn sid_text").next())
             .expect("stale profile sweep missing");
@@ -3269,10 +3344,15 @@ mod sandbox_tests {
         let startup = include_str!("startup.rs");
         assert!(startup.contains("unavailable_sandbox_must_fail"));
         assert!(startup.contains("no successful production preflight"));
+        assert!(startup.contains("fn preflight_startup_capabilities(&self)"));
+        assert!(startup.contains("run_startup_probes_concurrently("));
+        assert!(startup.contains("crate::sandbox::worker::containment_status"));
+        assert!(startup.contains("spawn_scoped(scope, general)"));
+        assert!(startup.contains("spawn_scoped(scope, worker)"));
 
         let main = include_str!("main.rs");
         let validation = main
-            .find("startup.validate_sandbox_availability()?")
+            .find("startup.preflight_startup_capabilities()?")
             .expect("common sandbox validation missing");
         let acp = main
             .find("if startup.cli.acp_enabled")

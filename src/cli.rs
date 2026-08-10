@@ -463,6 +463,53 @@ impl Cli {
         self.no_tools || cfg.no_tools.unwrap_or(false)
     }
 
+    pub(crate) fn tool_is_eligible(&self, cfg: &config::Config, name: &str) -> bool {
+        !self.resolve_no_tools(cfg)
+            && (self.tools.is_empty() || self.tools.iter().any(|allowed| allowed == name))
+    }
+
+    pub(crate) fn general_sandbox_is_eligible(&self, cfg: &config::Config) -> bool {
+        self.tool_is_eligible(cfg, "bash")
+            || cfg!(feature = "js") && self.tool_is_eligible(cfg, "js")
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn mcp_is_eligible(&self, cfg: &config::Config) -> bool {
+        const BUILTIN_TOOLS: &[&str] = &[
+            "read",
+            "write",
+            "edit",
+            "grep",
+            "find_files",
+            "list_dir",
+            "todo_write",
+            "bash",
+            #[cfg(feature = "js")]
+            "js",
+            #[cfg(feature = "subagents")]
+            "task",
+            #[cfg(feature = "memory")]
+            "memory_write",
+            #[cfg(feature = "memory")]
+            "memory_edit",
+            #[cfg(feature = "memory")]
+            "memory_read",
+            #[cfg(feature = "memory")]
+            "memory_search",
+            #[cfg(feature = "advisor")]
+            "advisor",
+            #[cfg(feature = "lsp")]
+            "lsp_diagnostics",
+        ];
+
+        !self.resolve_no_tools(cfg)
+            && (self.tools.is_empty()
+                || self
+                    .tools
+                    .iter()
+                    .any(|name| !BUILTIN_TOOLS.contains(&name.as_str())))
+    }
+
     /// Sandboxing is on unless explicitly refused. `--no-sandbox` outranks
     /// config so a host without a working backend can still start.
     pub fn resolve_sandbox(&self, cfg: &config::Config) -> bool {
@@ -613,6 +660,64 @@ mod tests {
     #[test]
     fn command_name_matches_canonical_cargo_binary() {
         assert_eq!(Cli::command().get_name(), "mini-agent");
+    }
+
+    #[test]
+    fn tool_eligibility_honors_global_and_named_suppression() {
+        let cfg = config::Config::default();
+        let all = Cli::default();
+        assert!(all.tool_is_eligible(&cfg, "bash"));
+        assert!(all.tool_is_eligible(&cfg, "js"));
+        assert!(all.general_sandbox_is_eligible(&cfg));
+
+        let bash_only = Cli {
+            tools: vec!["bash".to_string()],
+            ..Cli::default()
+        };
+        assert!(bash_only.tool_is_eligible(&cfg, "bash"));
+        assert!(!bash_only.tool_is_eligible(&cfg, "js"));
+        assert!(bash_only.general_sandbox_is_eligible(&cfg));
+
+        let js_only = Cli {
+            tools: vec!["js".to_string()],
+            ..Cli::default()
+        };
+        assert!(!js_only.tool_is_eligible(&cfg, "bash"));
+        assert!(js_only.tool_is_eligible(&cfg, "js"));
+        assert_eq!(
+            js_only.general_sandbox_is_eligible(&cfg),
+            cfg!(feature = "js")
+        );
+
+        let read_only = Cli {
+            tools: vec!["read".to_string()],
+            ..Cli::default()
+        };
+        assert!(!read_only.tool_is_eligible(&cfg, "bash"));
+        assert!(!read_only.tool_is_eligible(&cfg, "js"));
+        assert!(!read_only.general_sandbox_is_eligible(&cfg));
+
+        let no_tools = Cli {
+            no_tools: true,
+            tools: vec!["bash".to_string(), "js".to_string()],
+            ..Cli::default()
+        };
+        assert!(!no_tools.tool_is_eligible(&cfg, "bash"));
+        assert!(!no_tools.tool_is_eligible(&cfg, "js"));
+        assert!(!no_tools.general_sandbox_is_eligible(&cfg));
+
+        #[cfg(feature = "mcp")]
+        {
+            assert!(all.mcp_is_eligible(&cfg));
+            assert!(!read_only.mcp_is_eligible(&cfg));
+            assert!(!bash_only.mcp_is_eligible(&cfg));
+            assert!(!no_tools.mcp_is_eligible(&cfg));
+            let mcp_only = Cli {
+                tools: vec!["github_search".to_string()],
+                ..Cli::default()
+            };
+            assert!(mcp_only.mcp_is_eligible(&cfg));
+        }
     }
 
     #[test]

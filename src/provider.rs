@@ -1296,23 +1296,28 @@ pub async fn build_agent_in_workspace(
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
     #[cfg(feature = "js")]
-    let js_worker_containment_status = crate::sandbox::worker::containment_status();
+    let js_tool_eligible = cli.tool_is_eligible(cfg, "js");
+    #[cfg(feature = "js")]
+    let js_worker_containment_status =
+        resolve_js_worker_containment(js_tool_eligible, crate::sandbox::worker::containment_status);
     #[cfg(feature = "skills")]
-    let skills = {
+    let skills = if !js_tool_eligible
+        || !matches!(
+            &js_worker_containment_status,
+            crate::sandbox::worker::WorkerContainmentStatus::Available { .. }
+        ) {
+        None
+    } else {
         let workspace_root = workspace.root();
         let paths = crate::paths::process_paths()
             .and_then(|paths| paths.with_workspace_root(workspace_root));
         let embedding = cfg.embedding.clone();
-        let learned_js_enabled = matches!(
-            &js_worker_containment_status,
-            crate::sandbox::worker::WorkerContainmentStatus::Available { .. }
-        );
         match paths {
             Ok(paths) => match crate::agent::runner::spawn_blocking_scoped(move || {
                 crate::extras::js::skills::turn::SkillRuntime::open_with_learned_js(
                     &paths,
                     embedding.as_ref(),
-                    learned_js_enabled,
+                    true,
                 )
             })
             .await
@@ -1458,6 +1463,68 @@ pub async fn build_agent_in_workspace(
         #[cfg(feature = "skills")]
         skills,
     )
+}
+
+#[cfg(feature = "js")]
+fn resolve_js_worker_containment(
+    eligible: bool,
+    probe: impl FnOnce() -> crate::sandbox::worker::WorkerContainmentStatus,
+) -> crate::sandbox::worker::WorkerContainmentStatus {
+    if eligible {
+        probe()
+    } else {
+        crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+            backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+            assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+            reason: "JavaScript tool was not requested".to_string(),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "js"))]
+mod startup_capability_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::resolve_js_worker_containment;
+    use crate::sandbox::worker::{
+        WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus,
+    };
+
+    #[test]
+    fn ineligible_javascript_capability_performs_no_worker_probe() {
+        let calls = AtomicUsize::new(0);
+        let containment = resolve_js_worker_containment(false, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            WorkerContainmentStatus::Available {
+                backend: WorkerBackend::for_current_platform(),
+                assurance: WorkerContainmentAssurance::Enforced,
+            }
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            containment,
+            WorkerContainmentStatus::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn eligible_javascript_capability_probes_once() {
+        let calls = AtomicUsize::new(0);
+        let containment = resolve_js_worker_containment(true, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            WorkerContainmentStatus::Available {
+                backend: WorkerBackend::for_current_platform(),
+                assurance: WorkerContainmentAssurance::Enforced,
+            }
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            containment,
+            WorkerContainmentStatus::Available { .. }
+        ));
+    }
 }
 
 /// Builds the isolated, tool-less `/btw` agent for the active provider.

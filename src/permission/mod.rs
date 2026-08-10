@@ -154,7 +154,12 @@ pub(crate) fn resolve_configured_execution_authority(
             cli.resolve_windows_appcontainer_read_roots(cfg),
             cli.resolve_windows_appcontainer_write_roots(cfg),
         );
-    let authority = resolve_execution_authority(cli, cfg, configured.policy(), &backend)?;
+    let policy = if cli.general_sandbox_is_eligible(cfg) {
+        configured.policy()
+    } else {
+        crate::sandbox::SandboxPolicy::Disabled
+    };
+    let authority = resolve_execution_authority(cli, cfg, policy, &backend)?;
     let sandbox = if authority.sandbox == SandboxResolution::DegradedUnavailable {
         tracing::warn!(
             "sandbox backend '{backend}' was not found — continuing UNSANDBOXED; pass --sandbox to fail closed instead"
@@ -178,7 +183,7 @@ pub(crate) fn bind_configured_shell(
     search_path: Option<&std::ffi::OsStr>,
     sandbox: crate::sandbox::Sandbox,
 ) -> crate::sandbox::Sandbox {
-    if !authority.tools_enabled {
+    if !authority.tools_enabled || !cli.tool_is_eligible(cfg, "bash") {
         return sandbox.with_resolved_shell(None);
     }
     let configured = cli.resolve_shell(cfg);
@@ -780,6 +785,26 @@ mod execution_authority_tests {
             error.to_string(),
             "sandbox backend 'definitely-not-a-real-backend' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
         );
+    }
+
+    #[test]
+    fn non_process_tool_modes_do_not_probe_an_unavailable_sandbox() {
+        let cfg = Config::default();
+        for cli in [
+            Cli {
+                no_tools: true,
+                sandbox_backend: Some("definitely-not-a-real-backend".to_string()),
+                ..Cli::default()
+            },
+            Cli {
+                tools: vec!["read".to_string()],
+                sandbox_backend: Some("definitely-not-a-real-backend".to_string()),
+                ..Cli::default()
+            },
+        ] {
+            let (authority, _) = resolve_configured_execution_authority(&cli, &cfg).unwrap();
+            assert_eq!(authority.sandbox, SandboxResolution::Disabled);
+        }
     }
 
     #[test]

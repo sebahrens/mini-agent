@@ -225,7 +225,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ACP mode skips feature initialization, so validate the shared process
     // sandbox contract before entering either execution surface.
-    startup.validate_sandbox_availability()?;
+    startup.preflight_startup_capabilities()?;
 
     // ACP mode: serve and exit before feature init
     #[cfg(feature = "acp")]

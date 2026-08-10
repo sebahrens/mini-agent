@@ -9,6 +9,9 @@
 
 use std::io;
 use std::process::{Child, ExitStatus, Output};
+#[cfg(windows)]
+use std::time::Duration;
+use std::time::Instant;
 use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
 #[cfg(feature = "mcp")]
@@ -43,8 +46,40 @@ pub(crate) fn creation_guard() -> io::Result<CreationGuard> {
     }
 }
 
+pub(crate) fn creation_guard_until(deadline: Instant) -> io::Result<CreationGuard> {
+    #[cfg(windows)]
+    loop {
+        match PROCESS_CREATION_LOCK.try_lock() {
+            Ok(guard) => return Ok(CreationGuard { _inner: guard }),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let guard = poisoned.into_inner();
+                PROCESS_CREATION_LOCK.clear_poison();
+                return Ok(CreationGuard { _inner: guard });
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Windows process-creation lock deadline elapsed",
+                    ));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = deadline;
+        Ok(CreationGuard {})
+    }
+}
+
 pub(crate) trait StdCommandCreationExt {
     fn spawn_guarded(&mut self) -> io::Result<Child>;
+    fn spawn_guarded_until(&mut self, deadline: Instant) -> io::Result<Child>;
     fn status_guarded(&mut self) -> io::Result<ExitStatus>;
     fn output_guarded(&mut self) -> io::Result<Output>;
 }
@@ -52,6 +87,17 @@ pub(crate) trait StdCommandCreationExt {
 impl StdCommandCreationExt for std::process::Command {
     fn spawn_guarded(&mut self) -> io::Result<Child> {
         let _guard = creation_guard()?;
+        std::process::Command::spawn(self)
+    }
+
+    fn spawn_guarded_until(&mut self, deadline: Instant) -> io::Result<Child> {
+        let _guard = creation_guard_until(deadline)?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process-creation deadline elapsed",
+            ));
+        }
         std::process::Command::spawn(self)
     }
 

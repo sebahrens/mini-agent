@@ -155,6 +155,41 @@ fn apply_resume_provider_decision(
     session.update_context_window(cfg.resolve_context_window(&target.provider, &target.model, &qm));
 }
 
+#[cfg(any(test, all(target_os = "windows", feature = "js")))]
+fn run_startup_probes_concurrently<General, Worker, WorkerStatus>(
+    general: General,
+    worker: Worker,
+) -> anyhow::Result<(anyhow::Result<()>, WorkerStatus)>
+where
+    General: FnOnce() -> anyhow::Result<()> + Send,
+    Worker: FnOnce() -> WorkerStatus + Send,
+    WorkerStatus: Send,
+{
+    std::thread::scope(|scope| -> anyhow::Result<_> {
+        let general = std::thread::Builder::new()
+            .name("windows-general-preflight".into())
+            .spawn_scoped(scope, general)
+            .map_err(|_| anyhow::anyhow!("failed to start general containment preflight"))?;
+        let worker = match std::thread::Builder::new()
+            .name("windows-js-worker-preflight".into())
+            .spawn_scoped(scope, worker)
+        {
+            Ok(worker) => worker,
+            Err(_) => {
+                let _ = general.join();
+                anyhow::bail!("failed to start JavaScript-worker containment preflight");
+            }
+        };
+        let general = general.join();
+        let worker = worker.join();
+        let general =
+            general.map_err(|_| anyhow::anyhow!("general containment preflight worker failed"))?;
+        let worker = worker
+            .map_err(|_| anyhow::anyhow!("JavaScript-worker containment preflight failed"))?;
+        Ok((general, worker))
+    })
+}
+
 pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
     let saved = Session::new("anthropic", "claude-saved", 200_000, "");
     let changed_defaults = Cli {
@@ -477,6 +512,9 @@ impl Startup {
     /// other platforms retain the legacy warning only for an entirely
     /// inherited default.
     pub(crate) fn validate_sandbox_availability(&self) -> anyhow::Result<()> {
+        if !self.cli.general_sandbox_is_eligible(&self.cfg) {
+            return Ok(());
+        }
         let backend = self.cli.resolve_sandbox_backend(&self.cfg);
         let sandbox = Sandbox::new(self.cli.resolve_sandbox(&self.cfg), &backend)
             .with_windows_appcontainer_roots(
@@ -491,6 +529,25 @@ impl Startup {
             );
         }
         Ok(())
+    }
+
+    /// Resolve the startup containment gates after the workspace has been captured. On Windows,
+    /// the regular AppContainer and LPAC worker preflights are independent. Starting both before
+    /// joining avoids adding their cold-start latencies while their separate process-local caches,
+    /// process-creation lock, and fail-closed consumers retain their existing contracts.
+    pub(crate) fn preflight_startup_capabilities(&self) -> anyhow::Result<()> {
+        #[cfg(all(target_os = "windows", feature = "js"))]
+        if self.cli.tool_is_eligible(&self.cfg, "js") {
+            let (general, _worker_status) = run_startup_probes_concurrently(
+                || self.validate_sandbox_availability(),
+                crate::sandbox::worker::containment_status,
+            )?;
+            // Worker unavailability is consumed later as an unavailable JS tool; the cached status
+            // is never upgraded or bypassed. General sandbox failure retains its startup error.
+            return general;
+        }
+
+        self.validate_sandbox_availability()
     }
 
     /// Phase 2: subagents, OpenRouter pricing, sandbox, tools config,
@@ -1017,7 +1074,11 @@ impl Startup {
             let completion_model = self.client.completion_model(self.model.to_string());
             let read_tracker = self.session.read_tracker.clone();
             #[cfg(feature = "mcp")]
-            let mcp_manager = connect_headless_mcp(&self.cfg, &self.workspace).await;
+            let mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
+                None
+            } else {
+                connect_headless_mcp(&self.cfg, &self.workspace).await
+            };
             let agent = provider::build_agent_in_workspace(
                 completion_model,
                 &self.cli,
@@ -1095,7 +1156,11 @@ impl Startup {
         let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
         let read_tracker = self.session.read_tracker.clone();
         #[cfg(feature = "mcp")]
-        let mcp_manager = connect_headless_mcp(&self.cfg, &self.workspace).await;
+        let mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
+            None
+        } else {
+            connect_headless_mcp(&self.cfg, &self.workspace).await
+        };
         let agent = provider::build_agent_in_workspace(
             model_completion,
             &self.cli,
@@ -1194,13 +1259,64 @@ fn select_interactive_auto_trigger(cli: &Cli, fallback: Option<String>) -> Optio
 mod tests {
     use super::{
         ResumeProviderDecision, apply_resume_provider_decision, interactive_initial_message,
-        resolve_resume_provider_decision, select_interactive_auto_trigger,
-        unavailable_sandbox_must_fail, validate_startup_permission_policy,
+        resolve_resume_provider_decision, run_startup_probes_concurrently,
+        select_interactive_auto_trigger, unavailable_sandbox_must_fail,
+        validate_startup_permission_policy,
     };
     use crate::cli::Cli;
     use crate::config::Config;
     use crate::sandbox::{Sandbox, SandboxPolicy};
     use crate::session::Session;
+
+    #[test]
+    fn startup_probe_join_starts_both_before_waiting_for_the_slower_probe() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_general_tx, release_general_rx) = std::sync::mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+        let join = std::thread::spawn(move || {
+            let general_started_tx = started_tx.clone();
+            let probes = run_startup_probes_concurrently(
+                move || {
+                    general_started_tx.send("general").unwrap();
+                    release_general_rx.recv().unwrap();
+                    anyhow::bail!("closed general failure")
+                },
+                move || {
+                    started_tx.send("worker").unwrap();
+                    release_worker_rx.recv().unwrap();
+                    "closed worker status"
+                },
+            );
+            finished_tx.send(probes).unwrap();
+        });
+
+        let deadline = std::time::Duration::from_secs(1);
+        let first = started_rx
+            .recv_timeout(deadline)
+            .expect("first startup probe did not start");
+        let second = started_rx
+            .recv_timeout(deadline)
+            .expect("second startup probe was serialized behind the first");
+        assert_ne!(first, second);
+
+        release_general_tx.send(()).unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "join returned before the slower worker probe completed"
+        );
+        release_worker_tx.send(()).unwrap();
+        let (general, worker) = finished_rx
+            .recv_timeout(deadline)
+            .expect("startup probes did not join after the slower probe completed")
+            .expect("startup probe orchestration failed");
+        assert_eq!(general.unwrap_err().to_string(), "closed general failure");
+        assert_eq!(worker, "closed worker status");
+        join.join().unwrap();
+    }
 
     #[test]
     fn positional_interactive_input_becomes_one_auto_trigger_message() {

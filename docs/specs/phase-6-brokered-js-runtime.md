@@ -743,7 +743,9 @@ to record denial-canary, supported-install-location, and lifecycle observations 
 reference runner.
 
 Evaluating Windows containment status during ordinary startup or `--print-config` performs
-production preflight. That preflight creates or reuses a stable AppContainer profile and, for a
+production preflight only when the `js` tool is eligible. Global tool suppression and allowlists
+that omit `js` must not call the probe or initialize skill discovery. An eligible preflight creates
+or reuses a stable AppContainer profile and, for a
 supported current executable owned by the user, may add the package SID's exact read/execute ACE
 to the installed executable. The production profile and committed ACE persist after process exit.
 There is no automatic profile deletion, ACL rollback, explicit consent prompt, or cleanup command;

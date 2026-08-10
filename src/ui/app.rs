@@ -360,7 +360,9 @@ impl<'a> App<'a> {
                 task_scope
                     .run(async move {
                         #[cfg(feature = "mcp")]
-                        let mcp = if let Some(ref servers) = cfg_clone.mcp_servers {
+                        let mcp = if !cli_clone.mcp_is_eligible(&cfg_clone) {
+                            None
+                        } else if let Some(ref servers) = cfg_clone.mcp_servers {
                             if !servers.is_empty() {
                                 Some(
                                     McpClientManager::connect_all_in_binding(

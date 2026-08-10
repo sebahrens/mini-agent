@@ -144,7 +144,8 @@ pub(super) fn containment_status() -> WorkerContainmentStatus {
 }
 
 fn probe_containment() -> WorkerContainmentStatus {
-    match feasibility::production_runtime_preflight() {
+    let started = std::time::Instant::now();
+    let containment = match feasibility::production_runtime_preflight() {
         Ok(()) => WorkerContainmentStatus::Available {
             backend: BACKEND,
             assurance: WorkerContainmentAssurance::Enforced,
@@ -154,7 +155,14 @@ fn probe_containment() -> WorkerContainmentStatus {
             assurance: WorkerContainmentAssurance::Enforced,
             reason: PREFLIGHT_FAILURE_REASON.to_string(),
         },
-    }
+    };
+    tracing::debug!(
+        phase = "windows_js_worker_preflight",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        available = matches!(&containment, WorkerContainmentStatus::Available { .. }),
+        "completed closed Windows JavaScript-worker startup phase"
+    );
+    containment
 }
 
 pub(super) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
