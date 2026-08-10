@@ -32,6 +32,7 @@ use crate::ui::events::render_session;
 use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
 use crate::ui::state::{AgentBuildCtx, AgentRunState, ChainState, SlashState, UiContext};
+use crate::ui::terminal::TerminalGuard;
 
 pub(crate) const C_AGENT: crossterm::style::Color = crossterm::style::Color::White;
 pub(crate) const C_RESULT: crossterm::style::Color = crossterm::style::Color::DarkGrey;
@@ -54,6 +55,7 @@ pub struct SlashCtx<'a> {
     pub ask_tx: &'a Option<AskSender>,
     pub todo_tools_enabled: &'a mut bool,
     pub sandbox: &'a Sandbox,
+    pub terminal_guard: &'a mut TerminalGuard,
     #[cfg(feature = "loop")]
     pub loop_state: &'a mut Option<crate::extras::r#loop::LoopState>,
     #[cfg(feature = "mcp")]
@@ -459,6 +461,7 @@ pub async fn handle_slash(
     ui: &mut UiContext<'_>,
     slash: &mut SlashState,
     chain: &mut ChainState,
+    terminal_guard: &mut TerminalGuard,
 ) -> anyhow::Result<()> {
     // `chain` only feeds `SlashCtx::loop_state`; without the loop feature it
     // has no consumer here.
@@ -482,6 +485,7 @@ pub async fn handle_slash(
         ask_tx: &ui.ask_tx,
         todo_tools_enabled: &mut slash.todo_tools_enabled,
         sandbox: &ui.sandbox,
+        terminal_guard,
         #[cfg(feature = "loop")]
         loop_state: &mut chain.loop_state,
         #[cfg(feature = "mcp")]
@@ -509,10 +513,7 @@ pub async fn handle_slash(
             help::handle_welcome(ctx.renderer);
             Ok(())
         }
-        "/tutor" => {
-            help::handle_tutor(ctx.renderer);
-            Ok(())
-        }
+        "/tutor" => help::handle_tutor(ctx.renderer, ctx.terminal_guard),
         "/add" | "/drop" | "/drop-all" => add::handle(&parts, &mut ctx).await,
         "/init" => init::handle(&parts, &mut ctx).await,
         "/review" => review::handle(&parts, &mut ctx).await,

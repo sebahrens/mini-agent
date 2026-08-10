@@ -169,6 +169,11 @@ reproducing code; focus on structure, relationships, and rationale.
 ## Design Decisions
 - Type-erased client/agent via trait objects for provider flexibility
 - Tokio for async I/O; crossterm for TUI
+- TUI attachment is transactional: partial setup and every exit restore prior terminal state. On
+  an attached Windows console, input and output code pages use UTF-8 only while the TUI is active;
+  redirected/headless streams are never treated as console handles or mutated. External editors,
+  pagers, and support utilities suspend and resume that same lifecycle instead of toggling terminal
+  modes independently.
 - mpsc channels for agent events, user events, and permission requests
 
 ## Dependencies

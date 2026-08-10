@@ -1,38 +1,34 @@
-use std::io::Write;
-
-use crossterm::ExecutableCommand;
-
 use crate::ui::slash::{SlashCtx, write_ok, write_result};
+use crate::ui::terminal::TerminalGuard;
 
 pub fn handle_welcome(renderer: &mut crate::ui::renderer::Renderer) {
     let _ = crate::ui::events::show_welcome(renderer);
 }
 
-pub fn handle_tutor(renderer: &mut crate::ui::renderer::Renderer) {
-    match run_tutor() {
-        Ok(()) => {}
+pub fn handle_tutor(
+    renderer: &mut crate::ui::renderer::Renderer,
+    terminal_guard: &mut TerminalGuard,
+) -> anyhow::Result<()> {
+    match run_tutor(terminal_guard) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .downcast_ref::<crate::ui::terminal::TerminalLifecycleError>()
+                .is_some() =>
+        {
+            Err(error)
+        }
         Err(e) => {
-            let _ = renderer.write_line(&format!("{}", e), crate::ui::slash::C_ERROR);
+            renderer.write_line(&format!("{}", e), crate::ui::slash::C_ERROR)?;
+            Ok(())
         }
     }
 }
 
-fn run_tutor() -> anyhow::Result<()> {
-    let _ = crossterm::terminal::disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    let _ = stdout.execute(crossterm::event::DisableMouseCapture);
-    let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
-    let _ = stdout.flush();
-
+fn run_tutor(terminal_guard: &mut TerminalGuard) -> anyhow::Result<()> {
+    terminal_guard.suspend()?;
     let result = crate::docs::show_get_started();
-
-    let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
-    let _ = stdout.execute(crossterm::terminal::Clear(
-        crossterm::terminal::ClearType::All,
-    ));
-    let _ = stdout.execute(crossterm::event::EnableMouseCapture);
-    let _ = crossterm::terminal::enable_raw_mode();
-
+    terminal_guard.resume()?;
     result
 }
 

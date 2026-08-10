@@ -1,10 +1,9 @@
-use std::io::{self, Write};
+use std::io;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossterm::ExecutableCommand;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::Color;
 use tokio::sync::mpsc;
@@ -105,7 +104,7 @@ pub(crate) struct App<'a> {
     prebuild_rx: Option<mpsc::Receiver<PrebuildPayload>>,
     prebuild_task: Option<tokio::task::JoinHandle<()>>,
     prebuild_scope: Option<std::sync::Arc<crate::agent::runner::AgentWorkScope>>,
-    _terminal_guard: TerminalGuard,
+    terminal_guard: TerminalGuard,
 }
 
 impl<'a> App<'a> {
@@ -116,7 +115,7 @@ impl<'a> App<'a> {
         auto_trigger_msg: Option<String>,
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
     ) -> anyhow::Result<Self> {
-        let _terminal_guard = TerminalGuard::new()?;
+        let terminal_guard = TerminalGuard::new()?;
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
@@ -435,7 +434,7 @@ impl<'a> App<'a> {
             prebuild_rx,
             prebuild_task,
             prebuild_scope,
-            _terminal_guard,
+            terminal_guard,
         })
     }
 
@@ -758,7 +757,7 @@ impl<'a> App<'a> {
 
         if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.rebind_event_thread();
-            self.input.open_in_editor();
+            self.input.open_in_editor(&mut self.terminal_guard)?;
             return Ok(());
         }
 
@@ -1464,8 +1463,17 @@ impl<'a> App<'a> {
             &mut self.ui,
             &mut self.slash,
             &mut self.chain,
+            &mut self.terminal_guard,
         )
         .await;
+
+        if result.as_ref().is_err_and(|error| {
+            error
+                .downcast_ref::<crate::ui::terminal::TerminalLifecycleError>()
+                .is_some()
+        }) {
+            return result;
+        }
 
         {
             let provider = self.ui.session.provider.to_string();
@@ -1730,19 +1738,10 @@ impl<'a> App<'a> {
                     .clone()
                     .or_else(|| std::env::var("EDITOR").ok())
                     .unwrap_or_else(|| "editor".to_string());
-                let _ = crossterm::terminal::disable_raw_mode();
-                let mut stdout = std::io::stdout();
-                let _ = stdout.execute(crossterm::event::DisableMouseCapture);
-                let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
-                let _ = stdout.flush();
+                self.terminal_guard.suspend()?;
                 let edit_result =
                     crate::ui::slash::edit_memory_file(std::path::Path::new(&path), &editor);
-                let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
-                let _ = stdout.execute(crossterm::terminal::Clear(
-                    crossterm::terminal::ClearType::All,
-                ));
-                let _ = stdout.execute(crossterm::event::EnableMouseCapture);
-                let _ = crossterm::terminal::enable_raw_mode();
+                self.terminal_guard.resume()?;
                 render_session(
                     &mut self.renderer,
                     self.ui.session,
@@ -1764,6 +1763,12 @@ impl<'a> App<'a> {
                 }
             }
             Err(e) if crate::ui::slash::is_persistence_restart_required(&e) => {
+                return Err(e);
+            }
+            Err(e)
+                if e.downcast_ref::<crate::ui::terminal::TerminalLifecycleError>()
+                    .is_some() =>
+            {
                 return Err(e);
             }
             Err(e)
@@ -2115,11 +2120,7 @@ impl<'a> App<'a> {
             self.running.store(false, Ordering::Relaxed);
             let _ = h.join();
         }
-        let _ = crossterm::terminal::disable_raw_mode();
-        let mut stdout = std::io::stdout();
-        let _ = stdout.execute(crossterm::event::DisableMouseCapture);
-        let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
-        let _ = stdout.flush();
+        self.terminal_guard.suspend()?;
         let mut command = tokio::process::Command::new("lazygit");
         command.current_dir(self.ui.workspace.root());
         let result = self
@@ -2132,13 +2133,9 @@ impl<'a> App<'a> {
                 SupportCommandAudit::new("lazygit", "user-trusted-bypass"),
             )
             .await;
-        let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
-        let _ = stdout.execute(crossterm::terminal::Clear(
-            crossterm::terminal::ClearType::All,
-        ));
-        let _ = stdout.execute(crossterm::event::EnableMouseCapture);
-        let _ = crossterm::terminal::enable_raw_mode();
+        let resume_result = self.terminal_guard.resume();
         self.rebind_event_thread();
+        resume_result?;
         match result {
             Ok(output)
                 if output.status == CommandStatus::Completed
