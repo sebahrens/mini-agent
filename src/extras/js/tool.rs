@@ -773,23 +773,40 @@ impl Tool for JsTool {
     type Output = String;
 
     fn description(&self) -> String {
-        let globals = if cfg!(feature = "sandbox") {
-            "read_file(path), write_file(path, content), fetch(url, options), \
-             spawn(cmd, args), console.log(...)"
-                .to_string()
-        } else {
-            "read_file(path), write_file(path, content), spawn(cmd, args), console.log(...)"
-                .to_string()
-        };
+        let mut globals = vec![
+            "read_file(path)",
+            "write_file(path, content)",
+            "console.log(...)",
+        ];
+        if cfg!(feature = "sandbox") {
+            globals.push("fetch(url, options)");
+        }
+        if self.sandbox.owns_complete_process_tree() {
+            globals.push("spawn(cmd, args)");
+        }
         #[cfg(feature = "skills")]
-        let mut globals = globals;
+        let mut proposal_guidance = "";
         #[cfg(feature = "skills")]
         if self.proposal_service.is_some() {
-            globals.push_str(", propose_skill(draft)");
+            globals.push("propose_skill(draft)");
+            proposal_guidance = " After a pattern proves repeated and generalizable, curate it with \
+                propose_skill({source, description, exports: [{name, signature}], tests, \
+                capability: {tier, grants}, tags?, predecessor_id?}). Every test must be a \
+                JavaScript expression that returns exactly true. Tier is pure, read_only, or \
+                side_effecting. Grants use {kind: 'read_file'|'write_file', workspace_prefixes}, \
+                {kind: 'fetch', origins, methods}, or {kind: 'spawn', programs}; use [] when no \
+                effects are needed. A proposal is an immutable candidate for verification and \
+                human-gated admission; it is not executed or activated by proposing it.";
         }
+        #[cfg(not(feature = "skills"))]
+        let proposal_guidance = "";
         format!(
-            "Execute JavaScript code. Available globals: {globals}. Returns the last expression \
-             value as a string. Runtime failures use closed, source-free error classes."
+            "Execute JavaScript code. Prefer this tool for computation, parsing, data \
+             transformation, control flow, and cross-platform automation instead of invoking \
+             Python through a shell. Available globals: {}. Returns the last expression \
+             value as a string. Runtime failures use closed, source-free error classes.{}",
+            globals.join(", "),
+            proposal_guidance,
         )
     }
 

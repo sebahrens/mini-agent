@@ -680,7 +680,18 @@ async fn proposal_host_wiring_enqueues_only_in_normal_skills_context() {
         AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
         worker,
     );
-    assert!(tool.description().contains("propose_skill"));
+    let description = tool.description();
+    assert!(description.contains("propose_skill({source, description, exports"));
+    assert!(
+        description
+            .contains("Every test must be a JavaScript expression that returns exactly true")
+    );
+    assert!(description.contains("repeated and generalizable"));
+    assert!(description.contains("Tier is pure, read_only, or side_effecting"));
+    assert!(description.contains("{kind: 'fetch', origins, methods}"));
+    assert!(description.contains("{kind: 'spawn', programs}"));
+    assert!(description.contains("human-gated admission"));
+    assert!(!description.contains("spawn(cmd, args)"));
 
     let output = tool
         .call(JsArgs {

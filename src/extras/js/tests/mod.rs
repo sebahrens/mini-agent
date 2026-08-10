@@ -93,7 +93,18 @@ fn make_test_tool_with_permissions(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) -> JsTool {
-    let sandbox = sandbox.with_complete_process_tree_for_test();
+    make_test_tool_with_permissions_and_process_tree(
+        sandbox.with_complete_process_tree_for_test(),
+        permission,
+        ask_tx,
+    )
+}
+
+fn make_test_tool_with_permissions_and_process_tree(
+    sandbox: Sandbox,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+) -> JsTool {
     let root =
         std::env::temp_dir().join(format!("mini-agent-js-test-audit-{}", uuid::Uuid::new_v4()));
     let paths = crate::paths::AppPaths {
@@ -189,6 +200,25 @@ async fn test_fetch_global_matches_sandbox_feature() {
             "undefined"
         }
     );
+}
+
+#[tokio::test]
+async fn tool_description_prefers_javascript_for_computation() {
+    use rig::tool::Tool;
+    let description = make_test_tool().description();
+
+    assert!(description.contains("Prefer this tool for computation"));
+    assert!(description.contains("instead of invoking Python through a shell"));
+    assert!(description.contains("spawn(cmd, args)"));
+}
+
+#[tokio::test]
+async fn tool_description_only_advertises_spawn_with_process_tree_ownership() {
+    use rig::tool::Tool;
+    let tool =
+        make_test_tool_with_permissions_and_process_tree(Sandbox::new(false, "bwrap"), None, None);
+
+    assert!(!tool.description().contains("spawn(cmd, args)"));
 }
 
 #[cfg(feature = "skills")]
