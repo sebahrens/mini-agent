@@ -287,11 +287,6 @@ async fn run_with_limits_and_cancellation(
     limits: CommandLimits,
     cancellation: &ValidationCancellation,
 ) -> ValidationResult {
-    #[cfg(windows)]
-    let sandbox = sandbox
-        .clone()
-        .with_shell_command_arg("powershell", "-Command");
-    #[cfg(not(windows))]
     let sandbox = sandbox.clone();
 
     match sandbox

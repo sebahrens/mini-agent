@@ -17,11 +17,25 @@ use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::sandbox::Sandbox;
 
+fn registered_shell_capability<'a>(
+    cli: &Cli,
+    cfg: &Config,
+    sandbox: &'a Sandbox,
+) -> Option<&'a crate::sandbox::ShellCapability> {
+    if cli.resolve_no_tools(cfg)
+        || (!cli.tools.is_empty() && !cli.tools.iter().any(|name| name == "bash"))
+    {
+        return None;
+    }
+    sandbox.shell_capability()
+}
+
 /// Assemble the system-prompt preamble every request carries: the base
 /// `SYSTEM_PROMPT`, tool-use guidance, context files (AGENTS.md, ARCHITECTURE.md,
 /// active mode prompt), working directory, `/add`ed files, memory, and the user
 /// `SUFFIX.md`. Extracted from [`build_agent_inner`] so its token cost can be
 /// estimated (see [`estimate_overhead`]) without building an `Agent`.
+#[cfg(test)]
 pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String {
     build_preamble_for_workspace(
         context,
@@ -148,12 +162,54 @@ pub(crate) fn build_preamble_for_workspace(
     preamble
 }
 
-/// Estimate the token cost of the fixed request overhead (the preamble from
-/// [`build_preamble`]). Stored on the session and added to the context figure
-/// before the first real calibration. Does not yet include tool-schema tokens;
-/// the provider's first usage report folds those into the calibration anchor.
-pub fn estimate_overhead(context: &ContextFiles, reasoning_enabled: bool) -> u64 {
-    crate::session::Session::estimate_tokens(&build_preamble(context, reasoning_enabled))
+fn build_registered_preamble(
+    context: &ContextFiles,
+    reasoning_enabled: bool,
+    workspace_root: &Path,
+    cli: &Cli,
+    cfg: &Config,
+    sandbox: &Sandbox,
+    lsp_enabled: bool,
+) -> String {
+    let mut preamble =
+        build_preamble_for_workspace(context, reasoning_enabled, Some(workspace_root));
+    #[cfg(feature = "lsp")]
+    if lsp_enabled {
+        preamble.push_str(crate::agent::prompt::LSP_PROMPT);
+    }
+    #[cfg(not(feature = "lsp"))]
+    let _ = lsp_enabled;
+    if let Some(capability) = registered_shell_capability(cli, cfg, sandbox) {
+        preamble.push_str(&capability.model_guidance());
+    }
+    preamble
+}
+
+/// Estimate the token cost of the exact preamble registered for this agent.
+/// Stored on the session and added to the context figure before the first real
+/// calibration. Tool-schema tokens are folded into the first provider usage
+/// report.
+pub fn estimate_overhead(
+    context: &ContextFiles,
+    reasoning_enabled: bool,
+    cli: &Cli,
+    cfg: &Config,
+    sandbox: &Sandbox,
+) -> u64 {
+    #[cfg(feature = "lsp")]
+    let lsp_enabled = !cli.resolve_no_tools(cfg) && cfg.resolve_lsp().is_some();
+    #[cfg(not(feature = "lsp"))]
+    let lsp_enabled = false;
+    let preamble = build_registered_preamble(
+        context,
+        reasoning_enabled,
+        &context.workspace_root,
+        cli,
+        cfg,
+        sandbox,
+        lsp_enabled,
+    );
+    crate::session::Session::estimate_tokens(&preamble)
 }
 
 /// Retain only the tools whose names appear in `allowlist`. An empty
@@ -355,6 +411,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 ) -> Agent<M> {
     let workspace_root = workspace.root();
     let sandbox = sandbox.with_workspace_binding(workspace.clone());
+    let tools_enabled = !cli.resolve_no_tools(cfg);
+    let shell_tool_enabled = registered_shell_capability(cli, cfg, &sandbox).is_some();
     #[cfg(feature = "lsp")]
     let lsp_manager = if cli.resolve_no_tools(cfg) {
         None
@@ -363,13 +421,19 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             .map(|c| crate::extras::lsp::LspManager::new(c, workspace.clone()))
     };
 
-    #[cfg_attr(not(feature = "lsp"), allow(unused_mut))]
-    let mut preamble =
-        build_preamble_for_workspace(context, reasoning_enabled, Some(workspace_root));
     #[cfg(feature = "lsp")]
-    if lsp_manager.is_some() {
-        preamble.push_str(crate::agent::prompt::LSP_PROMPT);
-    }
+    let lsp_enabled = lsp_manager.is_some();
+    #[cfg(not(feature = "lsp"))]
+    let lsp_enabled = false;
+    let preamble = build_registered_preamble(
+        context,
+        reasoning_enabled,
+        workspace_root,
+        cli,
+        cfg,
+        &sandbox,
+        lsp_enabled,
+    );
 
     let mut builder = AgentBuilder::new(model).preamble(&preamble);
 
@@ -387,7 +451,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         builder = builder.temperature(temp);
     }
 
-    if cli.resolve_no_tools(cfg) {
+    if !tools_enabled {
         builder.build()
     } else {
         let max_text_file_size = cfg.max_text_file_size;
@@ -413,42 +477,43 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         .with_workspace_binding(workspace.clone());
         #[cfg(feature = "lsp")]
         let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
-        let base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::from_buf([
-            Box::new(
-                tools::ReadTool::new_with_tracker(
-                    permission.clone(),
-                    ask_tx.clone(),
-                    max_text_file_size,
-                    max_read_lines,
-                    read_tracker,
-                )
-                .with_workspace_binding(workspace.clone()),
-            ),
-            Box::new(write_tool),
-            Box::new(edit_tool),
-            Box::new(tools::BashTool::new(
+        let mut base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::new();
+        base_tools.push(Box::new(
+            tools::ReadTool::new_with_tracker(
+                permission.clone(),
+                ask_tx.clone(),
+                max_text_file_size,
+                max_read_lines,
+                read_tracker,
+            )
+            .with_workspace_binding(workspace.clone()),
+        ));
+        base_tools.push(Box::new(write_tool));
+        base_tools.push(Box::new(edit_tool));
+        if shell_tool_enabled {
+            base_tools.push(Box::new(tools::BashTool::new(
                 permission.clone(),
                 ask_tx.clone(),
                 sandbox.clone(),
                 max_bash_output_lines,
-            )),
-            Box::new(
-                tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
-                    .with_workspace_binding(workspace.clone()),
-            ),
-            Box::new(
-                tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
-                    .with_workspace_binding(workspace.clone()),
-            ),
-            Box::new(
-                tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
-                    .with_workspace_binding(workspace.clone()),
-            ),
-            Box::new(tools::WriteTodoList::new(
-                permission.clone(),
-                ask_tx.clone(),
-            )),
-        ]);
+            )));
+        }
+        base_tools.push(Box::new(
+            tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
+                .with_workspace_binding(workspace.clone()),
+        ));
+        base_tools.push(Box::new(
+            tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
+                .with_workspace_binding(workspace.clone()),
+        ));
+        base_tools.push(Box::new(
+            tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
+                .with_workspace_binding(workspace.clone()),
+        ));
+        base_tools.push(Box::new(tools::WriteTodoList::new(
+            permission.clone(),
+            ask_tx.clone(),
+        )));
 
         #[cfg_attr(
             not(any(
@@ -555,10 +620,13 @@ mod js_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use super::{build_agent_inner, build_btw_agent_inner, register_js_tool_with_status};
+    use super::{
+        build_agent_inner, build_btw_agent_inner, build_registered_preamble,
+        register_js_tool_with_status, registered_shell_capability,
+    };
     use crate::context::ContextFiles;
     use crate::sandbox::{
-        Sandbox,
+        Sandbox, ShellCapability, ShellDialect,
         worker::{WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus},
     };
 
@@ -593,6 +661,139 @@ mod js_tests {
         std::sync::Arc::new(
             crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
         )
+    }
+
+    fn shell_sandbox() -> Sandbox {
+        let capability =
+            ShellCapability::for_test(&std::env::current_exe().unwrap(), ShellDialect::Posix);
+        Sandbox::new(false, "bwrap").with_resolved_shell(Some(capability))
+    }
+
+    async fn test_main_agent(
+        cli: &crate::cli::Cli,
+        sandbox: Sandbox,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> rig::agent::Agent<rig::test_utils::MockCompletionModel> {
+        build_agent_inner(
+            fake_model("shell-test"),
+            cli,
+            &crate::config::Config::default(),
+            &empty_context(),
+            workspace,
+            None,
+            None,
+            sandbox,
+            crate::agent::tools::ReadTracker::new(true),
+            false,
+            None,
+            None,
+            crate::sandbox::worker::containment_status(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn shell_tool_and_guidance_follow_the_same_captured_capability() {
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let cfg = crate::config::Config::default();
+        let cli = crate::cli::Cli::default();
+        let guidance = registered_shell_capability(&cli, &cfg, &sandbox)
+            .unwrap()
+            .model_guidance();
+        assert!(guidance.contains("POSIX shell"));
+        let preamble = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &cli,
+            &cfg,
+            &sandbox,
+            false,
+        );
+        assert!(preamble.contains("Run POSIX shell commands"));
+        let agent = test_main_agent(&cli, sandbox.clone(), workspace.clone()).await;
+        let definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
+        let bash = definitions.iter().find(|tool| tool.name == "bash").unwrap();
+        assert!(bash.description.contains("POSIX shell"));
+
+        let missing = Sandbox::new(false, "bwrap").with_resolved_shell(None);
+        assert!(registered_shell_capability(&cli, &cfg, &missing).is_none());
+        let missing_preamble = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &cli,
+            &cfg,
+            &missing,
+            false,
+        );
+        assert!(!missing_preamble.contains("shell commands"));
+        assert!(!missing_preamble.contains("run commands"));
+        let agent = test_main_agent(&cli, missing, workspace.clone()).await;
+        assert!(
+            !agent
+                .tool_server_handle
+                .get_tool_defs(None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "bash")
+        );
+
+        let no_tools = crate::cli::Cli {
+            no_tools: true,
+            ..crate::cli::Cli::default()
+        };
+        assert!(registered_shell_capability(&no_tools, &cfg, &sandbox).is_none());
+        let no_tools_preamble = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &no_tools,
+            &cfg,
+            &sandbox,
+            false,
+        );
+        assert!(!no_tools_preamble.contains("shell commands"));
+        let agent = test_main_agent(&no_tools, sandbox.clone(), workspace.clone()).await;
+        assert!(
+            agent
+                .tool_server_handle
+                .get_tool_defs(None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let read_only = crate::cli::Cli {
+            tools: vec!["read".to_string()],
+            ..crate::cli::Cli::default()
+        };
+        assert!(registered_shell_capability(&read_only, &cfg, &sandbox).is_none());
+        let read_only_preamble = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &read_only,
+            &cfg,
+            &sandbox,
+            false,
+        );
+        assert!(!read_only_preamble.contains("shell commands"));
+        let agent = test_main_agent(&read_only, sandbox, workspace).await;
+        let definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read"]
+        );
     }
 
     #[tokio::test]

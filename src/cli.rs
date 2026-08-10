@@ -237,7 +237,7 @@ pub struct Cli {
 
     #[arg(
         long = "shell",
-        help = "Shell binary to use for the bash tool (default: bash; powershell.exe on Windows)"
+        help = "Shell for the bash compatibility tool: bash/sh, or PowerShell/pwsh on Windows"
     )]
     pub shell: Option<String>,
 

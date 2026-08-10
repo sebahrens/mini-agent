@@ -261,6 +261,7 @@ pub(crate) struct Startup {
     pub ask_tx: Option<AskSender>,
     pub ask_rx: Option<AskReceiver>,
     pub sandbox: Sandbox,
+    shell_search_path: Option<std::ffi::OsString>,
     pub status_signals: Option<StatusSignals>,
     #[cfg(feature = "advisor")]
     pub handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
@@ -460,6 +461,7 @@ impl Startup {
             ask_tx: None,
             ask_rx: None,
             sandbox: Sandbox::new(false, "bwrap"),
+            shell_search_path: std::env::var_os("PATH"),
             status_signals: None,
             #[cfg(feature = "advisor")]
             handoff_rx: None,
@@ -477,7 +479,6 @@ impl Startup {
     pub(crate) fn validate_sandbox_availability(&self) -> anyhow::Result<()> {
         let backend = self.cli.resolve_sandbox_backend(&self.cfg);
         let sandbox = Sandbox::new(self.cli.resolve_sandbox(&self.cfg), &backend)
-            .with_shell(&self.cli.resolve_shell(&self.cfg))
             .with_windows_appcontainer_roots(
                 self.cli.resolve_windows_appcontainer_read_roots(&self.cfg),
                 self.cli.resolve_windows_appcontainer_write_roots(&self.cfg),
@@ -581,7 +582,15 @@ impl Startup {
         // Sandbox, tools config, status signals, permission checker
         let (authority, sandbox) =
             crate::permission::resolve_configured_execution_authority(&self.cli, &self.cfg)?;
-        self.sandbox = sandbox.with_workspace_binding(self.workspace.clone());
+        self.sandbox = crate::permission::bind_configured_shell(
+            &self.cli,
+            &self.cfg,
+            authority,
+            &self.workspace,
+            self.shell_search_path.as_deref(),
+            sandbox,
+        )
+        .with_workspace_binding(self.workspace.clone());
         let edit_system = self.cli.resolve_edit_system(&self.cfg);
         tools::set_edit_system(edit_system);
 

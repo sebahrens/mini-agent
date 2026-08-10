@@ -98,6 +98,7 @@ struct SessionState {
     context: Arc<ContextFiles>,
     turns: Arc<StdMutex<SessionTurns>>,
     read_tracker: crate::agent::tools::ReadTracker,
+    sandbox: crate::sandbox::Sandbox,
 }
 
 const TURN_ACTIVE: u8 = 0;
@@ -269,6 +270,7 @@ struct AcpState {
     context: ContextFiles,
     sessions: Mutex<HashMap<SessionId, SessionState>>,
     cancel_routes: StdMutex<HashMap<SessionId, Arc<StdMutex<SessionTurns>>>>,
+    shell_search_path: Option<std::ffi::OsString>,
     #[cfg(test)]
     prompt_fixture: Option<PromptFixture>,
     #[cfg(test)]
@@ -505,6 +507,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         context,
         sessions: Mutex::new(HashMap::new()),
         cancel_routes: StdMutex::new(HashMap::new()),
+        shell_search_path: std::env::var_os("PATH"),
         #[cfg(test)]
         prompt_fixture: None,
         #[cfg(test)]
@@ -660,6 +663,7 @@ async fn handle_new_session(
 ) -> Result<(), agent_client_protocol::Error> {
     let workspace = Arc::new(canonical_session_workspace(&req.cwd)?);
     let workspace_root = workspace.root();
+    let sandbox = acp_session_sandbox(state, workspace.clone())?;
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
 
     tracing::info!(
@@ -697,6 +701,7 @@ async fn handle_new_session(
             read_tracker: crate::agent::tools::ReadTracker::new(
                 state.cfg.deny_repeated_reads.unwrap_or(true),
             ),
+            sandbox,
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id.clone(), turns);
@@ -715,6 +720,24 @@ fn canonical_session_workspace(
             format!("invalid ACP session cwd '{}': {error}", path.display()),
         )
     })
+}
+
+fn acp_session_sandbox(
+    state: &AcpState,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+) -> Result<crate::sandbox::Sandbox, agent_client_protocol::Error> {
+    let (authority, sandbox) =
+        crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg)
+            .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
+    Ok(crate::permission::bind_configured_shell(
+        &state.cli,
+        &state.cfg,
+        authority,
+        &workspace,
+        state.shell_search_path.as_deref(),
+        sandbox,
+    )
+    .with_workspace_binding(workspace))
 }
 
 async fn handle_prompt(
@@ -737,7 +760,7 @@ async fn handle_prompt(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (history, workspace, context, read_tracker, control, registration) = {
+    let (history, workspace, context, read_tracker, sandbox, control, registration) = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
@@ -764,6 +787,7 @@ async fn handle_prompt(
             sess.workspace.clone(),
             sess.context.clone(),
             sess.read_tracker.clone(),
+            sess.sandbox.clone(),
             control.clone(),
             TurnRegistration {
                 generation,
@@ -805,6 +829,7 @@ async fn handle_prompt(
                     workspace,
                     context,
                     read_tracker,
+                    sandbox,
                     responder,
                     cx,
                     control,
@@ -851,6 +876,7 @@ async fn run_prompt(
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
+    sandbox: crate::sandbox::Sandbox,
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
@@ -925,7 +951,7 @@ async fn run_prompt(
     }
 
     let workspace_root = workspace.root();
-    let (authority, sandbox) =
+    let authority =
         match crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -937,15 +963,14 @@ async fn run_prompt(
                     error.to_string(),
                 );
             }
-        };
+        }
+        .0;
     let (permission, ask_tx) = crate::permission::build_noninteractive_permission_at(
         &state.cfg,
         authority,
         Some(workspace_root.to_path_buf()),
     )
     .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
-    let sandbox = sandbox.with_workspace_binding(workspace.clone());
-
     let provider_str = state.cli.resolve_provider(&state.cfg);
     let mut model_str = state.cli.resolve_model(&state.cfg);
 
@@ -1576,6 +1601,7 @@ mod protocol_tests {
             context: crate::context::load(true),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
+            shell_search_path: std::env::var_os("PATH"),
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             prompt_exit_barrier: None,
@@ -1589,6 +1615,7 @@ mod protocol_tests {
             context: crate::context::load(true),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
+            shell_search_path: std::env::var_os("PATH"),
             prompt_fixture: None,
             runner_fixture: Some(runner_fixture),
             prompt_exit_barrier: None,
@@ -1605,10 +1632,57 @@ mod protocol_tests {
             context: crate::context::load(true),
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
+            shell_search_path: std::env::var_os("PATH"),
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             prompt_exit_barrier: Some(prompt_exit_barrier),
         })
+    }
+
+    #[test]
+    fn acp_workspace_shell_capability_is_captured_once_for_rebuilds() {
+        let temp = ProtocolTempDir::new();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join(if cfg!(windows) { "bash.exe" } else { "bash" });
+        #[cfg(windows)]
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(&executable, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(temp.path()).unwrap());
+        let state = AcpState {
+            cli: Cli {
+                no_sandbox: true,
+                shell: Some("bash".to_string()),
+                ..Cli::default()
+            },
+            cfg: Config::default(),
+            context: crate::context::load(true),
+            sessions: Mutex::new(HashMap::new()),
+            cancel_routes: StdMutex::new(HashMap::new()),
+            shell_search_path: Some(std::ffi::OsString::from("bin")),
+            prompt_fixture: None,
+            runner_fixture: None,
+            prompt_exit_barrier: None,
+        };
+
+        let sandbox = acp_session_sandbox(&state, workspace.clone()).unwrap();
+        let rebuilt = sandbox.clone();
+        let capability = sandbox.shell_capability().unwrap();
+        assert_eq!(capability.executable(), executable.canonicalize().unwrap());
+        assert_eq!(capability.command_arg(), "-c");
+        assert_eq!(
+            rebuilt.shell_capability().unwrap().executable(),
+            capability.executable()
+        );
+
+        drop((rebuilt, sandbox, workspace, state));
+        drop(temp);
     }
 
     fn done(response: &str, interactions: Vec<Message>) -> AgentEvent {

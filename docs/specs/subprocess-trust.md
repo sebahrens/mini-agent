@@ -41,7 +41,11 @@ The owner of a launch site must make all of these fields reviewable, even when t
 
 User-controlled values must remain data in a direct argv grammar. A profile that permits an opaque
 shell program must say so explicitly; quoting a value does not convert that grammar to direct
-exec. Configuration trust and command execution permission are separate decisions.
+exec. Configuration trust and command execution permission are separate decisions. The model-action
+shell is resolved once from the canonical workspace and the invocation's captured `PATH`. Only
+Bash/sh (`-c`) and, on Windows, PowerShell/pwsh (`-Command`) are supported. The canonical executable
+identity is held and revalidated at launch; missing, replaced, or unsupported shells are not
+registered or described to the model and never fall back to an unchecked name.
 
 ## Trust classes and normative contracts
 

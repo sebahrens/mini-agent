@@ -180,8 +180,13 @@ impl<'a> App<'a> {
             todo_tools_enabled: false,
         };
         ui.session.reasoning_enabled = slash.reasoning_enabled;
-        ui.session.overhead_tokens =
-            crate::agent::builder::estimate_overhead(ui.context, slash.reasoning_enabled);
+        ui.session.overhead_tokens = crate::agent::builder::estimate_overhead(
+            ui.context,
+            slash.reasoning_enabled,
+            ui.cli,
+            ui.cfg,
+            &ui.sandbox,
+        );
 
         render_session(&mut renderer, ui.session, ui.cli, ui.cfg, ui.context)?;
         let marker_path = crate::paths::process_paths()

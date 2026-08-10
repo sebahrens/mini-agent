@@ -40,17 +40,28 @@ impl Tool for BashTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Execute a bash command in the current working directory. Commands have a hard 30 second \
-         deadline and bounded output. The optional timeout can only lower the deadline. Complete \
-         output is decoded with UTF-8 replacement and returned as stdout followed by stderr."
-            .to_string()
+        let dialect = self
+            .sandbox
+            .shell_capability()
+            .map(|capability| capability.dialect().name())
+            .unwrap_or("configured shell");
+        format!(
+            "Execute a {dialect} command in the current working directory. Commands have a hard 30 second \
+             deadline and bounded output. The optional timeout can only lower the deadline. Complete \
+             output is decoded with UTF-8 replacement and returned as stdout followed by stderr."
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
+        let dialect = self
+            .sandbox
+            .shell_capability()
+            .map(|capability| capability.dialect().name())
+            .unwrap_or("configured shell");
         serde_json::json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Bash command to execute" },
+                "command": { "type": "string", "description": format!("{dialect} command to execute") },
                 "timeout": {
                     "type": "integer",
                     "description": "Lower command deadline in milliseconds (optional; maximum 30000)"

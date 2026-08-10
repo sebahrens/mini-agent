@@ -38,8 +38,13 @@ pub async fn ensure_agent(
     );
     // Keep the pre-calibration context estimate in sync with the preamble we
     // just built (system prompt + tools + context files).
-    ui.session.overhead_tokens =
-        crate::agent::builder::estimate_overhead(ui.context, reasoning_enabled);
+    ui.session.overhead_tokens = crate::agent::builder::estimate_overhead(
+        ui.context,
+        reasoning_enabled,
+        ui.cli,
+        ui.cfg,
+        &ui.sandbox,
+    );
 }
 
 pub async fn handle_agent_event(
