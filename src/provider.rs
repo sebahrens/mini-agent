@@ -408,6 +408,22 @@ pub async fn fetch_openrouter_pricing(
     custom_providers: &HashMap<String, CustomProviderConfig>,
     config_api_keys: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
+    fetch_openrouter_pricing_from_url(
+        api_key,
+        custom_providers,
+        config_api_keys,
+        "https://openrouter.ai/api/v1/models",
+    )
+    .await
+}
+
+pub(crate) async fn fetch_openrouter_pricing_from_url(
+    api_key: Option<&str>,
+    custom_providers: &HashMap<String, CustomProviderConfig>,
+    config_api_keys: Option<&HashMap<String, String>>,
+    url: &str,
+) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
+    const MAX_PRICING_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
     let config = resolve_provider_config("openrouter", custom_providers)?;
     let key = AuthResolver::new(config.kind)
         .with_cli_key(api_key)
@@ -423,7 +439,6 @@ pub async fn fetch_openrouter_pricing(
         custom,
         None,
     )?;
-    let url = "https://openrouter.ai/api/v1/models";
     let mut req = http.get(url);
     if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(k);
@@ -443,7 +458,21 @@ pub async fn fetch_openrouter_pricing(
     struct PricingList {
         data: Vec<PricingEntry>,
     }
-    let resp: PricingList = req.send().await?.error_for_status()?.json().await?;
+    let mut response = req.send().await?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|bytes| bytes > MAX_PRICING_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("OpenRouter pricing response exceeded its size limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_PRICING_RESPONSE_BYTES {
+            anyhow::bail!("OpenRouter pricing response exceeded its size limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let resp: PricingList = serde_json::from_slice(&body)?;
     let mut map = HashMap::new();
     for entry in resp.data {
         let (input, output) = match entry.pricing.as_ref() {

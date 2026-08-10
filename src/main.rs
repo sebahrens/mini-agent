@@ -233,7 +233,10 @@ async fn run() -> anyhow::Result<()> {
         return extras::acp::serve(startup.cli, startup.cfg, startup.context).await;
     }
 
+    startup.start_openrouter_pricing_refresh();
     startup.init_features().await?;
-    startup.resolve_prompts().await?;
+    let prompts = startup.resolve_prompts().await;
+    startup.finish_openrouter_pricing_refresh().await;
+    prompts?;
     startup.dispatch().await
 }

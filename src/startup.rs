@@ -298,12 +298,131 @@ pub(crate) struct Startup {
     pub sandbox: Sandbox,
     shell_search_path: Option<std::ffi::OsString>,
     pub status_signals: Option<StatusSignals>,
+    openrouter_pricing_refresh: Option<OpenRouterPricingRefresh>,
     #[cfg(feature = "advisor")]
     pub handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
     // Set by resolve_prompts:
     pub arch_msg: Option<String>,
     pub session_resumed: bool,
     pub resume_override_pending: bool,
+}
+
+type OpenRouterPricingMap = std::collections::HashMap<String, provider::OpenRouterModelInfo>;
+const OPENROUTER_PRICING_ABORT_JOIN_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(100);
+static ACTIVE_OPENROUTER_PRICING_REAPERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn reap_aborted_openrouter_pricing_refresh(
+    handle: tokio::task::JoinHandle<anyhow::Result<OpenRouterPricingMap>>,
+) {
+    ACTIVE_OPENROUTER_PRICING_REAPERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    tokio::spawn(async move {
+        struct ReaperPermit;
+        impl Drop for ReaperPermit {
+            fn drop(&mut self) {
+                ACTIVE_OPENROUTER_PRICING_REAPERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        let _permit = ReaperPermit;
+        let _ = handle.await;
+    });
+}
+
+struct OpenRouterPricingRefresh {
+    handle: Option<tokio::task::JoinHandle<anyhow::Result<OpenRouterPricingMap>>>,
+    model: CompactString,
+    need_pricing: bool,
+    need_context: bool,
+    initial_context_window: u64,
+}
+
+impl OpenRouterPricingRefresh {
+    fn start<Refresh>(
+        model: CompactString,
+        need_pricing: bool,
+        need_context: bool,
+        initial_context_window: u64,
+        refresh: Refresh,
+    ) -> Self
+    where
+        Refresh:
+            std::future::Future<Output = anyhow::Result<OpenRouterPricingMap>> + Send + 'static,
+    {
+        Self {
+            handle: Some(tokio::spawn(refresh)),
+            model,
+            need_pricing,
+            need_context,
+            initial_context_window,
+        }
+    }
+
+    async fn finish_without_wait(&mut self) -> Option<anyhow::Result<OpenRouterPricingMap>> {
+        let mut handle = self.handle.take()?;
+        if !handle.is_finished() {
+            handle.abort();
+            if tokio::time::timeout(OPENROUTER_PRICING_ABORT_JOIN_GRACE, &mut handle)
+                .await
+                .is_err()
+            {
+                reap_aborted_openrouter_pricing_refresh(handle);
+            }
+            return None;
+        }
+        handle.await.ok()
+    }
+
+    #[cfg(test)]
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+}
+
+impl Drop for OpenRouterPricingRefresh {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn apply_openrouter_pricing_refresh_result(
+    session: &mut Session,
+    refresh: &OpenRouterPricingRefresh,
+    result: Option<anyhow::Result<OpenRouterPricingMap>>,
+) {
+    let Some(Ok(infos)) = result else {
+        return;
+    };
+    if session.provider != "openrouter" || session.model != refresh.model {
+        return;
+    }
+    let Some(info) = infos.get(session.model.as_str()) else {
+        return;
+    };
+    if refresh.need_pricing && session.input_token_cost == 0.0 && session.output_token_cost == 0.0 {
+        session.input_token_cost = info.input_cost;
+        session.output_token_cost = info.output_cost;
+    }
+    if refresh.need_context
+        && session.context_window == refresh.initial_context_window
+        && let Some(context_window) = info.context_length
+    {
+        session.update_context_window(context_window);
+    }
+}
+
+fn needs_openrouter_context_refresh(cfg: &Config, model: &str) -> bool {
+    cfg.context_window.is_none()
+        && cfg.quick_models.as_ref().is_none_or(|quick_models| {
+            quick_models
+                .values()
+                .all(|quick| quick.model.as_str() != model || quick.context_window.is_none())
+        })
+        && Config::catalog_context_window("openrouter", model).is_none()
 }
 
 impl Startup {
@@ -498,6 +617,7 @@ impl Startup {
             sandbox: Sandbox::new(false, "bwrap"),
             shell_search_path: std::env::var_os("PATH"),
             status_signals: None,
+            openrouter_pricing_refresh: None,
             #[cfg(feature = "advisor")]
             handoff_rx: None,
             arch_msg: None,
@@ -550,7 +670,7 @@ impl Startup {
         self.validate_sandbox_availability()
     }
 
-    /// Phase 2: subagents, OpenRouter pricing, sandbox, tools config,
+    /// Phase 2: subagents, sandbox, tools config,
     /// permission checker, advisor.
     pub(crate) async fn init_features(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "subagents")]
@@ -608,32 +728,6 @@ impl Startup {
                 task_max_turns,
                 self.cfg.clone(),
             );
-        }
-
-        // Fetch OpenRouter pricing and context window at startup so cost tracking
-        // and the context meter work from the first turn.
-        if self.provider == "openrouter" {
-            let need_pricing =
-                self.session.input_token_cost == 0.0 && self.session.output_token_cost == 0.0;
-            let need_ctx = self.cfg.context_window.is_none()
-                && Config::catalog_context_window("openrouter", self.model.as_str()).is_none();
-            if (need_pricing || need_ctx)
-                && let Ok(infos) = provider::fetch_openrouter_pricing(
-                    self.cli.api_key.as_deref(),
-                    &self.cfg.custom_providers_map(),
-                    self.cfg.api_keys.as_ref(),
-                )
-                .await
-                && let Some(info) = infos.get(self.model.as_str())
-            {
-                if need_pricing {
-                    self.session.input_token_cost = info.input_cost;
-                    self.session.output_token_cost = info.output_cost;
-                }
-                if need_ctx && let Some(cw) = info.context_length {
-                    self.session.update_context_window(cw);
-                }
-            }
         }
 
         // Sandbox, tools config, status signals, permission checker
@@ -726,6 +820,44 @@ impl Startup {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn start_openrouter_pricing_refresh(&mut self) {
+        if self.provider != "openrouter" {
+            return;
+        }
+        let need_pricing =
+            self.session.input_token_cost == 0.0 && self.session.output_token_cost == 0.0;
+        let need_context = needs_openrouter_context_refresh(&self.cfg, self.model.as_str());
+        if !need_pricing && !need_context {
+            return;
+        }
+
+        let api_key = self.cli.api_key.clone();
+        let custom_providers = self.cfg.custom_providers_map();
+        let config_api_keys = self.cfg.api_keys.clone();
+        self.openrouter_pricing_refresh = Some(OpenRouterPricingRefresh::start(
+            self.model.clone(),
+            need_pricing,
+            need_context,
+            self.session.context_window,
+            async move {
+                provider::fetch_openrouter_pricing(
+                    api_key.as_deref(),
+                    &custom_providers,
+                    config_api_keys.as_ref(),
+                )
+                .await
+            },
+        ));
+    }
+
+    pub(crate) async fn finish_openrouter_pricing_refresh(&mut self) {
+        let Some(mut refresh) = self.openrouter_pricing_refresh.take() else {
+            return;
+        };
+        let result = refresh.finish_without_wait().await;
+        apply_openrouter_pricing_refresh_result(&mut self.session, &refresh, result);
     }
 
     /// Phase 3: version-change prompts, MCP recommendations, ARCHITECTURE.md,
@@ -1258,7 +1390,9 @@ fn select_interactive_auto_trigger(cli: &Cli, fallback: Option<String>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::{
-        ResumeProviderDecision, apply_resume_provider_decision, interactive_initial_message,
+        ACTIVE_OPENROUTER_PRICING_REAPERS, OpenRouterPricingRefresh, ResumeProviderDecision,
+        apply_openrouter_pricing_refresh_result, apply_resume_provider_decision,
+        interactive_initial_message, needs_openrouter_context_refresh,
         resolve_resume_provider_decision, run_startup_probes_concurrently,
         select_interactive_auto_trigger, unavailable_sandbox_must_fail,
         validate_startup_permission_policy,
@@ -1267,6 +1401,322 @@ mod tests {
     use crate::config::Config;
     use crate::sandbox::{Sandbox, SandboxPolicy};
     use crate::session::Session;
+
+    struct LocalPricingServer {
+        url: String,
+        started: std::sync::mpsc::Receiver<()>,
+        closed: std::sync::mpsc::Receiver<bool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    fn spawn_local_pricing_server(response: Option<(u16, &'static str)>) -> LocalPricingServer {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (closed_tx, closed) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "pricing client closed before sending headers");
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            started_tx.send(()).unwrap();
+            if let Some((status, body)) = response {
+                let reason = if status == 200 { "OK" } else { "Failure" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                return;
+            }
+
+            let closed_cleanly = loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break true,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break false;
+                    }
+                    Err(_) => break true,
+                }
+            };
+            closed_tx.send(closed_cleanly).unwrap();
+        });
+        LocalPricingServer {
+            url: format!("http://{address}/models"),
+            started,
+            closed,
+            thread,
+        }
+    }
+
+    async fn recv_channel<T>(receiver: &std::sync::mpsc::Receiver<T>, label: &str) -> T {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match receiver.try_recv() {
+                Ok(value) => return value,
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("{label}: {error}"),
+            }
+        }
+    }
+
+    async fn wait_for_pricing_refresh(refresh: &OpenRouterPricingRefresh) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !refresh.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(refresh.is_finished(), "pricing refresh did not finish");
+    }
+
+    fn local_pricing_refresh(url: String) -> OpenRouterPricingRefresh {
+        OpenRouterPricingRefresh::start("test/model".into(), true, true, 128_000, async move {
+            crate::provider::fetch_openrouter_pricing_from_url(
+                None,
+                &std::collections::HashMap::new(),
+                None,
+                &url,
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn pending_pricing_refresh_never_blocks_readiness_and_allows_relaunch() {
+        let server = spawn_local_pricing_server(None);
+        let mut refresh = local_pricing_refresh(server.url.clone());
+        recv_channel(
+            &server.started,
+            "pricing request did not reach delayed server",
+        )
+        .await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            refresh.finish_without_wait(),
+        )
+        .await
+        .expect("readiness waited for the delayed pricing response");
+        assert!(result.is_none(), "pending refresh returned a result");
+        assert!(
+            recv_channel(&server.closed, "cancelled pricing connection stayed open").await,
+            "cancelled pricing connection was not closed"
+        );
+        server.thread.join().unwrap();
+
+        const BODY: &str = r#"{"data":[{"id":"test/model","pricing":{"prompt":"0.000001","completion":"0.000002"}}]}"#;
+        let replacement_server = spawn_local_pricing_server(Some((200, BODY)));
+        let mut replacement = local_pricing_refresh(replacement_server.url.clone());
+        recv_channel(
+            &replacement_server.started,
+            "replacement pricing request did not start",
+        )
+        .await;
+        wait_for_pricing_refresh(&replacement).await;
+        assert!(matches!(
+            replacement.finish_without_wait().await,
+            Some(Ok(_))
+        ));
+        replacement_server.thread.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_non_cooperative_pricing_refresh_has_a_bounded_join() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let mut refresh =
+            OpenRouterPricingRefresh::start("test/model".into(), true, true, 128_000, async move {
+                let _ = started_tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = finished_tx.send(());
+                Ok(std::collections::HashMap::new())
+            });
+        started_rx.await.unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(refresh.finish_without_wait().await.is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "aborted pricing join exceeded its readiness budget"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+            .await
+            .expect("aborted pricing work did not finish under its reaper")
+            .expect("aborted pricing work dropped its completion signal");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while ACTIVE_OPENROUTER_PRICING_REAPERS.load(std::sync::atomic::Ordering::Acquire) != 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            ACTIVE_OPENROUTER_PRICING_REAPERS.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "aborted pricing reaper remained active"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_pricing_refresh_updates_missing_session_metadata() {
+        const BODY: &str = r#"{"data":[{"id":"test/model","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":64000}]}"#;
+        let server = spawn_local_pricing_server(Some((200, BODY)));
+        let mut refresh = local_pricing_refresh(server.url.clone());
+        recv_channel(
+            &server.started,
+            "pricing request did not reach success server",
+        )
+        .await;
+        wait_for_pricing_refresh(&refresh).await;
+        let result = refresh.finish_without_wait().await;
+        let mut session = Session::new("openrouter", "test/model", 128_000, "");
+
+        apply_openrouter_pricing_refresh_result(&mut session, &refresh, result);
+
+        assert_eq!(session.input_token_cost, 1.0);
+        assert_eq!(session.output_token_cost, 2.0);
+        assert_eq!(session.context_window, 64_000);
+        server.thread.join().unwrap();
+    }
+
+    #[test]
+    fn failed_pricing_refresh_preserves_existing_session_metadata() {
+        let refresh = OpenRouterPricingRefresh {
+            handle: None,
+            model: "test/model".into(),
+            need_pricing: true,
+            need_context: true,
+            initial_context_window: 128_000,
+        };
+        let mut session = Session::new("openrouter", "test/model", 128_000, "");
+        session.input_token_cost = 7.0;
+        session.output_token_cost = 9.0;
+
+        apply_openrouter_pricing_refresh_result(
+            &mut session,
+            &refresh,
+            Some(Err(anyhow::anyhow!("closed pricing failure"))),
+        );
+
+        assert_eq!(session.input_token_cost, 7.0);
+        assert_eq!(session.output_token_cost, 9.0);
+        assert_eq!(session.context_window, 128_000);
+    }
+
+    #[test]
+    fn quick_model_context_prevents_live_context_refresh() {
+        let mut cfg = Config::default();
+        cfg.quick_models = Some(std::collections::HashMap::from([(
+            "test".to_string(),
+            crate::config::QuickModelConfig {
+                provider: "openrouter".into(),
+                model: "uncatalogued/model".into(),
+                input_token_cost: 0.0,
+                output_token_cost: 0.0,
+                reserve_tokens: None,
+                temperature: None,
+                extra_body: None,
+                context_window: Some(64_000),
+            },
+        )]));
+
+        assert!(!needs_openrouter_context_refresh(
+            &cfg,
+            "uncatalogued/model"
+        ));
+        assert!(needs_openrouter_context_refresh(&cfg, "other/model"));
+    }
+
+    #[tokio::test]
+    async fn custom_provider_timeout_still_controls_live_pricing_request() {
+        let server = spawn_local_pricing_server(None);
+        let url = server.url.clone();
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "openrouter".to_string(),
+            crate::config::CustomProviderConfig {
+                provider_type: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                danger_accept_invalid_certs: None,
+                api_style: None,
+                headers: std::collections::HashMap::new(),
+                timeout_secs: Some(1),
+                model: None,
+            },
+        );
+        let mut refresh =
+            OpenRouterPricingRefresh::start("test/model".into(), true, true, 128_000, async move {
+                crate::provider::fetch_openrouter_pricing_from_url(None, &custom, None, &url).await
+            });
+        recv_channel(
+            &server.started,
+            "custom-timeout pricing request did not start",
+        )
+        .await;
+
+        wait_for_pricing_refresh(&refresh).await;
+        assert!(matches!(refresh.finish_without_wait().await, Some(Err(_))));
+        assert!(
+            recv_channel(&server.closed, "timed-out pricing connection stayed open").await,
+            "timed-out pricing connection was not closed"
+        );
+        server.thread.join().unwrap();
+    }
+
+    #[test]
+    fn startup_pricing_refresh_is_owned_across_prompt_resolution() {
+        let startup = include_str!("startup.rs");
+        assert!(startup.contains("impl Drop for OpenRouterPricingRefresh"));
+        assert!(startup.contains("handle.abort();"));
+
+        let main = include_str!("main.rs");
+        let start = main
+            .find("startup.start_openrouter_pricing_refresh();")
+            .expect("pricing refresh start missing");
+        let features = main
+            .find("startup.init_features().await?;")
+            .expect("feature initialization missing");
+        let prompts = main
+            .find("let prompts = startup.resolve_prompts().await;")
+            .expect("prompt result was not retained for pricing cleanup");
+        let cleanup = main
+            .find("startup.finish_openrouter_pricing_refresh().await;")
+            .expect("pricing refresh cleanup missing");
+        let propagate = main
+            .find("prompts?;")
+            .expect("prompt error propagation missing");
+        let dispatch = main
+            .find("startup.dispatch().await")
+            .expect("startup dispatch missing");
+        assert!(
+            start < features
+                && features < prompts
+                && prompts < cleanup
+                && cleanup < propagate
+                && propagate < dispatch
+        );
+    }
 
     #[test]
     fn startup_probe_join_starts_both_before_waiting_for_the_slower_probe() {

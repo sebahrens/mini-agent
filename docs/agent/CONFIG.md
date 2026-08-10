@@ -681,6 +681,16 @@ provider. TLS certificate verification can be disabled with
 `"danger_accept_invalid_certs": true` (for self-signed or internal-CA
 gateways) — use with care, as it makes the connection vulnerable to MITM.
 
+When OpenRouter pricing or context metadata is missing, startup refreshes it
+opportunistically while the remaining local initialization runs. Readiness
+never waits for that network request: a refresh still pending at the dispatch
+boundary is cancelled, and the existing session/catalog values are kept. The
+foreground abort join has a 100 ms ceiling; a runtime reaper retains ownership
+of any task still cancelling until it completes. A refresh that finishes in
+time updates only fields that are still missing.
+`custom_providers.openrouter.timeout_secs` continues to govern the request
+while it is live.
+
 ## Provider-specific request body parameters
 
 `headers` only touches HTTP headers. Some providers also accept parameters in
