@@ -132,6 +132,10 @@ ACLs; learned-skill process spawning remains disabled there until an immutable-e
 exists. If a required backend or live proof fails, that capability—or JavaScript itself—is
 unavailable instead of silently running with more authority.
 
+One deliberate exception remains: checked replacement of an existing workspace file fails closed on
+Windows because NT rename has no destination file-identity compare-and-swap operation. mini-agent
+does not trade away the raced-edit protection used by Linux and macOS merely to claim parity.
+
 See [the architecture overview](ARCHITECTURE.md) and
 [brokered runtime specification](docs/specs/phase-6-brokered-js-runtime.md) for the exact threat
 model.
