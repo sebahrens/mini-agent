@@ -3028,7 +3028,65 @@ mod sandbox_tests {
         assert!(!root_policy.contains("CARGO_HOME"));
         assert!(!root_policy.contains("RUSTUP_HOME"));
         assert!(source.contains("build_helper_with_ready_and_roots"));
-        assert!(source.contains("configured writable root overlaps a read-only root"));
+        for diagnostic in [
+            "AppContainer root-role conflict",
+            "workspace",
+            "read-only application cache",
+            "configured read-only root",
+            "configured writable root",
+            "private AppContainer control root",
+            "project subdirectory",
+            "ZS_CACHE_DIR outside the workspace",
+        ] {
+            assert!(
+                source.contains(diagnostic),
+                "missing closed overlap diagnostic: {diagnostic}"
+            );
+        }
+        let role_diagnostic = source
+            .split("fn root_role_conflict(")
+            .nth(1)
+            .and_then(|source| source.split("fn private_control_root_candidate(").next())
+            .expect("closed root-role diagnostic formatter missing");
+        assert!(!role_diagnostic.contains(".display()"));
+        assert!(!role_diagnostic.contains("to_string_lossy"));
+        let parent_request = source
+            .split("fn build_helper_with_ready_and_roots(")
+            .nth(1)
+            .and_then(|source| source.split("fn collect_read_roots(").next())
+            .expect("Windows parent request builder missing");
+        let parent_policy = parent_request
+            .find("validate_explicit_root_policy(")
+            .expect("parent root-policy validation missing");
+        let request_publish = parent_request
+            .find("let request = LaunchRequest")
+            .expect("Windows launch request publication missing");
+        assert!(parent_policy < request_publish);
+        let helper = source
+            .split("fn run_helper()")
+            .nth(1)
+            .and_then(|source| source.split("fn validate_ready_path").next())
+            .expect("Windows helper implementation missing");
+        let helper_policy = helper
+            .find("validate_explicit_root_policy(")
+            .expect("helper root-policy validation missing");
+        let profile_creation = helper
+            .find("create_appcontainer_profile(")
+            .expect("helper AppContainer profile creation missing");
+        assert!(helper_policy < profile_creation);
+        let control_candidate = source
+            .split("fn private_control_root_candidate(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("fn validate_private_control_root_policy(")
+                    .next()
+            })
+            .expect("private control-root candidate validation missing");
+        assert!(control_candidate.contains("FILE_ATTRIBUTE_REPARSE_POINT"));
+        assert!(control_candidate.contains("reject_reparse_components(&candidate)?"));
+        assert!(control_candidate.contains("reject_reparse_components(&canonical)?"));
+        assert!(!control_candidate.contains(".display()"));
         assert!(source.contains("fn grant_access_root(\n    root: &Path,\n    grants: &mut AccessGrants,\n    parent: &Handle,\n    permissions: u32,\n    share: u32,"));
         assert!(
             source.contains("FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,\n        FILE_SHARE_READ,")
@@ -3337,8 +3395,18 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn create_profile_journal").next())
             .expect("profile journal root implementation missing");
-        assert!(journal_root.contains(".parent()"));
-        assert!(journal_root.contains(".mini-agent-appcontainer-control-v1"));
+        assert!(journal_root.contains("private_control_root_candidate(cache)?"));
+        let control_candidate = source
+            .split("fn private_control_root_candidate(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("fn validate_private_control_root_policy(")
+                    .next()
+            })
+            .expect("private control-root candidate missing");
+        assert!(control_candidate.contains(".parent()"));
+        assert!(control_candidate.contains(".mini-agent-appcontainer-control-v1"));
         assert!(!journal_root.contains("cache.join("));
 
         let startup = include_str!("startup.rs");

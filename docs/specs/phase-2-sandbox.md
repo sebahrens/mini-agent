@@ -266,6 +266,14 @@ executable parent, ambient `PATH`, home, Cargo, or Rustup root. The AppContainer
 from the canonical workspace. There is no implicit writable cache root. Remote/UNC, reparse,
 multi-link, read/write-overlapping, or otherwise unsafe roots fail closed.
 
+Root conflicts are classified only after canonicalization and diagnostics expose fixed role names
+and containment direction, never user paths. A workspace that contains the read-only application
+cache is rejected with guidance to use a project subdirectory or move `ZS_CACHE_DIR` outside the
+workspace; the converse cache-contains-workspace case advises moving the project or cache so
+neither contains the other. Configured read/write conflicts likewise name both roles. The private
+AppContainer control sibling is derived with ancestor reparse rejection and checked against every
+granted role before profile or journal creation, then checked again after creation.
+
 ACL traversal is recursive, no-follow, handle-bound, and identity checked. Reparse points and
 multi-link files fail closed; cleanup revokes existing and newly created objects. `TEMP` and `TMP`
 use the OS-managed private per-profile storage directory, not a host writable root. An exclusive

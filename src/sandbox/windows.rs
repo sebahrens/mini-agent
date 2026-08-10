@@ -918,8 +918,138 @@ fn reject_remote_access_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    left.starts_with(right) || right.starts_with(left)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootRole {
+    Workspace,
+    ReadOnlyApplicationCache,
+    ConfiguredReadOnlyRoot,
+    ConfiguredWritableRoot,
+    SandboxExecutable,
+    PrivateControlRoot,
+    AuthorizedReadRoot,
+    AuthorizedWritableRoot,
+}
+
+impl RootRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::ReadOnlyApplicationCache => "read-only application cache",
+            Self::ConfiguredReadOnlyRoot => "configured read-only root",
+            Self::ConfiguredWritableRoot => "configured writable root",
+            Self::SandboxExecutable => "sandbox executable",
+            Self::PrivateControlRoot => "private AppContainer control root",
+            Self::AuthorizedReadRoot => "authorized read root",
+            Self::AuthorizedWritableRoot => "authorized writable root",
+        }
+    }
+}
+
+fn root_role_conflict(
+    left_role: RootRole,
+    left: &Path,
+    right_role: RootRole,
+    right: &Path,
+) -> Option<String> {
+    let relation = if left == right {
+        format!(
+            "{} is the same root as {}",
+            left_role.label(),
+            right_role.label()
+        )
+    } else if right.starts_with(left) {
+        format!("{} contains {}", left_role.label(), right_role.label())
+    } else if left.starts_with(right) {
+        format!("{} contains {}", right_role.label(), left_role.label())
+    } else {
+        return None;
+    };
+    let remedy = if [left_role, right_role].contains(&RootRole::Workspace)
+        && [left_role, right_role].contains(&RootRole::ReadOnlyApplicationCache)
+    {
+        if left_role == RootRole::Workspace && right.starts_with(left)
+            || right_role == RootRole::Workspace && left.starts_with(right)
+        {
+            "use a project subdirectory that excludes the application cache or set ZS_CACHE_DIR outside the workspace"
+        } else {
+            "move the project outside the application cache or set ZS_CACHE_DIR to a directory that does not contain the workspace"
+        }
+    } else if [left_role, right_role].contains(&RootRole::PrivateControlRoot) {
+        "set ZS_CACHE_DIR outside every AppContainer access root or narrow the conflicting configured root"
+    } else {
+        "remove or narrow one of the conflicting Windows AppContainer roots"
+    };
+    Some(format!(
+        "sandbox: AppContainer root-role conflict: {relation}; {remedy}"
+    ))
+}
+
+fn private_control_root_candidate(cache: &Path) -> Result<PathBuf, String> {
+    let parent = cache
+        .parent()
+        .ok_or("sandbox: application cache has no private control parent")?;
+    let candidate = parent.join(".mini-agent-appcontainer-control-v1");
+    reject_reparse_components(&candidate)?;
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => {
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("sandbox: private AppContainer control root is a reparse point".into());
+            }
+            if !metadata.is_dir() {
+                return Err(
+                    "sandbox: private AppContainer control root has unsupported type".into(),
+                );
+            }
+            let canonical = std::fs::canonicalize(candidate).map_err(|_| {
+                "sandbox: canonicalize private AppContainer control root failed".to_string()
+            })?;
+            reject_reparse_components(&canonical)?;
+            Ok(canonical)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(candidate),
+        Err(_) => Err("sandbox: inspect private AppContainer control root failed".into()),
+    }
+}
+
+fn validate_private_control_root_policy(
+    cache: &Path,
+    program: &Path,
+    cwd: &Path,
+    configured_read_roots: &[PathBuf],
+    configured_write_roots: &[PathBuf],
+) -> Result<(), String> {
+    let control = private_control_root_candidate(cache)?;
+    for (role, root) in [
+        (RootRole::Workspace, cwd),
+        (RootRole::ReadOnlyApplicationCache, cache),
+        (RootRole::SandboxExecutable, program),
+    ] {
+        if let Some(error) = root_role_conflict(RootRole::PrivateControlRoot, &control, role, root)
+        {
+            return Err(error);
+        }
+    }
+    for root in configured_read_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &control,
+            RootRole::ConfiguredReadOnlyRoot,
+            root,
+        ) {
+            return Err(error);
+        }
+    }
+    for root in configured_write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &control,
+            RootRole::ConfiguredWritableRoot,
+            root,
+        ) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn validate_explicit_root_policy(
@@ -931,8 +1061,13 @@ fn validate_explicit_root_policy(
     read_roots: &[PathBuf],
     write_roots: &[PathBuf],
 ) -> Result<(), String> {
-    if paths_overlap(cwd, cache) {
-        return Err("sandbox: workspace and read-only cache roots overlap".into());
+    if let Some(error) = root_role_conflict(
+        RootRole::Workspace,
+        cwd,
+        RootRole::ReadOnlyApplicationCache,
+        cache,
+    ) {
+        return Err(error);
     }
     let mut expected_reads = vec![
         cwd.to_path_buf(),
@@ -951,23 +1086,65 @@ fn validate_explicit_root_policy(
             "sandbox: AppContainer request violated the closed explicit root policy".into(),
         );
     }
-    let protected_reads =
-        std::iter::once(cache).chain(configured_read_roots.iter().map(PathBuf::as_path));
-    if protected_reads.clone().any(|read| {
-        expected_writes
-            .iter()
-            .any(|write| paths_overlap(read, write))
-    }) {
-        return Err("sandbox: configured writable root overlaps a read-only root".into());
-    }
-    for (index, write) in expected_writes.iter().enumerate() {
-        if expected_writes[index + 1..]
-            .iter()
-            .any(|other| paths_overlap(write, other))
-        {
-            return Err("sandbox: configured writable roots overlap".into());
+    for write in configured_write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::ReadOnlyApplicationCache,
+            cache,
+            RootRole::ConfiguredWritableRoot,
+            write,
+        ) {
+            return Err(error);
         }
     }
+    for read in configured_read_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::ConfiguredReadOnlyRoot,
+            read,
+            RootRole::Workspace,
+            cwd,
+        ) {
+            return Err(error);
+        }
+        for write in configured_write_roots {
+            if let Some(error) = root_role_conflict(
+                RootRole::ConfiguredReadOnlyRoot,
+                read,
+                RootRole::ConfiguredWritableRoot,
+                write,
+            ) {
+                return Err(error);
+            }
+        }
+    }
+    for write in configured_write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::Workspace,
+            cwd,
+            RootRole::ConfiguredWritableRoot,
+            write,
+        ) {
+            return Err(error);
+        }
+    }
+    for (index, write) in configured_write_roots.iter().enumerate() {
+        for other in &configured_write_roots[index + 1..] {
+            if let Some(error) = root_role_conflict(
+                RootRole::ConfiguredWritableRoot,
+                write,
+                RootRole::ConfiguredWritableRoot,
+                other,
+            ) {
+                return Err(error);
+            }
+        }
+    }
+    validate_private_control_root_policy(
+        cache,
+        program,
+        cwd,
+        configured_read_roots,
+        configured_write_roots,
+    )?;
     Ok(())
 }
 
@@ -2405,23 +2582,50 @@ fn profile_journal_root(
     read_roots: &[PathBuf],
     write_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let parent = cache
-        .parent()
-        .ok_or("sandbox: application cache has no private control parent")?;
-    let root = parent.join(".mini-agent-appcontainer-control-v1");
-    std::fs::create_dir_all(&root).map_err(|error| {
-        format!(
-            "sandbox: create AppContainer cleanup journal root {}: {error}",
-            root.display()
-        )
-    })?;
-    let root = canonical_root(&root, "AppContainer cleanup journal root")?;
-    if read_roots
-        .iter()
-        .chain(write_roots)
-        .any(|granted| paths_overlap(&root, granted))
-    {
-        return Err("sandbox: AppContainer cleanup journal overlaps a granted root".into());
+    let candidate = private_control_root_candidate(cache)?;
+    for root in read_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &candidate,
+            RootRole::AuthorizedReadRoot,
+            root,
+        ) {
+            return Err(error);
+        }
+    }
+    for root in write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &candidate,
+            RootRole::AuthorizedWritableRoot,
+            root,
+        ) {
+            return Err(error);
+        }
+    }
+    let root = candidate;
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("sandbox: create private AppContainer control root: {error}"))?;
+    let root = private_control_root_candidate(cache)?;
+    for granted in read_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &root,
+            RootRole::AuthorizedReadRoot,
+            granted,
+        ) {
+            return Err(error);
+        }
+    }
+    for granted in write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &root,
+            RootRole::AuthorizedWritableRoot,
+            granted,
+        ) {
+            return Err(error);
+        }
     }
     protect_and_attest_control_root(&root)?;
     Ok(root)
@@ -4415,6 +4619,60 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
+    struct RootPolicyFixture(PathBuf);
+
+    impl RootPolicyFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "mini-agent-root-policy-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).expect("create root-policy fixture");
+            Self(root)
+        }
+
+        fn directory(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(&path).expect("create root-policy directory");
+            std::fs::canonicalize(path).expect("canonicalize root-policy directory")
+        }
+
+        fn file(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create root-policy file parent");
+            }
+            std::fs::write(&path, b"fixture").expect("create root-policy file");
+            std::fs::canonicalize(path).expect("canonicalize root-policy file")
+        }
+    }
+
+    impl Drop for RootPolicyFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn validate_policy_fixture(
+        program: &Path,
+        workspace: &Path,
+        cache: &Path,
+        configured_reads: &[PathBuf],
+        configured_writes: &[PathBuf],
+    ) -> Result<(), String> {
+        let read_roots = collect_read_roots(program, workspace, cache, configured_reads)?;
+        let write_roots = collect_write_roots(workspace, configured_writes)?;
+        validate_explicit_root_policy(
+            program,
+            workspace,
+            cache,
+            configured_reads,
+            configured_writes,
+            &read_roots,
+            &write_roots,
+        )
+    }
+
     #[test]
     fn general_preflight_cache_runs_an_unavailable_probe_once() {
         let cache = Arc::new(OnceLock::new());
@@ -4440,6 +4698,120 @@ mod tests {
         assert!(!cached_general_sandbox_availability(&cache, || {
             panic!("cached unavailable result must not rerun its probe")
         }));
+    }
+
+    #[test]
+    fn project_workspace_and_separate_default_cache_topology_is_allowed() {
+        let fixture = RootPolicyFixture::new();
+        let workspace = fixture.directory("projects/example");
+        let cache = fixture.directory("home/AppData/Local/zerostack/cache");
+        let program = fixture.file("bin/tool.exe");
+
+        validate_policy_fixture(&program, &workspace, &cache, &[], &[])
+            .expect("separate project and default-cache topology must remain valid");
+    }
+
+    #[test]
+    fn workspace_containing_cache_reports_roles_direction_and_remedies_without_paths() {
+        let fixture = RootPolicyFixture::new();
+        let workspace = fixture.directory("home");
+        let cache = fixture.directory("home/AppData/Local/zerostack/cache");
+        let program = fixture.file("bin/tool.exe");
+
+        let error = validate_policy_fixture(&program, &workspace, &cache, &[], &[])
+            .expect_err("workspace containing cache must fail closed");
+        assert!(error.contains("workspace contains read-only application cache"));
+        assert!(error.contains("project subdirectory"));
+        assert!(error.contains("ZS_CACHE_DIR outside the workspace"));
+        assert!(!error.contains(fixture.0.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn cache_containing_workspace_reports_the_converse_without_paths() {
+        let fixture = RootPolicyFixture::new();
+        let cache = fixture.directory("cache");
+        let workspace = fixture.directory("cache/projects/example");
+        let program = fixture.file("bin/tool.exe");
+
+        let error = validate_policy_fixture(&program, &workspace, &cache, &[], &[])
+            .expect_err("cache containing workspace must fail closed");
+        assert!(error.contains("read-only application cache contains workspace"));
+        assert!(error.contains("move the project outside the application cache"));
+        assert!(error.contains("does not contain the workspace"));
+        assert!(!error.contains(fixture.0.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn configured_root_conflict_reports_both_roles_and_direction() {
+        let fixture = RootPolicyFixture::new();
+        let workspace = fixture.directory("project");
+        let cache = fixture.directory("state/cache");
+        let program = fixture.file("bin/tool.exe");
+        let configured_read = fixture.directory("shared");
+        let configured_write = fixture.directory("shared/output");
+
+        let error = validate_policy_fixture(
+            &program,
+            &workspace,
+            &cache,
+            std::slice::from_ref(&configured_read),
+            std::slice::from_ref(&configured_write),
+        )
+        .expect_err("configured read/write overlap must fail closed");
+        assert!(error.contains("configured read-only root contains configured writable root"));
+        assert!(!error.contains(fixture.0.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn configured_read_containing_control_root_is_rejected_before_creation() {
+        let fixture = RootPolicyFixture::new();
+        let workspace = fixture.directory("project");
+        let cache = fixture.directory("state/cache");
+        let program = fixture.file("bin/tool.exe");
+        let configured_read = std::fs::canonicalize(cache.parent().expect("cache parent"))
+            .expect("canonicalize configured read root");
+        let control = configured_read.join(".mini-agent-appcontainer-control-v1");
+        assert!(!control.exists());
+
+        let error = validate_policy_fixture(
+            &program,
+            &workspace,
+            &cache,
+            std::slice::from_ref(&configured_read),
+            &[],
+        )
+        .expect_err("configured read containing control root must fail closed");
+        assert!(
+            error.contains("configured read-only root contains private AppContainer control root")
+        );
+        assert!(error.contains("ZS_CACHE_DIR"));
+        assert!(!error.contains(fixture.0.to_string_lossy().as_ref()));
+        assert!(
+            !control.exists(),
+            "validation created the private control root"
+        );
+    }
+
+    #[test]
+    fn ordinary_and_verbatim_aliases_canonicalize_to_one_policy_identity() {
+        let fixture = RootPolicyFixture::new();
+        let canonical = fixture.directory("aliases/root");
+        let canonical_text = canonical.to_string_lossy();
+        let (ordinary, verbatim) = if let Some(ordinary) = canonical_text.strip_prefix(r"\\?\") {
+            (PathBuf::from(ordinary), canonical.clone())
+        } else {
+            (
+                canonical.clone(),
+                PathBuf::from(format!(r"\\?\{canonical_text}")),
+            )
+        };
+
+        assert_eq!(
+            canonical_root(&ordinary, "ordinary alias").expect("canonicalize ordinary alias"),
+            canonical_root(&verbatim, "verbatim alias").expect("canonicalize verbatim alias")
+        );
+        assert!(reject_remote_access_path(Path::new(r"\\server\share\root")).is_err());
+        assert!(reject_remote_access_path(Path::new(r"\\?\UNC\server\share\root")).is_err());
     }
 
     #[test]
