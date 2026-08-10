@@ -587,7 +587,7 @@ fn open_private_lock(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(windows)]
 fn secure_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    windows_private::atomic_write(path, bytes)
+    crate::fs::private_atomic_write_sync(path, bytes)
 }
 
 #[cfg(windows)]
@@ -652,7 +652,6 @@ fn unlock_file(_file: &std::fs::File) {}
 #[allow(unsafe_code)]
 mod windows_private {
     use std::ffi::{OsStr, c_void};
-    use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
@@ -672,7 +671,6 @@ mod windows_private {
     const FILE_SHARE_READ: Dword = 0x0000_0001;
     const FILE_SHARE_WRITE: Dword = 0x0000_0002;
     const FILE_SHARE_DELETE: Dword = 0x0000_0004;
-    const CREATE_NEW: Dword = 1;
     const OPEN_EXISTING: Dword = 3;
     const OPEN_ALWAYS: Dword = 4;
     const FILE_ATTRIBUTE_NORMAL: Dword = 0x0000_0080;
@@ -681,8 +679,6 @@ mod windows_private {
     const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
     const FILE_FLAG_WRITE_THROUGH: Dword = 0x8000_0000;
-    const MOVEFILE_REPLACE_EXISTING: Dword = 0x0000_0001;
-    const MOVEFILE_WRITE_THROUGH: Dword = 0x0000_0008;
     const SDDL_REVISION_1: Dword = 1;
     const SE_FILE_OBJECT: Dword = 1;
     const OWNER_SECURITY_INFORMATION: Dword = 0x0000_0001;
@@ -821,7 +817,6 @@ mod windows_private {
             bytes_high: Dword,
             overlapped: *mut Overlapped,
         ) -> Bool;
-        fn MoveFileExW(existing: *const u16, new: *const u16, flags: Dword) -> Bool;
         fn UnlockFileEx(
             file: Handle,
             reserved: Dword,
@@ -1167,63 +1162,6 @@ mod windows_private {
             Err(error) => return Err(error),
         }
         create_private_file(path, OPEN_ALWAYS)
-    }
-
-    pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                    || !metadata.is_file()
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "credential target is a reparse point or has the wrong type",
-                    ));
-                }
-                repair_path(path, false)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let parent = path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "credential target has no parent",
-            )
-        })?;
-        ensure_directory(parent)?;
-        let temp = parent.join(format!(".oauth-{}.tmp", uuid::Uuid::new_v4().simple()));
-        let mut temp_identity = None;
-        let write_result = (|| {
-            let mut file = create_private_file(&temp, CREATE_NEW)?;
-            temp_identity = Some(crate::fs::checked_file_metadata(&file)?);
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            drop(file);
-            let target_wide = wide(path.as_os_str());
-            let temp_wide = wide(temp.as_os_str());
-            let replaced = unsafe {
-                MoveFileExW(
-                    temp_wide.as_ptr(),
-                    target_wide.as_ptr(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            };
-            if replaced == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            repair_path(path, false)
-        })();
-        if write_result.is_err() {
-            if let (Some(identity), Ok(current)) = (
-                temp_identity.as_ref(),
-                crate::fs::checked_path_metadata(&temp),
-            ) && crate::fs::ensure_same_file(&temp, identity, &current).is_ok()
-            {
-                let _ = std::fs::remove_file(&temp);
-            }
-        }
-        write_result
     }
 
     pub(super) fn lock(file: &std::fs::File) -> std::io::Result<()> {

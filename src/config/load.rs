@@ -78,7 +78,19 @@ enum ProjectConfigTrustOutcome {
 
 /// Write `content` to `path` atomically via temp-file + rename.
 pub(crate) fn atomic_config_write(path: &Path, content: &str) -> io::Result<()> {
-    crate::fs::private_atomic_write_sync(path, content.as_bytes())
+    crate::fs::private_atomic_write_sync(path, content.as_bytes()).map_err(|error| {
+        if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "configuration file {} is temporarily locked",
+                    path.display()
+                ),
+            )
+        } else {
+            error
+        }
+    })
 }
 
 #[cfg(all(test, unix))]

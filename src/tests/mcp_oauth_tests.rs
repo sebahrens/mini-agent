@@ -251,6 +251,101 @@ fn mcp_oauth_storage_security_windows_dacls_exclude_broad_principals() {
     }
 }
 
+#[cfg(windows)]
+fn open_without_delete_sharing(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(windows)]
+fn oauth_temp_residue(directory: &Path) -> usize {
+    std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".oauth-")
+                || name.starts_with(".zsconfig.")
+                || name.starts_with(".zswrite.")
+        })
+        .count()
+}
+
+#[cfg(windows)]
+#[test]
+fn mcp_oauth_storage_windows_retries_transient_replacement_lock() {
+    let root = TempDir::new("windows-transient-lock");
+    let paths = test_paths(root.path());
+    let settings = OAuthSettings::default();
+    let store =
+        oauth::FileCredentialStore::for_paths(&paths, "server", "https://example.com", &settings)
+            .unwrap();
+    store
+        .write_blocking(&test_credentials("old-client"))
+        .unwrap();
+    let token = oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
+
+    let locked = open_without_delete_sharing(&token);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(locked);
+    });
+    store
+        .write_blocking(&test_credentials("new-client"))
+        .unwrap();
+    release.join().unwrap();
+
+    assert_eq!(
+        store.read_blocking().unwrap().unwrap().client_id.as_str(),
+        "new-client"
+    );
+    assert_eq!(oauth_temp_residue(token.parent().unwrap()), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn mcp_oauth_storage_windows_persistent_lock_preserves_old_record() {
+    let root = TempDir::new("windows-persistent-lock");
+    let paths = test_paths(root.path());
+    let settings = OAuthSettings::default();
+    let store =
+        oauth::FileCredentialStore::for_paths(&paths, "server", "https://example.com", &settings)
+            .unwrap();
+    store
+        .write_blocking(&test_credentials("old-client"))
+        .unwrap();
+    let token = oauth::token_path(&paths, "server", "https://example.com", &settings).unwrap();
+    let original = std::fs::read(&token).unwrap();
+    let original_dacl = oauth::windows_private_dacl_sddl(&token, false).unwrap();
+    let locked = open_without_delete_sharing(&token);
+
+    let error = store
+        .write_blocking(&test_credentials("SENTINEL-NEW-CLIENT"))
+        .unwrap_err();
+
+    assert!(!error.to_string().contains("SENTINEL-NEW-CLIENT"));
+    assert!(!error.to_string().contains(&token.display().to_string()));
+    assert_eq!(std::fs::read(&token).unwrap(), original);
+    assert_eq!(
+        oauth::windows_private_dacl_sddl(&token, false).unwrap(),
+        original_dacl
+    );
+    assert_eq!(oauth_temp_residue(token.parent().unwrap()), 0);
+    drop(locked);
+    assert_eq!(
+        store.read_blocking().unwrap().unwrap().client_id.as_str(),
+        "old-client"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn mcp_oauth_storage_security_rejects_symlink_and_repairs_owned_mode() {

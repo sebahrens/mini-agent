@@ -754,6 +754,23 @@ mod windows {
         Ok(unsafe { std::fs::File::from_raw_handle(handle) })
     }
 
+    fn replace_with_retry(
+        temp_wide: &[u16],
+        target_wide: &[u16],
+        flags: Dword,
+    ) -> std::io::Result<()> {
+        super::super::retry_windows_lock_violation(
+            || {
+                if unsafe { MoveFileExW(temp_wide.as_ptr(), target_wide.as_ptr(), flags) } != 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            },
+            || false,
+        )
+    }
+
     pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
         repair_path(path, false)?;
         let before = super::super::checked_path_metadata(path)?;
@@ -828,9 +845,12 @@ mod windows {
                 } else {
                     MOVEFILE_REPLACE_EXISTING
                 };
-            let replaced = unsafe { MoveFileExW(temp_wide.as_ptr(), target_wide.as_ptr(), flags) };
-            if replaced == 0 {
-                return Err(std::io::Error::last_os_error());
+            if create_only {
+                if unsafe { MoveFileExW(temp_wide.as_ptr(), target_wide.as_ptr(), flags) } == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else {
+                replace_with_retry(&temp_wide, &target_wide, flags)?;
             }
             repair_path(path, false)
         })();
