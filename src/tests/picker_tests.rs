@@ -347,11 +347,10 @@ fn test_walk_files_includes_nested_dirs() {
         fs::write(root.join("a").join("b").join("deep.txt"), b"deep").unwrap();
 
         let files = walk_files(&root.to_string_lossy());
-        let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
 
-        assert!(names.contains(&"a"));
-        assert!(names.contains(&"a/b"));
-        assert!(names.contains(&"a/b/deep.txt"));
+        assert!(files.contains(&Path::new("a").to_path_buf()));
+        assert!(files.contains(&Path::new("a").join("b")));
+        assert!(files.contains(&Path::new("a").join("b").join("deep.txt")));
     });
 }
 

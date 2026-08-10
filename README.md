@@ -4,15 +4,15 @@
 
 # mini-agent
 
-**A small Rust coding agent that can use JavaScript as a safe, portable action language—and learn
-better JavaScript tools for the work it repeatedly encounters.**
+**A small Rust coding agent that uses JavaScript as a safe, portable action language—and, in a
+skills-enabled build, learns better JavaScript tools for work it repeatedly encounters.**
 
 mini-agent starts from [ZeroStack](https://github.com/gi-dellav/zerostack), whose design gets the
 foundation right: a compact native agent, a fast terminal UI, strong permission controls, multiple
 model providers, persistent sessions, MCP, worktrees, subagents, prompts, memory, and automation
 without the runtime footprint of an Electron or Node application. mini-agent keeps that deliberately
-small core and adds a brokered QuickJS engine, native Linux/macOS/Windows containment, and a verified
-library of reusable agent-authored JavaScript skills.
+small core and adds a brokered QuickJS engine, native Linux/macOS/Windows containment, and an
+opt-in, verified library of reusable agent-authored JavaScript skills.
 
 The result is still a practical coding agent, but its action space is no longer limited to a pile of
 one-off shell commands.
@@ -231,6 +231,13 @@ See [Getting started](docs/agent/GET_STARTED.md),
 
 The default build includes the core ZeroStack experience plus `js`, `sandbox`, and `memory`.
 Learned-skill storage is opt-in because it adds SQLite and retrieval dependencies.
+
+Pre-built release archives include JavaScript execution but not learned-skill storage. To install a
+build that can propose, verify, retrieve, and curate skills, build from source with:
+
+```bash
+cargo install --git https://github.com/sebahrens/mini-agent --features skills
+```
 
 | Feature | Adds |
 |---|---|

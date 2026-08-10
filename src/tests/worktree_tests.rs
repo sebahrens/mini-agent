@@ -12,6 +12,35 @@ mod tests {
     use crate::extras::git_worktree::*;
     use crate::sandbox::CommandLimits;
 
+    #[cfg(feature = "hooks")]
+    static ACTIVE_WORKSPACE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(feature = "hooks")]
+    struct ScopedActiveWorkspace {
+        previous: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(feature = "hooks")]
+    impl ScopedActiveWorkspace {
+        fn capture() -> Self {
+            let guard = ACTIVE_WORKSPACE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self {
+                previous: crate::extras::hooks::active_workspace(),
+                _guard: guard,
+            }
+        }
+    }
+
+    #[cfg(feature = "hooks")]
+    impl Drop for ScopedActiveWorkspace {
+        fn drop(&mut self) {
+            crate::extras::hooks::set_active_workspace(&self.previous);
+        }
+    }
+
     struct TempRepo(PathBuf);
 
     impl TempRepo {
@@ -177,6 +206,9 @@ mod tests {
         let mut session = crate::session::Session::new("test", "test", 1, "test");
         let mut context = crate::context::load(true);
 
+        #[cfg(feature = "hooks")]
+        let _active_workspace_guard = ScopedActiveWorkspace::capture();
+
         crate::ui::rebind_worktree_workspace(&mut session, &mut context, &None, &worktree);
         assert_eq!(Path::new(session.working_dir.as_str()), worktree);
         assert_eq!(context.workspace_root, worktree);
@@ -240,6 +272,7 @@ mod tests {
         use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust};
 
         let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let _active_workspace_guard = ScopedActiveWorkspace::capture();
         let repo = TempRepo::new("hook workspace rebind");
         let worktree = repo.path().with_extension("hook workspace linked worktree");
         git(
@@ -314,7 +347,6 @@ mod tests {
         cleanup_worktree(&worktree, "hook-workspace", repo.path(), true)
             .await
             .unwrap();
-        crate::extras::hooks::set_active_workspace(&process_cwd);
     }
 
     #[tokio::test]
@@ -1003,20 +1035,44 @@ mod tests {
         let base = repo.path().with_extension("timed create base");
         std::fs::create_dir_all(&base).unwrap();
         let target = base.join("create-timeout");
+        let started = repo.path().join("create-timeout-hook-started");
         let hook = repo.path().join(".git/hooks/post-checkout");
-        std::fs::write(&hook, "#!/bin/sh\nsleep 1\n").unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf started > '{}'\nsleep 1\n",
+                started.display()
+            ),
+        )
+        .unwrap();
         let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&hook, permissions).unwrap();
 
-        let error = create_with_limits_for_test(
-            repo.path(),
-            "create-timeout",
-            Some(&base),
-            test_limits(Duration::from_millis(100)),
-        )
-        .await
-        .expect_err("timed out create must fail");
+        let repo_path = repo.path().to_path_buf();
+        let base_path = base.clone();
+        let create_task = tokio::spawn(async move {
+            create_with_limits_for_test(
+                &repo_path,
+                "create-timeout",
+                Some(&base_path),
+                test_limits(Duration::from_millis(100)),
+            )
+            .await
+        });
+        for _ in 0..200 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "post-checkout hook did not start");
+        std::thread::sleep(Duration::from_millis(1100));
+
+        let error = create_task
+            .await
+            .expect("create task should not panic")
+            .expect_err("timed out create must fail");
 
         assert!(error.contains("timed out"), "unexpected error: {error}");
         assert!(
@@ -2066,7 +2122,9 @@ mod tests {
             let result = cancel_merge(&mut state).await;
             (state, result)
         });
-        gate.wait_until_reached().await;
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_reached())
+            .await
+            .expect("target repository must reach the stash publication gate");
         git(
             repo.path(),
             ["symbolic-ref", "HEAD", "refs/heads/unrelated"],
@@ -2264,7 +2322,19 @@ mod tests {
             main_repo_path: repo.path().to_path_buf(),
         };
         let gate = TestMutationGate::new();
-        set_next_stash_publish_test_gate(gate.clone());
+        set_next_stash_publish_test_gate(repo.path(), gate.clone());
+
+        let unrelated = TempRepo::new("unrelated stash publication");
+        std::fs::write(unrelated.path().join("tracked.txt"), "unrelated dirty\n").unwrap();
+        let unrelated_stash = tokio::time::timeout(
+            Duration::from_secs(2),
+            create_and_publish_stash_for_test(unrelated.path()),
+        )
+        .await
+        .expect("an unrelated repository must not consume the targeted publication gate")
+        .expect("unrelated stash publication should succeed");
+        assert!(unrelated_stash.is_some());
+
         let task = tokio::spawn(async move { try_merge(&info, "main").await });
         gate.wait_until_reached().await;
 

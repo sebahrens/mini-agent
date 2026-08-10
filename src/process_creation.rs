@@ -28,10 +28,14 @@ pub(crate) struct CreationGuard {
 pub(crate) fn creation_guard() -> io::Result<CreationGuard> {
     #[cfg(windows)]
     {
-        return PROCESS_CREATION_LOCK
+        // The lock protects no data whose invariant can be corrupted. Poisoning only means a
+        // previous holder unwound; retaining the recovered guard therefore preserves the actual
+        // safety property (exclusive process creation) while avoiding a process-wide outage.
+        let guard = PROCESS_CREATION_LOCK
             .lock()
-            .map(|guard| CreationGuard { _inner: guard })
-            .map_err(|_| io::Error::other("Windows process-creation lock is poisoned"));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        PROCESS_CREATION_LOCK.clear_poison();
+        return Ok(CreationGuard { _inner: guard });
     }
     #[cfg(not(windows))]
     {
@@ -117,6 +121,39 @@ impl RmcpCommandCreationExt for rmcp::transport::child_process::TokioChildProces
 mod tests {
     use super::StdCommandCreationExt;
     use std::process::{Command, Stdio};
+
+    #[cfg(windows)]
+    #[test]
+    fn poisoned_creation_lock_recovers_without_losing_serialization() {
+        let poisoner = std::thread::spawn(|| {
+            let _guard = super::PROCESS_CREATION_LOCK
+                .lock()
+                .expect("process-creation lock starts healthy");
+            panic!("deliberately poison the process-creation lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(super::PROCESS_CREATION_LOCK.is_poisoned());
+
+        let recovered = super::creation_guard().expect("poisoned lock should recover safely");
+        assert!(!super::PROCESS_CREATION_LOCK.is_poisoned());
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _guard = super::creation_guard().expect("waiter should acquire recovered lock");
+            acquired_tx.send(()).expect("receiver remains live");
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+
+        drop(recovered);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("waiter should acquire after the recovered guard is dropped");
+        waiter.join().expect("waiter should not panic");
+    }
 
     #[test]
     fn guarded_output_preserves_explicit_stdio_across_builder_reuse() {

@@ -87,38 +87,44 @@ pub fn regen() -> anyhow::Result<()> {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     struct TestDir {
         dir: PathBuf,
-        orig_cwd: PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        paths: crate::paths::AppPaths,
     }
 
     impl TestDir {
         fn new() -> Self {
-            let lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            let dir = std::env::temp_dir().join(format!("zs_pr_test_{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("zs_pr_test_{}", uuid::Uuid::new_v4()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            unsafe {
-                std::env::set_var("ZS_DATA_DIR", dir.to_str().unwrap());
-            }
-            let orig_cwd = std::env::current_dir().unwrap();
-            std::env::set_current_dir(&dir).unwrap();
-            TestDir {
-                dir,
-                orig_cwd,
-                _lock: lock,
-            }
+            let paths = crate::paths::AppPaths {
+                config_dir: dir.join("config"),
+                data_dir: dir.join("data"),
+                local_data_dir: dir.join("local-data"),
+                state_dir: dir.join("state"),
+                cache_dir: dir.join("cache"),
+                credentials_dir: dir.join("credentials"),
+                project_dir: Some(dir.join(".zerostack")),
+            };
+            TestDir { dir, paths }
+        }
+
+        fn global_dir(&self) -> PathBuf {
+            self.paths.prompts_dir()
+        }
+
+        fn project_dir(&self) -> PathBuf {
+            self.paths.project_prompts_dir().unwrap()
+        }
+
+        fn load(&self) -> HashMap<String, String> {
+            load_with_paths(&self.paths)
         }
     }
 
     impl Drop for TestDir {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.orig_cwd);
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -130,72 +136,72 @@ mod tests {
 
     #[test]
     fn test_zerostack_prompts_are_loaded() {
-        let _td = TestDir::new();
-        let dir = zerostack_dir();
+        let td = TestDir::new();
+        let dir = td.project_dir();
         write_prompt(&dir, "myproject", "# My Project Prompt");
 
-        let prompts = load();
+        let prompts = td.load();
         assert!(prompts.contains_key("myproject"));
         assert_eq!(prompts["myproject"], "# My Project Prompt");
     }
 
     #[test]
     fn test_zerostack_overrides_prompts_dir() {
-        let _td = TestDir::new();
-        let prompts_dir = PathBuf::from("data/prompts");
-        let zs_dir = zerostack_dir();
+        let td = TestDir::new();
+        let prompts_dir = td.global_dir();
+        let zs_dir = td.project_dir();
         write_prompt(&prompts_dir, "code", "from prompts/");
         write_prompt(&zs_dir, "code", "from .zerostack/prompts/");
 
-        let prompts = load();
+        let prompts = td.load();
         assert_eq!(prompts["code"], "from .zerostack/prompts/");
     }
 
     #[test]
     fn test_zerostack_overrides_global() {
-        let _td = TestDir::new();
-        let global = global_dir();
-        let zs_dir = zerostack_dir();
+        let td = TestDir::new();
+        let global = td.global_dir();
+        let zs_dir = td.project_dir();
         write_prompt(&global, "code", "from global/");
         write_prompt(&zs_dir, "code", "from .zerostack/");
 
-        let prompts = load();
+        let prompts = td.load();
         assert_eq!(prompts["code"], "from .zerostack/");
     }
 
     #[test]
     fn test_zerostack_overrides_embedded() {
-        let _td = TestDir::new();
-        let zs_dir = zerostack_dir();
+        let td = TestDir::new();
+        let zs_dir = td.project_dir();
         write_prompt(&zs_dir, "code", "from .zerostack/");
 
-        let prompts = load();
+        let prompts = td.load();
         assert_eq!(prompts["code"], "from .zerostack/");
     }
 
     #[test]
     fn test_project_prompts_override_global() {
-        let _td = TestDir::new();
-        let global = global_dir();
-        let project_dir = zerostack_dir();
+        let td = TestDir::new();
+        let global = td.global_dir();
+        let project_dir = td.project_dir();
         write_prompt(&global, "custom", "from global/");
         write_prompt(&project_dir, "custom", "from project/");
 
-        let prompts = load();
+        let prompts = td.load();
         assert_eq!(prompts["custom"], "from project/");
     }
 
     #[test]
     fn test_full_priority_chain() {
-        let _td = TestDir::new();
-        let global = global_dir();
-        let zs_dir = zerostack_dir();
+        let td = TestDir::new();
+        let global = td.global_dir();
+        let zs_dir = td.project_dir();
 
         write_prompt(&global, "code", "from global/");
         write_prompt(&zs_dir, "custom", "from .zerostack/");
         write_prompt(&zs_dir, "code", "from .zerostack/code");
 
-        let prompts = load();
+        let prompts = td.load();
         assert_eq!(prompts["code"], "from .zerostack/code");
         assert_eq!(prompts["custom"], "from .zerostack/");
         assert!(prompts.contains_key("ask"));
@@ -203,8 +209,8 @@ mod tests {
 
     #[test]
     fn test_zerostack_dir_missing_is_ok() {
-        let _td = TestDir::new();
-        let prompts = load();
+        let td = TestDir::new();
+        let prompts = td.load();
         assert!(prompts.contains_key("code"));
         assert!(prompts.contains_key("ask"));
         assert!(prompts.contains_key("default"));

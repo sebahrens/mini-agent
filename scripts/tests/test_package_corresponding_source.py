@@ -75,6 +75,23 @@ class CorrespondingSourceIdentityTests(unittest.TestCase):
         self.assertEqual(2, result.returncode)
         self.assertIn("restricted to labels ending in -ci", result.stderr)
 
+    def test_modified_license_fails_before_source_packaging(self) -> None:
+        (self.repository / "LICENSE").write_text("not the GPL\n", encoding="utf-8")
+        subprocess.run(["git", "add", "LICENSE"], cwd=self.repository, check=True)
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", "bad license"],
+            cwd=self.repository,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "tag", "v1.2.3"], cwd=self.repository, check=True
+        )
+
+        result = self.run_packager("v1.2.3", str(self.repository))
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("canonical GPL-3.0-only", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

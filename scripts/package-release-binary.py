@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import tarfile
 from pathlib import Path
 
 
 REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md")
+CANONICAL_GPL3_LICENSE_SHA256 = (
+    "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+)
 
 
 def _normalized(info: tarfile.TarInfo, *, executable: bool) -> tarfile.TarInfo:
@@ -38,6 +42,9 @@ def package_binary(
     missing = [path.name for path in documents if not path.is_file()]
     if missing:
         raise ValueError(f"required release documents are missing: {', '.join(missing)}")
+    license_digest = hashlib.sha256((root / "LICENSE").read_bytes()).hexdigest()
+    if license_digest != CANONICAL_GPL3_LICENSE_SHA256:
+        raise ValueError("LICENSE is not the canonical GPL-3.0-only text")
 
     archive.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, mode="w:gz", format=tarfile.PAX_FORMAT) as output:

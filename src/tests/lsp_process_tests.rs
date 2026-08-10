@@ -313,33 +313,18 @@ impl FixtureBuild {
     }
 }
 
-struct EnvGuard(Vec<(String, Option<OsString>)>);
+struct EnvGuard {
+    _environment: crate::tests::ScopedProcessEnv,
+}
 
 impl EnvGuard {
     fn set(values: &[(&str, &str)]) -> Self {
-        let original = values
+        let values = values
             .iter()
-            .map(|(name, _)| ((*name).to_string(), std::env::var_os(name)))
-            .collect();
-        for (name, value) in values {
-            // SAFETY: these test-only, uniquely named variables are restored by
-            // Drop and no production code mutates them.
-            unsafe { std::env::set_var(name, value) };
-        }
-        Self(original)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.0 {
-            // SAFETY: restores the process environment snapshot from `set`.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
+            .map(|(name, value)| (*name, Some(OsString::from(value))))
+            .collect::<Vec<_>>();
+        Self {
+            _environment: crate::tests::ScopedProcessEnv::set(&values),
         }
     }
 }

@@ -14,14 +14,11 @@ use crate::ui::utils::suggest_pattern;
 use crate::ui::{mark_main_turn_started, persist_session_if_settled, rollback_pending_main_turn};
 use std::env;
 use std::path::Path;
-use std::sync::Mutex;
-
-static STORAGE_LOCK: Mutex<()> = Mutex::new(());
 
 struct TestEnv {
     dir: std::path::PathBuf,
     data_dir: String,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _environment: crate::tests::ScopedProcessEnv,
 }
 
 impl Drop for TestEnv {
@@ -31,22 +28,23 @@ impl Drop for TestEnv {
 }
 
 fn setup_test_env() -> TestEnv {
-    let lock = STORAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir()
         .canonicalize()
         .unwrap()
-        .join(format!("zs_test_{}", std::process::id()));
+        .join(format!("zs_test_{}", uuid::Uuid::new_v4()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let data_dir = dir.to_str().unwrap().to_string();
-    unsafe { env::set_var("ZS_DATA_DIR", &data_dir) };
-    unsafe { env::set_var("ZS_CONFIG_DIR", &data_dir) };
-    unsafe { env::set_var("ZS_STATE_DIR", &data_dir) };
+    let environment = crate::tests::ScopedProcessEnv::set(&[
+        ("ZS_DATA_DIR", Some(data_dir.clone().into())),
+        ("ZS_CONFIG_DIR", Some(data_dir.clone().into())),
+        ("ZS_STATE_DIR", Some(data_dir.clone().into())),
+    ]);
     std::fs::create_dir_all(dir.join("sessions")).unwrap();
     TestEnv {
         dir,
         data_dir,
-        _lock: lock,
+        _environment: environment,
     }
 }
 
@@ -514,29 +512,24 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
 
 #[test]
 fn long_tool_result_save_failure_keeps_full_output() {
-    let lock = STORAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let previous_state_dir = env::var_os("ZS_STATE_DIR");
     let path = std::env::temp_dir()
         .canonicalize()
         .unwrap()
-        .join(format!("zs_state_file_{}", std::process::id()));
+        .join(format!("zs_state_file_{}", uuid::Uuid::new_v4()));
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, b"not a directory").unwrap();
-    unsafe { env::set_var("ZS_STATE_DIR", path.to_str().unwrap()) };
+    let environment = crate::tests::ScopedProcessEnv::set(&[(
+        "ZS_STATE_DIR",
+        Some(path.as_os_str().to_os_string()),
+    )]);
 
     let mut s = Session::new("anthropic", "claude", 200000, "");
     let output = "x".repeat(TOOL_RESULT_SAVE_THRESHOLD + 1);
     s.add_tool_result_with_id("", "bash", &output);
 
     let content = s.messages[0].content.to_string();
-    unsafe {
-        match previous_state_dir {
-            Some(value) => env::set_var("ZS_STATE_DIR", value),
-            None => env::remove_var("ZS_STATE_DIR"),
-        }
-    }
+    drop(environment);
     let _ = std::fs::remove_file(path);
-    drop(lock);
 
     assert!(content.contains(&output));
     assert!(content.contains("failed to save long tool output separately"));
@@ -591,18 +584,12 @@ fn save_session_preserves_cost_fields() {
 
 #[test]
 fn find_sessions_by_prefix_empty_for_nonexistent_dir() {
-    let lock = STORAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir()
-        .canonicalize()
-        .unwrap()
-        .join(format!("zs_nodir_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    unsafe { env::set_var("ZS_DATA_DIR", dir.to_str().unwrap()) };
+    let env = setup_test_env();
+    std::fs::remove_dir_all(&env.dir).unwrap();
     // Don't create the directory at all
     let found = find_sessions_by_prefix("anything").unwrap();
     assert!(found.is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
-    drop(lock);
+    drop(env);
 }
 
 #[test]

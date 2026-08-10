@@ -325,8 +325,8 @@ mod dirty {
     #[test]
     fn scroll_triggers_chat_redraw() {
         let mut r = Renderer::new().unwrap();
-        // Enough lines to overflow the (fallback 80x24) viewport.
-        for i in 0..40 {
+        let visible = r.visible_lines();
+        for i in 0..=visible {
             r.feed_mut()
                 .push_line(BlockStyle::Plain, format!("line {i}"));
         }
@@ -334,6 +334,17 @@ mod dirty {
         assert!(!r.chat_needs_redraw());
         r.scroll_line_up();
         assert!(r.chat_needs_redraw());
+    }
+
+    #[test]
+    fn no_op_scroll_does_not_trigger_chat_redraw() {
+        let mut r = Renderer::new().unwrap();
+        r.feed_mut().push_line(BlockStyle::Plain, "one line");
+        r.mark_chat_clean();
+
+        r.scroll_line_up();
+
+        assert!(!r.chat_needs_redraw());
     }
 
     #[test]

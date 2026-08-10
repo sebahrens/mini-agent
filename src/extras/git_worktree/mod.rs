@@ -54,7 +54,13 @@ static REPOSITORY_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
 static PROCESS_WORKSPACE_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 #[cfg(test)]
-static STASH_PUBLISH_TEST_GATE: OnceLock<StdMutex<Option<Arc<TestMutationGate>>>> = OnceLock::new();
+static STASH_PUBLISH_TEST_GATE: OnceLock<StdMutex<Option<StashPublishTestGate>>> = OnceLock::new();
+
+#[cfg(test)]
+struct StashPublishTestGate {
+    repo_path: PathBuf,
+    gate: Arc<TestMutationGate>,
+}
 
 #[derive(Debug, Clone)]
 pub enum DeferredWorktreeAction {
@@ -179,11 +185,15 @@ impl TestMutationGate {
 }
 
 #[cfg(test)]
-pub(crate) fn set_next_stash_publish_test_gate(gate: Arc<TestMutationGate>) {
+pub(crate) fn set_next_stash_publish_test_gate(repo_path: &Path, gate: Arc<TestMutationGate>) {
+    let repo_path = repo_path
+        .canonicalize()
+        .expect("stash publication test repository must be canonicalizable");
     *STASH_PUBLISH_TEST_GATE
         .get_or_init(|| StdMutex::new(None))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(StashPublishTestGate { repo_path, gate });
 }
 
 #[cfg(test)]
@@ -1825,11 +1835,20 @@ async fn create_and_publish_stash(
     }
 
     #[cfg(test)]
-    let publish_gate = STASH_PUBLISH_TEST_GATE
-        .get_or_init(|| StdMutex::new(None))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
+    let publish_gate = {
+        let mut slot = STASH_PUBLISH_TEST_GATE
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|entry| entry.repo_path == repo_path)
+        {
+            slot.take().map(|entry| entry.gate)
+        } else {
+            None
+        }
+    };
     #[cfg(test)]
     if let Some(gate) = publish_gate {
         gate.reached.notify_one();
@@ -2561,6 +2580,13 @@ pub(crate) async fn create_with_ref_limits_for_test(
     limits: CommandLimits,
 ) -> Result<(PathBuf, WorktreeInfo), String> {
     create_with_limits(repo_path, name, base_dir, limits, LOCAL_MUTATION_LIMITS).await
+}
+
+#[cfg(test)]
+pub(crate) async fn create_and_publish_stash_for_test(
+    repo_path: &Path,
+) -> Result<Option<String>, String> {
+    create_and_publish_stash(repo_path, None).await
 }
 
 #[cfg(test)]

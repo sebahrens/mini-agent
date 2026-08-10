@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -25,6 +26,9 @@ FULL_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 VERSION_COMMENT = re.compile(r"^v\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?$")
 # Remote actions may only bypass immutable pins after an explicit, reviewed entry here.
 RELEASE_ACTION_PIN_ALLOWLIST: frozenset[str] = frozenset()
+CANONICAL_GPL3_LICENSE_SHA256 = (
+    "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+)
 APPROVED_RELEASE_ACTIONS = {
     ("actions/checkout", "v7.0.1"): "3d3c42e5aac5ba805825da76410c181273ba90b1",
     (
@@ -232,6 +236,15 @@ def validate_clean_tracked_worktree(root: Path) -> list[str]:
                 f"with status {result.returncode}"
             )
     return errors
+
+
+def validate_license_identity(root: Path) -> list[str]:
+    license_path = root / "LICENSE"
+    if not license_path.is_file():
+        return ["LICENSE is missing"]
+    if hashlib.sha256(license_path.read_bytes()).hexdigest() != CANONICAL_GPL3_LICENSE_SHA256:
+        return ["LICENSE is not the canonical GPL-3.0-only text"]
+    return []
 
 
 def canonical_binary(metadata: dict[str, Any], root: Path) -> tuple[str | None, list[str]]:
@@ -632,6 +645,8 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         ),
         "scripts/package-release-binary.py": (
             'REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md")',
+            "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+            "LICENSE is not the canonical GPL-3.0-only text",
             "release archive payload mismatch",
         ),
         "scripts/package-corresponding-source.sh": (
@@ -641,11 +656,21 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'elif [[ "$ALLOW_UNTAGGED_LABEL" != true ]]; then',
             '--allow-untagged-label is restricted to labels ending in -ci',
             '--compliance-docs requires a directory',
+            'CANONICAL_GPL3_LICENSE_SHA256="3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"',
+            "LICENSE is not the canonical GPL-3.0-only text",
             "cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml",
             "cargo metadata --locked --offline --format-version 1 > /dev/null",
             'for required in LICENSE NOTICE SOURCE.md Cargo.toml Cargo.lock rust-toolchain.toml Cross.toml .cargo/config.toml; do',
             'tar tzf "$STAGING_DIR/$ARCHIVE_NAME" > "$ARCHIVE_LISTING"',
             'grep -Eq -- "^$ESCAPED_SOURCE_ROOT/vendor/',
+        ),
+        "scripts/smoke-package-compliance.py": (
+            'CHANNELS = ("aur", "conda-bin", "conda-source", "homebrew")',
+            "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+            "LICENSE is not the canonical GPL-3.0-only text",
+            'run(["ruby", "--disable-gems", "-e", HOMEBREW_HARNESS]',
+            'source "$RECIPE"; package',
+            '"info/licenses/LICENSE": payload / "LICENSE"',
         ),
         "packaging/homebrew/zerostack.rb": (
             f'homepage "{CANONICAL_REPOSITORY_URL}"',
@@ -684,6 +709,10 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"repository: {CANONICAL_REPOSITORY_URL}",
             f"- {binary} --help",
             f"- {binary} --version",
+            "- test -f ${PREFIX}/THIRDPARTY.yml",
+        ),
+        "packaging/conda/zerostack/build.sh": (
+            'install -Dm644 THIRDPARTY.yml "${PREFIX}/THIRDPARTY.yml"',
         ),
         "justfile": (
             "bash scripts/update-release-checksums.sh all",
@@ -728,6 +757,12 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             '"${INSTALL_ROOT}/share/doc/mini-agent/${document}"',
         ),
         ".github/workflows/pages.yml": ("https://sebahrens.github.io/mini-agent",),
+        ".github/workflows/ci.yml": (
+            "package-compliance-smoke:",
+            "python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}",
+            "--channel aur --channel conda-bin --channel conda-source",
+            "--channel homebrew",
+        ),
         "src/product.rs": (
             f'pub const PUBLIC_NAME: &str = "{binary}";',
             f'pub const REPOSITORY_SLUG: &str = "{CANONICAL_REPOSITORY}";',
@@ -971,6 +1006,7 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
             )
         )
     errors.extend(validate_file_fragments(root, binary))
+    errors.extend(validate_license_identity(root))
     errors.extend(validate_distribution_notice_installs(root))
     errors.extend(validate_aur_srcinfo_checksums(root))
     errors.extend(validate_stale_coordinates(root))

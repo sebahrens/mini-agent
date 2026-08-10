@@ -16,6 +16,19 @@ CHECK_PACKAGE_METADATA = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK_PACKAGE_METADATA)
 
 
+class LicenseIdentityValidationTests(unittest.TestCase):
+    def test_canonical_gpl_text_is_accepted_and_modified_text_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copyfile(SCRIPT.parents[1] / "LICENSE", root / "LICENSE")
+            self.assertEqual([], CHECK_PACKAGE_METADATA.validate_license_identity(root))
+
+            (root / "LICENSE").write_text("not the GPL\n", encoding="utf-8")
+            errors = CHECK_PACKAGE_METADATA.validate_license_identity(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("canonical GPL-3.0-only", errors[0])
+
+
 class ReleaseWorkflowValidationTests(unittest.TestCase):
     def test_reviewed_current_release_action_pins_are_accepted(self) -> None:
         workflow = (

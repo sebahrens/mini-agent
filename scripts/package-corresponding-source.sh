@@ -43,6 +43,18 @@ while [[ $# -gt 0 ]]; do
 done
 SOURCE_REF="${SOURCE_REF:-$RELEASE_TAG}"
 BINARY_NAME="mini-agent"
+CANONICAL_GPL3_LICENSE_SHA256="3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        echo "Error: no SHA-256 utility is available" >&2
+        return 1
+    fi
+}
 
 if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
     echo "Error: invalid release tag: ${RELEASE_TAG}" >&2
@@ -80,6 +92,11 @@ if [[ -n "$COMPLIANCE_DOCS" ]]; then
             cp "$COMPLIANCE_DOCS/$document" "$STAGING_DIR/$SOURCE_ROOT/$document"
         fi
     done
+fi
+if [[ ! -f "$STAGING_DIR/$SOURCE_ROOT/LICENSE" ]] \
+    || [[ "$(sha256_file "$STAGING_DIR/$SOURCE_ROOT/LICENSE")" != "$CANONICAL_GPL3_LICENSE_SHA256" ]]; then
+    echo "Error: LICENSE is not the canonical GPL-3.0-only text" >&2
+    exit 2
 fi
 mkdir -p "$STAGING_DIR/$SOURCE_ROOT/.cargo"
 (

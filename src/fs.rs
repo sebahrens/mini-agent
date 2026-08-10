@@ -513,11 +513,15 @@ pub(crate) fn checked_path_metadata(path: &Path) -> std::io::Result<CheckedMetad
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
 
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         let file = std::fs::OpenOptions::new()
             .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)?;
         let metadata = file.metadata()?;

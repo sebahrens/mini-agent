@@ -2368,6 +2368,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/sandbox.rs",
         &[
             (
+                "1be8b9a093e8b907b6122b21db33a9b30571b75c96e87c7908f804bea7d99d06",
+                1,
+            ),
+            (
+                "c2f73c6bf16b04844a46c0a7239dbf486bedb5b09f3b287f895e6d033d7ce652",
+                1,
+            ),
+            (
                 "b9ba7b946e716954ba269b40394f014187892aff4dbe028a7cffda9ae5c63bea",
                 1,
             ),

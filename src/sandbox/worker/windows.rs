@@ -4734,6 +4734,22 @@ mod tests {
         WaitForSingleObject,
     };
 
+    /// Serializes complete production-launch observation windows in this test process.
+    ///
+    /// This is deliberately separate from `PROCESS_CREATION_LOCK`: these tests must be able to
+    /// hold the observation guard while exercising production code that acquires and releases the
+    /// creation lock internally. Recovering poison keeps one failed assertion from cascading into
+    /// unrelated Windows production tests.
+    static PRODUCTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn production_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = PRODUCTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        PRODUCTION_TEST_LOCK.clear_poison();
+        guard
+    }
+
     struct PrivateFailureExecutable {
         path: std::path::PathBuf,
         root: std::path::PathBuf,
@@ -4768,6 +4784,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real Windows AppContainer backend"]
     fn windows_lpac_can_load_current_exe_with_only_protocol_handles() {
+        let _production_test_guard = production_test_guard();
         super::run_lpac_image_loading_gate()
             .expect("all required real artifacts must pass the Windows LPAC feasibility gate");
     }
@@ -4902,6 +4919,7 @@ mod tests {
 
     #[test]
     fn windows_production_status_fails_closed_for_nonproduction_test_image() {
+        let _production_test_guard = production_test_guard();
         match super::containment_status() {
             crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
                 backend,
@@ -4923,6 +4941,7 @@ mod tests {
 
     #[test]
     fn windows_production_launch_uses_cached_unavailable_without_second_child() {
+        let _production_test_guard = production_test_guard();
         assert!(matches!(
             super::containment_status(),
             crate::sandbox::worker::WorkerContainmentStatus::Unavailable { .. }
@@ -4947,6 +4966,7 @@ mod tests {
 
     #[test]
     fn windows_production_inheriting_process_lock_serializes_launch_windows() {
+        let _production_test_guard = production_test_guard();
         let first = crate::process_creation::creation_guard()
             .expect("first inheriting-process creation lock acquisition");
         let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
@@ -4979,6 +4999,7 @@ mod tests {
         use crate::process_creation::StdCommandCreationExt;
         use std::process::Command as ProcessBuilder;
 
+        let _production_test_guard = production_test_guard();
         let inheritance_guard = crate::process_creation::creation_guard()
             .expect("acquire LPAC inheritable-handle window");
         let mut pipes = super::feasibility::ProtocolPipes::exact_anonymous_set(&inheritance_guard)
@@ -5087,6 +5108,7 @@ mod tests {
             launch_production,
         };
 
+        let _production_test_guard = production_test_guard();
         // The first AppContainer API call lazily initializes process-global
         // Windows state that remains live for the process. Warm that stable
         // production profile before measuring per-launch HANDLE ownership so

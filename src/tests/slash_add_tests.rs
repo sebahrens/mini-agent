@@ -3,14 +3,22 @@ use std::path::PathBuf;
 
 #[test]
 fn test_resolve_path_absolute() {
-    let result = resolve_path("/tmp/foo.txt");
-    assert_eq!(result, PathBuf::from("/tmp/foo.txt"));
+    let absolute = std::env::temp_dir().join("foo.txt");
+    assert!(absolute.is_absolute());
+    let result = resolve_path(&absolute.to_string_lossy());
+    assert_eq!(result, absolute);
 }
 
 #[test]
 fn test_resolve_path_relative_root() {
-    let result = resolve_path("/");
-    assert_eq!(result, PathBuf::from("/"));
+    let root = std::env::temp_dir()
+        .ancestors()
+        .last()
+        .expect("an absolute temporary directory has a root")
+        .to_path_buf();
+    assert!(root.is_absolute());
+    let result = resolve_path(&root.to_string_lossy());
+    assert_eq!(result, root);
 }
 
 #[test]

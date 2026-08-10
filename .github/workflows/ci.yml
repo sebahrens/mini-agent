@@ -86,6 +86,23 @@ jobs:
           python3 -m unittest scripts.tests.test_check_workspace_boundaries
           python3 scripts/check_workspace_boundaries.py
 
+  package-compliance-smoke:
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            channels: --channel aur --channel conda-bin --channel conda-source
+          - os: macos-latest
+            channels: --channel homebrew
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stage package recipes and verify GPL payloads
+        run: python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}
+
   clippy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
@@ -593,6 +610,12 @@ jobs:
         run: >-
           cargo test --locked --no-default-features --features js
           windows_production_ -- --nocapture --test-threads=1
+
+      - name: Test process-creation lock panic recovery under contention
+        run: >-
+          cargo test --locked --no-default-features --features js
+          process_creation::tests::poisoned_creation_lock_recovers_without_losing_serialization
+          -- --exact --nocapture
 
   windows-general-sandbox-policy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')

@@ -1860,9 +1860,11 @@ impl Sandbox {
         let termination = tokio::select! {
             biased;
             _ = wait_for_command_cancellation(cancellation.as_mut()) => CommandTermination::Cancelled,
+            // If executor starvation makes both branches ready, the elapsed deadline must win.
+            // Otherwise an over-budget child can be reported as a successful completion.
+            _ = tokio::time::sleep(limits.timeout) => CommandTermination::TimedOut,
             status = child.wait() => CommandTermination::Exited(status),
             Some(error) = reader_error_rx.recv() => CommandTermination::ReaderError(error),
-            _ = tokio::time::sleep(limits.timeout) => CommandTermination::TimedOut,
             _ = response_tx.closed() => CommandTermination::Cancelled,
         };
 
@@ -1990,8 +1992,10 @@ impl Sandbox {
         };
         let termination = tokio::select! {
             biased;
-            status = child.wait() => CommandTermination::Exited(status),
+            // Preserve the same hard deadline semantics as captured commands when the runtime is
+            // starved long enough for both completion and timeout to become ready.
             _ = tokio::time::sleep(limits.timeout) => CommandTermination::TimedOut,
+            status = child.wait() => CommandTermination::Exited(status),
             _ = response_tx.closed() => CommandTermination::Cancelled,
         };
         let (exit_status, status) = match termination {

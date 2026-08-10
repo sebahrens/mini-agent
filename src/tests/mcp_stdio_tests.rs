@@ -318,7 +318,7 @@ impl FixtureBuild {
 }
 
 struct PathGuard {
-    original: Option<OsString>,
+    _environment: crate::tests::ScopedProcessEnv,
 }
 
 impl PathGuard {
@@ -329,21 +329,8 @@ impl PathGuard {
             entries.extend(std::env::split_paths(existing));
         }
         let joined = std::env::join_paths(entries).unwrap();
-        // SAFETY: this test restores PATH before returning and the mutation is
-        // limited to resolving the uniquely named fixture command.
-        unsafe { std::env::set_var("PATH", joined) };
-        Self { original }
-    }
-}
-
-impl Drop for PathGuard {
-    fn drop(&mut self) {
-        // SAFETY: restores the process environment value saved by `prepend`.
-        unsafe {
-            match &self.original {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
+        Self {
+            _environment: crate::tests::ScopedProcessEnv::set(&[("PATH", Some(joined))]),
         }
     }
 }

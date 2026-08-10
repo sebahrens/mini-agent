@@ -78,7 +78,17 @@ The package metadata policy enforces both the release pins and the Dependabot co
 ```bash
 python3 -m unittest scripts.tests.test_check_package_metadata
 python3 scripts/check-package-metadata.py
+python3 scripts/smoke-package-compliance.py \
+  --channel aur --channel conda-bin --channel conda-source --channel homebrew
 ```
+
+The package-compliance smoke is offline. It first verifies the exact canonical GPL-3.0-only
+`LICENSE` digest, then executes the checked-in AUR and Conda install scripts
+with controlled command shims, executes the Homebrew formula's `install` method through a minimal
+Ruby DSL harness, and compares the staged `LICENSE`, `NOTICE`, and `SOURCE.md` bytes with the
+repository originals. The Conda source smoke also executes the recipe's declared binary checks and
+proves the generated third-party license inventory reaches `${PREFIX}/THIRDPARTY.yml`. CI runs
+Linux-only recipes on Ubuntu and the Homebrew formula on macOS.
 
 ## Quick start
 

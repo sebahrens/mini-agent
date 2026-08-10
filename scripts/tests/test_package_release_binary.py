@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import stat
 import tarfile
 import tempfile
@@ -18,7 +19,9 @@ SPEC.loader.exec_module(PACKAGE_RELEASE_BINARY)
 class PackageReleaseBinaryTests(unittest.TestCase):
     def make_root(self, directory: str) -> Path:
         root = Path(directory)
-        for name in PACKAGE_RELEASE_BINARY.REQUIRED_DOCUMENTS:
+        repository = SCRIPT.parents[1]
+        shutil.copyfile(repository / "LICENSE", root / "LICENSE")
+        for name in ("NOTICE", "SOURCE.md"):
             (root / name).write_text(f"{name}\n", encoding="utf-8")
         return root
 
@@ -72,6 +75,21 @@ class PackageReleaseBinaryTests(unittest.TestCase):
             binary.write_bytes(b"binary")
 
             with self.assertRaisesRegex(ValueError, "NOTICE"):
+                PACKAGE_RELEASE_BINARY.package_binary(
+                    root=root,
+                    binary=binary,
+                    archive=root / "release.tar.gz",
+                    executable_name="mini-agent",
+                )
+
+    def test_modified_license_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_root(directory)
+            (root / "LICENSE").write_text("not the GPL\n", encoding="utf-8")
+            binary = root / "mini-agent"
+            binary.write_bytes(b"binary")
+
+            with self.assertRaisesRegex(ValueError, "canonical GPL-3.0-only"):
                 PACKAGE_RELEASE_BINARY.package_binary(
                     root=root,
                     binary=binary,
