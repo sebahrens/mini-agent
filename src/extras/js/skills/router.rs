@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 
 use super::CapabilityTier;
 use super::lifecycle::LifecycleStatus;
+use crate::hex;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanaryCandidate {
@@ -153,5 +154,5 @@ fn route_fingerprint(
     }
     let digest = hash.finalize();
     let bucket_seed = u16::from_be_bytes([digest[0], digest[1]]);
-    (format!("{digest:x}"), bucket_seed)
+    (hex::encode_lower(digest.as_slice()), bucket_seed)
 }

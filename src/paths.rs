@@ -1938,7 +1938,7 @@ fn content_identity(path: &Path) -> io::Result<String> {
 
     let mut hasher = Sha256::new();
     update(&mut hasher, path, path)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::hex::encode_lower(hasher.finalize()))
 }
 
 fn open_regular_no_follow(path: &Path) -> io::Result<std::fs::File> {

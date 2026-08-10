@@ -86,6 +86,7 @@ jobs:
           - "--no-default-features"
           - "--no-default-features --features memory"
           - "--no-default-features --features sandbox"
+          - "--no-default-features --features acp"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ubuntu-latest
@@ -121,8 +122,14 @@ jobs:
           - "--no-default-features --features skills"
           - "--no-default-features --features js,sandbox"
           - "--no-default-features --features mcp"
+          - "--no-default-features --features acp"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
+        exclude:
+          # ACP's TCP authentication tests are covered on Linux. The macOS
+          # hosted runner has a known socket scheduling hang in this suite.
+          - os: macos-latest
+            features: "--no-default-features --features acp"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -270,7 +277,7 @@ jobs:
 
       - name: Archive Linux JS worker resource measurements
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-worker-resource-${{ runner.os }}
           path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
@@ -351,7 +358,7 @@ jobs:
 
       - name: Archive source-free Phase 6 gate evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: phase6-worker-gate-linux
           path: |
@@ -443,7 +450,7 @@ jobs:
 
       - name: Archive macOS JS worker resource measurements
         if: always() && matrix.os == 'macos-26'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-worker-resource-${{ runner.os }}
           path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
@@ -513,7 +520,7 @@ jobs:
 
       - name: Archive source-free Phase 6 gate evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: phase6-worker-gate-${{ matrix.os }}
           path: |
@@ -1131,7 +1138,7 @@ jobs:
 
       - name: Archive Windows JS worker resource measurements
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-worker-resource-${{ runner.os }}
           path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
@@ -1203,7 +1210,7 @@ jobs:
 
       - name: Archive Windows containment evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-worker-containment
           path: |
@@ -1244,7 +1251,7 @@ jobs:
 
       - name: Archive source-free Phase 6 gate evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: phase6-worker-gate-windows
           path: |
@@ -1318,7 +1325,7 @@ jobs:
 
       - name: Archive the validated cross-platform worker resource baseline
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-worker-resource-baseline
           path: ${{ runner.temp }}/js-worker-baseline.json
@@ -1408,7 +1415,7 @@ jobs:
 
       - name: Archive platform result
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: platform-paths-${{ matrix.os }}-${{ matrix.feature.name }}
           path: platform-path-result.json
@@ -1460,7 +1467,7 @@ jobs:
 
       - name: Archive negative-control result
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: platform-path-negative-controls
           path: platform-path-negative-controls.json
@@ -1568,7 +1575,7 @@ jobs:
 
       - name: Archive install-smoke result
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: platform-path-install-smoke-${{ matrix.os }}
           path: platform-path-install-smoke.json

@@ -164,7 +164,7 @@ impl<'a> QuarantineExecutor<'a> {
         ) {
             return Err(QuarantineExecutionError::Held("ineligible_status"));
         }
-        let evidence_id = format!("{:x}", Sha256::digest(canonical_snapshot.as_bytes()));
+        let evidence_id = crate::hex::encode_lower(Sha256::digest(canonical_snapshot.as_bytes()));
         let policy_inputs: std::collections::BTreeMap<String, serde_json::Value> =
             std::collections::BTreeMap::from([(
                 "quarantine".to_string(),

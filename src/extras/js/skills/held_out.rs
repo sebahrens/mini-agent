@@ -113,7 +113,7 @@ impl HeldOutSuiteDraft {
             cases: self.cases,
         };
         let canonical_payload = serde_json::to_string(&canonical)?;
-        let content_hash = format!("{:x}", Sha256::digest(canonical_payload.as_bytes()));
+        let content_hash = crate::hex::encode_lower(Sha256::digest(canonical_payload.as_bytes()));
         let record = HeldOutSuiteRecord {
             suite_id: content_hash.clone(),
             selector_json: serde_json::to_string(&canonical.selector)?,
@@ -146,7 +146,7 @@ pub(crate) fn select_suites(
 }
 
 fn decode_record(record: HeldOutSuiteRecord) -> Result<HeldOutSuite, HeldOutError> {
-    let hash = format!("{:x}", Sha256::digest(record.canonical_payload.as_bytes()));
+    let hash = crate::hex::encode_lower(Sha256::digest(record.canonical_payload.as_bytes()));
     if hash != record.suite_id || hash != record.content_hash {
         return Err(HeldOutError::TamperedSuite(record.suite_id));
     }
@@ -371,7 +371,7 @@ pub(crate) fn evaluate(
         "case_count": case_reports.len(),
         "outcome": "passed"
     }))?;
-    let report_id = format!("{:x}", Sha256::digest(identity_payload));
+    let report_id = crate::hex::encode_lower(Sha256::digest(identity_payload));
     Ok(HeldOutEvaluationReport {
         report_id,
         skill_id: artifact.id.clone(),

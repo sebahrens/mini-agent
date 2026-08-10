@@ -33,12 +33,12 @@ APPROVED_RELEASE_ACTIONS = {
     ): "166cdcfd11aee3cb47222f9ddb555ce30ddb9659",
     (
         "taiki-e/install-action",
-        "v2.84.1",
-    ): "c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd",
+        "v2.85.9",
+    ): "91ddec75689c4c78665b598d188dc821c5a43e5c",
     (
         "actions/upload-artifact",
-        "v4.6.2",
-    ): "ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "v7.0.1",
+    ): "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     (
         "actions/download-artifact",
         "v4.3.0",

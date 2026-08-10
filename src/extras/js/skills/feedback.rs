@@ -324,5 +324,5 @@ fn feedback_id(command: &FeedbackCommand) -> String {
         digest.update((value.len() as u64).to_be_bytes());
         digest.update(value.as_bytes());
     }
-    format!("{:x}", digest.finalize())
+    crate::hex::encode_lower(digest.finalize())
 }

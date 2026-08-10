@@ -113,7 +113,7 @@ fn hook_confirmation_description(handler: &HookHandler) -> String {
         .expect("serializing hook environment key strings cannot fail");
     let env_binding = serde_json::to_vec(&handler.env)
         .expect("serializing hook environment bindings cannot fail");
-    let env_binding_sha256 = format!("{:x}", Sha256::digest(env_binding));
+    let env_binding_sha256 = crate::hex::encode_lower(Sha256::digest(env_binding));
     let policy = format!(
         "subprocess trust={trust:?}; explicit env keys={env_keys}; env binding sha256={env_binding_sha256:?}"
     );

@@ -138,7 +138,7 @@ fn response_digest(nonce: &str, api_key: &str) -> String {
     let mut outer = Sha256::new();
     outer.update(outer_pad);
     outer.update(inner.finalize());
-    format!("{:x}", outer.finalize())
+    crate::hex::encode_lower(outer.finalize())
 }
 
 fn fixed_time_digest_eq(candidate: &[u8], expected: &[u8]) -> bool {

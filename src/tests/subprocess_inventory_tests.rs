@@ -620,7 +620,7 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
             hasher.update(b"mini-agent:macro-token-tree:v1");
         }
         hash_frame(&mut hasher, &invocation);
-        format!("{:x}", hasher.finalize())
+        crate::hex::encode_lower(hasher.finalize())
     }
 
     fn is_method_or_ufcs(tokens: &[TokenTree], index: usize) -> bool {
@@ -1614,12 +1614,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/export.rs",
         "anyhow::bail!(\"GitHub API returned {}: {}\", status, text.trim());",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/audit.rs",
-        "let _ = write!(output, \"{byte:02x}\");",
         1,
         "NON-PROCESS",
     ),

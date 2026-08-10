@@ -178,4 +178,5 @@ src/sandbox/worker/
 ```
 
 Tool registration lives in `src/agent/builder.rs`; general model-command isolation remains in
-`src/sandbox.rs`.
+`src/sandbox.rs`. Shared digest consumers use `src/hex.rs` for stable lowercase encoding across
+cryptographic crate upgrades.

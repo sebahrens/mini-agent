@@ -191,6 +191,9 @@ record of executable know-how rather than a growing prompt full of prose recipes
 
 ## Quick start
 
+The Cargo package, installed CLI, and every release archive use the executable name
+`mini-agent`.
+
 Install the latest checksum-verified release on Linux or macOS:
 
 ```bash

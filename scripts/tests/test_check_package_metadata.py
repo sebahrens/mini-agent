@@ -17,6 +17,19 @@ SPEC.loader.exec_module(CHECK_PACKAGE_METADATA)
 
 
 class ReleaseWorkflowValidationTests(unittest.TestCase):
+    def test_reviewed_current_release_action_pins_are_accepted(self) -> None:
+        workflow = (
+            "steps:\n"
+            "  - uses: actions/upload-artifact@"
+            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n"
+            "  - uses: taiki-e/install-action@"
+            "91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9\n"
+        )
+
+        self.assertEqual(
+            [], CHECK_PACKAGE_METADATA.validate_release_action_pins(workflow)
+        )
+
     def test_mutable_release_action_is_rejected(self) -> None:
         errors = CHECK_PACKAGE_METADATA.validate_release_action_pins(
             "steps:\n  - uses: actions/upload-artifact@v4\n"
@@ -117,7 +130,7 @@ class ReleaseWorkflowValidationTests(unittest.TestCase):
         errors = CHECK_PACKAGE_METADATA.validate_release_action_pins(
             "steps:\n"
             "  - uses: actions/upload-artifact@"
-            f"{'0' * 40} # v4.6.2\n"
+            f"{'0' * 40} # v7.0.1\n"
         )
 
         self.assertEqual(1, len(errors))
@@ -127,7 +140,7 @@ class ReleaseWorkflowValidationTests(unittest.TestCase):
         errors = CHECK_PACKAGE_METADATA.validate_release_action_pins(
             "steps:\n"
             "  - uses: actions/upload-artifact@"
-            "d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.6.2\n"
+            "d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.1\n"
         )
 
         self.assertEqual(1, len(errors))

@@ -565,7 +565,7 @@ fn identity(tree: &SourceTree) -> TreeIdentity {
     }
     TreeIdentity {
         version: 1,
-        digest: hex_digest(hasher.finalize()),
+        digest: crate::hex::encode_lower(hasher.finalize()),
         entries: tree.entries.len(),
         files,
         expanded_bytes,
@@ -805,17 +805,6 @@ fn set_read_only(_path: &Path, _directory: bool) -> Result<(), ImportError> {
 fn update_digest(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
-}
-
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    let bytes = bytes.as_ref();
-    let mut output = String::with_capacity(bytes.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 struct CleanupDirectory {

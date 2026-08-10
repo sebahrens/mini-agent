@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::store::{SkillStore, current_timestamp};
 use crate::extras::js::protocol::StepOutcome;
+use crate::hex;
 
 pub const MAX_EVENT_BATCH: usize = 256;
 pub const MAX_ARGUMENT_SHAPE_BYTES: usize = 512;
@@ -568,7 +569,7 @@ pub fn stable_invocation_id(
     }
     bytes.extend_from_slice(&ordinal.to_be_bytes());
     let digest = Sha256::digest([b"mini-agent/skill-invocation/v1".as_slice(), &bytes].concat());
-    format!("{digest:x}")
+    hex::encode_lower(digest.as_slice())
 }
 
 pub struct TelemetryIngestor<'a> {

@@ -591,13 +591,18 @@ async fn connect_agent(
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_dispatch(
-            |dispatch: Dispatch<AgentRequest, AgentNotification>, cx: ConnectionTo<Client>| {
+            |dispatch: Dispatch<AgentRequest, AgentNotification>, _cx: ConnectionTo<Client>| {
                 async move {
                     tracing::warn!("ACP unhandled dispatch message");
-                    dispatch.respond_with_error(
-                        agent_client_protocol::util::internal_error("Unhandled ACP message"),
-                        cx,
-                    )
+                    match dispatch {
+                        Dispatch::Request(_, responder) => responder.respond_with_error(
+                            agent_client_protocol::util::internal_error("Unhandled ACP message"),
+                        ),
+                        Dispatch::Notification(_) => Ok(()),
+                        Dispatch::Response(response, router) => {
+                            router.route_with_result(response)
+                        }
+                    }
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
