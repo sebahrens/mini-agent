@@ -6,7 +6,11 @@ use rig::agent::{Agent, AgentBuilder};
 use rig::completion::CompletionModel;
 use smallvec::SmallVec;
 
-use crate::agent::prompt::{SYSTEM_PROMPT, TODO_TOOLS_PROMPT};
+use crate::agent::prompt::{
+    EDIT_TOOL_PROMPT, FIND_FILES_TOOL_PROMPT, GREP_TOOL_PROMPT, JS_TOOL_PROMPT,
+    LIST_DIR_TOOL_PROMPT, READ_TOOL_PROMPT, SYSTEM_PROMPT, TASK_TOOL_PROMPT, TODO_TOOL_PROMPT,
+    WRITE_TOOL_PROMPT,
+};
 use crate::agent::tools;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -28,11 +32,32 @@ fn registered_shell_capability<'a>(
     sandbox.shell_capability()
 }
 
-/// Assemble the system-prompt preamble every request carries: the base
-/// `SYSTEM_PROMPT`, tool-use guidance, context files (AGENTS.md, ARCHITECTURE.md,
-/// active mode prompt), working directory, `/add`ed files, memory, and the user
-/// `SUFFIX.md`. Extracted from [`build_agent_inner`] so its token cost can be
-/// estimated (see [`estimate_overhead`]) without building an `Agent`.
+fn is_reserved_builtin_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "read"
+            | "write"
+            | "edit"
+            | "grep"
+            | "find_files"
+            | "list_dir"
+            | "todo_write"
+            | "bash"
+            | "js"
+            | "task"
+            | "memory_write"
+            | "memory_edit"
+            | "memory_read"
+            | "memory_search"
+            | "advisor"
+            | "lsp_diagnostics"
+    )
+}
+
+/// Assemble the tool-independent system-prompt context: the base
+/// `SYSTEM_PROMPT`, context files (AGENTS.md, ARCHITECTURE.md, active mode
+/// prompt), working directory, `/add`ed files, memory, and the user `SUFFIX.md`.
+/// [`build_registered_preamble`] adds guidance for the final registered tools.
 #[cfg(test)]
 pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String {
     build_preamble_for_workspace(
@@ -64,7 +89,6 @@ pub(crate) fn build_preamble_for_workspace(
     let total_len = reasoning_prefix.len()
         + SYSTEM_PROMPT.len()
         + 1
-        + TODO_TOOLS_PROMPT.len()
         + if context.agents.is_some() {
             2 + context_agents.len()
         } else {
@@ -86,9 +110,7 @@ pub(crate) fn build_preamble_for_workspace(
         };
 
     #[cfg(feature = "memory")]
-    let total_len = total_len
-        + context.memory.as_deref().map_or(0, |m| m.len() + 8) // "\n\n---\n\n" + content
-        + crate::agent::prompt::MEMORY_TOOLS_PROMPT.len();
+    let total_len = total_len + context.memory.as_deref().map_or(0, |m| m.len() + 8); // "\n\n---\n\n" + content
 
     let total_len = total_len + suffix.as_ref().map_or(0, |s| s.len() + 6); // "\n\n---\n\n"
 
@@ -126,7 +148,6 @@ pub(crate) fn build_preamble_for_workspace(
     preamble.push_str(reasoning_prefix);
     preamble.push_str(SYSTEM_PROMPT);
     preamble.push('\n');
-    preamble.push_str(TODO_TOOLS_PROMPT);
     if !context_agents.is_empty() {
         preamble.push_str("\n\n");
         preamble.push_str(context_agents);
@@ -151,7 +172,6 @@ pub(crate) fn build_preamble_for_workspace(
     #[cfg(feature = "memory")]
     {
         crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
-        preamble.push_str(crate::agent::prompt::MEMORY_TOOLS_PROMPT);
     }
     if let Some(s) = &suffix {
         preamble.push_str("\n\n---\n\n");
@@ -164,29 +184,111 @@ fn build_registered_preamble(
     context: &ContextFiles,
     reasoning_enabled: bool,
     workspace_root: &Path,
-    cli: &Cli,
-    cfg: &Config,
     sandbox: &Sandbox,
-    lsp_enabled: bool,
+    registered_tools: &[&str],
 ) -> String {
     let mut preamble =
         build_preamble_for_workspace(context, reasoning_enabled, Some(workspace_root));
-    #[cfg(feature = "lsp")]
-    if lsp_enabled {
-        preamble.push_str(crate::agent::prompt::LSP_PROMPT);
+    let has = |name: &str| registered_tools.contains(&name);
+    if has("js") {
+        preamble.push_str(JS_TOOL_PROMPT);
     }
-    #[cfg(not(feature = "lsp"))]
-    let _ = lsp_enabled;
-    if let Some(capability) = registered_shell_capability(cli, cfg, sandbox) {
+    if has("read") {
+        preamble.push_str(READ_TOOL_PROMPT);
+    }
+    if has("write") {
+        preamble.push_str(WRITE_TOOL_PROMPT);
+    }
+    if has("edit") {
+        preamble.push_str(EDIT_TOOL_PROMPT);
+    }
+    if has("grep") {
+        preamble.push_str(GREP_TOOL_PROMPT);
+    }
+    if has("find_files") {
+        preamble.push_str(FIND_FILES_TOOL_PROMPT);
+    }
+    if has("list_dir") {
+        preamble.push_str(LIST_DIR_TOOL_PROMPT);
+    }
+    if has("todo_write") {
+        preamble.push_str(TODO_TOOL_PROMPT);
+    }
+    if has("task") {
+        preamble.push_str(TASK_TOOL_PROMPT);
+    }
+    #[cfg(feature = "memory")]
+    {
+        if has("memory_write") {
+            preamble.push_str(crate::agent::prompt::MEMORY_WRITE_TOOL_PROMPT);
+        }
+        if has("memory_edit") {
+            preamble.push_str(crate::agent::prompt::MEMORY_EDIT_TOOL_PROMPT);
+        }
+        if has("memory_search") {
+            preamble.push_str(crate::agent::prompt::MEMORY_SEARCH_TOOL_PROMPT);
+        }
+        if has("memory_read") {
+            preamble.push_str(crate::agent::prompt::MEMORY_READ_TOOL_PROMPT);
+        }
+    }
+    #[cfg(feature = "lsp")]
+    if has("lsp_diagnostics") {
+        preamble.push_str(crate::agent::prompt::LSP_PROMPT);
+        if has("edit") || has("write") {
+            preamble.push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
+        }
+    }
+    if has("bash")
+        && let Some(capability) = sandbox.shell_capability()
+    {
         preamble.push_str(&capability.model_guidance());
     }
     preamble
 }
 
-/// Estimate the token cost of the exact preamble registered for this agent.
-/// Stored on the session and added to the context figure before the first real
-/// calibration. Tool-schema tokens are folded into the first provider usage
-/// report.
+fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec<&'static str> {
+    if cli.resolve_no_tools(cfg) {
+        return Vec::new();
+    }
+    let mut names = vec![
+        "read",
+        "write",
+        "edit",
+        "grep",
+        "find_files",
+        "list_dir",
+        "todo_write",
+    ];
+    if registered_shell_capability(cli, cfg, sandbox).is_some() {
+        names.push("bash");
+    }
+    #[cfg(feature = "js")]
+    if cli.tool_is_eligible(cfg, "js") {
+        names.push("js");
+    }
+    #[cfg(feature = "subagents")]
+    if cfg.task_enabled.unwrap_or(true) {
+        names.push("task");
+    }
+    #[cfg(feature = "memory")]
+    names.extend([
+        "memory_write",
+        "memory_edit",
+        "memory_read",
+        "memory_search",
+    ]);
+    #[cfg(feature = "lsp")]
+    if cli.tool_is_eligible(cfg, "lsp_diagnostics") && cfg.resolve_lsp().is_some() {
+        names.push("lsp_diagnostics");
+    }
+    names.retain(|name| cli.tool_is_eligible(cfg, name));
+    names
+}
+
+/// Conservatively estimate the registered preamble before provider calibration.
+/// Runtime-unavailable optional tools can make this slightly high. Tool-schema
+/// tokens are folded into the first provider usage report.
 pub fn estimate_overhead(
     context: &ContextFiles,
     reasoning_enabled: bool,
@@ -194,18 +296,13 @@ pub fn estimate_overhead(
     cfg: &Config,
     sandbox: &Sandbox,
 ) -> u64 {
-    #[cfg(feature = "lsp")]
-    let lsp_enabled = cli.tool_is_eligible(cfg, "lsp_diagnostics") && cfg.resolve_lsp().is_some();
-    #[cfg(not(feature = "lsp"))]
-    let lsp_enabled = false;
+    let registered_tools = estimated_registered_tools(cli, cfg, sandbox);
     let preamble = build_registered_preamble(
         context,
         reasoning_enabled,
         &context.workspace_root,
-        cli,
-        cfg,
         sandbox,
-        lsp_enabled,
+        &registered_tools,
     );
     crate::session::Session::estimate_tokens(&preamble)
 }
@@ -421,38 +518,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             .map(|c| crate::extras::lsp::LspManager::new(c, workspace.clone()))
     };
 
-    #[cfg(feature = "lsp")]
-    let lsp_enabled = lsp_manager.is_some();
-    #[cfg(not(feature = "lsp"))]
-    let lsp_enabled = false;
-    let preamble = build_registered_preamble(
-        context,
-        reasoning_enabled,
-        workspace_root,
-        cli,
-        cfg,
-        &sandbox,
-        lsp_enabled,
-    );
-
-    let mut builder = AgentBuilder::new(model).preamble(&preamble);
-
-    if let Some(params) = additional_params {
-        builder = builder.additional_params(params);
-    }
-
-    let max_tokens = cli.resolve_max_tokens(cfg);
-    builder = builder.max_tokens(max_tokens);
-
-    let max_turns = cli.resolve_max_agent_turns(cfg);
-    builder = builder.default_max_turns(max_turns);
-
-    if let Some(temp) = temperature {
-        builder = builder.temperature(temp);
-    }
-
-    if !tools_enabled {
-        builder.build()
+    let all_tools = if !tools_enabled {
+        None
     } else {
         let max_text_file_size = cfg.max_text_file_size;
         let max_read_lines = cfg.resolve_max_read_lines();
@@ -574,7 +641,13 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 .collect_tools(permission.clone(), ask_tx.clone())
                 .await;
             for t in mcp_tools {
-                all_tools.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
+                if is_reserved_builtin_tool_name(t.definition.name.as_ref()) {
+                    tracing::warn!(
+                        "MCP tool skipped because its name is reserved by a built-in tool"
+                    );
+                } else {
+                    all_tools.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
+                }
             }
         }
 
@@ -597,12 +670,12 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         if js_tool_enabled {
             register_js_tool(
                 &mut all_tools,
-                sandbox,
+                sandbox.clone(),
                 permission.clone(),
                 ask_tx.clone(),
                 cfg,
                 js_worker_containment_status,
-                workspace,
+                workspace.clone(),
                 #[cfg(feature = "skills")]
                 skill_turn_context,
             );
@@ -613,7 +686,34 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         #[cfg(feature = "hooks")]
         let all_tools = crate::extras::hooks::wrap_from_global(all_tools, permission.clone());
 
-        builder.tools(all_tools).build()
+        Some(all_tools)
+    };
+
+    let registered_tool_names: Vec<String> = all_tools
+        .as_ref()
+        .map(|tools| tools.iter().map(|tool| tool.name()).collect())
+        .unwrap_or_default();
+    let registered_tools: Vec<&str> = registered_tool_names.iter().map(String::as_str).collect();
+    let preamble = build_registered_preamble(
+        context,
+        reasoning_enabled,
+        workspace_root,
+        &sandbox,
+        &registered_tools,
+    );
+    let mut builder = AgentBuilder::new(model)
+        .preamble(&preamble)
+        .max_tokens(cli.resolve_max_tokens(cfg))
+        .default_max_turns(cli.resolve_max_agent_turns(cfg));
+    if let Some(params) = additional_params {
+        builder = builder.additional_params(params);
+    }
+    if let Some(temp) = temperature {
+        builder = builder.temperature(temp);
+    }
+    match all_tools {
+        Some(tools) => builder.tools(tools).build(),
+        None => builder.build(),
     }
 }
 
@@ -624,7 +724,7 @@ mod js_tests {
 
     use super::{
         build_agent_inner, build_btw_agent_inner, build_registered_preamble,
-        register_js_tool_with_status, registered_shell_capability,
+        is_reserved_builtin_tool_name, register_js_tool_with_status, registered_shell_capability,
     };
     use crate::context::ContextFiles;
     use crate::sandbox::{
@@ -712,10 +812,8 @@ mod js_tests {
             &empty_context(),
             false,
             workspace.root(),
-            &cli,
-            &cfg,
             &sandbox,
-            false,
+            &["bash"],
         );
         assert!(preamble.contains("Run POSIX shell commands"));
         let agent = test_main_agent(&cli, sandbox.clone(), workspace.clone()).await;
@@ -729,10 +827,8 @@ mod js_tests {
             &empty_context(),
             false,
             workspace.root(),
-            &cli,
-            &cfg,
             &missing,
-            false,
+            &["read"],
         );
         assert!(!missing_preamble.contains("shell commands"));
         assert!(!missing_preamble.contains("run commands"));
@@ -752,16 +848,11 @@ mod js_tests {
             ..crate::cli::Cli::default()
         };
         assert!(registered_shell_capability(&no_tools, &cfg, &sandbox).is_none());
-        let no_tools_preamble = build_registered_preamble(
-            &empty_context(),
-            false,
-            workspace.root(),
-            &no_tools,
-            &cfg,
-            &sandbox,
-            false,
-        );
+        let no_tools_preamble =
+            build_registered_preamble(&empty_context(), false, workspace.root(), &sandbox, &[]);
         assert!(!no_tools_preamble.contains("shell commands"));
+        assert!(!no_tools_preamble.contains("**js**"));
+        assert!(!no_tools_preamble.contains("**read**"));
         let agent = test_main_agent(&no_tools, sandbox.clone(), workspace.clone()).await;
         assert!(
             agent
@@ -781,12 +872,13 @@ mod js_tests {
             &empty_context(),
             false,
             workspace.root(),
-            &read_only,
-            &cfg,
             &sandbox,
-            false,
+            &["read"],
         );
         assert!(!read_only_preamble.contains("shell commands"));
+        assert!(read_only_preamble.contains("**read**"));
+        assert!(!read_only_preamble.contains("**js**"));
+        assert!(!read_only_preamble.contains("**write**"));
         let agent = test_main_agent(&read_only, sandbox, workspace).await;
         let definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
         assert_eq!(
@@ -796,6 +888,85 @@ mod js_tests {
                 .collect::<Vec<_>>(),
             vec!["read"]
         );
+    }
+
+    #[test]
+    fn registered_preamble_names_only_registered_execution_tools() {
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let js =
+            build_registered_preamble(&empty_context(), false, workspace.root(), &sandbox, &["js"]);
+        assert!(js.contains("**js**"));
+        assert!(js.contains("Use Python only when the user requests"));
+        assert!(!js.contains("**bash**"));
+        assert!(!js.contains("**read**"));
+
+        let mcp_only = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &sandbox,
+            &["github_search"],
+        );
+        assert!(!mcp_only.contains("**js**"));
+        assert!(!mcp_only.contains("**read**"));
+        assert!(!mcp_only.contains("shell commands"));
+
+        #[cfg(feature = "lsp")]
+        {
+            let without_lsp = build_registered_preamble(
+                &empty_context(),
+                false,
+                workspace.root(),
+                &sandbox,
+                &["read"],
+            );
+            assert!(!without_lsp.contains("lsp_diagnostics"));
+            let with_lsp = build_registered_preamble(
+                &empty_context(),
+                false,
+                workspace.root(),
+                &sandbox,
+                &["lsp_diagnostics"],
+            );
+            assert!(with_lsp.contains("lsp_diagnostics"));
+            assert!(!with_lsp.contains("after supported file changes"));
+            assert!(!with_lsp.contains("**edit**"));
+            assert!(!with_lsp.contains("**write**"));
+            let with_lsp_and_edit = build_registered_preamble(
+                &empty_context(),
+                false,
+                workspace.root(),
+                &sandbox,
+                &["lsp_diagnostics", "edit"],
+            );
+            assert!(with_lsp_and_edit.contains("after supported file changes"));
+        }
+    }
+
+    #[test]
+    fn external_tools_cannot_claim_builtin_prompt_semantics() {
+        for name in [
+            "read",
+            "write",
+            "edit",
+            "grep",
+            "find_files",
+            "list_dir",
+            "todo_write",
+            "bash",
+            "js",
+            "task",
+            "memory_write",
+            "memory_edit",
+            "memory_read",
+            "memory_search",
+            "advisor",
+            "lsp_diagnostics",
+        ] {
+            assert!(is_reserved_builtin_tool_name(name), "{name}");
+        }
+        assert!(!is_reserved_builtin_tool_name("github_search"));
     }
 
     #[tokio::test]
