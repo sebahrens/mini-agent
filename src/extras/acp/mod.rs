@@ -842,6 +842,7 @@ fn respond_terminal(
     responder.respond(PromptResponse::new(reason))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     state: &AcpState,
     prompt_text: &str,
@@ -1065,6 +1066,7 @@ async fn run_owned_pre_run<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_paused_runner(
     prompt_text: &str,
     session_id: SessionId,
@@ -1117,6 +1119,7 @@ fn respond_prompt_failure(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_prompt_events(
     prompt_text: &str,
     session_id: SessionId,
