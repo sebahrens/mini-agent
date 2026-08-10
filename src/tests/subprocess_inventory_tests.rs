@@ -620,7 +620,7 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
             hasher.update(b"mini-agent:macro-token-tree:v1");
         }
         hash_frame(&mut hasher, &invocation);
-        format!("{:x}", hasher.finalize())
+        crate::hex::encode_lower(hasher.finalize())
     }
 
     fn is_method_or_ufcs(tokens: &[TokenTree], index: usize) -> bool {
@@ -1618,12 +1618,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/js/audit.rs",
-        "let _ = write!(output, \"{byte:02x}\");",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/sandbox/windows.rs",
         "String::from_utf8_lossy(&output.stderr)",
         1,
@@ -2373,6 +2367,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/sandbox.rs",
         &[
+            (
+                "1be8b9a093e8b907b6122b21db33a9b30571b75c96e87c7908f804bea7d99d06",
+                1,
+            ),
+            (
+                "c2f73c6bf16b04844a46c0a7239dbf486bedb5b09f3b287f895e6d033d7ce652",
+                1,
+            ),
             (
                 "b9ba7b946e716954ba269b40394f014187892aff4dbe028a7cffda9ae5c63bea",
                 1,

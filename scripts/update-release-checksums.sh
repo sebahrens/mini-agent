@@ -89,7 +89,7 @@ if [[ "$need_license" == true ]]; then
     SHA_LICENSE="$(sha256_file "${DOWNLOAD_DIR}/LICENSE")"
 fi
 if [[ "$need_source" == true ]]; then
-    download source.tar.gz "https://github.com/sebahrens/mini-agent/archive/refs/tags/v${VERSION}.tar.gz"
+    download source.tar.gz "${RELEASE_BASE}/mini-agent-v${VERSION}-source.tar.gz"
     SHA_SOURCE="$(sha256_file "${DOWNLOAD_DIR}/source.tar.gz")"
 fi
 
@@ -99,7 +99,7 @@ if [[ "$TARGET" == all || "$TARGET" == aur ]]; then
     portable_sed "s/sha256sums_aarch64=('.*' '.*')/sha256sums_aarch64=('${SHA_LINUX_ARM}' '${SHA_LICENSE}')/" "${ROOT_DIR}/packaging/aur/PKGBUILD"
 fi
 if [[ "$TARGET" == all || "$TARGET" == conda-source ]]; then
-    portable_sed "/^  url:.*archive\/refs\/tags/{n;s/sha256: .*/sha256: ${SHA_SOURCE}/;}" "${ROOT_DIR}/packaging/conda/zerostack/meta.yaml"
+    portable_sed "/^  url:.*mini-agent-v.*-source.tar.gz/{n;s/sha256: .*/sha256: ${SHA_SOURCE}/;}" "${ROOT_DIR}/packaging/conda/zerostack/meta.yaml"
 fi
 if [[ "$TARGET" == all || "$TARGET" == conda-bin ]]; then
     portable_sed "/mini-agent-x86_64-unknown-linux-musl.tar.gz/{n;s/sha256: .*/sha256: ${SHA_LINUX_X86}/;}" "${ROOT_DIR}/packaging/conda/zerostack-bin/meta.yaml"

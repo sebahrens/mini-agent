@@ -7,22 +7,26 @@ description: "Get started with mini-agent: install the minimal Rust coding agent
 Thanks for picking up mini-agent. This guide covers installation, model setup, and the basic commands.
 
 This tutorial applies to Linux, macOS, and Windows. The checksum-verified shell installer below
-targets Linux and macOS; on Windows, install with Cargo. JavaScript actions expose the same brokered
+targets Linux and macOS; on Windows, build from the checked-out source. JavaScript actions expose the same brokered
 feature contract on all three systems, while each platform uses and reports its own containment
 assurance; see the repository README and architecture overview for those guarantees.
 
 ## 1. Installation
 
-You can install via Cargo or the checksum-verified shell installer. The shell installer requires a
+You can build from source or use the checksum-verified shell installer. The shell installer requires a
 complete release in the canonical repository:
 ```
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 ```
 
-For Cargo, use:
+For a source checkout, use:
 ```
-cargo install mini-agent
+git clone https://github.com/sebahrens/mini-agent.git
+cd mini-agent
+cargo install --path . --debug
 ```
+
+Do not run `cargo install mini-agent`: the crates.io package with that name is an unrelated project.
 
 The repository retains a Homebrew formula for package-channel compatibility, but no canonical
 `sebahrens` tap is published yet, so this guide does not advertise a tap command that cannot work.

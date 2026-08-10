@@ -7,7 +7,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(unix)]
 use crate::fs::atomic_write_within_sync;
 use crate::fs::{
     AtomicWriteCancellation, atomic_create_resolved_checked_cancellable, atomic_create_sync,
@@ -355,10 +354,25 @@ fn windows_atomic_temp_creation_is_relative_to_verified_directory_handle() {
     assert!(source.contains("RootDirectory = directory.as_raw_handle().cast()"));
     assert!(source.contains("ReplaceIfExists = replace"));
     assert!(source.contains("FILE_TRAVERSE | FILE_READ_ATTRIBUTES"));
+    assert!(source.contains(".share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)"));
     assert!(source.contains("ensure_same_file(path, expected, &opened)"));
     assert!(source.contains("FILE_CREATE"));
     assert!(!source.contains("let staging_path = parent.join"));
     assert!(!source.contains(".zswrite.{}.stage"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_checked_metadata_handle_allows_atomic_target_replacement() {
+    let directory = TempDir::new("windows_checked_metadata_replace");
+    let target = directory.join("config.toml");
+    std::fs::write(&target, b"before").unwrap();
+    let checked = crate::fs::checked_path_metadata(&target).unwrap();
+
+    atomic_write_within_sync(directory.path(), &target, b"after").unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"after");
+    assert!(checked.is_file());
 }
 
 #[cfg(windows)]

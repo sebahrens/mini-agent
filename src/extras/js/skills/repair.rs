@@ -97,7 +97,7 @@ pub fn persist_record(
     }
     let identity = repair_identity_bytes(record)?;
     if identity.len() > MAX_REPAIR_PAYLOAD_BYTES
-        || format!("{:x}", Sha256::digest(&identity)) != record.repair_id
+        || crate::hex::encode_lower(Sha256::digest(&identity)) != record.repair_id
     {
         return Err(RepairError::InvalidInput);
     }
@@ -296,7 +296,7 @@ pub fn create_record(input: RepairInput, redactor: &Redactor) -> Result<RepairRe
             RepairError::SecretRemaining
         });
     }
-    let repair_id = format!("{:x}", Sha256::digest(&bytes));
+    let repair_id = crate::hex::encode_lower(Sha256::digest(&bytes));
     Ok(RepairRecord { repair_id, ..draft })
 }
 

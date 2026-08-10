@@ -3,11 +3,11 @@ package:
   version: 1.7.2
 
 source:
-  url: https://github.com/sebahrens/mini-agent/archive/refs/tags/v1.7.2.tar.gz
-  sha256: ec28bc735b683b0c556388c898cc528affd5109ffccc026f36d64702e63561ee
+  url: https://github.com/sebahrens/mini-agent/releases/download/v1.7.2/mini-agent-v1.7.2-source.tar.gz
+  sha256: 340bcf05c0a3f2b47b5f6a5b68eff89ff3400e4192e4a2371e9301f9558f0011
 
 build:
-  number: 0
+  number: 1
   script_env:
     - CARGO_PROFILE_RELEASE_STRIP=symbols
     - CARGO_PROFILE_RELEASE_LTO=fat

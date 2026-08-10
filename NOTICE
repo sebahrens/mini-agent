@@ -1,0 +1,17 @@
+mini-agent — upstream provenance and modification notice
+
+mini-agent is a modified version of ZeroStack:
+
+  Upstream project: https://github.com/gi-dellav/zerostack
+  Upstream author: Giuseppe Della Vedova and ZeroStack contributors
+  Imported commit: 997b825a69d67022b169f36825632bdbcee296a0
+  Import date: 2026-07-27
+
+mini-agent contributors have modified the program beginning on 2026-07-27.
+Those modifications include the mini-agent product identity, dependency and
+release maintenance, and a brokered QuickJS tool runtime with cross-platform
+containment and a verified JavaScript skill library.
+
+ZeroStack and mini-agent are distributed under the GNU General Public License,
+version 3 only (GPL-3.0-only). See LICENSE for the complete license terms and
+SOURCE.md for access to the exact Corresponding Source of release binaries.

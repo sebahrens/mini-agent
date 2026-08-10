@@ -461,7 +461,7 @@ fn copy_and_hash_executable_inner(
         digest.update(&buffer[..read]);
     }
     Ok(ExecutableContent {
-        sha256: format!("{:x}", digest.finalize()),
+        sha256: crate::hex::encode_lower(digest.finalize()),
         bytes: total,
     })
 }
@@ -1733,7 +1733,7 @@ fn effect_id(invocation_id: &InvocationId, ordinal: u32) -> String {
     digest.update((bytes.len() as u64).to_be_bytes());
     digest.update(bytes);
     digest.update(ordinal.to_be_bytes());
-    format!("effect-{:x}", digest.finalize())
+    format!("effect-{}", crate::hex::encode_lower(digest.finalize()))
 }
 
 fn timestamp_ms() -> Result<i64, HostEffectError> {

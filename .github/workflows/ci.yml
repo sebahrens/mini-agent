@@ -59,16 +59,49 @@ jobs:
       - name: Test release workflow policy
         run: python3 -m unittest scripts.tests.test_check_package_metadata
 
+      - name: Test package version synchronization
+        run: python3 -m unittest scripts.tests.test_sync_version
+
+      - name: Test GPL release packaging
+        run: |
+          python3 -m unittest \
+            scripts.tests.test_package_release_binary \
+            scripts.tests.test_package_corresponding_source \
+            scripts.tests.test_install_script
+
       - name: Verify release workflow policy
         run: python3 scripts/check-package-metadata.py
 
       - name: Verify Cargo feature graph
         run: python3 scripts/check_feature_graph.py
 
+      - name: Assemble GPL Corresponding Source offline
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          bash scripts/package-corresponding-source.sh \
+            "v${version}-ci" "$RUNNER_TEMP" HEAD --allow-untagged-label
+
       - name: Verify production and research workspace boundaries
         run: |
           python3 -m unittest scripts.tests.test_check_workspace_boundaries
           python3 scripts/check_workspace_boundaries.py
+
+  package-compliance-smoke:
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            channels: --channel aur --channel conda-bin --channel conda-source
+          - os: macos-latest
+            channels: --channel homebrew
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stage package recipes and verify GPL payloads
+        run: python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}
 
   clippy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
@@ -86,6 +119,7 @@ jobs:
           - "--no-default-features"
           - "--no-default-features --features memory"
           - "--no-default-features --features sandbox"
+          - "--no-default-features --features acp"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ubuntu-latest
@@ -121,8 +155,14 @@ jobs:
           - "--no-default-features --features skills"
           - "--no-default-features --features js,sandbox"
           - "--no-default-features --features mcp"
+          - "--no-default-features --features acp"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
+        exclude:
+          # ACP's TCP authentication tests are covered on Linux. The macOS
+          # hosted runner has a known socket scheduling hang in this suite.
+          - os: macos-latest
+            features: "--no-default-features --features acp"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -270,7 +310,7 @@ jobs:
 
       - name: Archive Linux JS worker resource measurements
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-worker-resource-${{ runner.os }}
           path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
@@ -351,7 +391,7 @@ jobs:
 
       - name: Archive source-free Phase 6 gate evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: phase6-worker-gate-linux
           path: |
@@ -443,7 +483,7 @@ jobs:
 
       - name: Archive macOS JS worker resource measurements
         if: always() && matrix.os == 'macos-26'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-worker-resource-${{ runner.os }}
           path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
@@ -513,7 +553,7 @@ jobs:
 
       - name: Archive source-free Phase 6 gate evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: phase6-worker-gate-${{ matrix.os }}
           path: |
@@ -570,6 +610,12 @@ jobs:
         run: >-
           cargo test --locked --no-default-features --features js
           windows_production_ -- --nocapture --test-threads=1
+
+      - name: Test process-creation lock panic recovery under contention
+        run: >-
+          cargo test --locked --no-default-features --features js
+          process_creation::tests::poisoned_creation_lock_recovers_without_losing_serialization
+          -- --exact --nocapture
 
   windows-general-sandbox-policy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')
@@ -1131,7 +1177,7 @@ jobs:
 
       - name: Archive Windows JS worker resource measurements
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-worker-resource-${{ runner.os }}
           path: ${{ runner.temp }}/js-worker-${{ runner.os }}.json
@@ -1203,7 +1249,7 @@ jobs:
 
       - name: Archive Windows containment evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-worker-containment
           path: |
@@ -1244,7 +1290,7 @@ jobs:
 
       - name: Archive source-free Phase 6 gate evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: phase6-worker-gate-windows
           path: |
@@ -1318,7 +1364,7 @@ jobs:
 
       - name: Archive the validated cross-platform worker resource baseline
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: js-worker-resource-baseline
           path: ${{ runner.temp }}/js-worker-baseline.json
@@ -1408,7 +1454,7 @@ jobs:
 
       - name: Archive platform result
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: platform-paths-${{ matrix.os }}-${{ matrix.feature.name }}
           path: platform-path-result.json
@@ -1460,7 +1506,7 @@ jobs:
 
       - name: Archive negative-control result
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: platform-path-negative-controls
           path: platform-path-negative-controls.json
@@ -1568,7 +1614,7 @@ jobs:
 
       - name: Archive install-smoke result
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: platform-path-install-smoke-${{ matrix.os }}
           path: platform-path-install-smoke.json

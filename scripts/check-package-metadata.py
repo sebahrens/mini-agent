@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -25,6 +26,9 @@ FULL_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 VERSION_COMMENT = re.compile(r"^v\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?$")
 # Remote actions may only bypass immutable pins after an explicit, reviewed entry here.
 RELEASE_ACTION_PIN_ALLOWLIST: frozenset[str] = frozenset()
+CANONICAL_GPL3_LICENSE_SHA256 = (
+    "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+)
 APPROVED_RELEASE_ACTIONS = {
     ("actions/checkout", "v7.0.1"): "3d3c42e5aac5ba805825da76410c181273ba90b1",
     (
@@ -33,16 +37,33 @@ APPROVED_RELEASE_ACTIONS = {
     ): "166cdcfd11aee3cb47222f9ddb555ce30ddb9659",
     (
         "taiki-e/install-action",
-        "v2.84.1",
-    ): "c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd",
+        "v2.85.9",
+    ): "91ddec75689c4c78665b598d188dc821c5a43e5c",
     (
         "actions/upload-artifact",
-        "v4.6.2",
-    ): "ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "v7.0.1",
+    ): "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     (
         "actions/download-artifact",
         "v4.3.0",
     ): "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+}
+DISTRIBUTION_NOTICE_FRAGMENTS: dict[str, tuple[str, ...]] = {
+    "packaging/homebrew/zerostack.rb": (
+        'pkgshare.install "LICENSE", "NOTICE", "SOURCE.md"',
+    ),
+    "packaging/aur/PKGBUILD": (
+        'install -Dm644 NOTICE "${pkgdir}/usr/share/doc/${pkgname}/NOTICE"',
+        'install -Dm644 SOURCE.md "${pkgdir}/usr/share/doc/${pkgname}/SOURCE.md"',
+    ),
+    "packaging/conda/zerostack-bin/build.sh": (
+        'install -Dm644 "${SRC_DIR}/NOTICE" "${PREFIX}/share/doc/${PKG_NAME}/NOTICE"',
+        'install -Dm644 "${SRC_DIR}/SOURCE.md" "${PREFIX}/share/doc/${PKG_NAME}/SOURCE.md"',
+    ),
+    "packaging/conda/zerostack/build.sh": (
+        'install -Dm644 NOTICE "${PREFIX}/share/doc/${PKG_NAME}/NOTICE"',
+        'install -Dm644 SOURCE.md "${PREFIX}/share/doc/${PKG_NAME}/SOURCE.md"',
+    ),
 }
 USES_ENTRY = re.compile(
     r"(?P<quote>['\"]?)(?P<reference>[^\s#'\"]+)(?P=quote)"
@@ -131,6 +152,7 @@ LEGACY_COORDINATES = (
 HISTORICAL_COORDINATE_ALLOWLIST = (
     "docs/specs/superseded/",
 )
+UPSTREAM_PROVENANCE_FILES = frozenset({"README.md", "NOTICE"})
 SUPPORTED_PACKAGE_CHANNELS = ("cargo", "aur", "conda", "homebrew")
 REMOVED_NIX_ENTRYPOINTS = (
     "default.nix",
@@ -156,6 +178,7 @@ EXPECTED_RELEASE_ARCHIVES = (
     "mini-agent-lite-x86_64-unknown-linux-musl.tar.gz",
     "mini-agent-lite-aarch64-unknown-linux-musl.tar.gz",
     "mini-agent-lite-x86_64-pc-windows-msvc.tar.gz",
+    "mini-agent-${GITHUB_REF_NAME}-source.tar.gz",
 )
 EXPECTED_CROSS_IMAGES = {
     "aarch64-unknown-linux-musl": (
@@ -213,6 +236,15 @@ def validate_clean_tracked_worktree(root: Path) -> list[str]:
                 f"with status {result.returncode}"
             )
     return errors
+
+
+def validate_license_identity(root: Path) -> list[str]:
+    license_path = root / "LICENSE"
+    if not license_path.is_file():
+        return ["LICENSE is missing"]
+    if hashlib.sha256(license_path.read_bytes()).hexdigest() != CANONICAL_GPL3_LICENSE_SHA256:
+        return ["LICENSE is not the canonical GPL-3.0-only text"]
+    return []
 
 
 def canonical_binary(metadata: dict[str, Any], root: Path) -> tuple[str | None, list[str]]:
@@ -296,10 +328,10 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         # 3 jobs produce archives: build (Linux/macOS), build-static (musl), build-windows
         'archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"': 3,
         'archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"': 3,
-        # Unix jobs: 4 smoke invocations (2 jobs × 2 archives each)
-        'tar czf "$archive" -C "target/${{ matrix.target }}/release" '
-        '"$CANONICAL_BINARY"': 4,
-        'test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"': 4,
+        # All binary archives use the fail-closed GPL payload packager.
+        "python3 scripts/package-release-binary.py \\": 6,
+        '--executable-name "$CANONICAL_BINARY"': 4,
+        '--executable-name "${CANONICAL_BINARY}.exe"': 2,
         '"$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- '
         '"$CANONICAL_BINARY "': 4,
         'file "$smoke_dir/$CANONICAL_BINARY" | grep -Fq -- "ARM aarch64"': 2,
@@ -315,6 +347,20 @@ def validate_workflow(text: str, binary: str) -> list[str]:
                 f"{fragment!r} exactly {expected_count} time(s), found "
                 f"{observed_count}"
             )
+
+    corresponding_source_fragments = (
+        "corresponding-source:",
+        'bash scripts/package-corresponding-source.sh "$GITHUB_REF_NAME" . HEAD',
+        "name: corresponding-source",
+    )
+    missing_source_fragments = [
+        fragment for fragment in corresponding_source_fragments if fragment not in text
+    ]
+    if missing_source_fragments:
+        errors.append(
+            ".github/workflows/release.yml must build and validate vendored "
+            f"Corresponding Source; missing={missing_source_fragments}"
+        )
 
     static_start = text.find("\n  build-static:")
     static_end = text.find("\n  build-windows:", static_start + 1)
@@ -584,6 +630,47 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f'REPO="{CANONICAL_REPOSITORY}"',
             'if [[ ! -f "${TMPDIR}/${BINARY_NAME}" ]]',
             'cp "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"',
+            'REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md")',
+            'cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"',
+        ),
+        "NOTICE": (
+            "997b825a69d67022b169f36825632bdbcee296a0",
+            "2026-07-27",
+            "modified version of ZeroStack",
+        ),
+        "SOURCE.md": (
+            "mini-agent-v<VERSION>-source.tar.gz",
+            "vendored",
+            "for as long as it distributes",
+        ),
+        "scripts/package-release-binary.py": (
+            'REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md")',
+            "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+            "LICENSE is not the canonical GPL-3.0-only text",
+            "release archive payload mismatch",
+        ),
+        "scripts/package-corresponding-source.sh": (
+            'SOURCE_ROOT="${BINARY_NAME}-${RELEASE_TAG}-source"',
+            'TAG_COMMIT=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}"',
+            'if [[ "$SOURCE_COMMIT" != "$TAG_COMMIT" ]]; then',
+            'elif [[ "$ALLOW_UNTAGGED_LABEL" != true ]]; then',
+            '--allow-untagged-label is restricted to labels ending in -ci',
+            '--compliance-docs requires a directory',
+            'CANONICAL_GPL3_LICENSE_SHA256="3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"',
+            "LICENSE is not the canonical GPL-3.0-only text",
+            "cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml",
+            "cargo metadata --locked --offline --format-version 1 > /dev/null",
+            'for required in LICENSE NOTICE SOURCE.md Cargo.toml Cargo.lock rust-toolchain.toml Cross.toml .cargo/config.toml; do',
+            'tar tzf "$STAGING_DIR/$ARCHIVE_NAME" > "$ARCHIVE_LISTING"',
+            'grep -Eq -- "^$ESCAPED_SOURCE_ROOT/vendor/',
+        ),
+        "scripts/smoke-package-compliance.py": (
+            'CHANNELS = ("aur", "conda-bin", "conda-source", "homebrew")',
+            "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+            "LICENSE is not the canonical GPL-3.0-only text",
+            'run(["ruby", "--disable-gems", "-e", HOMEBREW_HARNESS]',
+            'source "$RECIPE"; package',
+            '"info/licenses/LICENSE": payload / "LICENSE"',
         ),
         "packaging/homebrew/zerostack.rb": (
             f'homepage "{CANONICAL_REPOSITORY_URL}"',
@@ -622,6 +709,10 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"repository: {CANONICAL_REPOSITORY_URL}",
             f"- {binary} --help",
             f"- {binary} --version",
+            "- test -f ${PREFIX}/THIRDPARTY.yml",
+        ),
+        "packaging/conda/zerostack/build.sh": (
+            'install -Dm644 THIRDPARTY.yml "${PREFIX}/THIRDPARTY.yml"',
         ),
         "justfile": (
             "bash scripts/update-release-checksums.sh all",
@@ -640,7 +731,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
         ),
         "README.md": (
-            f"The Cargo package, installed CLI, and every release archive use the executable name\n`{binary}`.",
+            f"The Cargo package, installed CLI, and every binary release archive use the executable name\n`{binary}`.",
         ),
         "docs/agent/PUBLISHING_RELEASES.md": (
             f"Cargo and every package channel install the public executable as `{binary}`.",
@@ -648,7 +739,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"`{CANONICAL_REPOSITORY}`",
             "`.zerostack`",
             "`ZEROSTACK_*`",
-            "Supported package channels are Cargo/crates.io, AUR, Conda, and Homebrew",
+            "Supported package channels are source/Cargo, AUR, Conda, and Homebrew",
             "Nix packaging is intentionally unsupported",
             "pinned inputs, Linux and macOS CI",
             "default-feature parity",
@@ -662,8 +753,16 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'bash "${ROOT_DIR}/install.sh" --release "$VERSION" --dir "${INSTALL_ROOT}/bin"',
             '"${INSTALL_ROOT}/bin/mini-agent" --version',
             'EXPECTED_OUTPUT="mini-agent ${VERSION}"',
+            'for document in LICENSE NOTICE SOURCE.md; do',
+            '"${INSTALL_ROOT}/share/doc/mini-agent/${document}"',
         ),
         ".github/workflows/pages.yml": ("https://sebahrens.github.io/mini-agent",),
+        ".github/workflows/ci.yml": (
+            "package-compliance-smoke:",
+            "python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}",
+            "--channel aur --channel conda-bin --channel conda-source",
+            "--channel homebrew",
+        ),
         "src/product.rs": (
             f'pub const PUBLIC_NAME: &str = "{binary}";',
             f'pub const REPOSITORY_SLUG: &str = "{CANONICAL_REPOSITORY}";',
@@ -722,6 +821,58 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
     return errors
 
 
+def validate_distribution_notice_installs(root: Path) -> list[str]:
+    """Require every maintained package recipe to install compliance documents."""
+
+    errors: list[str] = []
+    for relative, fragments in DISTRIBUTION_NOTICE_FRAGMENTS.items():
+        path = root / relative
+        if not path.is_file():
+            errors.append(f"{relative} is missing")
+            continue
+        text = path.read_text(encoding="utf-8")
+        for fragment in fragments:
+            if fragment not in text:
+                errors.append(
+                    f"{relative} must install the release compliance payload; "
+                    f"missing {fragment!r}"
+                )
+    return errors
+
+
+def validate_aur_srcinfo_checksums(root: Path) -> list[str]:
+    """Keep generated AUR metadata aligned with the checked-in PKGBUILD."""
+
+    pkgbuild_path = root / "packaging/aur/PKGBUILD"
+    srcinfo_path = root / "packaging/aur/.SRCINFO"
+    if not pkgbuild_path.is_file() or not srcinfo_path.is_file():
+        return ["AUR PKGBUILD and .SRCINFO are both required"]
+
+    pkgbuild = pkgbuild_path.read_text(encoding="utf-8")
+    srcinfo = srcinfo_path.read_text(encoding="utf-8")
+    errors: list[str] = []
+    for architecture in ("x86_64", "aarch64"):
+        array = re.search(
+            rf"^sha256sums_{architecture}=\(([^)]*)\)$", pkgbuild, re.MULTILINE
+        )
+        pkgbuild_hashes = re.findall(r"'([0-9a-f]{64})'", array.group(1)) if array else []
+        srcinfo_hashes = re.findall(
+            rf"^\s*sha256sums_{architecture} = ([0-9a-f]{{64}})$",
+            srcinfo,
+            re.MULTILINE,
+        )
+        if pkgbuild_hashes != srcinfo_hashes:
+            errors.append(
+                f"packaging/aur/.SRCINFO {architecture} checksums must match PKGBUILD"
+            )
+
+    pkgrel = re.search(r"^pkgrel=([0-9]+)$", pkgbuild, re.MULTILINE)
+    srcinfo_pkgrel = re.search(r"^\s*pkgrel = ([0-9]+)$", srcinfo, re.MULTILINE)
+    if not pkgrel or not srcinfo_pkgrel or pkgrel.group(1) != srcinfo_pkgrel.group(1):
+        errors.append("packaging/aur/.SRCINFO pkgrel must match PKGBUILD")
+    return errors
+
+
 def indexed_files(root: Path) -> list[str]:
     """Return only files in Git's release index, excluding developer-local files."""
     result = subprocess.run(
@@ -741,6 +892,8 @@ def validate_stale_coordinates(
     errors: list[str] = []
     for relative_path in paths:
         if relative_path.startswith(HISTORICAL_COORDINATE_ALLOWLIST):
+            continue
+        if relative_path in UPSTREAM_PROVENANCE_FILES:
             continue
         path = root / relative_path
         if not path.is_file():
@@ -853,6 +1006,9 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
             )
         )
     errors.extend(validate_file_fragments(root, binary))
+    errors.extend(validate_license_identity(root))
+    errors.extend(validate_distribution_notice_installs(root))
+    errors.extend(validate_aur_srcinfo_checksums(root))
     errors.extend(validate_stale_coordinates(root))
     errors.extend(validate_removed_nix_surface(root))
 

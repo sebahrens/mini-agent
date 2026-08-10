@@ -13,6 +13,7 @@ set -euo pipefail
 REPO="sebahrens/mini-agent"
 BINARY_NAME="mini-agent"
 DEFAULT_DIR="${HOME}/.local/bin"
+REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md")
 
 usage() {
     cat <<EOF
@@ -170,11 +171,27 @@ if [[ ! -f "${TMPDIR}/${BINARY_NAME}" ]]; then
     echo "Error: archive does not contain the canonical ${BINARY_NAME} executable." >&2
     exit 1
 fi
-cp "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+for document in "${REQUIRED_DOCUMENTS[@]}"; do
+    if [[ ! -f "${TMPDIR}/${document}" ]]; then
+        echo "Error: archive does not contain required GPL document ${document}." >&2
+        exit 1
+    fi
+done
 
+if [[ "$(basename "$INSTALL_DIR")" == "bin" ]]; then
+    DOC_DIR="$(dirname "$INSTALL_DIR")/share/doc/${BINARY_NAME}"
+else
+    DOC_DIR="${INSTALL_DIR}/share/doc/${BINARY_NAME}"
+fi
+mkdir -p "$DOC_DIR"
+for document in "${REQUIRED_DOCUMENTS[@]}"; do
+    cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"
+done
+cp "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 
 echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
+echo "Installed license and source notices to ${DOC_DIR}"
 
 # ---- path hint ----
 if ! echo "$PATH" | grep -qF "$INSTALL_DIR"; then

@@ -1,5 +1,65 @@
 #![allow(unsafe_code)]
 
+use std::ffi::OsString;
+use std::sync::{Mutex, MutexGuard};
+
+static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) struct ScopedProcessEnv {
+    previous: Vec<(OsString, Option<OsString>)>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl ScopedProcessEnv {
+    pub(crate) fn set(values: &[(&str, Option<OsString>)]) -> Self {
+        let lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = values
+            .iter()
+            .map(|(name, _)| (OsString::from(name), std::env::var_os(name)))
+            .collect();
+        for (name, value) in values {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for ScopedProcessEnv {
+    fn drop(&mut self) {
+        for (name, value) in &self.previous {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scoped_process_environment_restores_after_panic() {
+    const NAME: &str = "ZS_SCOPED_ENV_UNWIND_TEST";
+    let before = std::env::var_os(NAME);
+    let result = std::panic::catch_unwind(|| {
+        let _environment = ScopedProcessEnv::set(&[(NAME, Some(OsString::from("temporary")))]);
+        assert_eq!(std::env::var_os(NAME), Some(OsString::from("temporary")));
+        panic!("exercise unwind restoration");
+    });
+    assert!(result.is_err());
+    assert_eq!(std::env::var_os(NAME), before);
+}
+
 #[cfg(all(test, feature = "acp"))]
 mod acp_tests;
 #[cfg(all(test, feature = "advisor"))]

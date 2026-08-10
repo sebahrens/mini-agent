@@ -64,6 +64,11 @@ updates may be grouped; major updates remain separate pull requests so their
 security and compatibility impact is reviewed independently. No dependency
 updates are auto-merged.
 
+Cryptographic digest consumers use the shared `src/hex.rs` encoder instead of
+crate-specific formatting traits. This keeps stored IDs, trust records, and
+wire-visible hashes as stable lowercase hexadecimal when digest crates change
+their output types.
+
 Tool versions are pinned under `[workspace.metadata.dependency-policy]` in
 `Cargo.toml`. Update the pin and CI install command together, review the
 tooling changelog, then run:

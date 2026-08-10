@@ -1568,7 +1568,7 @@ fn try_lock_exclusive(_file: &File) -> Result<(), AuditError> {
 fn unlock(_file: &File) {}
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    hex_digest(Sha256::digest(bytes))
+    crate::hex::encode_lower(Sha256::digest(bytes))
 }
 
 fn split_host_port(authority: &str) -> Result<(String, Option<u16>), AuditError> {
@@ -1626,7 +1626,7 @@ fn target_tag(
         message.extend_from_slice(&(value.len() as u64).to_be_bytes());
         message.extend_from_slice(value);
     }
-    hex_digest(hmac_sha256(key, &message))
+    crate::hex::encode_lower(hmac_sha256(key, &message))
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
@@ -1653,16 +1653,6 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-fn hex_digest(digest: impl AsRef<[u8]>) -> String {
-    use std::fmt::Write as _;
-    let bytes = digest.as_ref();
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
-
 fn valid_hash(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1672,13 +1662,14 @@ fn valid_hash(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex_digest, hmac_sha256};
+    use super::hmac_sha256;
+    use crate::hex::encode_lower;
 
     #[test]
     fn js_effect_audit_storage_hmac_sha256_matches_rfc_4231() {
         let key = [0x0b_u8; 20];
         assert_eq!(
-            hex_digest(hmac_sha256(&key, b"Hi There")),
+            encode_lower(hmac_sha256(&key, b"Hi There")),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
     }

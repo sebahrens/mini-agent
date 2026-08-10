@@ -10,6 +10,7 @@ mod docs;
 mod event;
 mod extras;
 mod fs;
+mod hex;
 mod logging;
 mod models_catalog;
 mod paths;

@@ -64,9 +64,11 @@ fn expand_env_passthrough() {
 
 #[test]
 fn expand_env_reads_var() {
-    unsafe { std::env::set_var("ZS_TEST_HDR", "secret-value") };
+    let _environment = crate::tests::ScopedProcessEnv::set(&[(
+        "ZS_TEST_HDR",
+        Some(std::ffi::OsString::from("secret-value")),
+    )]);
     assert_eq!(expand_env("${ZS_TEST_HDR}").unwrap(), "secret-value");
-    unsafe { std::env::remove_var("ZS_TEST_HDR") };
 }
 
 #[test]

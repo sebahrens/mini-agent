@@ -172,7 +172,7 @@ impl EvaluationReportRecord {
             "summary": summary,
             "created_at": self.created_at
         }))?;
-        Ok(format!("{:x}", Sha256::digest(identity)))
+        Ok(crate::hex::encode_lower(Sha256::digest(identity)))
     }
 }
 
@@ -1318,7 +1318,8 @@ impl SkillStore {
         now: i64,
     ) -> Result<(), StoreError> {
         let admin = admin.ok_or(StoreError::Unauthorized)?;
-        let content_hash = format!("{:x}", Sha256::digest(suite.canonical_payload.as_bytes()));
+        let content_hash =
+            crate::hex::encode_lower(Sha256::digest(suite.canonical_payload.as_bytes()));
         if suite.suite_id != content_hash || suite.content_hash != content_hash {
             return Err(StoreError::InvalidSuite(
                 "suite ID and content hash must match canonical payload".to_string(),
@@ -2013,7 +2014,7 @@ pub(super) fn approval_manifest_digest(artifact: &SkillArtifact) -> Result<Strin
         "exports": artifact.exports,
         "capability": artifact.capability,
     }))?;
-    Ok(format!("{:x}", Sha256::digest(manifest)))
+    Ok(crate::hex::encode_lower(Sha256::digest(manifest)))
 }
 
 pub(super) fn consume_approval_authorization(

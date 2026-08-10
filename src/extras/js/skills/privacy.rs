@@ -58,7 +58,10 @@ pub fn keyed_fingerprint(key: &[u8], version: &str, value: &str) -> Option<Strin
         digest.update((part.len() as u64).to_be_bytes());
         digest.update(part);
     }
-    Some(format!("{version}:{:x}", digest.finalize()))
+    Some(format!(
+        "{version}:{}",
+        crate::hex::encode_lower(digest.finalize())
+    ))
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {

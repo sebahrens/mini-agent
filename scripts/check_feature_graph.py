@@ -103,6 +103,7 @@ TEST_MATRIX_ROWS = (
     "skills",
     "js-sandbox",
     "mcp",
+    "acp",
     "js-skills",
     "full",
 )
@@ -111,6 +112,7 @@ CLIPPY_MATRIX_ROWS = (
     "no-default",
     "memory",
     "sandbox",
+    "acp",
     "js-skills",
     "full",
 )

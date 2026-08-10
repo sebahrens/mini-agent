@@ -4,15 +4,15 @@
 
 # mini-agent
 
-**A small Rust coding agent that can use JavaScript as a safe, portable action language—and learn
-better JavaScript tools for the work it repeatedly encounters.**
+**A small Rust coding agent that uses JavaScript as a safe, portable action language—and, in a
+skills-enabled build, learns better JavaScript tools for work it repeatedly encounters.**
 
 mini-agent starts from [ZeroStack](https://github.com/gi-dellav/zerostack), whose design gets the
 foundation right: a compact native agent, a fast terminal UI, strong permission controls, multiple
 model providers, persistent sessions, MCP, worktrees, subagents, prompts, memory, and automation
 without the runtime footprint of an Electron or Node application. mini-agent keeps that deliberately
-small core and adds a brokered QuickJS engine, native Linux/macOS/Windows containment, and a verified
-library of reusable agent-authored JavaScript skills.
+small core and adds a brokered QuickJS engine, native Linux/macOS/Windows containment, and an
+opt-in, verified library of reusable agent-authored JavaScript skills.
 
 The result is still a practical coding agent, but its action space is no longer limited to a pile of
 one-off shell commands.
@@ -132,6 +132,10 @@ ACLs; learned-skill process spawning remains disabled there until an immutable-e
 exists. If a required backend or live proof fails, that capability—or JavaScript itself—is
 unavailable instead of silently running with more authority.
 
+One deliberate exception remains: checked replacement of an existing workspace file fails closed on
+Windows because NT rename has no destination file-identity compare-and-swap operation. mini-agent
+does not trade away the raced-edit protection used by Linux and macOS merely to claim parity.
+
 See [the architecture overview](ARCHITECTURE.md) and
 [brokered runtime specification](docs/specs/phase-6-brokered-js-runtime.md) for the exact threat
 model.
@@ -191,16 +195,22 @@ record of executable know-how rather than a growing prompt full of prose recipes
 
 ## Quick start
 
+The Cargo package, installed CLI, and every binary release archive use the executable name
+`mini-agent`.
+
 Install the latest checksum-verified release on Linux or macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 ```
 
-Or install with Cargo:
+Or build and install the checked-out source. Do not run `cargo install mini-agent`: crates.io
+currently assigns that name to an unrelated project.
 
 ```bash
-cargo install mini-agent
+git clone https://github.com/sebahrens/mini-agent.git
+cd mini-agent
+cargo install --path . --debug
 ```
 
 Configure a provider interactively, then start a session:
@@ -225,6 +235,13 @@ See [Getting started](docs/agent/GET_STARTED.md),
 
 The default build includes the core ZeroStack experience plus `js`, `sandbox`, and `memory`.
 Learned-skill storage is opt-in because it adds SQLite and retrieval dependencies.
+
+Pre-built release archives include JavaScript execution but not learned-skill storage. To install a
+build that can propose, verify, retrieve, and curate skills, build from source with:
+
+```bash
+cargo install --git https://github.com/sebahrens/mini-agent --features skills
+```
 
 | Feature | Adds |
 |---|---|
@@ -275,6 +292,8 @@ target. Do not use `cargo build`, `cargo check`, or development `--release` buil
 
 ## License and upstream
 
-mini-agent is licensed under [GPL-3.0-only](LICENSE). It is built from the excellent
+mini-agent is licensed under [GPL-3.0-only](LICENSE). Binary releases include the dated
+[upstream and modification notice](NOTICE) plus [exact Corresponding Source directions](SOURCE.md).
+It is built from the excellent
 [ZeroStack](https://github.com/gi-dellav/zerostack) project and preserves its preference for a small,
 fast, understandable native agent.

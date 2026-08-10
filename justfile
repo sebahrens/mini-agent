@@ -118,7 +118,7 @@ aur-regen-srcinfo:
 
 # ---- Packaging: release workflow ----
 
-# Full release: bump version, sync, commit, push, tag, and publish to crates.io
+# Full release: bump version, sync, commit, push, and tag for GitHub release CI
 release BUMP:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -162,7 +162,6 @@ release BUMP:
     git push origin "v${NEW_VERSION}"
     echo "Tag v${NEW_VERSION} pushed — CI release triggered."
 
-    cargo publish
     echo ""
     echo "=== release v${NEW_VERSION} done ==="
     echo "Next: wait for CI, then run: just post-release"

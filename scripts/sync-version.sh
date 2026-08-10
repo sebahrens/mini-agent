@@ -13,6 +13,7 @@ sed_in_place() {
 }
 
 VERSION=$(grep '^version' "${ROOT_DIR}/Cargo.toml" | head -1 | cut -d'"' -f2)
+PACKAGING_VERSION=$(sed -n 's/^pkgver=//p' "${ROOT_DIR}/packaging/aur/PKGBUILD" | head -1)
 
 if [ -z "$VERSION" ]; then
     echo "Error: Could not read version from Cargo.toml" >&2
@@ -20,6 +21,11 @@ if [ -z "$VERSION" ]; then
 fi
 
 echo "Syncing version ${VERSION} across packaging files..."
+
+VERSION_CHANGED=false
+if [[ "$PACKAGING_VERSION" != "$VERSION" ]]; then
+    VERSION_CHANGED=true
+fi
 
 # PKGBUILD
 sed_in_place "s/^pkgver=.*/pkgver=${VERSION}/" "${ROOT_DIR}/packaging/aur/PKGBUILD"
@@ -37,7 +43,7 @@ for meta in "${ROOT_DIR}/packaging/conda/"*/meta.yaml; do
 done
 
 # conda source URLs
-sed_in_place "s|/tags/v[0-9][^/]*/|/tags/v${VERSION}/|" \
+sed_in_place "s|/download/v[^/]*/mini-agent-v[^/]*-source.tar.gz|/download/v${VERSION}/mini-agent-v${VERSION}-source.tar.gz|" \
     "${ROOT_DIR}/packaging/conda/zerostack/meta.yaml"
 sed_in_place "s|/download/v[0-9][^/]*/|/download/v${VERSION}/|g" \
     "${ROOT_DIR}/packaging/conda/zerostack-bin/meta.yaml"
@@ -49,6 +55,15 @@ HB_FORMULA="${ROOT_DIR}/packaging/homebrew/zerostack.rb"
 if [ -f "$HB_FORMULA" ]; then
     sed_in_place "s/^  version \".*\"/  version \"${VERSION}\"/" "$HB_FORMULA"
     sed_in_place "s|/download/v[^/]*/|/download/v${VERSION}/|g" "$HB_FORMULA"
+fi
+
+if [[ "$VERSION_CHANGED" == true ]]; then
+    sed_in_place "s/^pkgrel=.*/pkgrel=1/" "${ROOT_DIR}/packaging/aur/PKGBUILD"
+    sed_in_place "s/^[[:space:]]*pkgrel = .*/\tpkgrel = 1/" "$SRCINFO"
+    for meta in "${ROOT_DIR}/packaging/conda/"*/meta.yaml; do
+        sed_in_place "s/^  number: .*/  number: 0/" "$meta"
+    done
+    sed_in_place "/^  revision [0-9][0-9]*$/d" "$HB_FORMULA"
 fi
 
 echo ""

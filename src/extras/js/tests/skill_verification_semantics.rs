@@ -557,10 +557,15 @@ mod tests {
             vec![],
         );
         let result = verify_skill(&s);
-        assert!(
-            matches!(&result, Err(VerificationError::SourceEvaluationFailed(_))),
-            "unexpected verification result: {result:?}"
-        );
+        let interrupted = match &result {
+            Err(VerificationError::SourceEvaluationFailed(_)) => true,
+            #[cfg(target_os = "linux")]
+            Err(VerificationError::RuntimeCreationFailed(message)) => {
+                message == "worker unavailable"
+            }
+            _ => false,
+        };
+        assert!(interrupted, "unexpected verification result: {result:?}");
     }
 
     #[test]

@@ -752,7 +752,7 @@ fn held_out_suite_schema_requires_authenticated_import_and_hashes_content() {
     let (root, paths) = paths();
     let mut store = SkillStore::open_at(&paths).expect("store");
     let suite_payload = r#"{"version":1,"selector":{"tags":["normalize"]},"cases":[{"expression":"normalize(' y ')", "expected":"y"}]}"#;
-    let expected_hash = format!("{:x}", Sha256::digest(suite_payload.as_bytes()));
+    let expected_hash = crate::hex::encode_lower(Sha256::digest(suite_payload.as_bytes()));
     let suite = HeldOutSuiteRecord {
         suite_id: expected_hash.clone(),
         selector_json: r#"{"tags":["normalize"]}"#.to_string(),
