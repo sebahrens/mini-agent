@@ -191,7 +191,7 @@ record of executable know-how rather than a growing prompt full of prose recipes
 
 ## Quick start
 
-The Cargo package, installed CLI, and every release archive use the executable name
+The Cargo package, installed CLI, and every binary release archive use the executable name
 `mini-agent`.
 
 Install the latest checksum-verified release on Linux or macOS:
@@ -200,10 +200,13 @@ Install the latest checksum-verified release on Linux or macOS:
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 ```
 
-Or install with Cargo:
+Or build and install the checked-out source. Do not run `cargo install mini-agent`: crates.io
+currently assigns that name to an unrelated project.
 
 ```bash
-cargo install mini-agent
+git clone https://github.com/sebahrens/mini-agent.git
+cd mini-agent
+cargo install --path . --debug
 ```
 
 Configure a provider interactively, then start a session:
@@ -278,6 +281,8 @@ target. Do not use `cargo build`, `cargo check`, or development `--release` buil
 
 ## License and upstream
 
-mini-agent is licensed under [GPL-3.0-only](LICENSE). It is built from the excellent
+mini-agent is licensed under [GPL-3.0-only](LICENSE). Binary releases include the dated
+[upstream and modification notice](NOTICE) plus [exact Corresponding Source directions](SOURCE.md).
+It is built from the excellent
 [ZeroStack](https://github.com/gi-dellav/zerostack) project and preserves its preference for a small,
 fast, understandable native agent.

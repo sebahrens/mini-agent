@@ -59,11 +59,27 @@ jobs:
       - name: Test release workflow policy
         run: python3 -m unittest scripts.tests.test_check_package_metadata
 
+      - name: Test package version synchronization
+        run: python3 -m unittest scripts.tests.test_sync_version
+
+      - name: Test GPL release packaging
+        run: |
+          python3 -m unittest \
+            scripts.tests.test_package_release_binary \
+            scripts.tests.test_package_corresponding_source \
+            scripts.tests.test_install_script
+
       - name: Verify release workflow policy
         run: python3 scripts/check-package-metadata.py
 
       - name: Verify Cargo feature graph
         run: python3 scripts/check_feature_graph.py
+
+      - name: Assemble GPL Corresponding Source offline
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          bash scripts/package-corresponding-source.sh \
+            "v${version}-ci" "$RUNNER_TEMP" HEAD --allow-untagged-label
 
       - name: Verify production and research workspace boundaries
         run: |

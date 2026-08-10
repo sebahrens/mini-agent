@@ -69,11 +69,11 @@ if ! $SKIP_MINI_AGENT; then
         echo "Found mini-agent at $(which mini-agent)"
         if ! mini-agent --help 2>&1 | grep -q '\-\-acp'; then
             echo "WARNING: This mini-agent build does not include ACP support." >&2
-            echo "  Rebuild with: cargo install mini-agent --features acp" >&2
+            echo "  Rebuild from a checkout with: cargo install --path . --debug --features acp" >&2
         fi
     else
         echo "mini-agent not found in PATH." >&2
-        echo "  Install from source: cargo install mini-agent --features acp" >&2
+        echo "  Install from a checkout: cargo install --path . --debug --features acp" >&2
         echo "  Or run with --skip-mini-agent to skip this check." >&2
         exit 1
     fi
@@ -235,7 +235,7 @@ echo "  2. Open a chat with: <leader>cc (default: \\cc)"
 echo "  3. Select the 'zerostack' adapter in the chat buffer"
 echo ""
 echo "Ensure mini-agent is built with ACP support:"
-echo "  cargo install mini-agent --features acp"
+echo "  cargo install --path . --debug --features acp"
 echo ""
 echo "You also need a provider configured (API keys, model, etc.)."
 echo "See: mini-agent --help"

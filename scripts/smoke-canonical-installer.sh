@@ -21,5 +21,8 @@ if [[ "$VERSION_OUTPUT" != "$EXPECTED_OUTPUT" ]]; then
     echo "Error: canonical installer produced ${VERSION_OUTPUT}; expected ${EXPECTED_OUTPUT}" >&2
     exit 1
 fi
+for document in LICENSE NOTICE SOURCE.md; do
+    cmp "${ROOT_DIR}/${document}" "${INSTALL_ROOT}/share/doc/mini-agent/${document}"
+done
 
 echo "canonical installer smoke: PASS (${VERSION_OUTPUT})"

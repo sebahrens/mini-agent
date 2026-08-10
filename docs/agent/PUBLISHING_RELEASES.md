@@ -1,20 +1,29 @@
 ---
-description: "How mini-agent releases are published: crates.io, Homebrew, AUR, Conda, and the release workflow."
+description: "How mini-agent releases are published: GitHub, Homebrew, AUR, Conda, and the release workflow."
 ---
 
 # Publishing Releases
 
-This guide covers the full release workflow: bumping the version, tagging, publishing to crates.io, and updating downstream package managers.
+This guide covers the full release workflow: bumping the version, tagging, publishing GPL-compliant
+GitHub assets, and updating downstream package managers.
 
 ## Canonical executable and archive layout
 
 Cargo and every package channel install the public executable as `mini-agent`. Full archives are
 named `mini-agent-<target>.tar.gz`; lite archives are named
-`mini-agent-lite-<target>.tar.gz`. Every archive contains exactly one top-level executable named
-`mini-agent`, which the release workflow extracts into a clean directory and runs with
-`--version` before upload. Full archives use the supported default Cargo feature set; lite archives
+`mini-agent-lite-<target>.tar.gz`. Every binary archive contains exactly four top-level files:
+`mini-agent` (or `mini-agent.exe`), `LICENSE`, `NOTICE`, and `SOURCE.md`. The release workflow checks
+that exact payload, extracts it into a clean directory, and runs the executable with `--version`
+before upload. Full archives use the supported default Cargo feature set; lite archives
 use `--no-default-features`. Opt-in native features such as `skills-embed` are not silently bundled
 into cross-platform archives and keep their platform-specific installation requirements.
+
+Every release also includes `mini-agent-vX.Y.Z-source.tar.gz`. This Corresponding Source archive is
+made from the exact tagged commit and adds the complete locked Cargo dependency graph under
+`vendor/` plus a generated `.cargo/config.toml`. CI validates that Cargo can resolve the bundle with
+`--locked --offline`, includes the source archive in `SHA256SUMS`, and publishes it in the same
+GitHub release as the binaries. Never delete a source asset while any matching binary asset remains
+available.
 
 ## Product identity matrix
 
@@ -22,18 +31,18 @@ into cross-platform archives and keep their platform-specific installation requi
 |---|---|---|
 | Cargo package, CLI/UI, provider identity, ACP agent, MCP OAuth, LSP client | `mini-agent` | Public identity; do not report `zerostack` to new integrations. |
 | Source repository and release origin | `sebahrens/mini-agent` | All active download, homepage, source, and checksum URLs use this repository. |
-| Release assets | `mini-agent-<target>.tar.gz` and `mini-agent-lite-<target>.tar.gz` | Archive contents contain the `mini-agent` executable. |
+| Release assets | binary archives plus `mini-agent-vX.Y.Z-source.tar.gz` | Binary archives carry the executable, GPL text, modification notice, and source directions; the same release carries vendored Corresponding Source. |
 | AUR, Conda, and Homebrew recipe names | `zerostack-bin`, `zerostack`, and `zerostack.rb` | Retained only as package-channel compatibility names; each installs `mini-agent`. |
 | Persisted data, project policy, and hook environment | `zerostack`, `.zerostack`, and `ZEROSTACK_*` | Stable user-data compatibility contract; release-coordinate changes must not migrate or rename it. |
 
 ## Supported distribution surfaces
 
-Supported package channels are Cargo/crates.io, AUR, Conda, and Homebrew. Their status is
+Supported package channels are source/Cargo, AUR, Conda, and Homebrew. Their status is
 deliberately explicit:
 
 | Surface | Support status |
 |---|---|
-| Cargo/crates.io | Published package and canonical `mini-agent` executable. |
+| Source/Cargo | Install only from this repository checkout. The crates.io `mini-agent` package is unrelated and must never be advertised or published by this project. |
 | GitHub release archives and shell installer | Supported only after the exact-version archive and `SHA256SUMS` smoke passes against the public canonical repository. |
 | AUR and Conda | Repository-maintained recipes; publication remains the manual downstream step described below. |
 | Homebrew | Compatibility formula retained, but no end-user install command is supported until a canonical tap exists and its archive smoke passes. |
@@ -46,7 +55,6 @@ smoke test of the exact store output before any install claim returns.
 ## Prerequisites
 
 - [just](https://github.com/casey/just) command runner
-- `cargo publish` access — run `cargo login` once to authenticate with crates.io
 - `gh` CLI (only needed for `post-release` checksum downloads)
 - `makepkg` (only needed for AUR `.SRCINFO` regeneration)
 - Ruby with its standard Psych YAML parser (used by the release workflow policy check)
@@ -80,7 +88,8 @@ just release minor   # 1.7.1 -> 1.8.0
 just release major   # 1.7.1 -> 2.0.0
 ```
 
-This single command handles everything up to crates.io publication. After CI finishes building the release binaries, run `just post-release` to update packaging checksums.
+This single command creates and pushes the release tag. After CI finishes building the release
+binaries and Corresponding Source, run `just post-release` to update packaging checksums.
 
 ## What `just release` does
 
@@ -90,7 +99,7 @@ This single command handles everything up to crates.io publication. After CI fin
 4. Commits as `bump to vX.Y.Z` and pushes the current branch
 5. Validates that the tag is exactly `vX.Y.Z` (or `vX.Y.Z-prerelease`) and matches the Cargo package version
 6. Creates and pushes an annotated tag — this triggers the [GitHub Actions release workflow](../../.github/workflows/release.yml), which builds binaries for all targets
-7. Runs `cargo publish` to publish the crate to crates.io
+7. Leaves crates.io untouched because its `mini-agent` package belongs to an unrelated project
 
 Both local tag commands require all tracked working-tree and staged changes to be committed, so
 the metadata they validate is the metadata in the commit they tag.
@@ -103,7 +112,22 @@ never become a public release identity. Tags containing a prerelease suffix (for
 
 If a tagged run needs recovery, use **Re-run jobs** on that tag's existing Actions run. Do not
 start the release workflow from a branch. Publication still happens only after every expected full
-and lite archive and `SHA256SUMS` have been assembled and checked.
+and lite archive, the tag-matched Corresponding Source archive, and `SHA256SUMS` have been assembled
+and checked.
+
+## GPL release checklist
+
+Before treating a release as complete, verify that:
+
+- every binary archive has only the executable, `LICENSE`, `NOTICE`, and `SOURCE.md`;
+- `NOTICE` identifies the imported ZeroStack commit and the date mini-agent modifications began;
+- the same release contains the source asset named by `SOURCE.md`;
+- the source asset contains the tagged tree, locked vendored dependencies, and offline Cargo config;
+- `SHA256SUMS` covers all binary and source archives; and
+- the shell installer and downstream recipes install `NOTICE` and `SOURCE.md` alongside the GPL text.
+
+For an older noncompliant release, attach its exact vendored source bundle, standalone compliance
+documents, and a prominent release-note correction before leaving its binary assets available.
 
 ## Post-release (after CI completes)
 

@@ -69,8 +69,10 @@ jobs:
       - name: Package and smoke binary
         run: |
           archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"
-          tar czf "$archive" -C "target/${{ matrix.target }}/release" "$CANONICAL_BINARY"
-          test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"
+          python3 scripts/package-release-binary.py \
+            --binary "target/${{ matrix.target }}/release/$CANONICAL_BINARY" \
+            --archive "$archive" \
+            --executable-name "$CANONICAL_BINARY"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
@@ -82,8 +84,10 @@ jobs:
       - name: Package and smoke lite binary
         run: |
           archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"
-          tar czf "$archive" -C "target/${{ matrix.target }}/release" "$CANONICAL_BINARY"
-          test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"
+          python3 scripts/package-release-binary.py \
+            --binary "target/${{ matrix.target }}/release/$CANONICAL_BINARY" \
+            --archive "$archive" \
+            --executable-name "$CANONICAL_BINARY"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
@@ -130,8 +134,10 @@ jobs:
       - name: Package and validate
         run: |
           archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"
-          tar czf "$archive" -C "target/${{ matrix.target }}/release" "$CANONICAL_BINARY"
-          test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"
+          python3 scripts/package-release-binary.py \
+            --binary "target/${{ matrix.target }}/release/$CANONICAL_BINARY" \
+            --archive "$archive" \
+            --executable-name "$CANONICAL_BINARY"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
@@ -152,8 +158,10 @@ jobs:
       - name: Package and validate lite
         run: |
           archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"
-          tar czf "$archive" -C "target/${{ matrix.target }}/release" "$CANONICAL_BINARY"
-          test "$(tar tzf "$archive")" = "$CANONICAL_BINARY"
+          python3 scripts/package-release-binary.py \
+            --binary "target/${{ matrix.target }}/release/$CANONICAL_BINARY" \
+            --archive "$archive" \
+            --executable-name "$CANONICAL_BINARY"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
@@ -206,8 +214,10 @@ jobs:
       - name: Package and smoke binary
         run: |
           archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"
-          tar czf "$archive" -C "target/${{ matrix.target }}/release" "${CANONICAL_BINARY}.exe"
-          test "$(tar tzf "$archive")" = "${CANONICAL_BINARY}.exe"
+          python3 scripts/package-release-binary.py \
+            --binary "target/${{ matrix.target }}/release/${CANONICAL_BINARY}.exe" \
+            --archive "$archive" \
+            --executable-name "${CANONICAL_BINARY}.exe"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           "$smoke_dir/${CANONICAL_BINARY}.exe" --version | grep -Fq -- "$CANONICAL_BINARY "
@@ -219,8 +229,10 @@ jobs:
       - name: Package and smoke lite binary
         run: |
           archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"
-          tar czf "$archive" -C "target/${{ matrix.target }}/release" "${CANONICAL_BINARY}.exe"
-          test "$(tar tzf "$archive")" = "${CANONICAL_BINARY}.exe"
+          python3 scripts/package-release-binary.py \
+            --binary "target/${{ matrix.target }}/release/${CANONICAL_BINARY}.exe" \
+            --archive "$archive" \
+            --executable-name "${CANONICAL_BINARY}.exe"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           "$smoke_dir/${CANONICAL_BINARY}.exe" --version | grep -Fq -- "$CANONICAL_BINARY "
@@ -236,9 +248,32 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  corresponding-source:
+    name: Corresponding Source
+    needs: package-metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: "1.96.0"
+
+      - name: Assemble and validate Corresponding Source
+        run: bash scripts/package-corresponding-source.sh "$GITHUB_REF_NAME" . HEAD
+
+      - name: Upload Corresponding Source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corresponding-source
+          path: ${{ env.CANONICAL_BINARY }}-${{ github.ref_name }}-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
   checksums:
     name: SHA256SUMS
-    needs: [build, build-static, build-windows]
+    needs: [build, build-static, build-windows, corresponding-source]
     runs-on: ubuntu-latest
     steps:
       - name: Download all archives
@@ -246,6 +281,11 @@ jobs:
         with:
           pattern: archives-*
           merge-multiple: true
+
+      - name: Download Corresponding Source
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: corresponding-source
 
       - name: Verify expected archive set
         run: |
@@ -264,6 +304,7 @@ jobs:
             mini-agent-lite-x86_64-unknown-linux-musl.tar.gz
             mini-agent-lite-aarch64-unknown-linux-musl.tar.gz
             mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-${GITHUB_REF_NAME}-source.tar.gz
           )
           found=$(ls *.tar.gz | sort)
           expected_sorted=$(printf '%s\n' "${expected[@]}" | sort)
@@ -289,7 +330,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub release
-    needs: [build, build-static, build-windows, checksums]
+    needs: [build, build-static, build-windows, corresponding-source, checksums]
     runs-on: ubuntu-latest
     steps:
       - name: Download all archives
@@ -297,6 +338,11 @@ jobs:
         with:
           pattern: archives-*
           merge-multiple: true
+
+      - name: Download Corresponding Source
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: corresponding-source
 
       - name: Download checksums
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -320,6 +366,7 @@ jobs:
             mini-agent-lite-x86_64-unknown-linux-musl.tar.gz
             mini-agent-lite-aarch64-unknown-linux-musl.tar.gz
             mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-${GITHUB_REF_NAME}-source.tar.gz
             SHA256SUMS
           )
           for f in "${expected[@]}"; do

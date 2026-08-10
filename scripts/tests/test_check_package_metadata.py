@@ -283,6 +283,68 @@ steps:
 
         self.assertTrue(any("all-features" in error for error in errors))
 
+    def test_release_requires_vendored_corresponding_source(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            'bash scripts/package-corresponding-source.sh "$GITHUB_REF_NAME" . HEAD',
+            "true",
+            1,
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("Corresponding Source" in error for error in errors))
+
+    def test_corresponding_source_script_avoids_pipefail_archive_listing(self) -> None:
+        script = (
+            SCRIPT.parents[1] / "scripts/package-corresponding-source.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'tar tzf "$STAGING_DIR/$ARCHIVE_NAME" > "$ARCHIVE_LISTING"', script
+        )
+        self.assertNotIn("tar tzf \"$STAGING_DIR/$ARCHIVE_NAME\" | grep", script)
+
+    def test_corresponding_source_script_vendors_and_checks_offline_metadata(
+        self,
+    ) -> None:
+        script = (
+            SCRIPT.parents[1] / "scripts/package-corresponding-source.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml",
+            script,
+        )
+        self.assertIn(
+            "cargo metadata --locked --offline --format-version 1 > /dev/null",
+            script,
+        )
+        self.assertIn(
+            'if [[ "$SOURCE_COMMIT" != "$TAG_COMMIT" ]]; then', script
+        )
+        self.assertIn(
+            'elif [[ "$ALLOW_UNTAGGED_LABEL" != true ]]; then', script
+        )
+
+    def test_release_requires_gpl_binary_packager_for_every_archive(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            "python3 scripts/package-release-binary.py \\",
+            "python3 ignored-packager.py \\",
+            1,
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(
+            any("package-release-binary.py" in error for error in errors)
+        )
+
     def test_static_release_matrix_rejects_arm_cross_host(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github/workflows/release.yml"
@@ -545,6 +607,74 @@ class RepositoryCoordinateValidationTests(unittest.TestCase):
             ),
         )
 
+    def test_checked_in_package_recipes_install_compliance_documents(self) -> None:
+        self.assertEqual(
+            [],
+            CHECK_PACKAGE_METADATA.validate_distribution_notice_installs(
+                SCRIPT.parents[1]
+            ),
+        )
+
+    def test_each_package_recipe_compliance_install_is_fail_closed(self) -> None:
+        repository = SCRIPT.parents[1]
+        for relative, fragments in (
+            CHECK_PACKAGE_METADATA.DISTRIBUTION_NOTICE_FRAGMENTS.items()
+        ):
+            for fragment in fragments:
+                with self.subTest(relative=relative, fragment=fragment):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        for source_relative in (
+                            CHECK_PACKAGE_METADATA.DISTRIBUTION_NOTICE_FRAGMENTS
+                        ):
+                            source = repository / source_relative
+                            destination = root / source_relative
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy(source, destination)
+                        path = root / relative
+                        path.write_text(
+                            path.read_text(encoding="utf-8").replace(fragment, "", 1),
+                            encoding="utf-8",
+                        )
+
+                        errors = (
+                            CHECK_PACKAGE_METADATA.validate_distribution_notice_installs(
+                                root
+                            )
+                        )
+
+                        self.assertTrue(
+                            any(relative in error and fragment in error for error in errors)
+                        )
+
+    def test_checked_in_aur_srcinfo_matches_pkgbuild(self) -> None:
+        self.assertEqual(
+            [],
+            CHECK_PACKAGE_METADATA.validate_aur_srcinfo_checksums(SCRIPT.parents[1]),
+        )
+
+    def test_stale_aur_srcinfo_checksum_is_rejected(self) -> None:
+        repository = SCRIPT.parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "packaging/aur"
+            destination.mkdir(parents=True)
+            shutil.copy(repository / "packaging/aur/PKGBUILD", destination)
+            shutil.copy(repository / "packaging/aur/.SRCINFO", destination)
+            srcinfo = destination / ".SRCINFO"
+            srcinfo.write_text(
+                srcinfo.read_text(encoding="utf-8").replace(
+                    "d0bae6b5b7813f4a4fe1aebf1ee5aeaac97e64698781a16cd00728c3d14f3f97",
+                    "0" * 64,
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            errors = CHECK_PACKAGE_METADATA.validate_aur_srcinfo_checksums(root)
+
+            self.assertTrue(any("checksums must match" in error for error in errors))
+
 
 class ReleaseChecksumUpdateTests(unittest.TestCase):
     def test_http_failure_does_not_mutate_package_metadata(self) -> None:
@@ -647,7 +777,7 @@ printf '%s' "${!#}" > "$out"
                     f"https://raw.githubusercontent.com/sebahrens/mini-agent/v{version}/LICENSE",
                 ),
                 "packaging/conda/zerostack/meta.yaml": (
-                    f"https://github.com/sebahrens/mini-agent/archive/refs/tags/v{version}.tar.gz",
+                    f"https://github.com/sebahrens/mini-agent/releases/download/v{version}/mini-agent-v{version}-source.tar.gz",
                 ),
                 "packaging/conda/zerostack-bin/meta.yaml": (
                     f"{release}/mini-agent-x86_64-unknown-linux-musl.tar.gz",
@@ -681,6 +811,22 @@ printf '%s' "${!#}" > "$out"
             self.assertEqual(
                 [],
                 CHECK_PACKAGE_METADATA.validate_stale_coordinates(root, [relative]),
+            )
+
+    def test_upstream_provenance_files_may_name_zerostack_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in CHECK_PACKAGE_METADATA.UPSTREAM_PROVENANCE_FILES:
+                (root / relative).write_text(
+                    "https://github.com/" + "gi-" + "dellav/zerostack",
+                    encoding="utf-8",
+                )
+
+            self.assertEqual(
+                [],
+                CHECK_PACKAGE_METADATA.validate_stale_coordinates(
+                    root, list(CHECK_PACKAGE_METADATA.UPSTREAM_PROVENANCE_FILES)
+                ),
             )
 
     def test_mixed_case_stale_coordinate_is_rejected(self) -> None:
