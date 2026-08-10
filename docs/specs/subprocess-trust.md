@@ -74,8 +74,11 @@ the no-effect skill verifier's in-memory fake `spawn`; it never authorizes an OS
 
 ### Selected-workspace rebinding
 
-The process-global current directory is only an initialization fallback; changing worktrees never
-mutates it. The selected session workspace is propagated explicitly to context discovery, the
+The process-global current directory is only an initialization fallback. Startup captures one
+canonical, identity-checked workspace binding and shares that authority across agent rebuilds;
+changing worktrees never mutates process-global CWD. A worktree replacement is captured and
+validated before state is committed, so a failed rebind retains the previous authority. The
+selected session workspace is propagated explicitly to context discovery, the
 permission root, model preambles, relative filesystem tools (including child `TaskTool` agents),
 the model-action sandbox, JavaScript broker configuration, `!` shell commands, lazygit, `/undo`,
 hook child CWD plus `ZEROSTACK_PROJECT_DIR`, and command-backed MCP transports. A worktree switch

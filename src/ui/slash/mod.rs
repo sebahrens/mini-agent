@@ -45,6 +45,7 @@ pub struct SlashCtx<'a> {
     pub cli: &'a Cli,
     pub cfg: &'a Config,
     pub context: &'a mut ContextFiles,
+    pub workspace: &'a std::sync::Arc<crate::paths::WorkspaceBinding>,
     pub show_reasoning: &'a mut bool,
     pub reasoning_enabled: &'a mut bool,
     pub is_running: &'a mut bool,
@@ -66,6 +67,7 @@ impl SlashCtx<'_> {
             cli: self.cli,
             cfg: self.cfg,
             context: self.context,
+            workspace: self.workspace,
             client: self.client,
             permission: self.permission,
             ask_tx: self.ask_tx,
@@ -86,6 +88,7 @@ impl SlashCtx<'_> {
             cli: self.cli,
             cfg: self.cfg,
             context: self.context,
+            workspace: self.workspace,
             client,
             permission: self.permission,
             ask_tx: self.ask_tx,
@@ -115,6 +118,8 @@ impl SlashCtx<'_> {
     /// against that session's fresh, configuration-scoped runtime state.
     pub async fn replace_session(&mut self, mut session: Session) -> anyhow::Result<()> {
         let provider_changed = session.provider != self.session.provider;
+        session.working_dir =
+            compact_str::CompactString::new(self.workspace.root().to_string_lossy());
         session.initialize_read_tracker(self.cfg.deny_repeated_reads.unwrap_or(true));
         let previous_session = std::mem::replace(self.session, session);
 
@@ -468,6 +473,7 @@ pub async fn handle_slash(
         cli: ui.cli,
         cfg: ui.cfg,
         context: ui.context,
+        workspace: &ui.workspace,
         show_reasoning: &mut slash.show_reasoning,
         reasoning_enabled: &mut slash.reasoning_enabled,
         is_running: &mut run.is_running,

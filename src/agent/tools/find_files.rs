@@ -962,7 +962,7 @@ mod tests {
             PermissionChecker::new(
                 &PermissionConfigs::from(config),
                 SecurityMode::Restrictive,
-                Some(std::path::PathBuf::from("/workspace")),
+                Some(std::env::current_dir().unwrap()),
                 Some(vec!["restrictive".to_string()]),
             )
             .expect("valid permission test configuration"),

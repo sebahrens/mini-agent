@@ -3,6 +3,7 @@
 //! purpose so helpers take a handful of coherent bundles instead.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -29,6 +30,7 @@ pub(crate) struct UiContext<'a> {
     pub cfg: &'a Config,
     pub session: &'a mut Session,
     pub context: &'a mut ContextFiles,
+    pub workspace: Arc<crate::paths::WorkspaceBinding>,
     pub client: AnyClient,
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -45,6 +47,7 @@ impl<'a> UiContext<'a> {
             cli: self.cli,
             cfg: self.cfg,
             context: self.context,
+            workspace: &self.workspace,
             client: &self.client,
             permission: &self.permission,
             ask_tx: &self.ask_tx,
@@ -62,6 +65,7 @@ impl<'a> UiContext<'a> {
         cfg: &'a Config,
         session: &'a mut Session,
         context: &'a mut ContextFiles,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
         client: AnyClient,
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
@@ -73,6 +77,7 @@ impl<'a> UiContext<'a> {
             cfg,
             session,
             context,
+            workspace,
             client,
             permission,
             ask_tx,
@@ -94,6 +99,7 @@ pub(crate) struct AgentBuildCtx<'a> {
     pub cli: &'a Cli,
     pub cfg: &'a Config,
     pub context: &'a ContextFiles,
+    pub workspace: &'a Arc<crate::paths::WorkspaceBinding>,
     pub client: &'a AnyClient,
     pub permission: &'a Option<PermCheck>,
     pub ask_tx: &'a Option<AskSender>,
@@ -110,11 +116,12 @@ impl AgentBuildCtx<'_> {
         let model = self.client.completion_model(model_id.to_string());
         let temperature = crate::config::resolve_temperature(self.cli, self.cfg, model_id);
         let extra_body = crate::config::resolve_extra_body(self.cfg, model_id);
-        crate::provider::build_agent(
+        crate::provider::build_agent_in_workspace(
             model,
             self.cli,
             self.cfg,
             self.context,
+            self.workspace.clone(),
             self.permission.clone(),
             self.ask_tx.clone(),
             self.sandbox.clone(),

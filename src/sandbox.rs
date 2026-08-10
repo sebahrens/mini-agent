@@ -913,6 +913,13 @@ impl Sandbox {
         self.workspace_binding = Some(workspace);
         self
     }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_root_for_test(&self) -> Option<&Path> {
+        self.workspace_binding
+            .as_ref()
+            .map(|workspace| workspace.root())
+    }
     /// Selects a shell whose script flag differs from the POSIX `-c`
     /// contract. The flag is passed as one literal argument; it is never
     /// concatenated with the command text.
@@ -1393,8 +1400,13 @@ impl Sandbox {
         if self.policy() != SandboxPolicy::RequiredAndAvailable || self.backend != "appcontainer" {
             return Err("Windows direct process launch requires the AppContainer sandbox".into());
         }
+        if let Some(workspace) = &self.workspace_binding {
+            workspace
+                .validate()
+                .map_err(|error| format!("sandbox: workspace is no longer valid: {error}"))?;
+        }
         let cwd = canonical_non_root(
-            &std::env::current_dir().map_err(|error| {
+            &self.working_dir().map_err(|error| {
                 format!("sandbox: failed to resolve working directory: {error}")
             })?,
             "working directory",

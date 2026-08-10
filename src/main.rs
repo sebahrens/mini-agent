@@ -88,6 +88,10 @@ async fn run() -> anyhow::Result<()> {
 
     let workspace_root =
         std::env::current_dir().context("failed to resolve the startup workspace root")?;
+    let workspace = std::sync::Arc::new(
+        paths::WorkspaceBinding::capture(&workspace_root)
+            .context("failed to bind the startup workspace root")?,
+    );
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
     paths::prepare_storage_roots(&app_paths)?;
@@ -212,6 +216,7 @@ async fn run() -> anyhow::Result<()> {
         cli,
         cfg,
         app_paths,
+        workspace,
         is_first_startup,
         version_changed,
         is_interactive,

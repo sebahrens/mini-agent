@@ -429,9 +429,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::BashTool::new(
                 permission.clone(),
                 ask_tx.clone(),
-                sandbox
-                    .clone()
-                    .with_working_dir(context.workspace_root.clone()),
+                sandbox.clone(),
                 max_bash_output_lines,
             )),
             Box::new(
@@ -533,7 +531,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         #[cfg(feature = "js")]
         register_js_tool(
             &mut all_tools,
-            sandbox.with_working_dir(context.workspace_root.clone()),
+            sandbox,
             permission.clone(),
             ask_tx.clone(),
             cfg,
@@ -555,6 +553,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 #[cfg(all(test, feature = "js"))]
 mod js_tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::{build_agent_inner, build_btw_agent_inner, register_js_tool_with_status};
     use crate::context::ContextFiles;
@@ -807,11 +806,15 @@ mod js_tests {
 
     #[tokio::test]
     async fn btw_agent_actual_tool_set_omits_js() {
+        let workspace = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
         let agent = build_btw_agent_inner(
             fake_model("btw"),
             &crate::cli::Cli::default(),
             &crate::config::Config::default(),
             &empty_context(),
+            &workspace,
             &None,
             &None,
             false,
@@ -871,6 +874,7 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
+    workspace: &Arc<crate::paths::WorkspaceBinding>,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     _reasoning_enabled: bool,
@@ -878,7 +882,7 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     // See `build_agent_inner`: OpenRouter `provider.order` pin for `anthropic/*`.
     additional_params: Option<serde_json::Value>,
 ) -> Agent<M> {
-    let cwd = context.workspace_root.display().to_string();
+    let cwd = workspace.root().display().to_string();
 
     let mut preamble = String::new();
     preamble.push_str(BTW_SYSTEM_PROMPT);
@@ -955,19 +959,19 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
                 max_read_lines,
                 read_tracker,
             )
-            .with_workspace(context.workspace_root.clone()),
+            .with_workspace_binding(workspace.clone()),
         ),
         Box::new(
             tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
-                .with_workspace(context.workspace_root.clone()),
+                .with_workspace_binding(workspace.clone()),
         ),
         Box::new(
             tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
-                .with_workspace(context.workspace_root.clone()),
+                .with_workspace_binding(workspace.clone()),
         ),
         Box::new(
             tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
-                .with_workspace(context.workspace_root.clone()),
+                .with_workspace_binding(workspace.clone()),
         ),
     ];
 

@@ -9,11 +9,22 @@ fn default_modes() -> Option<Vec<String>> {
     ])
 }
 
+fn test_workspace() -> std::path::PathBuf {
+    std::env::current_dir().unwrap().canonicalize().unwrap()
+}
+
+fn workspace_path(relative: &str) -> String {
+    test_workspace()
+        .join(relative)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn make_checker(mode: SecurityMode) -> PermissionChecker {
     PermissionChecker::new(
         &PermissionConfigs::default(),
         mode,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration")
@@ -24,7 +35,7 @@ fn make_checker_with_modes(mode: SecurityMode, modes: Option<Vec<String>>) -> Pe
     PermissionChecker::new(
         &PermissionConfigs::default(),
         mode,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         modes,
     )
     .expect("valid permission test configuration")
@@ -120,11 +131,11 @@ fn readonly_allows_read_tools() {
 fn readonly_denies_path_tools_outside_read() {
     let mut checker = make_checker(SecurityMode::ReadOnly);
     assert!(matches!(
-        checker.check_path("write", "/home/user/project/new.rs"),
+        checker.check_path("write", &workspace_path("new.rs")),
         CheckResult::Denied(_),
     ));
     assert!(matches!(
-        checker.check_path("edit", "/home/user/project/src/main.rs"),
+        checker.check_path("edit", &workspace_path("src/main.rs")),
         CheckResult::Denied(_),
     ));
 }
@@ -281,7 +292,7 @@ fn force_ask_once_never_overrides_a_deny_rule() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Yolo,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -323,7 +334,7 @@ fn allow_once_never_overrides_a_deny_rule() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Yolo,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -464,17 +475,17 @@ fn lsp_diagnostics_inherits_read_rules_and_path_semantics() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
 
     assert_eq!(
-        checker.check_path("lsp_diagnostics", "/home/user/project/src/main.rs"),
+        checker.check_path("lsp_diagnostics", &workspace_path("src/main.rs")),
         CheckResult::Allowed
     );
     assert_eq!(
-        checker.check_path("lsp_diagnostics", "/home/user/project/src/secret.rs"),
+        checker.check_path("lsp_diagnostics", &workspace_path("src/secret.rs")),
         CheckResult::Denied("Blocked by deny rule".to_string())
     );
     assert_eq!(
@@ -489,15 +500,15 @@ fn lsp_diagnostics_inherits_read_rules_and_path_semantics() {
 fn standard_path_tools_in_cwd_without_rules_are_allowed() {
     let mut checker = make_checker(SecurityMode::Standard);
     assert!(matches!(
-        checker.check_path("read", "/home/user/project/src/main.rs"),
+        checker.check_path("read", &workspace_path("src/main.rs")),
         CheckResult::Allowed,
     ));
     assert!(matches!(
-        checker.check_path("write", "/home/user/project/new_file.rs"),
+        checker.check_path("write", &workspace_path("new_file.rs")),
         CheckResult::Allowed,
     ));
     assert!(matches!(
-        checker.check_path("list_dir", "/home/user/project/src"),
+        checker.check_path("list_dir", &workspace_path("src")),
         CheckResult::Allowed,
     ));
 }
@@ -515,7 +526,7 @@ fn standard_respects_deny_rules_for_path_tools_in_cwd() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -538,7 +549,7 @@ fn standard_respects_deny_rules_for_write_in_cwd() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -580,7 +591,7 @@ fn grep_external_path_permission_pattern_allow_does_not_authorize_root() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Restrictive,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         Some(vec!["restrictive".to_string()]),
     )
     .expect("valid permission test configuration");
@@ -824,7 +835,7 @@ fn valid_external_directory_regex_retains_regex_behavior() {
     let mut checker = PermissionChecker::new(
         &configs,
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/workspace")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid external-directory regex must compile");
@@ -860,12 +871,8 @@ fn path_traversal_with_dotdot_is_detected_as_external() {
 #[test]
 fn dot_components_are_normalized_away() {
     let mut checker = make_checker(SecurityMode::Standard);
-    let path = if cfg!(windows) {
-        "C:\\home\\user\\project\\.\\src\\main.rs"
-    } else {
-        "/home/user/project/./src/main.rs"
-    };
-    let result = checker.check_path("read", path);
+    let path = workspace_path("./src/main.rs");
+    let result = checker.check_path("read", &path);
     assert!(
         matches!(result, CheckResult::Allowed),
         "expected Allowed for dot-normalized CWD path, got {:?}",
@@ -908,11 +915,7 @@ fn relative_dotdot_traversal_is_detected_as_external() {
 #[test]
 fn relative_dotdot_in_cwd_stays_allowed() {
     let mut checker = make_checker(SecurityMode::Standard);
-    let path = if cfg!(windows) {
-        "..\\project\\src\\main.rs"
-    } else {
-        "../project/src/main.rs"
-    };
+    let path = "nested/../src/main.rs";
     let result = checker.check_path("read", path);
     assert!(
         matches!(result, CheckResult::Allowed),
@@ -927,7 +930,7 @@ fn relative_dotdot_in_cwd_stays_allowed() {
 fn session_allowlist_matches_absolute_path_when_stored_as_relative() {
     let mut checker = make_checker(SecurityMode::Restrictive);
     checker.add_session_allowlist("read".into(), "src/*");
-    let result = checker.check_path("read", "/home/user/project/src/main.rs");
+    let result = checker.check_path("read", &workspace_path("src/main.rs"));
     assert!(
         matches!(result, CheckResult::Allowed),
         "expected Allowed for absolute path matching relative allowlist, got {:?}",
@@ -938,7 +941,8 @@ fn session_allowlist_matches_absolute_path_when_stored_as_relative() {
 #[test]
 fn session_allowlist_matches_relative_path_when_stored_as_absolute() {
     let mut checker = make_checker(SecurityMode::Restrictive);
-    checker.add_session_allowlist("read".into(), "/home/user/project/src/*");
+    let scope = format!("{}/src/*", test_workspace().display());
+    checker.add_session_allowlist("read".into(), &scope);
     let result = checker.check_path("read", "src/main.rs");
     assert!(
         matches!(result, CheckResult::Allowed),
@@ -1044,7 +1048,7 @@ fn restrictive_with_rules_in_permission_modes_respects_matched() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Restrictive,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         Some(vec!["restrictive".to_string(), "standard".to_string()]),
     )
     .expect("valid permission test configuration");
@@ -1074,7 +1078,7 @@ fn apply_rules_skipped_when_mode_not_in_permission_modes() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Guarded,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         Some(vec!["standard".to_string()]),
     )
     .expect("valid permission test configuration");
@@ -1099,7 +1103,7 @@ fn apply_rules_applied_when_mode_in_permission_modes() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         Some(vec!["standard".to_string()]),
     )
     .expect("valid permission test configuration");
@@ -1124,7 +1128,7 @@ fn guarded_respects_explicit_config_allow() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Guarded,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -1151,7 +1155,7 @@ fn guarded_respects_explicit_config_deny() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Guarded,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -1306,13 +1310,13 @@ fn empty_permission_modes_skips_rules_for_all_modes() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         Some(vec![]), // empty list: no modes apply rules
     )
     .expect("valid permission test configuration");
     // Standard with no rules applied: path tools in CWD still get auto-allow
     assert!(matches!(
-        checker.check_path("read", "/home/user/project/src/main.rs"),
+        checker.check_path("read", &workspace_path("src/main.rs")),
         CheckResult::Allowed
     ));
     // Bash never inherits a permissive default.
@@ -1334,7 +1338,7 @@ fn standard_external_dir_allow_rule_overrides_default_ask() {
     let mut checker = PermissionChecker::new(
         &configs,
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -1357,7 +1361,7 @@ fn standard_external_dir_deny_rule_overrides_default_ask() {
     let mut checker = PermissionChecker::new(
         &configs,
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -1380,7 +1384,7 @@ fn external_directory_deny_overrides_matching_read_and_lsp_allow_rules() {
         let mut checker = PermissionChecker::new(
             &configs_from(config),
             SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/workspace/project")),
+            Some(test_workspace()),
             default_modes(),
         )
         .unwrap();
@@ -1400,7 +1404,7 @@ fn external_directory_deny_overrides_broad_session_allow_always_scope() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/workspace/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .unwrap();
@@ -1429,7 +1433,7 @@ fn readonly_respects_explicit_config_allow() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::ReadOnly,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         Some(vec!["readonly".to_string()]),
     )
     .expect("valid permission test configuration");
@@ -1766,7 +1770,7 @@ fn standard_respects_exact_bash_allow_rule() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(test_workspace()),
         default_modes(),
     )
     .expect("valid permission test configuration");
@@ -1778,30 +1782,36 @@ fn standard_respects_exact_bash_allow_rule() {
 
 #[test]
 fn legacy_literal_bracket_path_deny_glob_keeps_its_original_meaning() {
+    let root = test_workspace();
+    let literal = format!("{}/[*]/secret.rs", root.display());
     let config = PermissionConfig {
-        read: Some(ToolPerm::Granular(
-            [("/repo/[*]/secret.rs".to_string(), Action::Deny)].into(),
-        )),
+        read: Some(ToolPerm::Granular([(literal.clone(), Action::Deny)].into())),
         ..PermissionConfig::default()
     };
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(std::path::PathBuf::from("/repo")),
+        Some(root.clone()),
         default_modes(),
     )
     .unwrap();
 
     assert!(matches!(
-        checker.check_path("lsp_diagnostics", "/repo/[*]/secret.rs"),
+        checker.check_path("lsp_diagnostics", &literal),
         CheckResult::Denied(_)
     ));
     assert!(matches!(
-        checker.check_path("lsp_diagnostics", "/repo/[tenant]/secret.rs"),
+        checker.check_path(
+            "lsp_diagnostics",
+            &format!("{}/[tenant]/secret.rs", root.display())
+        ),
         CheckResult::Denied(_)
     ));
     assert_eq!(
-        checker.check_path("lsp_diagnostics", "/repo/tenant/secret.rs"),
+        checker.check_path(
+            "lsp_diagnostics",
+            &format!("{}/tenant/secret.rs", root.display())
+        ),
         CheckResult::Allowed
     );
 }
@@ -1817,7 +1827,7 @@ fn generated_literal_path_scope_survives_session_reload_without_widening() {
     let mut checker = PermissionChecker::new(
         &configs_from(config),
         SecurityMode::Standard,
-        Some(root.to_path_buf()),
+        Some(test_workspace()),
         default_modes(),
     )
     .unwrap();

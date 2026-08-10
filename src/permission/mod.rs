@@ -180,7 +180,19 @@ pub(crate) fn build_interactive_permission(
     Option<ask::AskSender>,
     Option<ask::AskReceiver>,
 )> {
-    let Some(permission) = build_permission_checker_at(cfg, authority, None)? else {
+    build_interactive_permission_at(cfg, authority, None)
+}
+
+pub(crate) fn build_interactive_permission_at(
+    cfg: &crate::config::Config,
+    authority: ResolvedExecutionAuthority,
+    working_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<(
+    Option<checker::PermCheck>,
+    Option<ask::AskSender>,
+    Option<ask::AskReceiver>,
+)> {
+    let Some(permission) = build_permission_checker_at(cfg, authority, working_dir)? else {
         return Ok((None, None, None));
     };
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);

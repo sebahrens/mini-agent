@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ui_worktree_switch_and_exit_rebind_state_without_changing_process_cwd() {
+    async fn windows_workspace_authority_worktree_rebind_all_surfaces() {
         let repo = TempRepo::new("ui explicit workspace");
         let worktree = repo.path().with_extension("ui explicit linked worktree");
         git(
@@ -205,38 +205,54 @@ mod tests {
         let process_cwd = std::env::current_dir().unwrap();
         let mut session = crate::session::Session::new("test", "test", 1, "test");
         let mut context = crate::context::load(true);
+        let mut workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&process_cwd).unwrap());
+        let mut sandbox =
+            crate::sandbox::Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone());
 
         #[cfg(feature = "hooks")]
         let _active_workspace_guard = ScopedActiveWorkspace::capture();
 
-        crate::ui::rebind_worktree_workspace(&mut session, &mut context, &None, &worktree);
-        assert_eq!(Path::new(session.working_dir.as_str()), worktree);
-        assert_eq!(context.workspace_root, worktree);
+        crate::ui::rebind_worktree_workspace(
+            &mut session,
+            &mut context,
+            &None,
+            &mut workspace,
+            &mut sandbox,
+            &worktree,
+            false,
+        )
+        .unwrap();
+        let canonical_worktree = worktree.canonicalize().unwrap();
+        assert_eq!(Path::new(session.working_dir.as_str()), workspace.root());
+        assert_eq!(workspace.root(), canonical_worktree);
+        assert_eq!(context.workspace_root, canonical_worktree);
+        assert_eq!(sandbox.workspace_root_for_test(), Some(workspace.root()));
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
         assert!(
             crate::agent::builder::build_preamble(&context, false)
-                .contains(&worktree.display().to_string())
+                .contains(&canonical_worktree.display().to_string())
         );
         let listed = crate::agent::tools::ListDirTool::new(None, None, None)
-            .with_workspace(&worktree)
+            .with_workspace_binding(workspace.clone())
             .call(crate::agent::tools::ListDirArgs { path: None })
             .await
             .unwrap();
         assert!(listed.contains("tracked.txt"));
-        let shell_cwd = crate::sandbox::Sandbox::new(false, "bwrap")
-            .with_working_dir(&worktree)
-            .output_command("pwd")
-            .await
-            .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&shell_cwd.stdout).trim(),
-            worktree.canonicalize().unwrap().display().to_string()
-        );
-        let bang_cwd = crate::ui::run_shell_in_workspace("sh", "pwd", &worktree).unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&bang_cwd.stdout).trim(),
-            worktree.canonicalize().unwrap().display().to_string()
-        );
+        #[cfg(unix)]
+        {
+            let shell_cwd = sandbox.output_command("pwd").await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&shell_cwd.stdout).trim(),
+                canonical_worktree.display().to_string()
+            );
+            let bang_cwd =
+                crate::ui::run_shell_in_workspace("sh", "pwd", workspace.root()).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&bang_cwd.stdout).trim(),
+                canonical_worktree.display().to_string()
+            );
+        }
         let lazygit = crate::ui::lazygit_in_workspace(&worktree);
         assert_eq!(lazygit.get_current_dir(), Some(worktree.as_path()));
         #[cfg(feature = "hooks")]
@@ -252,15 +268,196 @@ mod tests {
             "initial\n"
         );
 
-        crate::ui::rebind_worktree_workspace(&mut session, &mut context, &None, repo.path());
-        assert_eq!(Path::new(session.working_dir.as_str()), repo.path());
-        assert_eq!(context.workspace_root, repo.path());
+        crate::ui::rebind_worktree_workspace(
+            &mut session,
+            &mut context,
+            &None,
+            &mut workspace,
+            &mut sandbox,
+            repo.path(),
+            false,
+        )
+        .unwrap();
+        let canonical_repo = repo.path().canonicalize().unwrap();
+        assert_eq!(Path::new(session.working_dir.as_str()), workspace.root());
+        assert_eq!(workspace.root(), canonical_repo);
+        assert_eq!(context.workspace_root, canonical_repo);
+        assert_eq!(sandbox.workspace_root_for_test(), Some(workspace.root()));
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
 
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
             .unwrap();
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+    }
+
+    #[test]
+    fn windows_workspace_authority_failed_rebind_retains_previous_state() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-workspace-rebind-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let original = root.join("original");
+        let missing = root.join("missing");
+        std::fs::create_dir_all(&original).unwrap();
+        let process_cwd = std::env::current_dir().unwrap();
+        let mut workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&original).unwrap());
+        let original_root = workspace.root().to_path_buf();
+        let mut session = crate::session::Session::new("test", "test", 1, "test");
+        session.working_dir = original_root.to_string_lossy().into_owned().into();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let permission = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &crate::permission::PermissionConfigs::default(),
+                crate::permission::SecurityMode::Standard,
+                Some(original.clone()),
+                Some(vec!["standard".to_string()]),
+            )
+            .unwrap(),
+        ));
+        let permission = Some(permission);
+        let mut sandbox =
+            crate::sandbox::Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone());
+
+        crate::ui::rebind_worktree_workspace(
+            &mut session,
+            &mut context,
+            &permission,
+            &mut workspace,
+            &mut sandbox,
+            &missing,
+            false,
+        )
+        .expect_err("a missing workspace must fail closed");
+
+        assert_eq!(workspace.root(), original_root);
+        assert_eq!(Path::new(&session.working_dir), original_root);
+        assert_eq!(context.workspace_root, original_root);
+        assert_eq!(
+            sandbox.workspace_root_for_test(),
+            Some(original_root.as_path())
+        );
+        assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+        drop(sandbox);
+        drop(workspace);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_workspace_authority_spawn_and_cleanup_keep_one_binding() {
+        let sandbox = include_str!("../sandbox.rs");
+        let direct = sandbox
+            .split("pub(crate) fn wrap_direct_command")
+            .nth(2)
+            .unwrap()
+            .split("fn build_seatbelt_command")
+            .next()
+            .unwrap();
+        assert!(direct.contains(".validate()"));
+        assert!(direct.contains("self.working_dir()"));
+        assert!(!direct.contains("std::env::current_dir()"));
+
+        let app = include_str!("../ui/app.rs");
+        let success = app
+            .split("MergeOutcome::Success")
+            .nth(1)
+            .unwrap()
+            .split("MergeOutcome::Conflicts")
+            .next()
+            .unwrap();
+        let retire = success
+            .find("retire_workspace_owners_before_cleanup")
+            .unwrap();
+        let cleanup = success.find("complete_merge(&mut state)").unwrap();
+        assert!(
+            retire < cleanup,
+            "workspace owners must retire before deletion"
+        );
+    }
+
+    #[test]
+    fn worktree_rebind_preserves_no_context_files() {
+        let repo = TempRepo::new("no context rebind");
+        std::fs::write(repo.path().join("AGENTS.md"), "DO_NOT_INJECT_CONTEXT\n").unwrap();
+        git(repo.path(), ["add", "AGENTS.md"]);
+        git(repo.path(), ["commit", "-m", "add context fixture"]);
+
+        let process_cwd = std::env::current_dir().unwrap();
+        let mut session = crate::session::Session::new("test", "test", 1, "test");
+        let mut context = crate::context::load(true);
+        let mut workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&process_cwd).unwrap());
+        let mut sandbox =
+            crate::sandbox::Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone());
+
+        crate::ui::rebind_worktree_workspace(
+            &mut session,
+            &mut context,
+            &None,
+            &mut workspace,
+            &mut sandbox,
+            repo.path(),
+            true,
+        )
+        .unwrap();
+
+        assert!(context.agents.is_none());
+        assert!(
+            !crate::agent::builder::build_preamble(&context, false)
+                .contains("DO_NOT_INJECT_CONTEXT")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_owner_retirement_waits_for_scoped_blocking_child() {
+        let app = include_str!("../ui/app.rs");
+        let btw_interrupt = app
+            .split("InterruptTarget::Btw =>")
+            .nth(1)
+            .unwrap()
+            .split("InterruptTarget::Validation")
+            .next()
+            .unwrap();
+        assert!(btw_interrupt.contains("retire_scoped_task"));
+
+        let (scope, started_rx, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        let task_scope = scope.clone();
+        let task = tokio::spawn(async move {
+            task_scope
+                .run(async {
+                    let _child = crate::agent::runner::spawn_blocking_scoped(|| ());
+                    std::future::pending::<()>().await;
+                })
+                .await;
+        });
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("scoped blocking child should start");
+        })
+        .await
+        .unwrap();
+
+        let mut retirement = tokio::spawn(crate::ui::retire_scoped_task(
+            task,
+            scope,
+            "test owner",
+            Duration::from_secs(1),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut retirement)
+                .await
+                .is_err(),
+            "retirement must wait for scoped blocking children"
+        );
+        release.release();
+        tokio::time::timeout(Duration::from_secs(1), retirement)
+            .await
+            .expect("retirement should finish after child release")
+            .expect("retirement task should not panic")
+            .expect("retirement should succeed");
     }
 
     #[cfg(feature = "hooks")]
@@ -319,7 +516,20 @@ mod tests {
         let process_cwd = std::env::current_dir().unwrap();
         let mut session = crate::session::Session::new("test", "test", 1, "test");
         let mut context = crate::context::load(true);
-        crate::ui::rebind_worktree_workspace(&mut session, &mut context, &None, &worktree);
+        let mut workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&process_cwd).unwrap());
+        let mut sandbox =
+            crate::sandbox::Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone());
+        crate::ui::rebind_worktree_workspace(
+            &mut session,
+            &mut context,
+            &None,
+            &mut workspace,
+            &mut sandbox,
+            &worktree,
+            false,
+        )
+        .unwrap();
 
         let ctx = crate::extras::hooks::best_effort_ctx();
         let dispatcher = crate::extras::hooks::get_dispatcher().expect("production dispatcher");
@@ -343,7 +553,16 @@ mod tests {
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
 
         std::fs::remove_file(observed).unwrap();
-        crate::ui::rebind_worktree_workspace(&mut session, &mut context, &None, repo.path());
+        crate::ui::rebind_worktree_workspace(
+            &mut session,
+            &mut context,
+            &None,
+            &mut workspace,
+            &mut sandbox,
+            repo.path(),
+            false,
+        )
+        .unwrap();
         cleanup_worktree(&worktree, "hook-workspace", repo.path(), true)
             .await
             .unwrap();
@@ -427,7 +646,7 @@ mod tests {
         );
         assert!(!cli.contains("Force worktree remove and branch delete even if dirty"));
         assert!(app.contains("--wt-force is deprecated; cleanup still preserves dirty worktrees"));
-        assert!(ui_module.contains("context.reload_from(workspace)"));
+        assert!(ui_module.contains("context.reload_from_binding(no_context_files, &replacement)"));
     }
 
     #[test]

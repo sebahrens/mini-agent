@@ -6929,6 +6929,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn windows_workspace_authority_native_and_js_relative_gold_eiffel() {
+        use rig::tool::Tool;
+
+        let temp = TempDir::new();
+        let ambient_target = std::env::current_dir().unwrap().join("gold-eiffel.js");
+        assert!(
+            !ambient_target.exists(),
+            "test requires a clean ambient path"
+        );
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(temp.path()).unwrap());
+        let permission = host_permission(temp.path().to_path_buf(), Action::Allow, Action::Allow);
+        let native_write =
+            crate::agent::tools::WriteTool::new(Some(permission.clone()), None, None)
+                .with_workspace_binding(workspace.clone());
+        native_write
+            .call(crate::agent::tools::WriteArgs {
+                path: "gold-eiffel.js".to_string(),
+                content: "export const source = 'native';\n".to_string(),
+            })
+            .await
+            .unwrap();
+        let native_read =
+            crate::agent::tools::ReadTool::new(Some(permission.clone()), None, None, 100)
+                .with_workspace_binding(workspace.clone());
+        let native_output = native_read
+            .call(crate::agent::tools::ReadArgs {
+                path: "gold-eiffel.js".to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert!(native_output.contains("source = 'native'"));
+
+        let owner = PermissionBridgeOwner::new(Some(permission), None, STEP_TIMEOUT);
+        let service = FileEffectService::new(
+            owner.bridge(),
+            AllowConfig::unrestricted(temp.path()).with_workspace_binding(workspace),
+            Duration::from_secs(1),
+        );
+        service
+            .write(
+                "gold-eiffel.js",
+                "export const source = 'js';\n".to_string(),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .read("gold-eiffel.js", PermCancellation::new())
+                .await
+                .unwrap(),
+            "export const source = 'js';\n"
+        );
+        assert!(
+            !ambient_target.exists(),
+            "relative native/JS writes escaped to process CWD"
+        );
+    }
+
+    #[tokio::test]
     async fn register_host_globals_returns_error_under_memory_pressure() {
         let runtime = rquickjs::Runtime::new().expect("create QuickJS runtime");
         let ctx = Context::full(&runtime).expect("create QuickJS context");

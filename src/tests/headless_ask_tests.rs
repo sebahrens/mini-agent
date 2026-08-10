@@ -38,7 +38,7 @@ fn guarded_checker() -> PermissionChecker {
     PermissionChecker::new(
         &PermissionConfigs::default(),
         SecurityMode::Guarded,
-        Some(std::path::PathBuf::from("/home/user/project")),
+        Some(std::env::current_dir().unwrap()),
         Some(vec![
             "guarded".to_string(),
             "standard".to_string(),

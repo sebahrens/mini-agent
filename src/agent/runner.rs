@@ -330,6 +330,8 @@ impl PausedAgentRunner {
 /// UI cancel the side question (e.g. on Ctrl-C) without touching the main agent.
 pub struct BtwRunner {
     pub abort_handle: tokio::task::AbortHandle,
+    pub task: tokio::task::JoinHandle<()>,
+    pub(crate) work_scope: Arc<AgentWorkScope>,
 }
 
 fn streamed_reasoning_text<R>(content: &StreamedAssistantContent<R>) -> Option<CompactString> {
@@ -914,7 +916,7 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
-    let join = tokio::spawn(async move {
+    let btw_future = async move {
         let stream_result = {
             let agent_ref = &agent;
             retry::retry_stream_chat(&retry_config, move || {
@@ -983,10 +985,17 @@ where
                 message: CompactString::new("side question ended without a response"),
             })
             .await;
+    };
+    let work_scope = AgentWorkScope::new();
+    let task_scope = Arc::clone(&work_scope);
+    let join = tokio::spawn(async move {
+        task_scope.run(btw_future).await;
     });
 
     BtwRunner {
         abort_handle: join.abort_handle(),
+        task: join,
+        work_scope,
     }
 }
 

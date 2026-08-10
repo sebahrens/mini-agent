@@ -20,7 +20,22 @@ pub struct McpClientManager {
 }
 
 impl McpClientManager {
-    pub(crate) async fn connect_all_in(
+    pub(crate) async fn connect_all_in_binding(
+        configs: &HashMap<String, config::McpServerConfig>,
+        workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> Self {
+        if let Err(error) = workspace.validate() {
+            return Self {
+                handles: Vec::new(),
+                notices: vec![CompactString::new(format!(
+                    "MCP workspace is no longer valid: {error}"
+                ))],
+            };
+        }
+        Self::connect_all_in(configs, workspace.root()).await
+    }
+
+    async fn connect_all_in(
         configs: &HashMap<String, config::McpServerConfig>,
         workspace: &std::path::Path,
     ) -> Self {
@@ -94,7 +109,7 @@ impl McpClientManager {
     /// (Re)connect a single server, replacing any existing handle for it.
     /// Used after an interactive OAuth login so the server's tools become
     /// available without restarting the session.
-    pub(crate) async fn reconnect_in(
+    async fn reconnect_in(
         &mut self,
         name: &str,
         cfg: &config::McpServerConfig,
@@ -120,6 +135,16 @@ impl McpClientManager {
         self.handles.retain(|h| h.server_name != name);
         self.handles.push(handle);
         Ok(())
+    }
+
+    pub(crate) async fn reconnect_in_binding(
+        &mut self,
+        name: &str,
+        cfg: &config::McpServerConfig,
+        workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    ) -> anyhow::Result<()> {
+        workspace.validate().map_err(anyhow::Error::msg)?;
+        self.reconnect_in(name, cfg, workspace.root()).await
     }
 
     pub async fn shutdown(self) {

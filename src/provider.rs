@@ -1279,47 +1279,6 @@ async fn build_openai_agent(
     }
 }
 
-// Builder inputs mirror independently resolved CLI/config authorities. Keeping
-// them explicit avoids hiding security-relevant state in a broad bag of options.
-#[allow(clippy::too_many_arguments)]
-pub async fn build_agent(
-    model: AnyModel,
-    cli: &Cli,
-    cfg: &Config,
-    context: &ContextFiles,
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
-    sandbox: Sandbox,
-    read_tracker: crate::agent::tools::ReadTracker,
-    reasoning_enabled: bool,
-    temperature: Option<f64>,
-    extra_body: Option<serde_json::Value>,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
-) -> AnyAgent {
-    let workspace_root = std::env::current_dir().unwrap_or_default();
-    let workspace = std::sync::Arc::new(
-        crate::paths::WorkspaceBinding::capture(&workspace_root)
-            .expect("current working directory must remain available while building an agent"),
-    );
-    build_agent_in_workspace(
-        model,
-        cli,
-        cfg,
-        context,
-        workspace,
-        permission,
-        ask_tx,
-        sandbox,
-        read_tracker,
-        reasoning_enabled,
-        temperature,
-        extra_body,
-        #[cfg(feature = "mcp")]
-        mcp_manager,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn build_agent_in_workspace(
     model: AnyModel,
@@ -1508,6 +1467,7 @@ pub fn build_btw_agent(
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     reasoning_enabled: bool,
@@ -1521,6 +1481,7 @@ pub fn build_btw_agent(
                 cli,
                 cfg,
                 context,
+                workspace,
                 permission,
                 ask_tx,
                 reasoning_enabled,
@@ -1534,6 +1495,7 @@ pub fn build_btw_agent(
                 cli,
                 cfg,
                 context,
+                workspace,
                 permission,
                 ask_tx,
                 reasoning_enabled,
@@ -1546,6 +1508,7 @@ pub fn build_btw_agent(
                     cli,
                     cfg,
                     context,
+                    workspace,
                     permission,
                     ask_tx,
                     reasoning_enabled,
@@ -1559,6 +1522,7 @@ pub fn build_btw_agent(
             cli,
             cfg,
             context,
+            workspace,
             permission,
             ask_tx,
             reasoning_enabled,
@@ -1570,6 +1534,7 @@ pub fn build_btw_agent(
             cli,
             cfg,
             context,
+            workspace,
             permission,
             ask_tx,
             reasoning_enabled,
@@ -1581,6 +1546,7 @@ pub fn build_btw_agent(
             cli,
             cfg,
             context,
+            workspace,
             permission,
             ask_tx,
             reasoning_enabled,

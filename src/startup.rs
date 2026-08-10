@@ -225,13 +225,14 @@ fn apply_startup_prompt_model(
 #[cfg(feature = "mcp")]
 pub(crate) async fn connect_headless_mcp(
     cfg: &Config,
-    workspace: &std::path::Path,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
 ) -> Option<crate::extras::mcp::McpClientManager> {
     let servers = cfg.mcp_servers.as_ref()?;
     if servers.is_empty() {
         return None;
     }
-    let manager = crate::extras::mcp::McpClientManager::connect_all_in(servers, workspace).await;
+    let manager =
+        crate::extras::mcp::McpClientManager::connect_all_in_binding(servers, workspace).await;
     for notice in &manager.notices {
         eprintln!("{}", notice);
     }
@@ -246,6 +247,7 @@ pub(crate) struct Startup {
     // Startup-owned source of truth shared by persistent artifact owners.
     #[allow(dead_code)]
     pub paths: AppPaths,
+    pub workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
     pub is_first_startup: bool,
     pub context: ContextFiles,
     pub provider: CompactString,
@@ -275,6 +277,7 @@ impl Startup {
         cli: Cli,
         cfg: Config,
         paths: AppPaths,
+        workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
         is_first_startup: bool,
         version_changed: bool,
         is_interactive: bool,
@@ -282,7 +285,9 @@ impl Startup {
         validate_startup_permission_policy(&cli, &cfg)?;
 
         // Load context first so prompts/themes are available early.
-        let context = context::load(cli.resolve_no_context_files(&cfg));
+        let no_context_files = cli.resolve_no_context_files(&cfg);
+        let context =
+            context::load(no_context_files).for_workspace_binding(no_context_files, &workspace);
 
         let mut provider = cli.resolve_provider(&cfg);
         let mut model = cli.resolve_model(&cfg);
@@ -417,6 +422,11 @@ impl Startup {
             session.update_context_window(cw);
         }
 
+        // The invocation's captured workspace is authoritative until an
+        // explicit, validated rebind replaces it. Saved pathname strings must
+        // not split tools across a different root during startup.
+        session.working_dir = CompactString::new(workspace.root().to_string_lossy());
+
         let client = provider::create_client(
             &provider,
             cli.api_key.as_deref(),
@@ -437,6 +447,7 @@ impl Startup {
             cli,
             cfg,
             paths,
+            workspace,
             is_first_startup,
             context,
             provider,
@@ -570,7 +581,7 @@ impl Startup {
         // Sandbox, tools config, status signals, permission checker
         let (authority, sandbox) =
             crate::permission::resolve_configured_execution_authority(&self.cli, &self.cfg)?;
-        self.sandbox = sandbox;
+        self.sandbox = sandbox.with_workspace_binding(self.workspace.clone());
         let edit_system = self.cli.resolve_edit_system(&self.cfg);
         tools::set_edit_system(edit_system);
 
@@ -579,8 +590,11 @@ impl Startup {
             self.status_signals = self.cli.status_socket.clone().map(StatusSignals::new);
         }
 
-        let (permission, ask_tx, ask_rx) =
-            crate::permission::build_interactive_permission(&self.cfg, authority)?;
+        let (permission, ask_tx, ask_rx) = crate::permission::build_interactive_permission_at(
+            &self.cfg,
+            authority,
+            Some(self.workspace.root().to_path_buf()),
+        )?;
         self.permission = permission;
         self.ask_tx = ask_tx;
         self.ask_rx = ask_rx;
@@ -701,7 +715,11 @@ impl Startup {
             }
 
             if regenerated {
-                self.context = context::load(self.cli.resolve_no_context_files(&self.cfg));
+                self.context = context::load(self.cli.resolve_no_context_files(&self.cfg))
+                    .for_workspace_binding(
+                        self.cli.resolve_no_context_files(&self.cfg),
+                        &self.workspace,
+                    );
             }
         }
 
@@ -963,7 +981,6 @@ impl Startup {
                 let run = self
                     .sandbox
                     .clone()
-                    .with_working_dir(std::path::PathBuf::from(self.session.working_dir.as_str()))
                     .run_explicit_shell(&msg, DEFAULT_COMMAND_LIMITS, None)
                     .await?;
                 let result = run.rendered_output();
@@ -991,16 +1008,13 @@ impl Startup {
             let completion_model = self.client.completion_model(self.model.to_string());
             let read_tracker = self.session.read_tracker.clone();
             #[cfg(feature = "mcp")]
-            let mcp_manager = connect_headless_mcp(
-                &self.cfg,
-                std::path::Path::new(self.session.working_dir.as_str()),
-            )
-            .await;
-            let agent = provider::build_agent(
+            let mcp_manager = connect_headless_mcp(&self.cfg, &self.workspace).await;
+            let agent = provider::build_agent_in_workspace(
                 completion_model,
                 &self.cli,
                 &self.cfg,
                 &self.context,
+                self.workspace.clone(),
                 self.permission,
                 // Non-interactive dispatch never keeps the ask channel: with
                 // no one draining it, an `Ask` verdict must fail closed as a
@@ -1072,16 +1086,13 @@ impl Startup {
         let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
         let read_tracker = self.session.read_tracker.clone();
         #[cfg(feature = "mcp")]
-        let mcp_manager = connect_headless_mcp(
-            &self.cfg,
-            std::path::Path::new(self.session.working_dir.as_str()),
-        )
-        .await;
-        let agent = provider::build_agent(
+        let mcp_manager = connect_headless_mcp(&self.cfg, &self.workspace).await;
+        let agent = provider::build_agent_in_workspace(
             model_completion,
             &self.cli,
             &self.cfg,
             &self.context,
+            self.workspace.clone(),
             self.permission,
             // Non-interactive dispatch never keeps the ask channel; see the
             // matching note in `dispatch_print`.
@@ -1115,6 +1126,7 @@ impl Startup {
             cfg,
             mut session,
             mut context,
+            workspace,
             client,
             permission,
             ask_tx,
@@ -1135,6 +1147,7 @@ impl Startup {
                 &cfg,
                 &mut session,
                 &mut context,
+                workspace,
                 client,
                 permission,
                 ask_tx,
