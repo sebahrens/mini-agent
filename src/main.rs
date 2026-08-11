@@ -41,6 +41,11 @@ fn main() -> anyhow::Result<ExitCode> {
         std::process::exit(exit_code);
     }
 
+    #[cfg(all(feature = "js", target_os = "windows"))]
+    if let Some(exit_code) = sandbox::worker::maybe_run_windows_preflight_helper() {
+        return Ok(exit_code);
+    }
+
     #[cfg(all(feature = "js", target_os = "macos"))]
     if let Some(exit_code) = sandbox::worker::maybe_run_macos_hosted_lifecycle() {
         return Ok(exit_code);
