@@ -596,7 +596,7 @@ pub struct JsTool {
     #[cfg(feature = "skills")]
     _admission_worker: Option<AdmissionWorker>,
     #[cfg(feature = "skills")]
-    telemetry: Option<crate::extras::js::skills::telemetry::TelemetryDispatcher>,
+    telemetry: Option<Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>>,
     #[cfg(feature = "skills")]
     skill_tool_call_ordinal: AtomicU64,
 }
@@ -703,7 +703,22 @@ impl JsTool {
         mut self,
         telemetry: crate::extras::js::skills::telemetry::TelemetryDispatcher,
     ) -> Self {
+        self.telemetry = Some(Arc::new(telemetry));
+        self
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_shared_telemetry(
+        mut self,
+        telemetry: Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>,
+    ) -> Self {
         self.telemetry = Some(telemetry);
+        self
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_proposal_service(mut self, proposal: ProposalEffectService) -> Self {
+        self.proposal_service = Some(proposal);
         self
     }
 
@@ -974,7 +989,7 @@ impl Tool for JsTool {
 
         #[cfg(feature = "skills")]
         dispatch_skill_telemetry(
-            self.telemetry.as_ref(),
+            self.telemetry.as_deref(),
             &skill_bundle,
             &skill_tool_call_id,
             &response.outcome,

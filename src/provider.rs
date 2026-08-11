@@ -605,7 +605,7 @@ pub enum AnyAgentInner {
 pub struct AnyAgent {
     inner: AnyAgentInner,
     #[cfg(feature = "skills")]
-    skills: Option<std::sync::Arc<crate::extras::js::skills::turn::SkillRuntime>>,
+    skills: Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>>,
     #[cfg(feature = "skills")]
     turn_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -624,15 +624,20 @@ impl AnyAgent {
     fn with_runtime(
         inner: AnyAgentInner,
         #[cfg(feature = "skills")] skills: Option<
-            std::sync::Arc<crate::extras::js::skills::turn::SkillRuntime>,
+            std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
         >,
     ) -> Self {
+        #[cfg(feature = "skills")]
+        let turn_gate = skills
+            .as_ref()
+            .map(|services| services.turn_gate())
+            .unwrap_or_else(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
         Self {
             inner,
             #[cfg(feature = "skills")]
             skills,
             #[cfg(feature = "skills")]
-            turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            turn_gate,
         }
     }
 }
@@ -1253,8 +1258,8 @@ async fn build_openai_agent(
     extra_body: Option<serde_json::Value>,
     #[cfg(feature = "js")]
     js_worker_containment_status: crate::sandbox::worker::WorkerContainmentStatus,
-    #[cfg(feature = "skills")] skill_turn_context: Option<
-        std::sync::Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+    #[cfg(feature = "skills")] skill_services: Option<
+        std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> OpenAiAgent {
@@ -1276,7 +1281,7 @@ async fn build_openai_agent(
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
-                skill_turn_context.clone(),
+                skill_services.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1299,7 +1304,7 @@ async fn build_openai_agent(
                 #[cfg(feature = "js")]
                 js_worker_containment_status,
                 #[cfg(feature = "skills")]
-                skill_turn_context,
+                skill_services,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1322,6 +1327,9 @@ pub async fn build_agent_in_workspace(
     reasoning_enabled: bool,
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
+    #[cfg(feature = "skills")] skill_service_owner: std::sync::Arc<
+        crate::extras::js::skills::session::SkillServiceOwner,
+    >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
     #[cfg(feature = "js")]
@@ -1330,45 +1338,14 @@ pub async fn build_agent_in_workspace(
     let js_worker_containment_status =
         resolve_js_worker_containment(js_tool_eligible, crate::sandbox::worker::containment_status);
     #[cfg(feature = "skills")]
-    let skills = if !js_tool_eligible
-        || !matches!(
-            &js_worker_containment_status,
-            crate::sandbox::worker::WorkerContainmentStatus::Available { .. }
-        ) {
-        None
-    } else {
-        let workspace_root = workspace.root();
-        let paths = crate::paths::process_paths()
-            .and_then(|paths| paths.with_workspace_root(workspace_root));
-        let embedding = cfg.embedding.clone();
-        match paths {
-            Ok(paths) => match crate::agent::runner::spawn_blocking_scoped(move || {
-                crate::extras::js::skills::turn::SkillRuntime::open_with_learned_js(
-                    &paths,
-                    embedding.as_ref(),
-                    true,
-                )
-            })
-            .await
-            {
-                Ok(Ok(runtime)) => Some(std::sync::Arc::new(runtime)),
-                Ok(Err(error)) => {
-                    tracing::warn!("skill discovery disabled: {error}");
-                    None
-                }
-                Err(error) => {
-                    tracing::warn!("skill discovery startup worker failed: {error}");
-                    None
-                }
-            },
-            Err(error) => {
-                tracing::warn!("skill discovery paths unavailable: {error}");
-                None
-            }
-        }
-    };
-    #[cfg(feature = "skills")]
-    let skill_turn_context = skills.as_ref().map(|runtime| runtime.turn_context());
+    let skills = resolve_skill_services(
+        js_tool_eligible,
+        &js_worker_containment_status,
+        &skill_service_owner,
+        &workspace,
+        cfg.embedding.clone(),
+    )
+    .await;
 
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(
@@ -1388,7 +1365,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
-                skill_turn_context.clone(),
+                skills.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1411,7 +1388,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
-                skill_turn_context.clone(),
+                skills.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1434,7 +1411,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
-                skill_turn_context.clone(),
+                skills.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1457,7 +1434,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
                 #[cfg(feature = "skills")]
-                skill_turn_context.clone(),
+                skills.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1480,7 +1457,7 @@ pub async fn build_agent_in_workspace(
                 #[cfg(feature = "js")]
                 js_worker_containment_status,
                 #[cfg(feature = "skills")]
-                skill_turn_context,
+                skills.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -1492,6 +1469,25 @@ pub async fn build_agent_in_workspace(
         #[cfg(feature = "skills")]
         skills,
     )
+}
+
+#[cfg(feature = "skills")]
+async fn resolve_skill_services(
+    eligible: bool,
+    containment: &crate::sandbox::worker::WorkerContainmentStatus,
+    owner: &std::sync::Arc<crate::extras::js::skills::session::SkillServiceOwner>,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+    embedding: Option<crate::config::EmbeddingConfig>,
+) -> Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>> {
+    if !eligible
+        || !matches!(
+            containment,
+            crate::sandbox::worker::WorkerContainmentStatus::Available { .. }
+        )
+    {
+        return None;
+    }
+    owner.resolve(workspace, embedding).await
 }
 
 #[cfg(feature = "js")]
@@ -1553,6 +1549,43 @@ mod startup_capability_tests {
             containment,
             WorkerContainmentStatus::Available { .. }
         ));
+    }
+
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn ineligible_or_uncontained_javascript_initializes_no_skill_services() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "mini-agent-skill-services-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap());
+        let owner =
+            std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+        let available = WorkerContainmentStatus::Available {
+            backend: WorkerBackend::for_current_platform(),
+            assurance: WorkerContainmentAssurance::Enforced,
+        };
+        let unavailable = WorkerContainmentStatus::Unavailable {
+            backend: WorkerBackend::for_current_platform(),
+            assurance: WorkerContainmentAssurance::Enforced,
+            reason: "test unavailable".to_string(),
+        };
+
+        assert!(
+            super::resolve_skill_services(false, &available, &owner, &workspace, None)
+                .await
+                .is_none()
+        );
+        assert!(
+            super::resolve_skill_services(true, &unavailable, &owner, &workspace, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(owner.initialization_attempts(), 0);
+        drop(workspace);
+        std::fs::remove_dir_all(workspace_root).unwrap();
     }
 }
 

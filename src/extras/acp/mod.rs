@@ -99,6 +99,20 @@ struct SessionState {
     turns: Arc<StdMutex<SessionTurns>>,
     read_tracker: crate::agent::tools::ReadTracker,
     sandbox: crate::sandbox::Sandbox,
+    #[cfg(feature = "skills")]
+    skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
+}
+
+struct PromptSessionSnapshot {
+    history: Arc<Mutex<SessionHistory>>,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+    context: Arc<ContextFiles>,
+    read_tracker: crate::agent::tools::ReadTracker,
+    sandbox: crate::sandbox::Sandbox,
+    #[cfg(feature = "skills")]
+    skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
+    control: Arc<TurnControl>,
+    registration: TurnRegistration,
 }
 
 const TURN_ACTIVE: u8 = 0;
@@ -702,6 +716,8 @@ async fn handle_new_session(
                 state.cfg.deny_repeated_reads.unwrap_or(true),
             ),
             sandbox,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id.clone(), turns);
@@ -760,7 +776,7 @@ async fn handle_prompt(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (history, workspace, context, read_tracker, sandbox, control, registration) = {
+    let snapshot = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
             .get(&session_id)
@@ -782,20 +798,33 @@ async fn handle_prompt(
             });
             generation
         };
-        (
-            sess.history.clone(),
-            sess.workspace.clone(),
-            sess.context.clone(),
-            sess.read_tracker.clone(),
-            sess.sandbox.clone(),
-            control.clone(),
-            TurnRegistration {
+        PromptSessionSnapshot {
+            history: sess.history.clone(),
+            workspace: sess.workspace.clone(),
+            context: sess.context.clone(),
+            read_tracker: sess.read_tracker.clone(),
+            sandbox: sess.sandbox.clone(),
+            #[cfg(feature = "skills")]
+            skill_services: sess.skill_services.clone(),
+            control: control.clone(),
+            registration: TurnRegistration {
                 generation,
                 turns: sess.turns.clone(),
                 control: control.clone(),
             },
-        )
+        }
     };
+    let PromptSessionSnapshot {
+        history,
+        workspace,
+        context,
+        read_tracker,
+        sandbox,
+        #[cfg(feature = "skills")]
+        skill_services,
+        control,
+        registration,
+    } = snapshot;
 
     let request_cancellation = responder.cancellation();
     if request_cancellation.is_cancelled() {
@@ -830,6 +859,8 @@ async fn handle_prompt(
                     context,
                     read_tracker,
                     sandbox,
+                    #[cfg(feature = "skills")]
+                    skill_services,
                     responder,
                     cx,
                     control,
@@ -877,6 +908,9 @@ async fn run_prompt(
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
     sandbox: crate::sandbox::Sandbox,
+    #[cfg(feature = "skills")] skill_services: Arc<
+        crate::extras::js::skills::session::SkillServiceOwner,
+    >,
     responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
@@ -1028,6 +1062,8 @@ async fn run_prompt(
             false,
             temperature,
             extra_body,
+            #[cfg(feature = "skills")]
+            skill_services,
             #[cfg(feature = "mcp")]
             None::<&crate::extras::mcp::McpClientManager>,
         ),
@@ -1814,6 +1850,8 @@ mod protocol_tests {
             })
         };
         let state = fixture_state(fixture);
+        #[cfg(feature = "skills")]
+        let state_for_skill_assertion = state.clone();
         let notifications = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
         let notification_sink = notifications.clone();
         let workspace = ProtocolTempDir::new();
@@ -1845,6 +1883,18 @@ mod protocol_tests {
                     .block_task()
                     .await?
                     .session_id;
+                #[cfg(feature = "skills")]
+                {
+                    let sessions = state_for_skill_assertion.sessions.lock().await;
+                    let first_services = &sessions.get(&first).unwrap().skill_services;
+                    let second_services = &sessions.get(&second).unwrap().skill_services;
+                    assert!(
+                        !Arc::ptr_eq(first_services, second_services),
+                        "ACP sessions must not share mutable learned-skill turn state"
+                    );
+                    assert_eq!(first_services.initialization_attempts(), 0);
+                    assert_eq!(second_services.initialization_attempts(), 0);
+                }
 
                 cx.send_request(prompt(first.clone(), "tools"))
                     .block_task()

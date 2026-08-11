@@ -596,25 +596,36 @@ pub enum DispatchError {
 impl TelemetryDispatcher {
     /// Spawn the bounded off-JS-thread SQLite ingestion worker.
     pub fn spawn(paths: &crate::paths::AppPaths) -> Result<Self, DispatchError> {
-        Self::spawn_inner(paths, None)
+        Self::spawn_inner(paths, None, crate::agent::runner::current_work_guard())
     }
 
     pub fn spawn_with_coordinator(
         paths: &crate::paths::AppPaths,
         coordinator: std::sync::Arc<super::coordinator::IndexCoordinator>,
     ) -> Result<Self, DispatchError> {
-        Self::spawn_inner(paths, Some(coordinator))
+        Self::spawn_inner(
+            paths,
+            Some(coordinator),
+            crate::agent::runner::current_work_guard(),
+        )
+    }
+
+    pub(crate) fn spawn_session_scoped_with_coordinator(
+        paths: &crate::paths::AppPaths,
+        coordinator: std::sync::Arc<super::coordinator::IndexCoordinator>,
+    ) -> Result<Self, DispatchError> {
+        Self::spawn_inner(paths, Some(coordinator), None)
     }
 
     fn spawn_inner(
         paths: &crate::paths::AppPaths,
         coordinator: Option<std::sync::Arc<super::coordinator::IndexCoordinator>>,
+        work_guard: Option<crate::agent::runner::AgentWorkGuard>,
     ) -> Result<Self, DispatchError> {
         let mut store = SkillStore::open_at(paths)?;
         let (tx, rx) = std::sync::mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
         let observability_lost = Arc::new(AtomicU64::new(0));
         let worker_observability_lost = Arc::clone(&observability_lost);
-        let work_guard = crate::agent::runner::current_work_guard();
         let join = std::thread::Builder::new()
             .name("skill-telemetry".into())
             .spawn(move || {

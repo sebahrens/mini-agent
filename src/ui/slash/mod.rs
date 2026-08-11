@@ -55,6 +55,8 @@ pub struct SlashCtx<'a> {
     pub ask_tx: &'a Option<AskSender>,
     pub todo_tools_enabled: &'a mut bool,
     pub sandbox: &'a Sandbox,
+    #[cfg(feature = "skills")]
+    pub skill_services: &'a std::sync::Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     pub terminal_guard: &'a mut TerminalGuard,
     #[cfg(feature = "loop")]
     pub loop_state: &'a mut Option<crate::extras::r#loop::LoopState>,
@@ -75,6 +77,8 @@ impl SlashCtx<'_> {
             ask_tx: self.ask_tx,
             sandbox: self.sandbox,
             read_tracker: &self.session.read_tracker,
+            #[cfg(feature = "skills")]
+            skill_services: self.skill_services,
             #[cfg(feature = "mcp")]
             mcp_manager: self.mcp_manager,
         }
@@ -96,6 +100,8 @@ impl SlashCtx<'_> {
             ask_tx: self.ask_tx,
             sandbox: self.sandbox,
             read_tracker,
+            #[cfg(feature = "skills")]
+            skill_services: self.skill_services,
             #[cfg(feature = "mcp")]
             mcp_manager: self.mcp_manager,
         }
@@ -495,6 +501,8 @@ pub async fn handle_slash(
         ask_tx: &ui.ask_tx,
         todo_tools_enabled: &mut slash.todo_tools_enabled,
         sandbox: &ui.sandbox,
+        #[cfg(feature = "skills")]
+        skill_services: &ui.skill_services,
         terminal_guard,
         #[cfg(feature = "loop")]
         loop_state: &mut chain.loop_state,

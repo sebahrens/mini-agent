@@ -46,6 +46,7 @@ pub mod repair;
 pub mod retention;
 pub mod router;
 pub mod scheduler;
+pub mod session;
 pub mod store;
 pub mod telemetry;
 pub mod turn;

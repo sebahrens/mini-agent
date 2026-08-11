@@ -590,10 +590,22 @@ pub(crate) struct AdmissionWorker {
 }
 
 impl AdmissionWorker {
-    pub(crate) fn start(mut evaluator: AdmissionEvaluator) -> Result<Self, AdmissionError> {
+    pub(crate) fn start(evaluator: AdmissionEvaluator) -> Result<Self, AdmissionError> {
+        Self::start_inner(evaluator, crate::agent::runner::current_work_guard())
+    }
+
+    pub(crate) fn start_session_scoped(
+        evaluator: AdmissionEvaluator,
+    ) -> Result<Self, AdmissionError> {
+        Self::start_inner(evaluator, None)
+    }
+
+    fn start_inner(
+        mut evaluator: AdmissionEvaluator,
+        work_guard: Option<crate::agent::runner::AgentWorkGuard>,
+    ) -> Result<Self, AdmissionError> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
-        let work_guard = crate::agent::runner::current_work_guard();
         let join = std::thread::Builder::new()
             .name("skill-admission".to_string())
             .spawn(move || {
