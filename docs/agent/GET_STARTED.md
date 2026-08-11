@@ -178,8 +178,9 @@ enabled by default: Linux uses `bwrap` when installed and trusted, supported mac
 system-provided Seatbelt backend at `/usr/bin/sandbox-exec`, and Windows selects the attested
 AppContainer backend (`restricted-token` remains a compatibility alias). Windows availability
 requires its cached native production preflight. That probe has a five-second run deadline followed
-by up to five seconds for whole-tree reaping and a fresh five-second profile/ACL recovery window;
-failure is cached and
+by up to five seconds for whole-tree reaping and a fresh five-second profile/ACL recovery window.
+Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by
+an interrupted earlier process; malformed or active roots fail closed without deletion. Failure is cached and
 remains closed unless `--no-sandbox` explicitly opts out. Other implicitly selected unavailable defaults warn and start
 unsandboxed. While sandboxing remains enabled, explicit `--sandbox`, `sandbox = true`, or selecting
 a backend through `--sandbox-backend` or `sandbox-backend` remains fail-closed. This general
