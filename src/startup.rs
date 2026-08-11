@@ -1541,6 +1541,7 @@ mod tests {
         replacement_server.thread.join().unwrap();
     }
 
+    #[cfg(feature = "multithread")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_non_cooperative_pricing_refresh_has_a_bounded_join() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
