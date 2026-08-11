@@ -93,13 +93,14 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     };
 
-    let mut session = match parse_imported_session(&content, ctx.session, ctx.cfg) {
-        Ok(session) => session,
-        Err(error) => {
-            write_error(ctx.renderer, format!("invalid session file: {}", error));
-            return Ok(());
-        }
-    };
+    let mut session =
+        match parse_imported_session(&content, ctx.session, ctx.cfg, ctx.workspace.root()) {
+            Ok(session) => session,
+            Err(error) => {
+                write_error(ctx.renderer, format!("invalid session file: {}", error));
+                return Ok(());
+            }
+        };
 
     if session.name.is_empty() {
         session.name = CompactString::new("imported");
@@ -193,6 +194,7 @@ fn parse_imported_session(
     content: &str,
     current: &crate::session::Session,
     cfg: &crate::config::Config,
+    workspace: &std::path::Path,
 ) -> anyhow::Result<crate::session::Session> {
     match crate::extras::export::parse_session_file(content)? {
         crate::extras::export::ParsedSessionFile::Native(mut session) => {
@@ -200,6 +202,7 @@ fn parse_imported_session(
             // Never accept a concealed redo payload that is absent from the
             // visible top-level history.
             session.rewind_undo = None;
+            session.working_dir = workspace.to_string_lossy().into_owned().into();
             Ok(session)
         }
         crate::extras::export::ParsedSessionFile::Jsonl(import) => {
@@ -212,7 +215,7 @@ fn parse_imported_session(
             );
             session.id = import.id;
             session.created_at = import.created_at;
-            session.working_dir = current.working_dir.clone();
+            session.working_dir = workspace.to_string_lossy().into_owned().into();
             session.total_estimated_tokens =
                 import.messages.iter().fold(0_u64, |total, message| {
                     total.saturating_add(message.estimated_tokens)
@@ -421,9 +424,7 @@ async fn handle_undo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         std::io::stdin().read_exact(&mut buf).is_ok() && (buf[0] == b'y' || buf[0] == b'Y');
 
     if do_stash {
-        match crate::ui::git_stash_in_workspace(std::path::Path::new(
-            ctx.session.working_dir.as_str(),
-        )) {
+        match crate::ui::git_stash_in_workspace(ctx.workspace.root()) {
             Ok(out) if out.status.success() => {
                 write_ok(ctx.renderer, "git stash done");
             }
@@ -670,6 +671,7 @@ mod import_tests {
     use crate::extras::export::session_to_jsonl;
     use crate::session::{MessageRole, Session};
     use std::cell::RefCell;
+    use std::path::Path;
 
     #[test]
     fn session_jsonl_slash_import_round_trip() {
@@ -679,9 +681,11 @@ mod import_tests {
         exported.add_message(MessageRole::Assistant, "second");
         let jsonl = session_to_jsonl(&exported).unwrap();
 
-        let current = Session::new("current-provider", "current-model", 128_000, "current");
+        let mut current = Session::new("current-provider", "current-model", 128_000, "current");
+        current.working_dir = "stale-session-workspace".into();
+        let workspace = Path::new("active-workspace");
         let cfg = Config::default();
-        let imported = parse_imported_session(&jsonl, &current, &cfg).unwrap();
+        let imported = parse_imported_session(&jsonl, &current, &cfg, workspace).unwrap();
         assert_eq!(imported.id, exported.id);
         assert_eq!(imported.name, exported.name);
         assert_eq!(imported.provider, exported.provider);
@@ -695,7 +699,7 @@ mod import_tests {
                 &crate::config::quick_models_map(&cfg)
             )
         );
-        assert_eq!(imported.working_dir, current.working_dir);
+        assert_eq!(Path::new(imported.working_dir.as_str()), workspace);
         assert_eq!(imported.messages.len(), exported.messages.len());
         for (imported, original) in imported.messages.iter().zip(&exported.messages) {
             assert_eq!(imported.role, original.role);
@@ -714,15 +718,19 @@ mod import_tests {
         let mut native = Session::new("native-provider", "native-model", 32_000, "native");
         native.input_token_cost = 1.25;
         native.output_token_cost = 2.5;
-        let current = Session::new("current", "current", 128_000, "current");
+        native.working_dir = "/saved/workspace-b".into();
+        let mut current = Session::new("current", "current", 128_000, "current");
+        current.working_dir = "stale-session-workspace".into();
+        let workspace = Path::new("active-workspace");
         let content = serde_json::to_string_pretty(&native).unwrap();
         let cfg = Config::default();
-        let imported = parse_imported_session(&content, &current, &cfg).unwrap();
+        let imported = parse_imported_session(&content, &current, &cfg, workspace).unwrap();
         assert_eq!(imported.id, native.id);
         assert_eq!(imported.provider, native.provider);
         assert_eq!(imported.context_window, native.context_window);
         assert_eq!(imported.input_token_cost, native.input_token_cost);
         assert_eq!(imported.output_token_cost, native.output_token_cost);
+        assert_eq!(Path::new(imported.working_dir.as_str()), workspace);
     }
 
     #[test]
@@ -739,6 +747,7 @@ mod import_tests {
             &serde_json::to_string(&native).unwrap(),
             &current,
             &Config::default(),
+            Path::new("active-workspace"),
         )
         .unwrap();
         assert!(imported.messages.is_empty());
@@ -751,9 +760,14 @@ mod import_tests {
         let original_id = current.id.clone();
         let original_messages = current.messages.len();
 
-        let error = parse_imported_session("{\"id\":", &current, &Config::default())
-            .err()
-            .expect("malformed input must fail");
+        let error = parse_imported_session(
+            "{\"id\":",
+            &current,
+            &Config::default(),
+            Path::new("active-workspace"),
+        )
+        .err()
+        .expect("malformed input must fail");
         assert!(error.to_string().contains("not valid JSON"));
         assert_eq!(current.id, original_id);
         assert_eq!(current.messages.len(), original_messages);

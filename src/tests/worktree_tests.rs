@@ -188,6 +188,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_workspace_consumers_do_not_trust_serialized_session_path() {
+        for path in [
+            "src/ui/app.rs",
+            "src/ui/events.rs",
+            "src/ui/statusline.rs",
+            "src/ui/slash/add.rs",
+            "src/ui/slash/features.rs",
+            "src/ui/slash/init.rs",
+            "src/ui/slash/review.rs",
+        ] {
+            let source = std::fs::read_to_string(path).unwrap();
+            assert!(
+                !source.contains("session.working_dir"),
+                "{path} must use the active WorkspaceBinding, not serialized session state"
+            );
+        }
+
+        let startup = include_str!("../startup.rs");
+        assert!(
+            !startup.contains("self.session.working_dir"),
+            "startup runtime consumers must use the captured WorkspaceBinding"
+        );
+
+        let slash = include_str!("../ui/slash/mod.rs");
+        let replacement = slash
+            .split("pub async fn replace_session")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn rebuild_agent_with_client")
+            .next()
+            .unwrap();
+        let prepare = replacement.find("create_client").unwrap();
+        for commit in ["*self.client =", "*self.agent =", "*self.session ="] {
+            assert!(
+                prepare < replacement.find(commit).unwrap(),
+                "session replacement must prepare fallible provider state before committing {commit}"
+            );
+        }
+        assert!(
+            !replacement.contains("mem::replace"),
+            "session replacement must not expose staged session state before activation succeeds"
+        );
+    }
+
     #[tokio::test]
     async fn windows_workspace_authority_worktree_rebind_all_surfaces() {
         let repo = TempRepo::new("ui explicit workspace");

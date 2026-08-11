@@ -92,12 +92,8 @@ async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     }
 
     let wt_base_dir = ctx.cli.resolve_wt_base_dir(ctx.cfg);
-    match crate::extras::git_worktree::create(
-        std::path::Path::new(ctx.session.working_dir.as_str()),
-        name,
-        wt_base_dir.as_deref(),
-    )
-    .await
+    match crate::extras::git_worktree::create(ctx.workspace.root(), name, wt_base_dir.as_deref())
+        .await
     {
         Ok((path, info)) => {
             return Err(anyhow::Error::new(
@@ -121,11 +117,7 @@ async fn handle_worktree(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Re
 
 #[cfg(feature = "git-worktree")]
 async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let info = match crate::extras::git_worktree::detect(std::path::Path::new(
-        ctx.session.working_dir.as_str(),
-    ))
-    .await
-    {
+    let info = match crate::extras::git_worktree::detect(ctx.workspace.root()).await {
         Some(i) => i,
         None => {
             write_error(ctx.renderer, "not in a git worktree");
@@ -166,11 +158,7 @@ async fn handle_wt_merge(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Re
 
 #[cfg(feature = "git-worktree")]
 async fn handle_wt_exit(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let info = match crate::extras::git_worktree::detect(std::path::Path::new(
-        ctx.session.working_dir.as_str(),
-    ))
-    .await
-    {
+    let info = match crate::extras::git_worktree::detect(ctx.workspace.root()).await {
         Some(i) => i,
         None => {
             write_error(ctx.renderer, "not in a git worktree");

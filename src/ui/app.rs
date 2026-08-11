@@ -223,7 +223,7 @@ impl<'a> App<'a> {
         if let Some(name) = &ui.cli.worktree {
             let wt_base_dir = ui.cli.resolve_wt_base_dir(ui.cfg);
             match crate::extras::git_worktree::create(
-                std::path::Path::new(ui.session.working_dir.as_str()),
+                ui.workspace.root(),
                 name,
                 wt_base_dir.as_deref(),
             )
@@ -267,7 +267,7 @@ impl<'a> App<'a> {
             let name = ts.to_string();
             let wt_base_dir = ui.cli.resolve_wt_base_dir(ui.cfg);
             match crate::extras::git_worktree::create(
-                std::path::Path::new(ui.session.working_dir.as_str()),
+                ui.workspace.root(),
                 &name,
                 wt_base_dir.as_deref(),
             )
@@ -2196,11 +2196,7 @@ impl<'a> App<'a> {
         if !self.ui.cli.resolve_wt_auto_merge(self.ui.cfg) {
             return Ok(());
         }
-        let info = match crate::extras::git_worktree::detect(std::path::Path::new(
-            self.ui.session.working_dir.as_str(),
-        ))
-        .await
-        {
+        let info = match crate::extras::git_worktree::detect(self.ui.workspace.root()).await {
             Some(i) => i,
             None => return Ok(()),
         };

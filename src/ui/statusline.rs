@@ -31,6 +31,7 @@ pub enum StatusSpan {
 
 /// Runtime values the statusline can show beyond the session itself.
 pub struct StatusContext<'a> {
+    pub workspace: &'a std::path::Path,
     pub loop_label: Option<&'a str>,
     pub prompt_name: Option<&'a str>,
     pub perm_mode: Option<&'a str>,
@@ -220,9 +221,9 @@ fn resolve_item(
         "git_branch" => session.git_branch.as_ref().map(|b| b.to_string()),
         "git_changes" => session.git_status.as_ref().and_then(format_changes),
         "git_status" => session.git_status.as_ref().map(format_status),
-        "cwd" => Some(basename(&session.working_dir)),
-        "cwd_full" => Some(contract_home(&session.working_dir)),
-        "worktree" => git_worktree(&session.working_dir),
+        "cwd" => Some(basename(&ctx.workspace.to_string_lossy())),
+        "cwd_full" => Some(contract_home(&ctx.workspace.to_string_lossy())),
+        "worktree" => git_worktree(&ctx.workspace.to_string_lossy()),
         "model" => Some(session.model.to_string()),
         "model_short" => Some(
             session
