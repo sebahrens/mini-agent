@@ -453,6 +453,7 @@ pub async fn handle_compress(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_slash(
     text: &str,
     renderer: &mut Renderer,
