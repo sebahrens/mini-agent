@@ -71,6 +71,22 @@ mod tests {
         }
     }
 
+    fn install_relative_shell(workspace: &Path) -> PathBuf {
+        let bin = workspace.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join(if cfg!(windows) { "bash.exe" } else { "bash" });
+        #[cfg(windows)]
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(&executable, b"#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        executable
+    }
+
     fn git<I, S>(repo: &Path, args: I)
     where
         I: IntoIterator<Item = S>,
@@ -233,9 +249,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_restore_paths_do_not_rebind_shell_capability() {
+        for path in [
+            "src/startup.rs",
+            "src/ui/slash/mod.rs",
+            "src/ui/slash/session.rs",
+        ] {
+            let source = std::fs::read_to_string(path).unwrap();
+            assert!(
+                !source.contains("rebind_workspace_binding"),
+                "{path} must retain the active shell capability outside explicit worktree switches"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn windows_workspace_authority_worktree_rebind_all_surfaces() {
         let repo = TempRepo::new("ui explicit workspace");
+        let repo_shell = install_relative_shell(repo.path());
+        git(repo.path(), ["add", "bin"]);
+        git(repo.path(), ["commit", "-m", "add workspace shell"]);
         let worktree = repo.path().with_extension("ui explicit linked worktree");
         git(
             repo.path(),
@@ -251,9 +285,18 @@ mod tests {
         let mut session = crate::session::Session::new("test", "test", 1, "test");
         let mut context = crate::context::load(true);
         let mut workspace =
-            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&process_cwd).unwrap());
-        let mut sandbox =
-            crate::sandbox::Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone());
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(repo.path()).unwrap());
+        let configured_shell = if cfg!(windows) {
+            "bin/bash.exe"
+        } else {
+            "bin/bash"
+        };
+        let shell_capability =
+            crate::sandbox::ShellCapability::resolve(configured_shell, workspace.root(), None)
+                .unwrap();
+        let mut sandbox = crate::sandbox::Sandbox::new(false, "bwrap")
+            .with_resolved_shell(Some(shell_capability))
+            .with_workspace_binding(workspace.clone());
 
         #[cfg(feature = "hooks")]
         let _active_workspace_guard = ScopedActiveWorkspace::capture();
@@ -273,6 +316,14 @@ mod tests {
         assert_eq!(workspace.root(), canonical_worktree);
         assert_eq!(context.workspace_root, canonical_worktree);
         assert_eq!(sandbox.workspace_root_for_test(), Some(workspace.root()));
+        assert_eq!(
+            sandbox.shell_capability().unwrap().executable(),
+            worktree
+                .join("bin")
+                .join(if cfg!(windows) { "bash.exe" } else { "bash" })
+                .canonicalize()
+                .unwrap()
+        );
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
         assert!(
             crate::agent::builder::build_preamble(&context, false)
@@ -328,6 +379,10 @@ mod tests {
         assert_eq!(workspace.root(), canonical_repo);
         assert_eq!(context.workspace_root, canonical_repo);
         assert_eq!(sandbox.workspace_root_for_test(), Some(workspace.root()));
+        assert_eq!(
+            sandbox.shell_capability().unwrap().executable(),
+            repo_shell.canonicalize().unwrap()
+        );
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
 
         cleanup_worktree(&worktree, "feature", repo.path(), true)
@@ -386,6 +441,91 @@ mod tests {
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
         drop(sandbox);
         drop(workspace);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_relative_shell_failure_rolls_back_every_workspace_authority() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-shell-rebind-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let original = root.join("original");
+        let replacement = root.join("replacement");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        let original_shell = install_relative_shell(&original);
+        let mut workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&original).unwrap());
+        let original_root = workspace.root().to_path_buf();
+        let configured_shell = if cfg!(windows) {
+            "bin/bash.exe"
+        } else {
+            "bin/bash"
+        };
+        let shell_capability =
+            crate::sandbox::ShellCapability::resolve(configured_shell, workspace.root(), None)
+                .unwrap();
+        let mut sandbox = crate::sandbox::Sandbox::new(false, "bwrap")
+            .with_resolved_shell(Some(shell_capability))
+            .with_workspace_binding(workspace.clone());
+        let mut session = crate::session::Session::new("test", "test", 1, "test");
+        session.working_dir = original_root.to_string_lossy().into_owned().into();
+        let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+        let permission = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::permission::checker::PermissionChecker::new(
+                &crate::permission::PermissionConfigs::default(),
+                crate::permission::SecurityMode::PlanWrite,
+                Some(original.clone()),
+                Some(vec!["planwrite".to_string()]),
+            )
+            .unwrap(),
+        ));
+        let permission = Some(permission);
+        let original_plan = original.join("PLAN.md");
+        let replacement_plan = replacement.join("PLAN.md");
+
+        let error = crate::ui::rebind_worktree_workspace(
+            &mut session,
+            &mut context,
+            &permission,
+            &mut workspace,
+            &mut sandbox,
+            &replacement,
+            true,
+        )
+        .expect_err("missing replacement shell must fail before publication");
+
+        assert!(error.to_string().contains("workspace-relative shell"));
+        assert_eq!(workspace.root(), original_root);
+        assert_eq!(Path::new(session.working_dir.as_str()), original_root);
+        assert_eq!(context.workspace_root, original_root);
+        assert_eq!(
+            sandbox.workspace_root_for_test(),
+            Some(original_root.as_path())
+        );
+        assert_eq!(
+            sandbox.shell_capability().unwrap().executable(),
+            original_shell.canonicalize().unwrap()
+        );
+        let checker = permission
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            checker
+                .plan_write_authorization("write", &original_plan.to_string_lossy())
+                .is_some()
+        );
+        assert!(
+            checker
+                .plan_write_authorization("write", &replacement_plan.to_string_lossy())
+                .is_none()
+        );
+        drop(checker);
+
+        drop((sandbox, workspace, permission));
         std::fs::remove_dir_all(root).unwrap();
     }
 
