@@ -302,6 +302,7 @@ mod windows {
     const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
     const GENERIC_READ: Dword = 0x8000_0000;
     const GENERIC_WRITE: Dword = 0x4000_0000;
+    const DELETE: Dword = 0x0001_0000;
     const READ_CONTROL: Dword = 0x0002_0000;
     const WRITE_DAC: Dword = 0x0004_0000;
     const FILE_SHARE_READ: Dword = 0x0000_0001;
@@ -324,6 +325,9 @@ mod windows {
     const PROTECTED_DACL_SECURITY_INFORMATION: Dword = 0x8000_0000;
     const TOKEN_QUERY: Dword = 0x0000_0008;
     const TOKEN_USER_CLASS: Dword = 1;
+    const ERROR_ACCESS_DENIED: Dword = 5;
+    const ERROR_SHARING_VIOLATION: Dword = 32;
+    const ERROR_LOCK_VIOLATION: Dword = 33;
     const ERROR_ALREADY_EXISTS: Dword = 183;
 
     #[repr(C)]
@@ -757,6 +761,7 @@ mod windows {
     fn replace_with_retry(
         temp_wide: &[u16],
         target_wide: &[u16],
+        target: &Path,
         flags: Dword,
     ) -> std::io::Result<()> {
         super::super::retry_windows_lock_violation(
@@ -764,11 +769,41 @@ mod windows {
                 if unsafe { MoveFileExW(temp_wide.as_ptr(), target_wide.as_ptr(), flags) } != 0 {
                     Ok(())
                 } else {
-                    Err(std::io::Error::last_os_error())
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+                        && delete_share_is_locked(target)
+                    {
+                        Err(std::io::Error::from_raw_os_error(
+                            ERROR_SHARING_VIOLATION as i32,
+                        ))
+                    } else {
+                        Err(error)
+                    }
                 }
             },
             || false,
         )
+    }
+
+    fn delete_share_is_locked(path: &Path) -> bool {
+        match open_handle(
+            path,
+            DELETE,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        ) {
+            Ok(handle) => {
+                let _ = unsafe { CloseHandle(handle) };
+                false
+            }
+            Err(error) => matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == ERROR_SHARING_VIOLATION as i32
+                        || code == ERROR_LOCK_VIOLATION as i32
+            ),
+        }
     }
 
     pub(crate) fn open_existing(path: &Path) -> std::io::Result<std::fs::File> {
@@ -850,7 +885,7 @@ mod windows {
                     return Err(std::io::Error::last_os_error());
                 }
             } else {
-                replace_with_retry(&temp_wide, &target_wide, flags)?;
+                replace_with_retry(&temp_wide, &target_wide, path, flags)?;
             }
             repair_path(path, false)
         })();
