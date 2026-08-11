@@ -3160,10 +3160,12 @@ mod sandbox_tests {
             .find("CreateAppContainerProfile(")
             .expect("AppContainer creation missing");
         assert!(profile_lock < intent_sync && intent_sync < profile_create);
-        assert!(
-            profile_creation
-                .contains("remove_profile_intent(&intent_path, intent_lease, &profile_control)")
+        assert_eq!(
+            profile_creation.matches("remove_profile_intent(").count(),
+            3,
+            "every profile transition outcome must remove its intent through the bound root"
         );
+        assert!(profile_creation.contains("&journal_root,"));
         let stale_sweep = source
             .split("fn sweep_stale_profiles_until(")
             .nth(1)
@@ -3397,6 +3399,11 @@ mod sandbox_tests {
             .and_then(|source| source.split("fn create_profile_journal").next())
             .expect("profile journal root implementation missing");
         assert!(journal_root.contains("private_control_root_candidate(cache)?"));
+        assert!(source.contains("struct ProfileJournalRootAuthority("));
+        assert!(source.contains("_ancestors: Vec<File>"));
+        assert!(source.contains("crate::fs::windows_file_identity(&directory)"));
+        assert!(source.contains("journal_root.revalidate()?;"));
+        assert!(source.contains("journal_root.validate_child(path)?;"));
         let control_candidate = source
             .split("fn private_control_root_candidate(")
             .nth(1)
