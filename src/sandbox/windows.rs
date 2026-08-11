@@ -254,16 +254,25 @@ impl Drop for Local {
     }
 }
 
-struct AclMutationGuard(Handle);
+pub(crate) struct AclMutationGuard(Handle);
 
 impl AclMutationGuard {
-    fn acquire() -> Result<Self, String> {
+    pub(crate) fn acquire() -> Result<Self, String> {
+        Self::acquire_until(Instant::now() + Duration::from_millis(ACL_MUTEX_WAIT_MS.into()))
+    }
+
+    pub(crate) fn acquire_until(deadline: Instant) -> Result<Self, String> {
         let name = wide_string(ACL_MUTEX_NAME);
         let mutex = Handle::created(
             unsafe { CreateMutexW(null(), 0, name.as_ptr()) },
             "open cross-process ACL mutation mutex",
         )?;
-        match unsafe { WaitForSingleObject(mutex.raw(), ACL_MUTEX_WAIT_MS) } {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("sandbox: timed out serializing ACL mutation".into());
+        }
+        let wait_ms = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+        match unsafe { WaitForSingleObject(mutex.raw(), wait_ms) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(Self(mutex)),
             WAIT_TIMEOUT => Err("sandbox: timed out serializing ACL mutation".into()),
             _ => Err(last_error("wait for cross-process ACL mutation mutex")),

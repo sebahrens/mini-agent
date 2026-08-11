@@ -140,7 +140,18 @@ pub(super) fn standard_streams_are_protocol_pipes() -> bool {
 }
 
 pub(super) fn containment_status() -> WorkerContainmentStatus {
-    STATUS.get_or_init(probe_containment).clone()
+    cached_containment_status(&STATUS, probe_containment)
+}
+
+fn cached_containment_status(
+    cache: &OnceLock<WorkerContainmentStatus>,
+    probe: impl FnOnce() -> WorkerContainmentStatus,
+) -> WorkerContainmentStatus {
+    cache.get_or_init(probe).clone()
+}
+
+pub(super) fn maybe_run_preflight_helper() -> Option<std::process::ExitCode> {
+    feasibility::maybe_run_runtime_preflight_helper()
 }
 
 fn probe_containment() -> WorkerContainmentStatus {
@@ -411,7 +422,7 @@ mod feasibility {
     use crate::sandbox::worker::{
         INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, WorkerBackend, WorkerProcess,
     };
-    use std::ffi::{OsStr, c_void};
+    use std::ffi::{OsStr, OsString, c_void};
     use std::fmt;
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read, Write};
@@ -431,7 +442,7 @@ mod feasibility {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, GENERIC_ALL,
+        ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, FALSE, GENERIC_ALL,
         GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, GetLastError, HANDLE,
         LocalFree, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
@@ -476,10 +487,12 @@ mod feasibility {
     use windows_sys::Win32::System::JobObjects::{
         CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
-        JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
         JobObjectBasicAndIoAccountingInformation, JobObjectBasicUIRestrictions,
         JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
     };
     use windows_sys::Win32::System::Memory::{
         GetProcessHeap, HEAP_ZERO_MEMORY, HeapAlloc, HeapFree,
@@ -549,6 +562,14 @@ mod feasibility {
     const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
     const PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
     const PRODUCTION_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+    const PRODUCTION_PREFLIGHT_HELPER_ARG: &str = "--mini-agent-windows-worker-preflight-v1";
+    const PRODUCTION_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+    #[cfg(test)]
+    pub(super) const PREFLIGHT_TIMEOUT_CHILD_TEST_NAME: &str =
+        "sandbox::worker::platform::tests::windows_worker_preflight_timeout_child";
+    #[cfg(test)]
+    pub(super) const PREFLIGHT_SUCCESS_CHILD_TEST_NAME: &str =
+        "sandbox::worker::platform::tests::windows_worker_preflight_success_child";
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
@@ -1112,19 +1133,19 @@ mod feasibility {
         }
     }
 
-    struct FileSecurity {
+    pub(super) struct FileSecurity {
         _descriptor: LocalMemory,
         owner: PSID,
         dacl: *mut ACL,
     }
 
     #[derive(Debug, PartialEq, Eq)]
-    struct FileSecuritySnapshot {
+    pub(super) struct FileSecuritySnapshot {
         owner: Vec<u8>,
         dacl: Vec<u8>,
     }
 
-    fn read_file_security(path: &Path) -> Result<FileSecurity, GateError> {
+    pub(super) fn read_file_security(path: &Path) -> Result<FileSecurity, GateError> {
         let path = wide_null(path.as_os_str())?;
         let mut owner = null_mut();
         let mut dacl = null_mut();
@@ -1165,7 +1186,9 @@ mod feasibility {
         })
     }
 
-    fn snapshot_file_security(security: &FileSecurity) -> Result<FileSecuritySnapshot, GateError> {
+    pub(super) fn snapshot_file_security(
+        security: &FileSecurity,
+    ) -> Result<FileSecuritySnapshot, GateError> {
         // SAFETY: `owner` is a validated SID inside the live owned security descriptor.
         let owner_bytes = unsafe { GetLengthSid(security.owner) } as usize;
         if owner_bytes == 0 {
@@ -1378,11 +1401,35 @@ mod feasibility {
         }
     }
 
+    enum ExecutableAclAuthority<'a> {
+        Local(&'a crate::sandbox::windows::AclMutationGuard),
+        Supervised,
+    }
+
     fn prepare_executable_acl(
         executable: &Path,
         appcontainer_sid: PSID,
         policy: &SidPolicy,
     ) -> Result<(PathBuf, InstallLocation, WinHandle), GateError> {
+        let mutation = crate::sandbox::windows::AclMutationGuard::acquire()
+            .map_err(|error| GateError(format!("serialize worker executable ACL: {error}")))?;
+        prepare_executable_acl_with_mode(
+            executable,
+            appcontainer_sid,
+            policy,
+            ExecutableAclAuthority::Local(&mutation),
+        )
+    }
+
+    fn prepare_executable_acl_with_mode(
+        executable: &Path,
+        appcontainer_sid: PSID,
+        policy: &SidPolicy,
+        authority: ExecutableAclAuthority<'_>,
+    ) -> Result<(PathBuf, InstallLocation, WinHandle), GateError> {
+        if let ExecutableAclAuthority::Local(mutation) = &authority {
+            let _ = mutation;
+        }
         reject_unc_or_remote_syntax(executable)?;
         reject_reparse_components(executable)?;
         let executable = std::fs::canonicalize(executable)
@@ -1490,11 +1537,15 @@ mod feasibility {
             ));
         }
 
+        let image_lock = lock_executable_image(&executable)?;
+        Ok((executable, location, image_lock))
+    }
+
+    fn lock_executable_image(executable: &Path) -> Result<WinHandle, GateError> {
         let path = wide_null(executable.as_os_str())?;
-        // FILE_SHARE_READ deliberately excludes share-write and share-delete.
-        // Keeping this handle alive through CreateProcess closes the final-file
-        // replacement window between ACL inspection and image mapping.
-        let image_lock = WinHandle::from_created(
+        // FILE_SHARE_READ deliberately excludes share-write and share-delete. Keeping this handle
+        // alive closes final-file replacement while ACL state is inspected, changed, or restored.
+        WinHandle::from_created(
             unsafe {
                 CreateFileW(
                     path.as_ptr(),
@@ -1507,8 +1558,46 @@ mod feasibility {
                 )
             },
             "lock inspected executable against write/delete",
-        )?;
-        Ok((executable, location, image_lock))
+        )
+        .map_err(Into::into)
+    }
+
+    fn restore_executable_dacl(
+        executable: &Path,
+        baseline: &FileSecurity,
+        expected: &FileSecuritySnapshot,
+    ) -> Result<(), GateError> {
+        let current = read_file_security(executable)?;
+        if !sid_equal(current.owner, baseline.owner) {
+            return Err(GateError(
+                "worker executable owner changed during preflight".to_string(),
+            ));
+        }
+        drop(current);
+        let mut path = wide_null(executable.as_os_str())?;
+        // SAFETY: `baseline` owns the complete descriptor containing this non-null DACL through
+        // the synchronous restore. The cross-process ACL mutation guard is held by the caller.
+        let result = unsafe {
+            SetNamedSecurityInfoW(
+                path.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                baseline.dacl,
+                null_mut(),
+            )
+        };
+        if result != 0 {
+            return Err(win32_error("restore worker executable DACL", result));
+        }
+        let restored = read_file_security(executable)?;
+        if snapshot_file_security(&restored)? != *expected {
+            return Err(GateError(
+                "worker executable DACL restoration did not attest exactly".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn supported_root(path: &Path, location: InstallLocation) -> Result<PathBuf, GateError> {
@@ -1760,6 +1849,7 @@ mod feasibility {
     pub(super) struct ProductionLaunchHooks {
         fail_at: Option<ProductionFailurePoint>,
         deadline: Option<Instant>,
+        preflight_acl_supervised: bool,
         child: ProductionChild,
         #[cfg(test)]
         containment: Option<ContainmentProbeConfiguration>,
@@ -1905,6 +1995,7 @@ mod feasibility {
             Self {
                 fail_at: None,
                 deadline: None,
+                preflight_acl_supervised: false,
                 child: ProductionChild::Worker,
                 #[cfg(test)]
                 containment: None,
@@ -1918,6 +2009,7 @@ mod feasibility {
             Self {
                 fail_at: Some(point),
                 deadline: None,
+                preflight_acl_supervised: false,
                 child: ProductionChild::FailureTest,
                 containment: None,
                 executable_override: None,
@@ -1932,6 +2024,7 @@ mod feasibility {
             Self {
                 fail_at: Some(point),
                 deadline: None,
+                preflight_acl_supervised: false,
                 child: ProductionChild::FailureTest,
                 containment: None,
                 executable_override: Some(executable),
@@ -1946,6 +2039,7 @@ mod feasibility {
             Self {
                 fail_at: None,
                 deadline: None,
+                preflight_acl_supervised: false,
                 child: ProductionChild::ContainmentTest,
                 containment: Some(configuration),
                 executable_override: Some(executable),
@@ -1957,6 +2051,7 @@ mod feasibility {
             Self {
                 fail_at: None,
                 deadline: None,
+                preflight_acl_supervised: false,
                 child: ProductionChild::ProtocolTest,
                 containment: None,
                 executable_override: Some(executable),
@@ -1968,6 +2063,7 @@ mod feasibility {
             Self {
                 fail_at: None,
                 deadline: None,
+                preflight_acl_supervised: false,
                 child: ProductionChild::Worker,
                 containment: None,
                 executable_override: Some(executable),
@@ -1985,6 +2081,11 @@ mod feasibility {
 
         fn with_deadline(mut self, deadline: Instant) -> Self {
             self.deadline = Some(deadline);
+            self
+        }
+
+        fn with_supervised_preflight_acl(mut self) -> Self {
+            self.preflight_acl_supervised = true;
             self
         }
 
@@ -2781,8 +2882,24 @@ mod feasibility {
         hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
         let executable = production_executable(&hooks)?;
         let policy = SidPolicy::current()?;
+        let acl_mutation = if hooks.preflight_acl_supervised {
+            None
+        } else {
+            let deadline = hooks
+                .deadline
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+            Some(
+                crate::sandbox::windows::AclMutationGuard::acquire_until(deadline).map_err(
+                    |error| GateError(format!("serialize worker executable ACL: {error}")),
+                )?,
+            )
+        };
+        let acl_mode = match acl_mutation.as_ref() {
+            Some(mutation) => ExecutableAclAuthority::Local(mutation),
+            None => ExecutableAclAuthority::Supervised,
+        };
         let (executable, _location, image_lock) =
-            prepare_executable_acl(&executable, profile.sid, &policy)?;
+            prepare_executable_acl_with_mode(&executable, profile.sid, &policy, acl_mode)?;
         let inheritance_guard = crate::process_creation::creation_guard()?;
         hooks.require_before_deadline()?;
         let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
@@ -2843,6 +2960,8 @@ mod feasibility {
 
         hooks.checkpoint(ProductionFailurePoint::CreateProcess)?;
         hooks.require_before_deadline()?;
+        // CreateProcessW itself is not cancellable, so the shared creation lock and the final
+        // deadline check must both complete before entering this bounded OS boundary.
         // SAFETY: all UTF-16 buffers are NUL-terminated and remain live; command_line is mutable
         // as required. STARTUPINFOEX and all six attribute values remain initialized until after
         // CreateProcessW. TRUE is required for HANDLE_LIST, whose exact three inheritable pipe
@@ -2960,43 +3079,413 @@ mod feasibility {
         })
     }
 
-    enum RuntimePreflightTarget {
+    pub(super) enum RuntimePreflightTarget {
         CurrentExecutable,
         #[cfg(test)]
         Installed(PathBuf),
+        #[cfg(test)]
+        Test {
+            executable: PathBuf,
+            child_test: &'static str,
+        },
+    }
+
+    #[derive(Clone, Copy)]
+    enum PreflightHelperCommand {
+        Production,
+        #[cfg(test)]
+        Test(&'static str),
     }
 
     fn run_runtime_preflight(target: RuntimePreflightTarget) -> Result<(), GateError> {
-        let deadline = Instant::now() + PRODUCTION_PREFLIGHT_TIMEOUT;
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("mini-agent-windows-preflight".to_string())
-            .spawn(move || {
-                let hooks = match target {
-                    RuntimePreflightTarget::CurrentExecutable => {
-                        ProductionLaunchHooks::production()
-                    }
-                    #[cfg(test)]
-                    RuntimePreflightTarget::Installed(executable) => {
-                        ProductionLaunchHooks::installed_worker(executable)
-                    }
-                }
-                .with_deadline(deadline);
-                // The helper retains sole ownership of any late worker result. Even if the
-                // the caller's wait deadline wins during ACL work, creation-lock wait, or a
-                // synchronous CreateProcessW call, a worker produced later is terminated and
-                // reaped below before this helper exits. CreateProcessW itself is not cancellable.
-                let _ = sender.send(run_runtime_preflight_owned(hooks, deadline));
-            })
-            .map_err(|error| GateError(format!("start Windows preflight helper: {error}")))?;
+        run_runtime_preflight_with_timeouts(
+            target,
+            PRODUCTION_PREFLIGHT_TIMEOUT,
+            PRODUCTION_PREFLIGHT_REAP_TIMEOUT,
+        )
+    }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        receiver.recv_timeout(remaining).map_err(|_| {
-            GateError(
-                "Windows production runtime preflight exceeded its caller wait deadline"
-                    .to_string(),
+    pub(super) fn run_runtime_preflight_with_timeouts(
+        target: RuntimePreflightTarget,
+        run_timeout: Duration,
+        cleanup_timeout: Duration,
+    ) -> Result<(), GateError> {
+        let started = Instant::now();
+        let run_deadline = started + run_timeout;
+        let cleanup_deadline = run_deadline + cleanup_timeout;
+        let (executable, helper_command) = match target {
+            RuntimePreflightTarget::CurrentExecutable => (
+                std::env::current_exe()
+                    .map_err(|error| GateError(format!("resolve preflight executable: {error}")))?,
+                PreflightHelperCommand::Production,
+            ),
+            #[cfg(test)]
+            RuntimePreflightTarget::Installed(executable) => {
+                (executable, PreflightHelperCommand::Production)
+            }
+            #[cfg(test)]
+            RuntimePreflightTarget::Test {
+                executable,
+                child_test,
+            } => (executable, PreflightHelperCommand::Test(child_test)),
+        };
+        reject_unc_or_remote_syntax(&executable)?;
+        reject_reparse_components(&executable)?;
+        let executable = std::fs::canonicalize(&executable).map_err(|error| {
+            GateError(format!("canonicalize worker-preflight executable: {error}"))
+        })?;
+        if !executable
+            .metadata()
+            .map_err(|error| GateError(format!("stat worker-preflight executable: {error}")))?
+            .is_file()
+        {
+            return Err(GateError(
+                "worker-preflight executable is not an exact file".to_string(),
+            ));
+        }
+        let mutation = crate::sandbox::windows::AclMutationGuard::acquire_until(run_deadline)
+            .map_err(|error| GateError(format!("serialize worker preflight ACL: {error}")))?;
+        let image_lock = lock_executable_image(&executable)?;
+        let baseline = read_file_security(&executable)?;
+        let baseline_snapshot = snapshot_file_security(&baseline)?;
+
+        let result = run_supervised_preflight_helper(
+            &executable,
+            helper_command,
+            run_deadline,
+            cleanup_deadline,
+        );
+        if result.is_err() {
+            let rollback = restore_executable_dacl(&executable, &baseline, &baseline_snapshot);
+            drop(image_lock);
+            return match (result, rollback) {
+                (Err(error), Ok(())) => Err(error),
+                (Err(error), Err(cleanup)) => Err(GateError(format!(
+                    "{error}; worker preflight ACL rollback failed: {cleanup}"
+                ))),
+                _ => unreachable!(),
+            };
+        }
+        drop(image_lock);
+        drop(mutation);
+        Ok(())
+    }
+
+    struct SupervisedPreflightHelper {
+        process: WinHandle,
+        job: WinHandle,
+    }
+
+    fn preflight_supervisor_job() -> Result<WinHandle, GateError> {
+        let job = WinHandle::from_created(
+            unsafe { CreateJobObjectW(null(), null()) },
+            "create Windows worker-preflight supervisor Job",
+        )?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the directly owned Job and initialized fixed-size limit structure remain live;
+        // SetInformationJobObject copies the configuration synchronously.
+        if unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
-        })?
+        } == 0
+        {
+            return Err(last_error("configure worker-preflight supervisor Job"));
+        }
+        Ok(job)
+    }
+
+    fn preflight_helper_command_line(
+        executable: &Path,
+        command: PreflightHelperCommand,
+    ) -> Result<Vec<u16>, GateError> {
+        let display = executable.as_os_str().to_string_lossy();
+        if display.contains('"') {
+            return Err(GateError(
+                "Windows preflight-helper executable path contains a quote".to_string(),
+            ));
+        }
+        let arguments = match command {
+            PreflightHelperCommand::Production => PRODUCTION_PREFLIGHT_HELPER_ARG.to_string(),
+            #[cfg(test)]
+            PreflightHelperCommand::Test(child_test) => {
+                format!("--exact {child_test} --nocapture --test-threads=1")
+            }
+        };
+        Ok(wide_string(&format!("\"{display}\" {arguments}")))
+    }
+
+    fn preflight_helper_environment_block() -> Result<Vec<u16>, GateError> {
+        let system_root = system_windows_directory()?;
+        let mut entries = vec![("SystemRoot", system_root.into_os_string())];
+        for name in ["CARGO_HOME", "LOCALAPPDATA", "TEMP", "TMP", "USERPROFILE"] {
+            if let Some(value) = std::env::var_os(name) {
+                entries.push((name, value));
+            }
+        }
+        entries.sort_by_key(|(name, _)| name.to_ascii_lowercase());
+        let mut block = Vec::new();
+        for (name, value) in entries {
+            let mut entry = OsString::from(format!("{name}="));
+            entry.push(value);
+            let encoded = entry.encode_wide().collect::<Vec<_>>();
+            if encoded.contains(&0) {
+                return Err(GateError(format!(
+                    "Windows preflight path variable {name} is invalid"
+                )));
+            }
+            block.extend(encoded);
+            block.push(0);
+        }
+        block.push(0);
+        Ok(block)
+    }
+
+    fn launch_supervised_preflight_helper(
+        executable: &Path,
+        command: PreflightHelperCommand,
+        deadline: Instant,
+    ) -> Result<SupervisedPreflightHelper, GateError> {
+        let job = preflight_supervisor_job()?;
+        let job_handles = [job.raw()];
+        let mut attributes = AttributeList::new(1)?;
+        attributes.update_slice(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handles)?;
+        let executable_wide = wide_null(executable.as_os_str())?;
+        let mut command_line = preflight_helper_command_line(executable, command)?;
+        let environment = preflight_helper_environment_block()?;
+        let child_directory = system_windows_directory()?;
+        let child_directory_wide = wide_null(child_directory.as_os_str())?;
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes.pointer;
+        let mut process_information = PROCESS_INFORMATION::default();
+        let _creation_guard =
+            crate::process_creation::creation_guard_until(deadline).map_err(|error| {
+                GateError(format!("acquire worker-preflight creation lock: {error}"))
+            })?;
+        if Instant::now() >= deadline {
+            return Err(GateError(
+                "Windows worker preflight expired before helper creation".to_string(),
+            ));
+        }
+        // SAFETY: all UTF-16 buffers and the initialized JOB_LIST attribute remain live through
+        // this call. No handles or ambient environment are inherited. The returned process/thread
+        // handles transfer to RAII owners immediately, and the helper enters the kill-on-close Job
+        // at creation time.
+        if unsafe {
+            CreateProcessW(
+                executable_wide.as_ptr(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                FALSE,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS,
+                environment.as_ptr().cast(),
+                child_directory_wide.as_ptr(),
+                &startup.StartupInfo,
+                &mut process_information,
+            )
+        } == 0
+        {
+            return Err(last_error(
+                "create supervised Windows worker-preflight helper",
+            ));
+        }
+        let process = match WinHandle::from_created(
+            process_information.hProcess,
+            "own Windows worker-preflight helper process",
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                close_unowned_handle(process_information.hThread);
+                return Err(error.into());
+            }
+        };
+        let thread = WinHandle::from_created(
+            process_information.hThread,
+            "own Windows worker-preflight helper thread",
+        )?;
+        drop(thread);
+        drop(attributes);
+        Ok(SupervisedPreflightHelper { process, job })
+    }
+
+    fn preflight_job_active_processes(job: &WinHandle) -> Result<u32, GateError> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the directly owned Job and exact initialized output structure remain live for
+        // this synchronous query; Windows retains neither pointer.
+        if unsafe {
+            QueryInformationJobObject(
+                job.raw(),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("query worker-preflight supervisor Job"));
+        }
+        Ok(accounting.ActiveProcesses)
+    }
+
+    fn terminate_and_reap_preflight_helper(
+        helper: &SupervisedPreflightHelper,
+        cleanup_deadline: Instant,
+    ) -> Result<(), GateError> {
+        let mut first_error = None;
+        // SAFETY: the directly owned supervisor Job remains live until all members are observed
+        // gone. TerminateJobObject requests termination for the complete helper/worker tree.
+        if unsafe { TerminateJobObject(helper.job.raw(), 1) } == 0 {
+            first_error = Some(last_error("terminate Windows worker-preflight Job"));
+        }
+        loop {
+            let helper_exited = match unsafe { WaitForSingleObject(helper.process.raw(), 0) } {
+                WAIT_OBJECT_0 => true,
+                WAIT_TIMEOUT => false,
+                _ => {
+                    first_error.get_or_insert_with(|| {
+                        last_error("poll Windows worker-preflight helper during cleanup")
+                    });
+                    false
+                }
+            };
+            let job_empty = match preflight_job_active_processes(&helper.job) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    false
+                }
+            };
+            if helper_exited && job_empty {
+                return match first_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                };
+            }
+            if Instant::now() >= cleanup_deadline {
+                return Err(first_error.unwrap_or_else(|| {
+                    GateError(
+                        "Windows worker-preflight tree exceeded its cleanup deadline".to_string(),
+                    )
+                }));
+            }
+            std::thread::sleep(
+                PRODUCTION_PREFLIGHT_POLL_INTERVAL
+                    .min(cleanup_deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn run_supervised_preflight_helper(
+        executable: &Path,
+        command: PreflightHelperCommand,
+        run_deadline: Instant,
+        cleanup_deadline: Instant,
+    ) -> Result<(), GateError> {
+        let helper = launch_supervised_preflight_helper(executable, command, run_deadline)?;
+        loop {
+            match unsafe { WaitForSingleObject(helper.process.raw(), 0) } {
+                WAIT_OBJECT_0 => {
+                    let status = match super::process_exit_status(&helper.process) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            let status = GateError(format!(
+                                "read Windows worker-preflight helper status: {error}"
+                            ));
+                            return match terminate_and_reap_preflight_helper(
+                                &helper,
+                                cleanup_deadline,
+                            ) {
+                                Ok(()) => Err(status),
+                                Err(cleanup) => {
+                                    Err(GateError(format!("{status}; cleanup failed: {cleanup}")))
+                                }
+                            };
+                        }
+                    };
+                    let active = match preflight_job_active_processes(&helper.job) {
+                        Ok(active) => active,
+                        Err(error) => {
+                            return match terminate_and_reap_preflight_helper(
+                                &helper,
+                                cleanup_deadline,
+                            ) {
+                                Ok(()) => Err(error),
+                                Err(cleanup) => {
+                                    Err(GateError(format!("{error}; cleanup failed: {cleanup}")))
+                                }
+                            };
+                        }
+                    };
+                    if !status.success() || active != 0 {
+                        terminate_and_reap_preflight_helper(&helper, cleanup_deadline)?;
+                        return Err(GateError(
+                            "Windows production runtime preflight helper failed".to_string(),
+                        ));
+                    }
+                    return Ok(());
+                }
+                WAIT_TIMEOUT => {}
+                _ => {
+                    let poll = last_error("poll Windows worker-preflight helper");
+                    return match terminate_and_reap_preflight_helper(&helper, cleanup_deadline) {
+                        Ok(()) => Err(poll),
+                        Err(cleanup) => {
+                            Err(GateError(format!("{poll}; cleanup failed: {cleanup}")))
+                        }
+                    };
+                }
+            }
+            if Instant::now() >= run_deadline {
+                terminate_and_reap_preflight_helper(&helper, cleanup_deadline)?;
+                return Err(GateError(
+                    "Windows production runtime preflight exceeded its caller deadline".to_string(),
+                ));
+            }
+            std::thread::sleep(
+                PRODUCTION_PREFLIGHT_POLL_INTERVAL
+                    .min(run_deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    pub(super) fn maybe_run_runtime_preflight_helper() -> Option<std::process::ExitCode> {
+        let arguments = std::env::args_os().collect::<Vec<_>>();
+        if arguments.len() != 2 || arguments[1] != OsStr::new(PRODUCTION_PREFLIGHT_HELPER_ARG) {
+            return None;
+        }
+        let deadline = Instant::now() + PRODUCTION_PREFLIGHT_TIMEOUT;
+        let hooks = ProductionLaunchHooks::production()
+            .with_deadline(deadline)
+            .with_supervised_preflight_acl();
+        Some(if run_runtime_preflight_owned(hooks, deadline).is_ok() {
+            std::process::ExitCode::SUCCESS
+        } else {
+            std::process::ExitCode::FAILURE
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn mutate_current_executable_acl_for_test() -> Result<(), GateError> {
+        let executable = std::env::current_exe()
+            .map_err(|error| GateError(format!("resolve preflight test executable: {error}")))?;
+        let profile = AppContainerProfile::production_zero_capability()?;
+        ensure_appcontainer_network_isolated(profile.sid)?;
+        let policy = SidPolicy::current()?;
+        let (_executable, _location, image_lock) = prepare_executable_acl_with_mode(
+            &executable,
+            profile.sid,
+            &policy,
+            ExecutableAclAuthority::Supervised,
+        )?;
+        drop(image_lock);
+        Ok(())
     }
 
     fn run_runtime_preflight_owned(
@@ -5244,6 +5733,145 @@ mod tests {
             WAIT_OBJECT_0,
             "kill-on-close Job did not reap injected child {pid}"
         );
+    }
+
+    fn invoked_as_exact_child(name: &str) -> bool {
+        let arguments = std::env::args_os().collect::<Vec<_>>();
+        arguments
+            .get(1)
+            .is_some_and(|argument| argument == std::ffi::OsStr::new("--exact"))
+            && arguments
+                .get(2)
+                .is_some_and(|argument| argument == std::ffi::OsStr::new(name))
+    }
+
+    #[test]
+    fn windows_worker_preflight_timeout_child() {
+        if invoked_as_exact_child(super::feasibility::PREFLIGHT_TIMEOUT_CHILD_TEST_NAME) {
+            super::feasibility::mutate_current_executable_acl_for_test()
+                .expect("timeout child must mutate its supervised executable ACL");
+            std::fs::write(
+                std::env::current_exe()
+                    .expect("resolve timeout child executable")
+                    .with_extension("acl-mutated"),
+                [],
+            )
+            .expect("publish timeout-child ACL mutation marker");
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn windows_worker_preflight_success_child() {
+        if invoked_as_exact_child(super::feasibility::PREFLIGHT_SUCCESS_CHILD_TEST_NAME) {
+            super::feasibility::mutate_current_executable_acl_for_test()
+                .expect("success child must mutate its supervised executable ACL");
+        }
+    }
+
+    #[test]
+    fn timed_out_worker_preflight_reaps_helper_restores_dacl_and_releases_creation_lock() {
+        use super::feasibility::{
+            PREFLIGHT_TIMEOUT_CHILD_TEST_NAME, RuntimePreflightTarget, read_file_security,
+            run_runtime_preflight_with_timeouts, snapshot_file_security,
+        };
+
+        let _production_test_guard = production_test_guard();
+        let executable = PrivateFailureExecutable::copy_current();
+        let baseline = snapshot_file_security(
+            &read_file_security(&executable.path).expect("read preflight fixture DACL"),
+        )
+        .expect("snapshot preflight fixture DACL");
+        let started = std::time::Instant::now();
+        let error = run_runtime_preflight_with_timeouts(
+            RuntimePreflightTarget::Test {
+                executable: executable.path.clone(),
+                child_test: PREFLIGHT_TIMEOUT_CHILD_TEST_NAME,
+            },
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .expect_err("parked preflight helper must time out");
+        assert!(error.to_string().contains("caller deadline"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "worker preflight exceeded its run plus cleanup ceiling"
+        );
+        let mutation_marker = executable.path.with_extension("acl-mutated");
+        assert!(
+            mutation_marker.is_file(),
+            "timeout child must reach ACL mutation before it is terminated"
+        );
+        std::fs::remove_file(&mutation_marker).expect("remove timeout-child mutation marker");
+        let restored = snapshot_file_security(
+            &read_file_security(&executable.path).expect("read restored preflight fixture DACL"),
+        )
+        .expect("snapshot restored preflight fixture DACL");
+        assert_eq!(
+            restored, baseline,
+            "timeout must restore the exact prior DACL"
+        );
+        drop(
+            crate::process_creation::creation_guard_until(
+                std::time::Instant::now() + Duration::from_millis(250),
+            )
+            .expect("timed-out preflight must release the process-creation lock"),
+        );
+    }
+
+    #[test]
+    fn supervised_worker_preflight_accepts_a_normal_helper_exit() {
+        use super::feasibility::{
+            PREFLIGHT_SUCCESS_CHILD_TEST_NAME, RuntimePreflightTarget, read_file_security,
+            run_runtime_preflight_with_timeouts, snapshot_file_security,
+        };
+
+        let _production_test_guard = production_test_guard();
+        let executable = PrivateFailureExecutable::copy_current();
+        let baseline = snapshot_file_security(
+            &read_file_security(&executable.path).expect("read success fixture DACL"),
+        )
+        .expect("snapshot success fixture DACL");
+        run_runtime_preflight_with_timeouts(
+            RuntimePreflightTarget::Test {
+                executable: executable.path.clone(),
+                child_test: PREFLIGHT_SUCCESS_CHILD_TEST_NAME,
+            },
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .expect("normally exiting supervised preflight helper must succeed");
+        let committed = snapshot_file_security(
+            &read_file_security(&executable.path).expect("read committed success fixture DACL"),
+        )
+        .expect("snapshot committed success fixture DACL");
+        assert_ne!(
+            committed, baseline,
+            "successful helper must commit its executable ACL mutation"
+        );
+    }
+
+    #[test]
+    fn worker_preflight_cache_publishes_only_the_first_completed_result() {
+        let cache = std::sync::OnceLock::new();
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let first = super::cached_containment_status(&cache, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+                backend: super::BACKEND,
+                assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+                reason: "first completed result".to_string(),
+            }
+        });
+        let second = super::cached_containment_status(&cache, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            crate::sandbox::worker::WorkerContainmentStatus::Available {
+                backend: super::BACKEND,
+                assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+            }
+        });
+        assert_eq!(first, second);
+        assert_eq!(probes.load(Ordering::Acquire), 1);
     }
 
     #[test]

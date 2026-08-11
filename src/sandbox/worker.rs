@@ -106,6 +106,11 @@ pub(crate) fn attest_windows_containment(
     platform::attest_containment(probe)
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn maybe_run_windows_preflight_helper() -> Option<std::process::ExitCode> {
+    platform::maybe_run_preflight_helper()
+}
+
 #[cfg(target_os = "linux")]
 #[path = "worker/linux.rs"]
 mod platform;
@@ -842,7 +847,8 @@ mod tests {
         assert!(creation_source.contains("trait TokioCommandCreationExt"));
         assert!(creation_source.contains("trait RmcpCommandCreationExt"));
         assert!(source.contains("static STATUS: OnceLock<WorkerContainmentStatus>"));
-        assert!(source.contains("STATUS.get_or_init(probe_containment).clone()"));
+        assert!(source.contains("cached_containment_status(&STATUS, probe_containment)"));
+        assert!(source.contains("cache.get_or_init(probe).clone()"));
         assert!(source.contains("production_runtime_preflight()"));
         assert!(source.contains("Windows LPAC production runtime preflight failed"));
         assert!(source.contains("phase = \"windows_js_worker_preflight\""));

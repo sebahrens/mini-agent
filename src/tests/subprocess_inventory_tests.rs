@@ -1216,12 +1216,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TC-BROKER-JS-WORKER",
     ),
     (
-        "src/sandbox/worker/windows.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/sandbox.rs",
         "let mut child_command = std::process::Command::new(\"/bin/sh\");",
         1,
@@ -2927,12 +2921,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "let mut command = Command::new(bwrap);",
         1,
         "TC-BROKER-JS-WORKER",
-    ),
-    (
-        "src/sandbox/worker/windows.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
     ),
     (
         "src/sandbox.rs",

@@ -727,11 +727,14 @@ attestation is unavailable, normal launch returns a typed unavailable error and 
 production worker. LPAC worker containment also does not satisfy the separate general-command
 sandbox required by parent-brokered JS `spawn`.
 
-The potentially blocking Windows creation call runs on one owned helper thread behind a five-second
-caller-side deadline. Cancellation and timeout do not claim to interrupt the operating-system call.
-If it returns late, the preflight helper retains sole ownership and tears down the result before it
-exits. A permanently blocked creation call cannot be forcibly stopped and remains an explicit
-availability residual; no second launch helper or worker may be created around it.
+The potentially blocking Windows creation call runs in a fixed-function helper process placed in a
+kill-on-close supervisor Job at creation time. The parent enforces a five-second run deadline and a
+one-second whole-tree cleanup ceiling before publishing the process-local cached result. The same
+cross-process ACL transaction used by the general AppContainer sandbox is held by the parent while
+the killable helper performs executable preparation and worker creation. On failure, the parent
+restores the exact prior DACL before releasing that transaction. Timeout terminates and reaps the
+helper and every worker descendant; no detached thread or late success can outlive the cached
+fail-closed decision.
 
 ### Windows production containment and install-location gate
 
