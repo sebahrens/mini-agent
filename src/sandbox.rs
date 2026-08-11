@@ -81,13 +81,16 @@ impl ShellDialect {
     }
 }
 
-/// One startup-captured shell contract used by every rebuild of an agent.
+/// One identity-pinned shell contract used by every rebuild of an agent.
+/// Explicit worktree transitions may replace only workspace-relative
+/// contracts after verifying the corresponding image under the new binding.
 #[derive(Debug, Clone)]
 pub(crate) struct ShellCapability {
     executable: PathBuf,
     dialect: ShellDialect,
     command_arg: &'static str,
     identity: crate::fs::CheckedMetadata,
+    workspace_relative_config: Option<String>,
 }
 
 impl ShellCapability {
@@ -121,11 +124,15 @@ impl ShellCapability {
         if !identity.is_file() {
             return None;
         }
+        let workspace_relative_config = (!configured_path.is_absolute()
+            && configured_path.components().count() > 1)
+            .then(|| configured.to_string());
         Some(Self {
             executable,
             dialect,
             command_arg: dialect.command_arg(),
             identity,
+            workspace_relative_config,
         })
     }
 
@@ -145,6 +152,7 @@ impl ShellCapability {
             executable,
             dialect,
             command_arg: dialect.command_arg(),
+            workspace_relative_config: None,
         }
     }
 
@@ -168,6 +176,15 @@ impl ShellCapability {
             .map_err(|_| "configured shell executable is no longer available".to_string())?;
         crate::fs::ensure_same_file(&self.executable, &self.identity, &current)
             .map_err(|_| "configured shell executable identity changed".to_string())
+    }
+
+    fn rebind_workspace(&self, workspace: &Path) -> Result<Self, String> {
+        let Some(configured) = &self.workspace_relative_config else {
+            return Ok(self.clone());
+        };
+        Self::resolve(configured, workspace, None).ok_or_else(|| {
+            "configured workspace-relative shell is unavailable or unsupported".to_string()
+        })
     }
 }
 
@@ -1125,6 +1142,20 @@ impl Sandbox {
         self.working_dir = Some(workspace.root().to_path_buf());
         self.workspace_binding = Some(workspace);
         self
+    }
+
+    /// Rebind an explicit workspace transition. Workspace-relative shell
+    /// configuration is re-resolved before the caller publishes any new
+    /// workspace state; absolute and PATH-resolved capabilities stay pinned.
+    pub(crate) fn rebind_workspace_binding(
+        mut self,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> Result<Self, String> {
+        if let Some(capability) = &self.shell_capability {
+            let capability = capability.rebind_workspace(workspace.root())?;
+            self = self.with_resolved_shell(Some(capability));
+        }
+        Ok(self.with_workspace_binding(workspace))
     }
 
     #[cfg(test)]
@@ -2695,6 +2726,153 @@ mod sandbox_tests {
 
         drop(capability);
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn workspace_relative_shell_capability_rebinds_to_the_new_workspace() {
+        let name = if cfg!(windows) { "bash.exe" } else { "bash" };
+        let (workspace_a, executable_a) = shell_fixture(name);
+        let (workspace_b, executable_b) = shell_fixture(name);
+        let relative = if cfg!(windows) {
+            "bin/bash.exe"
+        } else {
+            "bin/bash"
+        };
+        let capability = ShellCapability::resolve(relative, &workspace_a, None).unwrap();
+        let binding_a =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_a).unwrap());
+        let binding_b =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_b).unwrap());
+        let sandbox = Sandbox::new(false, "bwrap")
+            .with_resolved_shell(Some(capability))
+            .with_workspace_binding(binding_a);
+
+        let rebound = sandbox.clone().rebind_workspace_binding(binding_b).unwrap();
+
+        assert_eq!(
+            sandbox.shell_capability().unwrap().executable(),
+            executable_a.canonicalize().unwrap()
+        );
+        assert_eq!(
+            rebound.shell_capability().unwrap().executable(),
+            executable_b.canonicalize().unwrap()
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+
+            let overwrite = std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&executable_b);
+            assert!(
+                overwrite.is_err(),
+                "a rebound Windows shell image must remain pinned against replacement"
+            );
+        }
+
+        drop((sandbox, rebound));
+        std::fs::remove_dir_all(workspace_a).unwrap();
+        std::fs::remove_dir_all(workspace_b).unwrap();
+    }
+
+    #[test]
+    fn workspace_relative_shell_rebind_failure_preserves_the_old_capability() {
+        let name = if cfg!(windows) { "bash.exe" } else { "bash" };
+        let (workspace_a, executable_a) = shell_fixture(name);
+        let workspace_b = std::env::temp_dir().join(format!(
+            "mini-agent-shell-capability-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_b).unwrap();
+        let relative = if cfg!(windows) {
+            "bin/bash.exe"
+        } else {
+            "bin/bash"
+        };
+        let capability = ShellCapability::resolve(relative, &workspace_a, None).unwrap();
+        let binding_a =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_a).unwrap());
+        let binding_b =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_b).unwrap());
+        let sandbox = Sandbox::new(false, "bwrap")
+            .with_resolved_shell(Some(capability))
+            .with_workspace_binding(binding_a.clone());
+
+        let error = sandbox
+            .clone()
+            .rebind_workspace_binding(binding_b)
+            .expect_err("a missing workspace-relative shell must fail closed");
+
+        assert!(error.contains("workspace-relative shell"));
+        assert_eq!(sandbox.workspace_root_for_test(), Some(binding_a.root()));
+        assert_eq!(
+            sandbox.shell_capability().unwrap().executable(),
+            executable_a.canonicalize().unwrap()
+        );
+
+        drop(sandbox);
+        std::fs::remove_dir_all(workspace_a).unwrap();
+        std::fs::remove_dir_all(workspace_b).unwrap();
+    }
+
+    #[test]
+    fn absolute_and_path_resolved_shell_capabilities_remain_pinned_on_rebind() {
+        let name = if cfg!(windows) { "bash.exe" } else { "bash" };
+        let (workspace_a, executable_a) = shell_fixture(name);
+        let (workspace_b, _) = shell_fixture(name);
+        let binding_b =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_b).unwrap());
+
+        for capability in [
+            ShellCapability::resolve(&executable_a.to_string_lossy(), &workspace_a, None).unwrap(),
+            ShellCapability::resolve("bash", &workspace_a, Some(std::ffi::OsStr::new("bin")))
+                .unwrap(),
+        ] {
+            let rebound = Sandbox::new(false, "bwrap")
+                .with_resolved_shell(Some(capability))
+                .rebind_workspace_binding(binding_b.clone())
+                .unwrap();
+            assert_eq!(
+                rebound.shell_capability().unwrap().executable(),
+                executable_a.canonicalize().unwrap()
+            );
+        }
+
+        std::fs::remove_dir_all(workspace_a).unwrap();
+        std::fs::remove_dir_all(workspace_b).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebound_workspace_relative_shell_rejects_a_replaced_image() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (workspace_a, _) = shell_fixture("bash");
+        let (workspace_b, executable_b) = shell_fixture("bash");
+        let capability = ShellCapability::resolve("bin/bash", &workspace_a, None).unwrap();
+        let binding_b =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_b).unwrap());
+        let rebound = Sandbox::new(false, "bwrap")
+            .with_resolved_shell(Some(capability))
+            .rebind_workspace_binding(binding_b)
+            .unwrap();
+        let replacement = executable_b.with_extension("replacement");
+        std::fs::write(&replacement, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &executable_b).unwrap();
+
+        let error = rebound
+            .wrap_command("true")
+            .expect_err("a replaced rebound shell image must fail closed");
+        assert!(error.contains("identity changed"));
+
+        drop(rebound);
+        std::fs::remove_dir_all(workspace_a).unwrap();
+        std::fs::remove_dir_all(workspace_b).unwrap();
     }
 
     #[test]

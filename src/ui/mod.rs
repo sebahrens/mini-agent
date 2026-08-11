@@ -427,6 +427,10 @@ pub(crate) fn rebind_worktree_workspace(
     no_context_files: bool,
 ) -> anyhow::Result<()> {
     let replacement = std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(workspace)?);
+    let replacement_sandbox = sandbox
+        .clone()
+        .rebind_workspace_binding(replacement.clone())
+        .map_err(anyhow::Error::msg)?;
     if let Some(permission) = permission {
         permission
             .lock()
@@ -438,7 +442,7 @@ pub(crate) fn rebind_worktree_workspace(
     context.reload_from_binding(no_context_files, &replacement);
     #[cfg(feature = "hooks")]
     crate::extras::hooks::set_active_workspace(replacement.root());
-    *sandbox = sandbox.clone().with_workspace_binding(replacement.clone());
+    *sandbox = replacement_sandbox;
     *active_workspace = replacement;
     Ok(())
 }

@@ -89,7 +89,9 @@ permission root, model preambles, relative filesystem tools (including child `Ta
 the model-action sandbox, JavaScript broker configuration, `!` shell commands, lazygit, `/undo`,
 `/add`, worktree commands, welcome/status display,
 hook child CWD plus `ZEROSTACK_PROJECT_DIR`, and command-backed MCP transports. A worktree switch
-restarts command-backed MCP servers in that workspace before rebuilding the agent.
+re-resolves a workspace-relative configured shell before publishing any new authority, while
+absolute and `PATH`-resolved shell images retain their startup-pinned identity. It also restarts
+command-backed MCP servers in that workspace before rebuilding the agent.
 
 The internal-Git dirty-worktree transaction refuses automatic merge recovery when any untracked
 or ignored path is present, before a hard reset can remove an obstruction. For tracked changes it
