@@ -172,6 +172,7 @@ impl ShellCapability {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn is_windows_executable_image(executable: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetBinaryTypeW;
@@ -183,8 +184,8 @@ fn is_windows_executable_image(executable: &Path) -> bool {
     // SAFETY: `wide` is a live, NUL-terminated UTF-16 pathname and
     // `binary_type` is a valid writable output pointer for the duration of
     // this non-executing image-format query.
-    unsafe { GetBinaryTypeW(wide.as_ptr(), &mut binary_type) != 0 }
-    &&matches!(binary_type, SCS_32BIT_BINARY | SCS_64BIT_BINARY)
+    (unsafe { GetBinaryTypeW(wide.as_ptr(), &mut binary_type) != 0 })
+        && matches!(binary_type, SCS_32BIT_BINARY | SCS_64BIT_BINARY)
 }
 
 #[cfg(windows)]

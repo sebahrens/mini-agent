@@ -118,6 +118,7 @@ impl TerminalOperations for SystemTerminal {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn system_console_code_pages() -> io::Result<Option<ConsoleCodePages>> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
@@ -157,6 +158,7 @@ fn system_console_code_pages() -> io::Result<Option<ConsoleCodePages>> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn set_system_console_input_code_page(code_page: u32) -> io::Result<()> {
     use windows_sys::Win32::System::Console::SetConsoleCP;
 
@@ -173,6 +175,7 @@ fn set_system_console_input_code_page(_code_page: u32) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn set_system_console_output_code_page(code_page: u32) -> io::Result<()> {
     use windows_sys::Win32::System::Console::SetConsoleOutputCP;
 
@@ -646,6 +649,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[allow(unsafe_code)]
     fn attached_native_windows_console_restores_original_code_pages() {
         use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
 
