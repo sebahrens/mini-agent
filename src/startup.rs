@@ -972,7 +972,7 @@ impl Startup {
         // ARCHITECTURE.md prompt
         #[cfg(feature = "archmd")]
         let arch_created = if !self.cli.resolve_no_context_files(&self.cfg) {
-            let workspace = std::path::Path::new(self.session.working_dir.as_str());
+            let workspace = self.workspace.root();
             if workspace.exists() {
                 crate::extras::archmd::ask_and_create(workspace).unwrap_or_else(|e| {
                     tracing::warn!("Architecture.md prompt failed: {e}");
@@ -988,9 +988,8 @@ impl Startup {
         // Reload context after potential ARCHITECTURE.md creation
         #[cfg(feature = "archmd")]
         if arch_created {
-            self.context.architecture = crate::context::load_architecture_from(
-                std::path::Path::new(self.session.working_dir.as_str()),
-            );
+            self.context.architecture =
+                crate::context::load_architecture_from(self.workspace.root());
         }
 
         // Default prompt resolution (after prompts may have been regenerated)
@@ -1147,9 +1146,7 @@ impl Startup {
     /// Phase 4: mode dispatch — print, loop, or interactive.
     pub(crate) async fn dispatch(mut self) -> anyhow::Result<()> {
         #[cfg(feature = "hooks")]
-        crate::extras::hooks::set_active_workspace(std::path::Path::new(
-            self.session.working_dir.as_str(),
-        ));
+        crate::extras::hooks::set_active_workspace(self.workspace.root());
         if self.resume_override_pending {
             // All fallible startup validation has completed. Persist the
             // identity/audit update atomically before any agent can receive

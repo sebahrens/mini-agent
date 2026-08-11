@@ -123,19 +123,28 @@ impl SlashCtx<'_> {
         session.working_dir =
             compact_str::CompactString::new(self.workspace.root().to_string_lossy());
         session.initialize_read_tracker(self.cfg.deny_repeated_reads.unwrap_or(true));
-        let previous_session = std::mem::replace(self.session, session);
 
-        if provider_changed {
-            let provider = self.session.provider.to_string();
-            if let Err(error) = self
-                .rebuild_agent_with_client(&provider, *self.reasoning_enabled)
-                .await
-            {
-                *self.session = previous_session;
-                return Err(error);
-            }
+        let next_client = if provider_changed {
+            crate::provider::create_client(
+                &session.provider,
+                self.cli.api_key.as_deref(),
+                &self.cfg.custom_providers_map(),
+                self.cfg.api_keys.as_ref(),
+            )?
         } else {
-            self.rebuild_agent().await;
+            self.client.clone()
+        };
+        let next_agent = self
+            .build_agent_for_client(&next_client, &session.model, &session.read_tracker)
+            .await;
+
+        *self.client = next_client;
+        *self.agent = Some(next_agent);
+        *self.session = session;
+        #[cfg(feature = "advisor")]
+        {
+            crate::extras::advisor::update_client(self.client.clone());
+            crate::extras::advisor::set_session_messages(self.session.messages.clone());
         }
         Ok(())
     }

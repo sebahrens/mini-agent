@@ -9,16 +9,16 @@ fn is_session_empty(ctx: &SlashCtx<'_>) -> bool {
         .any(|m| m.role == MessageRole::User)
 }
 
-async fn is_in_worktree(working_dir: &str) -> bool {
+async fn is_in_worktree(workspace: &std::path::Path) -> bool {
     #[cfg(feature = "git-worktree")]
     {
-        crate::extras::git_worktree::detect(std::path::Path::new(working_dir))
+        crate::extras::git_worktree::detect(workspace)
             .await
             .is_some()
     }
     #[cfg(not(feature = "git-worktree"))]
     {
-        let _ = working_dir;
+        let _ = workspace;
         false
     }
 }
@@ -54,7 +54,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         parts[1..].join(" ")
     } else {
         let session_empty = is_session_empty(ctx);
-        let in_worktree = is_in_worktree(ctx.session.working_dir.as_str()).await;
+        let in_worktree = is_in_worktree(ctx.workspace.root()).await;
         build_default_review_message(session_empty, in_worktree)
     };
 

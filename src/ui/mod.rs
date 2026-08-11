@@ -147,6 +147,7 @@ pub(crate) fn refresh_display(
             .to_string()
     });
     let statusline_ctx = crate::ui::statusline::StatusContext {
+        workspace: ui.workspace.root(),
         loop_label: chain.loop_label.as_deref(),
         prompt_name: ui.context.current_prompt_name.as_deref(),
         perm_mode: perm_mode.as_deref(),

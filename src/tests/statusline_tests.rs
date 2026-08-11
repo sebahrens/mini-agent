@@ -4,6 +4,7 @@ use crate::ui::statusline::{self, StatusContext, StatusSpan};
 
 fn ctx() -> StatusContext<'static> {
     StatusContext {
+        workspace: std::path::Path::new("/var/lib/zerostack-demo/project"),
         loop_label: None,
         prompt_name: None,
         perm_mode: None,
@@ -233,7 +234,7 @@ fn cwd_full_vs_cwd_folder() {
         }],
     };
     let mut session = Session::new("openrouter", "m", 1000, "");
-    session.working_dir = "/var/lib/zerostack-demo/project".into();
+    session.working_dir = "/stale/imported/workspace".into();
     let lines = statusline::build_lines(&spec, &session, &ctx());
     // cwd = folder name, cwd_full = full path (no $HOME prefix here, unchanged)
     assert_eq!(
