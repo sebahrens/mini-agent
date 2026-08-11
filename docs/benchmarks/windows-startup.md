@@ -25,7 +25,8 @@ worker containment, MCP connection, or learned-skill initialization. The `--tool
 skips every process capability probe and MCP connection. The default case may run one
 general and one JavaScript preflight; each result is process-local and fail-closed. The general
 Windows preflight has a five-second run deadline, up to five seconds to reap the complete helper
-tree, and a fresh five-second profile/ACL recovery ceiling. Capture the
+tree, and a fresh five-second profile/ACL recovery ceiling. It may first spend up to five seconds
+recovering exact private preflight roots preserved by an earlier interrupted process. Capture the
 closed `windows_general_appcontainer_preflight` timing event alongside total process time; do not
 record paths, shell text, JavaScript diagnostics, or configuration contents.
 

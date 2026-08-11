@@ -176,7 +176,10 @@ permission for an uncontained JS worker.
 Startup resolves intended model capabilities before probing this backend. `--no-tools` and a tool
 allowlist that omits both `bash` and `js` perform no general-process preflight or shell discovery.
 On Windows, an eligible general AppContainer preflight is cached once per process and owns a bounded
-run-and-cleanup lifecycle; timeout remains a cached fail-closed result.
+run-and-cleanup lifecycle. Before starting a new probe it spends at most five seconds recovering
+exact, privately owned preflight roots preserved by an earlier interrupted process; malformed,
+active, or unverifiable roots remain untouched and fail closed. Timeout remains a cached fail-closed
+result.
 
 The Windows general-process AppContainer backend is not the Phase 6 LPAC worker profile.
 Its cached production preflight and hosted reference-runner gate establish the recorded

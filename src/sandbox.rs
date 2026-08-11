@@ -3414,7 +3414,10 @@ mod sandbox_tests {
             })
             .expect("private control-root candidate missing");
         assert!(control_candidate.contains(".parent()"));
-        assert!(control_candidate.contains(".mini-agent-appcontainer-control-v1"));
+        assert!(control_candidate.contains("parent.join(PRIVATE_CONTROL_ROOT_NAME)"));
+        assert!(source.contains(
+            "const PRIVATE_CONTROL_ROOT_NAME: &str = \".mini-agent-appcontainer-control-v1\";"
+        ));
         assert!(!journal_root.contains("cache.join("));
 
         let startup = include_str!("startup.rs");

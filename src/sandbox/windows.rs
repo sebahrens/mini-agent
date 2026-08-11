@@ -150,6 +150,12 @@ const MAX_REQUEST_FEEDERS: usize = 16;
 const MAX_ACL_ENTRIES: usize = 250_000;
 const MAX_ACCESS_ROOTS: usize = 128;
 const MAX_STALE_PROFILE_JOURNALS: usize = 64;
+const PREFLIGHT_ROOT_PREFIX: &str = "mini-agent-windows-sandbox-preflight-";
+const PREFLIGHT_OWNER_FILE: &str = ".owner-v1";
+const PRIVATE_CONTROL_ROOT_NAME: &str = ".mini-agent-appcontainer-control-v1";
+const MAX_STALE_PREFLIGHT_ROOTS: usize = 64;
+const MAX_PREFLIGHT_RECOVERY_ENTRIES: usize = 4_096;
+const MAX_PREFLIGHT_RECOVERY_BYTES: u64 = 1024 * 1024;
 const PROFILE_JOURNAL_VERSION: u32 = 2;
 const PROFILE_INTENT_VERSION: u32 = 1;
 const PROFILE_INTENT_EXTENSION: &str = "intent";
@@ -542,62 +548,111 @@ fn cached_general_sandbox_availability(
     *cache.get_or_init(|| probe().is_ok())
 }
 
-struct TemporaryPreflightRoot(Option<PathBuf>);
+struct TemporaryPreflightRoot {
+    path: Option<PathBuf>,
+    owner: Option<File>,
+    authority: Option<ProfileJournalRootAuthority>,
+}
 
 impl TemporaryPreflightRoot {
-    fn new(path: PathBuf) -> Self {
-        Self(Some(path))
+    fn create(temp_root: &Path) -> Result<Self, String> {
+        let path = temp_root.join(format!("{PREFLIGHT_ROOT_PREFIX}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path)
+            .map_err(|error| format!("sandbox: create production-preflight root: {error}"))?;
+        let directory = match protect_and_attest_control_root(&path) {
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&path);
+                return Err(error);
+            }
+        };
+        let authority = match ProfileJournalRootAuthority::new(path.clone(), directory) {
+            Ok(authority) => authority,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&path);
+                return Err(error);
+            }
+        };
+        let owner = match create_preflight_owner(&authority) {
+            Ok(owner) => owner,
+            Err(error) => {
+                drop(authority);
+                let _ = std::fs::remove_dir(&path);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            path: Some(path),
+            owner: Some(owner),
+            authority: Some(authority),
+        })
     }
 
     fn path(&self) -> &Path {
-        self.0.as_deref().expect("preflight root remains owned")
+        self.path.as_deref().expect("preflight root remains owned")
     }
 
     fn remove(&mut self) -> Result<(), String> {
-        let path = self.path().to_path_buf();
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => {
-                self.0.take();
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.0.take();
-                Ok(())
-            }
-            Err(error) => Err(format!(
-                "sandbox: remove Windows production-preflight temporary root: {error}"
-            )),
-        }
+        self.path.take();
+        let owner = self.owner.take().ok_or_else(|| {
+            "sandbox: production-preflight owner lease was already released".to_string()
+        })?;
+        let authority = self.authority.take().ok_or_else(|| {
+            "sandbox: production-preflight root authority was already released".to_string()
+        })?;
+        remove_preflight_tree(
+            authority,
+            owner,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
     }
 
     fn retain_recovery_state(&mut self) {
-        self.0.take();
+        self.path.take();
+        self.owner.take();
+        self.authority.take();
     }
 }
 
 impl Drop for TemporaryPreflightRoot {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = std::fs::remove_dir_all(path);
+        self.path.take();
+        if let (Some(owner), Some(authority)) = (self.owner.take(), self.authority.take()) {
+            let _ = remove_preflight_tree(
+                authority,
+                owner,
+                Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+            );
         }
     }
 }
 
 fn run_production_preflight() -> Result<(), String> {
+    let temp_root = canonical_preflight_temp_root()?;
+    recover_preserved_preflight_roots(
+        &temp_root,
+        next_general_preflight_recovery_deadline(Instant::now()),
+    )?;
     let started = Instant::now();
     let run_deadline = started + GENERAL_PREFLIGHT_RUN_TIMEOUT;
     let reap_deadline = run_deadline + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT;
-    run_production_preflight_owned(run_deadline, reap_deadline)
+    run_production_preflight_owned_in(&temp_root, run_deadline, reap_deadline)
 }
 
 fn run_production_preflight_owned(
     run_deadline: Instant,
     reap_deadline: Instant,
 ) -> Result<(), String> {
-    let mut root = TemporaryPreflightRoot::new(std::env::temp_dir().join(format!(
-        "mini-agent-windows-sandbox-preflight-{}",
-        uuid::Uuid::new_v4()
-    )));
+    let temp_root = canonical_preflight_temp_root()?;
+    run_production_preflight_owned_in(&temp_root, run_deadline, reap_deadline)
+}
+
+fn run_production_preflight_owned_in(
+    temp_root: &Path,
+    run_deadline: Instant,
+    reap_deadline: Instant,
+) -> Result<(), String> {
+    let mut root = TemporaryPreflightRoot::create(temp_root)?;
     let workspace = root.path().join("workspace");
     let cache = root.path().join("cache");
     let outside = root.path().join("outside");
@@ -662,6 +717,382 @@ fn run_production_preflight_owned(
 
 fn next_general_preflight_recovery_deadline(now: Instant) -> Instant {
     now + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT
+}
+
+fn canonical_preflight_temp_root() -> Result<PathBuf, String> {
+    let root = canonical_root(&std::env::temp_dir(), "Windows temporary directory")?;
+    reject_remote_access_path(&root)?;
+    Ok(root)
+}
+
+fn preflight_root_name_is_valid(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix(PREFLIGHT_ROOT_PREFIX) else {
+        return false;
+    };
+    uuid::Uuid::parse_str(suffix).is_ok_and(|parsed| parsed.hyphenated().to_string() == suffix)
+}
+
+fn create_preflight_owner(root: &ProfileJournalRootAuthority) -> Result<File, String> {
+    root.revalidate()?;
+    let path = root.path().join(PREFLIGHT_OWNER_FILE);
+    root.validate_child(&path)?;
+    let wide = wide_null(path.as_os_str())?;
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | FILE_GENERIC_WRITE,
+            0,
+            null(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    let handle = Handle::created(raw, "create exclusive production-preflight owner lease")?;
+    let file = unsafe { File::from_raw_handle(handle.0.into_raw_handle()) };
+    file.sync_all()
+        .map_err(|error| format!("sandbox: persist production-preflight owner lease: {error}"))?;
+    Ok(file)
+}
+
+fn open_preflight_owner(root: &ProfileJournalRootAuthority) -> Result<File, String> {
+    let path = root.path().join(PREFLIGHT_OWNER_FILE);
+    root.validate_child(&path)?;
+    let file = open_stable_path(&path, false, GENERIC_READ | FILE_READ_ATTRIBUTES, 0)
+        .map_err(|_| "sandbox: production-preflight root is active or unverifiable".to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "sandbox: production-preflight owner lease is unverifiable".to_string())?;
+    if metadata.len() != 0
+        || crate::fs::windows_file_link_count(&file)
+            .map_err(|_| "sandbox: production-preflight owner lease is unverifiable".to_string())?
+            != 1
+    {
+        return Err("sandbox: production-preflight owner lease is unverifiable".into());
+    }
+    Ok(file)
+}
+
+fn attest_existing_private_root(path: &Path) -> Result<ProfileJournalRootAuthority, String> {
+    let directory = open_stable_path(
+        path,
+        true,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+    .map_err(|_| "sandbox: preserved production-preflight root is unverifiable".to_string())?;
+    let user = current_user_sid_buffer()
+        .map_err(|_| "sandbox: preserved production-preflight root is unverifiable".to_string())?;
+    attest_control_root_dacl(&directory, token_user_sid(&user))
+        .map_err(|_| "sandbox: preserved production-preflight root is unverifiable".to_string())?;
+    ProfileJournalRootAuthority::new(path.to_path_buf(), directory)
+        .map_err(|_| "sandbox: preserved production-preflight root is unverifiable".to_string())
+}
+
+fn recover_preserved_preflight_roots(temp_root: &Path, deadline: Instant) -> Result<(), String> {
+    ensure_preflight_cleanup_deadline(deadline)?;
+    let canonical_temp = canonical_root(temp_root, "Windows temporary directory")?;
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&canonical_temp)
+        .map_err(|_| "sandbox: enumerate preserved production-preflight roots failed".to_string())?
+    {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        let entry = entry.map_err(|_| {
+            "sandbox: enumerate preserved production-preflight root failed".to_string()
+        })?;
+        let name = entry.file_name();
+        if !preflight_root_name_is_valid(&name) {
+            if name.to_string_lossy().starts_with(PREFLIGHT_ROOT_PREFIX) {
+                return Err("sandbox: preserved production-preflight root name is invalid".into());
+            }
+            continue;
+        }
+        if candidates.len() >= MAX_STALE_PREFLIGHT_ROOTS {
+            return Err("sandbox: preserved production-preflight root count exceeds 64".into());
+        }
+        candidates.push(entry.path());
+    }
+    candidates.sort();
+    for candidate in candidates {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        recover_preserved_preflight_root(&canonical_temp, &candidate, deadline)?;
+    }
+    Ok(())
+}
+
+fn recover_preserved_preflight_root(
+    temp_root: &Path,
+    candidate: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    ensure_preflight_cleanup_deadline(deadline)?;
+    if candidate.parent() != Some(temp_root)
+        || !candidate
+            .file_name()
+            .is_some_and(preflight_root_name_is_valid)
+    {
+        return Err("sandbox: preserved production-preflight root name is invalid".into());
+    }
+    let metadata = std::fs::symlink_metadata(candidate)
+        .map_err(|_| "sandbox: preserved production-preflight root is unverifiable".to_string())?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("sandbox: preserved production-preflight root is unverifiable".into());
+    }
+    let canonical = canonical_root(candidate, "preserved production-preflight root")?;
+    if canonical.parent() != Some(temp_root) || canonical.file_name() != candidate.file_name() {
+        return Err("sandbox: preserved production-preflight root is unverifiable".into());
+    }
+    let authority = attest_existing_private_root(&canonical)?;
+    let owner = open_preflight_owner(&authority)?;
+    validate_preflight_recovery_schema(&authority, deadline)?;
+
+    let cache = authority.path().join("cache");
+    if cache.exists() {
+        recover_verified_preflight_profiles(&cache, deadline)?;
+    }
+    ensure_preflight_cleanup_deadline(deadline)?;
+    authority.revalidate()?;
+    remove_preflight_tree(authority, owner, deadline)
+}
+
+enum PreflightRemovalEntry {
+    Visit(PathBuf),
+    RemoveDirectory(PathBuf, File),
+}
+
+fn remove_preflight_tree(
+    root: ProfileJournalRootAuthority,
+    owner: File,
+    deadline: Instant,
+) -> Result<(), String> {
+    validate_preflight_recovery_schema(&root, deadline)?;
+    let owner_path = root.path().join(PREFLIGHT_OWNER_FILE);
+    let mut pending = Vec::new();
+    for entry in std::fs::read_dir(root.path())
+        .map_err(|_| "sandbox: enumerate production-preflight cleanup root failed".to_string())?
+    {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        let path = entry
+            .map_err(|_| {
+                "sandbox: enumerate production-preflight cleanup entry failed".to_string()
+            })?
+            .path();
+        if path != owner_path {
+            pending.push(PreflightRemovalEntry::Visit(path));
+        }
+    }
+
+    while let Some(entry) = pending.pop() {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        match entry {
+            PreflightRemovalEntry::Visit(path) => {
+                let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+                    "sandbox: inspect production-preflight cleanup entry failed".to_string()
+                })?;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(
+                        "sandbox: production-preflight cleanup encountered a reparse point".into(),
+                    );
+                }
+                if metadata.is_dir() {
+                    let directory = open_stable_path(
+                        &path,
+                        true,
+                        FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    )
+                    .map_err(|_| {
+                        "sandbox: production-preflight cleanup directory is unverifiable"
+                            .to_string()
+                    })?;
+                    pending.push(PreflightRemovalEntry::RemoveDirectory(
+                        path.clone(),
+                        directory,
+                    ));
+                    for child in std::fs::read_dir(&path).map_err(|_| {
+                        "sandbox: enumerate production-preflight cleanup directory failed"
+                            .to_string()
+                    })? {
+                        ensure_preflight_cleanup_deadline(deadline)?;
+                        pending.push(PreflightRemovalEntry::Visit(
+                            child
+                                .map_err(|_| {
+                                    "sandbox: enumerate production-preflight cleanup child failed"
+                                        .to_string()
+                                })?
+                                .path(),
+                        ));
+                    }
+                } else if metadata.is_file() {
+                    let file = open_stable_path(
+                        &path,
+                        false,
+                        GENERIC_READ | FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    )
+                    .map_err(|_| {
+                        "sandbox: production-preflight cleanup file is unverifiable".to_string()
+                    })?;
+                    if crate::fs::windows_file_link_count(&file).map_err(|_| {
+                        "sandbox: production-preflight cleanup file is unverifiable".to_string()
+                    })? != 1
+                    {
+                        return Err(
+                            "sandbox: production-preflight cleanup file has multiple links".into(),
+                        );
+                    }
+                    drop(file);
+                    std::fs::remove_file(&path).map_err(|_| {
+                        "sandbox: remove production-preflight cleanup file failed".to_string()
+                    })?;
+                } else {
+                    return Err(
+                        "sandbox: production-preflight cleanup entry has unsupported type".into(),
+                    );
+                }
+            }
+            PreflightRemovalEntry::RemoveDirectory(path, directory) => {
+                let observed = open_stable_path(
+                    &path,
+                    true,
+                    FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                )
+                .map_err(|_| {
+                    "sandbox: production-preflight cleanup directory is unverifiable".to_string()
+                })?;
+                let retained_identity =
+                    crate::fs::windows_file_identity(&directory).map_err(|_| {
+                        "sandbox: production-preflight cleanup directory is unverifiable"
+                            .to_string()
+                    })?;
+                let observed_identity =
+                    crate::fs::windows_file_identity(&observed).map_err(|_| {
+                        "sandbox: production-preflight cleanup directory is unverifiable"
+                            .to_string()
+                    })?;
+                if retained_identity != observed_identity {
+                    return Err(
+                        "sandbox: production-preflight cleanup directory identity changed".into(),
+                    );
+                }
+                drop(observed);
+                drop(directory);
+                std::fs::remove_dir(&path).map_err(|_| {
+                    "sandbox: remove empty production-preflight cleanup directory failed"
+                        .to_string()
+                })?;
+            }
+        }
+    }
+
+    ensure_preflight_cleanup_deadline(deadline)?;
+    root.revalidate()?;
+    root.validate_child(&owner_path)?;
+    drop(owner);
+    std::fs::remove_file(&owner_path)
+        .map_err(|_| "sandbox: remove production-preflight owner lease failed".to_string())?;
+    let path = root.path().to_path_buf();
+    drop(root);
+    match std::fs::remove_dir(&path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // If the final empty-directory removal loses a transient race, restore the lease so a
+            // later startup can retry recovery. Re-attestation prevents publishing into a swapped
+            // or permission-weakened root.
+            if let Ok(authority) = attest_existing_private_root(&path) {
+                let _ = create_preflight_owner(&authority);
+            }
+            Err("sandbox: remove empty production-preflight root failed".into())
+        }
+    }
+}
+
+fn validate_preflight_recovery_schema(
+    root: &ProfileJournalRootAuthority,
+    deadline: Instant,
+) -> Result<(), String> {
+    root.revalidate()?;
+    let mut entries = 0usize;
+    let mut bytes = 0u64;
+    let mut pending = vec![root.path().to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        for entry in std::fs::read_dir(&directory).map_err(|_| {
+            "sandbox: inspect production-preflight recovery schema failed".to_string()
+        })? {
+            ensure_preflight_cleanup_deadline(deadline)?;
+            entries += 1;
+            if entries > MAX_PREFLIGHT_RECOVERY_ENTRIES {
+                return Err(
+                    "sandbox: production-preflight recovery schema exceeds entry bound".into(),
+                );
+            }
+            let entry = entry.map_err(|_| {
+                "sandbox: inspect production-preflight recovery entry failed".to_string()
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+                "sandbox: inspect production-preflight recovery entry failed".to_string()
+            })?;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(
+                    "sandbox: production-preflight recovery schema contains a reparse point".into(),
+                );
+            }
+            if directory == root.path() {
+                match entry.file_name().to_str() {
+                    Some(PREFLIGHT_OWNER_FILE) if metadata.is_file() => {}
+                    Some("workspace") | Some("cache") | Some("outside") if metadata.is_dir() => {}
+                    Some(PRIVATE_CONTROL_ROOT_NAME) if metadata.is_dir() => {}
+                    _ => {
+                        return Err("sandbox: production-preflight recovery schema has an unexpected root entry".into());
+                    }
+                }
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                if path == root.path().join(PREFLIGHT_OWNER_FILE) {
+                    continue;
+                }
+                let file = open_stable_path(
+                    &path,
+                    false,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                )
+                .map_err(|_| {
+                    "sandbox: production-preflight recovery file is unverifiable".to_string()
+                })?;
+                if crate::fs::windows_file_link_count(&file).map_err(|_| {
+                    "sandbox: production-preflight recovery file is unverifiable".to_string()
+                })? != 1
+                {
+                    return Err(
+                        "sandbox: production-preflight recovery file has multiple links".into(),
+                    );
+                }
+                bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
+                    "sandbox: production-preflight recovery bytes overflowed".to_string()
+                })?;
+                if bytes > MAX_PREFLIGHT_RECOVERY_BYTES {
+                    return Err(
+                        "sandbox: production-preflight recovery schema exceeds byte bound".into(),
+                    );
+                }
+            } else {
+                return Err(
+                    "sandbox: production-preflight recovery schema has unsupported entry type"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_bounded_preflight_helper(
@@ -752,6 +1183,15 @@ fn recover_preflight_profiles(cache: &Path, deadline: Instant) -> Result<(), Str
     if candidate.exists() {
         let directory = protect_and_attest_control_root(&candidate)?;
         let journal_root = ProfileJournalRootAuthority::new(candidate, directory)?;
+        sweep_stale_profiles_until(&journal_root, deadline)?;
+    }
+    Ok(())
+}
+
+fn recover_verified_preflight_profiles(cache: &Path, deadline: Instant) -> Result<(), String> {
+    let candidate = private_control_root_candidate(cache)?;
+    if candidate.exists() {
+        let journal_root = attest_existing_private_root(&candidate)?;
         sweep_stale_profiles_until(&journal_root, deadline)?;
     }
     Ok(())
@@ -1086,7 +1526,7 @@ fn private_control_root_candidate(cache: &Path) -> Result<PathBuf, String> {
     let parent = cache
         .parent()
         .ok_or("sandbox: application cache has no private control parent")?;
-    let candidate = parent.join(".mini-agent-appcontainer-control-v1");
+    let candidate = parent.join(PRIVATE_CONTROL_ROOT_NAME);
     reject_reparse_components(&candidate)?;
     match std::fs::symlink_metadata(&candidate) {
         Ok(metadata) => {
@@ -4737,6 +5177,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
+    const PREFLIGHT_RECOVERY_CHILD_ROOT: &str = "ZS_TEST_PREFLIGHT_RECOVERY_ROOT";
+
     struct RootPolicyFixture(PathBuf);
 
     impl RootPolicyFixture {
@@ -4888,7 +5330,7 @@ mod tests {
         let program = fixture.file("bin/tool.exe");
         let configured_read = std::fs::canonicalize(cache.parent().expect("cache parent"))
             .expect("canonicalize configured read root");
-        let control = configured_read.join(".mini-agent-appcontainer-control-v1");
+        let control = configured_read.join(PRIVATE_CONTROL_ROOT_NAME);
         assert!(!control.exists());
 
         let error = validate_policy_fixture(
@@ -5184,6 +5626,356 @@ mod tests {
         std::fs::remove_dir_all(base).expect("remove intent-race tree");
     }
 
+    fn new_preflight_recovery_fixture() -> (PathBuf, TemporaryPreflightRoot) {
+        let parent = std::env::temp_dir().join(format!(
+            "mini-agent-preflight-recovery-test-parent-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&parent).expect("create preflight-recovery parent");
+        let parent = canonical_root(&parent, "preflight-recovery parent")
+            .expect("canonicalize preflight-recovery parent");
+        let root = TemporaryPreflightRoot::create(&parent)
+            .expect("create private preflight-recovery root");
+        (parent, root)
+    }
+
+    #[test]
+    fn preflight_recovery_names_are_exact_lower_hex_uuids() {
+        assert!(preflight_root_name_is_valid(OsStr::new(
+            "mini-agent-windows-sandbox-preflight-01234567-89ab-cdef-0123-456789abcdef"
+        )));
+        for invalid in [
+            "mini-agent-windows-sandbox-preflight-0123456789abcdef",
+            "mini-agent-windows-sandbox-preflight-01234567-89AB-CDEF-0123-456789ABCDEF",
+            "mini-agent-windows-sandbox-preflight-01234567-89ab-cdef-0123-456789abcdeg",
+            "prefix-mini-agent-windows-sandbox-preflight-01234567-89ab-cdef-0123-456789abcdef",
+        ] {
+            assert!(!preflight_root_name_is_valid(OsStr::new(invalid)));
+        }
+    }
+
+    #[test]
+    fn later_preflight_sweep_removes_a_verified_abandoned_root_only() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let abandoned = root.path().to_path_buf();
+        std::fs::create_dir(abandoned.join("workspace")).expect("create abandoned workspace");
+        std::fs::create_dir(abandoned.join("cache")).expect("create abandoned cache");
+        std::fs::create_dir(abandoned.join("outside")).expect("create abandoned outside root");
+        std::fs::write(abandoned.join("workspace/output.txt"), b"bounded")
+            .expect("write bounded abandoned output");
+        let unrelated = parent.join("unrelated-entry");
+        std::fs::write(&unrelated, b"preserve").expect("write unrelated temp entry");
+        root.retain_recovery_state();
+
+        recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect("recover verified abandoned preflight root");
+
+        assert!(!abandoned.exists());
+        assert_eq!(
+            std::fs::read(&unrelated).expect("read unrelated entry"),
+            b"preserve"
+        );
+        std::fs::remove_dir_all(parent).expect("remove preflight-recovery parent");
+    }
+
+    #[test]
+    fn preserved_preflight_recovery_child() {
+        let Some(parent) = std::env::var_os(PREFLIGHT_RECOVERY_CHILD_ROOT) else {
+            return;
+        };
+        recover_preserved_preflight_roots(
+            Path::new(&parent),
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect("child process recovers preserved preflight root");
+    }
+
+    #[test]
+    fn next_process_recovers_a_preserved_profile_job_acls_and_root() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let abandoned = root.path().to_path_buf();
+        let workspace = abandoned.join("workspace");
+        let cache = abandoned.join("cache");
+        std::fs::create_dir(&workspace).expect("create restart-recovery workspace");
+        std::fs::create_dir(&cache).expect("create restart-recovery cache");
+        let executable = canonical_file(
+            &std::env::current_exe().expect("resolve restart-recovery executable"),
+            "restart-recovery executable",
+        )
+        .expect("canonicalize restart-recovery executable");
+        let ready = workspace.join("restart-ready.txt");
+        let mut command = build_helper_with_ready(
+            executable.clone(),
+            vec![
+                TARGET_PROBE_ARG.into(),
+                TARGET_SLEEP_ARG.into(),
+                "10".into(),
+            ],
+            &workspace,
+            &cache,
+            Some(ready.clone()),
+        )
+        .expect("build restart-recovery helper");
+        command
+            .as_std_mut()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut helper = command
+            .as_std_mut()
+            .spawn_guarded_until(Instant::now() + Duration::from_secs(5))
+            .expect("start restart-recovery helper");
+        wait_for_probe_file(&ready).expect("restart-recovery helper must become ready");
+        helper.kill().expect("crash restart-recovery helper");
+        let _ = helper.wait();
+        let proof = parse_crash_cleanup_proof(&ready)
+            .expect("crashed helper must leave complete recovery proof");
+        assert!(proof.storage.exists());
+        assert!(proof.journal.exists());
+        root.retain_recovery_state();
+
+        let output = Command::new(std::env::current_exe().expect("resolve test executable"))
+            .arg("--exact")
+            .arg("sandbox::windows::tests::preserved_preflight_recovery_child")
+            .arg("--nocapture")
+            .env(PREFLIGHT_RECOVERY_CHILD_ROOT, &parent)
+            .output_guarded()
+            .expect("run restart-recovery child");
+        assert!(output.status.success());
+        assert!(!abandoned.exists());
+        attest_cleanup_proof(&proof, [executable.as_path()])
+            .expect("next process removes the exact profile, Job, ACLs, and journal");
+
+        std::fs::remove_dir(parent).expect("remove restart-recovery parent");
+    }
+
+    #[test]
+    fn junction_in_preserved_preflight_root_is_rejected_without_mutation() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let abandoned = root.path().to_path_buf();
+        let outside = parent.join("outside");
+        let junction = abandoned.join("workspace");
+        std::fs::create_dir(&outside).expect("create junction target");
+        let status = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                junction.to_str().expect("junction path is UTF-8"),
+                outside.to_str().expect("junction target is UTF-8"),
+            ])
+            .status_guarded()
+            .expect("create preflight recovery junction");
+        assert!(status.success(), "fixture must create a real junction");
+        root.retain_recovery_state();
+
+        let error = recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect_err("junction must fail closed");
+        assert!(error.contains("reparse point"));
+        assert!(junction.exists());
+        assert!(outside.exists());
+
+        std::fs::remove_dir(&junction).expect("remove junction only");
+        std::fs::remove_dir_all(parent).expect("remove junction preflight fixture");
+    }
+
+    #[test]
+    fn active_preflight_owner_is_rejected_without_mutation() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let active = root.path().to_path_buf();
+        std::fs::create_dir(active.join("workspace")).expect("create active workspace");
+
+        let error = recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect_err("live owner lease must block recovery");
+        assert!(error.contains("active or unverifiable"));
+        assert!(active.join(PREFLIGHT_OWNER_FILE).exists());
+        assert!(active.join("workspace").exists());
+
+        root.remove().expect("remove active preflight fixture");
+        std::fs::remove_dir(parent).expect("remove active preflight parent");
+    }
+
+    #[test]
+    fn changed_preflight_root_dacl_is_rejected_without_cleanup() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let changed = root.path().to_path_buf();
+        let handle = root
+            .authority
+            .as_ref()
+            .expect("preflight authority remains held")
+            .0
+            ._directory
+            .as_raw_handle();
+        let result = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        assert_eq!(result, 0, "replace preflight owner-only DACL");
+        root.retain_recovery_state();
+
+        let error = recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect_err("changed preflight DACL must fail closed");
+        assert!(error.contains("unverifiable"));
+        assert!(changed.join(PREFLIGHT_OWNER_FILE).exists());
+
+        let restored = protect_and_attest_control_root(&changed)
+            .expect("restore private DACL for fixture cleanup");
+        drop(restored);
+        std::fs::remove_dir_all(parent).expect("remove changed-DACL preflight fixture");
+    }
+
+    #[test]
+    fn malformed_preflight_schema_is_preserved_without_mutation() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let malformed = root.path().to_path_buf();
+        std::fs::write(malformed.join("unexpected"), b"evidence")
+            .expect("write malformed recovery evidence");
+        root.retain_recovery_state();
+
+        let error = recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect_err("unexpected root entry must fail closed");
+        assert!(error.contains("unexpected root entry"));
+        assert_eq!(
+            std::fs::read(malformed.join("unexpected")).expect("read preserved evidence"),
+            b"evidence"
+        );
+
+        std::fs::remove_dir_all(parent).expect("remove malformed preflight fixture");
+    }
+
+    #[test]
+    fn malformed_preflight_namespace_name_fails_closed_without_mutation() {
+        let parent = std::env::temp_dir().join(format!(
+            "mini-agent-preflight-name-test-parent-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&parent).expect("create malformed-name parent");
+        let parent = canonical_root(&parent, "malformed-name parent")
+            .expect("canonicalize malformed-name parent");
+        let malformed = parent.join(format!("{PREFLIGHT_ROOT_PREFIX}not-a-uuid"));
+        std::fs::create_dir(&malformed).expect("create malformed namespace entry");
+
+        let error = recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect_err("malformed namespace entry must fail closed");
+        assert!(error.contains("root name is invalid"));
+        assert!(malformed.exists());
+
+        std::fs::remove_dir_all(parent).expect("remove malformed-name fixture");
+    }
+
+    #[test]
+    fn excess_preflight_root_count_is_bounded_without_mutation() {
+        let parent = std::env::temp_dir().join(format!(
+            "mini-agent-preflight-count-test-parent-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&parent).expect("create excess-count parent");
+        let parent = canonical_root(&parent, "excess-count parent")
+            .expect("canonicalize excess-count parent");
+        let mut candidates = Vec::new();
+        for _ in 0..=MAX_STALE_PREFLIGHT_ROOTS {
+            let candidate = parent.join(format!("{PREFLIGHT_ROOT_PREFIX}{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&candidate).expect("create excess-count candidate");
+            candidates.push(candidate);
+        }
+
+        let error = recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect_err("excess candidate count must fail closed");
+        assert!(error.contains("root count exceeds 64"));
+        assert!(candidates.iter().all(|candidate| candidate.exists()));
+
+        std::fs::remove_dir_all(parent).expect("remove excess-count fixture");
+    }
+
+    #[test]
+    fn hardlinked_preflight_file_is_preserved_without_cleanup() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let malformed = root.path().to_path_buf();
+        let workspace = malformed.join("workspace");
+        std::fs::create_dir(&workspace).expect("create hardlink workspace");
+        let source = workspace.join("source");
+        let alias = workspace.join("alias");
+        std::fs::write(&source, b"evidence").expect("write hardlink source");
+        std::fs::hard_link(&source, &alias).expect("create hardlink alias");
+        root.retain_recovery_state();
+
+        let error = recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect_err("hardlinked recovery evidence must fail closed");
+        assert!(error.contains("multiple links"));
+        assert!(source.exists());
+        assert!(alias.exists());
+
+        std::fs::remove_dir_all(parent).expect("remove hardlink preflight fixture");
+    }
+
+    #[test]
+    fn oversized_preflight_tree_is_preserved_without_cleanup() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let oversized = root.path().to_path_buf();
+        let workspace = oversized.join("workspace");
+        std::fs::create_dir(&workspace).expect("create oversized workspace");
+        std::fs::write(
+            workspace.join("oversized"),
+            vec![0u8; MAX_PREFLIGHT_RECOVERY_BYTES as usize + 1],
+        )
+        .expect("write oversized recovery fixture");
+        root.retain_recovery_state();
+
+        let error = recover_preserved_preflight_roots(
+            &parent,
+            Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
+        )
+        .expect_err("oversized recovery tree must fail closed");
+        assert!(error.contains("exceeds byte bound"));
+        assert!(oversized.join("workspace/oversized").exists());
+
+        std::fs::remove_dir_all(parent).expect("remove oversized preflight fixture");
+    }
+
+    #[test]
+    fn expired_preflight_root_sweep_is_bounded_and_preserves_evidence() {
+        let (parent, mut root) = new_preflight_recovery_fixture();
+        let abandoned = root.path().to_path_buf();
+        root.retain_recovery_state();
+
+        let error = recover_preserved_preflight_roots(&parent, Instant::now())
+            .expect_err("expired sweep must fail before mutation");
+        assert!(error.contains("cleanup deadline"));
+        assert!(abandoned.join(PREFLIGHT_OWNER_FILE).exists());
+
+        std::fs::remove_dir_all(parent).expect("remove expired preflight fixture");
+    }
+
     #[test]
     fn recovery_deadline_starts_after_reap_and_bounds_acl_traversal() {
         let after_reap = Instant::now();
@@ -5203,11 +5995,16 @@ mod tests {
 
     #[test]
     fn timed_out_general_preflight_reaps_tree_and_removes_recovery_state() {
-        let base = std::env::temp_dir().join(format!(
-            "mini-agent-general-timeout-test-{}",
-            uuid::Uuid::new_v4()
+        let temp_root = std::env::temp_dir().join(format!(
+            "mini-agent-general-timeout-test-parent-{}",
+            uuid::Uuid::new_v4().simple()
         ));
-        let mut root = TemporaryPreflightRoot::new(base.clone());
+        std::fs::create_dir(&temp_root).expect("create timeout-test parent");
+        let temp_root = canonical_root(&temp_root, "timeout-test parent")
+            .expect("canonicalize timeout-test parent");
+        let mut root =
+            TemporaryPreflightRoot::create(&temp_root).expect("create private timeout-test root");
+        let base = root.path().to_path_buf();
         let workspace = base.join("workspace");
         let cache = base.join("cache");
         std::fs::create_dir_all(&workspace).expect("create timeout-test workspace");
@@ -5260,6 +6057,7 @@ mod tests {
         );
         root.remove().expect("remove exact timeout-test tree");
         assert!(!base.exists(), "timeout-test temporary tree survived");
+        std::fs::remove_dir(temp_root).expect("remove timeout-test parent");
     }
 
     #[test]

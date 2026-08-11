@@ -1265,10 +1265,17 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        ".output()",
-        6,
-        "TC-INTERNAL-VERIFICATION",
+        "let output = Command::new(std::env::current_exe().expect(\"resolve test executable\"))",
+        1,
+        "TEST-ONLY",
     ),
+    (
+        "src/sandbox/windows.rs",
+        "let status = Command::new(\"cmd\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/sandbox/windows.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/sandbox/windows.rs",
         "command: &mut tokio::process::Command,",
@@ -1398,6 +1405,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/sandbox/windows.rs",
+        "assert!(output.status.success());",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "assert!(status.success(), \"fixture must create a real junction\");",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/agent/runner.rs",
         "assert_eq!(output, UNKNOWN_TOOL_OUTCOME);",
@@ -2473,10 +2492,20 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        &[(
-            "48b38d261851e6e3c7bb387f8fb5d093448cb69f8047816907f7b7dc699ca584",
-            1,
-        )],
+        &[
+            (
+                "2d89694470e84019a3e88ae581007d1b2f626839a3d9ab1ad2950a4a3a8d7e6d",
+                1,
+            ),
+            (
+                "48b38d261851e6e3c7bb387f8fb5d093448cb69f8047816907f7b7dc699ca584",
+                1,
+            ),
+            (
+                "7731da00f43136911c6dc28ad641ac88c4af40639bd4738168ad235d98d9effb",
+                1,
+            ),
+        ],
     ),
 ];
 
@@ -2498,6 +2527,19 @@ fn checked_macro_non_process_contexts() -> BTreeSet<(String, String, usize)> {
 /// Sites whose identical terminal expression inherits different classes from
 /// the surrounding constructor, in source order.
 const MIXED_SITES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox/windows.rs",
+        ".output()",
+        &[
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TEST-ONLY",
+        ],
+    ),
     (
         "src/sandbox/worker/macos.rs",
         ".output()",
@@ -2936,10 +2978,17 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/windows.rs",
-        ".output()",
-        6,
-        "TC-INTERNAL-VERIFICATION",
+        "let output = Command::new(std::env::current_exe().expect(\"resolve test executable\"))",
+        1,
+        "TEST-ONLY",
     ),
+    (
+        "src/sandbox/windows.rs",
+        "let status = Command::new(\"cmd\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/sandbox/windows.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/sandbox/windows.rs",
         "command: &mut tokio::process::Command,",
@@ -3033,6 +3082,19 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
 ];
 
 const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
+    (
+        "src/sandbox/windows.rs",
+        ".output()",
+        &[
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TC-INTERNAL-VERIFICATION",
+            "TEST-ONLY",
+        ],
+    ),
     (
         "src/sandbox/worker/macos.rs",
         ".output()",
