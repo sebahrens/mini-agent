@@ -19,10 +19,11 @@ use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf, Prefix};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME,
@@ -150,6 +151,8 @@ const MAX_ACL_ENTRIES: usize = 250_000;
 const MAX_ACCESS_ROOTS: usize = 128;
 const MAX_STALE_PROFILE_JOURNALS: usize = 64;
 const PROFILE_JOURNAL_VERSION: u32 = 2;
+const PROFILE_INTENT_VERSION: u32 = 1;
+const PROFILE_INTENT_EXTENSION: &str = "intent";
 const JOB_NAME_PREFIX: &str = "Global\\mini-agent-general-job-";
 const STALE_JOB_CLEANUP_EXIT_CODE: u32 = 126;
 const MAX_JOB_PROCESSES: u32 = 64;
@@ -157,11 +160,15 @@ const PROCESS_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const JOB_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 const PROCESS_CPU_100NS: i64 = 60 * 10_000_000;
 const ACL_MUTEX_WAIT_MS: u32 = 5_000;
+const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration = Duration::from_secs(5);
+const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const GENERAL_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // ACL snapshots must be serialized across terminal/RDP/service sessions. A Local\\ mutex would
 // allow two same-user helpers in different sessions to overwrite each other's read/modify/write
 // transaction. The object manager applies the creator token's default DACL; a pre-created object
 // that we cannot open therefore fails the launch closed.
 const ACL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-acl-v1";
+const PROFILE_CONTROL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-profile-control-v1";
 const HELPER_FAILURE_STATUS_BASE: i32 = 160;
 const HELPER_STAGE_REQUEST: u8 = 1;
 const HELPER_STAGE_SETUP: u8 = 2;
@@ -264,6 +271,41 @@ impl Drop for AclMutationGuard {
     }
 }
 
+struct ProfileControlGuard(Handle);
+
+impl ProfileControlGuard {
+    fn acquire_until(deadline: Instant) -> Result<Self, String> {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        let name = wide_string(PROFILE_CONTROL_MUTEX_NAME);
+        let mutex = Handle::created(
+            unsafe { CreateMutexW(null(), 0, name.as_ptr()) },
+            "open cross-process AppContainer profile-control mutex",
+        )?;
+        ensure_preflight_cleanup_deadline(deadline)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait_ms = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+        match unsafe { WaitForSingleObject(mutex.raw(), wait_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED_0 => {
+                let guard = Self(mutex);
+                ensure_preflight_cleanup_deadline(deadline)?;
+                Ok(guard)
+            }
+            WAIT_TIMEOUT => {
+                Err("sandbox: timed out serializing AppContainer profile control".into())
+            }
+            _ => Err(last_error(
+                "wait for cross-process AppContainer profile-control mutex",
+            )),
+        }
+    }
+}
+
+impl Drop for ProfileControlGuard {
+    fn drop(&mut self) {
+        unsafe { ReleaseMutex(self.0.raw()) };
+    }
+}
+
 struct AppContainerProfile {
     sid: PSID,
     name: Vec<u16>,
@@ -339,6 +381,12 @@ struct ProfileJournal {
     roots: Vec<PathBuf>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ProfileIntent {
+    version: u32,
+    profile_name: String,
+}
+
 #[derive(Debug)]
 struct CleanupProof {
     sid: String,
@@ -375,62 +423,240 @@ impl Drop for PrivateDesktop {
 }
 
 pub(crate) fn is_available() -> bool {
-    *GENERAL_SANDBOX_AVAILABLE.get_or_init(|| run_production_preflight().is_ok())
+    cached_general_sandbox_availability(&GENERAL_SANDBOX_AVAILABLE, || {
+        let started = Instant::now();
+        let result = run_production_preflight();
+        tracing::debug!(
+            phase = "windows_general_appcontainer_preflight",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            available = result.is_ok(),
+            "completed closed Windows general-sandbox startup phase"
+        );
+        result
+    })
 }
 
-struct TemporaryPreflightRoot(PathBuf);
+fn cached_general_sandbox_availability(
+    cache: &OnceLock<bool>,
+    probe: impl FnOnce() -> Result<(), String>,
+) -> bool {
+    *cache.get_or_init(|| probe().is_ok())
+}
+
+struct TemporaryPreflightRoot(Option<PathBuf>);
+
+impl TemporaryPreflightRoot {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("preflight root remains owned")
+    }
+
+    fn remove(&mut self) -> Result<(), String> {
+        let path = self.path().to_path_buf();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                self.0.take();
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.0.take();
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "sandbox: remove Windows production-preflight temporary root: {error}"
+            )),
+        }
+    }
+
+    fn retain_recovery_state(&mut self) {
+        self.0.take();
+    }
+}
 
 impl Drop for TemporaryPreflightRoot {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
 fn run_production_preflight() -> Result<(), String> {
-    let root = TemporaryPreflightRoot(std::env::temp_dir().join(format!(
+    let started = Instant::now();
+    let run_deadline = started + GENERAL_PREFLIGHT_RUN_TIMEOUT;
+    let reap_deadline = run_deadline + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT;
+    run_production_preflight_owned(run_deadline, reap_deadline)
+}
+
+fn run_production_preflight_owned(
+    run_deadline: Instant,
+    reap_deadline: Instant,
+) -> Result<(), String> {
+    let mut root = TemporaryPreflightRoot::new(std::env::temp_dir().join(format!(
         "mini-agent-windows-sandbox-preflight-{}",
         uuid::Uuid::new_v4()
     )));
-    let workspace = root.0.join("workspace");
-    let cache = root.0.join("cache");
-    let outside = root.0.join("outside");
-    std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(&outside).map_err(|error| error.to_string())?;
+    let workspace = root.path().join("workspace");
+    let cache = root.path().join("cache");
+    let outside = root.path().join("outside");
+    let operation = (|| -> Result<(), String> {
+        std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&outside).map_err(|error| error.to_string())?;
 
-    let inside_file = workspace.join("inside.txt");
-    let cache_fixture = cache.join("read-only-cache.txt");
-    let outside_secret = outside.join("secret.txt");
-    let outside_file = outside.join("outside.txt");
-    std::fs::write(&cache_fixture, b"cache-readable").map_err(|error| error.to_string())?;
-    std::fs::write(&outside_secret, b"outside-secret").map_err(|error| error.to_string())?;
-    let executable = canonical_file(
-        &std::env::current_exe().map_err(|error| error.to_string())?,
-        "production preflight executable",
-    )?;
-    let cleanup_ready = workspace.join("cleanup-ready.txt");
-    let mut command = build_helper_with_ready(
-        executable.clone(),
-        vec![
-            TARGET_PROBE_ARG.into(),
-            TARGET_BOUNDARY_ARG.into(),
-            inside_file.to_string_lossy().into_owned(),
-            cache_fixture.to_string_lossy().into_owned(),
-            outside_secret.to_string_lossy().into_owned(),
-            outside_file.to_string_lossy().into_owned(),
-        ],
-        &workspace,
-        &cache,
-        Some(cleanup_ready.clone()),
-    )?;
-    let output = command
-        .as_std_mut()
-        .output_guarded()
-        .map_err(|error| format!("run production AppContainer preflight: {error}"))?;
-    if !output.status.success() || !inside_file.exists() || outside_file.exists() {
-        return Err("production AppContainer preflight denied its declared boundary".into());
+        let inside_file = workspace.join("inside.txt");
+        let cache_fixture = cache.join("read-only-cache.txt");
+        let outside_secret = outside.join("secret.txt");
+        let outside_file = outside.join("outside.txt");
+        std::fs::write(&cache_fixture, b"cache-readable").map_err(|error| error.to_string())?;
+        std::fs::write(&outside_secret, b"outside-secret").map_err(|error| error.to_string())?;
+        let executable = canonical_file(
+            &std::env::current_exe().map_err(|error| error.to_string())?,
+            "production preflight executable",
+        )?;
+        let cleanup_ready = workspace.join("cleanup-ready.txt");
+        let mut command = build_helper_with_ready(
+            executable.clone(),
+            vec![
+                TARGET_PROBE_ARG.into(),
+                TARGET_BOUNDARY_ARG.into(),
+                inside_file.to_string_lossy().into_owned(),
+                cache_fixture.to_string_lossy().into_owned(),
+                outside_secret.to_string_lossy().into_owned(),
+                outside_file.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &cache,
+            Some(cleanup_ready.clone()),
+        )?;
+        command
+            .as_std_mut()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = run_bounded_preflight_helper(&mut command, run_deadline, reap_deadline)?;
+        if !status.success() || !inside_file.exists() || outside_file.exists() {
+            return Err("production AppContainer preflight denied its declared boundary".into());
+        }
+        attest_completed_cleanup(&cleanup_ready, [&workspace, &cache, executable.as_path()])
+    })();
+
+    // Recovery gets its own bounded window after the helper has been reaped. Reusing the reap
+    // deadline here can leave no time to revoke ACLs or delete the ephemeral profile.
+    let recovery_deadline = next_general_preflight_recovery_deadline(Instant::now());
+    let recovery = recover_preflight_profiles(&cache, recovery_deadline);
+    let removal = if recovery.is_ok() {
+        root.remove()
+    } else {
+        // Never erase the only durable profile/ACL recovery record after a failed sweep.
+        root.retain_recovery_state();
+        Ok(())
+    };
+    match (operation, recovery, removal) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (_, Err(error), _) | (_, _, Err(error)) => Err(error),
     }
-    attest_completed_cleanup(&cleanup_ready, [&workspace, &cache, executable.as_path()])
+}
+
+fn next_general_preflight_recovery_deadline(now: Instant) -> Instant {
+    now + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT
+}
+
+fn run_bounded_preflight_helper(
+    command: &mut tokio::process::Command,
+    run_deadline: Instant,
+    cleanup_deadline: Instant,
+) -> Result<ExitStatus, String> {
+    let mut child = command
+        .as_std_mut()
+        .spawn_guarded_until(run_deadline)
+        .map_err(|error| format!("sandbox: start production AppContainer preflight: {error}"))?;
+    loop {
+        if Instant::now() >= run_deadline {
+            terminate_and_reap_owned_helper(&mut child, cleanup_deadline)?;
+            return Err("sandbox: Windows general AppContainer preflight timed out".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if Instant::now() < run_deadline {
+                    Ok(status)
+                } else {
+                    Err("sandbox: Windows general AppContainer preflight timed out".into())
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let poll_error =
+                    format!("sandbox: poll production AppContainer preflight: {error}");
+                return Err(
+                    match terminate_and_reap_owned_helper(&mut child, cleanup_deadline) {
+                        Ok(()) => poll_error,
+                        Err(cleanup) => format!("{poll_error}; {cleanup}"),
+                    },
+                );
+            }
+        }
+        std::thread::sleep(
+            GENERAL_PREFLIGHT_POLL_INTERVAL
+                .min(run_deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn terminate_and_reap_owned_helper(
+    child: &mut Child,
+    cleanup_deadline: Instant,
+) -> Result<(), String> {
+    let mut first_error = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let wait = child.wait().map_err(|error| {
+                    format!("sandbox: finish reaping timed-out AppContainer helper: {error}")
+                });
+                return match (first_error, wait) {
+                    (None, Ok(_)) => Ok(()),
+                    (Some(error), Ok(_)) => Err(error),
+                    (None, Err(error)) => Err(error),
+                    (Some(error), Err(wait)) => Err(format!("{error}; {wait}")),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    format!("sandbox: poll timed-out AppContainer helper: {error}")
+                });
+            }
+        }
+        if let Err(error) = child.kill() {
+            first_error.get_or_insert_with(|| {
+                format!("sandbox: terminate timed-out AppContainer helper: {error}")
+            });
+        }
+        if Instant::now() >= cleanup_deadline {
+            return Err(first_error.unwrap_or_else(|| {
+                "sandbox: timed-out AppContainer helper exceeded its bounded reap deadline".into()
+            }));
+        }
+        std::thread::sleep(
+            GENERAL_PREFLIGHT_POLL_INTERVAL
+                .min(cleanup_deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn recover_preflight_profiles(cache: &Path, deadline: Instant) -> Result<(), String> {
+    let journal_root = cache
+        .parent()
+        .ok_or("sandbox: production-preflight cache has no control parent")?
+        .join(".mini-agent-appcontainer-control-v1");
+    if journal_root.exists() {
+        sweep_stale_profiles_until(&journal_root, deadline)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn build_shell_helper(
@@ -692,8 +918,138 @@ fn reject_remote_access_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    left.starts_with(right) || right.starts_with(left)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootRole {
+    Workspace,
+    ReadOnlyApplicationCache,
+    ConfiguredReadOnlyRoot,
+    ConfiguredWritableRoot,
+    SandboxExecutable,
+    PrivateControlRoot,
+    AuthorizedReadRoot,
+    AuthorizedWritableRoot,
+}
+
+impl RootRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::ReadOnlyApplicationCache => "read-only application cache",
+            Self::ConfiguredReadOnlyRoot => "configured read-only root",
+            Self::ConfiguredWritableRoot => "configured writable root",
+            Self::SandboxExecutable => "sandbox executable",
+            Self::PrivateControlRoot => "private AppContainer control root",
+            Self::AuthorizedReadRoot => "authorized read root",
+            Self::AuthorizedWritableRoot => "authorized writable root",
+        }
+    }
+}
+
+fn root_role_conflict(
+    left_role: RootRole,
+    left: &Path,
+    right_role: RootRole,
+    right: &Path,
+) -> Option<String> {
+    let relation = if left == right {
+        format!(
+            "{} is the same root as {}",
+            left_role.label(),
+            right_role.label()
+        )
+    } else if right.starts_with(left) {
+        format!("{} contains {}", left_role.label(), right_role.label())
+    } else if left.starts_with(right) {
+        format!("{} contains {}", right_role.label(), left_role.label())
+    } else {
+        return None;
+    };
+    let remedy = if [left_role, right_role].contains(&RootRole::Workspace)
+        && [left_role, right_role].contains(&RootRole::ReadOnlyApplicationCache)
+    {
+        if left_role == RootRole::Workspace && right.starts_with(left)
+            || right_role == RootRole::Workspace && left.starts_with(right)
+        {
+            "use a project subdirectory that excludes the application cache or set ZS_CACHE_DIR outside the workspace"
+        } else {
+            "move the project outside the application cache or set ZS_CACHE_DIR to a directory that does not contain the workspace"
+        }
+    } else if [left_role, right_role].contains(&RootRole::PrivateControlRoot) {
+        "set ZS_CACHE_DIR outside every AppContainer access root or narrow the conflicting configured root"
+    } else {
+        "remove or narrow one of the conflicting Windows AppContainer roots"
+    };
+    Some(format!(
+        "sandbox: AppContainer root-role conflict: {relation}; {remedy}"
+    ))
+}
+
+fn private_control_root_candidate(cache: &Path) -> Result<PathBuf, String> {
+    let parent = cache
+        .parent()
+        .ok_or("sandbox: application cache has no private control parent")?;
+    let candidate = parent.join(".mini-agent-appcontainer-control-v1");
+    reject_reparse_components(&candidate)?;
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => {
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("sandbox: private AppContainer control root is a reparse point".into());
+            }
+            if !metadata.is_dir() {
+                return Err(
+                    "sandbox: private AppContainer control root has unsupported type".into(),
+                );
+            }
+            let canonical = std::fs::canonicalize(candidate).map_err(|_| {
+                "sandbox: canonicalize private AppContainer control root failed".to_string()
+            })?;
+            reject_reparse_components(&canonical)?;
+            Ok(canonical)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(candidate),
+        Err(_) => Err("sandbox: inspect private AppContainer control root failed".into()),
+    }
+}
+
+fn validate_private_control_root_policy(
+    cache: &Path,
+    program: &Path,
+    cwd: &Path,
+    configured_read_roots: &[PathBuf],
+    configured_write_roots: &[PathBuf],
+) -> Result<(), String> {
+    let control = private_control_root_candidate(cache)?;
+    for (role, root) in [
+        (RootRole::Workspace, cwd),
+        (RootRole::ReadOnlyApplicationCache, cache),
+        (RootRole::SandboxExecutable, program),
+    ] {
+        if let Some(error) = root_role_conflict(RootRole::PrivateControlRoot, &control, role, root)
+        {
+            return Err(error);
+        }
+    }
+    for root in configured_read_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &control,
+            RootRole::ConfiguredReadOnlyRoot,
+            root,
+        ) {
+            return Err(error);
+        }
+    }
+    for root in configured_write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &control,
+            RootRole::ConfiguredWritableRoot,
+            root,
+        ) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn validate_explicit_root_policy(
@@ -705,8 +1061,13 @@ fn validate_explicit_root_policy(
     read_roots: &[PathBuf],
     write_roots: &[PathBuf],
 ) -> Result<(), String> {
-    if paths_overlap(cwd, cache) {
-        return Err("sandbox: workspace and read-only cache roots overlap".into());
+    if let Some(error) = root_role_conflict(
+        RootRole::Workspace,
+        cwd,
+        RootRole::ReadOnlyApplicationCache,
+        cache,
+    ) {
+        return Err(error);
     }
     let mut expected_reads = vec![
         cwd.to_path_buf(),
@@ -725,23 +1086,65 @@ fn validate_explicit_root_policy(
             "sandbox: AppContainer request violated the closed explicit root policy".into(),
         );
     }
-    let protected_reads =
-        std::iter::once(cache).chain(configured_read_roots.iter().map(PathBuf::as_path));
-    if protected_reads.clone().any(|read| {
-        expected_writes
-            .iter()
-            .any(|write| paths_overlap(read, write))
-    }) {
-        return Err("sandbox: configured writable root overlaps a read-only root".into());
-    }
-    for (index, write) in expected_writes.iter().enumerate() {
-        if expected_writes[index + 1..]
-            .iter()
-            .any(|other| paths_overlap(write, other))
-        {
-            return Err("sandbox: configured writable roots overlap".into());
+    for write in configured_write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::ReadOnlyApplicationCache,
+            cache,
+            RootRole::ConfiguredWritableRoot,
+            write,
+        ) {
+            return Err(error);
         }
     }
+    for read in configured_read_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::ConfiguredReadOnlyRoot,
+            read,
+            RootRole::Workspace,
+            cwd,
+        ) {
+            return Err(error);
+        }
+        for write in configured_write_roots {
+            if let Some(error) = root_role_conflict(
+                RootRole::ConfiguredReadOnlyRoot,
+                read,
+                RootRole::ConfiguredWritableRoot,
+                write,
+            ) {
+                return Err(error);
+            }
+        }
+    }
+    for write in configured_write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::Workspace,
+            cwd,
+            RootRole::ConfiguredWritableRoot,
+            write,
+        ) {
+            return Err(error);
+        }
+    }
+    for (index, write) in configured_write_roots.iter().enumerate() {
+        for other in &configured_write_roots[index + 1..] {
+            if let Some(error) = root_role_conflict(
+                RootRole::ConfiguredWritableRoot,
+                write,
+                RootRole::ConfiguredWritableRoot,
+                other,
+            ) {
+                return Err(error);
+            }
+        }
+    }
+    validate_private_control_root_policy(
+        cache,
+        program,
+        cwd,
+        configured_read_roots,
+        configured_write_roots,
+    )?;
     Ok(())
 }
 
@@ -1727,9 +2130,24 @@ fn grant_access_root(
 }
 
 fn revoke_tree(root: &Path, sid: PSID) -> Result<(), String> {
+    revoke_tree_with_deadline(root, sid, None)
+}
+
+fn revoke_tree_until(root: &Path, sid: PSID, deadline: Instant) -> Result<(), String> {
+    revoke_tree_with_deadline(root, sid, Some(deadline))
+}
+
+fn revoke_tree_with_deadline(
+    root: &Path,
+    sid: PSID,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
     let mut pending = vec![root.to_path_buf()];
     let mut seen = 0usize;
     while let Some(path) = pending.pop() {
+        if let Some(deadline) = deadline {
+            ensure_preflight_cleanup_deadline(deadline)?;
+        }
         seen += 1;
         if seen > MAX_ACL_ENTRIES {
             return Err("sandbox: cleanup ACL traversal exceeded 250000 entries".into());
@@ -1754,6 +2172,9 @@ fn revoke_tree(root: &Path, sid: PSID) -> Result<(), String> {
             for entry in std::fs::read_dir(&path)
                 .map_err(|error| format!("sandbox: cleanup enumerate: {error}"))?
             {
+                if let Some(deadline) = deadline {
+                    ensure_preflight_cleanup_deadline(deadline)?;
+                }
                 pending.push(
                     entry
                         .map_err(|error| format!("sandbox: cleanup enumerate: {error}"))?
@@ -1952,12 +2373,19 @@ fn create_appcontainer_profile(
     job_name: &str,
 ) -> Result<AppContainerProfile, String> {
     let journal_root = profile_journal_root(cache, read_roots, write_roots)?;
-    sweep_stale_profiles(&journal_root)?;
+    let profile_control_deadline = Instant::now() + Duration::from_secs(5);
+    let profile_control = ProfileControlGuard::acquire_until(profile_control_deadline)?;
+    sweep_stale_profiles_until_locked(&journal_root, profile_control_deadline, &profile_control)?;
     let name_text = format!(
         "{APPCONTAINER_PROFILE_PREFIX}{}",
         uuid::Uuid::new_v4().simple()
     );
     let name = wide_string(&name_text);
+    // Publish the name before profile creation. If this trusted helper is terminated between
+    // CreateAppContainerProfile and the full SID/root journal below, the parent can still delete
+    // the exact profile without guessing or deleting the control tree that owns recovery.
+    let (intent_path, intent_lease) =
+        create_profile_intent(&journal_root, &name_text, &profile_control)?;
     let display = wide_string("mini-agent general sandbox");
     let description = wide_string("Ephemeral workspace-capable mini-agent sandbox");
     let mut sid = null_mut();
@@ -1972,9 +2400,17 @@ fn create_appcontainer_profile(
         )
     };
     if result < 0 || sid.is_null() {
-        return Err(format!(
-            "sandbox: create unique AppContainer profile: HRESULT {result:#x}"
-        ));
+        if !sid.is_null() {
+            unsafe { FreeSid(sid) };
+        }
+        let create_error =
+            format!("sandbox: create unique AppContainer profile: HRESULT {result:#x}");
+        return Err(
+            match remove_profile_intent(&intent_path, intent_lease, &profile_control) {
+                Ok(()) => create_error,
+                Err(cleanup) => format!("{create_error}; {cleanup}"),
+            },
+        );
     }
     let mut profile = AppContainerProfile {
         sid,
@@ -2053,16 +2489,68 @@ fn create_appcontainer_profile(
         Ok((journal_path, lease)) => {
             profile.journal_path = journal_path;
             profile.journal_lease = Some(lease);
+            if let Err(intent_error) =
+                remove_profile_intent(&intent_path, intent_lease, &profile_control)
+            {
+                let cleanup = profile.finalize_cleanup();
+                return Err(match cleanup {
+                    Ok(()) => intent_error,
+                    Err(cleanup) => format!("{intent_error}; {cleanup}"),
+                });
+            }
             Ok(profile)
         }
         Err(error) => {
             let rollback = profile.rollback_unjournaled();
-            Err(match rollback {
-                Ok(()) => error,
-                Err(rollback) => format!("{error}; unjournaled rollback failed: {rollback}"),
+            let intent = remove_profile_intent(&intent_path, intent_lease, &profile_control);
+            Err(match (rollback, intent) {
+                (Ok(()), Ok(())) => error,
+                (Err(rollback), Ok(())) => {
+                    format!("{error}; unjournaled rollback failed: {rollback}")
+                }
+                (Ok(()), Err(intent)) => format!("{error}; {intent}"),
+                (Err(rollback), Err(intent)) => {
+                    format!("{error}; unjournaled rollback failed: {rollback}; {intent}")
+                }
             })
         }
     }
+}
+
+fn create_profile_intent(
+    journal_root: &Path,
+    profile_name: &str,
+    _profile_control: &ProfileControlGuard,
+) -> Result<(PathBuf, File), String> {
+    let payload = serde_json::to_vec(&ProfileIntent {
+        version: PROFILE_INTENT_VERSION,
+        profile_name: profile_name.to_string(),
+    })
+    .map_err(|error| format!("sandbox: encode AppContainer profile intent: {error}"))?;
+    let path = journal_root.join(format!(
+        "{}.{}",
+        uuid::Uuid::new_v4().simple(),
+        PROFILE_INTENT_EXTENSION
+    ));
+    let mut lease = create_profile_journal(&path)?;
+    if let Err(error) = lease.write_all(&payload).and_then(|()| lease.sync_all()) {
+        drop(lease);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!(
+            "sandbox: persist AppContainer profile intent: {error}"
+        ));
+    }
+    Ok((path, lease))
+}
+
+fn remove_profile_intent(
+    path: &Path,
+    lease: File,
+    _profile_control: &ProfileControlGuard,
+) -> Result<(), String> {
+    drop(lease);
+    std::fs::remove_file(path)
+        .map_err(|error| format!("sandbox: remove AppContainer profile intent: {error}"))
 }
 
 fn appcontainer_storage_path(sid: &str) -> Result<PathBuf, String> {
@@ -2094,23 +2582,50 @@ fn profile_journal_root(
     read_roots: &[PathBuf],
     write_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let parent = cache
-        .parent()
-        .ok_or("sandbox: application cache has no private control parent")?;
-    let root = parent.join(".mini-agent-appcontainer-control-v1");
-    std::fs::create_dir_all(&root).map_err(|error| {
-        format!(
-            "sandbox: create AppContainer cleanup journal root {}: {error}",
-            root.display()
-        )
-    })?;
-    let root = canonical_root(&root, "AppContainer cleanup journal root")?;
-    if read_roots
-        .iter()
-        .chain(write_roots)
-        .any(|granted| paths_overlap(&root, granted))
-    {
-        return Err("sandbox: AppContainer cleanup journal overlaps a granted root".into());
+    let candidate = private_control_root_candidate(cache)?;
+    for root in read_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &candidate,
+            RootRole::AuthorizedReadRoot,
+            root,
+        ) {
+            return Err(error);
+        }
+    }
+    for root in write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &candidate,
+            RootRole::AuthorizedWritableRoot,
+            root,
+        ) {
+            return Err(error);
+        }
+    }
+    let root = candidate;
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("sandbox: create private AppContainer control root: {error}"))?;
+    let root = private_control_root_candidate(cache)?;
+    for granted in read_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &root,
+            RootRole::AuthorizedReadRoot,
+            granted,
+        ) {
+            return Err(error);
+        }
+    }
+    for granted in write_roots {
+        if let Some(error) = root_role_conflict(
+            RootRole::PrivateControlRoot,
+            &root,
+            RootRole::AuthorizedWritableRoot,
+            granted,
+        ) {
+            return Err(error);
+        }
     }
     protect_and_attest_control_root(&root)?;
     Ok(root)
@@ -2287,7 +2802,16 @@ fn open_stale_profile_journal(path: &Path) -> Result<Option<File>, String> {
     Ok(Some(unsafe { File::from_raw_handle(raw) }))
 }
 
-fn sweep_stale_profiles(journal_root: &Path) -> Result<(), String> {
+fn sweep_stale_profiles_until(journal_root: &Path, deadline: Instant) -> Result<(), String> {
+    let profile_control = ProfileControlGuard::acquire_until(deadline)?;
+    sweep_stale_profiles_until_locked(journal_root, deadline, &profile_control)
+}
+
+fn sweep_stale_profiles_until_locked(
+    journal_root: &Path,
+    deadline: Instant,
+    _profile_control: &ProfileControlGuard,
+) -> Result<(), String> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(journal_root)
         .map_err(|error| format!("sandbox: enumerate AppContainer cleanup journals: {error}"))?
@@ -2302,73 +2826,132 @@ fn sweep_stale_profiles(journal_root: &Path) -> Result<(), String> {
         );
     }
     entries.sort();
+    let mut journals = Vec::new();
+    let mut intents = Vec::new();
     for path in entries {
-        if path.extension() != Some(OsStr::new("json")) {
-            return Err("sandbox: unexpected entry in AppContainer cleanup journal root".into());
-        }
-        let Some(mut lease) = open_stale_profile_journal(&path)? else {
-            continue;
-        };
-        let metadata = lease
-            .metadata()
-            .map_err(|error| format!("sandbox: inspect AppContainer cleanup journal: {error}"))?;
-        if !metadata.is_file()
-            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || crate::fs::windows_file_link_count(&lease)
-                .map_err(|error| format!("sandbox: inspect cleanup-journal links: {error}"))?
-                != 1
-            || metadata.len() > 64 * 1024
-        {
-            return Err("sandbox: invalid AppContainer cleanup journal object".into());
-        }
-        let mut payload = Vec::with_capacity(metadata.len() as usize);
-        lease
-            .read_to_end(&mut payload)
-            .map_err(|error| format!("sandbox: read AppContainer cleanup journal: {error}"))?;
-        let journal: ProfileJournal = serde_json::from_slice(&payload)
-            .map_err(|error| format!("sandbox: decode AppContainer cleanup journal: {error}"))?;
-        if journal.version != PROFILE_JOURNAL_VERSION
-            || !journal
-                .profile_name
-                .starts_with(APPCONTAINER_PROFILE_PREFIX)
-            || journal.profile_name.len() != APPCONTAINER_PROFILE_PREFIX.len() + 32
-            || !journal.job_name.starts_with(JOB_NAME_PREFIX)
-            || journal.job_name.len() != JOB_NAME_PREFIX.len() + 32
-            || journal.roots.is_empty()
-            || journal.roots.len() > MAX_ACCESS_ROOTS
-        {
-            return Err("sandbox: invalid AppContainer cleanup journal policy".into());
-        }
-        let name = wide_string(&journal.profile_name);
-        let mut sid = null_mut();
-        let result = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
-        if result < 0 || sid.is_null() {
-            return Err(format!(
-                "sandbox: derive stale AppContainer SID: HRESULT {result:#x}"
-            ));
-        }
-        struct Sid(PSID);
-        impl Drop for Sid {
-            fn drop(&mut self) {
-                unsafe { FreeSid(self.0) };
+        match path.extension().and_then(OsStr::to_str) {
+            Some("json") => journals.push(path),
+            Some(PROFILE_INTENT_EXTENSION) => intents.push(path),
+            _ => {
+                return Err(
+                    "sandbox: unexpected entry in AppContainer cleanup journal root".into(),
+                );
             }
         }
-        let sid = Sid(sid);
-        if sid_text(sid.0)? != journal.sid {
-            return Err("sandbox: stale AppContainer journal SID mismatch".into());
-        }
-        wait_for_stale_job_quiescence(&journal.job_name)?;
-        let roots =
-            canonicalize_access_roots(journal.roots.iter().map(PathBuf::as_path), journal_root)?;
-        for root in roots {
-            revoke_tree(&root, sid.0)?;
-        }
-        delete_appcontainer_profile(&name)?;
-        drop(lease);
-        std::fs::remove_file(&path)
-            .map_err(|error| format!("sandbox: remove stale AppContainer journal: {error}"))?;
+    }
+    // Full journals must run first: they retain the SID and root set required to revoke ACLs.
+    // An overlapping intent can then safely delete the already-absent profile idempotently.
+    for path in journals {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        sweep_stale_profile_journal(&path, journal_root, deadline)?;
+    }
+    for path in intents {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        sweep_stale_profile_intent(&path)?;
     }
     Ok(())
+}
+
+fn read_stale_control_file(path: &Path) -> Result<Option<(File, Vec<u8>)>, String> {
+    let Some(mut lease) = open_stale_profile_journal(path)? else {
+        return Ok(None);
+    };
+    let metadata = lease
+        .metadata()
+        .map_err(|error| format!("sandbox: inspect AppContainer cleanup journal: {error}"))?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || crate::fs::windows_file_link_count(&lease)
+            .map_err(|error| format!("sandbox: inspect cleanup-journal links: {error}"))?
+            != 1
+        || metadata.len() > 64 * 1024
+    {
+        return Err("sandbox: invalid AppContainer cleanup journal object".into());
+    }
+    let mut payload = Vec::with_capacity(metadata.len() as usize);
+    lease
+        .read_to_end(&mut payload)
+        .map_err(|error| format!("sandbox: read AppContainer cleanup journal: {error}"))?;
+    Ok(Some((lease, payload)))
+}
+
+fn sweep_stale_profile_journal(
+    path: &Path,
+    journal_root: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    let Some((lease, payload)) = read_stale_control_file(path)? else {
+        return Ok(());
+    };
+    let journal: ProfileJournal = serde_json::from_slice(&payload)
+        .map_err(|error| format!("sandbox: decode AppContainer cleanup journal: {error}"))?;
+    if journal.version != PROFILE_JOURNAL_VERSION
+        || !journal
+            .profile_name
+            .starts_with(APPCONTAINER_PROFILE_PREFIX)
+        || journal.profile_name.len() != APPCONTAINER_PROFILE_PREFIX.len() + 32
+        || !journal.job_name.starts_with(JOB_NAME_PREFIX)
+        || journal.job_name.len() != JOB_NAME_PREFIX.len() + 32
+        || journal.roots.is_empty()
+        || journal.roots.len() > MAX_ACCESS_ROOTS
+    {
+        return Err("sandbox: invalid AppContainer cleanup journal policy".into());
+    }
+    let name = wide_string(&journal.profile_name);
+    let mut sid = null_mut();
+    let result = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+    if result < 0 || sid.is_null() {
+        return Err(format!(
+            "sandbox: derive stale AppContainer SID: HRESULT {result:#x}"
+        ));
+    }
+    struct Sid(PSID);
+    impl Drop for Sid {
+        fn drop(&mut self) {
+            unsafe { FreeSid(self.0) };
+        }
+    }
+    let sid = Sid(sid);
+    if sid_text(sid.0)? != journal.sid {
+        return Err("sandbox: stale AppContainer journal SID mismatch".into());
+    }
+    wait_for_stale_job_quiescence_until(&journal.job_name, deadline)?;
+    let roots =
+        canonicalize_access_roots(journal.roots.iter().map(PathBuf::as_path), journal_root)?;
+    for root in roots {
+        ensure_preflight_cleanup_deadline(deadline)?;
+        revoke_tree_until(&root, sid.0, deadline)?;
+    }
+    delete_appcontainer_profile(&name)?;
+    drop(lease);
+    std::fs::remove_file(path)
+        .map_err(|error| format!("sandbox: remove stale AppContainer journal: {error}"))
+}
+
+fn sweep_stale_profile_intent(path: &Path) -> Result<(), String> {
+    let Some((lease, payload)) = read_stale_control_file(path)? else {
+        return Ok(());
+    };
+    let intent: ProfileIntent = serde_json::from_slice(&payload)
+        .map_err(|error| format!("sandbox: decode AppContainer profile intent: {error}"))?;
+    if intent.version != PROFILE_INTENT_VERSION
+        || !intent.profile_name.starts_with(APPCONTAINER_PROFILE_PREFIX)
+        || intent.profile_name.len() != APPCONTAINER_PROFILE_PREFIX.len() + 32
+    {
+        return Err("sandbox: invalid AppContainer profile intent policy".into());
+    }
+    delete_appcontainer_profile(&wide_string(&intent.profile_name))?;
+    drop(lease);
+    std::fs::remove_file(path)
+        .map_err(|error| format!("sandbox: remove stale AppContainer profile intent: {error}"))
+}
+
+fn ensure_preflight_cleanup_deadline(deadline: Instant) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        Err("sandbox: Windows AppContainer recovery exceeded its cleanup deadline".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn sid_text(sid: PSID) -> Result<String, String> {
@@ -2597,6 +3180,10 @@ fn verify_job_limits(job: &Handle) -> Result<(), String> {
 }
 
 fn wait_for_stale_job_quiescence(name: &str) -> Result<(), String> {
+    wait_for_stale_job_quiescence_until(name, Instant::now() + Duration::from_secs(5))
+}
+
+fn wait_for_stale_job_quiescence_until(name: &str, deadline: Instant) -> Result<(), String> {
     if !name.starts_with(JOB_NAME_PREFIX) || name.len() != JOB_NAME_PREFIX.len() + 32 {
         return Err("sandbox: invalid stale AppContainer Job name".into());
     }
@@ -2620,11 +3207,14 @@ fn wait_for_stale_job_quiescence(name: &str) -> Result<(), String> {
     if unsafe { TerminateJobObject(job.raw(), STALE_JOB_CLEANUP_EXIT_CODE) } == 0 {
         return Err(last_error("terminate exact stale AppContainer Job"));
     }
-    wait_for_job_zero(&job, "stale AppContainer Job")
+    wait_for_job_zero_until(&job, "stale AppContainer Job", deadline)
 }
 
 fn wait_for_job_zero(job: &Handle, label: &str) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    wait_for_job_zero_until(job, label, Instant::now() + Duration::from_secs(5))
+}
+
+fn wait_for_job_zero_until(job: &Handle, label: &str, deadline: Instant) -> Result<(), String> {
     loop {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         if unsafe {
@@ -2645,7 +3235,7 @@ fn wait_for_job_zero(job: &Handle, label: &str) -> Result<(), String> {
         if std::time::Instant::now() >= deadline {
             return Err(format!("sandbox: {label} did not drain all descendants"));
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(GENERAL_PREFLIGHT_POLL_INTERVAL);
     }
 }
 
@@ -4026,6 +4616,355 @@ fn last_error(context: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    struct RootPolicyFixture(PathBuf);
+
+    impl RootPolicyFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "mini-agent-root-policy-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).expect("create root-policy fixture");
+            Self(root)
+        }
+
+        fn directory(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(&path).expect("create root-policy directory");
+            std::fs::canonicalize(path).expect("canonicalize root-policy directory")
+        }
+
+        fn file(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create root-policy file parent");
+            }
+            std::fs::write(&path, b"fixture").expect("create root-policy file");
+            std::fs::canonicalize(path).expect("canonicalize root-policy file")
+        }
+    }
+
+    impl Drop for RootPolicyFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn validate_policy_fixture(
+        program: &Path,
+        workspace: &Path,
+        cache: &Path,
+        configured_reads: &[PathBuf],
+        configured_writes: &[PathBuf],
+    ) -> Result<(), String> {
+        let read_roots = collect_read_roots(program, workspace, cache, configured_reads)?;
+        let write_roots = collect_write_roots(workspace, configured_writes)?;
+        validate_explicit_root_policy(
+            program,
+            workspace,
+            cache,
+            configured_reads,
+            configured_writes,
+            &read_roots,
+            &write_roots,
+        )
+    }
+
+    #[test]
+    fn general_preflight_cache_runs_an_unavailable_probe_once() {
+        let cache = Arc::new(OnceLock::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                cached_general_sandbox_availability(&cache, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err("closed injected failure".into())
+                })
+            }));
+        }
+        for thread in threads {
+            assert!(!thread.join().expect("cache caller must not panic"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!cached_general_sandbox_availability(&cache, || {
+            panic!("cached unavailable result must not rerun its probe")
+        }));
+    }
+
+    #[test]
+    fn project_workspace_and_separate_default_cache_topology_is_allowed() {
+        let fixture = RootPolicyFixture::new();
+        let workspace = fixture.directory("projects/example");
+        let cache = fixture.directory("home/AppData/Local/zerostack/cache");
+        let program = fixture.file("bin/tool.exe");
+
+        validate_policy_fixture(&program, &workspace, &cache, &[], &[])
+            .expect("separate project and default-cache topology must remain valid");
+    }
+
+    #[test]
+    fn workspace_containing_cache_reports_roles_direction_and_remedies_without_paths() {
+        let fixture = RootPolicyFixture::new();
+        let workspace = fixture.directory("home");
+        let cache = fixture.directory("home/AppData/Local/zerostack/cache");
+        let program = fixture.file("bin/tool.exe");
+
+        let error = validate_policy_fixture(&program, &workspace, &cache, &[], &[])
+            .expect_err("workspace containing cache must fail closed");
+        assert!(error.contains("workspace contains read-only application cache"));
+        assert!(error.contains("project subdirectory"));
+        assert!(error.contains("ZS_CACHE_DIR outside the workspace"));
+        assert!(!error.contains(fixture.0.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn cache_containing_workspace_reports_the_converse_without_paths() {
+        let fixture = RootPolicyFixture::new();
+        let cache = fixture.directory("cache");
+        let workspace = fixture.directory("cache/projects/example");
+        let program = fixture.file("bin/tool.exe");
+
+        let error = validate_policy_fixture(&program, &workspace, &cache, &[], &[])
+            .expect_err("cache containing workspace must fail closed");
+        assert!(error.contains("read-only application cache contains workspace"));
+        assert!(error.contains("move the project outside the application cache"));
+        assert!(error.contains("does not contain the workspace"));
+        assert!(!error.contains(fixture.0.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn configured_root_conflict_reports_both_roles_and_direction() {
+        let fixture = RootPolicyFixture::new();
+        let workspace = fixture.directory("project");
+        let cache = fixture.directory("state/cache");
+        let program = fixture.file("bin/tool.exe");
+        let configured_read = fixture.directory("shared");
+        let configured_write = fixture.directory("shared/output");
+
+        let error = validate_policy_fixture(
+            &program,
+            &workspace,
+            &cache,
+            std::slice::from_ref(&configured_read),
+            std::slice::from_ref(&configured_write),
+        )
+        .expect_err("configured read/write overlap must fail closed");
+        assert!(error.contains("configured read-only root contains configured writable root"));
+        assert!(!error.contains(fixture.0.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn configured_read_containing_control_root_is_rejected_before_creation() {
+        let fixture = RootPolicyFixture::new();
+        let workspace = fixture.directory("project");
+        let cache = fixture.directory("state/cache");
+        let program = fixture.file("bin/tool.exe");
+        let configured_read = std::fs::canonicalize(cache.parent().expect("cache parent"))
+            .expect("canonicalize configured read root");
+        let control = configured_read.join(".mini-agent-appcontainer-control-v1");
+        assert!(!control.exists());
+
+        let error = validate_policy_fixture(
+            &program,
+            &workspace,
+            &cache,
+            std::slice::from_ref(&configured_read),
+            &[],
+        )
+        .expect_err("configured read containing control root must fail closed");
+        assert!(
+            error.contains("configured read-only root contains private AppContainer control root")
+        );
+        assert!(error.contains("ZS_CACHE_DIR"));
+        assert!(!error.contains(fixture.0.to_string_lossy().as_ref()));
+        assert!(
+            !control.exists(),
+            "validation created the private control root"
+        );
+    }
+
+    #[test]
+    fn ordinary_and_verbatim_aliases_canonicalize_to_one_policy_identity() {
+        let fixture = RootPolicyFixture::new();
+        let canonical = fixture.directory("aliases/root");
+        let canonical_text = canonical.to_string_lossy();
+        let (ordinary, verbatim) = if let Some(ordinary) = canonical_text.strip_prefix(r"\\?\") {
+            (PathBuf::from(ordinary), canonical.clone())
+        } else {
+            (
+                canonical.clone(),
+                PathBuf::from(format!(r"\\?\{canonical_text}")),
+            )
+        };
+
+        assert_eq!(
+            canonical_root(&ordinary, "ordinary alias").expect("canonicalize ordinary alias"),
+            canonical_root(&verbatim, "verbatim alias").expect("canonicalize verbatim alias")
+        );
+        assert!(reject_remote_access_path(Path::new(r"\\server\share\root")).is_err());
+        assert!(reject_remote_access_path(Path::new(r"\\?\UNC\server\share\root")).is_err());
+    }
+
+    #[test]
+    fn stale_pre_profile_intent_is_removed_without_a_profile() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-general-intent-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).expect("create intent-test cache");
+        let journal_root =
+            profile_journal_root(&cache, &[], &[]).expect("create private journal root");
+        let name = format!(
+            "{APPCONTAINER_PROFILE_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let profile_control =
+            ProfileControlGuard::acquire_until(Instant::now() + Duration::from_secs(5))
+                .expect("acquire profile control");
+        let (intent, lease) = create_profile_intent(&journal_root, &name, &profile_control)
+            .expect("persist profile intent");
+        drop(lease);
+        drop(profile_control);
+
+        sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(5))
+            .expect("sweep profile intent");
+        assert!(!intent.exists());
+        std::fs::remove_dir_all(base).expect("remove intent-test tree");
+    }
+
+    #[test]
+    fn profile_intent_transition_excludes_a_concurrent_sweeper() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-general-intent-race-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).expect("create intent-race cache");
+        let journal_root =
+            profile_journal_root(&cache, &[], &[]).expect("create private journal root");
+        let profile_control =
+            ProfileControlGuard::acquire_until(Instant::now() + Duration::from_secs(5))
+                .expect("acquire profile control");
+        let name = format!(
+            "{APPCONTAINER_PROFILE_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let (intent, lease) = create_profile_intent(&journal_root, &name, &profile_control)
+            .expect("persist profile intent");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let sweep_root = journal_root.clone();
+        let sweeper = std::thread::spawn(move || {
+            started_tx.send(()).expect("publish sweeper start");
+            let result =
+                sweep_stale_profiles_until(&sweep_root, Instant::now() + Duration::from_secs(5));
+            finished_tx.send(result).expect("publish sweep result");
+        });
+        started_rx.recv().expect("sweeper must start");
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "sweeper entered an active intent transition"
+        );
+
+        remove_profile_intent(&intent, lease, &profile_control)
+            .expect("remove intent while transition remains owned");
+        drop(profile_control);
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sweeper must finish after transition")
+            .expect("sweep after transition");
+        sweeper.join().expect("sweeper must not panic");
+        assert!(!intent.exists());
+        std::fs::remove_dir_all(base).expect("remove intent-race tree");
+    }
+
+    #[test]
+    fn recovery_deadline_starts_after_reap_and_bounds_acl_traversal() {
+        let after_reap = Instant::now();
+        assert_eq!(
+            next_general_preflight_recovery_deadline(after_reap),
+            after_reap + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT
+        );
+
+        let error = revoke_tree_until(
+            Path::new(r"C:\this-path-must-not-be-inspected"),
+            null_mut(),
+            Instant::now(),
+        )
+        .expect_err("expired recovery must stop before ACL traversal");
+        assert!(error.contains("cleanup deadline"));
+    }
+
+    #[test]
+    fn timed_out_general_preflight_reaps_tree_and_removes_recovery_state() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-general-timeout-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut root = TemporaryPreflightRoot::new(base.clone());
+        let workspace = base.join("workspace");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&workspace).expect("create timeout-test workspace");
+        std::fs::create_dir_all(&cache).expect("create timeout-test cache");
+        let executable = canonical_file(
+            &std::env::current_exe().expect("resolve test executable"),
+            "timeout-test executable",
+        )
+        .expect("canonicalize test executable");
+        let cleanup_ready = workspace.join("cleanup-ready.txt");
+        let tree_ready = workspace.join("tree-ready.txt");
+        let leaked_marker = workspace.join("leaked.txt");
+        let mut command = build_helper_with_ready(
+            executable.clone(),
+            vec![
+                TARGET_PROBE_ARG.into(),
+                TARGET_PARENT_ARG.into(),
+                executable.to_string_lossy().into_owned(),
+                tree_ready.to_string_lossy().into_owned(),
+                leaked_marker.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &cache,
+            Some(cleanup_ready.clone()),
+        )
+        .expect("build timeout-test helper");
+        command
+            .as_std_mut()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command
+            .as_std_mut()
+            .spawn_guarded_until(Instant::now() + Duration::from_secs(5))
+            .expect("start timeout-test helper");
+        wait_for_probe_file(&tree_ready).expect("descendant must become ready");
+
+        let cleanup_deadline = Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT;
+        terminate_and_reap_owned_helper(&mut child, cleanup_deadline)
+            .expect("reap exact timed-out helper");
+        let proof = parse_crash_cleanup_proof(&cleanup_ready)
+            .expect("timed-out helper must leave bounded recovery proof");
+        recover_preflight_profiles(&cache, cleanup_deadline)
+            .expect("recover timed-out AppContainer state");
+        attest_cleanup_proof(&proof, [&workspace, &cache, executable.as_path()])
+            .expect("profile, Job and ACL state must be absent");
+        std::thread::sleep(Duration::from_millis(2_100));
+        assert!(
+            !leaked_marker.exists(),
+            "contained descendant survived reap"
+        );
+        root.remove().expect("remove exact timeout-test tree");
+        assert!(!base.exists(), "timeout-test temporary tree survived");
+    }
 
     #[test]
     fn windows_argument_quoting_handles_empty_quotes_and_trailing_slashes() {

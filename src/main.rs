@@ -88,6 +88,10 @@ async fn run() -> anyhow::Result<()> {
 
     let workspace_root =
         std::env::current_dir().context("failed to resolve the startup workspace root")?;
+    let workspace = std::sync::Arc::new(
+        paths::WorkspaceBinding::capture(&workspace_root)
+            .context("failed to bind the startup workspace root")?,
+    );
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
     paths::prepare_storage_roots(&app_paths)?;
@@ -212,6 +216,7 @@ async fn run() -> anyhow::Result<()> {
         cli,
         cfg,
         app_paths,
+        workspace,
         is_first_startup,
         version_changed,
         is_interactive,
@@ -220,7 +225,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ACP mode skips feature initialization, so validate the shared process
     // sandbox contract before entering either execution surface.
-    startup.validate_sandbox_availability()?;
+    startup.preflight_startup_capabilities()?;
 
     // ACP mode: serve and exit before feature init
     #[cfg(feature = "acp")]
@@ -228,7 +233,10 @@ async fn run() -> anyhow::Result<()> {
         return extras::acp::serve(startup.cli, startup.cfg, startup.context).await;
     }
 
+    startup.start_openrouter_pricing_refresh();
     startup.init_features().await?;
-    startup.resolve_prompts().await?;
+    let prompts = startup.resolve_prompts().await;
+    startup.finish_openrouter_pricing_refresh().await;
+    prompts?;
     startup.dispatch().await
 }

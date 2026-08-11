@@ -1,10 +1,9 @@
-use std::io::{self, Write};
+use std::io;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossterm::ExecutableCommand;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::Color;
 use tokio::sync::mpsc;
@@ -85,7 +84,12 @@ pub(crate) struct App<'a> {
 
     btw_tx: mpsc::Sender<BtwEvent>,
     btw_rx: mpsc::Receiver<BtwEvent>,
-    btw_abort: Vec<(u32, tokio::task::AbortHandle)>,
+    btw_abort: Vec<(
+        u32,
+        tokio::task::AbortHandle,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<crate::agent::runner::AgentWorkScope>,
+    )>,
     btw_inflight: usize,
     btw_next_id: u32,
     btw_total_cost: f64,
@@ -98,7 +102,9 @@ pub(crate) struct App<'a> {
     running: Arc<AtomicBool>,
     event_handle: Option<std::thread::JoinHandle<()>>,
     prebuild_rx: Option<mpsc::Receiver<PrebuildPayload>>,
-    _terminal_guard: TerminalGuard,
+    prebuild_task: Option<tokio::task::JoinHandle<()>>,
+    prebuild_scope: Option<std::sync::Arc<crate::agent::runner::AgentWorkScope>>,
+    terminal_guard: TerminalGuard,
 }
 
 impl<'a> App<'a> {
@@ -109,7 +115,7 @@ impl<'a> App<'a> {
         auto_trigger_msg: Option<String>,
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
     ) -> anyhow::Result<Self> {
-        let _terminal_guard = TerminalGuard::new()?;
+        let terminal_guard = TerminalGuard::new()?;
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
@@ -173,8 +179,13 @@ impl<'a> App<'a> {
             todo_tools_enabled: false,
         };
         ui.session.reasoning_enabled = slash.reasoning_enabled;
-        ui.session.overhead_tokens =
-            crate::agent::builder::estimate_overhead(ui.context, slash.reasoning_enabled);
+        ui.session.overhead_tokens = crate::agent::builder::estimate_overhead(
+            ui.context,
+            slash.reasoning_enabled,
+            ui.cli,
+            ui.cfg,
+            &ui.sandbox,
+        );
 
         render_session(&mut renderer, ui.session, ui.cli, ui.cfg, ui.context)?;
         let marker_path = crate::paths::process_paths()
@@ -219,11 +230,18 @@ impl<'a> App<'a> {
             .await
             {
                 Ok((path, _info)) => {
-                    super::rebind_worktree_workspace(ui.session, ui.context, &ui.permission, &path);
+                    super::rebind_worktree_workspace(
+                        ui.session,
+                        ui.context,
+                        &ui.permission,
+                        &mut ui.workspace,
+                        &mut ui.sandbox,
+                        &path,
+                        ui.cli.resolve_no_context_files(ui.cfg),
+                    )?;
                     apply_current_prompt_mode(ui.context, &ui.permission);
                     #[cfg(feature = "mcp")]
-                    rebind_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.context.workspace_root)
-                        .await;
+                    rebind_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.workspace).await;
                     run.agent = Some(
                         ui.agent_build_ctx()
                             .rebuild_agent(&ui.session.model, slash.reasoning_enabled)
@@ -256,11 +274,18 @@ impl<'a> App<'a> {
             .await
             {
                 Ok((path, _info)) => {
-                    super::rebind_worktree_workspace(ui.session, ui.context, &ui.permission, &path);
+                    super::rebind_worktree_workspace(
+                        ui.session,
+                        ui.context,
+                        &ui.permission,
+                        &mut ui.workspace,
+                        &mut ui.sandbox,
+                        &path,
+                        ui.cli.resolve_no_context_files(ui.cfg),
+                    )?;
                     apply_current_prompt_mode(ui.context, &ui.permission);
                     #[cfg(feature = "mcp")]
-                    rebind_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.context.workspace_root)
-                        .await;
+                    rebind_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.workspace).await;
                     run.agent = Some(
                         ui.agent_build_ctx()
                             .rebuild_agent(&ui.session.model, slash.reasoning_enabled)
@@ -316,56 +341,69 @@ impl<'a> App<'a> {
 
         let (prebuild_tx, prebuild_rx_raw) = mpsc::channel::<PrebuildPayload>(1);
         let prebuild_rx = Some(prebuild_rx_raw);
-        if auto_trigger_msg.is_none() && run.agent.is_none() {
+        let (prebuild_task, prebuild_scope) = if auto_trigger_msg.is_none() && run.agent.is_none() {
             let client_clone = ui.client.clone();
             let session_model = ui.session.model.to_string();
             let cli_clone = ui.cli.clone();
             let cfg_clone = ui.cfg.clone();
             let context_clone = ui.context.clone();
+            let workspace_clone = ui.workspace.clone();
             let permission_clone = ui.permission.clone();
             let ask_tx_clone = ui.ask_tx.clone();
             let sandbox_clone = ui.sandbox.clone();
             let read_tracker_clone = ui.session.read_tracker.clone();
             let reasoning_enabled = slash.reasoning_enabled;
-            tokio::spawn(async move {
-                #[cfg(feature = "mcp")]
-                let mcp = if let Some(ref servers) = cfg_clone.mcp_servers {
-                    if !servers.is_empty() {
-                        Some(
-                            McpClientManager::connect_all_in(
-                                servers,
-                                &context_clone.workspace_root,
-                            )
-                            .await,
-                        )
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+            let prebuild_scope = crate::agent::runner::AgentWorkScope::new();
+            let task_scope = prebuild_scope.clone();
+            let task = tokio::spawn(async move {
+                task_scope
+                    .run(async move {
+                        #[cfg(feature = "mcp")]
+                        let mcp = if !cli_clone.mcp_is_eligible(&cfg_clone) {
+                            None
+                        } else if let Some(ref servers) = cfg_clone.mcp_servers {
+                            if !servers.is_empty() {
+                                Some(
+                                    McpClientManager::connect_all_in_binding(
+                                        servers,
+                                        &workspace_clone,
+                                    )
+                                    .await,
+                                )
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
 
-                let a = crate::ui::state::AgentBuildCtx {
-                    cli: &cli_clone,
-                    cfg: &cfg_clone,
-                    context: &context_clone,
-                    client: &client_clone,
-                    permission: &permission_clone,
-                    ask_tx: &ask_tx_clone,
-                    sandbox: &sandbox_clone,
-                    read_tracker: &read_tracker_clone,
-                    #[cfg(feature = "mcp")]
-                    mcp_manager: mcp.as_ref(),
-                }
-                .rebuild_agent(&session_model, reasoning_enabled)
-                .await;
+                        let a = crate::ui::state::AgentBuildCtx {
+                            cli: &cli_clone,
+                            cfg: &cfg_clone,
+                            context: &context_clone,
+                            workspace: &workspace_clone,
+                            client: &client_clone,
+                            permission: &permission_clone,
+                            ask_tx: &ask_tx_clone,
+                            sandbox: &sandbox_clone,
+                            read_tracker: &read_tracker_clone,
+                            #[cfg(feature = "mcp")]
+                            mcp_manager: mcp.as_ref(),
+                        }
+                        .rebuild_agent(&session_model, reasoning_enabled)
+                        .await;
 
-                #[cfg(feature = "mcp")]
-                let _ = prebuild_tx.send((a, mcp)).await;
-                #[cfg(not(feature = "mcp"))]
-                let _ = prebuild_tx.send(a).await;
+                        #[cfg(feature = "mcp")]
+                        let _ = prebuild_tx.send((a, mcp)).await;
+                        #[cfg(not(feature = "mcp"))]
+                        let _ = prebuild_tx.send(a).await;
+                    })
+                    .await;
             });
-        }
+            (Some(task), Some(prebuild_scope))
+        } else {
+            (None, None)
+        };
 
         let (btw_tx, btw_rx) = mpsc::channel::<BtwEvent>(32);
 
@@ -394,7 +432,9 @@ impl<'a> App<'a> {
             running,
             event_handle,
             prebuild_rx,
-            _terminal_guard,
+            prebuild_task,
+            prebuild_scope,
+            terminal_guard,
         })
     }
 
@@ -591,8 +631,14 @@ impl<'a> App<'a> {
                         self.run.is_running,
                     ) {
                         InterruptTarget::Btw => {
-                            for (_, handle) in self.btw_abort.drain(..) {
-                                handle.abort();
+                            for (_, _, task, scope) in self.btw_abort.drain(..) {
+                                retire_scoped_task(
+                                    task,
+                                    scope,
+                                    "side-question",
+                                    std::time::Duration::from_secs(5),
+                                )
+                                .await?;
                             }
                             self.btw_inflight = 0;
                             self.renderer.write_line("btw cancelled", C_ERROR)?;
@@ -711,7 +757,7 @@ impl<'a> App<'a> {
 
         if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.rebind_event_thread();
-            self.input.open_in_editor();
+            self.input.open_in_editor(&mut self.terminal_guard)?;
             return Ok(());
         }
 
@@ -1379,6 +1425,7 @@ impl<'a> App<'a> {
             self.ui.cli,
             self.ui.cfg,
             self.ui.context,
+            &self.ui.workspace,
             &self.ui.permission,
             &self.ui.ask_tx,
             self.slash.reasoning_enabled,
@@ -1392,7 +1439,8 @@ impl<'a> App<'a> {
             id,
             self.ui.cfg.retry.clone(),
         );
-        self.btw_abort.push((id, runner.abort_handle));
+        self.btw_abort
+            .push((id, runner.abort_handle, runner.task, runner.work_scope));
         self.btw_inflight += 1;
         self.renderer
             .write_line(&format!("[btw #{}] thinking...", id), C_BTW)?;
@@ -1415,8 +1463,17 @@ impl<'a> App<'a> {
             &mut self.ui,
             &mut self.slash,
             &mut self.chain,
+            &mut self.terminal_guard,
         )
         .await;
+
+        if result.as_ref().is_err_and(|error| {
+            error
+                .downcast_ref::<crate::ui::terminal::TerminalLifecycleError>()
+                .is_some()
+        }) {
+            return result;
+        }
 
         {
             let provider = self.ui.session.provider.to_string();
@@ -1572,8 +1629,11 @@ impl<'a> App<'a> {
                             self.ui.session,
                             self.ui.context,
                             &self.ui.permission,
+                            &mut self.ui.workspace,
+                            &mut self.ui.sandbox,
                             path,
-                        );
+                            self.ui.cli.resolve_no_context_files(self.ui.cfg),
+                        )?;
                         self.refresh_worktree_workspace_context().await?;
                         self.renderer.write_line(
                             &format!(
@@ -1593,14 +1653,17 @@ impl<'a> App<'a> {
                             self.ui.session,
                             self.ui.context,
                             &self.ui.permission,
+                            &mut self.ui.workspace,
+                            &mut self.ui.sandbox,
                             main_path,
-                        );
+                            self.ui.cli.resolve_no_context_files(self.ui.cfg),
+                        )?;
                         apply_current_prompt_mode(self.ui.context, &self.ui.permission);
                         #[cfg(feature = "mcp")]
                         rebind_mcp_manager(
                             &mut self.ui.mcp_manager,
                             self.ui.cfg,
-                            &self.ui.context.workspace_root,
+                            &self.ui.workspace,
                         )
                         .await;
                         let new_agent = self
@@ -1675,19 +1738,10 @@ impl<'a> App<'a> {
                     .clone()
                     .or_else(|| std::env::var("EDITOR").ok())
                     .unwrap_or_else(|| "editor".to_string());
-                let _ = crossterm::terminal::disable_raw_mode();
-                let mut stdout = std::io::stdout();
-                let _ = stdout.execute(crossterm::event::DisableMouseCapture);
-                let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
-                let _ = stdout.flush();
+                self.terminal_guard.suspend()?;
                 let edit_result =
                     crate::ui::slash::edit_memory_file(std::path::Path::new(&path), &editor);
-                let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
-                let _ = stdout.execute(crossterm::terminal::Clear(
-                    crossterm::terminal::ClearType::All,
-                ));
-                let _ = stdout.execute(crossterm::event::EnableMouseCapture);
-                let _ = crossterm::terminal::enable_raw_mode();
+                self.terminal_guard.resume()?;
                 render_session(
                     &mut self.renderer,
                     self.ui.session,
@@ -1709,6 +1763,12 @@ impl<'a> App<'a> {
                 }
             }
             Err(e) if crate::ui::slash::is_persistence_restart_required(&e) => {
+                return Err(e);
+            }
+            Err(e)
+                if e.downcast_ref::<crate::ui::terminal::TerminalLifecycleError>()
+                    .is_some() =>
+            {
                 return Err(e);
             }
             Err(e)
@@ -1781,13 +1841,7 @@ impl<'a> App<'a> {
         self.renderer.write_line("", Color::White)?;
 
         let cancellation = CommandCancellation::new();
-        let sandbox = self
-            .ui
-            .sandbox
-            .clone()
-            .with_working_dir(std::path::PathBuf::from(
-                self.ui.session.working_dir.as_str(),
-            ));
+        let sandbox = self.ui.sandbox.clone();
         let operation =
             sandbox.run_explicit_shell(text, DEFAULT_COMMAND_LIMITS, Some(&cancellation));
         tokio::pin!(operation);
@@ -1884,7 +1938,7 @@ impl<'a> App<'a> {
                 );
                 self.btw_total_in = self.btw_total_in.saturating_add(input_tokens);
                 self.btw_total_out = self.btw_total_out.saturating_add(output_tokens);
-                self.btw_abort.retain(|(i, _)| *i != id);
+                self.btw_abort.retain(|(i, _, _, _)| *i != id);
                 self.btw_inflight = self.btw_inflight.saturating_sub(1);
                 self.renderer
                     .write_line(&format!("[btw #{}] answer:", id), C_BTW)?;
@@ -1894,7 +1948,7 @@ impl<'a> App<'a> {
                 self.renderer.write_line("", Color::White)?;
             }
             BtwEvent::Error { id, message } => {
-                self.btw_abort.retain(|(i, _)| *i != id);
+                self.btw_abort.retain(|(i, _, _, _)| *i != id);
                 self.btw_inflight = self.btw_inflight.saturating_sub(1);
                 self.renderer.write_line(
                     &format!("[btw #{}] error: {}", id, sanitize_output(&message)),
@@ -1945,7 +1999,7 @@ impl<'a> App<'a> {
                 .and_then(|m| m.get(&server).cloned());
             match (self.ui.mcp_manager.as_mut(), server_cfg) {
                 (Some(mgr), Some(scfg)) => match mgr
-                    .reconnect_in(&server, &scfg, &self.ui.context.workspace_root)
+                    .reconnect_in_binding(&server, &scfg, &self.ui.workspace)
                     .await
                 {
                     Ok(()) => {
@@ -2003,7 +2057,7 @@ impl<'a> App<'a> {
         const INTERACTIVE_LIMITS: SupportCommandLimits = SupportCommandLimits {
             timeout: Duration::from_secs(24 * 60 * 60),
         };
-        let cwd = std::env::current_dir()?;
+        let cwd = self.ui.workspace.root().to_path_buf();
 
         let mut probe = tokio::process::Command::new("lazygit");
         probe.arg("--version");
@@ -2066,33 +2120,22 @@ impl<'a> App<'a> {
             self.running.store(false, Ordering::Relaxed);
             let _ = h.join();
         }
-        let _ = crossterm::terminal::disable_raw_mode();
-        let mut stdout = std::io::stdout();
-        let _ = stdout.execute(crossterm::event::DisableMouseCapture);
-        let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
-        let _ = stdout.flush();
+        self.terminal_guard.suspend()?;
         let mut command = tokio::process::Command::new("lazygit");
-        command.current_dir(std::path::Path::new(self.ui.session.working_dir.as_str()));
+        command.current_dir(self.ui.workspace.root());
         let result = self
             .ui
             .sandbox
             .clone()
-            .with_working_dir(std::path::PathBuf::from(
-                self.ui.session.working_dir.as_str(),
-            ))
             .status_support_command(
                 command,
                 INTERACTIVE_LIMITS,
                 SupportCommandAudit::new("lazygit", "user-trusted-bypass"),
             )
             .await;
-        let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
-        let _ = stdout.execute(crossterm::terminal::Clear(
-            crossterm::terminal::ClearType::All,
-        ));
-        let _ = stdout.execute(crossterm::event::EnableMouseCapture);
-        let _ = crossterm::terminal::enable_raw_mode();
+        let resume_result = self.terminal_guard.resume();
         self.rebind_event_thread();
+        resume_result?;
         match result {
             Ok(output)
                 if output.status == CommandStatus::Completed
@@ -2275,8 +2318,12 @@ impl<'a> App<'a> {
                     self.ui.session,
                     self.ui.context,
                     &self.ui.permission,
+                    &mut self.ui.workspace,
+                    &mut self.ui.sandbox,
                     &info.main_repo_path,
-                );
+                    self.ui.cli.resolve_no_context_files(self.ui.cfg),
+                )?;
+                self.retire_workspace_owners_before_cleanup().await?;
                 if self.ui.cli.resolve_wt_force(self.ui.cfg) {
                     let _ = self.renderer.write_line(
                         "--wt-force is deprecated; cleanup still preserves dirty worktrees",
@@ -2347,8 +2394,11 @@ impl<'a> App<'a> {
                             self.ui.session,
                             self.ui.context,
                             &self.ui.permission,
+                            &mut self.ui.workspace,
+                            &mut self.ui.sandbox,
                             &info.main_repo_path,
-                        );
+                            self.ui.cli.resolve_no_context_files(self.ui.cfg),
+                        )?;
                         if refresh_ui {
                             self.refresh_worktree_workspace_context().await?;
                         }
@@ -2362,8 +2412,11 @@ impl<'a> App<'a> {
                             self.ui.session,
                             self.ui.context,
                             &self.ui.permission,
+                            &mut self.ui.workspace,
+                            &mut self.ui.sandbox,
                             &info.main_repo_path,
-                        );
+                            self.ui.cli.resolve_no_context_files(self.ui.cfg),
+                        )?;
                         if refresh_ui {
                             self.refresh_worktree_workspace_context().await?;
                         }
@@ -2391,12 +2444,7 @@ impl<'a> App<'a> {
     async fn refresh_worktree_workspace_context(&mut self) -> anyhow::Result<()> {
         apply_current_prompt_mode(self.ui.context, &self.ui.permission);
         #[cfg(feature = "mcp")]
-        rebind_mcp_manager(
-            &mut self.ui.mcp_manager,
-            self.ui.cfg,
-            &self.ui.context.workspace_root,
-        )
-        .await;
+        rebind_mcp_manager(&mut self.ui.mcp_manager, self.ui.cfg, &self.ui.workspace).await;
         self.run.agent = Some(
             self.ui
                 .agent_build_ctx()
@@ -2413,10 +2461,60 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    #[cfg(feature = "git-worktree")]
+    async fn retire_workspace_owners_before_cleanup(&mut self) -> anyhow::Result<()> {
+        const RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        self.run.agent = None;
+        if let Some(abort) = self.run.main_abort.take() {
+            abort.abort();
+        }
+        if let Some(mut events) = self.run.agent_rx.take() {
+            tokio::time::timeout(RETIRE_TIMEOUT, async {
+                while events.recv().await.is_some() {}
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out retiring the active agent workspace"))?;
+        }
+        for (_, _, task, scope) in self.btw_abort.drain(..) {
+            retire_scoped_task(task, scope, "side-question", RETIRE_TIMEOUT).await?;
+        }
+        self.btw_inflight = 0;
+        self.prebuild_rx = None;
+        if let Some(task) = self.prebuild_task.take() {
+            let scope = self
+                .prebuild_scope
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("agent prebuild workspace scope is unavailable"))?;
+            retire_scoped_task(task, scope, "agent prebuild", RETIRE_TIMEOUT).await?;
+        }
+        #[cfg(feature = "mcp")]
+        if let Some(manager) = self.ui.mcp_manager.take() {
+            manager.shutdown().await;
+        }
+        Ok(())
+    }
+
     #[cfg(not(feature = "git-worktree"))]
     async fn handle_worktree_auto_merge(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+pub(crate) async fn retire_scoped_task(
+    task: tokio::task::JoinHandle<()>,
+    scope: std::sync::Arc<crate::agent::runner::AgentWorkScope>,
+    label: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    scope.cancellation_handle().cancel();
+    task.abort();
+    tokio::time::timeout(timeout, async {
+        let _ = task.await;
+        scope.wait_idle().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out retiring the {label} workspace"))
 }
 
 struct AutoTriggerTurn {

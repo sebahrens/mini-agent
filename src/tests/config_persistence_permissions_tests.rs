@@ -254,6 +254,62 @@ fn config_persistence_permissions_windows_dacls_exclude_broad_principals() {
     }
 }
 
+#[cfg(windows)]
+fn open_without_delete_sharing(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn config_persistence_permissions_windows_retries_transient_replacement_lock() {
+    let root = TempDir::new("windows-transient-lock");
+    let config_dir = root.path().join("config");
+    let config = config_dir.join("config.toml");
+    atomic_config_write(&config, "old").unwrap();
+
+    let locked = open_without_delete_sharing(&config);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(locked);
+    });
+    atomic_config_write(&config, "new").unwrap();
+    release.join().unwrap();
+
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "new");
+    assert_eq!(atomic_temp_residue(&config_dir), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn config_persistence_permissions_windows_persistent_lock_preserves_old_file() {
+    let root = TempDir::new("windows-persistent-lock");
+    let config_dir = root.path().join("config");
+    let config = config_dir.join("config.toml");
+    atomic_config_write(&config, "old-secret").unwrap();
+    let original_dacl = crate::fs::private_dacl_sddl(&config, false).unwrap();
+    let _locked = open_without_delete_sharing(&config);
+
+    let error = atomic_config_write(&config, "new-secret").unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(error.to_string().contains(&config.display().to_string()));
+    assert!(error.to_string().contains("temporarily locked"));
+    assert!(!error.to_string().contains("new-secret"));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "old-secret");
+    assert_eq!(
+        crate::fs::private_dacl_sddl(&config, false).unwrap(),
+        original_dacl
+    );
+    assert_eq!(atomic_temp_residue(&config_dir), 0);
+}
+
 #[cfg(not(any(unix, windows)))]
 #[test]
 fn config_persistence_permissions_unsupported_platform_fails_closed() {

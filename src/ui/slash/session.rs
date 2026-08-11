@@ -105,8 +105,13 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         session.name = CompactString::new("imported");
     }
     session.initialize_read_tracker(ctx.cfg.deny_repeated_reads.unwrap_or(true));
-    session.overhead_tokens =
-        crate::agent::builder::estimate_overhead(ctx.context, *ctx.reasoning_enabled);
+    session.overhead_tokens = crate::agent::builder::estimate_overhead(
+        ctx.context,
+        *ctx.reasoning_enabled,
+        ctx.cli,
+        ctx.cfg,
+        ctx.sandbox,
+    );
     let new_client = match crate::provider::create_client(
         &session.provider,
         ctx.cli.api_key.as_deref(),

@@ -80,6 +80,27 @@ use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
 use crate::sandbox::Sandbox;
 use crate::sandbox::worker::TestWorkerLauncher;
 
+struct TestTempDir(std::path::PathBuf);
+
+impl TestTempDir {
+    fn new(label: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("mini-agent-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn make_test_tool() -> JsTool {
     make_test_tool_with_sandbox(Sandbox::new(false, "bwrap"))
 }
@@ -122,6 +143,38 @@ fn make_test_tool_with_permissions_and_process_tree(
         permission,
         ask_tx,
         AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        std::sync::Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            TestWorkerLauncher::internal_worker_process(),
+        )),
+        std::sync::Arc::new(std::sync::Mutex::new(audit)),
+    )
+}
+
+fn make_test_tool_in_workspace(
+    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+    permission: PermCheck,
+) -> JsTool {
+    let root = std::env::temp_dir().join(format!(
+        "mini-agent-js-workspace-audit-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let paths = crate::paths::AppPaths {
+        config_dir: root.join("config"),
+        data_dir: root.join("data"),
+        local_data_dir: root.join("local"),
+        state_dir: root.join("state"),
+        cache_dir: root.join("cache"),
+        credentials_dir: root.join("credentials"),
+        project_dir: None,
+    };
+    let audit = EffectAudit::open(paths.effect_audit()).expect("test effect audit");
+    JsTool::new_with_runtime_for_test(
+        Sandbox::new(false, "bwrap")
+            .with_workspace_binding(workspace.clone())
+            .with_complete_process_tree_for_test(),
+        Some(permission),
+        None,
+        AllowConfig::unrestricted(workspace.root()).with_workspace_binding(workspace),
         std::sync::Arc::new(JsWorkerSupervisor::with_launcher_for_test(
             TestWorkerLauncher::internal_worker_process(),
         )),
@@ -300,6 +353,39 @@ async fn test_read_write_roundtrip() {
     assert_eq!(
         read_result, "hello from js",
         "read_file returned: {read_result}"
+    );
+}
+
+#[tokio::test]
+async fn windows_workspace_authority_js_tool_relative_gold_eiffel() {
+    use rig::tool::Tool;
+
+    let temp = TestTempDir::new("js-workspace");
+    let root = temp.path().to_path_buf();
+    let workspace = std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&root).unwrap());
+    let permission = std::sync::Arc::new(std::sync::Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(root.clone()),
+            Some(vec!["standard".to_string()]),
+        )
+        .unwrap(),
+    ));
+    let tool = make_test_tool_in_workspace(workspace, permission);
+
+    assert_eq!(
+        tool.call(crate::extras::js::tool::JsArgs {
+            code: "write_file('gold-eiffel.js', 'from js tool'); read_file('gold-eiffel.js')"
+                .to_string(),
+        })
+        .await
+        .unwrap(),
+        "from js tool"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("gold-eiffel.js")).unwrap(),
+        "from js tool"
     );
 }
 

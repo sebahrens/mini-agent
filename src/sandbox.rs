@@ -33,6 +33,8 @@ pub struct Sandbox {
     backend: String,
     shell: String,
     shell_command_arg: String,
+    shell_capability: Option<ShellCapability>,
+    shell_resolution_complete: bool,
     disabled_reason: DisabledSandboxReason,
     working_dir: Option<PathBuf>,
     workspace_binding: Option<Arc<crate::paths::WorkspaceBinding>>,
@@ -44,6 +46,198 @@ pub struct Sandbox {
     complete_process_tree_for_test: bool,
     #[cfg(test)]
     explicit_shell_audit_receipts: Option<ExplicitShellAuditReceipts>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellDialect {
+    Posix,
+    PowerShell,
+}
+
+impl ShellDialect {
+    fn for_name(name: &str) -> Option<Self> {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "bash" | "bash.exe" | "sh" | "sh.exe" => Some(Self::Posix),
+            "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" if cfg!(windows) => {
+                Some(Self::PowerShell)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn command_arg(self) -> &'static str {
+        match self {
+            Self::Posix => "-c",
+            Self::PowerShell => "-Command",
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Posix => "POSIX shell",
+            Self::PowerShell => "PowerShell",
+        }
+    }
+}
+
+/// One startup-captured shell contract used by every rebuild of an agent.
+#[derive(Debug, Clone)]
+pub(crate) struct ShellCapability {
+    executable: PathBuf,
+    dialect: ShellDialect,
+    command_arg: &'static str,
+    identity: crate::fs::CheckedMetadata,
+}
+
+impl ShellCapability {
+    pub(crate) fn resolve(
+        configured: &str,
+        workspace: &Path,
+        search_path: Option<&std::ffi::OsStr>,
+    ) -> Option<Self> {
+        let configured_path = Path::new(configured);
+        let name = configured_path.file_name()?.to_str()?;
+        let dialect = ShellDialect::for_name(name)?;
+        let candidates = shell_candidates(configured_path, workspace, search_path);
+        #[cfg(windows)]
+        let (executable, identity) = candidates.into_iter().find_map(|candidate| {
+            let candidate = candidate.canonicalize().ok()?;
+            if !is_executable(&candidate) {
+                return None;
+            }
+            let identity = pin_windows_shell_path(&candidate).ok()?;
+            is_windows_executable_image(&candidate).then_some((candidate, identity))
+        })?;
+        #[cfg(not(windows))]
+        let (executable, identity) = candidates.into_iter().find_map(|candidate| {
+            let candidate = candidate.canonicalize().ok()?;
+            if !is_executable(&candidate) {
+                return None;
+            }
+            let identity = crate::fs::checked_path_metadata(&candidate).ok()?;
+            Some((candidate, identity))
+        })?;
+        if !identity.is_file() {
+            return None;
+        }
+        Some(Self {
+            executable,
+            dialect,
+            command_arg: dialect.command_arg(),
+            identity,
+        })
+    }
+
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(executable: &Path, dialect: ShellDialect) -> Self {
+        let executable = executable.canonicalize().unwrap();
+        #[cfg(windows)]
+        let identity = pin_windows_shell_path(&executable).unwrap();
+        #[cfg(not(windows))]
+        let identity = crate::fs::checked_path_metadata(&executable).unwrap();
+        Self {
+            identity,
+            executable,
+            dialect,
+            command_arg: dialect.command_arg(),
+        }
+    }
+
+    pub(crate) fn dialect(&self) -> ShellDialect {
+        self.dialect
+    }
+
+    pub(crate) fn command_arg(&self) -> &'static str {
+        self.command_arg
+    }
+
+    pub(crate) fn model_guidance(&self) -> String {
+        format!(
+            "\n- **bash**: Run {} commands (timeout in ms). The compatibility tool name remains `bash`.",
+            self.dialect.name()
+        )
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let current = crate::fs::checked_path_metadata(&self.executable)
+            .map_err(|_| "configured shell executable is no longer available".to_string())?;
+        crate::fs::ensure_same_file(&self.executable, &self.identity, &current)
+            .map_err(|_| "configured shell executable identity changed".to_string())
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn is_windows_executable_image(executable: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetBinaryTypeW;
+    use windows_sys::Win32::System::WindowsProgramming::{SCS_32BIT_BINARY, SCS_64BIT_BINARY};
+
+    let mut wide: Vec<u16> = executable.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut binary_type = 0;
+    // SAFETY: `wide` is a live, NUL-terminated UTF-16 pathname and
+    // `binary_type` is a valid writable output pointer for the duration of
+    // this non-executing image-format query.
+    (unsafe { GetBinaryTypeW(wide.as_ptr(), &mut binary_type) != 0 })
+        && matches!(binary_type, SCS_32BIT_BINARY | SCS_64BIT_BINARY)
+}
+
+#[cfg(windows)]
+fn pin_windows_shell_path(executable: &Path) -> std::io::Result<crate::fs::CheckedMetadata> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(executable)?;
+    crate::fs::checked_file_metadata(&file)
+}
+
+fn shell_candidates(
+    configured: &Path,
+    workspace: &Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let has_directory = configured.is_absolute() || configured.components().count() > 1;
+    let bases = if has_directory {
+        vec![if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            workspace.join(configured)
+        }]
+    } else {
+        search_path
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten()
+            .map(|directory| {
+                let directory = if directory.is_absolute() {
+                    directory
+                } else {
+                    workspace.join(directory)
+                };
+                directory.join(configured)
+            })
+            .collect()
+    };
+
+    bases
+        .into_iter()
+        .flat_map(|candidate| {
+            let mut candidates = vec![candidate.clone()];
+            if candidate.extension().is_none() {
+                candidates.push(candidate.with_extension("exe"));
+            }
+            candidates
+        })
+        .collect()
 }
 
 /// Transfers a direct-exec workspace service and every descendant into one
@@ -699,6 +893,8 @@ impl Sandbox {
             backend: backend.to_string(),
             shell: "bash".to_string(),
             shell_command_arg: "-c".to_string(),
+            shell_capability: None,
+            shell_resolution_complete: false,
             disabled_reason: DisabledSandboxReason::UserTrustedBypass,
             working_dir: None,
             workspace_binding: None,
@@ -874,10 +1070,27 @@ impl Sandbox {
     }
 
     pub fn with_shell(self, shell: &str) -> Self {
-        #[cfg(target_os = "windows")]
-        return self.with_shell_command_arg(shell, "-Command");
-        #[cfg(not(target_os = "windows"))]
-        self.with_shell_command_arg(shell, "-c")
+        let command_arg = Path::new(shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(ShellDialect::for_name)
+            .map(ShellDialect::command_arg)
+            .unwrap_or("-c");
+        self.with_shell_command_arg(shell, command_arg)
+    }
+
+    pub(crate) fn with_resolved_shell(mut self, capability: Option<ShellCapability>) -> Self {
+        if let Some(capability) = &capability {
+            self.shell = capability.executable().to_string_lossy().into_owned();
+            self.shell_command_arg = capability.command_arg().to_string();
+        }
+        self.shell_capability = capability;
+        self.shell_resolution_complete = true;
+        self
+    }
+
+    pub(crate) fn shell_capability(&self) -> Option<&ShellCapability> {
+        self.shell_capability.as_ref()
     }
 
     /// Preserve why startup disabled sandboxing after an unavailable backend
@@ -913,6 +1126,13 @@ impl Sandbox {
         self.workspace_binding = Some(workspace);
         self
     }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_root_for_test(&self) -> Option<&Path> {
+        self.workspace_binding
+            .as_ref()
+            .map(|workspace| workspace.root())
+    }
     /// Selects a shell whose script flag differs from the POSIX `-c`
     /// contract. The flag is passed as one literal argument; it is never
     /// concatenated with the command text.
@@ -923,6 +1143,8 @@ impl Sandbox {
         if !command_arg.is_empty() {
             self.shell_command_arg = command_arg.to_string();
         }
+        self.shell_capability = None;
+        self.shell_resolution_complete = false;
         self
     }
 
@@ -979,6 +1201,12 @@ impl Sandbox {
     fn wrap_command_inner(&self, command: &str) -> Result<Command, String> {
         if let Some(workspace) = &self.workspace_binding {
             workspace.validate()?;
+        }
+        if self.shell_resolution_complete {
+            self.shell_capability
+                .as_ref()
+                .ok_or_else(|| "configured shell is unavailable or unsupported".to_string())?
+                .validate()?;
         }
         let requested_cwd = self
             .working_dir
@@ -1393,8 +1621,13 @@ impl Sandbox {
         if self.policy() != SandboxPolicy::RequiredAndAvailable || self.backend != "appcontainer" {
             return Err("Windows direct process launch requires the AppContainer sandbox".into());
         }
+        if let Some(workspace) = &self.workspace_binding {
+            workspace
+                .validate()
+                .map_err(|error| format!("sandbox: workspace is no longer valid: {error}"))?;
+        }
         let cwd = canonical_non_root(
-            &std::env::current_dir().map_err(|error| {
+            &self.working_dir().map_err(|error| {
                 format!("sandbox: failed to resolve working directory: {error}")
             })?,
             "working directory",
@@ -2427,6 +2660,159 @@ mod sandbox_tests {
         Sandbox::new(true, "__no_such_backend_exists__")
     }
 
+    fn shell_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let workspace = std::env::temp_dir().join(format!(
+            "mini-agent-shell-capability-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let bin = workspace.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join(name);
+        #[cfg(windows)]
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(&executable, b"shell fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        (workspace, executable)
+    }
+
+    #[test]
+    fn shell_capability_resolves_supported_path_once_with_literal_contract() {
+        let (workspace, executable) =
+            shell_fixture(if cfg!(windows) { "bash.exe" } else { "bash" });
+        let capability =
+            ShellCapability::resolve("bash", &workspace, Some(std::ffi::OsStr::new("bin")))
+                .unwrap();
+
+        assert_eq!(capability.executable(), executable.canonicalize().unwrap());
+        assert_eq!(capability.dialect(), ShellDialect::Posix);
+        assert_eq!(capability.command_arg(), "-c");
+        assert!(capability.validate().is_ok());
+
+        drop(capability);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn shell_capability_rejects_missing_and_unsupported_executables() {
+        let workspace = std::env::temp_dir();
+        assert!(ShellCapability::resolve("python", &workspace, None).is_none());
+        assert!(ShellCapability::resolve("bash", &workspace, None).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_capability_rejects_text_named_as_executable() {
+        let workspace = std::env::temp_dir().join(format!(
+            "mini-agent-shell-capability-text-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let bin = workspace.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("pwsh.exe"), b"not a Windows image").unwrap();
+
+        assert!(
+            ShellCapability::resolve("pwsh", &workspace, Some(std::ffi::OsStr::new("bin")))
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_capability_skips_bad_images_and_pins_valid_bytes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let workspace = std::env::temp_dir().join(format!(
+            "mini-agent-shell-capability-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let bad = workspace.join("bad");
+        let good = workspace.join("good");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(bad.join("bash.exe"), b"not a Windows image").unwrap();
+        let valid = good.join("bash.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &valid).unwrap();
+        let search_path = std::env::join_paths(["bad", "good"]).unwrap();
+
+        let capability =
+            ShellCapability::resolve("bash", &workspace, Some(search_path.as_os_str())).unwrap();
+        assert_eq!(capability.executable(), valid.canonicalize().unwrap());
+        let overwrite = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&valid);
+        assert!(overwrite.is_err(), "pinned shell bytes must reject writers");
+
+        drop(capability);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_capability_distinguishes_powershell_and_git_bash_flags() {
+        let (powershell_workspace, _) = shell_fixture("pwsh.exe");
+        let powershell = ShellCapability::resolve(
+            "pwsh",
+            &powershell_workspace,
+            Some(std::ffi::OsStr::new("bin")),
+        )
+        .unwrap();
+        assert_eq!(powershell.dialect(), ShellDialect::PowerShell);
+        assert_eq!(powershell.command_arg(), "-Command");
+
+        let (bash_workspace, _) = shell_fixture("bash.exe");
+        let bash =
+            ShellCapability::resolve("bash", &bash_workspace, Some(std::ffi::OsStr::new("bin")))
+                .unwrap();
+        assert_eq!(bash.dialect(), ShellDialect::Posix);
+        assert_eq!(bash.command_arg(), "-c");
+
+        drop((powershell, bash));
+        std::fs::remove_dir_all(powershell_workspace).unwrap();
+        std::fs::remove_dir_all(bash_workspace).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolved_shell_contract_reaches_the_process_argv() {
+        for (name, dialect, expected_flag) in [
+            ("pwsh.exe", ShellDialect::PowerShell, "-Command"),
+            ("bash.exe", ShellDialect::Posix, "-c"),
+        ] {
+            let (workspace, executable) = shell_fixture(name);
+            let capability =
+                ShellCapability::resolve(name, &workspace, Some(std::ffi::OsStr::new("bin")))
+                    .unwrap();
+            assert_eq!(capability.dialect(), dialect);
+            let sandbox = Sandbox::new(false, "appcontainer")
+                .with_resolved_shell(Some(capability))
+                .with_working_dir(&workspace);
+            let command = sandbox.wrap_command("Write-Output exact").unwrap();
+            let command = command.as_std();
+            assert_eq!(command.get_program(), executable.canonicalize().unwrap());
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    std::ffi::OsStr::new(expected_flag),
+                    std::ffi::OsStr::new("Write-Output exact")
+                ]
+            );
+
+            drop((sandbox, command));
+            std::fs::remove_dir_all(workspace).unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn kill_process_group_does_not_require_path() {
@@ -2643,7 +3029,65 @@ mod sandbox_tests {
         assert!(!root_policy.contains("CARGO_HOME"));
         assert!(!root_policy.contains("RUSTUP_HOME"));
         assert!(source.contains("build_helper_with_ready_and_roots"));
-        assert!(source.contains("configured writable root overlaps a read-only root"));
+        for diagnostic in [
+            "AppContainer root-role conflict",
+            "workspace",
+            "read-only application cache",
+            "configured read-only root",
+            "configured writable root",
+            "private AppContainer control root",
+            "project subdirectory",
+            "ZS_CACHE_DIR outside the workspace",
+        ] {
+            assert!(
+                source.contains(diagnostic),
+                "missing closed overlap diagnostic: {diagnostic}"
+            );
+        }
+        let role_diagnostic = source
+            .split("fn root_role_conflict(")
+            .nth(1)
+            .and_then(|source| source.split("fn private_control_root_candidate(").next())
+            .expect("closed root-role diagnostic formatter missing");
+        assert!(!role_diagnostic.contains(".display()"));
+        assert!(!role_diagnostic.contains("to_string_lossy"));
+        let parent_request = source
+            .split("fn build_helper_with_ready_and_roots(")
+            .nth(1)
+            .and_then(|source| source.split("fn collect_read_roots(").next())
+            .expect("Windows parent request builder missing");
+        let parent_policy = parent_request
+            .find("validate_explicit_root_policy(")
+            .expect("parent root-policy validation missing");
+        let request_publish = parent_request
+            .find("let request = LaunchRequest")
+            .expect("Windows launch request publication missing");
+        assert!(parent_policy < request_publish);
+        let helper = source
+            .split("fn run_helper()")
+            .nth(1)
+            .and_then(|source| source.split("fn validate_ready_path").next())
+            .expect("Windows helper implementation missing");
+        let helper_policy = helper
+            .find("validate_explicit_root_policy(")
+            .expect("helper root-policy validation missing");
+        let profile_creation = helper
+            .find("create_appcontainer_profile(")
+            .expect("helper AppContainer profile creation missing");
+        assert!(helper_policy < profile_creation);
+        let control_candidate = source
+            .split("fn private_control_root_candidate(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("fn validate_private_control_root_policy(")
+                    .next()
+            })
+            .expect("private control-root candidate validation missing");
+        assert!(control_candidate.contains("FILE_ATTRIBUTE_REPARSE_POINT"));
+        assert!(control_candidate.contains("reject_reparse_components(&candidate)?"));
+        assert!(control_candidate.contains("reject_reparse_components(&canonical)?"));
+        assert!(!control_candidate.contains(".display()"));
         assert!(source.contains("fn grant_access_root(\n    root: &Path,\n    grants: &mut AccessGrants,\n    parent: &Handle,\n    permissions: u32,\n    share: u32,"));
         assert!(
             source.contains("FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,\n        FILE_SHARE_READ,")
@@ -2655,8 +3099,83 @@ mod sandbox_tests {
         assert!(!source.contains("WRITE_RESTRICTED"));
         assert!(!source.contains("RegOverridePredefKey"));
         assert!(source.contains("static GENERAL_SANDBOX_AVAILABLE: OnceLock<bool>"));
-        assert!(source.contains("GENERAL_SANDBOX_AVAILABLE.get_or_init"));
+        assert!(source.contains("cached_general_sandbox_availability("));
+        assert!(source.contains("*cache.get_or_init(|| probe().is_ok())"));
         assert!(source.contains("fn run_production_preflight() -> Result<(), String>"));
+        assert!(source.contains("const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration"));
+        assert!(source.contains("const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration"));
+        assert!(source.contains(".spawn_guarded_until(run_deadline)"));
+        assert!(source.contains("terminate_and_reap_owned_helper"));
+        assert!(source.contains("sweep_stale_profiles_until(&journal_root, deadline)?"));
+        assert!(source.contains("let (intent_path, intent_lease) ="));
+        assert!(
+            source.contains("create_profile_intent(&journal_root, &name_text, &profile_control)?")
+        );
+        let production_preflight = source
+            .split("fn run_production_preflight_owned(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_bounded_preflight_helper(").next())
+            .expect("bounded Windows production preflight missing");
+        assert!(!production_preflight.contains("output_guarded"));
+        assert!(!production_preflight.contains("std::thread::"));
+        let recovery_deadline = production_preflight
+            .find("next_general_preflight_recovery_deadline(Instant::now())")
+            .expect("fresh post-reap recovery deadline missing");
+        let recovery = production_preflight
+            .find("let recovery = recover_preflight_profiles(&cache, recovery_deadline);")
+            .expect("preflight recovery missing");
+        let removal = production_preflight
+            .find("let removal = if recovery.is_ok()")
+            .expect("recovery-gated temporary-root removal missing");
+        let preserve = production_preflight
+            .find("root.retain_recovery_state();")
+            .expect("failed recovery must preserve durable state");
+        assert!(recovery_deadline < recovery && recovery < removal && removal < preserve);
+
+        let bounded_helper = source
+            .split("fn run_bounded_preflight_helper(")
+            .nth(1)
+            .and_then(|source| source.split("fn terminate_and_reap_owned_helper(").next())
+            .expect("bounded Windows production helper missing");
+        assert_eq!(
+            bounded_helper
+                .matches("terminate_and_reap_owned_helper(&mut child, cleanup_deadline)")
+                .count(),
+            2,
+            "deadline and poll failure must both clean up the owned helper"
+        );
+
+        let profile_creation = source
+            .split("fn create_appcontainer_profile(")
+            .nth(1)
+            .and_then(|source| source.split("fn create_profile_intent(").next())
+            .expect("AppContainer profile creation missing");
+        let profile_lock = profile_creation
+            .find("ProfileControlGuard::acquire_until(profile_control_deadline)?")
+            .expect("profile-control transition lock missing");
+        let intent_sync = profile_creation
+            .find("create_profile_intent(&journal_root, &name_text, &profile_control)?")
+            .expect("durable pre-profile intent missing");
+        let profile_create = profile_creation
+            .find("CreateAppContainerProfile(")
+            .expect("AppContainer creation missing");
+        assert!(profile_lock < intent_sync && intent_sync < profile_create);
+        assert!(
+            profile_creation
+                .contains("remove_profile_intent(&intent_path, intent_lease, &profile_control)")
+        );
+        let stale_sweep = source
+            .split("fn sweep_stale_profiles_until(")
+            .nth(1)
+            .and_then(|source| source.split("fn sweep_stale_profiles_until_locked(").next())
+            .expect("profile sweep lock wrapper missing");
+        assert!(stale_sweep.contains("ProfileControlGuard::acquire_until(deadline)?"));
+        let stale_journal = source
+            .split("fn sweep_stale_profile_journal(")
+            .nth(1)
+            .and_then(|source| source.split("fn sweep_stale_profile_intent(").next())
+            .expect("stale profile journal sweep missing");
+        assert!(stale_journal.contains("revoke_tree_until(&root, sid.0, deadline)?"));
         assert!(source.contains("if !is_available() || !is_available()"));
 
         let update = source
@@ -2728,7 +3247,7 @@ mod sandbox_tests {
         assert!(journal_sync < journal_publish);
 
         let stale_sweep = source
-            .split("fn sweep_stale_profiles(")
+            .split("fn sweep_stale_profiles_until_locked(")
             .nth(1)
             .and_then(|source| source.split("fn sid_text").next())
             .expect("stale profile sweep missing");
@@ -2877,17 +3396,32 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn create_profile_journal").next())
             .expect("profile journal root implementation missing");
-        assert!(journal_root.contains(".parent()"));
-        assert!(journal_root.contains(".mini-agent-appcontainer-control-v1"));
+        assert!(journal_root.contains("private_control_root_candidate(cache)?"));
+        let control_candidate = source
+            .split("fn private_control_root_candidate(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("fn validate_private_control_root_policy(")
+                    .next()
+            })
+            .expect("private control-root candidate missing");
+        assert!(control_candidate.contains(".parent()"));
+        assert!(control_candidate.contains(".mini-agent-appcontainer-control-v1"));
         assert!(!journal_root.contains("cache.join("));
 
         let startup = include_str!("startup.rs");
         assert!(startup.contains("unavailable_sandbox_must_fail"));
         assert!(startup.contains("no successful production preflight"));
+        assert!(startup.contains("fn preflight_startup_capabilities(&self)"));
+        assert!(startup.contains("run_startup_probes_concurrently("));
+        assert!(startup.contains("crate::sandbox::worker::containment_status"));
+        assert!(startup.contains("spawn_scoped(scope, general)"));
+        assert!(startup.contains("spawn_scoped(scope, worker)"));
 
         let main = include_str!("main.rs");
         let validation = main
-            .find("startup.validate_sandbox_availability()?")
+            .find("startup.preflight_startup_capabilities()?")
             .expect("common sandbox validation missing");
         let acp = main
             .find("if startup.cli.acp_enabled")

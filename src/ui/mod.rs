@@ -1,5 +1,7 @@
 mod app;
 #[cfg(test)]
+pub(crate) use app::retire_scoped_task;
+#[cfg(test)]
 pub(crate) use app::{InterruptTarget, interrupt_target};
 mod event_handler;
 pub(crate) mod events;
@@ -333,12 +335,12 @@ pub(crate) fn spawn_event_thread(
 pub(crate) async fn ensure_mcp_manager<'a>(
     mcp: &'a mut Option<McpClientManager>,
     cfg: &'a Config,
-    workspace: &std::path::Path,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
 ) -> Option<&'a McpClientManager> {
     if mcp.is_none()
         && let Some(servers) = &cfg.mcp_servers
     {
-        *mcp = Some(McpClientManager::connect_all_in(servers, workspace).await);
+        *mcp = Some(McpClientManager::connect_all_in_binding(servers, workspace).await);
     }
     mcp.as_ref()
 }
@@ -347,13 +349,13 @@ pub(crate) async fn ensure_mcp_manager<'a>(
 pub(crate) async fn rebind_mcp_manager(
     mcp: &mut Option<McpClientManager>,
     cfg: &Config,
-    workspace: &std::path::Path,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
 ) {
     if let Some(previous) = mcp.take() {
         previous.shutdown().await;
     }
     if let Some(servers) = &cfg.mcp_servers {
-        *mcp = Some(McpClientManager::connect_all_in(servers, workspace).await);
+        *mcp = Some(McpClientManager::connect_all_in_binding(servers, workspace).await);
     }
 }
 
@@ -418,18 +420,26 @@ pub(crate) fn rebind_worktree_workspace(
     session: &mut Session,
     context: &mut ContextFiles,
     permission: &Option<crate::permission::checker::PermCheck>,
+    active_workspace: &mut std::sync::Arc<crate::paths::WorkspaceBinding>,
+    sandbox: &mut crate::sandbox::Sandbox,
     workspace: &std::path::Path,
-) {
-    session.working_dir = compact_str::CompactString::new(workspace.to_string_lossy());
-    context.reload_from(workspace);
-    #[cfg(feature = "hooks")]
-    crate::extras::hooks::set_active_workspace(workspace);
+    no_context_files: bool,
+) -> anyhow::Result<()> {
+    let replacement = std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(workspace)?);
     if let Some(permission) = permission {
         permission
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .rebind_working_dir(workspace);
+            .rebind_working_dir(replacement.root())?;
     }
+
+    session.working_dir = compact_str::CompactString::new(replacement.root().to_string_lossy());
+    context.reload_from_binding(no_context_files, &replacement);
+    #[cfg(feature = "hooks")]
+    crate::extras::hooks::set_active_workspace(replacement.root());
+    *sandbox = sandbox.clone().with_workspace_binding(replacement.clone());
+    *active_workspace = replacement;
+    Ok(())
 }
 
 pub(crate) fn run_shell_in_workspace(

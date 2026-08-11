@@ -7,15 +7,14 @@ pub use cursor::{
 };
 pub use pickers::Picker;
 
-use compact_str::CompactString;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::io::Write;
-
 use crate::process_creation::StdCommandCreationExt;
 use crate::ui::pickers::file::FilePicker;
 use crate::ui::pickers::list::ListPicker;
 use crate::ui::pickers::models::ModelsPicker;
 use crate::ui::pickers::rewind::{RewindOutcome, RewindPicker};
+use crate::ui::terminal::TerminalGuard;
+use compact_str::CompactString;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 const MAX_KILL_RING: usize = 30;
 
@@ -224,7 +223,7 @@ impl InputEditor {
         self.picker = Some(Picker::Prefixed(picker, "/theme "));
     }
 
-    pub fn open_in_editor(&mut self) {
+    pub fn open_in_editor(&mut self, terminal_guard: &mut TerminalGuard) -> anyhow::Result<()> {
         let editor = self
             .editor
             .clone()
@@ -235,17 +234,7 @@ impl InputEditor {
 
         let _ = std::fs::write(&tmp, self.buffer.as_bytes());
 
-        let _ = crossterm::terminal::disable_raw_mode();
-        let mut stdout = std::io::stdout();
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::event::DisableMouseCapture,
-        );
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::terminal::LeaveAlternateScreen,
-        );
-        let _ = stdout.flush();
+        terminal_guard.suspend()?;
 
         let _ = std::process::Command::new("sh")
             .arg("-c")
@@ -254,19 +243,7 @@ impl InputEditor {
             .arg(&tmp)
             .status_guarded();
 
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::terminal::EnterAlternateScreen,
-        );
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        );
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::event::EnableMouseCapture,
-        );
-        let _ = crossterm::terminal::enable_raw_mode();
+        let resume_result = terminal_guard.resume();
 
         if let Ok(content) = std::fs::read_to_string(&tmp) {
             self.buffer = CompactString::new(content.trim_end());
@@ -274,6 +251,7 @@ impl InputEditor {
         }
 
         let _ = std::fs::remove_file(&tmp);
+        Ok(resume_result?)
     }
 
     pub fn handle_paste(&mut self, data: String) {

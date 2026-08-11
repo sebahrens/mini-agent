@@ -1,7 +1,5 @@
 use std::io::Write;
 
-use crossterm::ExecutableCommand;
-
 use crate::ui::slash::{SlashCtx, write_error, write_ok};
 
 pub(crate) const AGENTS_CREATION_PROMPT: &str = "\
@@ -25,22 +23,13 @@ fn ask_yn(question: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-fn exit_tui_for_io() {
-    let _ = crossterm::terminal::disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    let _ = stdout.execute(crossterm::event::DisableMouseCapture);
-    let _ = stdout.execute(crossterm::terminal::LeaveAlternateScreen);
-    let _ = stdout.flush();
+fn exit_tui_for_io(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    ctx.terminal_guard.suspend()?;
+    Ok(())
 }
 
 fn restore_tui_and_render(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let mut stdout = std::io::stdout();
-    let _ = stdout.execute(crossterm::terminal::EnterAlternateScreen);
-    let _ = stdout.execute(crossterm::terminal::Clear(
-        crossterm::terminal::ClearType::All,
-    ));
-    let _ = stdout.execute(crossterm::event::EnableMouseCapture);
-    let _ = crossterm::terminal::enable_raw_mode();
+    ctx.terminal_guard.resume()?;
     crate::ui::events::render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)
 }
 
@@ -75,7 +64,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         }
         (true, true)
     } else {
-        exit_tui_for_io();
+        exit_tui_for_io(ctx)?;
 
         let create_a = ask_yn(&build_question(
             "AGENTS.md",

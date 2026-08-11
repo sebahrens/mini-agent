@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 mod private;
@@ -14,6 +14,59 @@ pub(crate) use private::{
     atomic_create as private_atomic_create_sync, atomic_write as private_atomic_write_sync,
     ensure_directory as ensure_private_directory, open_existing as open_private_file,
 };
+
+#[cfg(windows)]
+const WINDOWS_LOCK_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+#[cfg(windows)]
+const WINDOWS_LOCK_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[cfg(windows)]
+fn is_windows_lock_violation(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+/// Retry one already-prepared Windows publication without reopening either
+/// path. The first attempt is always made; cancellation and the deadline gate
+/// only subsequent attempts after a confirmed sharing/lock violation.
+#[cfg(windows)]
+pub(crate) fn retry_windows_lock_violation<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+    cancellation_requested: impl Fn() -> bool,
+) -> std::io::Result<T> {
+    let deadline = std::time::Instant::now() + WINDOWS_LOCK_RETRY_TIMEOUT;
+    let mut retry_error = None;
+    loop {
+        if let Some(error) = retry_error.take() {
+            if cancellation_requested() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "atomic write cancelled during publication retry",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(error);
+            }
+            std::thread::sleep(WINDOWS_LOCK_RETRY_BACKOFF.min(remaining));
+            let cancelled = cancellation_requested();
+            if cancelled || std::time::Instant::now() >= deadline {
+                return if cancelled {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "atomic write cancelled during publication retry",
+                    ))
+                } else {
+                    Err(error)
+                };
+            }
+        }
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_windows_lock_violation(&error) => retry_error = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
@@ -631,6 +684,7 @@ const ATOMIC_WRITE_FINISHED: u8 = 3;
 #[derive(Debug, Default)]
 struct AtomicWriteCancellationState {
     publication: AtomicU8,
+    cancel_requested: AtomicBool,
     #[cfg(test)]
     publication_probe: Option<AtomicWritePublicationProbe>,
 }
@@ -667,6 +721,7 @@ impl AtomicWritePublicationProbe {
 
 impl AtomicWriteCancellation {
     pub(crate) fn cancel(&self) {
+        self.0.cancel_requested.store(true, Ordering::Release);
         let _ = self.0.publication.compare_exchange(
             ATOMIC_WRITE_ACTIVE,
             ATOMIC_WRITE_CANCELLED,
@@ -684,6 +739,14 @@ impl AtomicWriteCancellation {
         } else {
             Ok(())
         }
+    }
+
+    // `publication` arbitrates whether the first syscall may start. Once that
+    // decision is won, this separate signal can still stop another attempt
+    // after a retryable Windows failure without misreporting an in-flight call.
+    #[cfg(windows)]
+    fn cancellation_requested(&self) -> bool {
+        self.0.cancel_requested.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -744,6 +807,7 @@ impl AtomicWriteCancellation {
         };
         let cancellation = Self(Arc::new(AtomicWriteCancellationState {
             publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+            cancel_requested: AtomicBool::new(false),
             publication_probe: Some(probe.clone()),
         }));
         (cancellation, probe)
@@ -758,6 +822,7 @@ impl AtomicWriteCancellation {
         };
         let cancellation = Self(Arc::new(AtomicWriteCancellationState {
             publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+            cancel_requested: AtomicBool::new(false),
             publication_probe: Some(probe.clone()),
         }));
         (cancellation, probe)
@@ -773,6 +838,7 @@ impl AtomicWriteCancellation {
         };
         let cancellation = Self(Arc::new(AtomicWriteCancellationState {
             publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+            cancel_requested: AtomicBool::new(false),
             publication_probe: Some(probe.clone()),
         }));
         (cancellation, probe)
@@ -1741,6 +1807,7 @@ fn atomic_write_platform(
         file: &std::fs::File,
         name: &std::ffi::OsStr,
         replace: bool,
+        cancellation: &AtomicWriteCancellation,
     ) -> std::io::Result<()> {
         let name: Vec<u16> = name.encode_wide().collect();
         if name.is_empty() || name.len() > (u32::MAX as usize / 2) {
@@ -1760,11 +1827,10 @@ fn atomic_write_platform(
         // identity-verified directory handle used for temp creation. The Win32
         // SetFileInformationByHandle wrapper does not preserve this native
         // RootDirectory contract consistently.
-        // SAFETY: `storage` is aligned, large enough for the header and UTF-16
-        // name, both handles remain live for the call, and `io_status` is valid
-        // writable storage for the synchronous result.
-        let mut io_status = IO_STATUS_BLOCK::default();
-        let status = unsafe {
+        // SAFETY: `storage` is aligned and large enough for the header and UTF-16
+        // name. Both handles and the buffer remain live across every bounded
+        // retry of the same final publication call.
+        unsafe {
             (*information).Anonymous.ReplaceIfExists = replace;
             (*information).RootDirectory = directory.as_raw_handle().cast();
             (*information).FileNameLength = name_bytes as u32;
@@ -1773,22 +1839,32 @@ fn atomic_write_platform(
                 (*information).FileName.as_mut_ptr(),
                 name.len(),
             );
-            NtSetInformationFile(
-                file.as_raw_handle().cast(),
-                &mut io_status,
-                information.cast(),
-                required as u32,
-                FileRenameInformation,
-            )
-        };
-        if status < 0 {
-            // SAFETY: the conversion accepts any NTSTATUS returned by
-            // NtSetInformationFile.
-            let code = unsafe { RtlNtStatusToDosError(status) };
-            Err(std::io::Error::from_raw_os_error(code as i32))
-        } else {
-            Ok(())
         }
+        retry_windows_lock_violation(
+            || {
+                let mut io_status = IO_STATUS_BLOCK::default();
+                // SAFETY: the retained file and directory handles, initialized
+                // rename buffer, and writable status block are valid for this
+                // synchronous call.
+                let status = unsafe {
+                    NtSetInformationFile(
+                        file.as_raw_handle().cast(),
+                        &mut io_status,
+                        information.cast(),
+                        required as u32,
+                        FileRenameInformation,
+                    )
+                };
+                if status >= 0 {
+                    return Ok(());
+                }
+                // SAFETY: the conversion accepts any NTSTATUS returned by
+                // NtSetInformationFile.
+                let code = unsafe { RtlNtStatusToDosError(status) } as i32;
+                Err(std::io::Error::from_raw_os_error(code))
+            },
+            || cancellation.cancellation_requested(),
+        )
     }
 
     fn open_verified_directory(
@@ -1979,8 +2055,15 @@ fn atomic_write_platform(
         }
     }
 
-    let publish_result = cancellation
-        .publish(|| rename_open_file(&directory, &file, leaf, mode == AtomicWriteMode::Replace));
+    let publish_result = cancellation.publish(|| {
+        rename_open_file(
+            &directory,
+            &file,
+            leaf,
+            mode == AtomicWriteMode::Replace,
+            cancellation,
+        )
+    });
     if let Err(error) = publish_result {
         delete_open_file(&file);
         return Err(error);

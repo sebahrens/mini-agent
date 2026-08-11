@@ -177,8 +177,10 @@ Sandboxing and memory support are compiled into the default build. The general-p
 enabled by default: Linux uses `bwrap` when installed and trusted, supported macOS hosts use the
 system-provided Seatbelt backend at `/usr/bin/sandbox-exec`, and Windows selects the attested
 AppContainer backend (`restricted-token` remains a compatibility alias). Windows availability
-requires its cached native production preflight; failure remains closed unless `--no-sandbox`
-explicitly opts out. Other implicitly selected unavailable defaults warn and start
+requires its cached native production preflight. That probe has a five-second run deadline followed
+by up to five seconds for whole-tree reaping and a fresh five-second profile/ACL recovery window;
+failure is cached and
+remains closed unless `--no-sandbox` explicitly opts out. Other implicitly selected unavailable defaults warn and start
 unsandboxed. While sandboxing remains enabled, explicit `--sandbox`, `sandbox = true`, or selecting
 a backend through `--sandbox-backend` or `sandbox-backend` remains fail-closed. This general
 subprocess policy is distinct from the mandatory, stricter JavaScript worker containment below.
@@ -193,8 +195,10 @@ There is no in-parent or uncontained fallback. The `mini-agent-lite-*` release a
 are built with `--no-default-features` and omit JS and other default features
 — use those only when you need a minimal binary without the JS runtime.
 
-On Windows, ordinary startup and `--print-config` evaluate worker status. That check creates or
-reuses a persistent AppContainer profile and may add a persistent read/execute ACE for that
+On Windows, ordinary startup and `--print-config` evaluate worker status only when the `js` tool is
+eligible. `--no-tools` and allowlists that omit `js` skip the worker check and learned-skill startup.
+An eligible check creates or reuses a persistent AppContainer profile and may add a persistent
+read/execute ACE for that
 profile to a supported, user-owned installed executable. It has no automatic cleanup, ACL rollback,
 or separate consent prompt. The local attestation does not test general host filesystem/network
 denial; the delivered hosted canaries record those broader observations only for their reference

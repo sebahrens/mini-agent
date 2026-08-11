@@ -408,6 +408,22 @@ pub async fn fetch_openrouter_pricing(
     custom_providers: &HashMap<String, CustomProviderConfig>,
     config_api_keys: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
+    fetch_openrouter_pricing_from_url(
+        api_key,
+        custom_providers,
+        config_api_keys,
+        "https://openrouter.ai/api/v1/models",
+    )
+    .await
+}
+
+pub(crate) async fn fetch_openrouter_pricing_from_url(
+    api_key: Option<&str>,
+    custom_providers: &HashMap<String, CustomProviderConfig>,
+    config_api_keys: Option<&HashMap<String, String>>,
+    url: &str,
+) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
+    const MAX_PRICING_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
     let config = resolve_provider_config("openrouter", custom_providers)?;
     let key = AuthResolver::new(config.kind)
         .with_cli_key(api_key)
@@ -423,7 +439,6 @@ pub async fn fetch_openrouter_pricing(
         custom,
         None,
     )?;
-    let url = "https://openrouter.ai/api/v1/models";
     let mut req = http.get(url);
     if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(k);
@@ -443,7 +458,21 @@ pub async fn fetch_openrouter_pricing(
     struct PricingList {
         data: Vec<PricingEntry>,
     }
-    let resp: PricingList = req.send().await?.error_for_status()?.json().await?;
+    let mut response = req.send().await?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|bytes| bytes > MAX_PRICING_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("OpenRouter pricing response exceeded its size limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_PRICING_RESPONSE_BYTES {
+            anyhow::bail!("OpenRouter pricing response exceeded its size limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let resp: PricingList = serde_json::from_slice(&body)?;
     let mut map = HashMap::new();
     for entry in resp.data {
         let (input, output) = match entry.pricing.as_ref() {
@@ -1279,47 +1308,6 @@ async fn build_openai_agent(
     }
 }
 
-// Builder inputs mirror independently resolved CLI/config authorities. Keeping
-// them explicit avoids hiding security-relevant state in a broad bag of options.
-#[allow(clippy::too_many_arguments)]
-pub async fn build_agent(
-    model: AnyModel,
-    cli: &Cli,
-    cfg: &Config,
-    context: &ContextFiles,
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
-    sandbox: Sandbox,
-    read_tracker: crate::agent::tools::ReadTracker,
-    reasoning_enabled: bool,
-    temperature: Option<f64>,
-    extra_body: Option<serde_json::Value>,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
-) -> AnyAgent {
-    let workspace_root = std::env::current_dir().unwrap_or_default();
-    let workspace = std::sync::Arc::new(
-        crate::paths::WorkspaceBinding::capture(&workspace_root)
-            .expect("current working directory must remain available while building an agent"),
-    );
-    build_agent_in_workspace(
-        model,
-        cli,
-        cfg,
-        context,
-        workspace,
-        permission,
-        ask_tx,
-        sandbox,
-        read_tracker,
-        reasoning_enabled,
-        temperature,
-        extra_body,
-        #[cfg(feature = "mcp")]
-        mcp_manager,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn build_agent_in_workspace(
     model: AnyModel,
@@ -1337,23 +1325,28 @@ pub async fn build_agent_in_workspace(
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
     #[cfg(feature = "js")]
-    let js_worker_containment_status = crate::sandbox::worker::containment_status();
+    let js_tool_eligible = cli.tool_is_eligible(cfg, "js");
+    #[cfg(feature = "js")]
+    let js_worker_containment_status =
+        resolve_js_worker_containment(js_tool_eligible, crate::sandbox::worker::containment_status);
     #[cfg(feature = "skills")]
-    let skills = {
+    let skills = if !js_tool_eligible
+        || !matches!(
+            &js_worker_containment_status,
+            crate::sandbox::worker::WorkerContainmentStatus::Available { .. }
+        ) {
+        None
+    } else {
         let workspace_root = workspace.root();
         let paths = crate::paths::process_paths()
             .and_then(|paths| paths.with_workspace_root(workspace_root));
         let embedding = cfg.embedding.clone();
-        let learned_js_enabled = matches!(
-            &js_worker_containment_status,
-            crate::sandbox::worker::WorkerContainmentStatus::Available { .. }
-        );
         match paths {
             Ok(paths) => match crate::agent::runner::spawn_blocking_scoped(move || {
                 crate::extras::js::skills::turn::SkillRuntime::open_with_learned_js(
                     &paths,
                     embedding.as_ref(),
-                    learned_js_enabled,
+                    true,
                 )
             })
             .await
@@ -1501,6 +1494,68 @@ pub async fn build_agent_in_workspace(
     )
 }
 
+#[cfg(feature = "js")]
+fn resolve_js_worker_containment(
+    eligible: bool,
+    probe: impl FnOnce() -> crate::sandbox::worker::WorkerContainmentStatus,
+) -> crate::sandbox::worker::WorkerContainmentStatus {
+    if eligible {
+        probe()
+    } else {
+        crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+            backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+            assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+            reason: "JavaScript tool was not requested".to_string(),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "js"))]
+mod startup_capability_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::resolve_js_worker_containment;
+    use crate::sandbox::worker::{
+        WorkerBackend, WorkerContainmentAssurance, WorkerContainmentStatus,
+    };
+
+    #[test]
+    fn ineligible_javascript_capability_performs_no_worker_probe() {
+        let calls = AtomicUsize::new(0);
+        let containment = resolve_js_worker_containment(false, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            WorkerContainmentStatus::Available {
+                backend: WorkerBackend::for_current_platform(),
+                assurance: WorkerContainmentAssurance::Enforced,
+            }
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            containment,
+            WorkerContainmentStatus::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn eligible_javascript_capability_probes_once() {
+        let calls = AtomicUsize::new(0);
+        let containment = resolve_js_worker_containment(true, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            WorkerContainmentStatus::Available {
+                backend: WorkerBackend::for_current_platform(),
+                assurance: WorkerContainmentAssurance::Enforced,
+            }
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            containment,
+            WorkerContainmentStatus::Available { .. }
+        ));
+    }
+}
+
 /// Builds the isolated, tool-less `/btw` agent for the active provider.
 #[allow(clippy::too_many_arguments)]
 pub fn build_btw_agent(
@@ -1508,6 +1563,7 @@ pub fn build_btw_agent(
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     reasoning_enabled: bool,
@@ -1521,6 +1577,7 @@ pub fn build_btw_agent(
                 cli,
                 cfg,
                 context,
+                workspace,
                 permission,
                 ask_tx,
                 reasoning_enabled,
@@ -1534,6 +1591,7 @@ pub fn build_btw_agent(
                 cli,
                 cfg,
                 context,
+                workspace,
                 permission,
                 ask_tx,
                 reasoning_enabled,
@@ -1546,6 +1604,7 @@ pub fn build_btw_agent(
                     cli,
                     cfg,
                     context,
+                    workspace,
                     permission,
                     ask_tx,
                     reasoning_enabled,
@@ -1559,6 +1618,7 @@ pub fn build_btw_agent(
             cli,
             cfg,
             context,
+            workspace,
             permission,
             ask_tx,
             reasoning_enabled,
@@ -1570,6 +1630,7 @@ pub fn build_btw_agent(
             cli,
             cfg,
             context,
+            workspace,
             permission,
             ask_tx,
             reasoning_enabled,
@@ -1581,6 +1642,7 @@ pub fn build_btw_agent(
             cli,
             cfg,
             context,
+            workspace,
             permission,
             ask_tx,
             reasoning_enabled,

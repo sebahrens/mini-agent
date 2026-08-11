@@ -845,6 +845,8 @@ mod tests {
         assert!(source.contains("STATUS.get_or_init(probe_containment).clone()"));
         assert!(source.contains("production_runtime_preflight()"));
         assert!(source.contains("Windows LPAC production runtime preflight failed"));
+        assert!(source.contains("phase = \"windows_js_worker_preflight\""));
+        assert!(source.contains("elapsed_ms = started.elapsed().as_millis() as u64"));
         assert!(source.contains("PeekNamedPipe"));
         assert!(source.contains("terminate_and_reap"));
         assert!(source.contains("WorkerLaunchError::Unavailable {"));
@@ -872,6 +874,7 @@ mod tests {
         assert!(!probe.contains("containment_status()"));
         assert!(!probe.contains("ProductionWorkerLauncher"));
         assert!(!probe.contains("JsWorkerSupervisor"));
+        assert!(!probe.contains("error ="));
 
         let runtime_start = source
             .find("fn run_runtime_preflight(")

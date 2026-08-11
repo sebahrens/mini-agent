@@ -445,7 +445,10 @@ async fn mcp_stdio_config_global_and_project_entries_reach_headless_and_tui_wiri
     })
     .unwrap();
     let global: Config = toml::from_str(&serialized_global).unwrap();
-    let headless = crate::startup::connect_headless_mcp(&global, std::path::Path::new("."))
+    let workspace = std::sync::Arc::new(
+        crate::paths::WorkspaceBinding::capture(std::path::Path::new(".")).unwrap(),
+    );
+    let headless = crate::startup::connect_headless_mcp(&global, &workspace)
         .await
         .expect("global command entry must connect in headless wiring");
     assert_eq!(call_fixture_tool(&headless).await["args"][0], "global");
@@ -469,10 +472,9 @@ async fn mcp_stdio_config_global_and_project_entries_reach_headless_and_tui_wiri
     .unwrap();
     let local = merge_config_override(&Config::default(), &local_fragment).unwrap();
     let mut tui_manager = None;
-    let manager =
-        crate::ui::ensure_mcp_manager(&mut tui_manager, &local, std::path::Path::new("."))
-            .await
-            .expect("project command entry must connect in TUI wiring");
+    let manager = crate::ui::ensure_mcp_manager(&mut tui_manager, &local, &workspace)
+        .await
+        .expect("project command entry must connect in TUI wiring");
     assert_eq!(call_fixture_tool(manager).await["args"][0], "project");
     let local_pid = wait_for_pid(&local_lease).await;
     shutdown(tui_manager.take().unwrap()).await;
@@ -917,8 +919,10 @@ async fn mcp_stdio_drop_and_reconnect_reap_process_trees() {
             exclusive.display().to_string(),
         );
     }
+    let workspace =
+        std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.root).unwrap());
     manager
-        .reconnect_in("fixture", &second, &fixture.root)
+        .reconnect_in_binding("fixture", &second, &workspace)
         .await
         .unwrap();
     assert_process_reaped(first_pid).await;

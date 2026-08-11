@@ -292,7 +292,12 @@ fn is_creation_guard_expression(expression: &syn::Expr) -> bool {
             if matches!(
                 call.func.as_ref(),
                 syn::Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|segment| segment.ident == "creation_guard")
+                    if path.path.segments.last().is_some_and(|segment| {
+                        matches!(
+                            segment.ident.to_string().as_str(),
+                            "creation_guard" | "creation_guard_until"
+                        )
+                    })
             )
     )
 }
@@ -1261,8 +1266,14 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".output()",
-        7,
+        6,
         "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "command: &mut tokio::process::Command,",
+        1,
+        "NON-PROCESS",
     ),
     (
         "src/sandbox/windows.rs",
@@ -2926,8 +2937,14 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ".output()",
-        7,
+        6,
         "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "command: &mut tokio::process::Command,",
+        1,
+        "NON-PROCESS",
     ),
     (
         "src/sandbox/windows.rs",
@@ -3431,6 +3448,10 @@ fn process_creation_raw_terminals_are_exact_and_guard_dominated() {
         ),
         (
             "spawn_guarded|std::process::Command::spawn(self)".to_string(),
+            1,
+        ),
+        (
+            "spawn_guarded_until|std::process::Command::spawn(self)".to_string(),
             1,
         ),
         (

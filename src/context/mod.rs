@@ -146,6 +146,22 @@ impl ContextFiles {
             self.memory = crate::extras::memory::Mem::open().context_block();
         }
     }
+
+    #[cfg(feature = "git-worktree")]
+    pub(crate) fn reload_from_binding(
+        &mut self,
+        no_context_files: bool,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) {
+        let mut rebound = self.for_workspace_binding(no_context_files, workspace);
+        rebound.themes = themes::load();
+        rebound.current_theme_name = crate::session::storage::load_theme_name();
+        #[cfg(feature = "memory")]
+        {
+            rebound.memory = crate::extras::memory::Mem::open().context_block();
+        }
+        *self = rebound;
+    }
 }
 
 fn walk_bound_context_files(

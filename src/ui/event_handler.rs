@@ -30,7 +30,9 @@ pub async fn ensure_agent(
         return;
     }
     #[cfg(feature = "mcp")]
-    crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.context.workspace_root).await;
+    if ui.cli.mcp_is_eligible(ui.cfg) {
+        crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg, &ui.workspace).await;
+    }
     *agent = Some(
         ui.agent_build_ctx()
             .rebuild_agent(&ui.session.model, reasoning_enabled)
@@ -38,8 +40,13 @@ pub async fn ensure_agent(
     );
     // Keep the pre-calibration context estimate in sync with the preamble we
     // just built (system prompt + tools + context files).
-    ui.session.overhead_tokens =
-        crate::agent::builder::estimate_overhead(ui.context, reasoning_enabled);
+    ui.session.overhead_tokens = crate::agent::builder::estimate_overhead(
+        ui.context,
+        reasoning_enabled,
+        ui.cli,
+        ui.cfg,
+        &ui.sandbox,
+    );
 }
 
 pub async fn handle_agent_event(

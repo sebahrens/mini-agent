@@ -32,6 +32,7 @@ use crate::ui::events::render_session;
 use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
 use crate::ui::state::{AgentBuildCtx, AgentRunState, ChainState, SlashState, UiContext};
+use crate::ui::terminal::TerminalGuard;
 
 pub(crate) const C_AGENT: crossterm::style::Color = crossterm::style::Color::White;
 pub(crate) const C_RESULT: crossterm::style::Color = crossterm::style::Color::DarkGrey;
@@ -45,6 +46,7 @@ pub struct SlashCtx<'a> {
     pub cli: &'a Cli,
     pub cfg: &'a Config,
     pub context: &'a mut ContextFiles,
+    pub workspace: &'a std::sync::Arc<crate::paths::WorkspaceBinding>,
     pub show_reasoning: &'a mut bool,
     pub reasoning_enabled: &'a mut bool,
     pub is_running: &'a mut bool,
@@ -53,6 +55,7 @@ pub struct SlashCtx<'a> {
     pub ask_tx: &'a Option<AskSender>,
     pub todo_tools_enabled: &'a mut bool,
     pub sandbox: &'a Sandbox,
+    pub terminal_guard: &'a mut TerminalGuard,
     #[cfg(feature = "loop")]
     pub loop_state: &'a mut Option<crate::extras::r#loop::LoopState>,
     #[cfg(feature = "mcp")]
@@ -66,6 +69,7 @@ impl SlashCtx<'_> {
             cli: self.cli,
             cfg: self.cfg,
             context: self.context,
+            workspace: self.workspace,
             client: self.client,
             permission: self.permission,
             ask_tx: self.ask_tx,
@@ -86,6 +90,7 @@ impl SlashCtx<'_> {
             cli: self.cli,
             cfg: self.cfg,
             context: self.context,
+            workspace: self.workspace,
             client,
             permission: self.permission,
             ask_tx: self.ask_tx,
@@ -115,6 +120,8 @@ impl SlashCtx<'_> {
     /// against that session's fresh, configuration-scoped runtime state.
     pub async fn replace_session(&mut self, mut session: Session) -> anyhow::Result<()> {
         let provider_changed = session.provider != self.session.provider;
+        session.working_dir =
+            compact_str::CompactString::new(self.workspace.root().to_string_lossy());
         session.initialize_read_tracker(self.cfg.deny_repeated_reads.unwrap_or(true));
         let previous_session = std::mem::replace(self.session, session);
 
@@ -446,6 +453,7 @@ pub async fn handle_compress(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_slash(
     text: &str,
     renderer: &mut Renderer,
@@ -454,6 +462,7 @@ pub async fn handle_slash(
     ui: &mut UiContext<'_>,
     slash: &mut SlashState,
     chain: &mut ChainState,
+    terminal_guard: &mut TerminalGuard,
 ) -> anyhow::Result<()> {
     // `chain` only feeds `SlashCtx::loop_state`; without the loop feature it
     // has no consumer here.
@@ -468,6 +477,7 @@ pub async fn handle_slash(
         cli: ui.cli,
         cfg: ui.cfg,
         context: ui.context,
+        workspace: &ui.workspace,
         show_reasoning: &mut slash.show_reasoning,
         reasoning_enabled: &mut slash.reasoning_enabled,
         is_running: &mut run.is_running,
@@ -476,6 +486,7 @@ pub async fn handle_slash(
         ask_tx: &ui.ask_tx,
         todo_tools_enabled: &mut slash.todo_tools_enabled,
         sandbox: &ui.sandbox,
+        terminal_guard,
         #[cfg(feature = "loop")]
         loop_state: &mut chain.loop_state,
         #[cfg(feature = "mcp")]
@@ -503,10 +514,7 @@ pub async fn handle_slash(
             help::handle_welcome(ctx.renderer);
             Ok(())
         }
-        "/tutor" => {
-            help::handle_tutor(ctx.renderer);
-            Ok(())
-        }
+        "/tutor" => help::handle_tutor(ctx.renderer, ctx.terminal_guard),
         "/add" | "/drop" | "/drop-all" => add::handle(&parts, &mut ctx).await,
         "/init" => init::handle(&parts, &mut ctx).await,
         "/review" => review::handle(&parts, &mut ctx).await,

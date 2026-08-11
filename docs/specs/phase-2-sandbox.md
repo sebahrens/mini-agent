@@ -173,6 +173,11 @@ fails closed, and Windows always fails closed while its enabled backend is unava
 absence or setup failure never masquerades as isolation, and this fallback policy is never
 permission for an uncontained JS worker.
 
+Startup resolves intended model capabilities before probing this backend. `--no-tools` and a tool
+allowlist that omits both `bash` and `js` perform no general-process preflight or shell discovery.
+On Windows, an eligible general AppContainer preflight is cached once per process and owns a bounded
+run-and-cleanup lifecycle; timeout remains a cached fail-closed result.
+
 The Windows general-process AppContainer backend is not the Phase 6 LPAC worker profile.
 Its cached production preflight and hosted reference-runner gate establish the recorded
 AppContainer identity, scoped filesystem grants and writes, zero-capability network
@@ -260,6 +265,14 @@ executable parent, ambient `PATH`, home, Cargo, or Rustup root. The AppContainer
 `windows-appcontainer-write-roots` settings add bounded explicit roots; relative paths resolve
 from the canonical workspace. There is no implicit writable cache root. Remote/UNC, reparse,
 multi-link, read/write-overlapping, or otherwise unsafe roots fail closed.
+
+Root conflicts are classified only after canonicalization and diagnostics expose fixed role names
+and containment direction, never user paths. A workspace that contains the read-only application
+cache is rejected with guidance to use a project subdirectory or move `ZS_CACHE_DIR` outside the
+workspace; the converse cache-contains-workspace case advises moving the project or cache so
+neither contains the other. Configured read/write conflicts likewise name both roles. The private
+AppContainer control sibling is derived with ancestor reparse rejection and checked against every
+granted role before profile or journal creation, then checked again after creation.
 
 ACL traversal is recursive, no-follow, handle-bound, and identity checked. Reparse points and
 multi-link files fail closed; cleanup revokes existing and newly created objects. `TEMP` and `TMP`

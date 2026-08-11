@@ -149,26 +149,50 @@ pub(crate) fn resolve_configured_execution_authority(
     cfg: &crate::config::Config,
 ) -> Result<(ResolvedExecutionAuthority, crate::sandbox::Sandbox), ExecutionAuthorityError> {
     let backend = cli.resolve_sandbox_backend(cfg);
-    let shell = cli.resolve_shell(cfg);
     let configured = crate::sandbox::Sandbox::new(cli.resolve_sandbox(cfg), &backend)
-        .with_shell(&shell)
         .with_windows_appcontainer_roots(
             cli.resolve_windows_appcontainer_read_roots(cfg),
             cli.resolve_windows_appcontainer_write_roots(cfg),
         );
-    let authority = resolve_execution_authority(cli, cfg, configured.policy(), &backend)?;
+    let policy = if cli.general_sandbox_is_eligible(cfg) {
+        configured.policy()
+    } else {
+        crate::sandbox::SandboxPolicy::Disabled
+    };
+    let authority = resolve_execution_authority(cli, cfg, policy, &backend)?;
     let sandbox = if authority.sandbox == SandboxResolution::DegradedUnavailable {
         tracing::warn!(
             "sandbox backend '{backend}' was not found — continuing UNSANDBOXED; pass --sandbox to fail closed instead"
         );
-        crate::sandbox::Sandbox::new(false, &backend)
-            .with_shell(&shell)
-            .with_unavailable_default_fallback()
+        crate::sandbox::Sandbox::new(false, &backend).with_unavailable_default_fallback()
     } else {
         configured
     };
 
     Ok((authority, sandbox))
+}
+
+/// Resolve the model-visible shell exactly once from the invocation's
+/// captured workspace and PATH. Tool-free modes intentionally perform no
+/// executable lookup.
+pub(crate) fn bind_configured_shell(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    authority: ResolvedExecutionAuthority,
+    workspace: &crate::paths::WorkspaceBinding,
+    search_path: Option<&std::ffi::OsStr>,
+    sandbox: crate::sandbox::Sandbox,
+) -> crate::sandbox::Sandbox {
+    if !authority.tools_enabled || !cli.tool_is_eligible(cfg, "bash") {
+        return sandbox.with_resolved_shell(None);
+    }
+    let configured = cli.resolve_shell(cfg);
+    let capability =
+        crate::sandbox::ShellCapability::resolve(&configured, workspace.root(), search_path);
+    if capability.is_none() {
+        tracing::warn!(shell = %configured, "configured shell is unavailable or unsupported; bash tool disabled");
+    }
+    sandbox.with_resolved_shell(capability)
 }
 
 /// Build a permission policy and approval channel for interactive startup.
@@ -180,7 +204,19 @@ pub(crate) fn build_interactive_permission(
     Option<ask::AskSender>,
     Option<ask::AskReceiver>,
 )> {
-    let Some(permission) = build_permission_checker_at(cfg, authority, None)? else {
+    build_interactive_permission_at(cfg, authority, None)
+}
+
+pub(crate) fn build_interactive_permission_at(
+    cfg: &crate::config::Config,
+    authority: ResolvedExecutionAuthority,
+    working_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<(
+    Option<checker::PermCheck>,
+    Option<ask::AskSender>,
+    Option<ask::AskReceiver>,
+)> {
+    let Some(permission) = build_permission_checker_at(cfg, authority, working_dir)? else {
         return Ok((None, None, None));
     };
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
@@ -404,7 +440,7 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
 #[cfg(test)]
 mod execution_authority_tests {
     use super::{
-        SandboxResolution, SecurityMode, build_interactive_permission,
+        SandboxResolution, SecurityMode, bind_configured_shell, build_interactive_permission,
         build_noninteractive_permission, resolve_configured_execution_authority,
         resolve_execution_authority,
     };
@@ -749,6 +785,70 @@ mod execution_authority_tests {
             error.to_string(),
             "sandbox backend 'definitely-not-a-real-backend' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
         );
+    }
+
+    #[test]
+    fn non_process_tool_modes_do_not_probe_an_unavailable_sandbox() {
+        let cfg = Config::default();
+        for cli in [
+            Cli {
+                no_tools: true,
+                sandbox_backend: Some("definitely-not-a-real-backend".to_string()),
+                ..Cli::default()
+            },
+            Cli {
+                tools: vec!["read".to_string()],
+                sandbox_backend: Some("definitely-not-a-real-backend".to_string()),
+                ..Cli::default()
+            },
+        ] {
+            let (authority, _) = resolve_configured_execution_authority(&cli, &cfg).unwrap();
+            assert_eq!(authority.sandbox, SandboxResolution::Disabled);
+        }
+    }
+
+    #[test]
+    fn no_tools_binds_no_shell_even_when_a_supported_executable_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-no-tools-shell-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join(if cfg!(windows) { "bash.exe" } else { "bash" });
+        std::fs::write(&executable, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let workspace = crate::paths::WorkspaceBinding::capture(&root).unwrap();
+        let cli = Cli {
+            no_tools: true,
+            shell: Some("bash".to_string()),
+            no_sandbox: true,
+            ..Cli::default()
+        };
+        let cfg = Config::default();
+        let (authority, sandbox) = resolve_configured_execution_authority(&cli, &cfg).unwrap();
+        let sandbox = bind_configured_shell(
+            &cli,
+            &cfg,
+            authority,
+            &workspace,
+            Some(bin.as_os_str()),
+            sandbox,
+        );
+
+        assert!(!authority.tools_enabled);
+        assert!(sandbox.shell_capability().is_none());
+        assert_eq!(
+            sandbox.wrap_command("echo must-not-run").unwrap_err(),
+            "configured shell is unavailable or unsupported"
+        );
+
+        drop((sandbox, workspace));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

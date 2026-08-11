@@ -94,6 +94,7 @@ impl Drop for McpClientHandle {
 }
 
 impl McpClientHandle {
+    #[cfg(test)]
     pub async fn connect(
         server_name: CompactString,
         config: &McpServerConfig,
@@ -110,6 +111,7 @@ impl McpClientHandle {
         Self::connect_with_timeout_in(server_name, config, MCP_INITIALIZE_TIMEOUT, workspace).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn connect_with_timeout(
         server_name: CompactString,
         config: &McpServerConfig,

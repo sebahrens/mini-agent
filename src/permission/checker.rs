@@ -34,6 +34,30 @@ struct PlanWriteRoot {
     identity: crate::fs::CheckedMetadata,
 }
 
+fn canonical_working_dir(working_dir: &Path) -> anyhow::Result<(PathBuf, PlanWriteRoot)> {
+    let canonical = std::fs::canonicalize(working_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to bind permission workspace {}: {error}",
+            working_dir.display()
+        )
+    })?;
+    let identity = crate::fs::checked_path_metadata(&canonical).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to validate permission workspace {}: {error}",
+            canonical.display()
+        )
+    })?;
+    anyhow::ensure!(identity.is_dir(), "permission workspace is not a directory");
+    Ok((
+        canonical.clone(),
+        PlanWriteRoot {
+            configured: working_dir.to_path_buf(),
+            canonical,
+            identity,
+        },
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PlanWriteAuthorization {
     root: PlanWriteRoot,
@@ -96,18 +120,11 @@ pub struct PermissionChecker {
 impl PermissionChecker {
     /// Rebind relative path authorization to an explicitly selected workspace.
     /// Worktree switching uses this instead of mutating process-global CWD.
-    pub(crate) fn rebind_working_dir(&mut self, working_dir: &Path) {
-        self.plan_write_root = std::fs::canonicalize(working_dir)
-            .ok()
-            .and_then(|canonical| {
-                let identity = crate::fs::checked_path_metadata(&canonical).ok()?;
-                identity.is_dir().then_some(PlanWriteRoot {
-                    configured: working_dir.to_path_buf(),
-                    canonical,
-                    identity,
-                })
-            });
-        self.working_dir = working_dir.to_string_lossy().into_owned();
+    pub(crate) fn rebind_working_dir(&mut self, working_dir: &Path) -> anyhow::Result<()> {
+        let (canonical, plan_write_root) = canonical_working_dir(working_dir)?;
+        self.working_dir = canonical.to_string_lossy().into_owned();
+        self.plan_write_root = Some(plan_write_root);
+        Ok(())
     }
 
     fn compile_config(
@@ -254,19 +271,12 @@ impl PermissionChecker {
             }
         }
 
-        let working_dir =
-            working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let plan_write_root = std::fs::canonicalize(&working_dir)
-            .ok()
-            .and_then(|canonical| {
-                let identity = crate::fs::checked_path_metadata(&canonical).ok()?;
-                identity.is_dir().then_some(PlanWriteRoot {
-                    configured: working_dir.clone(),
-                    canonical,
-                    identity,
-                })
-            });
-        let working_dir = working_dir.to_string_lossy().to_string();
+        let working_dir = match working_dir {
+            Some(working_dir) => working_dir,
+            None => std::env::current_dir()?,
+        };
+        let (canonical_working_dir, plan_write_root) = canonical_working_dir(&working_dir)?;
+        let working_dir = canonical_working_dir.to_string_lossy().into_owned();
 
         let resolved_modes: Vec<SecurityMode> = {
             let raw = permission_modes.unwrap_or_else(|| {
@@ -295,7 +305,7 @@ impl PermissionChecker {
             ext_dir_rules,
             doom_loop_action,
             working_dir,
-            plan_write_root,
+            plan_write_root: Some(plan_write_root),
             session_allowlist: Vec::new(),
             last_call: None,
             consecutive_repeat_count: 0,
@@ -1004,6 +1014,56 @@ fn windows_verbatim_policy_path(path: &str) -> Option<String> {
             && bytes[1] == b':'
             && matches!(bytes[2], b'\\' | b'/'))
         .then(|| format!(r"\\?\{path}"))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_workspace_authority_tests {
+    use super::*;
+
+    #[test]
+    fn windows_workspace_authority_drive_and_unc_spelling_parity() {
+        assert_eq!(
+            windows_verbatim_policy_path(r"C:\projects\mini-agent"),
+            Some(r"\\?\C:\projects\mini-agent".to_string())
+        );
+        assert_eq!(
+            windows_verbatim_policy_path(r"\\server\share\mini-agent"),
+            Some(r"\\?\UNC\server\share\mini-agent".to_string())
+        );
+
+        let workspace = std::env::temp_dir().join(format!(
+            "mini-agent-workspace-authority-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Simple(Action::Allow)),
+            write: Some(ToolPerm::Simple(Action::Allow)),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["standard".to_string()]),
+        )
+        .unwrap();
+
+        assert_eq!(Path::new(&checker.working_dir), binding.root());
+        let target = binding.root().join("gold-eiffel.js");
+        assert_eq!(
+            checker.check_bound_path("write", &target.to_string_lossy()),
+            CheckResult::Allowed
+        );
+        checker.rebind_working_dir(binding.root()).unwrap();
+        assert_eq!(
+            checker.check_bound_path("read", &target.to_string_lossy()),
+            CheckResult::Allowed
+        );
+        drop(binding);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }
 

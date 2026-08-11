@@ -131,13 +131,24 @@ fn javascript_worker_entries_for_status(
     entries
 }
 
-fn javascript_worker_entries() -> Vec<(&'static str, String)> {
+fn javascript_worker_entries(eligible: bool) -> Vec<(&'static str, String)> {
     #[cfg(feature = "js")]
     {
-        javascript_worker_entries_for_status(crate::sandbox::worker::containment_status())
+        if eligible {
+            javascript_worker_entries_for_status(crate::sandbox::worker::containment_status())
+        } else {
+            javascript_worker_entries_for_status(
+                crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+                    backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+                    assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+                    reason: "JavaScript tool was not requested".to_string(),
+                },
+            )
+        }
     }
     #[cfg(not(feature = "js"))]
     {
+        let _ = eligible;
         vec![
             javascript_worker_compiled_entry(),
             ("status", "not compiled".to_string()),
@@ -271,13 +282,16 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     let sandbox = cli.resolve_sandbox(cfg);
     let sandbox_backend = cli.resolve_sandbox_backend(cfg);
     let shell = cli.resolve_shell(cfg);
-    let sandbox_capabilities = Sandbox::new(sandbox, &sandbox_backend)
-        .with_shell(&shell)
-        .with_windows_appcontainer_roots(
-            cli.resolve_windows_appcontainer_read_roots(cfg),
-            cli.resolve_windows_appcontainer_write_roots(cfg),
-        )
-        .capability_matrix();
+    let sandbox_capabilities = Sandbox::new(
+        sandbox && cli.general_sandbox_is_eligible(cfg),
+        &sandbox_backend,
+    )
+    .with_shell(&shell)
+    .with_windows_appcontainer_roots(
+        cli.resolve_windows_appcontainer_read_roots(cfg),
+        cli.resolve_windows_appcontainer_write_roots(cfg),
+    )
+    .capability_matrix();
     let edit_system = cli.resolve_edit_system(cfg);
     let compact = cfg.resolve_compact_enabled();
 
@@ -429,7 +443,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
     append_section(
         &mut output,
         "JavaScript worker",
-        &javascript_worker_entries(),
+        &javascript_worker_entries(cli.tool_is_eligible(cfg, "js")),
     );
 
     #[cfg(feature = "advisor")]
@@ -565,12 +579,23 @@ mod tests {
     #[test]
     fn config_reports_complete_not_compiled_javascript_worker_section() {
         assert_eq!(
-            super::javascript_worker_entries(),
+            super::javascript_worker_entries(false),
             vec![
                 ("compiled", "false".to_string()),
                 ("status", "not compiled".to_string()),
             ]
         );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn config_skips_worker_probe_when_javascript_is_not_requested() {
+        let entries = super::javascript_worker_entries(false)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(entries["status"], "unavailable");
+        assert_eq!(entries["reason"], "JavaScript tool was not requested");
     }
 
     #[cfg(feature = "js")]

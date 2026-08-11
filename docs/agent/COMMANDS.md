@@ -216,9 +216,9 @@ Requires the `subagents` feature (default-on; see [SUBAGENTS.md](SUBAGENTS.md)).
 ## Loop (feature-gated)
 
 The optional `--loop-run <command>` validator uses the selected process sandbox
-and the platform's existing shell contract (`-c` normally, PowerShell
-`-Command` on Windows). Headless and interactive loops share one
-bounded runner: each validation has a 30-second deadline, 1 MiB caps for stdout
+and the same captured shell contract as the model-visible shell tool (`-c` for
+Bash/sh or `-Command` for PowerShell/pwsh). Headless and interactive loops share
+one bounded runner: each validation has a 30-second deadline, 1 MiB caps for stdout
 and stderr, and a 1.5 MiB combined cap. Timeout, cancellation, output-limit,
 launch-failure, and nonzero-exit results are recorded with explicit status and
 separate sanitized stdout/stderr sections. Resource-limit cancellation reaps
@@ -242,6 +242,14 @@ cannot advance or respawn the replacement loop.
 Prefix a message with `!` to run it as a shell command instead of sending it to
 the agent. The command's output is captured and stored in the session history as
 an Assistant message. Works in both TUI and `--print` mode.
+
+At startup, mini-agent resolves the configured shell once against the canonical
+workspace and captured `PATH`. Supported Windows contracts are PowerShell/pwsh
+with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
+executable identity and argument contract are retained across agent rebuilds.
+If the executable is missing or unsupported, the model-visible compatibility
+tool named `bash` and its prompt guidance are omitted, and shell execution fails
+closed. `--no-tools` performs no shell lookup.
 
 Shell commands use the configured general sandbox when it is enabled. Running
 with `--no-sandbox` is an explicit user-trusted bypass that inherits the parent
