@@ -17,6 +17,7 @@ use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 const MAX_KILL_RING: usize = 30;
+const MAX_PICKER_PASTE_CHARS: usize = 256;
 
 pub struct InputEditor {
     pub buffer: CompactString,
@@ -255,8 +256,27 @@ impl InputEditor {
     }
 
     pub fn handle_paste(&mut self, data: String) {
-        self.buffer.insert_str(self.cursor, &data);
-        self.cursor += data.len();
+        // Keep query pickers open only for bounded, single-line text. Larger or
+        // control-bearing pastes use the normal atomic buffer path below.
+        let picker_accepts_query = self.picker.as_ref().is_some_and(|picker| {
+            picker.active()
+                && !matches!(picker, Picker::Rewind(_))
+                && data.chars().take(MAX_PICKER_PASTE_CHARS + 1).count() <= MAX_PICKER_PASTE_CHARS
+                && data.chars().all(|c| !c.is_control())
+        });
+        if picker_accepts_query {
+            for c in data.chars() {
+                let handled =
+                    self.handle_picker_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                debug_assert!(handled, "active query picker must accept printable text");
+            }
+        } else {
+            if self.picker.as_ref().is_some_and(Picker::active) {
+                self.picker = None;
+            }
+            self.buffer.insert_str(self.cursor, &data);
+            self.cursor += data.len();
+        }
         self.history_pos = None;
         self.draft = None;
         self.yank_pos = None;
