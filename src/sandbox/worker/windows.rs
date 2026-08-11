@@ -565,10 +565,10 @@ mod feasibility {
     const PRODUCTION_PREFLIGHT_HELPER_ARG: &str = "--mini-agent-windows-worker-preflight-v1";
     const PRODUCTION_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(5);
     #[cfg(test)]
-    const PREFLIGHT_TIMEOUT_CHILD_TEST_NAME: &str =
+    pub(super) const PREFLIGHT_TIMEOUT_CHILD_TEST_NAME: &str =
         "sandbox::worker::platform::tests::windows_worker_preflight_timeout_child";
     #[cfg(test)]
-    const PREFLIGHT_SUCCESS_CHILD_TEST_NAME: &str =
+    pub(super) const PREFLIGHT_SUCCESS_CHILD_TEST_NAME: &str =
         "sandbox::worker::platform::tests::windows_worker_preflight_success_child";
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
@@ -1133,19 +1133,19 @@ mod feasibility {
         }
     }
 
-    struct FileSecurity {
+    pub(super) struct FileSecurity {
         _descriptor: LocalMemory,
         owner: PSID,
         dacl: *mut ACL,
     }
 
     #[derive(Debug, PartialEq, Eq)]
-    struct FileSecuritySnapshot {
+    pub(super) struct FileSecuritySnapshot {
         owner: Vec<u8>,
         dacl: Vec<u8>,
     }
 
-    fn read_file_security(path: &Path) -> Result<FileSecurity, GateError> {
+    pub(super) fn read_file_security(path: &Path) -> Result<FileSecurity, GateError> {
         let path = wide_null(path.as_os_str())?;
         let mut owner = null_mut();
         let mut dacl = null_mut();
@@ -1186,7 +1186,9 @@ mod feasibility {
         })
     }
 
-    fn snapshot_file_security(security: &FileSecurity) -> Result<FileSecuritySnapshot, GateError> {
+    pub(super) fn snapshot_file_security(
+        security: &FileSecurity,
+    ) -> Result<FileSecuritySnapshot, GateError> {
         // SAFETY: `owner` is a validated SID inside the live owned security descriptor.
         let owner_bytes = unsafe { GetLengthSid(security.owner) } as usize;
         if owner_bytes == 0 {
@@ -3077,7 +3079,7 @@ mod feasibility {
         })
     }
 
-    enum RuntimePreflightTarget {
+    pub(super) enum RuntimePreflightTarget {
         CurrentExecutable,
         #[cfg(test)]
         Installed(PathBuf),
@@ -3103,7 +3105,7 @@ mod feasibility {
         )
     }
 
-    fn run_runtime_preflight_with_timeouts(
+    pub(super) fn run_runtime_preflight_with_timeouts(
         target: RuntimePreflightTarget,
         run_timeout: Duration,
         cleanup_timeout: Duration,
@@ -3470,7 +3472,7 @@ mod feasibility {
     }
 
     #[cfg(test)]
-    fn mutate_current_executable_acl_for_test() -> Result<(), GateError> {
+    pub(super) fn mutate_current_executable_acl_for_test() -> Result<(), GateError> {
         let executable = std::env::current_exe()
             .map_err(|error| GateError(format!("resolve preflight test executable: {error}")))?;
         let profile = AppContainerProfile::production_zero_capability()?;
