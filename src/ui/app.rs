@@ -352,6 +352,8 @@ impl<'a> App<'a> {
             let ask_tx_clone = ui.ask_tx.clone();
             let sandbox_clone = ui.sandbox.clone();
             let read_tracker_clone = ui.session.read_tracker.clone();
+            #[cfg(feature = "skills")]
+            let skill_services_clone = ui.skill_services.clone();
             let reasoning_enabled = slash.reasoning_enabled;
             let prebuild_scope = crate::agent::runner::AgentWorkScope::new();
             let task_scope = prebuild_scope.clone();
@@ -387,6 +389,8 @@ impl<'a> App<'a> {
                             ask_tx: &ask_tx_clone,
                             sandbox: &sandbox_clone,
                             read_tracker: &read_tracker_clone,
+                            #[cfg(feature = "skills")]
+                            skill_services: &skill_services_clone,
                             #[cfg(feature = "mcp")]
                             mcp_manager: mcp.as_ref(),
                         }

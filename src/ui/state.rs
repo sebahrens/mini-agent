@@ -35,6 +35,8 @@ pub(crate) struct UiContext<'a> {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub sandbox: Sandbox,
+    #[cfg(feature = "skills")]
+    pub skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     pub status_signals: Option<StatusSignals>,
     #[cfg(feature = "mcp")]
     pub mcp_manager: Option<McpClientManager>,
@@ -53,6 +55,8 @@ impl<'a> UiContext<'a> {
             ask_tx: &self.ask_tx,
             sandbox: &self.sandbox,
             read_tracker: &self.session.read_tracker,
+            #[cfg(feature = "skills")]
+            skill_services: &self.skill_services,
             #[cfg(feature = "mcp")]
             mcp_manager: self.mcp_manager.as_ref(),
         }
@@ -82,6 +86,8 @@ impl<'a> UiContext<'a> {
             permission,
             ask_tx,
             sandbox,
+            #[cfg(feature = "skills")]
+            skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
             status_signals,
             #[cfg(feature = "mcp")]
             mcp_manager: None,
@@ -105,6 +111,8 @@ pub(crate) struct AgentBuildCtx<'a> {
     pub ask_tx: &'a Option<AskSender>,
     pub sandbox: &'a Sandbox,
     pub read_tracker: &'a crate::agent::tools::ReadTracker,
+    #[cfg(feature = "skills")]
+    pub skill_services: &'a Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     #[cfg(feature = "mcp")]
     pub mcp_manager: Option<&'a McpClientManager>,
 }
@@ -129,6 +137,8 @@ impl AgentBuildCtx<'_> {
             reasoning_enabled,
             temperature,
             extra_body,
+            #[cfg(feature = "skills")]
+            self.skill_services.clone(),
             #[cfg(feature = "mcp")]
             self.mcp_manager,
         )

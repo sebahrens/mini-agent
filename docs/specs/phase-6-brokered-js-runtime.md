@@ -143,6 +143,12 @@ snapshots its own permission bridge, file/fetch policy, selected skill artifacts
 grants, cancellation, and broker for each `JsTool::call`; none of those values is stored in the
 warm process or supervisor. Model switches and network retries therefore reuse the existing tool
 and worker generation, while dropping an agent closes only that build's permission receiver.
+When learned skills are enabled, `skills/session.rs` separately owns one workspace-bound service
+bundle per logical UI, headless, or ACP session. Rebuilds share that bundle's discovery runtime,
+turn gate/context, proposal budget, and proposal/admission/telemetry workers. Initialization is
+lazy and failure-cached, and a canonical workspace rebind replaces the slot without exposing its
+state to another concurrent ACP session. These parent services never inherit an individual turn's
+cancellation scope; their worker guards are joined when the final session/service owner drops.
 Subagents and `/btw` intentionally keep their exact restricted tool sets and do not receive JS.
 Lifecycle regression tests assert stable process ID and generation across rebuilds plus denial
 under a rebuilt policy, proving that the old policy did not leak into the reused worker.

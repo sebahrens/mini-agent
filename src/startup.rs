@@ -1224,6 +1224,8 @@ impl Startup {
                 true,
                 temperature,
                 extra_body,
+                #[cfg(feature = "skills")]
+                std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
             )
@@ -1305,6 +1307,8 @@ impl Startup {
             true,
             temperature,
             extra_body,
+            #[cfg(feature = "skills")]
+            std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
         )

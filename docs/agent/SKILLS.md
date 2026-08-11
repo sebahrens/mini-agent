@@ -20,6 +20,12 @@ startup rebuilds run once per process in a dedicated background thread; an exact
 published before the HNSW graph, then the completed graph is atomically published while existing
 turn leases remain unchanged.
 
+Within a logical agent session, discovery storage and the proposal, admission, and telemetry
+workers are initialized lazily once for the canonical workspace and reused across model switches,
+compaction, and other full-agent rebuilds. `--no-tools`, an ineligible JS tool, or unavailable
+worker containment starts none of these services. ACP sessions retain separate service owners and
+turn contexts, so concurrent clients cannot replace one another's selected-skill bundle.
+
 At a JS call boundary, `JsTool` snapshots the current bundle. Each selected skill runs in a private
 lexical namespace, its full SHA-256 identity and exports are revalidated, and only declared,
 JSON-shaped function boundaries are published with the exact host-capability scope. Every selected
