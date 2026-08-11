@@ -21,8 +21,8 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf, Prefix};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr::{null, null_mut};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -306,6 +306,104 @@ impl Drop for ProfileControlGuard {
     }
 }
 
+const CONTROL_ROOT_AUTHORITY_ERROR: &str =
+    "sandbox: private AppContainer control-root authority validation failed";
+
+#[derive(Clone, Debug)]
+struct ProfileJournalRootAuthority(Arc<ProfileJournalRootAuthorityInner>);
+
+#[derive(Debug)]
+struct ProfileJournalRootAuthorityInner {
+    path: PathBuf,
+    identity: crate::fs::WindowsFileIdentity,
+    _directory: File,
+    // Retaining no-delete-share handles for every ancestor closes the gap between identity
+    // revalidation and the unavoidable path-based Win32 journal operations below.
+    _ancestors: Vec<File>,
+}
+
+impl ProfileJournalRootAuthority {
+    fn new(path: PathBuf, directory: File) -> Result<Self, String> {
+        let identity = crate::fs::windows_file_identity(&directory)
+            .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        reject_reparse_components(&path).map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+
+        let mut ancestor_paths = path
+            .ancestors()
+            .skip(1)
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        ancestor_paths.reverse();
+        let mut ancestors = Vec::with_capacity(ancestor_paths.len());
+        for ancestor in ancestor_paths {
+            ancestors.push(
+                open_stable_path(
+                    &ancestor,
+                    true,
+                    FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                )
+                .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?,
+            );
+        }
+
+        let authority = Self(Arc::new(ProfileJournalRootAuthorityInner {
+            path,
+            identity,
+            _directory: directory,
+            _ancestors: ancestors,
+        }));
+        authority.revalidate()?;
+        Ok(authority)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0.path
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        reject_reparse_components(self.path())
+            .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        let canonical = std::fs::canonicalize(self.path())
+            .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        reject_reparse_components(&canonical)
+            .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        let observed = open_stable_path(
+            &canonical,
+            true,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        let observed_identity = crate::fs::windows_file_identity(&observed)
+            .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        let retained_identity = crate::fs::windows_file_identity(&self.0._directory)
+            .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        if observed_identity != self.0.identity || retained_identity != self.0.identity {
+            return Err(CONTROL_ROOT_AUTHORITY_ERROR.into());
+        }
+        let user =
+            current_user_sid_buffer().map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        attest_control_root_dacl(&self.0._directory, token_user_sid(&user))
+            .map_err(|_| CONTROL_ROOT_AUTHORITY_ERROR.to_string())?;
+        Ok(())
+    }
+
+    fn validate_child(&self, path: &Path) -> Result<(), String> {
+        self.revalidate()?;
+        if path.parent() != Some(self.path()) {
+            return Err(CONTROL_ROOT_AUTHORITY_ERROR.into());
+        }
+        Ok(())
+    }
+
+    fn remove_file(&self, path: &Path, action: &str) -> Result<(), String> {
+        self.validate_child(path)?;
+        std::fs::remove_file(path).map_err(|error| format!("sandbox: {action}: {error}"))
+    }
+}
+
 struct AppContainerProfile {
     sid: PSID,
     name: Vec<u16>,
@@ -314,6 +412,7 @@ struct AppContainerProfile {
     storage: PathBuf,
     journal_path: PathBuf,
     journal_lease: Option<File>,
+    journal_root: ProfileJournalRootAuthority,
 }
 
 impl AppContainerProfile {
@@ -337,8 +436,8 @@ impl AppContainerProfile {
     fn finalize_cleanup(&mut self) -> Result<(), String> {
         delete_appcontainer_profile(&self.name)?;
         self.journal_lease.take();
-        std::fs::remove_file(&self.journal_path)
-            .map_err(|error| format!("sandbox: remove completed AppContainer journal: {error}"))?;
+        self.journal_root
+            .remove_file(&self.journal_path, "remove completed AppContainer journal")?;
         self.journal_path.clear();
         Ok(())
     }
@@ -649,11 +748,10 @@ fn terminate_and_reap_owned_helper(
 }
 
 fn recover_preflight_profiles(cache: &Path, deadline: Instant) -> Result<(), String> {
-    let journal_root = cache
-        .parent()
-        .ok_or("sandbox: production-preflight cache has no control parent")?
-        .join(".mini-agent-appcontainer-control-v1");
-    if journal_root.exists() {
+    let candidate = private_control_root_candidate(cache)?;
+    if candidate.exists() {
+        let directory = protect_and_attest_control_root(&candidate)?;
+        let journal_root = ProfileJournalRootAuthority::new(candidate, directory)?;
         sweep_stale_profiles_until(&journal_root, deadline)?;
     }
     Ok(())
@@ -2406,7 +2504,8 @@ fn create_appcontainer_profile(
         let create_error =
             format!("sandbox: create unique AppContainer profile: HRESULT {result:#x}");
         return Err(
-            match remove_profile_intent(&intent_path, intent_lease, &profile_control) {
+            match remove_profile_intent(&journal_root, &intent_path, intent_lease, &profile_control)
+            {
                 Ok(()) => create_error,
                 Err(cleanup) => format!("{create_error}; {cleanup}"),
             },
@@ -2420,6 +2519,7 @@ fn create_appcontainer_profile(
         storage: PathBuf::new(),
         journal_path: PathBuf::new(),
         journal_lease: None,
+        journal_root: journal_root.clone(),
     };
     let setup = (|| -> Result<(PathBuf, File), String> {
         let mut derived = null_mut();
@@ -2468,8 +2568,7 @@ fn create_appcontainer_profile(
         };
         let payload = serde_json::to_vec(&journal)
             .map_err(|error| format!("sandbox: encode AppContainer cleanup journal: {error}"))?;
-        let journal_path = journal_root.join(format!("{}.json", uuid::Uuid::new_v4().simple()));
-        let mut lease = create_profile_journal(&journal_path)?;
+        let (journal_path, mut lease) = create_profile_journal(&journal_root, "json")?;
         let durable = lease
             .write_all(&payload)
             .map_err(|error| format!("sandbox: write AppContainer cleanup journal: {error}"))
@@ -2480,7 +2579,10 @@ fn create_appcontainer_profile(
             });
         if let Err(error) = durable {
             drop(lease);
-            let _ = std::fs::remove_file(&journal_path);
+            let _ = journal_root.remove_file(
+                &journal_path,
+                "remove incomplete AppContainer cleanup journal",
+            );
             return Err(error);
         }
         Ok((journal_path, lease))
@@ -2490,7 +2592,7 @@ fn create_appcontainer_profile(
             profile.journal_path = journal_path;
             profile.journal_lease = Some(lease);
             if let Err(intent_error) =
-                remove_profile_intent(&intent_path, intent_lease, &profile_control)
+                remove_profile_intent(&journal_root, &intent_path, intent_lease, &profile_control)
             {
                 let cleanup = profile.finalize_cleanup();
                 return Err(match cleanup {
@@ -2502,7 +2604,8 @@ fn create_appcontainer_profile(
         }
         Err(error) => {
             let rollback = profile.rollback_unjournaled();
-            let intent = remove_profile_intent(&intent_path, intent_lease, &profile_control);
+            let intent =
+                remove_profile_intent(&journal_root, &intent_path, intent_lease, &profile_control);
             Err(match (rollback, intent) {
                 (Ok(()), Ok(())) => error,
                 (Err(rollback), Ok(())) => {
@@ -2518,7 +2621,7 @@ fn create_appcontainer_profile(
 }
 
 fn create_profile_intent(
-    journal_root: &Path,
+    journal_root: &ProfileJournalRootAuthority,
     profile_name: &str,
     _profile_control: &ProfileControlGuard,
 ) -> Result<(PathBuf, File), String> {
@@ -2527,15 +2630,10 @@ fn create_profile_intent(
         profile_name: profile_name.to_string(),
     })
     .map_err(|error| format!("sandbox: encode AppContainer profile intent: {error}"))?;
-    let path = journal_root.join(format!(
-        "{}.{}",
-        uuid::Uuid::new_v4().simple(),
-        PROFILE_INTENT_EXTENSION
-    ));
-    let mut lease = create_profile_journal(&path)?;
+    let (path, mut lease) = create_profile_journal(journal_root, PROFILE_INTENT_EXTENSION)?;
     if let Err(error) = lease.write_all(&payload).and_then(|()| lease.sync_all()) {
         drop(lease);
-        let _ = std::fs::remove_file(&path);
+        let _ = journal_root.remove_file(&path, "remove incomplete AppContainer profile intent");
         return Err(format!(
             "sandbox: persist AppContainer profile intent: {error}"
         ));
@@ -2544,13 +2642,13 @@ fn create_profile_intent(
 }
 
 fn remove_profile_intent(
+    journal_root: &ProfileJournalRootAuthority,
     path: &Path,
     lease: File,
     _profile_control: &ProfileControlGuard,
 ) -> Result<(), String> {
     drop(lease);
-    std::fs::remove_file(path)
-        .map_err(|error| format!("sandbox: remove AppContainer profile intent: {error}"))
+    journal_root.remove_file(path, "remove AppContainer profile intent")
 }
 
 fn appcontainer_storage_path(sid: &str) -> Result<PathBuf, String> {
@@ -2581,54 +2679,38 @@ fn profile_journal_root(
     cache: &Path,
     read_roots: &[PathBuf],
     write_roots: &[PathBuf],
-) -> Result<PathBuf, String> {
+) -> Result<ProfileJournalRootAuthority, String> {
     let candidate = private_control_root_candidate(cache)?;
-    for root in read_roots {
-        if let Some(error) = root_role_conflict(
-            RootRole::PrivateControlRoot,
-            &candidate,
-            RootRole::AuthorizedReadRoot,
-            root,
-        ) {
-            return Err(error);
-        }
-    }
-    for root in write_roots {
-        if let Some(error) = root_role_conflict(
-            RootRole::PrivateControlRoot,
-            &candidate,
-            RootRole::AuthorizedWritableRoot,
-            root,
-        ) {
-            return Err(error);
-        }
-    }
+    validate_control_root_against_access_roots(&candidate, read_roots, write_roots)?;
     let root = candidate;
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("sandbox: create private AppContainer control root: {error}"))?;
     let root = private_control_root_candidate(cache)?;
-    for granted in read_roots {
-        if let Some(error) = root_role_conflict(
-            RootRole::PrivateControlRoot,
-            &root,
-            RootRole::AuthorizedReadRoot,
-            granted,
-        ) {
-            return Err(error);
+    validate_control_root_against_access_roots(&root, read_roots, write_roots)?;
+    let directory = protect_and_attest_control_root(&root)?;
+    let authority = ProfileJournalRootAuthority::new(root, directory)?;
+    validate_control_root_against_access_roots(authority.path(), read_roots, write_roots)?;
+    Ok(authority)
+}
+
+fn validate_control_root_against_access_roots(
+    control_root: &Path,
+    read_roots: &[PathBuf],
+    write_roots: &[PathBuf],
+) -> Result<(), String> {
+    for (role, roots) in [
+        (RootRole::AuthorizedReadRoot, read_roots),
+        (RootRole::AuthorizedWritableRoot, write_roots),
+    ] {
+        for root in roots {
+            if let Some(error) =
+                root_role_conflict(RootRole::PrivateControlRoot, control_root, role, root)
+            {
+                return Err(error);
+            }
         }
     }
-    for granted in write_roots {
-        if let Some(error) = root_role_conflict(
-            RootRole::PrivateControlRoot,
-            &root,
-            RootRole::AuthorizedWritableRoot,
-            granted,
-        ) {
-            return Err(error);
-        }
-    }
-    protect_and_attest_control_root(&root)?;
-    Ok(root)
+    Ok(())
 }
 
 fn current_user_sid_buffer() -> Result<Vec<usize>, String> {
@@ -2662,12 +2744,12 @@ fn token_user_sid(buffer: &[usize]) -> PSID {
     unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid }
 }
 
-fn protect_and_attest_control_root(root: &Path) -> Result<(), String> {
+fn protect_and_attest_control_root(root: &Path) -> Result<File, String> {
     let directory = open_stable_path(
         root,
         true,
         READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
     )?;
     let user = current_user_sid_buffer()?;
     let user_sid = token_user_sid(&user);
@@ -2711,6 +2793,11 @@ fn protect_and_attest_control_root(root: &Path) -> Result<(), String> {
     }
     drop(dacl_allocation);
 
+    attest_control_root_dacl(&directory, user_sid)?;
+    Ok(directory)
+}
+
+fn attest_control_root_dacl(directory: &File, user_sid: PSID) -> Result<(), String> {
     let mut owner = null_mut();
     let mut observed_dacl = null_mut();
     let mut descriptor = null_mut();
@@ -2760,7 +2847,15 @@ fn protect_and_attest_control_root(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn create_profile_journal(path: &Path) -> Result<File, String> {
+fn create_profile_journal(
+    journal_root: &ProfileJournalRootAuthority,
+    extension: &str,
+) -> Result<(PathBuf, File), String> {
+    journal_root.revalidate()?;
+    let path = journal_root
+        .path()
+        .join(format!("{}.{}", uuid::Uuid::new_v4().simple(), extension));
+    journal_root.validate_child(&path)?;
     let wide = wide_null(path.as_os_str())?;
     let raw = unsafe {
         CreateFileW(
@@ -2774,10 +2869,16 @@ fn create_profile_journal(path: &Path) -> Result<File, String> {
         )
     };
     let handle = Handle::created(raw, "create exclusive AppContainer cleanup journal")?;
-    Ok(unsafe { File::from_raw_handle(handle.0.into_raw_handle()) })
+    Ok((path, unsafe {
+        File::from_raw_handle(handle.0.into_raw_handle())
+    }))
 }
 
-fn open_stale_profile_journal(path: &Path) -> Result<Option<File>, String> {
+fn open_stale_profile_journal(
+    journal_root: &ProfileJournalRootAuthority,
+    path: &Path,
+) -> Result<Option<File>, String> {
+    journal_root.validate_child(path)?;
     let wide = wide_null(path.as_os_str())?;
     let raw = unsafe {
         CreateFileW(
@@ -2802,18 +2903,22 @@ fn open_stale_profile_journal(path: &Path) -> Result<Option<File>, String> {
     Ok(Some(unsafe { File::from_raw_handle(raw) }))
 }
 
-fn sweep_stale_profiles_until(journal_root: &Path, deadline: Instant) -> Result<(), String> {
+fn sweep_stale_profiles_until(
+    journal_root: &ProfileJournalRootAuthority,
+    deadline: Instant,
+) -> Result<(), String> {
     let profile_control = ProfileControlGuard::acquire_until(deadline)?;
     sweep_stale_profiles_until_locked(journal_root, deadline, &profile_control)
 }
 
 fn sweep_stale_profiles_until_locked(
-    journal_root: &Path,
+    journal_root: &ProfileJournalRootAuthority,
     deadline: Instant,
     _profile_control: &ProfileControlGuard,
 ) -> Result<(), String> {
+    journal_root.revalidate()?;
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(journal_root)
+    for entry in std::fs::read_dir(journal_root.path())
         .map_err(|error| format!("sandbox: enumerate AppContainer cleanup journals: {error}"))?
     {
         if entries.len() >= MAX_STALE_PROFILE_JOURNALS {
@@ -2847,13 +2952,16 @@ fn sweep_stale_profiles_until_locked(
     }
     for path in intents {
         ensure_preflight_cleanup_deadline(deadline)?;
-        sweep_stale_profile_intent(&path)?;
+        sweep_stale_profile_intent(&path, journal_root, deadline)?;
     }
     Ok(())
 }
 
-fn read_stale_control_file(path: &Path) -> Result<Option<(File, Vec<u8>)>, String> {
-    let Some(mut lease) = open_stale_profile_journal(path)? else {
+fn read_stale_control_file(
+    journal_root: &ProfileJournalRootAuthority,
+    path: &Path,
+) -> Result<Option<(File, Vec<u8>)>, String> {
+    let Some(mut lease) = open_stale_profile_journal(journal_root, path)? else {
         return Ok(None);
     };
     let metadata = lease
@@ -2877,10 +2985,11 @@ fn read_stale_control_file(path: &Path) -> Result<Option<(File, Vec<u8>)>, Strin
 
 fn sweep_stale_profile_journal(
     path: &Path,
-    journal_root: &Path,
+    journal_root: &ProfileJournalRootAuthority,
     deadline: Instant,
 ) -> Result<(), String> {
-    let Some((lease, payload)) = read_stale_control_file(path)? else {
+    ensure_preflight_cleanup_deadline(deadline)?;
+    let Some((lease, payload)) = read_stale_control_file(journal_root, path)? else {
         return Ok(());
     };
     let journal: ProfileJournal = serde_json::from_slice(&payload)
@@ -2916,20 +3025,28 @@ fn sweep_stale_profile_journal(
         return Err("sandbox: stale AppContainer journal SID mismatch".into());
     }
     wait_for_stale_job_quiescence_until(&journal.job_name, deadline)?;
-    let roots =
-        canonicalize_access_roots(journal.roots.iter().map(PathBuf::as_path), journal_root)?;
+    let roots = canonicalize_access_roots(
+        journal.roots.iter().map(PathBuf::as_path),
+        journal_root.path(),
+    )?;
     for root in roots {
         ensure_preflight_cleanup_deadline(deadline)?;
         revoke_tree_until(&root, sid.0, deadline)?;
     }
+    ensure_preflight_cleanup_deadline(deadline)?;
     delete_appcontainer_profile(&name)?;
     drop(lease);
-    std::fs::remove_file(path)
-        .map_err(|error| format!("sandbox: remove stale AppContainer journal: {error}"))
+    ensure_preflight_cleanup_deadline(deadline)?;
+    journal_root.remove_file(path, "remove stale AppContainer journal")
 }
 
-fn sweep_stale_profile_intent(path: &Path) -> Result<(), String> {
-    let Some((lease, payload)) = read_stale_control_file(path)? else {
+fn sweep_stale_profile_intent(
+    path: &Path,
+    journal_root: &ProfileJournalRootAuthority,
+    deadline: Instant,
+) -> Result<(), String> {
+    ensure_preflight_cleanup_deadline(deadline)?;
+    let Some((lease, payload)) = read_stale_control_file(journal_root, path)? else {
         return Ok(());
     };
     let intent: ProfileIntent = serde_json::from_slice(&payload)
@@ -2940,10 +3057,11 @@ fn sweep_stale_profile_intent(path: &Path) -> Result<(), String> {
     {
         return Err("sandbox: invalid AppContainer profile intent policy".into());
     }
+    ensure_preflight_cleanup_deadline(deadline)?;
     delete_appcontainer_profile(&wide_string(&intent.profile_name))?;
     drop(lease);
-    std::fs::remove_file(path)
-        .map_err(|error| format!("sandbox: remove stale AppContainer profile intent: {error}"))
+    ensure_preflight_cleanup_deadline(deadline)?;
+    journal_root.remove_file(path, "remove stale AppContainer profile intent")
 }
 
 fn ensure_preflight_cleanup_deadline(deadline: Instant) -> Result<(), String> {
@@ -4810,8 +4928,152 @@ mod tests {
             canonical_root(&ordinary, "ordinary alias").expect("canonicalize ordinary alias"),
             canonical_root(&verbatim, "verbatim alias").expect("canonicalize verbatim alias")
         );
+        let directory = protect_and_attest_control_root(&canonical)
+            .expect("attest control root through canonical alias");
+        let authority = ProfileJournalRootAuthority::new(ordinary, directory)
+            .expect("bind ordinary alias to the canonical file identity");
+        authority
+            .revalidate()
+            .expect("ordinary/verbatim alias must preserve bound identity");
         assert!(reject_remote_access_path(Path::new(r"\\server\share\root")).is_err());
         assert!(reject_remote_access_path(Path::new(r"\\?\UNC\server\share\root")).is_err());
+        drop(authority);
+    }
+
+    fn attempt_control_directory_swap(target: PathBuf, replacement: PathBuf) -> std::io::Error {
+        let barrier = Arc::new(Barrier::new(2));
+        let mutator_barrier = barrier.clone();
+        let mutator = std::thread::spawn(move || {
+            mutator_barrier.wait();
+            std::fs::rename(target, replacement)
+                .expect_err("bound control authority must deny directory replacement")
+        });
+        barrier.wait();
+        mutator.join().expect("control-root mutator must not panic")
+    }
+
+    #[test]
+    fn control_root_authority_denies_root_swap_after_attestation() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-control-root-swap-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = base.join("state/cache");
+        std::fs::create_dir_all(&cache).expect("create root-swap cache");
+        let authority = profile_journal_root(&cache, &[], &[]).expect("bind private control root");
+        let replacement = authority.path().with_extension("replacement");
+
+        let error =
+            attempt_control_directory_swap(authority.path().to_path_buf(), replacement.clone());
+        assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
+        authority
+            .revalidate()
+            .expect("failed swap must leave the original authority valid");
+        assert!(!replacement.exists());
+        assert_eq!(
+            std::fs::read_dir(authority.path())
+                .expect("enumerate protected control root")
+                .count(),
+            0,
+            "failed swap must not create an external journal or residue"
+        );
+
+        drop(authority);
+        std::fs::remove_dir_all(base).expect("remove root-swap tree");
+    }
+
+    #[test]
+    fn control_root_authority_denies_ancestor_swap_after_attestation() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-control-ancestor-swap-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = base.join("state");
+        let cache = state.join("cache");
+        std::fs::create_dir_all(&cache).expect("create ancestor-swap cache");
+        let authority = profile_journal_root(&cache, &[], &[]).expect("bind private control root");
+        let replacement = base.join("state-replacement");
+
+        let error = attempt_control_directory_swap(state.clone(), replacement.clone());
+        assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
+        authority
+            .revalidate()
+            .expect("failed ancestor swap must leave the original authority valid");
+        assert!(!replacement.exists());
+        assert_eq!(
+            std::fs::read_dir(authority.path())
+                .expect("enumerate protected control root")
+                .count(),
+            0,
+            "failed ancestor swap must not create an external journal or residue"
+        );
+
+        drop(authority);
+        std::fs::remove_dir_all(base).expect("remove ancestor-swap tree");
+    }
+
+    #[test]
+    fn control_root_authority_rejects_rebound_identity_without_leaking_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-control-identity-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let original = base.join("original");
+        let rebound = base.join("rebound");
+        std::fs::create_dir_all(&original).expect("create original control directory");
+        std::fs::create_dir_all(&rebound).expect("create rebound control directory");
+        let directory =
+            protect_and_attest_control_root(&original).expect("attest original control root");
+
+        let error = ProfileJournalRootAuthority::new(rebound.clone(), directory)
+            .expect_err("mismatched path and handle identities must fail closed");
+        assert_eq!(error, CONTROL_ROOT_AUTHORITY_ERROR);
+        assert!(!error.contains(original.to_string_lossy().as_ref()));
+        assert!(!error.contains(rebound.to_string_lossy().as_ref()));
+
+        std::fs::remove_dir_all(base).expect("remove identity-test tree");
+    }
+
+    #[test]
+    fn control_root_authority_rejects_post_attestation_dacl_change() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-control-dacl-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = base.join("state/cache");
+        std::fs::create_dir_all(&cache).expect("create DACL-test cache");
+        let authority = profile_journal_root(&cache, &[], &[]).expect("bind private control root");
+
+        let result = unsafe {
+            SetSecurityInfo(
+                authority.0._directory.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        assert_eq!(
+            result, 0,
+            "replace owner-only DACL with an injected null DACL"
+        );
+        assert_eq!(
+            authority
+                .revalidate()
+                .expect_err("changed control-root DACL must fail closed"),
+            CONTROL_ROOT_AUTHORITY_ERROR
+        );
+
+        let restored = protect_and_attest_control_root(authority.path())
+            .expect("restore owner-only DACL for cleanup");
+        authority
+            .revalidate()
+            .expect("restored owner-only DACL must revalidate");
+        drop(restored);
+        drop(authority);
+        std::fs::remove_dir_all(base).expect("remove DACL-test tree");
     }
 
     #[test]
@@ -4839,7 +5101,40 @@ mod tests {
         sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(5))
             .expect("sweep profile intent");
         assert!(!intent.exists());
+        drop(journal_root);
         std::fs::remove_dir_all(base).expect("remove intent-test tree");
+    }
+
+    #[test]
+    fn expired_recovery_preserves_profile_intent_for_later_startup() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-agent-expired-intent-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).expect("create expired-intent cache");
+        let journal_root =
+            profile_journal_root(&cache, &[], &[]).expect("create private journal root");
+        let name = format!(
+            "{APPCONTAINER_PROFILE_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let profile_control =
+            ProfileControlGuard::acquire_until(Instant::now() + Duration::from_secs(5))
+                .expect("acquire profile control");
+        let (intent, lease) = create_profile_intent(&journal_root, &name, &profile_control)
+            .expect("persist profile intent");
+        drop(lease);
+
+        let error = sweep_stale_profile_intent(&intent, &journal_root, Instant::now())
+            .expect_err("expired recovery must not consume its durable intent");
+        assert!(error.contains("cleanup deadline"));
+        assert!(intent.exists());
+
+        std::fs::remove_file(&intent).expect("remove preserved intent");
+        drop(profile_control);
+        drop(journal_root);
+        std::fs::remove_dir_all(base).expect("remove expired-intent tree");
     }
 
     #[test]
@@ -4876,7 +5171,7 @@ mod tests {
             "sweeper entered an active intent transition"
         );
 
-        remove_profile_intent(&intent, lease, &profile_control)
+        remove_profile_intent(&journal_root, &intent, lease, &profile_control)
             .expect("remove intent while transition remains owned");
         drop(profile_control);
         finished_rx
@@ -4885,6 +5180,7 @@ mod tests {
             .expect("sweep after transition");
         sweeper.join().expect("sweeper must not panic");
         assert!(!intent.exists());
+        drop(journal_root);
         std::fs::remove_dir_all(base).expect("remove intent-race tree");
     }
 
