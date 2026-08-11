@@ -27,6 +27,10 @@ use crate::sandbox::worker::{WorkerLaunchError, WorkerLauncher, WorkerProcess};
 
 const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// A pipe can report EOF just before the OS makes the worker's exit status observable. Keep this
+/// window short and bounded so native resource exits retain their closed classification without a
+/// malformed or abandoned transport delaying the caller materially.
+const PROCESS_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_millis(100);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// Effect services get a short, independent drain window after invocation cancellation. This is
@@ -1751,7 +1755,32 @@ async fn read_worker(
     {
         return Err(classify_worker_exit(status));
     }
-    tagged.result.map_err(map_frame_error)
+    match tagged.result {
+        Ok(frame) => Ok(frame),
+        Err(error) => {
+            let error = map_frame_error(error);
+            if error == WorkerError::Transport {
+                Err(reconcile_transport_exit(connection, deadline).await)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn reconcile_transport_exit(
+    connection: &mut WorkerConnection,
+    invocation_deadline: Instant,
+) -> WorkerError {
+    let deadline = invocation_deadline.min(Instant::now() + PROCESS_EXIT_RECONCILIATION_TIMEOUT);
+    loop {
+        match connection.process.try_wait() {
+            Ok(Some(status)) => return classify_worker_exit(status),
+            Err(_) => return WorkerError::Transport,
+            Ok(None) if Instant::now() >= deadline => return WorkerError::Transport,
+            Ok(None) => tokio::time::sleep(PROCESS_POLL_INTERVAL).await,
+        }
+    }
 }
 
 fn classify_worker_exit(status: ExitStatus) -> WorkerError {
