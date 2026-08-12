@@ -1697,18 +1697,13 @@ mod windows_clipboard {
         }
     }
 
-    pub(super) fn write(text: &str) -> io::Result<()> {
+    fn write_with_owner(text: &str, owner: HWND) -> io::Result<()> {
         validate_clipboard_text(text)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid clipboard text"))?;
         let normalized = normalize_windows_clipboard_newlines(text);
         let mut units: Vec<u16> = normalized.encode_utf16().collect();
         units.push(0);
         let mut memory = OwnedGlobalMemory::from_utf16(&units)?;
-        // EmptyClipboard requires a real owner before SetClipboardData. A TUI
-        // attached to either ConHost or a pseudoconsole has a console HWND.
-        // SAFETY: GetConsoleWindow takes no arguments and returns a borrowed
-        // process-associated window handle.
-        let owner = unsafe { GetConsoleWindow() };
         if owner.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1727,6 +1722,14 @@ mod windows_clipboard {
         }
         memory.transferred = true;
         clipboard.close()
+    }
+
+    pub(super) fn write(text: &str) -> io::Result<()> {
+        // EmptyClipboard requires a real owner before SetClipboardData. A TUI
+        // attached to either ConHost or a pseudoconsole has a console HWND.
+        // SAFETY: GetConsoleWindow takes no arguments and returns a borrowed
+        // process-associated window handle.
+        write_with_owner(text, unsafe { GetConsoleWindow() })
     }
 
     pub(super) fn read() -> io::Result<String> {
@@ -1787,9 +1790,12 @@ mod windows_clipboard {
         use std::sync::Mutex;
         use std::sync::mpsc;
 
-        use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE,
+        };
 
-        use super::{ClipboardGuard, read, write};
+        use super::{ClipboardGuard, read, write_with_owner};
 
         static CLIPBOARD_TEST: Mutex<()> = Mutex::new(());
         static OPEN_FAILURE_HOOK: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
@@ -1800,21 +1806,53 @@ mod windows_clipboard {
             }
         }
 
-        struct RestoreClipboard(Option<String>);
+        struct ClipboardOwner(HWND);
 
-        fn ensure_console() {
-            // GitHub-hosted test processes may start without an attached
-            // console even though the production TUI always has one.
-            if unsafe { GetConsoleWindow() }.is_null() {
-                // SAFETY: this test process has no console, as checked above.
-                assert_ne!(unsafe { AllocConsole() }, 0, "test must allocate console");
+        impl ClipboardOwner {
+            fn new() -> Self {
+                let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+                // SAFETY: STATIC is a system window class. The message-only
+                // window stays live for the complete clipboard operation.
+                let owner = unsafe {
+                    CreateWindowExW(
+                        0,
+                        class.as_ptr(),
+                        std::ptr::null(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        HWND_MESSAGE,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                    )
+                };
+                assert!(
+                    !owner.is_null(),
+                    "test must create a clipboard owner window"
+                );
+                Self(owner)
             }
+        }
+
+        impl Drop for ClipboardOwner {
+            fn drop(&mut self) {
+                // SAFETY: this test owns the window and destroys it once.
+                unsafe { DestroyWindow(self.0) };
+            }
+        }
+
+        struct RestoreClipboard {
+            owner: HWND,
+            text: Option<String>,
         }
 
         impl Drop for RestoreClipboard {
             fn drop(&mut self) {
-                if let Some(text) = self.0.as_deref() {
-                    let _ = write(text);
+                if let Some(text) = self.text.as_deref() {
+                    let _ = write_with_owner(text, self.owner);
                 }
             }
         }
@@ -1837,10 +1875,13 @@ mod windows_clipboard {
         #[ignore = "mutates the process-global Windows clipboard; run in isolated Windows CI"]
         fn windows_clipboard_round_trips_unicode_empty_and_multiline_text() {
             let _serial = CLIPBOARD_TEST.lock().unwrap();
-            ensure_console();
-            let _restore = RestoreClipboard(read().ok());
+            let owner = ClipboardOwner::new();
+            let _restore = RestoreClipboard {
+                owner: owner.0,
+                text: read().ok(),
+            };
             for text in ["ASCII", "non-BMP 🧰 𐐷", "", "first\nsecond\nthird"] {
-                write(text).unwrap();
+                write_with_owner(text, owner.0).unwrap();
                 assert_eq!(read().unwrap(), text);
             }
         }
@@ -1849,8 +1890,11 @@ mod windows_clipboard {
         #[ignore = "mutates the process-global Windows clipboard; run in isolated Windows CI"]
         fn windows_clipboard_retries_transient_contention_and_recovers_after_exhaustion() {
             let _serial = CLIPBOARD_TEST.lock().unwrap();
-            ensure_console();
-            let _restore = RestoreClipboard(read().ok());
+            let owner = ClipboardOwner::new();
+            let _restore = RestoreClipboard {
+                owner: owner.0,
+                text: read().ok(),
+            };
 
             let (release, holder) = hold_clipboard();
             let (failed_tx, failed_rx) = mpsc::channel();
@@ -1859,18 +1903,18 @@ mod windows_clipboard {
                 failed_rx.recv().unwrap();
                 release.send(()).unwrap();
             });
-            write("transient").unwrap();
+            write_with_owner("transient", owner.0).unwrap();
             releaser.join().unwrap();
             holder.join().unwrap();
             assert_eq!(read().unwrap(), "transient");
 
             let (release, holder) = hold_clipboard();
-            let error = write("persistent").unwrap_err();
+            let error = write_with_owner("persistent", owner.0).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
             release.send(()).unwrap();
             holder.join().unwrap();
 
-            write("recovered").unwrap();
+            write_with_owner("recovered", owner.0).unwrap();
             assert_eq!(read().unwrap(), "recovered");
         }
     }
