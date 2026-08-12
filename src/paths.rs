@@ -862,6 +862,10 @@ mod windows_workspace_binding_tests {
                 .starts_with(".target.txt.mini-agent-")
         }));
 
+        drop(published_identity);
+        drop(raced_identity);
+        drop(expected);
+        drop(binding);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
