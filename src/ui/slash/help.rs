@@ -298,6 +298,13 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
         ctx.renderer,
         "  Esc (while selected)   clear selection (no copy)",
     );
+    #[cfg(windows)]
+    write_result(ctx.renderer, "  Ctrl+Shift+C           copy selected text");
+    #[cfg(windows)]
+    write_result(
+        ctx.renderer,
+        "  Ctrl+V                 paste Unicode clipboard text",
+    );
     write_result(ctx.renderer, "  Ctrl+R                 toggle reasoning");
     write_result(ctx.renderer, "  Ctrl+C / Ctrl+D        interrupt/quit");
     write_result(ctx.renderer, "  mouse scroll           scroll chat");

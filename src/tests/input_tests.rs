@@ -91,3 +91,49 @@ fn semantic_interrupt_routing_preserves_btw_and_validation_isolation() {
     assert_eq!(interrupt_target(0, false, true), InterruptTarget::MainRun);
     assert_eq!(interrupt_target(0, false, false), InterruptTarget::Exit);
 }
+
+#[test]
+fn clipboard_shortcuts_precede_interrupt_and_literal_input_routing() {
+    use crate::ui::{ClipboardShortcut, clipboard_shortcut};
+
+    let copy = KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    let paste = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+    let altgr_paste = KeyEvent::new(
+        KeyCode::Char('v'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let modified_copy = KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+    );
+
+    assert_eq!(
+        clipboard_shortcut(copy, true),
+        Some(ClipboardShortcut::CopySelection)
+    );
+    assert_eq!(clipboard_shortcut(copy, false), None);
+    assert_eq!(clipboard_shortcut(interrupt, true), None);
+    assert_eq!(
+        clipboard_shortcut(paste, true),
+        Some(ClipboardShortcut::Paste)
+    );
+    assert_eq!(clipboard_shortcut(paste, false), None);
+    assert_eq!(clipboard_shortcut(altgr_paste, true), None);
+    assert_eq!(clipboard_shortcut(modified_copy, true), None);
+}
+
+#[test]
+fn clipboard_paste_payload_is_inserted_once_at_the_cursor() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "ab");
+    editor.cursor = 1;
+
+    editor.handle_paste("☃\r\nline".to_string());
+
+    assert_eq!(editor.buffer.as_str(), "a☃\r\nlineb");
+    assert_eq!(editor.cursor, "a☃\r\nline".len());
+}

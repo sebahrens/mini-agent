@@ -23,7 +23,10 @@ use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
 use crate::ui::permission_handler::handle_permission_request;
 use crate::ui::pickers::rewind::RewindOutcome;
-use crate::ui::renderer::{self as renderer_mod, ChainPrompt, Renderer, copy_to_clipboard};
+use crate::ui::renderer::{
+    self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, copy_to_clipboard,
+    read_from_clipboard,
+};
 use crate::ui::slash::{apply_prompt_model, handle_compress, handle_slash};
 use crate::ui::state::{
     AgentRunState, BtwStats, ChainState, PendingMainTurn, SlashState, UiContext,
@@ -51,6 +54,31 @@ pub(crate) enum InterruptTarget {
     Validation,
     MainRun,
     Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardShortcut {
+    CopySelection,
+    Paste,
+}
+
+pub(crate) fn clipboard_shortcut(
+    key: KeyEvent,
+    native_clipboard_available: bool,
+) -> Option<ClipboardShortcut> {
+    if native_clipboard_available
+        && key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        Some(ClipboardShortcut::CopySelection)
+    } else if native_clipboard_available
+        && key.modifiers == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char('v' | 'V'))
+    {
+        Some(ClipboardShortcut::Paste)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn interrupt_target(
@@ -599,13 +627,7 @@ impl<'a> App<'a> {
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
                         self.renderer.selection_end = Some(idx);
                     }
-                    if let Some(text) = self.renderer.selected_text()
-                        && let Err(e) = copy_to_clipboard(&text)
-                    {
-                        self.renderer
-                            .write_line(&format!("copy to clipboard failed: {}", e), C_ERROR)?;
-                    }
-                    self.renderer.clear_selection();
+                    self.copy_selection_to_clipboard()?;
                 }
             }
             UserEvent::Paste(data) => {
@@ -620,6 +642,25 @@ impl<'a> App<'a> {
                 self.handle_mcp_login_done(server, error).await?;
             }
             UserEvent::Key(key) => {
+                match clipboard_shortcut(key, cfg!(windows)) {
+                    Some(ClipboardShortcut::CopySelection) => {
+                        self.copy_selection_to_clipboard()?;
+                        self.refresh()?;
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    Some(ClipboardShortcut::Paste) => {
+                        match read_from_clipboard() {
+                            Ok(text) => self.input.handle_paste(text),
+                            Err(error) => self.renderer.write_line(
+                                &format!("paste from clipboard failed: {error}"),
+                                C_ERROR,
+                            )?,
+                        }
+                        self.refresh()?;
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    None => {}
+                }
                 let is_ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
                 let is_ctrl_d =
@@ -671,20 +712,32 @@ impl<'a> App<'a> {
         Ok(ControlFlow::Continue(()))
     }
 
+    fn copy_selection_to_clipboard(&mut self) -> anyhow::Result<()> {
+        let Some(text) = self.renderer.selected_text() else {
+            self.renderer.clear_selection();
+            return Ok(());
+        };
+        match copy_to_clipboard(&text) {
+            Ok(ClipboardCopyOutcome::Confirmed) => {
+                self.renderer.write_line("copied selection", Color::Green)?;
+                self.renderer.clear_selection();
+            }
+            Ok(ClipboardCopyOutcome::FallbackRequested) => {
+                self.renderer
+                    .write_line("copy requested through terminal", Color::Green)?;
+                self.renderer.clear_selection();
+            }
+            Err(error) => {
+                self.renderer
+                    .write_line(&format!("copy to clipboard failed: {error}"), C_ERROR)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         if self.renderer.selection_active && key.code == KeyCode::Char('y') {
-            if let Some(text) = self.renderer.selected_text() {
-                match copy_to_clipboard(&text) {
-                    Ok(()) => {
-                        self.renderer.write_line("copied selection", Color::Green)?;
-                    }
-                    Err(e) => {
-                        self.renderer
-                            .write_line(&format!("copy to clipboard failed: {}", e), C_ERROR)?;
-                    }
-                }
-            }
-            self.renderer.clear_selection();
+            self.copy_selection_to_clipboard()?;
             return Ok(());
         }
         if self.renderer.selection_active && key.code == KeyCode::Esc {
@@ -1564,15 +1617,18 @@ impl<'a> App<'a> {
                         match crate::extras::mcp::oauth::begin_login(&server, &url, &settings).await
                         {
                             Ok(login) => {
-                                let copied = copy_to_clipboard(&login.auth_url).is_ok();
-                                self.renderer.write_line(
-                                    if copied {
+                                let copy_status = match copy_to_clipboard(&login.auth_url) {
+                                    Ok(ClipboardCopyOutcome::Confirmed) => {
                                         "open this URL to authorize (copied to clipboard):"
-                                    } else {
+                                    }
+                                    Ok(ClipboardCopyOutcome::FallbackRequested) => {
+                                        "open this URL to authorize (terminal copy requested):"
+                                    }
+                                    Err(_) => {
                                         "open this URL to authorize (could not copy to clipboard):"
-                                    },
-                                    C_AGENT,
-                                )?;
+                                    }
+                                };
+                                self.renderer.write_line(copy_status, C_AGENT)?;
                                 self.renderer.write_line(&login.auth_url, Color::Cyan)?;
                                 self.renderer.write_line(
                                     &format!(
