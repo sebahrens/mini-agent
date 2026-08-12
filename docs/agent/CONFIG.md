@@ -1132,10 +1132,12 @@ OAuth fields (all optional):
 | `redirect_port` | `8970`                         | Loopback port for the redirect URI `http://127.0.0.1:<port>/callback`.   |
 
 The first time you connect, run `/mcp login <server>` inside the TUI. zerostack
-prints an authorization URL and copies it to your clipboard; open it in a
-browser, approve access, and the redirect is caught on the loopback port. The
-browser wait runs in the background, so the TUI stays responsive (you can keep
-working or select the URL with the mouse to copy it). The token is saved to
+prints an authorization URL and attempts to copy it to your clipboard; the TUI
+distinguishes a confirmed clipboard write from an unacknowledged OSC 52
+terminal request. Open the URL in a browser, approve access, and the redirect
+is caught on the loopback port. The browser wait runs in the background, so the
+TUI stays responsive (you can keep working or select the URL with the mouse to
+copy it). The token is saved to
 `<credentials_dir>/mcp-oauth/<opaque-server-identity>.json`; server display
 names never become filenames. `credentials_dir` defaults to
 `<local_data_dir>/credentials` (including `%LOCALAPPDATA%\zerostack\credentials`

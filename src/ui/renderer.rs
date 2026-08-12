@@ -11,6 +11,7 @@ use crossterm::terminal::{Clear, ClearType};
 use regex::Regex;
 use smallvec::SmallVec;
 
+#[cfg(not(windows))]
 use crate::process_creation::StdCommandCreationExt;
 
 use super::feed::{BlockStyle, Feed, style_from_color};
@@ -1465,48 +1466,458 @@ pub fn open_url(url: &str) -> anyhow::Result<()> {
     anyhow::bail!("no working opener found (tried xdg-open and open)")
 }
 
-/// Copy `text` to the system clipboard. Tries external tools (checking
-/// their exit status, so a tool that starts but fails — e.g. xclip without
-/// an X display — falls through) and finally the OSC 52 terminal escape.
-/// Errors only when even the escape cannot be written.
-pub fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
-    let cmds: &[(&str, &[&str])] = &[
-        ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
-        ("pbcopy", &[]),
-        ("clip.exe", &[]),
-    ];
-    for &(cmd, args) in cmds {
-        let Ok(mut child) = std::process::Command::new(cmd)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn_guarded()
-        else {
-            continue; // tool not installed
-        };
-        let wrote = match child.stdin.take() {
-            Some(mut stdin) => {
-                let ok = stdin.write_all(text.as_bytes()).is_ok();
-                drop(stdin); // close stdin so the tool sees EOF
-                ok
+pub(crate) const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardCopyOutcome {
+    Confirmed,
+    FallbackRequested,
+}
+
+pub(crate) fn validate_clipboard_text(text: &str) -> anyhow::Result<()> {
+    if text.contains('\0') {
+        anyhow::bail!("clipboard text contains an embedded NUL");
+    }
+    let units = normalize_windows_clipboard_newlines(text)
+        .encode_utf16()
+        .count()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("clipboard text is too large"))?;
+    if units > MAX_CLIPBOARD_BYTES / std::mem::size_of::<u16>() {
+        anyhow::bail!("clipboard text is too large");
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_windows_clipboard_newlines(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                normalized.push_str("\r\n");
             }
-            None => false,
-        };
-        if wrote && matches!(child.wait(), Ok(status) if status.success()) {
-            return Ok(());
+            '\n' => normalized.push_str("\r\n"),
+            _ => normalized.push(ch),
+        }
+    }
+    normalized
+}
+
+pub(crate) fn normalize_internal_clipboard_newlines(text: String) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+pub(crate) fn osc52_request(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+}
+
+fn request_terminal_clipboard(text: &str) -> anyhow::Result<ClipboardCopyOutcome> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(osc52_request(text).as_bytes())?;
+    stdout.flush()?;
+    Ok(ClipboardCopyOutcome::FallbackRequested)
+}
+
+/// Copy `text` to the system clipboard. Native Windows CF_UNICODETEXT and
+/// successful Unix clipboard utilities are confirmed. OSC 52 only reports
+/// that a terminal fallback was requested because it has no acknowledgement.
+pub fn copy_to_clipboard(text: &str) -> anyhow::Result<ClipboardCopyOutcome> {
+    validate_clipboard_text(text)?;
+
+    #[cfg(windows)]
+    {
+        if windows_clipboard::write(text).is_ok() {
+            return Ok(ClipboardCopyOutcome::Confirmed);
+        }
+        request_terminal_clipboard(text)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let cmds: &[(&str, &[&str])] = &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("pbcopy", &[]),
+        ];
+        for &(cmd, args) in cmds {
+            let Ok(mut child) = std::process::Command::new(cmd)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn_guarded()
+            else {
+                continue; // tool not installed
+            };
+            let wrote = match child.stdin.take() {
+                Some(mut stdin) => {
+                    let ok = stdin.write_all(text.as_bytes()).is_ok();
+                    drop(stdin); // close stdin so the tool sees EOF
+                    ok
+                }
+                None => false,
+            };
+            if wrote && matches!(child.wait(), Ok(status) if status.success()) {
+                return Ok(ClipboardCopyOutcome::Confirmed);
+            }
+        }
+        request_terminal_clipboard(text)
+    }
+}
+
+pub fn read_from_clipboard() -> anyhow::Result<String> {
+    #[cfg(windows)]
+    {
+        return Ok(windows_clipboard::read()?);
+    }
+    #[cfg(not(windows))]
+    anyhow::bail!("native clipboard paste is unavailable on this platform")
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_clipboard {
+    use std::io;
+    use std::ptr;
+    use std::thread;
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+        OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    };
+
+    use super::{
+        MAX_CLIPBOARD_BYTES, normalize_internal_clipboard_newlines,
+        normalize_windows_clipboard_newlines, validate_clipboard_text,
+    };
+
+    const CF_UNICODETEXT: u32 = 13;
+    const OPEN_ATTEMPTS: usize = 20;
+    const OPEN_BACKOFF: Duration = Duration::from_millis(5);
+
+    struct ClipboardGuard {
+        open: bool,
+    }
+
+    impl ClipboardGuard {
+        fn open(owner: HWND) -> io::Result<Self> {
+            for attempt in 0..OPEN_ATTEMPTS {
+                // SAFETY: `owner` is either null for reads/contention probes or
+                // the current process's console window for writes. The open
+                // state is closed by Drop.
+                if unsafe { OpenClipboard(owner) } != 0 {
+                    return Ok(Self { open: true });
+                }
+                #[cfg(test)]
+                tests::notify_open_failure_for_test();
+                if attempt + 1 < OPEN_ATTEMPTS {
+                    thread::sleep(OPEN_BACKOFF);
+                }
+            }
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "clipboard is temporarily unavailable",
+            ))
+        }
+
+        fn close(mut self) -> io::Result<()> {
+            // SAFETY: this guard exists only after OpenClipboard succeeded.
+            if unsafe { CloseClipboard() } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.open = false;
+            Ok(())
         }
     }
 
-    // OSC 52 escape sequence — clipboard access via terminal emulator.
-    // Supported by Kitty, Alacritty, WezTerm, foot, iTerm2, Windows Terminal,
-    // and most other modern terminals. No external tools needed.
-    let encoded = base64_encode(text.as_bytes());
-    let mut stdout = std::io::stdout().lock();
-    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
-    stdout.flush()?;
-    Ok(())
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            if self.open {
+                // SAFETY: this guard exists only after OpenClipboard succeeded.
+                unsafe { CloseClipboard() };
+            }
+        }
+    }
+
+    struct OwnedGlobalMemory {
+        handle: windows_sys::Win32::Foundation::HGLOBAL,
+        transferred: bool,
+    }
+
+    impl OwnedGlobalMemory {
+        fn from_utf16(units: &[u16]) -> io::Result<Self> {
+            let bytes = units
+                .len()
+                .checked_mul(std::mem::size_of::<u16>())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "clipboard text is too large")
+                })?;
+            // SAFETY: GlobalAlloc returns an owned movable allocation or null.
+            let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the allocation is live and large enough for `units`.
+            let destination = unsafe { GlobalLock(handle) }.cast::<u16>();
+            if destination.is_null() {
+                // SAFETY: ownership has not transferred to the clipboard.
+                unsafe { GlobalFree(handle) };
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: source and destination are valid for `units.len()` u16s
+            // and do not overlap.
+            unsafe { ptr::copy_nonoverlapping(units.as_ptr(), destination, units.len()) };
+            // A zero return here normally means the lock count reached zero.
+            // SAFETY: the handle was successfully locked above.
+            unsafe { GlobalUnlock(handle) };
+            Ok(Self {
+                handle,
+                transferred: false,
+            })
+        }
+    }
+
+    impl Drop for OwnedGlobalMemory {
+        fn drop(&mut self) {
+            if !self.transferred {
+                // SAFETY: this process still owns the allocation.
+                unsafe { GlobalFree(self.handle) };
+            }
+        }
+    }
+
+    fn write_with_owner(text: &str, owner: HWND) -> io::Result<()> {
+        validate_clipboard_text(text)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid clipboard text"))?;
+        let normalized = normalize_windows_clipboard_newlines(text);
+        let mut units: Vec<u16> = normalized.encode_utf16().collect();
+        units.push(0);
+        let mut memory = OwnedGlobalMemory::from_utf16(&units)?;
+        if owner.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native clipboard copy requires an attached Windows console",
+            ));
+        }
+        let clipboard = ClipboardGuard::open(owner)?;
+        // SAFETY: this thread owns the open clipboard for both calls.
+        if unsafe { EmptyClipboard() } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CF_UNICODETEXT requires movable global memory containing a
+        // NUL-terminated UTF-16 string. Ownership transfers only on success.
+        if unsafe { SetClipboardData(CF_UNICODETEXT, memory.handle) }.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        memory.transferred = true;
+        clipboard.close()
+    }
+
+    pub(super) fn write(text: &str) -> io::Result<()> {
+        // EmptyClipboard requires a real owner before SetClipboardData. A TUI
+        // attached to either ConHost or a pseudoconsole has a console HWND.
+        // SAFETY: GetConsoleWindow takes no arguments and returns a borrowed
+        // process-associated window handle.
+        write_with_owner(text, unsafe { GetConsoleWindow() })
+    }
+
+    pub(super) fn read() -> io::Result<String> {
+        let clipboard = ClipboardGuard::open(ptr::null_mut())?;
+        // SAFETY: this thread owns the open clipboard.
+        if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Unicode clipboard text is unavailable",
+            ));
+        }
+        // SAFETY: the returned handle remains owned by the clipboard.
+        let handle = unsafe { GetClipboardData(CF_UNICODETEXT) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GetClipboardData returned a global-memory handle.
+        let bytes = unsafe { GlobalSize(handle) };
+        if bytes == 0 || bytes > MAX_CLIPBOARD_BYTES || bytes % std::mem::size_of::<u16>() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "clipboard text has an invalid size",
+            ));
+        }
+        // SAFETY: the clipboard stays open while the handle is locked/read.
+        let data = unsafe { GlobalLock(handle) }.cast::<u16>();
+        if data.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let unit_count = bytes / std::mem::size_of::<u16>();
+        // SAFETY: GlobalSize bounds this slice and the allocation is locked.
+        let units = unsafe { std::slice::from_raw_parts(data, unit_count) };
+        let terminator = units.iter().position(|unit| *unit == 0);
+        let decoded = terminator
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "clipboard text is not terminated",
+                )
+            })
+            .and_then(|end| {
+                String::from_utf16(&units[..end]).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "clipboard text is invalid UTF-16",
+                    )
+                })
+            });
+        // SAFETY: the handle was successfully locked above.
+        unsafe { GlobalUnlock(handle) };
+        let decoded = normalize_internal_clipboard_newlines(decoded?);
+        clipboard.close()?;
+        Ok(decoded)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Mutex;
+        use std::sync::mpsc;
+
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE,
+        };
+
+        use super::{ClipboardGuard, read, write_with_owner};
+
+        static CLIPBOARD_TEST: Mutex<()> = Mutex::new(());
+        static OPEN_FAILURE_HOOK: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
+
+        pub(super) fn notify_open_failure_for_test() {
+            if let Some(sender) = OPEN_FAILURE_HOOK.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+        }
+
+        struct ClipboardOwner(HWND);
+
+        impl ClipboardOwner {
+            fn new() -> Self {
+                let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+                // SAFETY: STATIC is a system window class. The message-only
+                // window stays live for the complete clipboard operation.
+                let owner = unsafe {
+                    CreateWindowExW(
+                        0,
+                        class.as_ptr(),
+                        std::ptr::null(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        HWND_MESSAGE,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                    )
+                };
+                assert!(
+                    !owner.is_null(),
+                    "test must create a clipboard owner window"
+                );
+                Self(owner)
+            }
+        }
+
+        impl Drop for ClipboardOwner {
+            fn drop(&mut self) {
+                // SAFETY: this test owns the window and destroys it once.
+                unsafe { DestroyWindow(self.0) };
+            }
+        }
+
+        struct RestoreClipboard {
+            owner: HWND,
+            text: Option<String>,
+        }
+
+        impl Drop for RestoreClipboard {
+            fn drop(&mut self) {
+                if let Some(text) = self.text.as_deref() {
+                    let _ = write_with_owner(text, self.owner);
+                }
+            }
+        }
+
+        fn hold_clipboard() -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+            let (opened_tx, opened_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let guard =
+                    ClipboardGuard::open(std::ptr::null_mut()).expect("test must open clipboard");
+                opened_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(guard);
+            });
+            opened_rx.recv().unwrap();
+            (release_tx, holder)
+        }
+
+        #[test]
+        #[ignore = "mutates the process-global Windows clipboard; run in isolated Windows CI"]
+        fn windows_clipboard_round_trips_unicode_empty_and_multiline_text() {
+            let _serial = CLIPBOARD_TEST.lock().unwrap();
+            let owner = ClipboardOwner::new();
+            let _restore = RestoreClipboard {
+                owner: owner.0,
+                text: read().ok(),
+            };
+            for text in ["ASCII", "non-BMP 🧰 𐐷", "", "first\nsecond\nthird"] {
+                write_with_owner(text, owner.0).unwrap();
+                assert_eq!(read().unwrap(), text);
+            }
+        }
+
+        #[test]
+        #[ignore = "mutates the process-global Windows clipboard; run in isolated Windows CI"]
+        fn windows_clipboard_retries_transient_contention_and_recovers_after_exhaustion() {
+            let _serial = CLIPBOARD_TEST.lock().unwrap();
+            let owner = ClipboardOwner::new();
+            let _restore = RestoreClipboard {
+                owner: owner.0,
+                text: read().ok(),
+            };
+
+            let (release, holder) = hold_clipboard();
+            let (failed_tx, failed_rx) = mpsc::channel();
+            *OPEN_FAILURE_HOOK.lock().unwrap() = Some(failed_tx);
+            let releaser = std::thread::spawn(move || {
+                failed_rx.recv().unwrap();
+                release.send(()).unwrap();
+            });
+            write_with_owner("transient", owner.0).unwrap();
+            releaser.join().unwrap();
+            holder.join().unwrap();
+            assert_eq!(read().unwrap(), "transient");
+
+            let (release, holder) = hold_clipboard();
+            let error = write_with_owner("persistent", owner.0).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            release.send(()).unwrap();
+            holder.join().unwrap();
+
+            write_with_owner("recovered", owner.0).unwrap();
+            assert_eq!(read().unwrap(), "recovered");
+        }
+    }
 }
 
 /// Minimal base64 encoder — avoids pulling in a crate just for clipboard support.

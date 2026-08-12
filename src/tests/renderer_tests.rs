@@ -1,8 +1,11 @@
 use std::cell::{Cell, RefCell};
 
+#[cfg(not(windows))]
+use crate::ui::renderer::{ClipboardCopyOutcome, copy_to_clipboard};
 use crate::ui::renderer::{
-    base64_encode, copy_to_clipboard, dispatch_windows_open, is_nul_terminated_utf16, is_safe_url,
-    windows_open_request,
+    MAX_CLIPBOARD_BYTES, base64_encode, dispatch_windows_open, is_nul_terminated_utf16,
+    is_safe_url, normalize_internal_clipboard_newlines, normalize_windows_clipboard_newlines,
+    osc52_request, validate_clipboard_text, windows_open_request,
 };
 
 #[test]
@@ -43,14 +46,47 @@ fn base64_encode_long_input() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn copy_to_clipboard_does_not_panic() {
-    // Succeeds via an external tool or the OSC 52 fallback.
-    copy_to_clipboard("test text").expect("copy should succeed");
+    let outcome = copy_to_clipboard("test text").expect("copy should succeed");
+    assert!(matches!(
+        outcome,
+        ClipboardCopyOutcome::Confirmed | ClipboardCopyOutcome::FallbackRequested
+    ));
 }
 
 #[test]
+#[cfg(not(windows))]
 fn copy_to_clipboard_empty_string() {
     copy_to_clipboard("").expect("copy should succeed");
+}
+
+#[test]
+fn clipboard_text_validation_rejects_nul_and_oversize() {
+    assert!(validate_clipboard_text("before\0after").is_err());
+    let oversized = "x".repeat(MAX_CLIPBOARD_BYTES / 2);
+    assert!(validate_clipboard_text(&oversized).is_err());
+}
+
+#[test]
+fn windows_clipboard_newline_codec_preserves_internal_lf_text() {
+    for internal in ["one\ntwo", "one\r\ntwo", "one\rtwo", "no newline"] {
+        let windows = normalize_windows_clipboard_newlines(internal);
+        let remainder = windows.replace("\r\n", "");
+        assert!(!remainder.contains('\r') && !remainder.contains('\n'));
+        assert_eq!(
+            normalize_internal_clipboard_newlines(windows),
+            internal.replace("\r\n", "\n").replace('\r', "\n")
+        );
+    }
+}
+
+#[test]
+fn osc52_fallback_is_an_exact_unconfirmed_request() {
+    assert_eq!(
+        osc52_request("snowman ☃\nline 2"),
+        "\x1b]52;c;c25vd21hbiDimIMKbGluZSAy\x07"
+    );
 }
 
 #[test]

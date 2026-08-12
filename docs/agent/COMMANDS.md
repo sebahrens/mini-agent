@@ -300,6 +300,8 @@ message, and after the response restores the previous prompt and
 | `Enter` | Send message. |
 | `Shift+Enter` | Insert newline. |
 | `Ctrl+C` | Cancel the current agent response, validation, or shell command; quit when idle. |
+| `Ctrl+Shift+C` | Copy selected text through the Unicode clipboard on Windows. |
+| `Ctrl+V` | Paste Unicode clipboard text at the cursor on Windows. |
 | `Ctrl+D` | Send message (alternative). |
 | `Ctrl+W` | Delete word backwards. |
 | `Ctrl+U` | Delete to beginning of line. |

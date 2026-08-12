@@ -150,6 +150,8 @@ Here is some keybindings to speed up your coding experience:
 | `Ctrl+H` | Launches `lazygit`
 | `Ctrl+S` | Force-save session |
 | `Ctrl+C` | Interrupt the agent |
+| `Ctrl+Shift+C` | Copy selected text (Windows) |
+| `Ctrl+V` | Paste Unicode clipboard text (Windows) |
 | `PgUp` / `PgDn` | Scroll chat |
 | `Home` / `End` | Jump to top/bottom |
 

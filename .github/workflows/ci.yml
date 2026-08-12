@@ -1430,6 +1430,25 @@ jobs:
           cargo test --locked $test -- --exact --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Test Windows Unicode clipboard
+        if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'
+        shell: pwsh
+        run: |
+          $tests = @(
+            'ui::renderer::windows_clipboard::tests::windows_clipboard_round_trips_unicode_empty_and_multiline_text',
+            'ui::renderer::windows_clipboard::tests::windows_clipboard_retries_transient_contention_and_recovers_after_exhaustion'
+          )
+          $discovered = cargo test --locked -- --list 2>&1
+          foreach ($test in $tests) {
+            if ($LASTEXITCODE -ne 0 -or -not ($discovered -match [regex]::Escape("${test}: test"))) {
+              throw "Windows Unicode clipboard test was not discovered: $test"
+            }
+          }
+          foreach ($test in $tests) {
+            cargo test --locked $test -- --exact --ignored --nocapture --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
       - name: Test config and session private storage
         shell: bash
         run: |

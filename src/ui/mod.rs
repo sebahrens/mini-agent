@@ -2,7 +2,7 @@ mod app;
 #[cfg(test)]
 pub(crate) use app::retire_scoped_task;
 #[cfg(test)]
-pub(crate) use app::{InterruptTarget, interrupt_target};
+pub(crate) use app::{ClipboardShortcut, InterruptTarget, clipboard_shortcut, interrupt_target};
 mod event_handler;
 pub(crate) mod events;
 pub(crate) mod feed;
