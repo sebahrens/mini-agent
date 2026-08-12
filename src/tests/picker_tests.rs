@@ -1,7 +1,87 @@
+use crate::ui::input::{InputEditor, Picker};
 use crate::ui::pickers::file::{FilePicker, walk_files, walk_files_streaming};
 use crate::ui::pickers::list::ListPicker;
 use crate::ui::pickers::models::ModelsPicker;
 use std::path::PathBuf;
+
+#[test]
+fn test_command_picker_paste_keeps_query_and_buffer_coherent() {
+    let mut input = InputEditor::new();
+    input.buffer = "/".into();
+    input.cursor = 1;
+    input.start_command_picker();
+
+    input.handle_paste("mod".to_string());
+
+    assert_eq!(input.buffer, "/mod");
+    assert_eq!(input.cursor, 4);
+    let Some(Picker::Command(picker)) = input.picker.as_ref() else {
+        panic!("command picker should remain active");
+    };
+    assert_eq!(picker.query, "mod");
+    assert!(picker.matches.contains(&"/model".to_string()));
+}
+
+#[test]
+fn test_prefixed_picker_paste_keeps_unicode_query_and_cursor_coherent() {
+    let mut input = InputEditor::new();
+    input.set_prompt_names(vec!["café".to_string()]);
+    input.buffer = "/prompt ".into();
+    input.cursor = input.buffer.len();
+    input.start_prompt_picker();
+
+    input.handle_paste("café".to_string());
+
+    assert_eq!(input.buffer, "/prompt café");
+    assert_eq!(input.cursor, input.buffer.len());
+    let Some(Picker::Prefixed(picker, "/prompt ")) = input.picker.as_ref() else {
+        panic!("prompt picker should remain active");
+    };
+    assert_eq!(picker.query, "café");
+    assert_eq!(picker.matches, vec!["café"]);
+}
+
+#[test]
+fn test_multiline_paste_closes_picker_and_inserts_without_submitting() {
+    let mut input = InputEditor::new();
+    input.buffer = "/".into();
+    input.cursor = 1;
+    input.start_command_picker();
+
+    input.handle_paste("mod\nnext".to_string());
+
+    assert_eq!(input.buffer, "/mod\nnext");
+    assert_eq!(input.cursor, input.buffer.len());
+    assert!(input.picker.is_none());
+}
+
+#[test]
+fn test_oversized_picker_paste_closes_picker_without_replaying_each_character() {
+    let mut input = InputEditor::new();
+    input.buffer = "/".into();
+    input.cursor = 1;
+    input.start_command_picker();
+    let pasted = "x".repeat(257);
+
+    input.handle_paste(pasted.clone());
+
+    assert_eq!(input.buffer, format!("/{pasted}"));
+    assert_eq!(input.cursor, input.buffer.len());
+    assert!(input.picker.is_none());
+}
+
+#[test]
+fn test_paste_without_picker_preserves_mid_buffer_behavior() {
+    let mut input = InputEditor::new();
+    input.load_text("ab");
+    input.set_cursor(1);
+
+    input.handle_paste("é\n".to_string());
+
+    assert_eq!(input.buffer, "aé\nb");
+    assert_eq!(input.cursor, "aé\n".len());
+    assert!(input.picker.is_none());
+}
 
 #[test]
 fn test_models_picker_starts_on_quick_group() {
