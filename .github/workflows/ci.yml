@@ -1418,6 +1418,18 @@ jobs:
           cargo test --locked ${{ matrix.feature.args }} portable_filename_policy
           cargo test --locked ${{ matrix.feature.args }} path_containment
 
+      - name: Test checked Windows workspace replacement
+        if: matrix.os == 'windows-latest' && matrix.feature.name == 'default'
+        shell: pwsh
+        run: |
+          $test = 'paths::windows_workspace_binding_tests::checked_replace_preserves_a_target_raced_after_the_last_identity_check'
+          $discovered = cargo test --locked -- --list 2>&1
+          if ($LASTEXITCODE -ne 0 -or -not ($discovered -match [regex]::Escape("${test}: test"))) {
+            throw "Checked Windows workspace replacement test was not discovered"
+          }
+          cargo test --locked $test -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test config and session private storage
         shell: bash
         run: |

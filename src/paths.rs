@@ -446,6 +446,11 @@ fn exchange_relative(
     _replacement: &OsStr,
     _target: &OsStr,
 ) -> io::Result<()> {
+    // Windows rename APIs can replace or refuse an existing name, but cannot
+    // condition replacement on that name still identifying `expected`.
+    // Oplocks coordinate breaks; they do not add that compare operand. Keep
+    // existing-file writes closed until Windows exposes an equivalent atomic
+    // name exchange or compare-and-replace operation.
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic compare-and-replace is unsupported on this platform",
@@ -529,10 +534,13 @@ fn open_file_no_follow(directory: &cap_std::fs::Dir, name: &OsStr) -> io::Result
     {
         use cap_std::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
         options
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            // The retained handle keeps the approved file identity alive;
+            // delete sharing lets the name race and be rejected by the final
+            // identity check instead of making our own publication impossible.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     #[cfg(not(any(unix, windows)))]
@@ -795,6 +803,69 @@ mod workspace_binding_tests {
             "referent"
         );
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_workspace_binding_tests {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::WorkspaceBinding;
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-windows-workspace-binding-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn checked_replace_preserves_a_target_raced_after_the_last_identity_check() {
+        let root = temp_root("atomic-cas");
+        let target = root.join("target.txt");
+        let displaced = root.join("expected-displaced.txt");
+        let raced = root.join("raced.txt");
+        std::fs::write(&target, "expected").unwrap();
+        std::fs::write(&raced, "newer writer").unwrap();
+        let raced_identity = crate::fs::checked_path_metadata(&raced).unwrap();
+        let binding = WorkspaceBinding::capture(&root).unwrap();
+        let expected_file = binding.open_relative(Path::new("target.txt")).unwrap();
+        let expected = crate::fs::checked_file_metadata(&expected_file).unwrap();
+        drop(expected_file);
+
+        let result = binding.replace_relative_atomic_with_hook(
+            Path::new("target.txt"),
+            b"agent replacement",
+            &expected,
+            || {
+                std::fs::rename(&target, &displaced).unwrap();
+                std::fs::rename(&raced, &target).unwrap();
+            },
+        );
+
+        assert!(result.is_err(), "a raced replacement must not publish");
+        let published_identity = crate::fs::checked_path_metadata(&target).unwrap();
+        crate::fs::ensure_same_file(&target, &raced_identity, &published_identity).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "newer writer");
+        assert_eq!(std::fs::read_to_string(&displaced).unwrap(), "expected");
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".target.txt.mini-agent-")
+        }));
+
+        drop(published_identity);
+        drop(raced_identity);
+        drop(expected);
+        drop(binding);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -952,6 +952,16 @@ configured permission policy. New plan files require an existing stable parent
 directory; publication uses the same no-follow atomic-write checks as ordinary
 file tools so a path replacement after authorization fails closed.
 
+Existing-file workspace-relative `edit` and `js/write_file` operations bound to
+the captured startup workspace additionally require an atomic compare-and-
+replace primitive: the published replacement must displace the same file
+identity that was approved. Linux and macOS provide an atomic name exchange for
+this check. Windows does not expose an equivalent expected-identity condition
+on its rename or replacement APIs, and opportunistic locks can be broken by a
+competing rename. These checked workspace replacements therefore fail closed
+on Windows without changing the target; create-only `write` and `js/write_file`
+operations remain available.
+
 Bash commands have a mandatory 30-second deadline. A tool call's optional
 `timeout` value is milliseconds and can only lower that deadline. Captured raw
 output is limited to 1 MiB of stdout, 1 MiB of stderr, and 1.5 MiB combined;
