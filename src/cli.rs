@@ -465,11 +465,15 @@ impl Cli {
 
     pub(crate) fn tool_is_eligible(&self, cfg: &config::Config, name: &str) -> bool {
         !self.resolve_no_tools(cfg)
-            && (self.tools.is_empty() || self.tools.iter().any(|allowed| allowed == name))
+            && (self.tools.is_empty()
+                || self
+                    .tools
+                    .iter()
+                    .any(|allowed| canonical_tool_name(allowed) == canonical_tool_name(name)))
     }
 
     pub(crate) fn general_sandbox_is_eligible(&self, cfg: &config::Config) -> bool {
-        self.tool_is_eligible(cfg, "bash")
+        self.tool_is_eligible(cfg, "shell")
             || cfg!(feature = "js") && self.tool_is_eligible(cfg, "js")
     }
 
@@ -483,6 +487,7 @@ impl Cli {
             "find_files",
             "list_dir",
             "todo_write",
+            "shell",
             "bash",
             #[cfg(feature = "js")]
             "js",
@@ -648,6 +653,10 @@ impl Cli {
                 .unwrap_or(256)
         }
     }
+}
+
+fn canonical_tool_name(name: &str) -> &str {
+    if name == "bash" { "shell" } else { name }
 }
 
 #[cfg(test)]

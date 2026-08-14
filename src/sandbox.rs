@@ -33,6 +33,9 @@ pub struct Sandbox {
     backend: String,
     shell: String,
     shell_command_arg: String,
+    /// Resolved executable retained across workspace probes so a failed bound
+    /// workspace cannot permanently poison later rebinds.
+    shell_candidate: Option<ShellCapability>,
     shell_capability: Option<ShellCapability>,
     shell_resolution_complete: bool,
     disabled_reason: DisabledSandboxReason,
@@ -166,7 +169,7 @@ impl ShellCapability {
 
     pub(crate) fn model_guidance(&self) -> String {
         format!(
-            "\n- **bash**: Run {} commands (timeout in ms). The compatibility tool name remains `bash`.",
+            "\n- **shell**: Run {} commands (timeout in ms). The legacy `bash` name is accepted only as a compatibility alias.",
             self.dialect.name()
         )
     }
@@ -910,6 +913,7 @@ impl Sandbox {
             backend: backend.to_string(),
             shell: "bash".to_string(),
             shell_command_arg: "-c".to_string(),
+            shell_candidate: None,
             shell_capability: None,
             shell_resolution_complete: false,
             disabled_reason: DisabledSandboxReason::UserTrustedBypass,
@@ -1101,9 +1105,81 @@ impl Sandbox {
             self.shell = capability.executable().to_string_lossy().into_owned();
             self.shell_command_arg = capability.command_arg().to_string();
         }
+        self.shell_candidate = capability.clone();
         self.shell_capability = capability;
         self.shell_resolution_complete = true;
         self
+    }
+
+    /// Publish a shell only after the exact workspace/process boundary has
+    /// accepted a bounded no-op. On Windows this uses the same AppContainer
+    /// helper and root-role policy as a real direct launch.
+    pub(crate) fn with_bound_resolved_shell(
+        mut self,
+        capability: Option<ShellCapability>,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> Self {
+        self.shell_candidate = capability.clone();
+        self.shell_resolution_complete = true;
+        self.shell_capability = capability.and_then(|candidate| {
+            match self.verify_shell_candidate(&candidate, workspace) {
+                Ok(()) => {
+                    self.shell = candidate.executable().to_string_lossy().into_owned();
+                    self.shell_command_arg = candidate.command_arg().to_string();
+                    Some(candidate)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        reason = %error,
+                        "bound shell capability is unavailable; model-visible shell disabled"
+                    );
+                    None
+                }
+            }
+        });
+        self
+    }
+
+    fn verify_shell_candidate(
+        &self,
+        capability: &ShellCapability,
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> Result<(), String> {
+        workspace.validate()?;
+        capability.validate()?;
+        match self.policy() {
+            SandboxPolicy::Disabled
+                if self.disabled_reason == DisabledSandboxReason::UserTrustedBypass =>
+            {
+                Ok(())
+            }
+            SandboxPolicy::Disabled => {
+                Err("configured sandbox boundary is unavailable".to_string())
+            }
+            SandboxPolicy::RequiredButUnavailable => {
+                Err("configured sandbox boundary is unavailable".to_string())
+            }
+            SandboxPolicy::RequiredAndAvailable => {
+                #[cfg(target_os = "windows")]
+                if self.backend == "appcontainer" {
+                    let paths = crate::paths::process_paths().map_err(|_| {
+                        "application paths are unavailable for bound shell validation".to_string()
+                    })?;
+                    std::fs::create_dir_all(&paths.cache_dir).map_err(|_| {
+                        "application cache is unavailable for bound shell validation".to_string()
+                    })?;
+                    windows::verify_direct_command(
+                        capability.executable(),
+                        &[capability.command_arg().to_string(), "exit 0".to_string()],
+                        workspace.root(),
+                        &paths.cache_dir,
+                        &self.windows_appcontainer_read_roots,
+                        &self.windows_appcontainer_write_roots,
+                    )?;
+                }
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn shell_capability(&self) -> Option<&ShellCapability> {
@@ -1151,9 +1227,9 @@ impl Sandbox {
         mut self,
         workspace: Arc<crate::paths::WorkspaceBinding>,
     ) -> Result<Self, String> {
-        if let Some(capability) = &self.shell_capability {
+        if let Some(capability) = &self.shell_candidate {
             let capability = capability.rebind_workspace(workspace.root())?;
-            self = self.with_resolved_shell(Some(capability));
+            self = self.with_bound_resolved_shell(Some(capability), &workspace);
         }
         Ok(self.with_workspace_binding(workspace))
     }
@@ -1175,6 +1251,7 @@ impl Sandbox {
             self.shell_command_arg = command_arg.to_string();
         }
         self.shell_capability = None;
+        self.shell_candidate = None;
         self.shell_resolution_complete = false;
         self
     }
@@ -1317,6 +1394,23 @@ impl Sandbox {
             )
         })?;
         let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+
+        #[cfg(target_os = "windows")]
+        if self.backend == "appcontainer" {
+            if deny_network {
+                return windows::build_direct_helper(
+                    program,
+                    args,
+                    &cwd,
+                    &cache_dir,
+                    &self.windows_appcontainer_read_roots,
+                    &self.windows_appcontainer_write_roots,
+                );
+            }
+            return Err(
+                "Windows workspace-service launch without network denial is unsupported".into(),
+            );
+        }
 
         if self.backend == "seatbelt" {
             let seatbelt = seatbelt_path().ok_or_else(|| {
@@ -1641,6 +1735,44 @@ impl Sandbox {
             .args(args);
         configure_child_lifetime(&mut cmd);
         Ok(cmd)
+    }
+
+    /// Validate that a direct executable can cross the exact bound workspace
+    /// service boundary. Windows executes a closed bounded probe because the
+    /// AppContainer helper can reject a root during setup; Unix construction
+    /// fully validates the selected sandbox profile without launching.
+    pub(crate) fn verify_workspace_service_capability(
+        &self,
+        program: &Path,
+        args: &[String],
+        workspace: &crate::paths::WorkspaceBinding,
+    ) -> Result<(), String> {
+        workspace.validate()?;
+        #[cfg(target_os = "windows")]
+        {
+            if self.policy() != SandboxPolicy::RequiredAndAvailable
+                || self.backend != "appcontainer"
+            {
+                return Err("Windows direct capability requires AppContainer".to_string());
+            }
+            let paths = crate::paths::process_paths()
+                .map_err(|_| "application paths are unavailable".to_string())?;
+            std::fs::create_dir_all(&paths.cache_dir)
+                .map_err(|_| "application cache is unavailable".to_string())?;
+            return windows::verify_direct_command(
+                program,
+                args,
+                workspace.root(),
+                &paths.cache_dir,
+                &self.windows_appcontainer_read_roots,
+                &self.windows_appcontainer_write_roots,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.wrap_workspace_service(program, args, workspace.root(), &[], true)
+                .map(|_| ())
+        }
     }
 
     #[cfg(target_os = "windows")]

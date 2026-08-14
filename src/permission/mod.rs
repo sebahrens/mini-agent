@@ -24,7 +24,22 @@ pub enum ToolPerm {
 pub struct PermissionConfig {
     #[serde(rename = "*")]
     pub default: Option<Action>,
+    #[serde(alias = "shell")]
     pub bash: Option<ToolPerm>,
+    #[serde(rename = "git/status")]
+    pub git_status: Option<ToolPerm>,
+    #[serde(rename = "git/diff")]
+    pub git_diff: Option<ToolPerm>,
+    #[serde(rename = "git/log")]
+    pub git_log: Option<ToolPerm>,
+    #[serde(rename = "git/show")]
+    pub git_show: Option<ToolPerm>,
+    #[serde(rename = "git/stage")]
+    pub git_stage: Option<ToolPerm>,
+    #[serde(rename = "git/unstage")]
+    pub git_unstage: Option<ToolPerm>,
+    #[serde(rename = "git/commit")]
+    pub git_commit: Option<ToolPerm>,
     #[serde(rename = "js/fetch", alias = "fetch")]
     pub js_fetch: Option<ToolPerm>,
     pub read: Option<ToolPerm>,
@@ -183,16 +198,16 @@ pub(crate) fn bind_configured_shell(
     search_path: Option<&std::ffi::OsStr>,
     sandbox: crate::sandbox::Sandbox,
 ) -> crate::sandbox::Sandbox {
-    if !authority.tools_enabled || !cli.tool_is_eligible(cfg, "bash") {
+    if !authority.tools_enabled || !cli.tool_is_eligible(cfg, "shell") {
         return sandbox.with_resolved_shell(None);
     }
     let configured = cli.resolve_shell(cfg);
     let capability =
         crate::sandbox::ShellCapability::resolve(&configured, workspace.root(), search_path);
     if capability.is_none() {
-        tracing::warn!(shell = %configured, "configured shell is unavailable or unsupported; bash tool disabled");
+        tracing::warn!(shell = %configured, "configured shell is unavailable or unsupported; shell tool disabled");
     }
-    sandbox.with_resolved_shell(capability)
+    sandbox.with_bound_resolved_shell(capability, workspace)
 }
 
 /// Build a permission policy and approval channel for interactive startup.

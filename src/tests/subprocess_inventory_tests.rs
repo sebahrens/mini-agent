@@ -874,13 +874,13 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/extras/git_worktree/mod.rs",
+        "src/git/runner.rs",
         "let mut command = Command::new(&self.program);",
         1,
         "TC-INTERNAL-GIT",
     ),
     (
-        "src/extras/git_worktree/mod.rs",
+        "src/git/runner.rs",
         "use tokio::process::Command;",
         1,
         "TC-INTERNAL-GIT",
@@ -1523,7 +1523,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/agent/tools/bash.rs",
-        "tracing::warn!(\"tool bash stopped before completion: {:?}\", output.status);",
+        "tracing::warn!(\"tool shell stopped before completion: {:?}\", output.status);",
         1,
         "NON-PROCESS",
     ),
@@ -1951,6 +1951,36 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/ui/slash/features.rs", "status,", 1, "NON-PROCESS"),
+    (
+        "src/git/runner.rs",
+        "&& (matches!(output.status, CommandStatus::OutputLimitExceeded(_))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "\"truncated\": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "\"text\": String::from_utf8_lossy(&output.stdout),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "\"stderr\": String::from_utf8_lossy(&output.stderr),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/git/tool.rs",
+        "\"exit_code\": output.exit_status.and_then(|status| status.code()),",
+        1,
+        "NON-PROCESS",
+    ),
 ];
 
 /// SHA-256 of the length-framed structural macro path and complete token tree.
@@ -2029,6 +2059,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "f67e03a1d8c8573ffae016bbaf134c13aa8d999566a8ed47610219e3e5507457",
+                1,
+            ),
+            (
+                "de107f2c0dc302621f93592167955ba5a4b893704e701a03dd8e3add083f7dc4",
                 1,
             ),
         ],
@@ -2497,6 +2531,30 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "7731da00f43136911c6dc28ad641ac88c4af40639bd4738168ad235d98d9effb",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/git/runner.rs",
+        &[(
+            "bb8b0f921bc2afe7c1a0fdd7d97dc264237bdbe93e6c7aff99554fb104933299",
+            1,
+        )],
+    ),
+    (
+        "src/git/tool.rs",
+        &[
+            (
+                "a8b477f08aa5c038c7d3892b7bda9395807cacfdcb17158cba72ecaecf0ae1a2",
+                1,
+            ),
+            (
+                "8977c81253878389e36cb016b24448143669f556688aa5aa9cd327c48c048604",
+                1,
+            ),
+            (
+                "b7d3a343dd8cc9b7c5fd729f36f1f77cff90127a7634b70d129a1e15b9a3063d",
                 1,
             ),
         ],
@@ -3123,7 +3181,7 @@ const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
 /// Files whose non-disposition launch expressions all have one owner.
 const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/docs.rs", "TC-SUPPORT-UTILITY"),
-    ("src/extras/git_worktree/mod.rs", "TC-INTERNAL-GIT"),
+    ("src/git/runner.rs", "TC-INTERNAL-GIT"),
     ("src/extras/hooks/subprocess.rs", "TC-PROJECT-AUTOMATION"),
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),

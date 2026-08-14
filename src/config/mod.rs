@@ -616,6 +616,14 @@ impl Config {
                 } else if matches!(
                     tool.as_str(),
                     "bash"
+                        | "shell"
+                        | "git/status"
+                        | "git/diff"
+                        | "git/log"
+                        | "git/show"
+                        | "git/stage"
+                        | "git/unstage"
+                        | "git/commit"
                         | "js/fetch"
                         | "fetch"
                         | "read"

@@ -6,51 +6,21 @@
 //! and caller-drop paths kill and reap the Unix child process group (or the
 //! direct child on platforms without implemented descendant-tree cleanup).
 
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
-use tokio::process::Command;
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 
-use crate::sandbox::{
-    CommandLimits, CommandOutput, CommandStatus, Sandbox, configure_child_lifetime,
+use crate::git::runner::{
+    GitRunner, LOCAL_MUTATION_LIMITS, NETWORK_LIMITS, QUERY_LIMITS, acquire_process_git_mutation,
+    command_failure,
 };
+use crate::sandbox::{CommandLimits, CommandOutput};
 
-const QUERY_LIMITS: CommandLimits = CommandLimits {
-    timeout: Duration::from_secs(10),
-    stdout_bytes: 256 * 1024,
-    stderr_bytes: 256 * 1024,
-    combined_bytes: 384 * 1024,
-};
-const LOCAL_MUTATION_LIMITS: CommandLimits = CommandLimits {
-    timeout: Duration::from_secs(60),
-    stdout_bytes: 512 * 1024,
-    stderr_bytes: 512 * 1024,
-    combined_bytes: 768 * 1024,
-};
-const NETWORK_LIMITS: CommandLimits = CommandLimits {
-    timeout: Duration::from_secs(120),
-    stdout_bytes: 512 * 1024,
-    stderr_bytes: 512 * 1024,
-    combined_bytes: 768 * 1024,
-};
-const REPOSITORY_REDIRECTING_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_PREFIX",
-];
-
-static REPOSITORY_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 static PROCESS_WORKSPACE_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 #[cfg(test)]
@@ -217,132 +187,6 @@ impl fmt::Debug for MergeState {
     }
 }
 
-#[derive(Clone)]
-struct GitRunner {
-    program: OsString,
-}
-
-impl Default for GitRunner {
-    fn default() -> Self {
-        Self {
-            program: OsString::from("git"),
-        }
-    }
-}
-
-impl GitRunner {
-    fn command<I, S>(&self, repo_path: &Path, args: I) -> Command
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let mut command = Command::new(&self.program);
-        command.arg("-C").arg(repo_path).args(args);
-        for name in REPOSITORY_REDIRECTING_ENV {
-            command.env_remove(name);
-        }
-        configure_child_lifetime(&mut command);
-        command
-    }
-
-    async fn run<I, S>(
-        &self,
-        repo_path: &Path,
-        operation: &'static str,
-        args: I,
-        limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let command = self.command(repo_path, args);
-
-        let output = Sandbox::new(false, "git")
-            .output_built_command_with_limits(command, limits)
-            .await
-            .map_err(|error| format!("git {operation} runner failed: {error}"))?;
-
-        command_result(operation, limits, output)
-    }
-
-    async fn run_with_input<I, S>(
-        &self,
-        repo_path: &Path,
-        operation: &'static str,
-        args: I,
-        input: Vec<u8>,
-        limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let command = self.command(repo_path, args);
-        let output = Sandbox::new(false, "git")
-            .output_built_command_with_input_and_limits(command, input, limits)
-            .await
-            .map_err(|error| format!("git {operation} runner failed: {error}"))?;
-
-        command_result(operation, limits, output)
-    }
-
-    async fn run_allow_exit<I, S>(
-        &self,
-        repo_path: &Path,
-        operation: &'static str,
-        args: I,
-        limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let command = self.command(repo_path, args);
-        let output = Sandbox::new(false, "git")
-            .output_built_command_with_limits(command, limits)
-            .await
-            .map_err(|error| format!("git {operation} runner failed: {error}"))?;
-        if output.status == CommandStatus::Completed && output.exit_status.is_some() {
-            Ok(output)
-        } else {
-            command_result(operation, limits, output)
-        }
-    }
-}
-
-fn command_result(
-    operation: &str,
-    limits: CommandLimits,
-    output: CommandOutput,
-) -> Result<CommandOutput, String> {
-    match output.status {
-        CommandStatus::Completed if output.exit_status.is_some_and(|status| status.success()) => {
-            Ok(output)
-        }
-        CommandStatus::Completed => Err(command_failure(operation, &output)),
-        CommandStatus::TimedOut => Err(format!(
-            "git {operation} timed out after {}ms",
-            limits.timeout.as_millis()
-        )),
-        CommandStatus::Cancelled => Err(format!("git {operation} was cancelled")),
-        CommandStatus::OutputLimitExceeded(limit) => Err(format!(
-            "git {operation} exceeded bounded output limit ({limit:?})"
-        )),
-        CommandStatus::Failed => Err(command_failure(operation, &output)),
-    }
-}
-
-fn command_failure(operation: &str, output: &CommandOutput) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        format!("git {operation} failed")
-    } else {
-        format!("git {operation} failed: {stderr}")
-    }
-}
-
 fn canonical_path(path: &Path, label: &str) -> Result<PathBuf, String> {
     path.canonicalize()
         .map_err(|error| format!("failed to resolve {label} {}: {error}", path.display()))
@@ -371,18 +215,6 @@ async fn lock_process_workspace() -> OwnedMutexGuard<()> {
         .await
 }
 
-fn repository_lock(repo_path: &Path) -> Arc<Mutex<()>> {
-    let locks = REPOSITORY_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(repo_path).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(repo_path.to_path_buf(), Arc::downgrade(&lock));
-    lock
-}
-
 async fn acquire_repository(repo_path: &Path) -> Result<OwnedMutexGuard<()>, String> {
     let output = run_query(
         repo_path,
@@ -391,8 +223,8 @@ async fn acquire_repository(repo_path: &Path) -> Result<OwnedMutexGuard<()>, Str
     )
     .await
     .map_err(|error| format!("cannot establish repository identity: {error}"))?;
-    let key = canonical_path(&output_path(&output.stdout), "common Git directory")?;
-    Ok(repository_lock(&key).lock_owned().await)
+    let _key = canonical_path(&output_path(&output.stdout), "common Git directory")?;
+    Ok(acquire_process_git_mutation().await)
 }
 
 fn trim_line(bytes: &[u8]) -> &[u8] {

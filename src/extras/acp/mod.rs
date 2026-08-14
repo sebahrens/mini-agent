@@ -89,7 +89,9 @@ impl SessionHistory {
 
 fn acp_capabilities() -> AgentCapabilities {
     // Session history is intentionally process-local; session/load is unsupported.
-    AgentCapabilities::new()
+    AgentCapabilities::new().session_capabilities(
+        SessionCapabilities::new().close(Some(SessionCloseCapabilities::new())),
+    )
 }
 
 struct SessionState {
@@ -581,6 +583,16 @@ async fn connect_agent(
         .on_receive_request(
             {
                 let state = state.clone();
+                move |req: CloseSessionRequest, responder, _cx| {
+                    let state = state.clone();
+                    async move { handle_close_session(req, responder, &state).await }
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
                 move |req: PromptRequest, responder, cx| {
                     let state = state.clone();
                     async move { handle_prompt(req, responder, cx, state).await }
@@ -725,6 +737,31 @@ async fn handle_new_session(
 
     let resp = NewSessionResponse::new(session_id);
     responder.respond(resp)
+}
+
+async fn handle_close_session(
+    req: CloseSessionRequest,
+    responder: Responder<CloseSessionResponse>,
+    state: &AcpState,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = &req.session_id;
+    tracing::info!("ACP close session: {}", session_id);
+
+    // Cancel any active turn first, then remove the session.
+    // Unknown or already-closed sessions are silently accepted (idempotent).
+    {
+        let turns = lock_unpoisoned(&state.cancel_routes).remove(session_id);
+        if let Some(turns) = turns {
+            let turns = lock_unpoisoned(&turns);
+            if let Some(front) = turns.queue.front() {
+                front.control.cancel();
+            }
+        }
+    }
+
+    state.sessions.lock().await.remove(session_id);
+
+    responder.respond(CloseSessionResponse::new())
 }
 
 fn canonical_session_workspace(
@@ -887,6 +924,96 @@ async fn handle_prompt(
     })
 }
 
+// --- Permission Bridge ---
+
+async fn drive_permission_bridge(
+    cx: ConnectionTo<Client>,
+    session_id: SessionId,
+    mut ask_rx: crate::permission::ask::AskReceiver,
+    control: Arc<TurnControl>,
+) {
+    use crate::permission::ask::UserDecision;
+
+    const OPT_ALLOW_ONCE: &str = "allow_once";
+    const OPT_ALLOW_ALWAYS: &str = "allow_always";
+    const OPT_DENY: &str = "deny";
+
+    loop {
+        let ask = tokio::select! {
+            biased;
+            _ = control.cancelled() => break,
+            ask = ask_rx.recv() => match ask {
+                Some(ask) => ask,
+                None => return,
+            },
+        };
+
+        let suggested = ask
+            .suggested_pattern
+            .as_deref()
+            .unwrap_or(&ask.input)
+            .to_string();
+        let tool_call_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
+        let tool_call = ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new()
+                .title(ask.tool.to_string())
+                .content(vec![ToolCallContent::from(ContentBlock::Text(
+                    TextContent::new(ask.input.clone()),
+                ))]),
+        );
+        let options = vec![
+            PermissionOption::new(
+                OPT_ALLOW_ONCE,
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                OPT_ALLOW_ALWAYS,
+                "Allow always",
+                PermissionOptionKind::AllowAlways,
+            ),
+            PermissionOption::new(OPT_DENY, "Deny", PermissionOptionKind::RejectOnce),
+        ];
+        let req = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
+
+        let response = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                let _ = ask.reply.send(UserDecision::Deny);
+                break;
+            }
+            res = cx.send_request(req).block_task() => res,
+        };
+
+        let decision = match response {
+            Ok(resp) => match resp.outcome {
+                RequestPermissionOutcome::Cancelled => UserDecision::Deny,
+                RequestPermissionOutcome::Selected(sel) => {
+                    let id = sel.option_id.0.as_ref();
+                    if id == OPT_ALLOW_ALWAYS {
+                        UserDecision::AllowAlways(suggested)
+                    } else if id == OPT_ALLOW_ONCE {
+                        UserDecision::AllowOnce
+                    } else {
+                        UserDecision::Deny
+                    }
+                }
+                _ => UserDecision::Deny,
+            },
+            Err(e) => {
+                tracing::warn!("ACP permission request failed: {e}");
+                UserDecision::Deny
+            }
+        };
+        let _ = ask.reply.send(decision);
+    }
+    // Drain remaining buffered asks as Deny after control cancelled.
+    while let Ok(ask) = ask_rx.try_recv() {
+        let _ = ask.reply.send(UserDecision::Deny);
+    }
+}
+
 // --- Prompt Execution ---
 
 fn respond_terminal(
@@ -999,12 +1126,20 @@ async fn run_prompt(
             }
         }
         .0;
-    let (permission, ask_tx) = crate::permission::build_noninteractive_permission_at(
+    let (permission, ask_tx, ask_rx) = crate::permission::build_interactive_permission_at(
         &state.cfg,
         authority,
         Some(workspace_root.to_path_buf()),
     )
     .map_err(|error| agent_client_protocol::Error::new(-32602, error.to_string()))?;
+    if let Some(rx) = ask_rx {
+        tokio::spawn(drive_permission_bridge(
+            cx.clone(),
+            session_id.clone(),
+            rx,
+            control.clone(),
+        ));
+    }
     let provider_str = state.cli.resolve_provider(&state.cfg);
     let mut model_str = state.cli.resolve_model(&state.cfg);
 
@@ -1561,6 +1696,14 @@ mod history_tests {
     #[test]
     fn initialize_truthfully_does_not_advertise_load_session() {
         assert!(!acp_capabilities().load_session);
+    }
+
+    #[test]
+    fn initialize_advertises_close_session() {
+        assert!(
+            acp_capabilities().session_capabilities.close.is_some(),
+            "session/close must be advertised so clients can release capacity"
+        );
     }
 }
 
@@ -3081,6 +3224,135 @@ mod protocol_tests {
             state_for_assertion.sessions.lock().await.len(),
             MAX_ACP_SESSIONS
         );
+    }
+
+    #[tokio::test]
+    async fn close_session_removes_it_and_is_idempotent() {
+        let fixture: PromptFixture = Arc::new(|p, _| {
+            Box::pin(async move { Ok(vec![done(&p, vec![Message::assistant(p.clone())])]) })
+        });
+        let state = fixture_state(fixture);
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state.clone()), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                assert!(
+                    state.sessions.lock().await.contains_key(&session),
+                    "session must exist before close"
+                );
+
+                cx.send_request(CloseSessionRequest::new(session.clone()))
+                    .block_task()
+                    .await?;
+                assert!(
+                    !state.sessions.lock().await.contains_key(&session),
+                    "session must be removed after close"
+                );
+
+                // Second close must also succeed (idempotent).
+                cx.send_request(CloseSessionRequest::new(session.clone()))
+                    .block_task()
+                    .await?;
+
+                // After close, prompt must fail.
+                assert!(
+                    cx.send_request(prompt(session, "after-close"))
+                        .block_task()
+                        .await
+                        .is_err(),
+                    "prompt on closed session must return error"
+                );
+
+                // New session in same workspace still works.
+                let fresh = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let resp = cx
+                    .send_request(prompt(fresh.clone(), "hello"))
+                    .block_task()
+                    .await?;
+                assert_eq!(resp.stop_reason, StopReason::EndTurn);
+                cx.send_request(CloseSessionRequest::new(fresh))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_session_cancels_active_turn() {
+        let turn_started = Arc::new(tokio::sync::Notify::new());
+        let fixture: PromptFixture = {
+            let turn_started = turn_started.clone();
+            Arc::new(move |_p, _| {
+                let turn_started = turn_started.clone();
+                Box::pin(async move {
+                    turn_started.notify_one();
+                    std::future::pending::<Result<Vec<AgentEvent>, String>>().await
+                })
+            })
+        };
+        let state = fixture_state(fixture);
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                let cx2 = cx.clone();
+                let sid = session.clone();
+                let blocked = tokio::spawn(async move {
+                    cx2.send_request(prompt(sid, "blocked")).block_task().await
+                });
+                tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+                    .await
+                    .expect("turn should start");
+
+                cx.send_request(CloseSessionRequest::new(session))
+                    .block_task()
+                    .await?;
+
+                let resp = tokio::time::timeout(Duration::from_secs(1), blocked)
+                    .await
+                    .expect("cancelled turn must complete")
+                    .unwrap()?;
+                assert_eq!(resp.stop_reason, StopReason::Cancelled);
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 }
 

@@ -110,7 +110,7 @@ impl ReadTracker {
     }
 }
 
-pub use bash::BashTool;
+pub use bash::{BashTool, ShellTool};
 pub use edit::EditTool;
 pub use find_files::FindFilesTool;
 pub use grep::GrepTool;

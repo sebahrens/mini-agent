@@ -134,7 +134,14 @@ impl PermissionChecker {
     ) -> anyhow::Result<HashMap<String, Vec<(Pattern, Action)>>> {
         let mut rules: HashMap<String, Vec<(Pattern, Action)>> = HashMap::new();
         for (tool_name, tool_perm) in [
-            ("bash", &config.bash),
+            ("shell", &config.bash),
+            ("git/status", &config.git_status),
+            ("git/diff", &config.git_diff),
+            ("git/log", &config.git_log),
+            ("git/show", &config.git_show),
+            ("git/stage", &config.git_stage),
+            ("git/unstage", &config.git_unstage),
+            ("git/commit", &config.git_commit),
             ("js/fetch", &config.js_fetch),
             ("read", &config.read),
             ("write", &config.write),
@@ -235,19 +242,27 @@ impl PermissionChecker {
         merge_entries(&mut rules, &configs.glob.ask_entries, Action::Ask);
         merge_entries(&mut rules, &configs.glob.deny_entries, Action::Deny);
 
-        if !rules.contains_key("bash") {
+        if !rules.contains_key("shell") {
             let mut defaults = Vec::new();
             for (pat, action) in crate::permission::default_bash_rules() {
                 defaults.push((Pattern::new(pat), action));
             }
+            rules.insert("shell".to_string(), defaults.clone());
             rules.insert("bash".to_string(), defaults);
         }
 
         for (tool, regex) in crate::permission::default_deny_regex_rules() {
-            rules.entry(tool.to_string()).or_default().push((
-                Pattern::new_regex(regex).expect("trusted built-in deny regex must compile"),
-                Action::Deny,
-            ));
+            let compiled =
+                Pattern::new_regex(regex).expect("trusted built-in deny regex must compile");
+            let canonical = canonical_permission_tool(tool);
+            for key in
+                std::iter::once(canonical).chain(permission_tool_aliases(canonical).iter().copied())
+            {
+                rules
+                    .entry(key.to_string())
+                    .or_default()
+                    .push((compiled.clone(), Action::Deny));
+            }
         }
 
         let mut ext_dir_rules: Vec<(Pattern, Action)> = configs
@@ -325,7 +340,7 @@ impl PermissionChecker {
     /// hook `ask` verdict; never overrides a deny rule (checked first).
     #[cfg(feature = "hooks")]
     pub fn force_ask_once(&mut self, tool: String) {
-        self.pending_forced_ask = Some(tool);
+        self.pending_forced_ask = Some(canonical_permission_tool(&tool).to_string());
     }
 
     /// Suppresses the interactive prompt for the next `check`/`check_path`
@@ -333,7 +348,7 @@ impl PermissionChecker {
     /// verdict; never overrides a deny rule (checked first).
     #[cfg(feature = "hooks")]
     pub fn allow_once(&mut self, tool: String) {
-        self.pending_one_shot_allow = Some(tool);
+        self.pending_one_shot_allow = Some(canonical_permission_tool(&tool).to_string());
     }
 
     fn apply_rules(&self) -> bool {
@@ -350,6 +365,10 @@ impl PermissionChecker {
                 | "find_files"
                 | "list_dir"
                 | "task"
+                | "git/status"
+                | "git/diff"
+                | "git/log"
+                | "git/show"
         )
     }
 
@@ -372,7 +391,7 @@ impl PermissionChecker {
                 }
             }),
             SecurityMode::Standard => base.unwrap_or({
-                if matches!(tool, "bash" | "js/fetch") {
+                if matches!(tool, "shell" | "bash" | "js/fetch") {
                     // Bash scripts and network destinations are opaque,
                     // security-sensitive permission keys. An unmatched call
                     // must never inherit a permissive default.
@@ -529,6 +548,7 @@ impl PermissionChecker {
         identity: &str,
         mcp_read_only_exempt: bool,
     ) -> CheckResult {
+        let tool = canonical_permission_tool(tool);
         tracing::debug!(
             "perm check: tool={}, input_len={}",
             tool,
@@ -564,7 +584,7 @@ impl PermissionChecker {
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
-                let matches = if tool == "bash" && *action == Action::Allow {
+                let matches = if tool == "shell" && *action == Action::Allow {
                     // Model B: allow only the exact, complete script. Ask and
                     // deny rules remain pattern-based so broad safeguards keep
                     // working, but globs/regexes cannot widen Bash execution.
@@ -583,6 +603,7 @@ impl PermissionChecker {
     }
 
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {
+        let tool = canonical_permission_tool(tool);
         tracing::debug!("perm check path: tool={}, path={}", tool, path);
         if tool == "todo_write" {
             return CheckResult::Allowed;
@@ -789,7 +810,7 @@ impl PermissionChecker {
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
         for (allowed_tool, pattern) in &self.session_allowlist {
-            let matches = if tool == "bash" {
+            let matches = if tool == "shell" {
                 pattern.original == input
             } else if is_path_tool_name(tool) {
                 pattern.matches_path(input)
@@ -804,6 +825,7 @@ impl PermissionChecker {
     }
 
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
+        let tool = canonical_permission_tool(&tool).to_string();
         let generated_path_scope = self
             .is_path_tool(&tool)
             .then(|| Pattern::new_generated_path_scope(pattern_str))
@@ -827,19 +849,20 @@ impl PermissionChecker {
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
         for (tool, pat) in entries {
+            let tool = canonical_permission_tool(tool).to_string();
             let generated_path_scope = self
-                .is_path_tool(tool)
+                .is_path_tool(&tool)
                 .then(|| Pattern::new_generated_path_scope(pat))
                 .flatten();
             let pattern = if let Some(pattern) = generated_path_scope {
                 pattern
-            } else if self.is_path_tool(tool) {
+            } else if self.is_path_tool(&tool) {
                 Pattern::new_path(pat)
             } else {
                 Pattern::new(pat)
             };
             self.session_allowlist.push((tool.clone(), pattern));
-            if self.is_path_tool(tool) && Pattern::new_generated_path_scope(pat).is_none() {
+            if self.is_path_tool(&tool) && Pattern::new_generated_path_scope(pat).is_none() {
                 let expanded = crate::fs::expand_tilde(pat);
                 let abs = resolve_absolute(&expanded, &self.working_dir);
                 if abs != expanded {
@@ -943,7 +966,7 @@ impl PermissionChecker {
     /// retry forever invisibly to doom detection.
     #[cfg(feature = "hooks")]
     pub fn record_blocked(&mut self, tool: &str, input: &str) {
-        self.track_doom_loop(tool, input);
+        self.track_doom_loop(canonical_permission_tool(tool), input);
     }
 
     fn track_doom_loop(&mut self, tool: &str, input: &str) {
@@ -985,10 +1008,16 @@ fn is_path_tool_name(tool: &str) -> bool {
 
 fn permission_tool_aliases(tool: &str) -> &'static [&'static str] {
     match tool {
+        "shell" => &["bash"],
+        "bash" => &["shell"],
         "read" => &["js/read_file", "lsp_diagnostics"],
         "write" => &["js/write_file"],
         _ => &[],
     }
+}
+
+fn canonical_permission_tool(tool: &str) -> &str {
+    if tool == "bash" { "shell" } else { tool }
 }
 
 fn resolve_absolute(path: &str, working_dir: &str) -> String {

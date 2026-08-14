@@ -26,7 +26,7 @@ fn registered_shell_capability<'a>(
     cfg: &Config,
     sandbox: &'a Sandbox,
 ) -> Option<&'a crate::sandbox::ShellCapability> {
-    if !cli.tool_is_eligible(cfg, "bash") {
+    if !cli.tool_is_eligible(cfg, "shell") {
         return None;
     }
     sandbox.shell_capability()
@@ -42,7 +42,9 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "find_files"
             | "list_dir"
             | "todo_write"
+            | "shell"
             | "bash"
+            | "git"
             | "js"
             | "task"
             | "memory_write"
@@ -52,6 +54,10 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "advisor"
             | "lsp_diagnostics"
     )
+}
+
+fn canonical_tool_name(name: &str) -> &str {
+    if name == "bash" { "shell" } else { name }
 }
 
 /// Assemble the tool-independent system-prompt context: the base
@@ -239,7 +245,7 @@ fn build_registered_preamble(
             preamble.push_str(crate::agent::prompt::LSP_MUTATION_PROMPT);
         }
     }
-    if has("bash")
+    if has("shell")
         && let Some(capability) = sandbox.shell_capability()
     {
         preamble.push_str(&capability.model_guidance());
@@ -260,8 +266,9 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         "list_dir",
         "todo_write",
     ];
+    names.push("git");
     if registered_shell_capability(cli, cfg, sandbox).is_some() {
-        names.push("bash");
+        names.push("shell");
     }
     #[cfg(feature = "js")]
     if cli.tool_is_eligible(cfg, "js") {
@@ -317,15 +324,18 @@ pub(crate) fn filter_tools_by_allowlist(
     if allowlist.is_empty() {
         return tools;
     }
-    let allowed: HashSet<&str> = allowlist.iter().map(|s| s.as_str()).collect();
+    let allowed: HashSet<&str> = allowlist.iter().map(|s| canonical_tool_name(s)).collect();
     for name in &allowed {
-        if !tools.iter().any(|t| t.name() == *name) {
+        if !tools
+            .iter()
+            .any(|t| canonical_tool_name(t.name().as_ref()) == *name)
+        {
             tracing::warn!("--tools: unknown tool '{name}' (ignored)");
         }
     }
     tools
         .into_iter()
-        .filter(|t| allowed.contains(t.name().as_str()))
+        .filter(|t| allowed.contains(canonical_tool_name(t.name().as_ref())))
         .collect()
 }
 
@@ -495,7 +505,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         base_tools.push(Box::new(write_tool));
         base_tools.push(Box::new(edit_tool));
         if shell_tool_enabled {
-            base_tools.push(Box::new(tools::BashTool::new(
+            base_tools.push(Box::new(tools::ShellTool::new(
                 permission.clone(),
                 ask_tx.clone(),
                 sandbox.clone(),
@@ -518,6 +528,29 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             permission.clone(),
             ask_tx.clone(),
         )));
+        if cli.tool_is_eligible(cfg, "git") {
+            match crate::git::tool::GitTool::capture(
+                workspace.clone(),
+                sandbox.clone(),
+                permission.clone(),
+                ask_tx.clone(),
+            ) {
+                Ok(tool) => base_tools.push(Box::new(tool)),
+                Err(error) => tracing::debug!(%error, "structured Git tool unavailable"),
+            }
+        }
+
+        // Structured Git is intentionally available only when the Git feature
+        // is compiled in; it has no shell/raw-argv escape hatch.
+        #[cfg(feature = "git-worktree")]
+        if let Ok(git) = crate::git::tool::GitTool::capture(
+            workspace.clone(),
+            sandbox.clone(),
+            permission.clone(),
+            ask_tx.clone(),
+        ) {
+            base_tools.push(Box::new(git));
+        }
 
         #[cfg_attr(
             not(any(
@@ -750,13 +783,16 @@ mod js_tests {
             false,
             workspace.root(),
             &sandbox,
-            &["bash"],
+            &["shell"],
         );
         assert!(preamble.contains("Run POSIX shell commands"));
         let agent = test_main_agent(&cli, sandbox.clone(), workspace.clone()).await;
         let definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
-        let bash = definitions.iter().find(|tool| tool.name == "bash").unwrap();
-        assert!(bash.description.contains("POSIX shell"));
+        let shell = definitions
+            .iter()
+            .find(|tool| tool.name == "shell")
+            .unwrap();
+        assert!(shell.description.contains("POSIX shell"));
 
         let missing = Sandbox::new(false, "bwrap").with_resolved_shell(None);
         assert!(registered_shell_capability(&cli, &cfg, &missing).is_none());
@@ -777,7 +813,7 @@ mod js_tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|tool| tool.name == "bash")
+                .any(|tool| tool.name == "shell")
         );
 
         let no_tools = crate::cli::Cli {

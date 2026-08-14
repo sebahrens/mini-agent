@@ -1245,6 +1245,41 @@ pub(crate) fn build_direct_helper(
     )
 }
 
+/// Prove that the exact executable and bound workspace can cross the same
+/// production AppContainer helper boundary used by a real direct launch.
+/// Diagnostics are intentionally closed: command output and workspace data
+/// are never surfaced from this capability probe.
+pub(crate) fn verify_direct_command(
+    program: &Path,
+    arguments: &[String],
+    cwd: &Path,
+    cache: &Path,
+    configured_read_roots: &[PathBuf],
+    configured_write_roots: &[PathBuf],
+) -> Result<(), String> {
+    let mut command = build_direct_helper(
+        program,
+        arguments,
+        cwd,
+        cache,
+        configured_read_roots,
+        configured_write_roots,
+    )?;
+    command
+        .as_std_mut()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let started = Instant::now();
+    let run_deadline = started + Duration::from_secs(3);
+    let cleanup_deadline = run_deadline + Duration::from_secs(3);
+    let status = run_bounded_preflight_helper(&mut command, run_deadline, cleanup_deadline)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("bound Windows AppContainer launch probe was rejected".to_string())
+    }
+}
+
 fn build_helper(
     program: PathBuf,
     arguments: Vec<String>,

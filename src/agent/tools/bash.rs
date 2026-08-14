@@ -7,7 +7,7 @@ use crate::sandbox::{
     Sandbox,
 };
 
-pub struct BashTool {
+pub struct ShellTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub sandbox: Sandbox,
@@ -16,14 +16,14 @@ pub struct BashTool {
     pub max_output_lines: Option<u64>,
 }
 
-impl BashTool {
+impl ShellTool {
     pub fn new(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
         sandbox: Sandbox,
         max_output_lines: Option<u64>,
     ) -> Self {
-        BashTool {
+        ShellTool {
             permission,
             ask_tx,
             sandbox,
@@ -32,8 +32,8 @@ impl BashTool {
     }
 }
 
-impl Tool for BashTool {
-    const NAME: &'static str = "bash";
+impl Tool for ShellTool {
+    const NAME: &'static str = "shell";
 
     type Error = ToolError;
     type Args = BashArgs;
@@ -73,14 +73,14 @@ impl Tool for BashTool {
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
         tracing::debug!(
-            "tool bash start: cmd_len={}, timeout={:?}",
+            "tool shell start: cmd_len={}, timeout={:?}",
             args.command.len(),
             args.timeout,
         );
         // The complete script is the permission key and is passed unchanged to
         // the shell. Never split or tokenize it: Bash can execute nested
         // programs from syntax that ad-hoc command splitting cannot classify.
-        let coaching = check_perm(&self.permission, &self.ask_tx, "bash", &args.command).await?;
+        let coaching = check_perm(&self.permission, &self.ask_tx, "shell", &args.command).await?;
 
         let mut limits = DEFAULT_COMMAND_LIMITS;
         if let Some(timeout_ms) = args.timeout {
@@ -94,7 +94,7 @@ impl Tool for BashTool {
             .await?;
 
         if output.status != CommandStatus::Completed {
-            tracing::warn!("tool bash stopped before completion: {:?}", output.status);
+            tracing::warn!("tool shell stopped before completion: {:?}", output.status);
             return Err(resource_limit_error(output, limits));
         }
 
@@ -104,7 +104,7 @@ impl Tool for BashTool {
             .unwrap_or(-1);
 
         if exit_code != 0 {
-            tracing::warn!("tool bash: non-zero exit code={}", exit_code);
+            tracing::warn!("tool shell: non-zero exit code={}", exit_code);
         }
 
         let output_len = output.stdout.len() + output.stderr.len();
@@ -135,13 +135,17 @@ impl Tool for BashTool {
             None => result,
         };
         tracing::debug!(
-            "tool bash done: exit_code={}, output_len={}",
+            "tool shell done: exit_code={}, output_len={}",
             exit_code,
             output_len,
         );
         Ok(result)
     }
 }
+
+/// Source-compatibility alias for integrations that still construct the old
+/// Rust type. The model-visible tool name is always `shell`.
+pub type BashTool = ShellTool;
 
 fn render_streams(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = String::from_utf8_lossy(stdout);
