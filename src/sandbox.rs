@@ -1197,6 +1197,7 @@ impl Sandbox {
     }
 
     /// Set the workspace used as the child CWD and sandbox write root.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn with_working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(working_dir.into());
         self
@@ -1261,6 +1262,7 @@ impl Sandbox {
     }
 
     #[cfg(feature = "js")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn wrap_command_with_executable_snapshot(
         &self,
         arguments: &[String],
@@ -1875,6 +1877,7 @@ impl Sandbox {
     }
 
     #[cfg(feature = "js")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn build_bwrap_snapshot_command(
         &self,
         bwrap: &Path,

@@ -93,11 +93,10 @@ pub(crate) async fn run_headless_loop(
                 &iteration_prompt,
                 cli.pure_stdout,
                 &cfg.retry,
-                // TODO(loop-history): the loop threads context only through the
-                // plan/summary state folded into `iteration_prompt`, so every
-                // iteration sends empty history. Making `--loop --continue`
-                // meaningful needs the loop to carry a real `Session`, a
-                // separate change.
+                // The loop threads context through the plan/summary state
+                // folded into `iteration_prompt`; every iteration sends empty
+                // history. Making `--loop --continue` meaningful requires the
+                // loop to carry a real `Session` — tracked separately.
                 Vec::new(),
                 #[cfg(feature = "hooks")]
                 Some(crate::extras::hooks::LoopInfo {

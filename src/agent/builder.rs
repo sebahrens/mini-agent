@@ -528,6 +528,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             permission.clone(),
             ask_tx.clone(),
         )));
+        // Structured Git is intentionally available only when the git-worktree
+        // feature is compiled in; it has no shell/raw-argv escape hatch.
+        #[cfg(feature = "git-worktree")]
         if cli.tool_is_eligible(cfg, "git") {
             match crate::git::tool::GitTool::capture(
                 workspace.clone(),
@@ -538,18 +541,6 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 Ok(tool) => base_tools.push(Box::new(tool)),
                 Err(error) => tracing::debug!(%error, "structured Git tool unavailable"),
             }
-        }
-
-        // Structured Git is intentionally available only when the Git feature
-        // is compiled in; it has no shell/raw-argv escape hatch.
-        #[cfg(feature = "git-worktree")]
-        if let Ok(git) = crate::git::tool::GitTool::capture(
-            workspace.clone(),
-            sandbox.clone(),
-            permission.clone(),
-            ask_tx.clone(),
-        ) {
-            base_tools.push(Box::new(git));
         }
 
         #[cfg_attr(
