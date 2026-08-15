@@ -45,12 +45,13 @@ pub struct Sandbox {
     windows_appcontainer_write_roots: Vec<PathBuf>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
-    /// Cached environment variables (19 standard vars) computed once per instance
-    cached_essential_env: Arc<Mutex<Option<Vec<(&'static str, String)>>>>,
-    /// Cached canonicalized cache directory computed on first use
-    cached_cache_dir: Arc<Mutex<Option<PathBuf>>>,
-    /// Cached seatbelt profile strings keyed by (workspace_path_display, cache_path_display)
-    cached_seatbelt_profiles: Arc<Mutex<std::collections::HashMap<(String, String), String>>>,
+    /// Lazily captured environment snapshot shared by all clones.
+    cached_essential_env: Arc<OnceLock<Arc<[(&'static str, String)]>>>,
+    /// Canonicalized cache directory computed once per instance.
+    cached_cache_dir: Arc<Mutex<Option<Arc<PathBuf>>>>,
+    /// Cached seatbelt profiles keyed by escaped workspace/cache and network policy.
+    cached_seatbelt_profiles:
+        Arc<Mutex<std::collections::HashMap<(String, String, bool), Arc<str>>>>,
     #[cfg(test)]
     complete_process_tree_for_test: bool,
     #[cfg(test)]
@@ -929,7 +930,7 @@ impl Sandbox {
             windows_appcontainer_write_roots: Vec::new(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
-            cached_essential_env: Arc::new(Mutex::new(None)),
+            cached_essential_env: Arc::new(OnceLock::new()),
             cached_cache_dir: Arc::new(Mutex::new(None)),
             cached_seatbelt_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
@@ -1171,17 +1172,14 @@ impl Sandbox {
             SandboxPolicy::RequiredAndAvailable => {
                 #[cfg(target_os = "windows")]
                 if self.backend == "appcontainer" {
-                    let paths = crate::paths::process_paths().map_err(|_| {
-                        "application paths are unavailable for bound shell validation".to_string()
-                    })?;
-                    std::fs::create_dir_all(&paths.cache_dir).map_err(|_| {
+                    let cache_dir = self.get_cached_cache_dir().map_err(|_| {
                         "application cache is unavailable for bound shell validation".to_string()
                     })?;
                     windows::verify_direct_command(
                         capability.executable(),
                         &[capability.command_arg().to_string(), "exit 0".to_string()],
                         workspace.root(),
-                        &paths.cache_dir,
+                        &cache_dir,
                         &self.windows_appcontainer_read_roots,
                         &self.windows_appcontainer_write_roots,
                     )?;
@@ -1266,32 +1264,20 @@ impl Sandbox {
         self
     }
 
-    /// Get the cached essential environment variables. Computed once per Sandbox
-    /// instance from the current process environment at first use.
-    fn get_essential_env(&self) -> Vec<(&'static str, String)> {
-        let mut cache = self
-            .cached_essential_env
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(env) = cache.as_ref() {
-            return env.clone();
-        }
-        let env = essential_env();
-        *cache = Some(env.clone());
-        env
+    fn get_essential_env(&self) -> &[(&'static str, String)] {
+        self.cached_essential_env
+            .get_or_init(|| Arc::from(essential_env()))
+            .as_ref()
     }
 
-    /// Get the cached canonicalized cache directory. Computed once per Sandbox
-    /// instance on first use by reading process paths and canonicalizing.
-    fn get_cached_cache_dir(&self) -> Result<PathBuf, String> {
-        let mut cache = self
+    fn get_cached_cache_dir(&self) -> Result<Arc<PathBuf>, String> {
+        let mut cached = self
             .cached_cache_dir
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(dir) = cache.as_ref() {
-            return Ok(dir.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cache_dir) = cached.as_ref() {
+            return Ok(cache_dir.clone());
         }
-
         let paths = crate::paths::process_paths()
             .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
         std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
@@ -1300,19 +1286,24 @@ impl Sandbox {
                 paths.cache_dir.display()
             )
         })?;
-        let canonical = canonical_non_root(&paths.cache_dir, "application cache")?;
-        *cache = Some(canonical.clone());
-        Ok(canonical)
+        let cache_dir = Arc::new(canonical_non_root(&paths.cache_dir, "application cache")?);
+        *cached = Some(cache_dir.clone());
+        Ok(cache_dir)
     }
 
     /// Get or build a cached seatbelt profile string for the given workspace and cache
     /// directory paths. The profile is cached per (workspace_display, cache_display) pair
     /// to ensure byte-identical output and optimize repeated uses.
-    fn get_seatbelt_profile(&self, workspace: &Path, cache: &Path) -> Result<String, String> {
+    fn get_seatbelt_profile(
+        &self,
+        workspace: &Path,
+        cache: &Path,
+        deny_network: bool,
+    ) -> Result<Arc<str>, String> {
         let workspace_str = seatbelt_string_literal(workspace, "working directory")?;
         let cache_str = seatbelt_string_literal(cache, "application cache")?;
 
-        let cache_key = (workspace_str.clone(), cache_str.clone());
+        let cache_key = (workspace_str.clone(), cache_str.clone(), deny_network);
         let mut profiles = self
             .cached_seatbelt_profiles
             .lock()
@@ -1322,6 +1313,11 @@ impl Sandbox {
             return Ok(profile.clone());
         }
 
+        let network_rule = if deny_network {
+            "(deny network*)"
+        } else {
+            "(allow network*)"
+        };
         let profile = format!(
             r#"(version 1)
 (deny default)
@@ -1332,8 +1328,9 @@ impl Sandbox {
     (subpath "{cache_str}")
     (subpath "/private/tmp")
     (literal "/dev/null"))
-(deny network*)"#
+{network_rule}"#
         );
+        let profile: Arc<str> = Arc::from(profile);
         profiles.insert(cache_key, profile.clone());
         Ok(profile)
     }
@@ -1361,15 +1358,7 @@ impl Sandbox {
             .workspace_authority_path()
             .map(Ok)
             .unwrap_or_else(|| canonical_non_root(&cwd, "working directory"))?;
-        let paths = crate::paths::process_paths()
-            .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
-        std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
-            format!(
-                "sandbox: failed to create application cache {}: {error}",
-                paths.cache_dir.display()
-            )
-        })?;
-        let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+        let cache_dir = self.get_cached_cache_dir()?;
         let bwrap = bwrap_path().ok_or_else(|| {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing to run unsandboxed"
                 .to_string()
@@ -1429,15 +1418,7 @@ impl Sandbox {
 
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
-            let paths = crate::paths::process_paths()
-                .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
-            std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
-                format!(
-                    "sandbox: failed to create application cache {}: {error}",
-                    paths.cache_dir.display()
-                )
-            })?;
-            let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+            let cache_dir = self.get_cached_cache_dir()?;
             return windows::build_shell_helper(
                 &self.shell,
                 &self.shell_command_arg,
@@ -1576,10 +1557,10 @@ impl Sandbox {
                 "sandbox backend 'seatbelt' is not a trusted system executable — refusing to run hook unsandboxed"
                     .to_string()
             })?;
-            let profile = self.get_seatbelt_profile(&cwd, &cache_dir)?;
+            let profile = self.get_seatbelt_profile(&cwd, &cache_dir, true)?;
             let mut cmd = Command::new(seatbelt);
             cmd.arg("-p")
-                .arg(profile)
+                .arg(profile.as_ref())
                 .arg(readiness_shell)
                 .arg("-c")
                 .arg(HOOK_SANDBOX_READY_SCRIPT)
@@ -1617,8 +1598,8 @@ impl Sandbox {
             .arg(&cwd)
             .arg(&cwd)
             .arg("--bind")
-            .arg(&cache_dir)
-            .arg(&cache_dir)
+            .arg(cache_dir.as_path())
+            .arg(cache_dir.as_path())
             .args([
                 "--unshare-user",
                 "--unshare-ipc",
@@ -1678,28 +1659,13 @@ impl Sandbox {
                 "sandbox backend 'seatbelt' is not a trusted system executable — refusing workspace-service launch"
                     .to_string()
             })?;
-            let workspace = seatbelt_string_literal(&cwd, "workspace-service working directory")?;
-            let cache = seatbelt_string_literal(&cache_dir, "application cache")?;
-            let network_rule = if deny_network {
-                "(deny network*)"
-            } else {
-                "(allow network*)"
-            };
-            let profile = format!(
-                r#"(version 1)
-(deny default)
-(allow process*)
-(allow file-read*)
-(allow file-write*
-    (subpath "{workspace}")
-    (subpath "{cache}")
-    (subpath "/private/tmp")
-    (literal "/dev/null"))
-{network_rule}"#
-            );
+            let profile = self.get_seatbelt_profile(&cwd, &cache_dir, deny_network)?;
             let mut cmd = Command::new(seatbelt);
             cmd.env_clear();
-            cmd.arg("-p").arg(profile).arg("/usr/bin/env").arg("-i");
+            cmd.arg("-p")
+                .arg(profile.as_ref())
+                .arg("/usr/bin/env")
+                .arg("-i");
             for (key, value) in env {
                 let key = key.to_str().ok_or_else(|| {
                     "workspace-service environment name is not valid UTF-8 for Seatbelt".to_string()
@@ -1760,7 +1726,9 @@ impl Sandbox {
         }
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
         cmd.arg("--bind").arg(&cwd).arg(&cwd);
-        cmd.arg("--bind").arg(&cache_dir).arg(&cache_dir);
+        cmd.arg("--bind")
+            .arg(cache_dir.as_path())
+            .arg(cache_dir.as_path());
         cmd.args([
             "--unshare-user",
             "--unshare-ipc",
@@ -1801,15 +1769,14 @@ impl Sandbox {
             {
                 return Err("Windows direct capability requires AppContainer".to_string());
             }
-            let paths = crate::paths::process_paths()
-                .map_err(|_| "application paths are unavailable".to_string())?;
-            std::fs::create_dir_all(&paths.cache_dir)
+            let cache_dir = self
+                .get_cached_cache_dir()
                 .map_err(|_| "application cache is unavailable".to_string())?;
             return windows::verify_direct_command(
                 program,
                 args,
                 workspace.root(),
-                &paths.cache_dir,
+                &cache_dir,
                 &self.windows_appcontainer_read_roots,
                 &self.windows_appcontainer_write_roots,
             );
@@ -1841,15 +1808,7 @@ impl Sandbox {
             })?,
             "working directory",
         )?;
-        let paths = crate::paths::process_paths()
-            .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
-        std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
-            format!(
-                "sandbox: failed to create application cache {}: {error}",
-                paths.cache_dir.display()
-            )
-        })?;
-        let cache_dir = canonical_non_root(&paths.cache_dir, "application cache")?;
+        let cache_dir = self.get_cached_cache_dir()?;
         windows::build_direct_helper(
             program,
             arguments,
@@ -1867,10 +1826,10 @@ impl Sandbox {
         cwd: &Path,
         cache_dir: &Path,
     ) -> Result<Command, String> {
-        let profile = self.get_seatbelt_profile(cwd, cache_dir)?;
+        let profile = self.get_seatbelt_profile(cwd, cache_dir, true)?;
 
         let mut cmd = Command::new(seatbelt);
-        cmd.arg("-p").arg(profile);
+        cmd.arg("-p").arg(profile.as_ref());
         // `env -i` is inside the sandbox wrapper, so callers cannot restore
         // credentials by adding environment variables to the returned command.
         cmd.arg("/usr/bin/env").arg("-i");
@@ -4188,7 +4147,7 @@ printf MACOS_SEATBELT_POLICY_PASS
 
         // Build profile through cache
         let cached_profile = sandbox
-            .get_seatbelt_profile(&workspace, &cache_dir)
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
             .unwrap();
 
         // Build the same profile manually (simulating what would happen without caching)
@@ -4209,7 +4168,8 @@ printf MACOS_SEATBELT_POLICY_PASS
 
         // The cached result must be byte-identical to the uncached result
         assert_eq!(
-            cached_profile, uncached_profile,
+            cached_profile.as_ref(),
+            uncached_profile,
             "cached profile must be byte-identical to uncached profile built from same inputs"
         );
 
@@ -4219,10 +4179,11 @@ printf MACOS_SEATBELT_POLICY_PASS
         // on a cache hit. Byte-identity against the uncached build above is the
         // property that actually protects confinement.
         let cached_again = sandbox
-            .get_seatbelt_profile(&workspace, &cache_dir)
+            .get_seatbelt_profile(&workspace, &cache_dir, true)
             .unwrap();
         assert_eq!(
-            cached_profile, cached_again,
+            cached_profile.as_ref(),
+            cached_again.as_ref(),
             "repeated cache reads must return identical profile text"
         );
     }
@@ -4234,9 +4195,9 @@ printf MACOS_SEATBELT_POLICY_PASS
 
         // Each instance has its own cache storage (not global)
         assert!(
-            !std::ptr::eq(
-                sandbox1.cached_essential_env.as_ref() as *const _,
-                sandbox2.cached_essential_env.as_ref() as *const _
+            !Arc::ptr_eq(
+                &sandbox1.cached_essential_env,
+                &sandbox2.cached_essential_env
             ),
             "each Sandbox instance must have its own cached_essential_env Arc"
         );
@@ -4259,6 +4220,18 @@ printf MACOS_SEATBELT_POLICY_PASS
     }
 
     #[test]
+    fn essential_environment_reuses_one_snapshot_without_per_call_allocation() {
+        let sandbox = Sandbox::new(false, "bwrap");
+        let first = sandbox.get_essential_env();
+        let second = sandbox.get_essential_env();
+        assert_eq!(
+            first.as_ptr(),
+            second.as_ptr(),
+            "repeated command construction should borrow one environment snapshot"
+        );
+    }
+
+    #[test]
     fn seatbelt_profile_cache_key_varies_correctly() {
         let sandbox = Sandbox::new(true, "seatbelt");
         let workspace_a = std::env::temp_dir().join(format!("test-ws-a-{}", uuid::Uuid::new_v4()));
@@ -4267,16 +4240,16 @@ printf MACOS_SEATBELT_POLICY_PASS
         let cache_b = std::env::temp_dir().join(format!("test-cache-b-{}", uuid::Uuid::new_v4()));
 
         let profile_a_a = sandbox
-            .get_seatbelt_profile(&workspace_a, &cache_a)
+            .get_seatbelt_profile(&workspace_a, &cache_a, true)
             .unwrap();
         let profile_a_b = sandbox
-            .get_seatbelt_profile(&workspace_a, &cache_b)
+            .get_seatbelt_profile(&workspace_a, &cache_b, true)
             .unwrap();
         let profile_b_a = sandbox
-            .get_seatbelt_profile(&workspace_b, &cache_a)
+            .get_seatbelt_profile(&workspace_b, &cache_a, true)
             .unwrap();
         let profile_b_b = sandbox
-            .get_seatbelt_profile(&workspace_b, &cache_b)
+            .get_seatbelt_profile(&workspace_b, &cache_b, true)
             .unwrap();
 
         // All different (workspace, cache) pairs should produce different profiles
@@ -4299,11 +4272,17 @@ printf MACOS_SEATBELT_POLICY_PASS
 
         // Same pair called again should return cached copy
         let profile_a_a_again = sandbox
-            .get_seatbelt_profile(&workspace_a, &cache_a)
+            .get_seatbelt_profile(&workspace_a, &cache_a, true)
             .unwrap();
         assert_eq!(
             profile_a_a, profile_a_a_again,
             "same path pair must return same profile string"
         );
+
+        let profile_with_network = sandbox
+            .get_seatbelt_profile(&workspace_a, &cache_a, false)
+            .unwrap();
+        assert_ne!(profile_a_a, profile_with_network);
+        assert!(profile_with_network.contains("(allow network*)"));
     }
 }

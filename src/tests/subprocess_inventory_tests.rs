@@ -875,7 +875,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/git/runner.rs",
-        "let mut command = Command::new(&self.program);",
+        "let mut command = Command::new(self.program.as_path());",
         1,
         "TC-INTERNAL-GIT",
     ),

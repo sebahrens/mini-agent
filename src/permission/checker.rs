@@ -907,7 +907,7 @@ impl PermissionChecker {
         is_path_tool_name(tool)
     }
 
-    fn is_external_path(&self, path_str: &str) -> bool {
+    fn is_external_path(&mut self, path_str: &str) -> bool {
         let p = Path::new(path_str);
         let p = if p.is_absolute() {
             p.to_path_buf()
@@ -922,14 +922,19 @@ impl PermissionChecker {
                 if metadata.is_dir() {
                     Some(cached.clone())
                 } else {
-                    resolve_path_allow_missing(Path::new(&self.working_dir))
+                    None
                 }
             } else {
-                resolve_path_allow_missing(Path::new(&self.working_dir))
+                None
             }
         } else {
-            resolve_path_allow_missing(Path::new(&self.working_dir))
+            None
         };
+        let normalized_cwd = normalized_cwd.or_else(|| {
+            let resolved = resolve_path_allow_missing(Path::new(&self.working_dir));
+            self.cached_resolved_cwd = resolved.clone();
+            resolved
+        });
 
         match normalized_cwd {
             Some(cwd) => !normalized.starts_with(&cwd),
@@ -1602,7 +1607,7 @@ mod tests {
             CheckResult::Denied("Blocked by deny rule".to_string())
         );
 
-        let default_checker = PermissionChecker::new(
+        let mut default_checker = PermissionChecker::new(
             &PermissionConfigs::default(),
             SecurityMode::Standard,
             Some(workspace),

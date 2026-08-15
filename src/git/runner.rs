@@ -58,14 +58,11 @@ static PROCESS_GIT_MUTATION_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 /// Assumes PATH and relevant environment variables do not change mid-session.
 static CACHED_GIT_ENVIRONMENT: OnceLock<Vec<(OsString, OsString)>> = OnceLock::new();
 
-/// Cached git executable path. Built once per process lifetime.
-/// Assumes PATH and git installation do not change mid-session.
-///
-/// HAZARD: If a test scopes PATH around git discovery (e.g., via
-/// `ScopedProcessEnv::set(&[("PATH", ...)])` in the same process), the cache
-/// will return a stale path. Do NOT test git discovery with PATH scoping;
-/// git discovery is only called at startup and should use the actual PATH.
-static CACHED_GIT_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// Checked runner cached for the production process lifetime. Tests discover
+/// from their scoped PATH because process environment fixtures can run
+/// concurrently with unrelated tests. Every launch still revalidates identity.
+#[cfg(not(test))]
+static CACHED_GIT_RUNNER: OnceLock<Result<GitRunner, String>> = OnceLock::new();
 
 /// Git's own index locks protect files, but one process-wide admission lock
 /// also prevents mini-agent worktree and structured-tool mutations from
@@ -80,8 +77,8 @@ pub(crate) async fn acquire_process_git_mutation() -> OwnedMutexGuard<()> {
 
 #[derive(Clone)]
 pub(crate) struct GitRunner {
-    program: PathBuf,
-    identity: crate::fs::CheckedMetadata,
+    program: Arc<PathBuf>,
+    identity: Arc<crate::fs::CheckedMetadata>,
 }
 
 impl Default for GitRunner {
@@ -94,14 +91,32 @@ impl Default for GitRunner {
 
 impl GitRunner {
     pub(crate) fn discover() -> Result<Self, String> {
-        let program = resolve_git_executable()
+        #[cfg(not(test))]
+        {
+            return Self::discover_cached(&CACHED_GIT_RUNNER);
+        }
+        #[cfg(test)]
+        Self::discover_uncached(std::env::var_os("PATH").as_deref())
+    }
+
+    fn discover_cached(cache: &OnceLock<Result<Self, String>>) -> Result<Self, String> {
+        cache
+            .get_or_init(|| Self::discover_uncached(std::env::var_os("PATH").as_deref()))
+            .clone()
+    }
+
+    fn discover_uncached(path: Option<&OsStr>) -> Result<Self, String> {
+        let program = resolve_git_executable(path)
             .ok_or_else(|| "Git executable is unavailable or unsupported".to_string())?;
         let identity = crate::fs::checked_path_metadata(&program)
             .map_err(|_| "Git executable identity is unavailable".to_string())?;
         if !identity.is_file() {
             return Err("Git executable is not a regular file".to_string());
         }
-        Ok(Self { program, identity })
+        Ok(Self {
+            program: Arc::new(program),
+            identity: Arc::new(identity),
+        })
     }
 
     fn unavailable() -> Result<Self, String> {
@@ -109,8 +124,8 @@ impl GitRunner {
         let identity = crate::fs::checked_path_metadata(&program)
             .map_err(|e| format!("process executable identity unavailable: {e}"))?;
         Ok(Self {
-            program: PathBuf::new(),
-            identity,
+            program: Arc::new(PathBuf::new()),
+            identity: Arc::new(identity),
         })
     }
 
@@ -125,7 +140,7 @@ impl GitRunner {
     ) -> Result<(), String> {
         self.validate()?;
         sandbox.verify_workspace_service_capability(
-            &self.program,
+            self.program.as_path(),
             &["--version".to_string()],
             workspace,
         )
@@ -135,9 +150,9 @@ impl GitRunner {
         if self.program.as_os_str().is_empty() {
             return Err("Git executable is unavailable or unsupported".to_string());
         }
-        let current = crate::fs::checked_path_metadata(&self.program)
+        let current = crate::fs::checked_path_metadata(self.program.as_path())
             .map_err(|_| "Git executable identity changed before launch".to_string())?;
-        crate::fs::ensure_same_file(&self.program, &self.identity, &current)
+        crate::fs::ensure_same_file(self.program.as_path(), &self.identity, &current)
             .map_err(|_| "Git executable identity changed before launch".to_string())
     }
 
@@ -157,7 +172,7 @@ impl GitRunner {
         S: AsRef<OsStr>,
     {
         self.validate()?;
-        let mut command = Command::new(&self.program);
+        let mut command = Command::new(self.program.as_path());
         command.args(self.argv(repo_path, args));
         for name in REDIRECTING_ENV {
             command.env_remove(name);
@@ -185,7 +200,7 @@ impl GitRunner {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         sandbox.wrap_workspace_service(
-            &self.program,
+            self.program.as_path(),
             &argv,
             workspace.root(),
             git_environment(),
@@ -294,7 +309,7 @@ fn apply_git_environment(command: &mut Command) {
 }
 
 fn build_git_environment() -> Vec<(OsString, OsString)> {
-    let mut values = vec![
+    let values = vec![
         (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
         (OsString::from("GIT_NO_LAZY_FETCH"), OsString::from("1")),
         (OsString::from("GIT_PAGER"), OsString::from("cat")),
@@ -304,12 +319,15 @@ fn build_git_environment() -> Vec<(OsString, OsString)> {
     ];
     #[cfg(windows)]
     {
+        let mut values = values;
         for name in ["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"] {
             if let Some(value) = std::env::var_os(name) {
                 values.push((OsString::from(name), value));
             }
         }
+        values
     }
+    #[cfg(not(windows))]
     values
 }
 
@@ -355,14 +373,14 @@ pub(crate) fn command_failure(operation: &str, output: &CommandOutput) -> String
     }
 }
 
-fn find_git_executable() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+fn find_git_executable(path: Option<&OsStr>) -> Option<PathBuf> {
+    let path = path?;
     let names: &[&str] = if cfg!(windows) {
         &["git.exe"]
     } else {
         &["git"]
     };
-    for directory in std::env::split_paths(&path) {
+    for directory in std::env::split_paths(path) {
         for name in names {
             let candidate = directory.join(name);
             let Ok(candidate) = candidate.canonicalize() else {
@@ -387,15 +405,8 @@ fn find_git_executable() -> Option<PathBuf> {
     None
 }
 
-/// Resolves the git executable path, caching the result for the process
-/// lifetime. `GitRunner` is long-lived, so the PATH walk (canonicalize +
-/// metadata per candidate) only needs to happen once.
-///
-/// Assumption: PATH and the git installation do not change mid-session.
-fn resolve_git_executable() -> Option<PathBuf> {
-    CACHED_GIT_EXECUTABLE
-        .get_or_init(find_git_executable)
-        .clone()
+fn resolve_git_executable(path: Option<&OsStr>) -> Option<PathBuf> {
+    find_git_executable(path)
 }
 
 #[cfg(test)]
@@ -427,6 +438,18 @@ mod tests {
     fn command_failure_empty_stderr() {
         let out = make_output(CommandStatus::Failed, b"");
         assert_eq!(command_failure("log", &out), "git log failed");
+    }
+
+    #[test]
+    fn repeated_discovery_reuses_the_cached_runner_identity() {
+        let cache = OnceLock::new();
+        let first =
+            GitRunner::discover_cached(&cache).expect("git is available for repository tests");
+        let second = GitRunner::discover_cached(&cache).expect("cached git remains available");
+        assert!(
+            Arc::ptr_eq(&first.identity, &second.identity),
+            "discovery should reuse the checked executable identity, not only its path"
+        );
     }
 
     #[test]
@@ -551,12 +574,5 @@ mod tests {
             build_git_environment().as_slice(),
             "cached git environment diverged from a freshly built one"
         );
-    }
-
-    #[test]
-    fn resolve_git_executable_is_cached() {
-        // `Option<PathBuf>` is cloned out of the cache, so pointer identity is
-        // not observable here; equality across calls is what we can assert.
-        assert_eq!(resolve_git_executable(), resolve_git_executable());
     }
 }
