@@ -358,7 +358,7 @@ async fn dispatch_starts_async_handlers_without_waiting_and_ignores_their_decisi
 
 #[cfg(unix)]
 #[tokio::test]
-async fn cancelling_dispatch_terminates_async_hook_descendants() {
+async fn cancelling_owning_work_scope_terminates_async_hook_descendants() {
     let pid_file = std::env::temp_dir().join(format!(
         "zerostack-hooks-async-cancel-descendant-{}",
         std::process::id()
@@ -370,23 +370,26 @@ async fn cancelling_dispatch_terminates_async_hook_descendants() {
     );
     let config = config_with("Stop", None, vec![async_handler(&command)]);
     let dispatcher = std::sync::Arc::new(HookDispatcher::from_config(&config).unwrap());
-    let dispatch = tokio::spawn({
-        let dispatcher = std::sync::Arc::clone(&dispatcher);
-        async move {
-            dispatcher
-                .dispatch(
-                    "Stop",
-                    None,
-                    &ctx(),
-                    EventFields::Stop {
-                        stop_hook_active: false,
-                        loop_iteration: None,
-                        loop_active: None,
-                    },
-                )
-                .await
-        }
-    });
+    let work_scope = crate::agent::runner::AgentWorkScope::new();
+    work_scope
+        .run({
+            let dispatcher = std::sync::Arc::clone(&dispatcher);
+            async move {
+                dispatcher
+                    .dispatch(
+                        "Stop",
+                        None,
+                        &ctx(),
+                        EventFields::Stop {
+                            stop_hook_active: false,
+                            loop_iteration: None,
+                            loop_active: None,
+                        },
+                    )
+                    .await
+            }
+        })
+        .await;
 
     let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while !pid_file.exists() && tokio::time::Instant::now() < ready_deadline {
@@ -397,8 +400,10 @@ async fn cancelling_dispatch_terminates_async_hook_descendants() {
         .trim()
         .parse()
         .unwrap();
-    dispatch.abort();
-    let _ = dispatch.await;
+    work_scope.cancellation_handle().cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), work_scope.wait_idle())
+        .await
+        .expect("owned async hook should settle after cancellation");
 
     let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while process_is_alive(descendant_pid) && tokio::time::Instant::now() < cleanup_deadline {

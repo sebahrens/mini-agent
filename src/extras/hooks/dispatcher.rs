@@ -536,11 +536,94 @@ impl HookDispatcher {
     ) -> Vec<HookOutput> {
         let stdin = serde_json::to_vec(envelope).unwrap_or_default();
         let mut futures = Vec::new();
-        let mut async_futures = Vec::new();
         for handler in handlers {
             let Some(command) = handler.command.clone() else {
                 continue;
             };
+
+            if handler.is_async {
+                let handler = (*handler).clone();
+                let event = event.to_string();
+                let stdin = stdin.clone();
+                let project_dir = project_dir.to_string();
+                let execution_root = execution_root.clone();
+                let sandbox_backend = self.sandbox_backend.clone();
+                let once_ran = Arc::clone(&self.once_ran);
+                std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
+                    let policy =
+                        HookPolicy::new(handler.trust, &sandbox_backend, handler.env.clone());
+                    if let Some(condition) = &handler.condition {
+                        let cond_timeout = std::time::Duration::from_secs(
+                            handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                        );
+                        let cond_output = run_shell_condition_at_root(
+                            condition,
+                            &stdin,
+                            cond_timeout,
+                            &project_dir,
+                            &policy,
+                            &execution_root,
+                        )
+                        .await;
+                        audit_hook_outcome(
+                            &event,
+                            &command,
+                            "condition",
+                            handler.trust,
+                            &cond_output,
+                        );
+                        match cond_output.status {
+                            HookStatus::TimedOut => tracing::warn!(
+                                "hooks: `if` condition for {command:?} timed out; failing closed (running the handler)"
+                            ),
+                            HookStatus::OutputLimitExceeded(limit) => tracing::warn!(
+                                "hooks: `if` condition for {command:?} exceeded its {limit:?} output limit; failing closed (running the handler)"
+                            ),
+                            HookStatus::Completed
+                            | HookStatus::Failed
+                            | HookStatus::PolicyDenied => match cond_output.exit_code {
+                                Some(0) => {}
+                                Some(_) => return,
+                                None => tracing::warn!(
+                                    "hooks: `if` condition for {command:?} could not be completed; failing closed (running the handler)"
+                                ),
+                            },
+                        }
+                    }
+
+                    let once_key = handler.once.then(|| (event.clone(), handler.clone()));
+                    let Some(mut once_reservation) = OnceReservation::reserve(once_ran, once_key)
+                    else {
+                        return;
+                    };
+                    let diagnostics = policy.diagnostics();
+                    tracing::info!(
+                        event,
+                        command = command.as_str(),
+                        trust = ?handler.trust,
+                        containment = diagnostics.containment,
+                        filesystem = diagnostics.filesystem,
+                        network = diagnostics.network,
+                        "hooks: applying subprocess policy"
+                    );
+                    let timeout = std::time::Duration::from_secs(
+                        handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                    );
+                    let output = run_hook_with_policy_at_root(
+                        &command,
+                        handler.args.as_deref(),
+                        &stdin,
+                        timeout,
+                        &project_dir,
+                        &policy,
+                        &execution_root,
+                    )
+                    .await;
+                    once_reservation.consume_if_started(&output);
+                    audit_hook_outcome(&event, &command, "handler", handler.trust, &output);
+                }));
+                continue;
+            }
 
             if let Some(condition) = &handler.condition {
                 let policy =
@@ -613,44 +696,23 @@ impl HookDispatcher {
                 network = diagnostics.network,
                 "hooks: applying subprocess policy"
             );
-            if handler.is_async {
-                async_futures.push(async move {
-                    let output = run_hook_with_policy_at_root(
-                        &command,
-                        args.as_deref(),
-                        &stdin,
-                        timeout,
-                        &project_dir,
-                        &policy,
-                        &execution_root,
-                    )
-                    .await;
-                    once_reservation.consume_if_started(&output);
-                    audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
-                });
-            } else {
-                futures.push(async move {
-                    let output = run_hook_with_policy_at_root(
-                        &command,
-                        args.as_deref(),
-                        &stdin,
-                        timeout,
-                        &project_dir,
-                        &policy,
-                        &execution_root,
-                    )
-                    .await;
-                    once_reservation.consume_if_started(&output);
-                    audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
-                    output
-                });
-            }
+            futures.push(async move {
+                let output = run_hook_with_policy_at_root(
+                    &command,
+                    args.as_deref(),
+                    &stdin,
+                    timeout,
+                    &project_dir,
+                    &policy,
+                    &execution_root,
+                )
+                .await;
+                once_reservation.consume_if_started(&output);
+                audit_hook_outcome(&audit_event, &command, "handler", trust, &output);
+                output
+            });
         }
-        let (outputs, _) = tokio::join!(
-            futures::future::join_all(futures),
-            futures::future::join_all(async_futures)
-        );
-        outputs
+        futures::future::join_all(futures).await
     }
 }
 
