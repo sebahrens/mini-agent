@@ -1,0 +1,98 @@
+{
+  "name": "mini-agent",
+  "displayName": "Mini Agent",
+  "description": "Mini Agent — AI coding agent with ACP stdio integration",
+  "version": "0.1.0",
+  "publisher": "mini-agent",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["AI", "Other"],
+  "extensionKind": ["workspace", "ui"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mini-agent.start",
+        "title": "Mini Agent: Start Session"
+      },
+      {
+        "command": "mini-agent.stop",
+        "title": "Mini Agent: Stop Session"
+      },
+      {
+        "command": "mini-agent.restart",
+        "title": "Mini Agent: Restart Session"
+      },
+      {
+        "command": "mini-agent.selectFolder",
+        "title": "Mini Agent: Select Workspace Folder"
+      }
+    ],
+    "configuration": {
+      "title": "Mini Agent",
+      "properties": {
+        "mini-agent.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the mini-agent executable. Leave empty to use the bundled artifact.",
+          "scope": "machine"
+        },
+        "mini-agent.logLevel": {
+          "type": "string",
+          "enum": ["error", "warn", "info", "debug", "trace"],
+          "default": "info",
+          "description": "Log verbosity for the mini-agent output channel.",
+          "scope": "machine"
+        }
+      }
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "mini-agent.panel",
+          "name": "Mini Agent",
+          "when": "workspaceFolderCount > 0"
+        }
+      ]
+    },
+    "viewsContainers": {}
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Mini Agent can read files and execute tools; workspace must be trusted."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Mini Agent requires a real file system and cannot operate in virtual workspaces."
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "dev": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "package:win32-x64": "vsce package --target win32-x64",
+    "package:darwin-arm64": "vsce package --target darwin-arm64",
+    "package:linux-x64": "vsce package --target linux-x64"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "esbuild": "^0.21.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.4.0",
+    "@vscode/vsce": "^2.26.0"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.0.0"
+  }
+}
