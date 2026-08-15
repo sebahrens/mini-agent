@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
@@ -8,6 +12,39 @@ use crate::session::storage;
 pub(crate) const MAX_CHAT_HISTORY_ENTRIES: usize = 10_000;
 /// Compact only when line count exceeds 2x the maximum (lazy compaction).
 const COMPACTION_THRESHOLD_MULTIPLIER: usize = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Default)]
+struct HistoryFileState {
+    entry_count: usize,
+    observed: Option<FileStamp>,
+    #[cfg(test)]
+    full_scans: usize,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HistoryFormat {
+    JsonLines,
+    LegacyArray,
+}
+
+struct ParsedHistory {
+    entries: Vec<ChatHistoryEntry>,
+    format: HistoryFormat,
+    corrupt: bool,
+    original: String,
+}
+
+static HISTORY_FILE_STATES: OnceLock<Mutex<HashMap<PathBuf, HistoryFileState>>> = OnceLock::new();
+
+fn history_file_states() -> &'static Mutex<HashMap<PathBuf, HistoryFileState>> {
+    HISTORY_FILE_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatHistoryEntry {
@@ -29,202 +66,179 @@ pub fn append_entry(entry: &ChatHistoryEntry) -> anyhow::Result<()> {
     append_entry_to_path(&path, entry, MAX_CHAT_HISTORY_ENTRIES)
 }
 
-/// Append one entry to chat history using JSONL format (O(1) append operation).
-/// Handles migration from legacy JSON array format.
-/// Lazily compacts when actual line count exceeds 2x the maximum.
+/// Append one JSONL record. Existing content is scanned once per process (or
+/// after an external file change), then an in-memory count makes ordinary
+/// appends O(1). Compaction is one amortized rewrite per `max_entries` appends.
 fn append_entry_to_path(
     path: &Path,
     entry: &ChatHistoryEntry,
     max_entries: usize,
 ) -> anyhow::Result<()> {
-    // Ensure parent directory exists with private permissions.
     if let Some(parent) = path.parent() {
         crate::paths::ensure_private_directory(parent)?;
     }
 
-    // Check if file exists and is in legacy JSON array format.
-    // If so, migrate to JSONL before appending.
-    if path.exists() {
-        let content = std::fs::read_to_string(path)?;
-        if is_legacy_json_format(&content) {
-            // Parse legacy array and migrate to JSONL.
-            migrate_legacy_to_jsonl(path, &content, entry, max_entries)?;
-            return Ok(());
-        }
-    }
-
-    // Serialize the new entry as JSONL (one per line).
-    let json_line = format!("{}\n", serde_json::to_string(entry)?);
-
-    // Try to append to existing file, or create if missing.
-    match append_line_to_file(path, &json_line) {
-        Ok(()) => {
-            // Check if compaction is needed (lazy compaction at 2x threshold).
-            check_and_compact_if_needed(path, max_entries)?;
-            Ok(())
-        }
-        Err(_e) => {
-            // File exists but is corrupt/unreadable. Back it up and start fresh.
-            if path.exists() {
-                let bak = path.with_extension("json.bak");
-                if let Err(rename_err) = std::fs::rename(path, &bak) {
-                    tracing::warn!("failed to back up corrupt chat history: {}", rename_err);
-                } else {
-                    tracing::warn!("chat history was corrupt, backed up to {:?}", bak);
-                }
+    let mut states = history_file_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = states.entry(path.to_path_buf()).or_default();
+    let current = file_stamp(path)?;
+    if state.observed != current {
+        if current.is_some() {
+            let parsed = read_history_document(path)?;
+            #[cfg(test)]
+            {
+                state.full_scans += 1;
             }
-            // Create a fresh file with just the new entry.
-            storage::atomic_write(path, &json_line)?;
-            Ok(())
+            state.entry_count = parsed.entries.len();
+            if parsed.format == HistoryFormat::LegacyArray || parsed.corrupt {
+                if parsed.corrupt {
+                    backup_corrupt_history(path, &parsed.original)?;
+                }
+                let mut entries = parsed.entries;
+                trim_to_recent(&mut entries, max_entries);
+                storage::atomic_write(path, &serialize_jsonl(&entries)?)?;
+                state.entry_count = entries.len();
+            }
+        } else {
+            state.entry_count = 0;
         }
-    }
-}
-
-/// Migrate a legacy JSON array file to JSONL format and append a new entry.
-fn migrate_legacy_to_jsonl(
-    path: &Path,
-    content: &str,
-    new_entry: &ChatHistoryEntry,
-    max_entries: usize,
-) -> anyhow::Result<()> {
-    // Parse the legacy JSON array.
-    let mut entries: Vec<ChatHistoryEntry> = serde_json::from_str(content).unwrap_or_default();
-
-    // Add the new entry.
-    entries.push(new_entry.clone());
-
-    // Enforce the cap.
-    let excess = entries.len().saturating_sub(max_entries);
-    if excess > 0 {
-        entries.drain(..excess);
+        state.observed = file_stamp(path)?;
     }
 
-    // Rebuild as JSONL and write atomically.
-    let mut jsonl = String::new();
-    for entry in entries {
-        jsonl.push_str(&serde_json::to_string(&entry)?);
-        jsonl.push('\n');
+    let json_line = format!("{}\n", serde_json::to_string(entry)?);
+    append_line_to_file(path, &json_line)?;
+    state.entry_count = state.entry_count.saturating_add(1);
+    state.observed = file_stamp(path)?;
+
+    let compaction_threshold = max_entries.saturating_mul(COMPACTION_THRESHOLD_MULTIPLIER);
+    if state.entry_count > compaction_threshold {
+        let parsed = read_history_document(path)?;
+        #[cfg(test)]
+        {
+            state.full_scans += 1;
+        }
+        let mut entries = parsed.entries;
+        trim_to_recent(&mut entries, max_entries);
+        storage::atomic_write(path, &serialize_jsonl(&entries)?)?;
+        state.entry_count = entries.len();
+        state.observed = file_stamp(path)?;
     }
 
-    storage::atomic_write(path, &jsonl)?;
     Ok(())
 }
 
-/// Append a single line to a file, creating it with private permissions if needed.
-/// Returns error if the file exists but cannot be appended to.
+fn file_stamp(path: &Path) -> anyhow::Result<Option<FileStamp>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(FileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn append_line_to_file(path: &Path, line: &str) -> anyhow::Result<()> {
     use std::fs::OpenOptions;
-    use std::io::Write;
+
+    if !path.exists() {
+        crate::fs::private_atomic_create_sync(path, line.as_bytes())?;
+        return Ok(());
+    }
+
+    // Reject links, foreign ownership, and non-regular files before reopening
+    // for append. The containing directory is private, so another user cannot
+    // swap the validated entry between these operations.
+    drop(crate::fs::open_private_file(path)?);
+
+    let mut options = OpenOptions::new();
+    options.write(true).append(true);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(line.as_bytes())?;
-        file.flush()?;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
 
     #[cfg(windows)]
     {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(path)?;
-        file.write_all(line.as_bytes())?;
-        file.flush()?;
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
 
+    let mut file = options.open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.flush()?;
     Ok(())
 }
 
-/// Count actual newlines in the file to determine line count.
-/// This is the true measure of entries, regardless of entry size.
-fn count_lines(path: &Path) -> anyhow::Result<usize> {
-    let content = std::fs::read_to_string(path)?;
-    if content.is_empty() {
-        return Ok(0);
-    }
-    // Count lines: each line ends with '\n', so count '\n' occurrences.
-    let line_count = content.matches('\n').count();
-    Ok(line_count)
+fn read_history_document(path: &Path) -> anyhow::Result<ParsedHistory> {
+    let mut file = crate::fs::open_private_file(path)?;
+    let mut original = String::new();
+    file.read_to_string(&mut original)?;
+    Ok(parse_history_document(original))
 }
 
-/// Check if compaction is needed and perform it if necessary.
-/// Uses a cheap pre-filter (file size heuristic) to avoid reading the entire file,
-/// then counts actual lines only if the pre-filter suggests we might be over the threshold.
-fn check_and_compact_if_needed(path: &Path, max_entries: usize) -> anyhow::Result<()> {
-    if !path.exists() {
-        return Ok(());
+fn parse_history_document(original: String) -> ParsedHistory {
+    if is_legacy_json_format(&original) {
+        return match serde_json::from_str::<Vec<ChatHistoryEntry>>(&original) {
+            Ok(entries) => ParsedHistory {
+                entries,
+                format: HistoryFormat::LegacyArray,
+                corrupt: false,
+                original,
+            },
+            Err(_) => ParsedHistory {
+                entries: Vec::new(),
+                format: HistoryFormat::LegacyArray,
+                corrupt: true,
+                original,
+            },
+        };
     }
 
-    // Pre-filter: if file is obviously small, skip. Use a conservative estimate.
-    const MIN_BYTES_PER_ENTRY: u64 = 40; // Minimum JSON overhead + tiny content
-    let prefilter_threshold =
-        (max_entries * COMPACTION_THRESHOLD_MULTIPLIER) as u64 * MIN_BYTES_PER_ENTRY;
-    let file_size = std::fs::metadata(path)?.len();
-
-    if file_size < prefilter_threshold {
-        // File is definitely under the threshold; no need to count lines.
-        return Ok(());
-    }
-
-    // Pre-filter triggered: count actual lines to make a real decision.
-    let line_count = count_lines(path)?;
-    let compaction_threshold = max_entries * COMPACTION_THRESHOLD_MULTIPLIER;
-
-    if line_count > compaction_threshold {
-        compact_history(path, max_entries)?;
-    }
-
-    Ok(())
-}
-
-/// Load all entries from JSONL file, skipping corrupt lines.
-fn load_entries_from_jsonl(path: &Path) -> anyhow::Result<Vec<ChatHistoryEntry>> {
-    let content = std::fs::read_to_string(path)?;
     let mut entries = Vec::new();
-
-    for line in content.lines() {
+    let mut corrupt = false;
+    for line in original.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        // Skip lines that fail to parse; don't error on corruption.
-        if let Ok(entry) = serde_json::from_str::<ChatHistoryEntry>(trimmed) {
-            entries.push(entry);
+        match serde_json::from_str::<ChatHistoryEntry>(trimmed) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => corrupt = true,
         }
     }
-
-    Ok(entries)
+    ParsedHistory {
+        entries,
+        format: HistoryFormat::JsonLines,
+        corrupt,
+        original,
+    }
 }
 
-/// Compact the history file by rewriting it with only the most recent entries.
-fn compact_history(path: &Path, max_entries: usize) -> anyhow::Result<()> {
-    let entries = load_entries_from_jsonl(path)?;
-
-    // Keep only the most recent max_entries.
-    let to_keep = if entries.len() > max_entries {
-        entries.len() - max_entries
-    } else {
-        0
-    };
-    let trimmed: Vec<_> = entries.into_iter().skip(to_keep).collect();
-
-    // Rebuild the JSONL file with selected entries.
+fn serialize_jsonl(entries: &[ChatHistoryEntry]) -> anyhow::Result<String> {
     let mut content = String::new();
-    for entry in trimmed {
-        content.push_str(&serde_json::to_string(&entry)?);
+    for entry in entries {
+        content.push_str(&serde_json::to_string(entry)?);
         content.push('\n');
     }
+    Ok(content)
+}
 
-    storage::atomic_write(path, &content)?;
+fn trim_to_recent(entries: &mut Vec<ChatHistoryEntry>, max_entries: usize) {
+    let excess = entries.len().saturating_sub(max_entries);
+    if excess > 0 {
+        entries.drain(..excess);
+    }
+}
+
+fn backup_corrupt_history(path: &Path, original: &str) -> anyhow::Result<()> {
+    let backup = path.with_extension("json.bak");
+    storage::atomic_write(&backup, original)?;
+    tracing::warn!("chat history was corrupt, backed up to {:?}", backup);
     Ok(())
 }
 
@@ -239,24 +253,25 @@ fn load_history_from_path(
         return Ok(Vec::new());
     }
 
-    let content = std::fs::read_to_string(path)?;
-
-    let mut entries = if is_legacy_json_format(&content) {
-        // Legacy JSON array format: parse directly.
-        serde_json::from_str::<Vec<ChatHistoryEntry>>(&content).unwrap_or_default()
-    } else {
-        // JSONL format: load and skip corrupt lines.
-        load_entries_from_jsonl(path).unwrap_or_default()
-    };
-
-    // Enforce the cap at read time. This ensures the observable behavior (what
-    // callers see) is always bounded, even though the file may temporarily hold
-    // more entries due to lazy compaction.
-    let excess = entries.len().saturating_sub(max_entries);
-    if excess > 0 {
-        entries.drain(..excess);
+    let mut states = history_file_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = states.entry(path.to_path_buf()).or_default();
+    let parsed = read_history_document(path)?;
+    #[cfg(test)]
+    {
+        state.full_scans += 1;
     }
-
+    let mut entries = parsed.entries;
+    trim_to_recent(&mut entries, max_entries);
+    if parsed.format == HistoryFormat::LegacyArray || parsed.corrupt {
+        if parsed.corrupt {
+            backup_corrupt_history(path, &parsed.original)?;
+        }
+        storage::atomic_write(path, &serialize_jsonl(&entries)?)?;
+    }
+    state.entry_count = entries.len();
+    state.observed = file_stamp(path)?;
     Ok(entries)
 }
 
@@ -374,7 +389,12 @@ mod tests {
         let legacy_json = serde_json::to_string_pretty(&legacy_entries).unwrap();
         std::fs::write(&path, &legacy_json).unwrap();
 
-        // First append triggers migration from legacy array to JSONL.
+        // Loading performs the one-time migration before any new append.
+        let migrated = load_history_from_path(&path, 100).unwrap();
+        assert_eq!(migrated.len(), 3);
+        let migrated_content = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated_content.trim().starts_with('['));
+
         append_entry_to_path(
             &path,
             &ChatHistoryEntry {
@@ -425,6 +445,17 @@ mod tests {
         assert_eq!(entries[0].content, "good-entry-0");
         assert_eq!(entries[1].content, "good-entry-1");
         assert_eq!(entries[2].content, "good-entry-2");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.bak")).unwrap(),
+            jsonl,
+            "the original corrupt file must remain recoverable"
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("invalid json"),
+            "the active file should be repaired after backup"
+        );
     }
 
     #[test]
@@ -471,5 +502,50 @@ mod tests {
             size_diff > 500 && size_diff < 700,
             "10 entries at ~58 bytes each should add ~580 bytes; got {size_diff}"
         );
+
+        let states = super::history_file_states()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            states.get(&path).unwrap().full_scans,
+            0,
+            "a newly created, unchanged JSONL file must not be rescanned per append"
+        );
+    }
+
+    #[test]
+    fn external_jsonl_change_is_rescanned_once_then_returns_to_constant_time_appends() {
+        let temp = TempDir::new();
+        let path = temp.path().join("chat_history.json");
+        let first = ChatHistoryEntry {
+            content: "external-entry".into(),
+            timestamp: "2026-07-29T00:00:00Z".into(),
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+        )
+        .unwrap();
+
+        for index in 0..20 {
+            append_entry_to_path(
+                &path,
+                &ChatHistoryEntry {
+                    content: format!("appended-{index}"),
+                    timestamp: "2026-07-29T00:00:01Z".into(),
+                },
+                100,
+            )
+            .unwrap();
+        }
+
+        let states = super::history_file_states()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(states.get(&path).unwrap().full_scans, 1);
+        drop(states);
+        let entries = load_history_from_path(&path, 100).unwrap();
+        assert_eq!(entries.len(), 21);
+        assert_eq!(entries.first().unwrap().content, "external-entry");
     }
 }
