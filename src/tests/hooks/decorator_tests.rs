@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
@@ -152,12 +152,27 @@ fn dispatcher_with(event: &str, handlers: Vec<HookHandler>) -> Arc<HookDispatche
     Arc::new(HookDispatcher::from_config(&config).unwrap())
 }
 
+fn permission_workspace() -> std::path::PathBuf {
+    static WORKSPACE: OnceLock<std::path::PathBuf> = OnceLock::new();
+    WORKSPACE
+        .get_or_init(|| {
+            let path = std::env::temp_dir().join(format!(
+                "mini-agent-hooks-decorator-workspace-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create permission test workspace");
+            path.canonicalize()
+                .expect("canonicalize permission test workspace")
+        })
+        .clone()
+}
+
 fn permission() -> Option<crate::permission::checker::PermCheck> {
     Some(Arc::new(std::sync::Mutex::new(
         PermissionChecker::new(
             &PermissionConfigs::default(),
             SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/repo")),
+            Some(permission_workspace()),
             None,
         )
         .expect("valid permission test configuration"),
@@ -172,7 +187,7 @@ fn permission_restrictive() -> Option<crate::permission::checker::PermCheck> {
         PermissionChecker::new(
             &PermissionConfigs::default(),
             SecurityMode::Restrictive,
-            Some(std::path::PathBuf::from("/repo")),
+            Some(permission_workspace()),
             None,
         )
         .expect("valid permission test configuration"),
@@ -267,7 +282,7 @@ async fn pre_tool_use_rewrite_cannot_bypass_a_permission_deny_rule() {
         PermissionChecker::new(
             &config.into(),
             SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/repo")),
+            Some(permission_workspace()),
             None,
         )
         .expect("valid permission test configuration"),

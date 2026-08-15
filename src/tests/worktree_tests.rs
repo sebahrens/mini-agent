@@ -1791,26 +1791,19 @@ mod tests {
         };
         let task = tokio::spawn(async move { try_merge(&info, "main").await });
 
-        for _ in 0..300 {
-            if started.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(started.exists(), "delayed commit hook did not start");
+        wait_for_mutation_marker(&started, || task.is_finished(), "delayed merge commit hook")
+            .await;
         task.abort();
         let _ = task.await;
-        tokio::time::timeout(
-            Duration::from_secs(4),
-            run_locked_git_with_limits_for_test(
-                repo.path(),
-                &["status", "--porcelain"],
-                test_limits(Duration::from_secs(2)),
-            ),
+        let admission = acquire_released_mutation_lock("commit cancellation rollback").await;
+        run_git_with_limits_for_test(
+            repo.path(),
+            &["status", "--porcelain"],
+            test_limits(Duration::from_secs(2)),
         )
         .await
-        .expect("caller-drop rollback did not release repository lock")
         .expect("status after commit cancellation");
+        drop(admission);
 
         assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
         assert_eq!(

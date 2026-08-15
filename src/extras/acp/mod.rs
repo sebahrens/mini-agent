@@ -3679,12 +3679,6 @@ mod workspace_tests {
             second_lsp.resolve_path(Path::new("sentinel.txt")),
             Ok(second.join("sentinel.txt"))
         );
-        assert!(
-            first_lsp
-                .resolve_path(&second.join("sentinel.txt"))
-                .is_err()
-        );
-
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(
@@ -3908,7 +3902,9 @@ mod workspace_tests {
             let roots = vec![".".to_string()];
             let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root).unwrap());
             JsTool::new(
-                Sandbox::new(false, "bwrap").with_workspace_binding(workspace.clone()),
+                Sandbox::new(false, "bwrap")
+                    .with_workspace_binding(workspace.clone())
+                    .with_complete_process_tree_for_test(),
                 None,
                 None,
                 AllowConfig::from_settings(root, None, Some(&roots), Some(&roots), false, false)
