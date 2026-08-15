@@ -121,6 +121,15 @@ fn format_status_shows_sync_and_dirty() {
 }
 
 #[test]
+fn statusline_cache_key_distinguishes_missing_and_clean_git_status() {
+    let mut session = Session::new("openrouter", "m", 1000, "");
+    let missing = statusline::cache_key(&session, &ctx());
+    session.git_status = Some(GitStatus::default());
+
+    assert_ne!(missing, statusline::cache_key(&session, &ctx()));
+}
+
+#[test]
 fn fmt_tokens_scales() {
     assert_eq!(statusline::fmt_tokens(0), "0");
     assert_eq!(statusline::fmt_tokens(12_000), "12k");

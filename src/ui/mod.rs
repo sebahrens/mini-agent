@@ -156,8 +156,17 @@ pub(crate) fn refresh_display(
         btw_in: btw.input,
         btw_out: btw.output,
     };
-    let statusline = crate::ui::statusline::build(ui.session, &statusline_ctx);
-    renderer.draw_bottom(&input.buffer, input.cursor, &statusline, run.is_running)?;
+    let statusline_key = crate::ui::statusline::cache_key(ui.session, &statusline_ctx);
+    let statusline = renderer.cached_statusline(statusline_key, || {
+        crate::ui::statusline::build(ui.session, &statusline_ctx)
+    });
+    renderer.draw_bottom(
+        &input.buffer,
+        input.cursor,
+        &statusline,
+        statusline_key,
+        run.is_running,
+    )?;
     if let Some(ref mut picker) = input.picker {
         let was_active = picker.active();
         picker.draw()?;

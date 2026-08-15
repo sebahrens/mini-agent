@@ -1,4 +1,6 @@
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 use compact_str::CompactString;
@@ -91,13 +93,13 @@ pub(crate) struct BottomSnapshot {
     pub(crate) cols: u16,
     pub(crate) rows: u16,
     pub(crate) statusline_height: usize,
-    pub(crate) input: String,
+    pub(crate) input_hash: u64,
     pub(crate) cursor_pos: usize,
     pub(crate) is_running: bool,
     pub(crate) spinner_frame: u8,
     pub(crate) input_vscroll_offset: usize,
     pub(crate) prompt: PromptSnapshot,
-    pub(crate) statusline: Vec<Vec<StatusSpan>>,
+    pub(crate) statusline_key: u64,
     pub(crate) scroll_indicator: bool,
     pub(crate) monochrome: bool,
     pub(crate) input_bg: Option<Color>,
@@ -114,6 +116,13 @@ pub(crate) enum BottomRedrawPlan {
     /// Input area (or the geometry it sits in) changed; full bottom redraw.
     Full,
 }
+
+struct StatuslineCache {
+    key: u64,
+    lines: Arc<Vec<Vec<StatusSpan>>>,
+}
+
+const SPINNER: &[&str] = &["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
 
 pub struct Renderer {
     spinner_frame: u8,
@@ -155,6 +164,9 @@ pub struct Renderer {
     last_chat_snapshot: Option<ChatSnapshot>,
     bottom_dirty: bool,
     last_bottom_snapshot: Option<BottomSnapshot>,
+    statusline_cache: Option<StatuslineCache>,
+    #[cfg(test)]
+    statusline_builds: usize,
     /// Screen position of the input caret after the last full bottom draw;
     /// `None` when the caret is hidden (permission/chain prompts).
     bottom_cursor: Option<(u16, u16)>,
@@ -195,6 +207,9 @@ impl Renderer {
             last_chat_snapshot: None,
             bottom_dirty: true,
             last_bottom_snapshot: None,
+            statusline_cache: None,
+            #[cfg(test)]
+            statusline_builds: 0,
             bottom_cursor: None,
         })
     }
@@ -202,6 +217,33 @@ impl Renderer {
     /// Set the number of statusline rows (1-3). Call once at startup.
     pub fn set_statusline_height(&mut self, h: usize) {
         self.statusline_height = h.clamp(1, 3);
+    }
+
+    pub(crate) fn cached_statusline(
+        &mut self,
+        key: u64,
+        build: impl FnOnce() -> Vec<Vec<StatusSpan>>,
+    ) -> Arc<Vec<Vec<StatusSpan>>> {
+        if let Some(cache) = &self.statusline_cache
+            && cache.key == key
+        {
+            return Arc::clone(&cache.lines);
+        }
+        let lines = Arc::new(build());
+        self.statusline_cache = Some(StatuslineCache {
+            key,
+            lines: Arc::clone(&lines),
+        });
+        #[cfg(test)]
+        {
+            self.statusline_builds += 1;
+        }
+        lines
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statusline_builds(&self) -> usize {
+        self.statusline_builds
     }
 
     /// Rows reserved at the bottom: statusline lines + separator + input baseline.
@@ -259,12 +301,12 @@ impl Renderer {
         self.max_line_width()
     }
 
-    fn chat_lines(&self, width: usize) -> Vec<LineEntry> {
+    fn chat_lines(&self, width: usize) -> Arc<Vec<LineEntry>> {
         let mut lines = self.feed.lines(width);
         if !self.partial.is_empty() {
             let color = self.partial_style.color();
             for chunk in word_wrap(&self.partial, width) {
-                lines.push(LineEntry { text: chunk, color });
+                Arc::make_mut(&mut lines).push(LineEntry { text: chunk, color });
             }
         }
         lines
@@ -915,7 +957,7 @@ impl Renderer {
         &self,
         input_line: &str,
         cursor_pos: usize,
-        statusline: &[Vec<StatusSpan>],
+        statusline_key: u64,
         is_running: bool,
         cols: u16,
         rows: u16,
@@ -937,14 +979,14 @@ impl Renderer {
             cols,
             rows,
             statusline_height: self.statusline_height,
-            input: input_line.to_string(),
+            input_hash: hash_value(input_line),
             cursor_pos,
             is_running,
             spinner_frame: self.spinner_frame,
             input_vscroll_offset: self.input_vscroll_offset,
             scroll_indicator: matches!(prompt, PromptSnapshot::Input) && self.scroll_offset > 0,
             prompt,
-            statusline: statusline.to_vec(),
+            statusline_key,
             monochrome: self.monochrome,
             input_bg: self.input_bg,
             status_bg: self.status_bg,
@@ -969,10 +1011,21 @@ impl Renderer {
         if prev == next {
             return BottomRedrawPlan::Skip;
         }
-        let mut status_only = next.clone();
-        status_only.statusline = prev.statusline.clone();
-        status_only.scroll_indicator = prev.scroll_indicator;
-        if status_only == *prev {
+        if next.cols == prev.cols
+            && next.rows == prev.rows
+            && next.statusline_height == prev.statusline_height
+            && next.input_hash == prev.input_hash
+            && next.cursor_pos == prev.cursor_pos
+            && next.is_running == prev.is_running
+            && next.spinner_frame == prev.spinner_frame
+            && next.input_vscroll_offset == prev.input_vscroll_offset
+            && next.prompt == prev.prompt
+            && next.monochrome == prev.monochrome
+            && next.input_bg == prev.input_bg
+            && next.status_bg == prev.status_bg
+            && (next.statusline_key != prev.statusline_key
+                || next.scroll_indicator != prev.scroll_indicator)
+        {
             BottomRedrawPlan::StatuslineOnly
         } else {
             BottomRedrawPlan::Full
@@ -1006,11 +1059,18 @@ impl Renderer {
         input_line: &str,
         cursor_pos: usize,
         statusline: &[Vec<StatusSpan>],
+        statusline_key: u64,
         is_running: bool,
     ) -> io::Result<()> {
         let (cols, rows) = crossterm::terminal::size()?;
-        let snapshot =
-            self.bottom_snapshot(input_line, cursor_pos, statusline, is_running, cols, rows);
+        let snapshot = self.bottom_snapshot(
+            input_line,
+            cursor_pos,
+            statusline_key,
+            is_running,
+            cols,
+            rows,
+        );
         match Self::bottom_redraw_plan(
             self.last_bottom_snapshot.as_ref(),
             &snapshot,
@@ -1128,7 +1188,6 @@ impl Renderer {
         let max_input_rows = available_rows.min((available_rows * 3 / 10).max(5));
         let need_scroll = line_count > max_input_rows;
 
-        const SPINNER: &[&str] = &["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
         let prompt = if is_running {
             let frame = SPINNER[self.spinner_frame as usize];
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len() as u8;
@@ -1302,6 +1361,46 @@ impl Renderer {
         self.record_bottom_drawn(drawn);
         Ok(())
     }
+
+    /// Advance only the running prompt's spinner cell. The 100 ms UI tick uses
+    /// this after an ordinary full draw has established the input geometry.
+    pub(crate) fn tick_spinner(&mut self) -> io::Result<()> {
+        let Some(snapshot) = self.last_bottom_snapshot.as_ref() else {
+            return Ok(());
+        };
+        if self.bottom_dirty
+            || !snapshot.is_running
+            || !matches!(snapshot.prompt, PromptSnapshot::Input)
+        {
+            return Ok(());
+        }
+
+        let drawn_frame = self.spinner_frame;
+        let mut stdout = io::stdout();
+        stdout.execute(MoveTo(0, self.input_base_row))?;
+        if let Some(bg) = self.input_bg {
+            write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+        }
+        write!(
+            stdout,
+            "{}{}{}",
+            SetForegroundColor(self.color(Color::DarkYellow)),
+            SPINNER[drawn_frame as usize],
+            ResetColor
+        )?;
+        stdout.flush()?;
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len() as u8;
+        if let Some(snapshot) = self.last_bottom_snapshot.as_mut() {
+            snapshot.spinner_frame = drawn_frame;
+        }
+        self.restore_bottom_cursor()
+    }
+}
+
+fn hash_value(value: impl Hash) -> u64 {
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut state);
+    state.finish()
 }
 
 /// Validate that a URL is safe to hand to the OS opener: an absolute http(s)

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use compact_str::CompactString;
 use crossterm::style::Color;
@@ -94,12 +95,12 @@ struct MdCache {
     stable_len: usize,
     /// Lines parsed up to stable_len. This is the stable prefix that won't
     /// change if text is extended beyond stable_len (within the same width).
-    stable_lines: Vec<LineEntry>,
+    stable_lines: Arc<Vec<LineEntry>>,
     /// Byte length of the parsed prefix: up to the last completed line for
     /// running blocks, the full text once finalized.
     parsed_len: usize,
     /// All lines parsed so far (for text[0..parsed_len]).
-    lines: Vec<LineEntry>,
+    lines: Arc<Vec<LineEntry>>,
 }
 
 impl Block {
@@ -142,7 +143,7 @@ pub struct Feed {
 struct LayoutCache {
     width: usize,
     generation: u64,
-    lines: Vec<LineEntry>,
+    lines: Arc<Vec<LineEntry>>,
 }
 
 // Several helpers exist primarily for unit testing layout/scroll math without
@@ -256,7 +257,7 @@ impl Feed {
     /// generation)`, so scroll and selection queries (`line_count`,
     /// `visible_range`, `line_at_visual_row`, `selected_text`) operate on the
     /// cached visual rows instead of re-laying out the feed on every call.
-    pub fn lines(&self, width: usize) -> Vec<LineEntry> {
+    pub fn lines(&self, width: usize) -> Arc<Vec<LineEntry>> {
         {
             let cache = self.layout_cache.borrow();
             if let Some(c) = cache.as_ref()
@@ -266,13 +267,13 @@ impl Feed {
                 return c.lines.clone();
             }
         }
-        let lines = self.compute_lines(width);
+        let lines = Arc::new(self.compute_lines(width));
         #[cfg(test)]
         self.layout_computes.set(self.layout_computes.get() + 1);
         *self.layout_cache.borrow_mut() = Some(LayoutCache {
             width,
             generation: self.generation,
-            lines: lines.clone(),
+            lines: Arc::clone(&lines),
         });
         lines
     }
@@ -295,11 +296,8 @@ impl Feed {
         for block in &self.blocks {
             match block.style {
                 BlockStyle::Agent => {
-                    let mut styled = agent_block_lines(self, block, width);
-                    if !styled.is_empty() {
-                        styled[0].text = CompactString::from(format!("< {}", styled[0].text));
-                    }
-                    result.extend(styled);
+                    let styled = agent_block_lines(self, block, width);
+                    result.extend(styled.iter().cloned());
                 }
                 _ => {
                     let color = block.style.color();
@@ -560,7 +558,7 @@ fn contains_global_markdown_definition(text: &str) -> bool {
 /// When completed_len extends within the same stable boundary, only the new
 /// portion (stable_len..completed_len) is re-parsed and appended. Mutators
 /// that rewrite text (`replace_last`, `finalize_last`) clear the cache explicitly.
-fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEntry> {
+fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEntry>> {
     // Text parsed as markdown: the whole block once finalized, or only the
     // completed lines (up to the last newline) while streaming.
     let completed_len = if block.running {
@@ -576,7 +574,10 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEntry>
     // unfinished tail leaves completed_len unchanged and needs no markdown work.
     if let Some(cached) = cached_agent_lines(block, width, completed_len) {
         let mut lines = cached;
-        append_agent_tail(&mut lines, block, completed_len, width);
+        if block.running && completed_len < block.text.len() {
+            append_agent_tail(Arc::make_mut(&mut lines), block, completed_len, width);
+            prefix_agent_first_line(Arc::make_mut(&mut lines));
+        }
         return lines;
     }
 
@@ -588,7 +589,7 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEntry>
             (cache.width == width && cache.parsed_len < completed_len).then(|| {
                 (
                     cache.stable_len,
-                    cache.stable_lines.clone(),
+                    Arc::clone(&cache.stable_lines),
                     cache.parsed_len,
                 )
             })
@@ -603,59 +604,83 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEntry>
         let stable_len = find_stable_boundary(&block.text, previous_stable_len, completed_len);
         let suffix =
             parse_agent_markdown(feed, &block.text[previous_stable_len..completed_len], width);
-        let mut lines = previous_stable_lines.clone();
+        let mut lines = previous_stable_lines.as_ref().clone();
         lines.extend_from_slice(&suffix);
+        prefix_agent_first_line(&mut lines);
 
         let stable_lines = if stable_len == previous_stable_len {
-            previous_stable_lines
+            Arc::clone(&previous_stable_lines)
         } else if stable_len == completed_len {
-            lines.clone()
+            Arc::new(lines.clone())
         } else {
-            let mut stable_lines = previous_stable_lines;
+            let mut stable_lines = previous_stable_lines.as_ref().clone();
             stable_lines.extend(parse_agent_markdown(
                 feed,
                 &block.text[previous_stable_len..stable_len],
                 width,
             ));
-            stable_lines
+            prefix_agent_first_line(&mut stable_lines);
+            Arc::new(stable_lines)
         };
+
+        let cached_lines = Arc::new(lines);
 
         *block.md_cache.borrow_mut() = Some(MdCache {
             width,
             stable_len,
             stable_lines,
             parsed_len: completed_len,
-            lines: lines.clone(),
+            lines: Arc::clone(&cached_lines),
         });
 
-        append_agent_tail(&mut lines, block, completed_len, width);
-        return lines;
+        let mut rendered = cached_lines;
+        if block.running && completed_len < block.text.len() {
+            append_agent_tail(Arc::make_mut(&mut rendered), block, completed_len, width);
+            prefix_agent_first_line(Arc::make_mut(&mut rendered));
+        }
+        return rendered;
     }
 
     // Full re-parse: need to establish a new stable boundary or handle width change.
     let stable_len = find_stable_boundary(&block.text, 0, completed_len);
-    let full_parsed = parse_agent_markdown(feed, &block.text[..completed_len], width);
+    let mut full_parsed = parse_agent_markdown(feed, &block.text[..completed_len], width);
+    prefix_agent_first_line(&mut full_parsed);
 
     // Compute stable lines: parse only up to the stable boundary.
     let stable_lines = if stable_len == completed_len {
-        full_parsed.clone()
+        Arc::new(full_parsed.clone())
     } else if stable_len > 0 {
-        parse_agent_markdown(feed, &block.text[..stable_len], width)
+        let mut stable = parse_agent_markdown(feed, &block.text[..stable_len], width);
+        prefix_agent_first_line(&mut stable);
+        Arc::new(stable)
     } else {
-        Vec::new()
+        Arc::new(Vec::new())
     };
+
+    let cached_lines = Arc::new(full_parsed);
 
     *block.md_cache.borrow_mut() = Some(MdCache {
         width,
         stable_len,
         stable_lines,
         parsed_len: completed_len,
-        lines: full_parsed.clone(),
+        lines: Arc::clone(&cached_lines),
     });
 
-    let mut lines = full_parsed;
-    append_agent_tail(&mut lines, block, completed_len, width);
-    lines
+    let mut rendered = cached_lines;
+    if block.running && completed_len < block.text.len() {
+        append_agent_tail(Arc::make_mut(&mut rendered), block, completed_len, width);
+        prefix_agent_first_line(Arc::make_mut(&mut rendered));
+    }
+    rendered
+}
+
+fn prefix_agent_first_line(lines: &mut Vec<LineEntry>) {
+    if let Some(first) = lines.first_mut()
+        && !first.text.starts_with("< ")
+    {
+        first.text = CompactString::from(format!("< {}", first.text));
+    }
 }
 
 fn parse_agent_markdown(feed: &Feed, text: &str, width: usize) -> Vec<LineEntry> {
@@ -685,11 +710,15 @@ fn append_agent_tail(
 }
 
 /// Return the memoized markdown layout when it matches `(width, stable_len, parsed_len)`.
-fn cached_agent_lines(block: &Block, width: usize, parsed_len: usize) -> Option<Vec<LineEntry>> {
+fn cached_agent_lines(
+    block: &Block,
+    width: usize,
+    parsed_len: usize,
+) -> Option<Arc<Vec<LineEntry>>> {
     let cache = block.md_cache.borrow();
     let cache = cache.as_ref()?;
     if cache.width == width && cache.parsed_len == parsed_len {
-        Some(cache.lines.clone())
+        Some(Arc::clone(&cache.lines))
     } else {
         None
     }

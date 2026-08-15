@@ -312,24 +312,19 @@ fn chat_margin_reduces_content_width() {
 mod dirty {
     use crate::ui::feed::BlockStyle;
     use crate::ui::renderer::{BottomRedrawPlan, BottomSnapshot, PromptSnapshot, Renderer};
-    use crate::ui::statusline::StatusSpan;
 
     fn bottom_snapshot() -> BottomSnapshot {
         BottomSnapshot {
             cols: 80,
             rows: 24,
             statusline_height: 1,
-            input: String::new(),
+            input_hash: 0,
             cursor_pos: 0,
             is_running: false,
             spinner_frame: 0,
             input_vscroll_offset: 0,
             prompt: PromptSnapshot::Input,
-            statusline: vec![vec![StatusSpan::Text {
-                text: "model".to_string(),
-                fg: None,
-                bg: None,
-            }]],
+            statusline_key: 0,
             scroll_indicator: false,
             monochrome: false,
             input_bg: None,
@@ -448,11 +443,7 @@ mod dirty {
     fn bottom_plan_statusline_only_on_statusline_change() {
         let prev = bottom_snapshot();
         let mut next = bottom_snapshot();
-        next.statusline = vec![vec![StatusSpan::Text {
-            text: "other model".to_string(),
-            fg: None,
-            bg: None,
-        }]];
+        next.statusline_key = 1;
         assert_eq!(
             Renderer::bottom_redraw_plan(Some(&prev), &next, false),
             BottomRedrawPlan::StatuslineOnly
@@ -474,7 +465,7 @@ mod dirty {
     fn bottom_plan_full_on_input_change() {
         let prev = bottom_snapshot();
         let mut next = bottom_snapshot();
-        next.input = "typed".to_string();
+        next.input_hash = 1;
         assert_eq!(
             Renderer::bottom_redraw_plan(Some(&prev), &next, false),
             BottomRedrawPlan::Full
@@ -544,11 +535,23 @@ mod dirty {
     fn bottom_plan_full_when_statusline_and_input_change() {
         let prev = bottom_snapshot();
         let mut next = bottom_snapshot();
-        next.input = "typed".to_string();
-        next.statusline = Vec::new();
+        next.input_hash = 1;
+        next.statusline_key = 1;
         assert_eq!(
             Renderer::bottom_redraw_plan(Some(&prev), &next, false),
             BottomRedrawPlan::Full
         );
+    }
+
+    #[test]
+    fn statusline_cache_reuses_spans_until_its_input_key_changes() {
+        let mut renderer = Renderer::new().unwrap();
+        let first = renderer.cached_statusline(7, || vec![Vec::new()]);
+        let second = renderer.cached_statusline(7, || panic!("cache hit rebuilt statusline"));
+        let third = renderer.cached_statusline(8, || vec![Vec::new(), Vec::new()]);
+
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(!std::sync::Arc::ptr_eq(&second, &third));
+        assert_eq!(renderer.statusline_builds(), 2);
     }
 }

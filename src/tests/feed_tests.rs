@@ -1,5 +1,6 @@
 use crate::ui::feed::{BlockStyle, Feed};
 use crossterm::style::Color;
+use std::sync::Arc;
 
 #[test]
 fn block_style_color_mapping() {
@@ -31,7 +32,7 @@ fn lines_wrap_narrow_width() {
     feed.push_line(BlockStyle::Plain, "hello world");
     let lines = feed.lines(5);
     assert!(lines.len() > 1);
-    for line in &lines {
+    for line in lines.iter() {
         assert!(line.text.chars().count() <= 5 || line.text == "hello" || line.text == "world");
     }
 }
@@ -88,6 +89,18 @@ fn line_count_matches_lines() {
     feed.push_line(BlockStyle::Plain, "two");
     feed.push_line(BlockStyle::Plain, "three");
     assert_eq!(feed.line_count(80), 3);
+}
+
+#[test]
+fn repeated_layout_hits_share_the_cached_line_vector() {
+    let mut feed = Feed::new();
+    feed.push_line(BlockStyle::Plain, "shared");
+
+    let first = feed.lines(80);
+    let second = feed.lines(80);
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(feed.layout_computes(), 1);
 }
 
 #[test]
@@ -483,7 +496,7 @@ fn streaming_reference_definition_reparses_earlier_references() {
     let reparsed = fresh.lines(80);
 
     assert_eq!(incremental.len(), reparsed.len());
-    for (actual, expected) in incremental.iter().zip(&reparsed) {
+    for (actual, expected) in incremental.iter().zip(reparsed.iter()) {
         assert_eq!(actual.text, expected.text);
         assert_eq!(actual.color, expected.color);
     }
@@ -503,7 +516,7 @@ fn streaming_indented_code_continues_across_blank_line() {
     let reparsed = fresh.lines(80);
 
     assert_eq!(incremental.len(), reparsed.len());
-    for (actual, expected) in incremental.iter().zip(&reparsed) {
+    for (actual, expected) in incremental.iter().zip(reparsed.iter()) {
         assert_eq!(actual.text, expected.text);
         assert_eq!(actual.color, expected.color);
     }

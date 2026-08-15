@@ -524,7 +524,7 @@ impl<'a> App<'a> {
                     self.refresh()?;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if self.run.is_running => {
-                    self.refresh()?;
+                    self.renderer.tick_spinner()?;
                 }
                 else => {
                     if let Some(rx) = self.prebuild_rx.as_mut()

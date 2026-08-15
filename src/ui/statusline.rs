@@ -6,6 +6,7 @@
 //! time; `separator` is literal text and `flex_separator` expands to fill the
 //! row, pushing later segments to the right.
 
+use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
 use crossterm::style::Color;
@@ -78,6 +79,69 @@ pub fn needs_git_status() -> bool {
 /// Build the statusline's drawable lines for the current state.
 pub fn build(session: &Session, ctx: &StatusContext) -> Vec<Vec<StatusSpan>> {
     build_lines(spec(), session, ctx)
+}
+
+/// Stable fingerprint of every live value that can affect [`build`]. The UI
+/// uses this to retain built spans across refreshes where only the spinner or
+/// chat viewport changed.
+pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    session.id.hash(&mut state);
+    session.name.hash(&mut state);
+    session.messages.len().hash(&mut state);
+    session.compactions.len().hash(&mut state);
+    session.created_at.hash(&mut state);
+    session.updated_at.hash(&mut state);
+    session.total_input_tokens.hash(&mut state);
+    session.total_output_tokens.hash(&mut state);
+    session.total_cached_input_tokens.hash(&mut state);
+    session.total_cache_creation_input_tokens.hash(&mut state);
+    session.total_cost.to_bits().hash(&mut state);
+    session.effective_context_tokens().hash(&mut state);
+    session.context_window.hash(&mut state);
+    session.model.hash(&mut state);
+    session.provider.hash(&mut state);
+    session.show_cost_always.hash(&mut state);
+    session.git_branch.hash(&mut state);
+    session.git_status.is_some().hash(&mut state);
+    if let Some(git) = &session.git_status {
+        git.staged.hash(&mut state);
+        git.modified.hash(&mut state);
+        git.deleted.hash(&mut state);
+        git.untracked.hash(&mut state);
+        git.ahead.hash(&mut state);
+        git.behind.hash(&mut state);
+    }
+    session.reasoning_enabled.hash(&mut state);
+    ctx.workspace.hash(&mut state);
+    ctx.loop_label.hash(&mut state);
+    ctx.prompt_name.hash(&mut state);
+    ctx.perm_mode.hash(&mut state);
+    ctx.chain_label.hash(&mut state);
+    ctx.btw_cost.to_bits().hash(&mut state);
+    ctx.btw_in.hash(&mut state);
+    ctx.btw_out.hash(&mut state);
+
+    let uses = |item: &str| {
+        spec()
+            .lines
+            .iter()
+            .flat_map(|line| &line.segments)
+            .any(|segment| segment.item == item)
+    };
+    if uses("clock") {
+        chrono::Local::now()
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+            .hash(&mut state);
+    }
+    if uses("session_age") {
+        fmt_elapsed(&session.created_at).hash(&mut state);
+    }
+    if uses("session_updated") {
+        fmt_elapsed(&session.updated_at).hash(&mut state);
+    }
+    state.finish()
 }
 
 /// Build drawable lines from an explicit spec (used by `build` and tests).
