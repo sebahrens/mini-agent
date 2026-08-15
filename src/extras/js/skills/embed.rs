@@ -681,69 +681,99 @@ pub struct ModelMetadata {
     pub normalized: bool,
 }
 
-/// Bounded query cache with LRU eviction.
+/// Bounded query cache with O(1)-hit monotonic counter LRU eviction.
 struct QueryCache {
     entries: HashMap<String, CacheEntry>,
-    lru_order: Vec<String>,
     max_entries: usize,
     max_bytes: usize,
     current_bytes: usize,
     hits: u64,
     evictions: u64,
+    /// Monotonic generation counter for last-used tracking.
+    /// Incremented on each cache hit to avoid O(n) list manipulations.
+    generation: u64,
 }
 
-#[derive(Clone)]
+/// A cache entry holding the embedding and tracking when it was last used.
+/// The immutable slice makes cache hits cheap to share without exposing spare
+/// vector capacity or allowing callers to mutate the cached value.
 struct CacheEntry {
-    embedding: Vec<f32>,
+    embedding: Arc<[f32]>,
     size_bytes: usize,
+    /// Generation at which this entry was last accessed (or inserted).
+    last_used: u64,
 }
 
 impl QueryCache {
     fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            lru_order: Vec::new(),
             max_entries,
             max_bytes,
             current_bytes: 0,
             hits: 0,
             evictions: 0,
+            generation: 0,
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<Vec<f32>> {
-        if let Some(entry) = self.entries.get(key) {
-            // Update LRU order: move to end
-            self.lru_order.retain(|k| k != key);
-            self.lru_order.push(key.to_string());
+    fn next_generation(&mut self) -> u64 {
+        if self.generation == u64::MAX {
+            let mut entries: Vec<_> = self.entries.values_mut().collect();
+            entries.sort_unstable_by_key(|entry| entry.last_used);
+            for (index, entry) in entries.into_iter().enumerate() {
+                entry.last_used = index as u64 + 1;
+            }
+            self.generation = self.entries.len() as u64;
+        }
+        self.generation += 1;
+        self.generation
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<[f32]>> {
+        let generation = self.next_generation();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_used = generation;
             self.hits += 1;
-            Some(entry.embedding.clone())
+            Some(Arc::clone(&entry.embedding))
         } else {
             None
         }
     }
 
-    fn insert(&mut self, key: String, embedding: Vec<f32>) {
+    fn insert(&mut self, key: String, embedding: Arc<[f32]>) {
         let size_bytes = embedding.len() * std::mem::size_of::<f32>();
-        let entry = CacheEntry {
-            embedding,
-            size_bytes,
-        };
+
+        if self.max_entries == 0 || size_bytes > self.max_bytes {
+            return;
+        }
+
+        let generation = self.next_generation();
 
         // If key exists, remove old entry first
         if let Some(old_entry) = self.entries.remove(&key) {
             self.current_bytes = self.current_bytes.saturating_sub(old_entry.size_bytes);
-            self.lru_order.retain(|k| k != &key);
         }
 
-        // Evict entries if necessary to make room
+        let entry = CacheEntry {
+            embedding,
+            size_bytes,
+            last_used: generation,
+        };
+
+        // Evict entries if necessary to make room: O(n) but only on eviction
         while (self.current_bytes + size_bytes > self.max_bytes && !self.entries.is_empty())
             || (self.entries.len() >= self.max_entries && !self.entries.is_empty())
         {
-            if let Some(lru_key) = self.lru_order.first().cloned() {
+            // Scan for the entry with minimum last_used
+            if let Some(lru_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| k.clone())
+            {
                 if let Some(removed) = self.entries.remove(&lru_key) {
                     self.current_bytes = self.current_bytes.saturating_sub(removed.size_bytes);
-                    self.lru_order.remove(0);
                     self.evictions += 1;
                 }
             } else {
@@ -752,7 +782,6 @@ impl QueryCache {
         }
 
         self.current_bytes += size_bytes;
-        self.lru_order.push(key.clone());
         self.entries.insert(key, entry);
     }
 
@@ -767,7 +796,6 @@ impl QueryCache {
 
     fn clear(&mut self) {
         self.entries.clear();
-        self.lru_order.clear();
         self.current_bytes = 0;
     }
 }
@@ -920,8 +948,9 @@ impl Embedder {
 
     /// Embed a single query with caching.
     ///
-    /// Returned vector is normalized and has correct dimension.
-    pub async fn embed_query_cached(&self, query: &str) -> Result<Vec<f32>, EmbeddingError> {
+    /// Returned embedding is normalized, has the correct dimension, and is
+    /// cheaply shared across cache hits.
+    pub async fn embed_query_cached(&self, query: &str) -> Result<Arc<[f32]>, EmbeddingError> {
         if query.trim().is_empty() {
             return Err(EmbeddingError::EmptyQuery);
         }
@@ -968,10 +997,12 @@ impl Embedder {
             return Err(EmbeddingError::NonFiniteValue);
         }
 
-        // Cache result
+        let embedding: Arc<[f32]> = embedding.into();
+
+        // Cache result without copying its allocation.
         {
             let mut cache = self.cache.lock().await;
-            cache.insert(cache_key, embedding.clone());
+            cache.insert(cache_key, Arc::clone(&embedding));
         }
 
         Ok(embedding)
@@ -1233,6 +1264,129 @@ mod tests {
 
         let stats = embedder.cache_stats().await;
         assert!(stats.evictions > 0, "cache should have evicted");
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_does_not_reallocate_embedding() {
+        // Test that the cached Arc is reused across hits, not reallocated.
+        // We inspect the cache directly to verify Arc pointer equality.
+        let backend = Arc::new(DeterministicBackend::new());
+        let metadata = ModelMetadata {
+            model_id: backend.model_id().to_string(),
+            model_revision: backend.model_revision().to_string(),
+            dimensions: backend.dimensions(),
+            normalized: backend.normalized(),
+        };
+
+        let cache = Arc::new(tokio::sync::Mutex::new(QueryCache::new(100, usize::MAX)));
+        let embedder = Embedder {
+            backend,
+            metadata,
+            cache: Arc::clone(&cache),
+        };
+
+        let query = "test query for arc sharing";
+        let emb1 = embedder.embed_query_cached(query).await.unwrap();
+
+        let emb2 = embedder.embed_query_cached(query).await.unwrap();
+
+        assert!(Arc::ptr_eq(&emb1, &emb2));
+        assert_eq!(cache.lock().await.hits, 1);
+    }
+
+    #[test]
+    fn test_query_cache_arc_sharing_on_hit() {
+        // Unit test: verify that get() returns the same Arc, not a cloned vector.
+        let mut cache = QueryCache::new(10, usize::MAX);
+        let embedding = vec![1.0, 2.0, 3.0, 4.0];
+        let key = "test_key".to_string();
+
+        cache.insert(key.clone(), embedding.into());
+
+        // First get
+        let arc1 = cache.get(&key).expect("should find key");
+        let ptr1 = Arc::as_ptr(&arc1);
+
+        // Second get on same key
+        let arc2 = cache.get(&key).expect("should find key");
+        let ptr2 = Arc::as_ptr(&arc2);
+
+        // Both should point to the same Arc allocation
+        assert_eq!(ptr1, ptr2, "cache should return the same Arc on hit");
+
+        // Verify the data is correct
+        assert_eq!(arc1.len(), 4);
+        assert_eq!(arc1[0], 1.0);
+    }
+
+    #[test]
+    fn test_query_cache_rejects_entries_that_cannot_fit() {
+        let embedding: Arc<[f32]> = vec![1.0, 2.0].into();
+
+        let mut entry_limited = QueryCache::new(0, usize::MAX);
+        entry_limited.insert("entry-limit".to_string(), Arc::clone(&embedding));
+        assert_eq!(entry_limited.stats().entries, 0);
+        assert_eq!(entry_limited.stats().bytes, 0);
+
+        let mut byte_limited = QueryCache::new(1, std::mem::size_of::<f32>());
+        byte_limited.insert("byte-limit".to_string(), embedding);
+        assert_eq!(byte_limited.stats().entries, 0);
+        assert_eq!(byte_limited.stats().bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_lru_eviction_respects_recency() {
+        // Test that LRU eviction is based on last used (via get), not insertion order.
+        let backend = Arc::new(DeterministicBackend::new());
+        let metadata = ModelMetadata {
+            model_id: backend.model_id().to_string(),
+            model_revision: backend.model_revision().to_string(),
+            dimensions: backend.dimensions(),
+            normalized: backend.normalized(),
+        };
+
+        // Create a small cache: max 2 entries
+        let embedder = Embedder {
+            backend,
+            metadata,
+            cache: Arc::new(tokio::sync::Mutex::new(QueryCache::new(2, usize::MAX))),
+        };
+
+        // Insert q1, q2
+        embedder.embed_query_cached("query1").await.unwrap();
+        embedder.embed_query_cached("query2").await.unwrap();
+        let stats = embedder.cache_stats().await;
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.evictions, 0);
+
+        // Access q1 again, making it recently used
+        embedder.embed_query_cached("query1").await.unwrap();
+
+        // Insert q3: should evict q2 (least recently used), not q1
+        embedder.embed_query_cached("query3").await.unwrap();
+        let stats = embedder.cache_stats().await;
+        assert_eq!(stats.entries, 2, "should have evicted exactly one entry");
+        assert_eq!(stats.evictions, 1, "should have evicted q2");
+
+        // Verify q1 is still cached
+        let stats_before = embedder.cache_stats().await;
+        let hits_before = stats_before.hits;
+        embedder.embed_query_cached("query1").await.unwrap();
+        let stats_after = embedder.cache_stats().await;
+        assert_eq!(
+            stats_after.hits,
+            hits_before + 1,
+            "q1 should still be in cache"
+        );
+
+        // Verify q2 was evicted
+        embedder.embed_query_cached("query2").await.unwrap();
+        let stats_q2 = embedder.cache_stats().await;
+        // One more eviction to make room for q2
+        assert!(
+            stats_q2.evictions >= 2,
+            "q2 should have been evicted earlier"
+        );
     }
 
     #[test]
