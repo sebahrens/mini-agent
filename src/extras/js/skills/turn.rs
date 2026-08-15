@@ -20,8 +20,6 @@ const MAX_QUERY_BYTES: usize = 8 * 1024;
 const MAX_TRUSTED_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_AGENT_RESOURCE_CONTEXT_BYTES: usize = 32 * 1024;
 const MAX_AGENT_RESOURCE_INVENTORY_BYTES: usize = 8 * 1024;
-const BACKGROUND_REBUILD_ROWS: usize = 10_000;
-
 type CoordinatorRegistry = Mutex<HashMap<String, Arc<IndexCoordinator>>>;
 static COORDINATORS: OnceLock<CoordinatorRegistry> = OnceLock::new();
 
@@ -141,43 +139,7 @@ impl SkillRuntime {
         let mut diagnostics = Vec::new();
         let learned = if learned_js_enabled {
             match shared_coordinator(paths, Arc::clone(&embedder)) {
-                Ok((coordinator, created)) => {
-                    if !created {
-                        Some(coordinator)
-                    } else {
-                        match coordinator.active_count() {
-                            Ok(count) if count >= BACKGROUND_REBUILD_ROWS => {
-                                // `SkillRuntime::open` is already run inside the
-                                // turn's owned blocking scope. A nested raw thread
-                                // would escape ACP cancellation, so complete the
-                                // rebuild on that tracked worker instead.
-                                tracing::info!(count, "building learned-skill index");
-                                if let Err(error) = coordinator.rebuild_and_publish() {
-                                    diagnostics.push(format!(
-                                        "learned_js_index_worker_unavailable:{error}"
-                                    ));
-                                    None
-                                } else {
-                                    Some(coordinator)
-                                }
-                            }
-                            Ok(_) => {
-                                if let Err(error) = coordinator.rebuild_and_publish() {
-                                    diagnostics
-                                        .push(format!("learned_js_index_unavailable:{error}"));
-                                    None
-                                } else {
-                                    Some(coordinator)
-                                }
-                            }
-                            Err(error) => {
-                                diagnostics
-                                    .push(format!("learned_js_index_count_unavailable:{error}"));
-                                None
-                            }
-                        }
-                    }
-                }
+                Ok((coordinator, _created)) => Some(coordinator),
                 Err(error) => {
                     diagnostics.push(format!("learned_js_store_unavailable:{error}"));
                     None
@@ -207,6 +169,15 @@ impl SkillRuntime {
         })
     }
 
+    /// Start a stale-while-revalidate publication without delaying runtime
+    /// construction or the first prompt. Repeated callers coalesce at the
+    /// process-wide coordinator.
+    pub(crate) fn schedule_learned_rebuild(&self) -> bool {
+        self.learned.as_ref().is_some_and(|coordinator| {
+            coordinator.needs_refresh().unwrap_or(true) && coordinator.schedule_rebuild()
+        })
+    }
+
     pub fn turn_context(&self) -> Arc<SkillTurnContext> {
         Arc::clone(&self.turn_context)
     }
@@ -225,19 +196,8 @@ impl SkillRuntime {
         if let Some(coordinator) = &self.learned {
             match coordinator.needs_refresh() {
                 Ok(true) => {
-                    let coordinator = Arc::clone(coordinator);
-                    match crate::agent::runner::spawn_blocking_scoped(move || {
-                        coordinator.rebuild_and_publish()
-                    })
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            diagnostics.push(format!("learned_js_refresh_unavailable:{error}"))
-                        }
-                        Err(error) => diagnostics
-                            .push(format!("learned_js_refresh_worker_unavailable:{error}")),
-                    }
+                    self.schedule_learned_rebuild();
+                    diagnostics.push("learned_js_refresh_pending".to_string());
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -673,6 +633,31 @@ impl SkillRuntime {
             (None, None) => true,
             _ => false,
         }
+    }
+
+    pub(crate) async fn settle_learned_rebuild_for_test(&self) {
+        let Some(coordinator) = &self.learned else {
+            return;
+        };
+        self.schedule_learned_rebuild();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !coordinator.rebuild_in_flight_for_test()
+                    && !coordinator.needs_refresh().unwrap()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("learned-skill background rebuild should settle");
+    }
+
+    pub(crate) fn learned_rebuild_starts_for_test(&self) -> usize {
+        self.learned
+            .as_ref()
+            .map_or(0, |coordinator| coordinator.rebuild_starts_for_test())
     }
 }
 

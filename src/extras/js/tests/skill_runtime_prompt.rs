@@ -117,6 +117,7 @@ async fn prompt_discovery_reuses_one_query_embedding_for_both_typed_indexes() {
                 ..AgentSkillSearchPolicy::default()
             },
         );
+    runtime.settle_learned_rebuild_for_test().await;
     let prompt = retrieval_document(&learned);
     let discovery = runtime.prepare_turn(&prompt).await;
 
@@ -228,6 +229,7 @@ async fn prepared_prompt_places_trusted_manifest_before_the_user_prompt() {
             },
             AgentSkillSearchPolicy::default(),
         );
+    runtime.settle_learned_rebuild_for_test().await;
     let prompt = retrieval_document(&learned);
 
     let prepared = runtime.prepare_prompt(&prompt).await;
@@ -240,7 +242,7 @@ async fn prepared_prompt_places_trusted_manifest_before_the_user_prompt() {
 }
 
 #[tokio::test]
-async fn configured_skill_blocking_discovery_remains_owned_after_cancellation() {
+async fn background_skill_rebuild_returns_early_but_remains_owned() {
     let temp = TempPaths::new();
     let learned = learned_skill();
     SkillStore::open_at(&temp.paths)
@@ -257,13 +259,17 @@ async fn configured_skill_blocking_discovery_remains_owned_after_cancellation() 
                 AgentSkillSearchPolicy::default(),
             ),
     );
-    let prompt = retrieval_document(&learned);
     let (work_scope, started_rx, release) =
         crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
     let cancellation = work_scope.cancellation_handle();
+    let task_runtime = std::sync::Arc::clone(&runtime);
     let mut task = tokio::spawn({
         let work_scope = std::sync::Arc::clone(&work_scope);
-        async move { work_scope.run(runtime.prepare_prompt(&prompt)).await }
+        async move {
+            work_scope
+                .run(async move { task_runtime.schedule_learned_rebuild() })
+                .await
+        }
     });
     tokio::task::spawn_blocking(move || {
         started_rx
@@ -273,19 +279,26 @@ async fn configured_skill_blocking_discovery_remains_owned_after_cancellation() 
     .await
     .unwrap();
 
+    let scheduled = tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
+        .await
+        .expect("scheduling must not wait for the full index rebuild")
+        .unwrap();
+    assert!(scheduled);
     cancellation.cancel();
+    let mut idle = Box::pin(work_scope.wait_idle());
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut idle)
             .await
             .is_err(),
-        "cancellation must not detach already-running skill discovery"
+        "cancellation must retain ownership of the already-running rebuild"
     );
     release.release();
-    let prepared = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+    tokio::time::timeout(std::time::Duration::from_secs(1), idle)
         .await
-        .expect("owned skill discovery should finish after its blocking child completes")
-        .unwrap();
-    assert!(prepared.contains(&learned.id));
+        .expect("owned rebuild should finish after its blocking child completes");
+    runtime.settle_learned_rebuild_for_test().await;
+    let prompt = retrieval_document(&learned);
+    assert!(runtime.prepare_prompt(&prompt).await.contains(&learned.id));
 }
 
 #[tokio::test]
@@ -332,11 +345,32 @@ async fn trusted_skill_context_neutralizes_closing_tags_in_markdown_and_resource
     );
 }
 
-#[test]
-fn repeated_runtime_construction_reuses_one_process_coordinator() {
+#[tokio::test]
+async fn matching_generation_reuses_the_index_and_mutations_coalesce_one_rebuild() {
     let temp = TempPaths::new();
     let first = SkillRuntime::open(&temp.paths, None).unwrap();
-    let second = SkillRuntime::open(&temp.paths, None).unwrap();
+    assert_eq!(first.learned_rebuild_starts_for_test(), 0);
+    first.settle_learned_rebuild_for_test().await;
+    assert_eq!(first.learned_rebuild_starts_for_test(), 1);
 
+    let second = SkillRuntime::open(&temp.paths, None).unwrap();
     assert!(first.shares_learned_coordinator(&second));
+    assert!(!second.schedule_learned_rebuild());
+    assert_eq!(second.learned_rebuild_starts_for_test(), 1);
+
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store.insert_verified(&learned_skill()).unwrap();
+    let generation = store.generation_state().unwrap();
+    store
+        .request_generation(
+            &generation.model_id,
+            &generation.model_revision,
+            generation.dimensions,
+            generation.normalized,
+        )
+        .unwrap();
+    assert!(first.schedule_learned_rebuild());
+    assert!(!second.schedule_learned_rebuild());
+    first.settle_learned_rebuild_for_test().await;
+    assert_eq!(first.learned_rebuild_starts_for_test(), 2);
 }

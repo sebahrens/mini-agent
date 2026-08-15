@@ -1,7 +1,11 @@
 //! Off-request-path embedding migration and immutable index publication.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 use super::embed::{Embedder, EmbeddingError, ModelMetadata, SkillDocument};
 use super::index::{ImmutableSkillIndex, SkillIndex, SkillIndexError};
@@ -45,6 +49,18 @@ pub struct IndexCoordinator {
     store: Mutex<SkillStore>,
     embedder: Arc<Embedder>,
     published: RwLock<Arc<ImmutableSkillIndex>>,
+    hydrated: AtomicBool,
+    rebuild_in_flight: AtomicBool,
+    #[cfg(test)]
+    rebuild_starts: AtomicUsize,
+}
+
+struct RebuildFlightGuard<'a>(&'a AtomicBool);
+
+impl Drop for RebuildFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl IndexCoordinator {
@@ -75,6 +91,10 @@ impl IndexCoordinator {
             store: Mutex::new(store),
             embedder,
             published: RwLock::new(empty),
+            hydrated: AtomicBool::new(false),
+            rebuild_in_flight: AtomicBool::new(false),
+            #[cfg(test)]
+            rebuild_starts: AtomicUsize::new(0),
         })
     }
 
@@ -86,21 +106,41 @@ impl IndexCoordinator {
             .map_err(|_| CoordinatorError::Poisoned)
     }
 
-    pub fn active_count(&self) -> Result<usize, CoordinatorError> {
-        self.store
-            .lock()
-            .map_err(|_| CoordinatorError::Poisoned)?
-            .active_count()
-            .map_err(Into::into)
-    }
-
     pub fn needs_refresh(&self) -> Result<bool, CoordinatorError> {
+        if self.rebuild_in_flight.load(Ordering::Acquire) {
+            return Ok(true);
+        }
         let state = self
             .store
             .lock()
             .map_err(|_| CoordinatorError::Poisoned)?
             .generation_state()?;
-        Ok(state.desired_generation > state.applied_generation || state.publication_mode != "full")
+        Ok(!self.hydrated.load(Ordering::Acquire)
+            || state.desired_generation > state.applied_generation
+            || state.publication_mode != "full")
+    }
+
+    /// Schedule at most one tracked rebuild while readers keep using the last
+    /// immutable generation. The caller deliberately does not await the join
+    /// handle: the current agent work scope owns it through cancellation.
+    pub fn schedule_rebuild(self: &Arc<Self>) -> bool {
+        if self
+            .rebuild_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        #[cfg(test)]
+        self.rebuild_starts.fetch_add(1, Ordering::Relaxed);
+        let coordinator = Arc::clone(self);
+        std::mem::drop(crate::agent::runner::spawn_blocking_scoped(move || {
+            let _flight = RebuildFlightGuard(&coordinator.rebuild_in_flight);
+            if let Err(error) = coordinator.rebuild_and_publish() {
+                tracing::warn!(%error, "learned-skill background rebuild failed");
+            }
+        }));
+        true
     }
 
     /// Resolve one eligible replacement canary against the exact applied
@@ -247,6 +287,7 @@ impl IndexCoordinator {
                     CoordinatedMutationError::Publication(CoordinatorError::Poisoned)
                 })?;
                 *published = Arc::new(snapshot);
+                self.hydrated.store(true, Ordering::Release);
                 Ok((
                     result,
                     PublicationReport {
@@ -377,6 +418,7 @@ impl IndexCoordinator {
                 .write()
                 .map_err(|_| CoordinatorError::Poisoned)?;
             *published = Arc::clone(&snapshot);
+            self.hydrated.store(true, Ordering::Release);
         }
         // Publish the exact/FTS generation first, then build the expensive graph
         // without holding the store lock. A lifecycle update advances the durable
@@ -397,6 +439,16 @@ impl IndexCoordinator {
             }
         }
         Ok(generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rebuild_starts_for_test(&self) -> usize {
+        self.rebuild_starts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rebuild_in_flight_for_test(&self) -> bool {
+        self.rebuild_in_flight.load(Ordering::Acquire)
     }
 
     /// Retire durable state before publishing removal to readers.

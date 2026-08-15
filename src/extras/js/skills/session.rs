@@ -288,6 +288,7 @@ impl SkillSessionServices {
                 return None;
             }
         };
+        runtime.schedule_learned_rebuild();
 
         let mutation = match Self::start_mutation_services(&paths, embedding.as_ref()) {
             Ok(services) => Some(services),
