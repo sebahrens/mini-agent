@@ -131,6 +131,10 @@ pub struct Feed {
     /// pre-wrapped rows.
     #[cfg(test)]
     layout_computes: std::cell::Cell<usize>,
+    /// Total bytes sent to markdown_to_styled during agent_block_lines calls;
+    /// test-only proof that streaming achieves sub-quadratic parsing.
+    #[cfg(test)]
+    markdown_bytes_parsed: std::cell::Cell<usize>,
 }
 
 /// Memoized layout of the whole feed at a viewport width and generation.
@@ -152,6 +156,8 @@ impl Feed {
             layout_cache: RefCell::new(None),
             #[cfg(test)]
             layout_computes: std::cell::Cell::new(0),
+            #[cfg(test)]
+            markdown_bytes_parsed: std::cell::Cell::new(0),
         }
     }
 
@@ -277,13 +283,19 @@ impl Feed {
         self.layout_computes.get()
     }
 
+    /// Total bytes parsed by markdown_to_styled during agent_block_lines (test-only).
+    #[cfg(test)]
+    pub(crate) fn markdown_bytes_parsed(&self) -> usize {
+        self.markdown_bytes_parsed.get()
+    }
+
     /// Lay out every block at `width`. Called by `lines` on a cache miss.
     fn compute_lines(&self, width: usize) -> Vec<LineEntry> {
         let mut result = Vec::new();
         for block in &self.blocks {
             match block.style {
                 BlockStyle::Agent => {
-                    let mut styled = agent_block_lines(block, width);
+                    let mut styled = agent_block_lines(self, block, width);
                     if !styled.is_empty() {
                         styled[0].text = CompactString::from(format!("< {}", styled[0].text));
                     }
@@ -414,9 +426,9 @@ impl Feed {
 /// Find the byte offset of the last finalized markdown block boundary.
 ///
 /// A blank line is only a stable boundary if we're at top-level: not inside
-/// a fenced code block, indented code block, or loose list. This function
-/// scans the text tracking fence state and returns the position after the
-/// last blank line that occurs at top-level.
+/// a fenced code block, indented code block, or loose list. `start` must
+/// already be a known top-level boundary, which lets streaming callers scan
+/// only the newly unstable suffix instead of repeatedly scanning the prefix.
 ///
 /// Correctness note: This approach safely handles:
 /// - Fenced code blocks (``` / ~~~) containing blank lines: blank lines inside
@@ -426,49 +438,103 @@ impl Feed {
 /// Limitation: Within a single long fenced block with no blank lines at
 /// top-level, we degrade to O(n²) per-line re-parsing within that block.
 /// This is acceptable as long-lived fences are less common than mixed content.
-fn find_stable_boundary(text: &str, up_to: usize) -> usize {
-    let search_text = &text[..up_to.min(text.len())];
+fn find_stable_boundary(text: &str, start: usize, up_to: usize) -> usize {
+    let up_to = up_to.min(text.len());
+    let start = start.min(up_to);
+    let search_text = &text[start..up_to];
 
-    // Scan through the text, tracking whether we're inside a fenced code block.
-    // Only blank lines at top-level (not in a fence) are stable boundaries.
     let mut in_fence = false;
     let mut fence_char: Option<char> = None; // '`' or '~'
-    let mut last_stable_pos = 0;
-    let mut prev_was_blank = false;
-    let mut byte_pos = 0;
+    let mut in_list = false;
+    let mut in_indented_code = false;
+    let mut deferred_blank = None;
+    let mut last_stable_pos = start;
+    let mut byte_pos = start;
 
-    for line in search_text.split('\n') {
-        let line_start = byte_pos;
+    // split_inclusive excludes a synthetic empty line after a trailing newline,
+    // so every boundary we return is an actual byte offset in `text`.
+    for completed_line in search_text.split_inclusive('\n') {
+        if !completed_line.ends_with('\n') {
+            break;
+        }
+        let line = completed_line.strip_suffix('\n').unwrap_or(completed_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_end = byte_pos + completed_line.len();
 
         // Check if this line opens/closes a fence. Fences must start at line
         // beginning (with optional leading whitespace, which we skip).
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let new_fence_char = if trimmed.starts_with("```") { '`' } else { '~' };
+            let fence_char_candidate = if trimmed.starts_with("```") { '`' } else { '~' };
 
-            if in_fence && fence_char == Some(new_fence_char) {
+            if in_fence && fence_char == Some(fence_char_candidate) {
                 // Closing the fence.
                 in_fence = false;
                 fence_char = None;
             } else if !in_fence {
                 // Opening a new fence.
                 in_fence = true;
-                fence_char = Some(new_fence_char);
+                fence_char = Some(fence_char_candidate);
             }
-            // If in_fence but char doesn't match, it's just content; ignore
+            byte_pos = line_end;
+            continue;
         }
 
-        // If the previous line was blank and this one is too (and we're at
-        // top-level), the position after the previous line is a stable boundary.
-        if !in_fence && prev_was_blank && line.is_empty() {
-            last_stable_pos = byte_pos;
+        if in_fence {
+            byte_pos = line_end;
+            continue;
         }
 
-        prev_was_blank = !in_fence && line.is_empty();
-        byte_pos = line_start + line.len() + 1; // +1 for the newline
+        let indent = line.len().saturating_sub(trimmed.len());
+        if trimmed.is_empty() {
+            if in_list || in_indented_code {
+                // A loose list or indented code block may continue after one or
+                // more blank lines. Wait for the next content line before
+                // deciding whether this blank actually closed the construct.
+                deferred_blank.get_or_insert(line_end);
+            } else {
+                last_stable_pos = line_end;
+            }
+            byte_pos = line_end;
+            continue;
+        }
+
+        if let Some(blank_end) = deferred_blank.take() {
+            let continues_list = in_list && (is_list_item(trimmed) || indent > 0);
+            let continues_indented_code = in_indented_code && indent >= 4;
+            if !continues_list && !continues_indented_code {
+                last_stable_pos = blank_end;
+                in_list = false;
+                in_indented_code = false;
+            }
+        }
+
+        if is_list_item(trimmed) {
+            in_list = true;
+            in_indented_code = false;
+        } else if indent >= 4 && !in_list {
+            in_indented_code = true;
+        }
+
+        byte_pos = line_end;
     }
 
     last_stable_pos
+}
+
+fn is_list_item(trimmed: &str) -> bool {
+    if ["- ", "+ ", "* "]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+    {
+        return true;
+    }
+
+    let digit_count = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    digit_count > 0
+        && trimmed
+            .get(digit_count..)
+            .is_some_and(|suffix| suffix.starts_with(". ") || suffix.starts_with(") "))
 }
 
 /// Lay out an agent block: markdown for completed lines, plain text for the
@@ -480,7 +546,7 @@ fn find_stable_boundary(text: &str, up_to: usize) -> usize {
 /// When completed_len extends within the same stable boundary, only the new
 /// portion (stable_len..completed_len) is re-parsed and appended. Mutators
 /// that rewrite text (`replace_last`, `finalize_last`) clear the cache explicitly.
-fn agent_block_lines(block: &Block, width: usize) -> Vec<LineEntry> {
+fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEntry> {
     // Text parsed as markdown: the whole block once finalized, or only the
     // completed lines (up to the last newline) while streaming.
     let completed_len = if block.running {
@@ -492,78 +558,66 @@ fn agent_block_lines(block: &Block, width: usize) -> Vec<LineEntry> {
         block.text.len()
     };
 
-    let stable_len = find_stable_boundary(&block.text, completed_len);
-
-    // Try exact cache hit first: same width, stable_len, and parsed_len.
-    if let Some(cached) = cached_agent_lines(block, width, completed_len, stable_len) {
+    // Try an exact cache hit before scanning markdown boundaries. Appending an
+    // unfinished tail leaves completed_len unchanged and needs no markdown work.
+    if let Some(cached) = cached_agent_lines(block, width, completed_len) {
         let mut lines = cached;
-        // Append the unfinished tail line if needed.
-        if block.running && completed_len < block.text.len() {
-            let tail = block.text[completed_len..].trim_end_matches('\r');
-            if !tail.is_empty() {
-                let color = BlockStyle::Agent.color();
-                for chunk in word_wrap(tail, width) {
-                    lines.push(LineEntry { text: chunk, color });
-                }
-            }
-        }
+        append_agent_tail(&mut lines, block, completed_len, width);
         return lines;
     }
 
-    // Check if we can extend incrementally from a previous cache state.
-    // If the stable boundary hasn't changed and the width is the same,
-    // we can reuse the stable lines and only re-parse from stable_len to completed_len.
-    let should_extend = {
+    // Mutators that can replace text clear md_cache, so a same-width cache
+    // with a shorter parsed prefix is known to be an append-only extension.
+    let incremental_base = {
         let cache = block.md_cache.borrow();
-        cache
-            .as_ref()
-            .map(|c| c.width == width && c.stable_len == stable_len && c.parsed_len < completed_len)
-            .unwrap_or(false)
+        cache.as_ref().and_then(|cache| {
+            (cache.width == width && cache.parsed_len < completed_len)
+                .then(|| (cache.stable_len, cache.stable_lines.clone()))
+        })
     };
 
-    if should_extend {
-        // We need to re-borrow since we released the previous borrow.
-        let (stable_lines_to_use, stable_count) = {
-            let cache = block.md_cache.borrow();
-            let c = cache.as_ref().unwrap();
-            (c.stable_lines.clone(), c.stable_lines.len())
+    if let Some((previous_stable_len, previous_stable_lines)) = incremental_base {
+        let stable_len = find_stable_boundary(&block.text, previous_stable_len, completed_len);
+        let suffix =
+            parse_agent_markdown(feed, &block.text[previous_stable_len..completed_len], width);
+        let mut lines = previous_stable_lines.clone();
+        lines.extend_from_slice(&suffix);
+
+        let stable_lines = if stable_len == previous_stable_len {
+            previous_stable_lines
+        } else if stable_len == completed_len {
+            lines.clone()
+        } else {
+            let mut stable_lines = previous_stable_lines;
+            stable_lines.extend(parse_agent_markdown(
+                feed,
+                &block.text[previous_stable_len..stable_len],
+                width,
+            ));
+            stable_lines
         };
-
-        // Incremental extension within the same stable boundary.
-        let full_parsed = markdown_to_styled(&block.text[..completed_len], width);
-
-        let mut lines = stable_lines_to_use.clone();
-        if stable_count < full_parsed.len() {
-            lines.extend_from_slice(&full_parsed[stable_count..]);
-        }
 
         *block.md_cache.borrow_mut() = Some(MdCache {
             width,
             stable_len,
-            stable_lines: stable_lines_to_use,
+            stable_lines,
             parsed_len: completed_len,
             lines: lines.clone(),
         });
 
-        // Append the unfinished tail line if needed.
-        if block.running && completed_len < block.text.len() {
-            let tail = block.text[completed_len..].trim_end_matches('\r');
-            if !tail.is_empty() {
-                let color = BlockStyle::Agent.color();
-                for chunk in word_wrap(tail, width) {
-                    lines.push(LineEntry { text: chunk, color });
-                }
-            }
-        }
+        append_agent_tail(&mut lines, block, completed_len, width);
         return lines;
     }
 
     // Full re-parse: need to establish a new stable boundary or handle width change.
-    let full_parsed = markdown_to_styled(&block.text[..completed_len], width);
+    let stable_len = find_stable_boundary(&block.text, 0, completed_len);
+    let full_parsed = parse_agent_markdown(feed, &block.text[..completed_len], width);
 
     // Compute stable lines: parse only up to the stable boundary.
-    let stable_lines = if stable_len > 0 {
-        markdown_to_styled(&block.text[..stable_len.min(block.text.len())], width)
+    let stable_lines = if stable_len == completed_len {
+        full_parsed.clone()
+    } else if stable_len > 0 {
+        parse_agent_markdown(feed, &block.text[..stable_len], width)
     } else {
         Vec::new()
     };
@@ -577,7 +631,25 @@ fn agent_block_lines(block: &Block, width: usize) -> Vec<LineEntry> {
     });
 
     let mut lines = full_parsed;
-    // Append the unfinished tail line if needed.
+    append_agent_tail(&mut lines, block, completed_len, width);
+    lines
+}
+
+fn parse_agent_markdown(feed: &Feed, text: &str, width: usize) -> Vec<LineEntry> {
+    #[cfg(test)]
+    feed.markdown_bytes_parsed
+        .set(feed.markdown_bytes_parsed.get() + text.len());
+    #[cfg(not(test))]
+    let _ = feed;
+    markdown_to_styled(text, width)
+}
+
+fn append_agent_tail(
+    lines: &mut Vec<LineEntry>,
+    block: &Block,
+    completed_len: usize,
+    width: usize,
+) {
     if block.running && completed_len < block.text.len() {
         let tail = block.text[completed_len..].trim_end_matches('\r');
         if !tail.is_empty() {
@@ -587,19 +659,13 @@ fn agent_block_lines(block: &Block, width: usize) -> Vec<LineEntry> {
             }
         }
     }
-    lines
 }
 
 /// Return the memoized markdown layout when it matches `(width, stable_len, parsed_len)`.
-fn cached_agent_lines(
-    block: &Block,
-    width: usize,
-    parsed_len: usize,
-    stable_len: usize,
-) -> Option<Vec<LineEntry>> {
+fn cached_agent_lines(block: &Block, width: usize, parsed_len: usize) -> Option<Vec<LineEntry>> {
     let cache = block.md_cache.borrow();
     let cache = cache.as_ref()?;
-    if cache.width == width && cache.parsed_len == parsed_len && cache.stable_len == stable_len {
+    if cache.width == width && cache.parsed_len == parsed_len {
         Some(cache.lines.clone())
     } else {
         None

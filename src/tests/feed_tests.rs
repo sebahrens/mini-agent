@@ -385,19 +385,51 @@ fn scroll_and_selection_queries_reuse_prewrapped_rows() {
 }
 
 #[test]
-fn streaming_within_stable_boundary_minimizes_parses() {
+fn streaming_within_stable_boundary_is_subquadratic() {
     // Test that appending lines within a stable boundary (after a blank line)
-    // reuses the cached parse. The key insight: even though layout_computes
-    // increments on every append (due to generation changes invalidating the
-    // feed-level layout_cache), the agent_block_lines function should reuse
-    // the cached stable lines and only re-parse from stable_len to completed_len.
+    // achieves sub-quadratic parsing: O(n) not O(n^2).
     //
     // Without the optimization, each agent_block_lines call would re-parse the
-    // entire text[0..completed_len], giving O(n^2) work.
+    // entire text[0..completed_len], giving O(n^2) total bytes parsed.
     // With the optimization, stable lines are reused, giving O(n) work.
     //
-    // We verify this by checking that the final output is correct (matches
-    // a from-scratch parse).
+    // We measure total bytes sent to markdown_to_styled and verify it's bounded
+    // by roughly 2-3x the final text length (one parse for the stable part, one
+    // for the extended part, plus some overhead).
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+
+    // Append lines with proper blank-line boundaries to enable the optimization.
+    // Each "paragraph" is 2 lines, separated by a blank line.
+    let mut total_text_len = 0;
+    for para in 0..20 {
+        let text = format!("line {}_a\nline {}_b\n\n", para, para);
+        total_text_len += text.len();
+        assert!(feed.append_to_last(&text));
+        let _ = feed.lines(80);
+    }
+
+    let bytes_parsed = feed.markdown_bytes_parsed();
+
+    // With the optimization, we expect bytes_parsed to be roughly 2-3x the final text.
+    // Without optimization (naive full re-parse each time), we'd see O(n^2):
+    // - ~40 appends, each re-parsing the entire prefix: sum of 1+2+3+...+40 ~ 820x bytes
+    // - Much larger than what we'll observe with the optimization.
+    assert!(
+        bytes_parsed <= total_text_len * 3,
+        "streaming with stable boundaries should be sub-quadratic; \
+         total_text_len={}, bytes_parsed={}, ratio={:.2}x",
+        total_text_len,
+        bytes_parsed,
+        bytes_parsed as f64 / total_text_len as f64
+    );
+}
+
+#[test]
+fn streaming_correctness_with_stable_boundary_enabled() {
+    // Verify that with proper stable-boundary detection, the output equals
+    // a from-scratch parse. This is the correctness check that the boundary
+    // detection doesn't break rendering.
     let mut feed = Feed::new();
     feed.push_streaming_block(BlockStyle::Agent);
 
@@ -422,8 +454,6 @@ fn streaming_within_stable_boundary_minimizes_parses() {
     let fresh_lines = fresh_feed.lines(80);
 
     // The incremental and fresh parses should produce identical output.
-    // This verifies that the optimization produces correct results despite
-    // re-parsing only from the stable boundary.
     assert_eq!(
         incremental_lines.len(),
         fresh_lines.len(),
@@ -495,6 +525,7 @@ fn streaming_loose_list_produces_correct_output() {
 
     // Start a loose list with blank line between items.
     assert!(feed.append_to_last("- item one\n\n"));
+    let _ = feed.lines(80);
     assert!(feed.append_to_last("- item two\n"));
 
     let incremental_lines = feed.lines(80);
