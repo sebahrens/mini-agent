@@ -42,6 +42,12 @@ pub struct TaskArgs {
     /// One or more exploration prompts. Concurrency and aggregate resources
     /// are bounded by the task-tool configuration.
     pub prompts: Vec<String>,
+    /// Optional named agent type. When set the subagent receives a
+    /// specialization system prompt prepended before the base explore prompt.
+    /// Recognized names correspond to files in data/agents/. Unknown names
+    /// are silently ignored and fall back to the default explore prompt.
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -210,6 +216,10 @@ editing in a known location, grepping for a literal you will act on immediately.
                     "maxItems": max_prompts,
                     "items": { "type": "string", "minLength": 1 },
                     "description": "Investigation prompt for the subagent. Use one for a focused question, or multiple to run independent investigations with bounded parallelism. Examples: 'List all tests in this project', 'Where is config loaded?', 'How does the agent loop work?'"
+                },
+                "agent_type": {
+                    "type": "string",
+                    "description": "Optional specialist agent type. Sets a specialization system prompt prepended before the base explore prompt. Known types: 'rust-async-concurrency' (Tokio, Send/Sync, Pin/Unpin, cancel-safety), 'rust-unsafe-code-audit' (UB categories, SAFETY comments, FFI, Phase 6 invariants), 'vscode-extension-developer' (VS Code API, webview CSP, postMessage, vsce packaging). Omit for general codebase exploration."
                 }
             },
             "required": ["prompts"]
@@ -248,6 +258,11 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(not(feature = "archmd"))]
         let architecture: Option<String> = None;
 
+        let specialization = args
+            .agent_type
+            .as_deref()
+            .and_then(crate::context::agents::lookup);
+
         let authorization = SubagentAuthorization::new(
             self.permission.clone(),
             self.ask_tx.clone(),
@@ -262,6 +277,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let architecture = architecture.clone();
             let config = config.clone();
             let authorization = authorization.clone();
+            let specialization = specialization.clone();
             Box::pin(async move {
                 let display_prompt = prompt_text.clone();
                 #[cfg(feature = "hooks")]
@@ -281,6 +297,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                     authorization,
                     #[cfg(feature = "archmd")]
                     architecture,
+                    specialization,
                 )
                 .await;
                 let initial_usage = SharedUsageLedger::default();

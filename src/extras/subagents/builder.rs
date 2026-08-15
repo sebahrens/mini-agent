@@ -128,10 +128,13 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     // OpenRouter `provider.order` pin for `anthropic/*` (see `AnyClient::completion_model`).
     additional_params: Option<serde_json::Value>,
     #[cfg(feature = "archmd")] architecture: Option<&str>,
+    // Optional specialization prompt prepended before the base explore prompt.
+    specialization: Option<&str>,
 ) -> Agent<M> {
     let mut preamble = build_explore_preamble(
         #[cfg(feature = "archmd")]
         architecture,
+        specialization,
     );
 
     if let Some(s) = crate::session::storage::load_suffix() {
@@ -168,8 +171,18 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     builder.build()
 }
 
-fn build_explore_preamble(#[cfg(feature = "archmd")] architecture: Option<&str>) -> String {
-    let mut preamble = prompt::explore_prompt();
+fn build_explore_preamble(
+    #[cfg(feature = "archmd")] architecture: Option<&str>,
+    specialization: Option<&str>,
+) -> String {
+    let mut preamble = String::new();
+    if let Some(spec) = specialization {
+        if !spec.is_empty() {
+            preamble.push_str(spec);
+            preamble.push_str("\n\n---\n\n");
+        }
+    }
+    preamble.push_str(&prompt::explore_prompt());
     #[cfg(feature = "archmd")]
     if let Some(arch) = architecture
         && !arch.is_empty()
@@ -186,6 +199,7 @@ pub(crate) async fn build_explore_agent(
     cfg: &crate::config::Config,
     authorization: SubagentAuthorization,
     #[cfg(feature = "archmd")] architecture: Option<String>,
+    specialization: Option<String>,
 ) -> AnyAgent {
     let max_text_file_size = cfg.max_text_file_size.unwrap_or(10 * 1024 * 1024);
     let max_read_lines = cfg.resolve_subagent_max_read_lines();
@@ -194,6 +208,7 @@ pub(crate) async fn build_explore_agent(
     let max_list_dir_entries = cfg.resolve_subagent_max_list_dir_entries();
     #[cfg(feature = "archmd")]
     let arch_ref = architecture.as_deref();
+    let spec_ref = specialization.as_deref();
     let inner = match model {
         AnyModel::OpenRouter(m, extra) => AnyAgentInner::OpenRouter(build_explore_agent_inner(
             m,
@@ -207,6 +222,7 @@ pub(crate) async fn build_explore_agent(
             extra,
             #[cfg(feature = "archmd")]
             arch_ref,
+            spec_ref,
         )),
         AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
             OpenAiModel::Responses(m) => OpenAiAgent::Responses(build_explore_agent_inner(
@@ -221,6 +237,7 @@ pub(crate) async fn build_explore_agent(
                 None,
                 #[cfg(feature = "archmd")]
                 arch_ref,
+                spec_ref,
             )),
             OpenAiModel::Completions(m) => OpenAiAgent::Completions(build_explore_agent_inner(
                 m,
@@ -234,6 +251,7 @@ pub(crate) async fn build_explore_agent(
                 None,
                 #[cfg(feature = "archmd")]
                 arch_ref,
+                spec_ref,
             )),
         }),
         AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(build_explore_agent_inner(
@@ -248,6 +266,7 @@ pub(crate) async fn build_explore_agent(
             None,
             #[cfg(feature = "archmd")]
             arch_ref,
+            spec_ref,
         )),
         AnyModel::Gemini(m) => AnyAgentInner::Gemini(build_explore_agent_inner(
             m,
@@ -261,6 +280,7 @@ pub(crate) async fn build_explore_agent(
             None,
             #[cfg(feature = "archmd")]
             arch_ref,
+            spec_ref,
         )),
         AnyModel::Ollama(m) => AnyAgentInner::Ollama(build_explore_agent_inner(
             m,
@@ -274,6 +294,7 @@ pub(crate) async fn build_explore_agent(
             None,
             #[cfg(feature = "archmd")]
             arch_ref,
+            spec_ref,
         )),
     };
     AnyAgent::without_skills(inner)
@@ -301,6 +322,7 @@ mod js_isolation_tests {
             &SubagentAuthorization::new(None, None, true),
             None,
             #[cfg(feature = "archmd")]
+            None,
             None,
         );
         let names = agent
@@ -331,12 +353,39 @@ mod tests {
     #[cfg(feature = "archmd")]
     #[test]
     fn explore_preamble_uses_only_the_supplied_session_architecture() {
-        let first = build_explore_preamble(Some("FIRST_SESSION_ARCHITECTURE"));
-        let second = build_explore_preamble(Some("SECOND_SESSION_ARCHITECTURE"));
+        let first = build_explore_preamble(Some("FIRST_SESSION_ARCHITECTURE"), None);
+        let second = build_explore_preamble(Some("SECOND_SESSION_ARCHITECTURE"), None);
         assert!(first.contains("FIRST_SESSION_ARCHITECTURE"));
         assert!(!first.contains("SECOND_SESSION_ARCHITECTURE"));
         assert!(second.contains("SECOND_SESSION_ARCHITECTURE"));
         assert!(!second.contains("FIRST_SESSION_ARCHITECTURE"));
+    }
+
+    #[test]
+    fn specialization_prepended_before_base_prompt() {
+        let preamble = build_explore_preamble(
+            #[cfg(feature = "archmd")]
+            None,
+            Some("You are a Rust async specialist."),
+        );
+        let spec_pos = preamble.find("You are a Rust async specialist.").unwrap();
+        let base_pos = preamble.find("You are a precise code investigation agent.").unwrap();
+        assert!(spec_pos < base_pos, "specialization must precede base prompt");
+    }
+
+    #[test]
+    fn empty_specialization_omits_separator() {
+        let with_none = build_explore_preamble(
+            #[cfg(feature = "archmd")]
+            None,
+            None,
+        );
+        let with_empty = build_explore_preamble(
+            #[cfg(feature = "archmd")]
+            None,
+            Some(""),
+        );
+        assert_eq!(with_none, with_empty);
     }
 
     struct TempDir(PathBuf);

@@ -1259,6 +1259,16 @@ impl AppPaths {
         self.data_dir.join("memory")
     }
 
+    pub fn agents_dir(&self) -> PathBuf {
+        self.data_dir.join("agents")
+    }
+
+    pub fn project_agents_dir(&self) -> Option<PathBuf> {
+        self.project_dir
+            .as_ref()
+            .map(|directory| directory.join("agents"))
+    }
+
     #[allow(dead_code)]
     pub fn portable_agent_skills_dir(&self) -> PathBuf {
         self.data_dir.join("skills")

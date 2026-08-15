@@ -566,6 +566,7 @@ async fn model_for_subagent(
         ),
         #[cfg(feature = "archmd")]
         None,
+        None,
     )
     .await;
     Ok(())
