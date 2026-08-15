@@ -1365,14 +1365,20 @@ where
             history.len(),
             retry_config.max_attempts,
         );
-        let retry_prompt = prompt.clone();
-        let retry_history: Vec<Message> = history.clone();
+        // Keep the caller-owned inputs as the one canonical replay payload.
+        // Rig requires an owned prompt/history for each API attempt, so the
+        // attempt below clones exactly once; avoid making additional full
+        // copies before any request has even started.
+        let retry_prompt = prompt;
+        let retry_history = history;
         let mut interactions: Vec<Message> = Vec::new();
         let mut tool_calls = ToolCallTracker::default();
         let mut completion_had_tool_call = false;
         let mut exhausted_budget_after_completion = None;
         let mut completed_interactions: Vec<Message> = Vec::new();
-        let mut stream_prompt = prompt.clone();
+        // `None` means the initial prompt. Continuations install only their
+        // small replacement instruction instead of cloning the initial prompt.
+        let mut stream_prompt: Option<String> = None;
         let mut empty_response_count: u32 = 0;
         const MAX_EMPTY_RESPONSES: u32 = 3;
         let max_turns = agent.default_max_turns.unwrap_or(1);
@@ -1409,7 +1415,7 @@ where
             loop {
                 attempt += 1;
                 let mut s = agent
-                    .stream_chat(prompt.clone(), history.clone())
+                    .stream_chat(retry_prompt.clone(), retry_history.clone())
                     .max_turns(max_turns)
                     .await;
                 let first = s.next().await;
@@ -1597,17 +1603,19 @@ where
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                         terminal_response_seen = true;
-                        let completed_delta =
-                            match completed_stream_delta(res.messages.clone(), &stream_prompt) {
-                                Ok(messages) => messages,
-                                Err(error) => {
-                                    tracing::error!(error, "agent final history invariant failed");
-                                    let _ = event_tx
-                                        .send(AgentEvent::Error(CompactString::from(error)))
-                                        .await;
-                                    return;
-                                }
-                            };
+                        let completed_delta = match completed_stream_delta(
+                            res.messages.clone(),
+                            stream_prompt.as_deref().unwrap_or(&retry_prompt),
+                        ) {
+                            Ok(messages) => messages,
+                            Err(error) => {
+                                tracing::error!(error, "agent final history invariant failed");
+                                let _ = event_tx
+                                    .send(AgentEvent::Error(CompactString::from(error)))
+                                    .await;
+                                return;
+                            }
+                        };
                         completed_interactions.extend(completed_delta);
                         let usage = res.usage();
                         let context_complete = !usage_ledger.stream_has_observed_usage();
@@ -1821,7 +1829,7 @@ where
                 &continuation_instruction,
             );
             completed_interactions = continuation_bridge.clone();
-            stream_prompt = continuation_instruction.clone();
+            stream_prompt = Some(continuation_instruction.clone());
             stream = stream_policy.apply(
                 continue_prompt_injector(
                     &agent,
