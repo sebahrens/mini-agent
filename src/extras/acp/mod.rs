@@ -393,6 +393,16 @@ fn accept_authenticated_peer(
 
         match listener.accept() {
             Ok((mut stream, peer_addr)) => {
+                // macOS inherits O_NONBLOCK from the listening socket. The
+                // authentication protocol uses bounded blocking reads in a
+                // dedicated worker, so restore blocking mode before the peer
+                // can race its response against the first read.
+                if let Err(error) = stream.set_nonblocking(false) {
+                    tracing::warn!(
+                        "ACP TCP peer rejected because blocking mode could not be restored: {error}"
+                    );
+                    continue;
+                }
                 if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_AUTHENTICATIONS {
                     pending.fetch_sub(1, Ordering::AcqRel);
                     tracing::warn!("ACP TCP peer rejected because authentication capacity is full");
@@ -4021,8 +4031,12 @@ mod tcp_authentication_tests {
     fn racing_valid_peer_is_not_blocked_by_partial_peer() {
         let listener = TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            accept_authenticated_peer(listener, "configured-key".to_owned()).unwrap()
+        let (server_tx, server_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = server_tx.send(accept_authenticated_peer(
+                listener,
+                "configured-key".to_owned(),
+            ));
         });
 
         let mut partial = TcpStream::connect(address).unwrap();
@@ -4033,7 +4047,10 @@ mod tcp_authentication_tests {
         send_response(&mut valid, &nonce, "configured-key").unwrap();
         let valid_address = valid.local_addr().unwrap();
 
-        let (_, authenticated_address) = server.join().unwrap();
+        let (_, authenticated_address) = server_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a valid peer must not be blocked by a partial peer")
+            .unwrap();
         assert_eq!(authenticated_address, valid_address);
     }
 }
