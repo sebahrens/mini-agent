@@ -9,13 +9,15 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sandbox")]
 use rquickjs::prelude::Opt;
 use rquickjs::promise::PromiseState;
-use rquickjs::{Context, Ctx, Error, Function, IntoJs, Object, Persistent, Runtime, Value};
+use rquickjs::{
+    Context, Ctx, Error, Function, IntoJs, Module, Object, Persistent, Runtime, Value, WriteOptions,
+};
 
 use super::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass,
@@ -744,6 +746,86 @@ pub(super) const STRICT_CLONE_SOURCE: &str = r#"
 })()
 "#;
 
+const TRUSTED_BOOTSTRAP_MODULE_NAME: &str = "mini-agent:trusted-bootstrap";
+static TRUSTED_BOOTSTRAP_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+
+fn compile_trusted_bootstrap_bytecode() -> rquickjs::Result<Vec<u8>> {
+    let runtime = Runtime::new()?;
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let context = Context::full(&runtime)?;
+    context.with(|ctx| {
+        let source = format!(
+            "export const strictClone = {STRICT_CLONE_SOURCE};\n\
+             export const stringGate = {STRING_GATE_SOURCE};"
+        );
+        Module::declare(ctx, TRUSTED_BOOTSTRAP_MODULE_NAME, source)?.write(WriteOptions::default())
+    })
+}
+
+fn trusted_bootstrap_bytecode() -> Option<&'static [u8]> {
+    TRUSTED_BOOTSTRAP_BYTECODE
+        .get_or_init(|| compile_trusted_bootstrap_bytecode().ok())
+        .as_deref()
+}
+
+#[allow(unsafe_code)]
+fn load_trusted_bootstrap_functions(
+    context: &Context,
+    bytecode: &[u8],
+) -> rquickjs::Result<(Persistent<Function<'static>>, Persistent<Function<'static>>)> {
+    context.with(|ctx| {
+        // SAFETY: these bytes are compiled once in this process from the two
+        // trusted constants above, with the same linked QuickJS ABI, and are
+        // never accepted from disk, IPC, model output, or any other input.
+        let module = unsafe { Module::load(ctx.clone(), bytecode)? };
+        let (module, evaluation) = module.eval()?;
+        evaluation.finish::<()>()?;
+        let clone = module.get::<_, Function>("strictClone")?;
+        let string_gate = module.get::<_, Function>("stringGate")?;
+        Ok((
+            Persistent::save(&ctx, clone),
+            Persistent::save(&ctx, string_gate),
+        ))
+    })
+}
+
+#[cfg(test)]
+mod trusted_bootstrap_bytecode_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_bootstrap_bytecode_loads_into_distinct_fresh_runtimes() {
+        let bytecode = compile_trusted_bootstrap_bytecode().expect("compile trusted bootstrap");
+
+        for expected in ["{\"runtime\":1}", "{\"runtime\":2}"] {
+            let runtime = Runtime::new().expect("create fresh runtime");
+            runtime.set_memory_limit(MEMORY_LIMIT);
+            runtime.set_max_stack_size(STACK_LIMIT);
+            let deadline = Instant::now() + STEP_TIMEOUT;
+            runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+            let context = Context::full(&runtime).expect("create fresh context");
+            let (clone, string_gate) =
+                load_trusted_bootstrap_functions(&context, &bytecode).expect("load bytecode");
+
+            context.with(|ctx| {
+                let clone = clone.clone().restore(&ctx).expect("restore strict clone");
+                let string_gate = string_gate
+                    .clone()
+                    .restore(&ctx)
+                    .expect("restore string gate");
+                let value: Object = ctx.eval(format!("({expected})")).expect("create value");
+                let encoded: String = clone.call((value,)).expect("clone value");
+                assert_eq!(encoded, expected);
+                let gated: String = string_gate.call((expected,)).expect("gate string");
+                assert_eq!(gated, expected);
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ExecutionLimits {
     timeout: Duration,
@@ -882,6 +964,9 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
     protocol.on_receive(&hello).map_err(|_| ())?;
 
     finalize_internal_worker().map_err(|_| ())?;
+    // Compile trusted, static helpers before advertising readiness. Request
+    // runtimes load these bytes but remain fresh and request-local.
+    trusted_bootstrap_bytecode().ok_or(())?;
 
     let ready: WorkerWireFrame = WireFrame::connection(
         build.clone(),
@@ -1568,27 +1653,11 @@ fn execute_fresh_step(
             )
         })?;
     }
-    let clone = context
-        .with(|ctx| {
-            ctx.eval::<Function, _>(STRICT_CLONE_SOURCE)
-                .map(|function| Persistent::save(&ctx, function))
-        })
-        .map_err(|error| {
-            classify_error(
-                &context,
-                error,
-                deadline,
-                &interrupted,
-                DiagnosticStage::Initialization,
-                role,
-            )
-        })?;
-    let string_gate = context
-        .with(|ctx| {
-            ctx.eval::<Function, _>(STRING_GATE_SOURCE)
-                .map(|function| Persistent::save(&ctx, function))
-        })
-        .map_err(|error| {
+    let bytecode = trusted_bootstrap_bytecode().ok_or_else(|| {
+        ClosedFailure::error(JsErrorCode::Internal, DiagnosticStage::Initialization, role)
+    })?;
+    let (clone, string_gate) =
+        load_trusted_bootstrap_functions(&context, bytecode).map_err(|error| {
             classify_error(
                 &context,
                 error,
