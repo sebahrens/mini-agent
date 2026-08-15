@@ -26,7 +26,10 @@ use crate::sandbox::worker::ProductionWorkerLauncher;
 use crate::sandbox::worker::{WorkerLaunchError, WorkerLauncher, WorkerProcess};
 
 const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
-const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Polling interval for detecting worker process exit. Raised from 10ms to 250ms to reduce
+/// per-frame IPC overhead: thousands of unnecessary wakeups and syscalls during long effects are
+/// now avoided. Worst-case worker-death detection latency is therefore 250ms.
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// A pipe can report EOF just before the OS makes the worker's exit status observable. Keep this
 /// window short and bounded so native resource exits retain their closed classification without a
 /// malformed or abandoned transport delaying the caller materially.
@@ -154,6 +157,9 @@ struct WorkerConnection {
     created_at: Instant,
     completed_invocations: u64,
     retirement: Option<Arc<RetirementTicket>>,
+    /// Dedicated protocol handles cloned once when the connection is established.
+    input_handle: Arc<Mutex<std::fs::File>>,
+    output_handle: Arc<Mutex<std::fs::File>>,
 }
 
 struct RetirementTicket {
@@ -1339,6 +1345,19 @@ async fn launch_connection(
     let process = launch_process(launcher, launch_gate, cancellation, deadline).await?;
     let stderr_drain = start_stderr_drain(&process)?;
     let build = BuildIdentity::current();
+
+    // Clone the protocol handles once per connection instead of issuing dup() for every frame.
+    // A clone failure is launch-terminal: retaining a connection without a usable transport would
+    // only defer the same closed Transport error until the first frame.
+    let input_handle = process
+        .input
+        .try_clone()
+        .map_err(|_| WorkerError::Transport)?;
+    let output_handle = process
+        .output
+        .try_clone()
+        .map_err(|_| WorkerError::Transport)?;
+
     let mut connection = WorkerConnection {
         generation,
         sequence: 0,
@@ -1349,6 +1368,8 @@ async fn launch_connection(
         created_at: Instant::now(),
         completed_invocations: 0,
         retirement: None,
+        input_handle: Arc::new(Mutex::new(input_handle)),
+        output_handle: Arc::new(Mutex::new(output_handle)),
     };
     let hello = WireFrame::connection(build, 0, ParentFrame::Hello(connection.protocol.hello()));
     connection
@@ -1527,7 +1548,8 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     cancellation: effect_cancellation.clone(),
                     armed: true,
                 };
-                let mut effect = handler.handle_effect(request.clone(), effect_cancellation);
+                let effect_ordinal = request.effect_ordinal;
+                let mut effect = handler.handle_effect(request, effect_cancellation);
                 enum EffectWait {
                     Completed(EffectResult),
                     Cancelled,
@@ -1610,7 +1632,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     invocation.clone(),
                     connection.sequence,
                     ParentFrame::EffectResponse(EffectResponse {
-                        effect_ordinal: request.effect_ordinal,
+                        effect_ordinal,
                         result,
                     }),
                 );
@@ -1679,13 +1701,12 @@ async fn write_parent(
     deadline: Instant,
 ) -> Result<(), WorkerError> {
     let generation = connection.generation;
-    let mut input = connection
-        .process
-        .input
-        .try_clone()
-        .map_err(|_| WorkerError::Transport)?;
+    let input_handle = connection.input_handle.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let result = write_frame(&mut input, &frame)
+        let mut input = input_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = write_frame(&mut *input, &frame)
             .and_then(|()| input.flush().map_err(|error| FrameError::Io(error.kind())));
         TaggedIo { generation, result }
     });
@@ -1723,13 +1744,12 @@ async fn read_worker(
     deadline: Instant,
 ) -> Result<WorkerWireFrame, WorkerError> {
     let generation = connection.generation;
-    let mut output = connection
-        .process
-        .output
-        .try_clone()
-        .map_err(|_| WorkerError::Transport)?;
+    let output_handle = connection.output_handle.clone();
     let mut task = tokio::task::spawn_blocking(move || {
-        let result = read_worker_frame(&mut output, accepts_test_preamble);
+        let mut output = output_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = read_worker_frame(&mut *output, accepts_test_preamble);
         TaggedIo { generation, result }
     });
     let tagged = loop {
