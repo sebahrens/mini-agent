@@ -54,6 +54,19 @@ const REDIRECTING_ENV: &[&str] = &[
 
 static PROCESS_GIT_MUTATION_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
+/// Cached git environment variables. Built once per process lifetime.
+/// Assumes PATH and relevant environment variables do not change mid-session.
+static CACHED_GIT_ENVIRONMENT: OnceLock<Vec<(OsString, OsString)>> = OnceLock::new();
+
+/// Cached git executable path. Built once per process lifetime.
+/// Assumes PATH and git installation do not change mid-session.
+///
+/// HAZARD: If a test scopes PATH around git discovery (e.g., via
+/// `ScopedProcessEnv::set(&[("PATH", ...)])` in the same process), the cache
+/// will return a stale path. Do NOT test git discovery with PATH scoping;
+/// git discovery is only called at startup and should use the actual PATH.
+static CACHED_GIT_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 /// Git's own index locks protect files, but one process-wide admission lock
 /// also prevents mini-agent worktree and structured-tool mutations from
 /// racing each other between their before/after audit snapshots.
@@ -175,7 +188,7 @@ impl GitRunner {
             &self.program,
             &argv,
             workspace.root(),
-            &git_environment(),
+            git_environment(),
             true,
         )
     }
@@ -280,7 +293,7 @@ fn apply_git_environment(command: &mut Command) {
         .env("GIT_CONFIG_NOSYSTEM", "1");
 }
 
-fn git_environment() -> Vec<(OsString, OsString)> {
+fn build_git_environment() -> Vec<(OsString, OsString)> {
     let mut values = vec![
         (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
         (OsString::from("GIT_NO_LAZY_FETCH"), OsString::from("1")),
@@ -290,12 +303,23 @@ fn git_environment() -> Vec<(OsString, OsString)> {
         (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
     ];
     #[cfg(windows)]
-    for name in ["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"] {
-        if let Some(value) = std::env::var_os(name) {
-            values.push((OsString::from(name), value));
+    {
+        for name in ["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                values.push((OsString::from(name), value));
+            }
         }
     }
     values
+}
+
+/// Returns cached git environment variables. On first call, constructs the
+/// environment vector once and caches it; subsequent calls return a borrowed
+/// reference to the cached vector at no cost.
+///
+/// Assumption: PATH and environment variables do not change mid-session.
+fn git_environment() -> &'static [(OsString, OsString)] {
+    CACHED_GIT_ENVIRONMENT.get_or_init(build_git_environment)
 }
 
 pub(crate) fn command_result(
@@ -331,7 +355,7 @@ pub(crate) fn command_failure(operation: &str, output: &CommandOutput) -> String
     }
 }
 
-fn resolve_git_executable() -> Option<PathBuf> {
+fn find_git_executable() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let names: &[&str] = if cfg!(windows) {
         &["git.exe"]
@@ -361,6 +385,17 @@ fn resolve_git_executable() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Resolves the git executable path, caching the result for the process
+/// lifetime. `GitRunner` is long-lived, so the PATH walk (canonicalize +
+/// metadata per candidate) only needs to happen once.
+///
+/// Assumption: PATH and the git installation do not change mid-session.
+fn resolve_git_executable() -> Option<PathBuf> {
+    CACHED_GIT_EXECUTABLE
+        .get_or_init(find_git_executable)
+        .clone()
 }
 
 #[cfg(test)]
@@ -494,5 +529,34 @@ mod tests {
                 "missing key {required} in git_environment"
             );
         }
+    }
+
+    #[test]
+    fn git_environment_is_cached_and_not_reallocated() {
+        // Fails if the OnceLock cache is removed: two calls would then return
+        // distinct allocations rather than the same borrowed slice.
+        let first = git_environment();
+        let second = git_environment();
+        assert!(
+            std::ptr::eq(first, second),
+            "git_environment must hand back the same cached slice on every call"
+        );
+    }
+
+    #[test]
+    fn cached_git_environment_matches_freshly_built() {
+        // The cache must not change what git actually receives.
+        assert_eq!(
+            git_environment(),
+            build_git_environment().as_slice(),
+            "cached git environment diverged from a freshly built one"
+        );
+    }
+
+    #[test]
+    fn resolve_git_executable_is_cached() {
+        // `Option<PathBuf>` is cloned out of the cache, so pointer identity is
+        // not observable here; equality across calls is what we can assert.
+        assert_eq!(resolve_git_executable(), resolve_git_executable());
     }
 }

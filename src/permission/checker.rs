@@ -106,6 +106,7 @@ pub struct PermissionChecker {
     user_mode: SecurityMode,
     permission_modes: Vec<SecurityMode>,
     allow_all_mcp_calls: bool,
+    cached_resolved_cwd: Option<PathBuf>,
     /// One-shot: the next `check`/`check_path` call for this tool is forced
     /// to `Ask`, consumed immediately after. Set by a hook `ask` verdict.
     #[cfg(feature = "hooks")]
@@ -124,6 +125,7 @@ impl PermissionChecker {
         let (canonical, plan_write_root) = canonical_working_dir(working_dir)?;
         self.working_dir = canonical.to_string_lossy().into_owned();
         self.plan_write_root = Some(plan_write_root);
+        self.cached_resolved_cwd = resolve_path_allow_missing(Path::new(&self.working_dir));
         Ok(())
     }
 
@@ -314,6 +316,8 @@ impl PermissionChecker {
                 .collect()
         };
 
+        let cached_resolved_cwd = resolve_path_allow_missing(Path::new(&working_dir));
+
         Ok(PermissionChecker {
             rules,
             default_action,
@@ -328,6 +332,7 @@ impl PermissionChecker {
             user_mode: mode,
             permission_modes: resolved_modes,
             allow_all_mcp_calls: false,
+            cached_resolved_cwd,
             #[cfg(feature = "hooks")]
             pending_forced_ask: None,
             #[cfg(feature = "hooks")]
@@ -830,6 +835,7 @@ impl PermissionChecker {
             .is_path_tool(&tool)
             .then(|| Pattern::new_generated_path_scope(pattern_str))
             .flatten();
+        let has_generated = generated_path_scope.is_some();
         let pattern = if let Some(pattern) = generated_path_scope {
             pattern
         } else if self.is_path_tool(&tool) {
@@ -838,7 +844,7 @@ impl PermissionChecker {
             Pattern::new(pattern_str)
         };
         self.session_allowlist.push((tool.clone(), pattern));
-        if self.is_path_tool(&tool) && Pattern::new_generated_path_scope(pattern_str).is_none() {
+        if self.is_path_tool(&tool) && !has_generated {
             let expanded = crate::fs::expand_tilde(pattern_str);
             let abs = resolve_absolute(&expanded, &self.working_dir);
             if abs != expanded {
@@ -854,6 +860,7 @@ impl PermissionChecker {
                 .is_path_tool(&tool)
                 .then(|| Pattern::new_generated_path_scope(pat))
                 .flatten();
+            let has_generated = generated_path_scope.is_some();
             let pattern = if let Some(pattern) = generated_path_scope {
                 pattern
             } else if self.is_path_tool(&tool) {
@@ -862,7 +869,7 @@ impl PermissionChecker {
                 Pattern::new(pat)
             };
             self.session_allowlist.push((tool.clone(), pattern));
-            if self.is_path_tool(&tool) && Pattern::new_generated_path_scope(pat).is_none() {
+            if self.is_path_tool(&tool) && !has_generated {
                 let expanded = crate::fs::expand_tilde(pat);
                 let abs = resolve_absolute(&expanded, &self.working_dir);
                 if abs != expanded {
@@ -907,14 +914,27 @@ impl PermissionChecker {
         } else {
             Path::new(&self.working_dir).join(p)
         };
-        let cwd = Path::new(&self.working_dir);
         let Some(normalized) = resolve_path_allow_missing(&p) else {
             return true;
         };
-        let Some(normalized_cwd) = resolve_path_allow_missing(cwd) else {
-            return true;
+        let normalized_cwd = if let Some(cached) = &self.cached_resolved_cwd {
+            if let Ok(metadata) = std::fs::symlink_metadata(cached) {
+                if metadata.is_dir() {
+                    Some(cached.clone())
+                } else {
+                    resolve_path_allow_missing(Path::new(&self.working_dir))
+                }
+            } else {
+                resolve_path_allow_missing(Path::new(&self.working_dir))
+            }
+        } else {
+            resolve_path_allow_missing(Path::new(&self.working_dir))
         };
-        !normalized.starts_with(normalized_cwd)
+
+        match normalized_cwd {
+            Some(cwd) => !normalized.starts_with(&cwd),
+            None => true, // Fail-closed: if we can't resolve cwd, treat as external
+        }
     }
 
     fn match_ext_dir(&self, path_str: &str) -> Option<Action> {
@@ -1665,5 +1685,146 @@ mod tests {
             ),
             CheckResult::Denied(_)
         ));
+    }
+
+    #[test]
+    fn cwd_cache_invalidates_on_rebind_working_dir() {
+        let temp = TempDir::new();
+        let workspace_a = temp.0.join("workspace_a");
+        let workspace_b = temp.0.join("workspace_b");
+        let external = temp.0.join("external");
+        std::fs::create_dir_all(&workspace_a).unwrap();
+        std::fs::create_dir_all(&workspace_b).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace_a.clone()),
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid permission fixture");
+
+        let external_path = external.join("file.txt").to_string_lossy().to_string();
+
+        assert!(
+            checker.is_external_path(&external_path),
+            "path outside workspace_a should be external"
+        );
+
+        checker.rebind_working_dir(&external).unwrap();
+
+        assert!(
+            !checker.is_external_path("file.txt"),
+            "same file is now internal after rebind to external directory"
+        );
+
+        checker.rebind_working_dir(&workspace_b).unwrap();
+
+        let external_from_b = external.join("file.txt").to_string_lossy().to_string();
+        assert!(
+            checker.is_external_path(&external_from_b),
+            "path is external again after rebind to workspace_b"
+        );
+    }
+
+    #[test]
+    fn is_external_path_cache_produces_same_answer_as_live_resolution() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        let external = temp.0.join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid permission fixture");
+
+        let test_paths = vec![
+            workspace.join("inside.txt").to_string_lossy().to_string(),
+            external.join("outside.txt").to_string_lossy().to_string(),
+            workspace
+                .join("nonexistent/file.txt")
+                .to_string_lossy()
+                .to_string(),
+            "relative_inside.txt".to_string(),
+        ];
+
+        let cached_results: Vec<bool> = test_paths
+            .iter()
+            .map(|p| checker.is_external_path(p))
+            .collect();
+
+        checker.cached_resolved_cwd = None;
+
+        let live_results: Vec<bool> = test_paths
+            .iter()
+            .map(|p| checker.is_external_path(p))
+            .collect();
+
+        assert_eq!(
+            cached_results, live_results,
+            "cache must produce identical results to live resolution"
+        );
+    }
+
+    #[test]
+    fn session_allowlist_entries_match_before_and_after_optimization() {
+        let temp = TempDir::new();
+        let workspace = temp.0.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid permission fixture");
+
+        let entries = vec![
+            ("read".to_string(), "src/**".to_string()),
+            ("write".to_string(), "docs/**".to_string()),
+            ("read".to_string(), "README.md".to_string()),
+        ];
+
+        checker.load_session_allowlist(&entries);
+
+        assert!(
+            checker.session_allowlist.len() >= 3,
+            "at least all input entries should be in allowlist"
+        );
+
+        let read_entries: Vec<_> = checker
+            .session_allowlist
+            .iter()
+            .filter(|(t, _)| t == "read")
+            .collect();
+
+        assert!(
+            read_entries.len() >= 2,
+            "should have at least 2 read entries (src/** and README.md)"
+        );
+
+        assert!(
+            read_entries.iter().any(|(_, p)| p.matches("README.md")
+                || p.matches(&workspace.join("README.md").to_string_lossy())),
+            "README.md entry should match against both relative and absolute paths"
+        );
+
+        let write_entries: Vec<_> = checker
+            .session_allowlist
+            .iter()
+            .filter(|(t, _)| t == "write")
+            .collect();
+
+        assert!(
+            write_entries.len() >= 1,
+            "should have write entry for docs/**"
+        );
     }
 }

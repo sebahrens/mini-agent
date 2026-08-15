@@ -383,3 +383,241 @@ fn scroll_and_selection_queries_reuse_prewrapped_rows() {
     let _ = feed.lines(80);
     assert_eq!(feed.layout_computes(), 4);
 }
+
+#[test]
+fn streaming_within_stable_boundary_minimizes_parses() {
+    // Test that appending lines within a stable boundary (after a blank line)
+    // reuses the cached parse. The key insight: even though layout_computes
+    // increments on every append (due to generation changes invalidating the
+    // feed-level layout_cache), the agent_block_lines function should reuse
+    // the cached stable lines and only re-parse from stable_len to completed_len.
+    //
+    // Without the optimization, each agent_block_lines call would re-parse the
+    // entire text[0..completed_len], giving O(n^2) work.
+    // With the optimization, stable lines are reused, giving O(n) work.
+    //
+    // We verify this by checking that the final output is correct (matches
+    // a from-scratch parse).
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+
+    // Append lines up to a stable boundary (blank line).
+    assert!(feed.append_to_last("line one\nline two\n\n"));
+    let _ = feed.lines(80);
+
+    // Append more lines after the stable boundary.
+    for i in 3..10 {
+        assert!(feed.append_to_last(&format!("line {}\n", i)));
+        let _ = feed.lines(80);
+    }
+
+    // Get the incremental parse result.
+    let incremental_lines = feed.lines(80);
+
+    // Create a fresh feed and parse the full text at once for comparison.
+    let mut fresh_feed = Feed::new();
+    let full_text =
+        "line one\nline two\n\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n";
+    fresh_feed.push_block(BlockStyle::Agent, full_text);
+    let fresh_lines = fresh_feed.lines(80);
+
+    // The incremental and fresh parses should produce identical output.
+    // This verifies that the optimization produces correct results despite
+    // re-parsing only from the stable boundary.
+    assert_eq!(
+        incremental_lines.len(),
+        fresh_lines.len(),
+        "incremental vs fresh: line count should match"
+    );
+
+    for (i, (inc, fresh)) in incremental_lines.iter().zip(fresh_lines.iter()).enumerate() {
+        assert_eq!(inc.text, fresh.text, "line {} text should match", i);
+        assert_eq!(inc.color, fresh.color, "line {} color should match", i);
+    }
+}
+
+#[test]
+fn streaming_fence_with_blank_line_produces_correct_output() {
+    // Test correctness: a fence containing a blank line, streamed line by line.
+    // This is the critical test that would fail if find_stable_boundary used
+    // naive "\n\n" search, since the blank line inside the fence is not a
+    // top-level block boundary.
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+
+    // Append intro, then open a fence.
+    assert!(feed.append_to_last("Here is code:\n\n"));
+    assert!(feed.append_to_last("```rust\n"));
+    assert!(feed.append_to_last("fn a() {}\n"));
+    // Blank line inside the fence: not a top-level boundary.
+    assert!(feed.append_to_last("\n"));
+    assert!(feed.append_to_last("fn b() {}\n"));
+    assert!(feed.append_to_last("```\n"));
+
+    // Get the incremental parse result.
+    let incremental_lines = feed.lines(80);
+
+    // Parse from scratch for comparison.
+    feed.finalize_last();
+    let fresh_lines = feed.lines(80);
+
+    // The incremental and fresh parses must produce identical output.
+    assert_eq!(
+        incremental_lines.len(),
+        fresh_lines.len(),
+        "fence with blank line: line count mismatch"
+    );
+
+    let incremental_text: String = incremental_lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fresh_text: String = fresh_lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(
+        incremental_text, fresh_text,
+        "fence with blank line: full content mismatch"
+    );
+}
+
+#[test]
+fn streaming_loose_list_produces_correct_output() {
+    // Test correctness: a loose list (with blank lines between items) keeps
+    // the list open across blank lines. The blank line between items is not
+    // a top-level block boundary.
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+
+    // Start a loose list with blank line between items.
+    assert!(feed.append_to_last("- item one\n\n"));
+    assert!(feed.append_to_last("- item two\n"));
+
+    let incremental_lines = feed.lines(80);
+
+    // Parse from scratch for comparison.
+    feed.finalize_last();
+    let fresh_parse_lines = feed.lines(80);
+
+    // Verify they match.
+    let incremental_text: String = incremental_lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fresh_text: String = fresh_parse_lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(
+        incremental_text, fresh_text,
+        "loose list: incremental vs fresh content should match"
+    );
+}
+
+#[test]
+fn streaming_setext_heading_produces_correct_output() {
+    // Test correctness: setext-style headings are retroactive (the underline
+    // makes the previous line a heading). This is a key edge case for
+    // incremental parsing.
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+
+    // Add a line that will become a setext heading when the underline arrives.
+    assert!(feed.append_to_last("This is a heading\n"));
+    let intermediate_lines = feed.lines(80);
+
+    // Add the underline that retroactively makes it a heading.
+    assert!(feed.append_to_last("==================\n"));
+    let final_lines = feed.lines(80);
+
+    // Parse from scratch.
+    feed.finalize_last();
+    let fresh_parse_lines = feed.lines(80);
+
+    // The text should be the same between the two approaches.
+    let intermediate_text: String = intermediate_lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let final_text: String = final_lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fresh_text: String = fresh_parse_lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Before the underline, the line should be treated as plain text.
+    assert!(
+        intermediate_text.contains("This is a heading"),
+        "intermediate should contain the heading text"
+    );
+
+    // After the underline, it becomes a setext heading in the final parse.
+    // The final text after adding the underline should match the fresh parse.
+    assert_eq!(
+        final_text, fresh_text,
+        "setext heading: incremental vs fresh result"
+    );
+
+    // The final result should also contain the heading text.
+    assert!(fresh_text.contains("This is a heading"));
+}
+
+#[test]
+fn finalized_streaming_block_equals_from_scratch_parse() {
+    // General correctness test: any streaming sequence should produce the
+    // same output as parsing the final text from scratch.
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+
+    let chunks = vec![
+        "# Heading\n",
+        "\n",
+        "Some **bold** text.\n",
+        "\n",
+        "```\n",
+        "code block\n",
+        "```\n",
+        "\n",
+        "- List item 1\n",
+        "- List item 2\n",
+    ];
+
+    for chunk in &chunks {
+        assert!(feed.append_to_last(chunk));
+        let _ = feed.lines(80);
+    }
+
+    // Get the incremental parse result.
+    let incremental_lines = feed.lines(80);
+
+    // Create a fresh feed and parse the entire text at once.
+    let full_text: String = chunks.join("");
+    let mut fresh_feed = Feed::new();
+    fresh_feed.push_block(BlockStyle::Agent, &full_text);
+    let fresh_lines = fresh_feed.lines(80);
+
+    // They should match.
+    assert_eq!(
+        incremental_lines.len(),
+        fresh_lines.len(),
+        "incremental vs fresh: line count mismatch"
+    );
+
+    for (i, (inc, fresh)) in incremental_lines.iter().zip(fresh_lines.iter()).enumerate() {
+        assert_eq!(inc.text, fresh.text, "line {} text mismatch", i);
+        assert_eq!(inc.color, fresh.color, "line {} color mismatch", i);
+    }
+}

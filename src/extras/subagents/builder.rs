@@ -369,8 +369,13 @@ mod tests {
             Some("You are a Rust async specialist."),
         );
         let spec_pos = preamble.find("You are a Rust async specialist.").unwrap();
-        let base_pos = preamble.find("You are a precise code investigation agent.").unwrap();
-        assert!(spec_pos < base_pos, "specialization must precede base prompt");
+        let base_pos = preamble
+            .find("You are a precise code investigation agent.")
+            .unwrap();
+        assert!(
+            spec_pos < base_pos,
+            "specialization must precede base prompt"
+        );
     }
 
     #[test]
