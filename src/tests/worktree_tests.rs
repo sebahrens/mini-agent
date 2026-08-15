@@ -1460,7 +1460,10 @@ mod tests {
                 &repo_path,
                 "create-timeout",
                 Some(&base_path),
-                test_limits(Duration::from_millis(100)),
+                // Leave enough time for `git worktree add` to reach the hook in
+                // large feature-enabled test binaries while still timing out
+                // well before the hook's one-second sleep completes.
+                test_limits(Duration::from_millis(500)),
             )
             .await
         });

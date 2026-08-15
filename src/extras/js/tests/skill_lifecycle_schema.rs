@@ -80,7 +80,7 @@ fn phase5_schema_is_restartable_and_complete() {
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            6
+            7
         );
         for table in [
             "skill_events",
