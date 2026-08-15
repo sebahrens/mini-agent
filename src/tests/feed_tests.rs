@@ -467,6 +467,49 @@ fn streaming_correctness_with_stable_boundary_enabled() {
 }
 
 #[test]
+fn streaming_reference_definition_reparses_earlier_references() {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    assert!(feed.append_to_last("Read the [guide] for details.\n\n"));
+    let _ = feed.lines(80);
+    assert!(feed.append_to_last("[guide]: https://example.com/guide\n"));
+
+    let incremental = feed.lines(80);
+    let mut fresh = Feed::new();
+    fresh.push_block(
+        BlockStyle::Agent,
+        "Read the [guide] for details.\n\n[guide]: https://example.com/guide\n",
+    );
+    let reparsed = fresh.lines(80);
+
+    assert_eq!(incremental.len(), reparsed.len());
+    for (actual, expected) in incremental.iter().zip(&reparsed) {
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(actual.color, expected.color);
+    }
+}
+
+#[test]
+fn streaming_indented_code_continues_across_blank_line() {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    assert!(feed.append_to_last("Intro.\n\n    alpha\n\n"));
+    let _ = feed.lines(80);
+    assert!(feed.append_to_last("    beta\n"));
+
+    let incremental = feed.lines(80);
+    let mut fresh = Feed::new();
+    fresh.push_block(BlockStyle::Agent, "Intro.\n\n    alpha\n\n    beta\n");
+    let reparsed = fresh.lines(80);
+
+    assert_eq!(incremental.len(), reparsed.len());
+    for (actual, expected) in incremental.iter().zip(&reparsed) {
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(actual.color, expected.color);
+    }
+}
+
+#[test]
 fn streaming_fence_with_blank_line_produces_correct_output() {
     // Test correctness: a fence containing a blank line, streamed line by line.
     // This is the critical test that would fail if find_stable_boundary used

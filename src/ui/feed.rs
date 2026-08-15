@@ -537,6 +537,20 @@ fn is_list_item(trimmed: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with(". ") || suffix.starts_with(") "))
 }
 
+/// Link and footnote definitions can change the rendering of references that
+/// appeared earlier in the document. When one arrives in an appended chunk,
+/// the cached prefix is no longer independent and must be parsed again.
+fn contains_global_markdown_definition(text: &str) -> bool {
+    text.lines().any(|line| {
+        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+        if indent > 3 {
+            return false;
+        }
+        let trimmed = &line[indent..];
+        trimmed.starts_with('[') && trimmed.contains("]:")
+    })
+}
+
 /// Lay out an agent block: markdown for completed lines, plain text for the
 /// unfinished tail line of a still-streaming block.
 ///
@@ -571,12 +585,21 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Vec<LineEntry>
     let incremental_base = {
         let cache = block.md_cache.borrow();
         cache.as_ref().and_then(|cache| {
-            (cache.width == width && cache.parsed_len < completed_len)
-                .then(|| (cache.stable_len, cache.stable_lines.clone()))
+            (cache.width == width && cache.parsed_len < completed_len).then(|| {
+                (
+                    cache.stable_len,
+                    cache.stable_lines.clone(),
+                    cache.parsed_len,
+                )
+            })
         })
     };
 
-    if let Some((previous_stable_len, previous_stable_lines)) = incremental_base {
+    if let Some((previous_stable_len, previous_stable_lines, _previous_parsed_len)) =
+        incremental_base.filter(|(_, _, previous_parsed_len)| {
+            !contains_global_markdown_definition(&block.text[*previous_parsed_len..completed_len])
+        })
+    {
         let stable_len = find_stable_boundary(&block.text, previous_stable_len, completed_len);
         let suffix =
             parse_agent_markdown(feed, &block.text[previous_stable_len..completed_len], width);

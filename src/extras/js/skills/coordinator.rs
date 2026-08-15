@@ -361,6 +361,7 @@ impl IndexCoordinator {
         }
 
         let rows = refresh_snapshot_embeddings(&store, &model, initial)?;
+        ensure_generation_current(&store, generation)?;
         let snapshot = Arc::new(ImmutableSkillIndex::build_without_ann(
             generation,
             model,
@@ -452,14 +453,7 @@ fn build_generation(
     generation: u64,
 ) -> Result<ImmutableSkillIndex, CoordinatorError> {
     let model = embedder.model_metadata().clone();
-    let state = store.generation_state()?;
-    if state.desired_generation != generation {
-        return Err(StoreError::Constraint(format!(
-            "lifecycle requested generation {generation}, durable generation is {}",
-            state.desired_generation
-        ))
-        .into());
-    }
+    ensure_generation_current(store, generation)?;
     let initial = store.snapshot_rows(&model.model_id, &model.model_revision)?;
     let missing = initial
         .iter()
@@ -492,7 +486,20 @@ fn build_generation(
         )?;
     }
     let rows = refresh_snapshot_embeddings(store, &model, initial)?;
+    ensure_generation_current(store, generation)?;
     ImmutableSkillIndex::build(generation, model, store.database_path(), rows).map_err(Into::into)
+}
+
+fn ensure_generation_current(store: &SkillStore, generation: u64) -> Result<(), StoreError> {
+    let state = store.generation_state()?;
+    if state.desired_generation == generation {
+        Ok(())
+    } else {
+        Err(StoreError::Constraint(format!(
+            "lifecycle requested generation {generation}, durable generation is {}",
+            state.desired_generation
+        )))
+    }
 }
 
 fn refresh_snapshot_embeddings(

@@ -1,8 +1,10 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::extras::js::skills::coordinator::IndexCoordinator;
-use crate::extras::js::skills::embed::{Embedder, ModelMetadata, SkillDocument};
+use crate::extras::js::skills::embed::{
+    Embedder, EmbeddingBackend, EmbeddingError, ModelMetadata, SkillDocument,
+};
 use crate::extras::js::skills::index::{ImmutableSkillIndex, RetrievalPolicy, SkillIndex};
 use crate::extras::js::skills::store::SkillStore;
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
@@ -50,6 +52,49 @@ fn artifact(name: &str, description: &str, tag: &str) -> SkillArtifact {
         CapabilityManifest::pure(),
     )
     .unwrap()
+}
+
+struct ConcurrentAdmissionBackend {
+    paths: AppPaths,
+    artifact: Mutex<Option<SkillArtifact>>,
+}
+
+impl EmbeddingBackend for ConcurrentAdmissionBackend {
+    fn embed_documents(&self, documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if let Some(artifact) = self.artifact.lock().unwrap().take() {
+            let mut store = SkillStore::open_at(&self.paths).unwrap();
+            store.insert_verified(&artifact).unwrap();
+            store
+                .request_generation(
+                    self.model_id(),
+                    self.model_revision(),
+                    self.dimensions(),
+                    true,
+                )
+                .unwrap();
+        }
+        Ok(vec![vec![1.0, 0.0]; documents.len()])
+    }
+
+    fn embed_query(&self, _query: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(vec![1.0, 0.0])
+    }
+
+    fn model_id(&self) -> &str {
+        "concurrent-admission-fixture"
+    }
+
+    fn model_revision(&self) -> &str {
+        "v1"
+    }
+
+    fn dimensions(&self) -> usize {
+        2
+    }
+
+    fn normalized(&self) -> bool {
+        true
+    }
 }
 
 fn vector_bytes(values: &[f32]) -> Vec<u8> {
@@ -261,6 +306,39 @@ fn skill_index_rebuild_batches_and_refreshes_embedding_only_rows() {
         )
         .unwrap();
     assert_eq!(stored_bytes, vector_bytes(&expected));
+}
+
+#[test]
+fn skill_index_rebuild_rejects_generation_advanced_by_concurrent_admission() {
+    let temp = TempPaths::new();
+    let initial = artifact("initialSkill", "Initial searchable skill.", "initial");
+    let concurrent = artifact(
+        "concurrentSkill",
+        "Skill admitted during index embedding.",
+        "concurrent",
+    );
+    SkillStore::open_at(&temp.paths)
+        .and_then(|mut store| store.insert_verified(&initial))
+        .unwrap();
+
+    let embedder = Embedder::with_backend(Arc::new(ConcurrentAdmissionBackend {
+        paths: temp.paths.clone(),
+        artifact: Mutex::new(Some(concurrent.clone())),
+    }))
+    .unwrap();
+    let coordinator = IndexCoordinator::open(&temp.paths, Arc::new(embedder)).unwrap();
+
+    let error = coordinator
+        .rebuild_and_publish()
+        .expect_err("a stale generation must not be acknowledged");
+    assert!(error.to_string().contains("durable generation"));
+    assert!(coordinator.lease().unwrap().is_empty());
+    assert!(coordinator.needs_refresh().unwrap());
+
+    let store = SkillStore::open_at(&temp.paths).unwrap();
+    assert!(store.get(&concurrent.id).unwrap().is_some());
+    let state = store.generation_state().unwrap();
+    assert!(state.desired_generation > state.applied_generation);
 }
 
 #[test]

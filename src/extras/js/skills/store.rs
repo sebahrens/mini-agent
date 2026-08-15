@@ -599,33 +599,14 @@ impl SkillStore {
                 superseded_by_id,
                 row_version: u64::try_from(row_version).unwrap_or(0),
             };
-            let embedding = match (dimensions, normalized, bytes) {
-                (None, None, None) => None,
-                (Some(dimensions), Some(normalized), Some(bytes)) => {
-                    let dimensions = usize::try_from(dimensions).map_err(|_| {
-                        StoreError::MalformedEmbedding {
-                            skill_id: artifact.id.clone(),
-                            reason: "dimensions are outside the supported range".to_string(),
-                        }
-                    })?;
-                    let normalized = normalized == 1;
-                    validate_embedding_bytes(&artifact.id, dimensions, normalized, &bytes)?;
-                    Some(StoredEmbedding {
-                        skill_id: artifact.id.clone(),
-                        model_id: model_id.to_string(),
-                        model_revision: model_revision.to_string(),
-                        dimensions,
-                        normalized,
-                        values: decode_embedding(&bytes),
-                    })
-                }
-                _ => {
-                    return Err(StoreError::MalformedEmbedding {
-                        skill_id: artifact.id.clone(),
-                        reason: "embedding row is partially null".to_string(),
-                    });
-                }
-            };
+            let embedding = decode_stored_embedding(
+                &artifact.id,
+                model_id,
+                model_revision,
+                dimensions,
+                normalized,
+                bytes,
+            )?;
             snapshot.push((artifact, embedding, metadata));
         }
         Ok(snapshot)
@@ -682,33 +663,14 @@ impl SkillStore {
                 superseded_by_id,
                 row_version: u64::try_from(row_version).unwrap_or(0),
             };
-            let embedding = match (dimensions, normalized, bytes) {
-                (None, None, None) => None,
-                (Some(dimensions), Some(normalized), Some(bytes)) => {
-                    let dimensions = usize::try_from(dimensions).map_err(|_| {
-                        StoreError::MalformedEmbedding {
-                            skill_id: id.clone(),
-                            reason: "dimensions are outside the supported range".to_string(),
-                        }
-                    })?;
-                    let normalized = normalized == 1;
-                    validate_embedding_bytes(&id, dimensions, normalized, &bytes)?;
-                    Some(StoredEmbedding {
-                        skill_id: id.clone(),
-                        model_id: model_id.to_string(),
-                        model_revision: model_revision.to_string(),
-                        dimensions,
-                        normalized,
-                        values: decode_embedding(&bytes),
-                    })
-                }
-                _ => {
-                    return Err(StoreError::MalformedEmbedding {
-                        skill_id: id.clone(),
-                        reason: "embedding row is partially null".to_string(),
-                    });
-                }
-            };
+            let embedding = decode_stored_embedding(
+                &id,
+                model_id,
+                model_revision,
+                dimensions,
+                normalized,
+                bytes,
+            )?;
             snapshot.push((id, embedding, metadata));
         }
         Ok(snapshot)
@@ -3422,6 +3384,40 @@ fn validate_embedding_bytes(
         }
     }
     Ok(())
+}
+
+fn decode_stored_embedding(
+    skill_id: &str,
+    model_id: &str,
+    model_revision: &str,
+    dimensions: Option<i64>,
+    normalized: Option<i64>,
+    bytes: Option<Vec<u8>>,
+) -> Result<Option<StoredEmbedding>, StoreError> {
+    match (dimensions, normalized, bytes) {
+        (None, None, None) => Ok(None),
+        (Some(dimensions), Some(normalized), Some(bytes)) => {
+            let dimensions =
+                usize::try_from(dimensions).map_err(|_| StoreError::MalformedEmbedding {
+                    skill_id: skill_id.to_string(),
+                    reason: "dimensions are outside the supported range".to_string(),
+                })?;
+            let normalized = normalized == 1;
+            validate_embedding_bytes(skill_id, dimensions, normalized, &bytes)?;
+            Ok(Some(StoredEmbedding {
+                skill_id: skill_id.to_string(),
+                model_id: model_id.to_string(),
+                model_revision: model_revision.to_string(),
+                dimensions,
+                normalized,
+                values: decode_embedding(&bytes),
+            }))
+        }
+        _ => Err(StoreError::MalformedEmbedding {
+            skill_id: skill_id.to_string(),
+            reason: "embedding row is partially null".to_string(),
+        }),
+    }
 }
 
 fn decode_embedding(bytes: &[u8]) -> Vec<f32> {

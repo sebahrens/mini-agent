@@ -758,7 +758,7 @@ fn test_transaction_interruption_recovery() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn test_schema_v1_to_v3_migration_preserves_rows_and_rebuilds_active_only_fts()
+fn test_schema_v1_to_v7_migration_preserves_rows_and_rebuilds_active_only_fts()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = temp_app_paths();
     let paths = resolve_test_paths(&temp_dir)?;
@@ -786,7 +786,7 @@ fn test_schema_v1_to_v3_migration_preserves_rows_and_rebuilds_active_only_fts()
             store
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            6
+            7
         );
         assert_eq!(
             store
@@ -815,6 +815,39 @@ fn test_schema_v1_to_v3_migration_preserves_rows_and_rebuilds_active_only_fts()
         assert_eq!(state.model_revision, "");
         assert_eq!(state.dimensions, 0);
         assert!(state.normalized);
+    }
+
+    std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+#[test]
+fn test_schema_v6_to_v7_adds_active_identity_index() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = temp_app_paths();
+    let paths = resolve_test_paths(&temp_dir)?;
+    {
+        let store = SkillStore::open_at(&paths)?;
+        store.conn().execute_batch(
+            "DROP INDEX skill_revisions_status_identity_version_idx;
+             PRAGMA user_version = 6;",
+        )?;
+    }
+
+    for _ in 0..2 {
+        let store = SkillStore::open_at(&paths)?;
+        assert_eq!(
+            store
+                .conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            7
+        );
+        let index_count: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'skill_revisions_status_identity_version_idx'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(index_count, 1);
     }
 
     std::fs::remove_dir_all(&temp_dir)?;

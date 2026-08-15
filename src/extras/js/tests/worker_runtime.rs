@@ -2642,6 +2642,20 @@ async fn worker_supervisor_transport_rejects_stale_generation_before_protocol_st
     assert_eq!(result.outcome, StepOutcome::Value("success".into()));
 }
 
+#[test]
+fn worker_exit_reconciliation_never_sleeps_past_its_deadline() {
+    assert_eq!(
+        crate::extras::js::supervisor::reconciliation_poll_delay_for_test(Duration::from_millis(
+            100
+        )),
+        Duration::from_millis(100)
+    );
+    assert_eq!(
+        crate::extras::js::supervisor::reconciliation_poll_delay_for_test(Duration::ZERO),
+        Duration::ZERO
+    );
+}
+
 #[tokio::test]
 async fn worker_supervisor_transport_bounds_stderr_without_blocking_worker() {
     let supervisor = scripted_supervisor(256 * 1024);

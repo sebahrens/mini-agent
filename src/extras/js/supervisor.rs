@@ -1798,9 +1798,15 @@ async fn reconcile_transport_exit(
             Ok(Some(status)) => return classify_worker_exit(status),
             Err(_) => return WorkerError::Transport,
             Ok(None) if Instant::now() >= deadline => return WorkerError::Transport,
-            Ok(None) => tokio::time::sleep(PROCESS_POLL_INTERVAL).await,
+            Ok(None) => {
+                tokio::time::sleep(reconciliation_poll_delay(Instant::now(), deadline)).await
+            }
         }
     }
+}
+
+fn reconciliation_poll_delay(now: Instant, deadline: Instant) -> Duration {
+    PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(now))
 }
 
 fn classify_worker_exit(status: ExitStatus) -> WorkerError {
@@ -1831,6 +1837,12 @@ fn validate_generation(expected: u64, actual: u64) -> Result<(), WorkerError> {
 #[cfg(test)]
 pub(crate) fn validate_generation_for_test(expected: u64, actual: u64) -> Result<(), WorkerError> {
     validate_generation(expected, actual)
+}
+
+#[cfg(test)]
+pub(crate) fn reconciliation_poll_delay_for_test(remaining: Duration) -> Duration {
+    let now = Instant::now();
+    reconciliation_poll_delay(now, now + remaining)
 }
 
 fn read_worker_frame(
