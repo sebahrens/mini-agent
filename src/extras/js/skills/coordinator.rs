@@ -1,11 +1,11 @@
 //! Off-request-path embedding migration and immutable index publication.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::embed::{Embedder, EmbeddingError, SkillDocument};
+use super::embed::{Embedder, EmbeddingError, ModelMetadata, SkillDocument};
 use super::index::{ImmutableSkillIndex, SkillIndex, SkillIndexError};
-use super::store::{SkillStore, StoreError};
+use super::store::{SkillRecordMetadata, SkillStore, StoreError, StoredEmbedding};
 use crate::paths::AppPaths;
 use rusqlite::OptionalExtension;
 
@@ -346,35 +346,21 @@ impl IndexCoordinator {
                 )
                 .into());
             }
-            for ((skill_id, _), vector) in batch.iter().zip(vectors) {
-                let bytes = vector
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<_>>();
-                store.store_embedding(
-                    skill_id,
-                    &model.model_id,
-                    &model.model_revision,
-                    model.dimensions as u32,
-                    model.normalized,
-                    &bytes,
-                )?;
-            }
+            let embeddings = batch
+                .iter()
+                .zip(vectors)
+                .map(|((skill_id, _), vector)| (skill_id.clone(), vector))
+                .collect::<Vec<_>>();
+            store.store_embedding_batch(
+                &model.model_id,
+                &model.model_revision,
+                model.dimensions,
+                model.normalized,
+                &embeddings,
+            )?;
         }
 
-        // Re-read one joined view after inference so the published snapshot is
-        // bound to a single identity/lifecycle scan.
-        let rows = store
-            .snapshot_rows(&model.model_id, &model.model_revision)?
-            .into_iter()
-            .map(|(artifact, embedding, metadata)| {
-                let embedding = embedding.ok_or_else(|| StoreError::MalformedEmbedding {
-                    skill_id: artifact.id.clone(),
-                    reason: "compatible vector is missing after rebuild".to_string(),
-                })?;
-                Ok((artifact, embedding, metadata))
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?;
+        let rows = refresh_snapshot_embeddings(&store, &model, initial)?;
         let snapshot = Arc::new(ImmutableSkillIndex::build_without_ann(
             generation,
             model,
@@ -492,33 +478,55 @@ fn build_generation(
             )
             .into());
         }
-        for ((skill_id, _), vector) in batch.iter().zip(vectors) {
-            let bytes = vector
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<_>>();
-            store.store_embedding(
-                skill_id,
-                &model.model_id,
-                &model.model_revision,
-                model.dimensions as u32,
-                model.normalized,
-                &bytes,
-            )?;
-        }
+        let embeddings = batch
+            .iter()
+            .zip(vectors)
+            .map(|((skill_id, _), vector)| (skill_id.clone(), vector))
+            .collect::<Vec<_>>();
+        store.store_embedding_batch(
+            &model.model_id,
+            &model.model_revision,
+            model.dimensions,
+            model.normalized,
+            &embeddings,
+        )?;
     }
-    let rows = store
-        .snapshot_rows(&model.model_id, &model.model_revision)?
+    let rows = refresh_snapshot_embeddings(store, &model, initial)?;
+    ImmutableSkillIndex::build(generation, model, store.database_path(), rows).map_err(Into::into)
+}
+
+fn refresh_snapshot_embeddings(
+    store: &SkillStore,
+    model: &ModelMetadata,
+    initial: Vec<(
+        super::SkillArtifact,
+        Option<StoredEmbedding>,
+        SkillRecordMetadata,
+    )>,
+) -> Result<Vec<(super::SkillArtifact, StoredEmbedding, SkillRecordMetadata)>, StoreError> {
+    let mut embeddings = store
+        .snapshot_embeddings_only(&model.model_id, &model.model_revision)?
         .into_iter()
-        .map(|(artifact, embedding, metadata)| {
+        .map(|(skill_id, embedding, metadata)| (skill_id, (embedding, metadata)))
+        .collect::<HashMap<_, _>>();
+
+    initial
+        .into_iter()
+        .map(|(artifact, _, _)| {
+            let (embedding, metadata) =
+                embeddings
+                    .remove(&artifact.id)
+                    .ok_or_else(|| StoreError::MalformedEmbedding {
+                        skill_id: artifact.id.clone(),
+                        reason: "active row disappeared during rebuild".to_string(),
+                    })?;
             let embedding = embedding.ok_or_else(|| StoreError::MalformedEmbedding {
                 skill_id: artifact.id.clone(),
                 reason: "compatible vector is missing after rebuild".to_string(),
             })?;
             Ok((artifact, embedding, metadata))
         })
-        .collect::<Result<Vec<_>, StoreError>>()?;
-    ImmutableSkillIndex::build(generation, model, store.database_path(), rows).map_err(Into::into)
+        .collect()
 }
 
 fn skill_document(artifact: &super::SkillArtifact) -> String {

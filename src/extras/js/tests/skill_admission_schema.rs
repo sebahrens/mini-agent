@@ -2,12 +2,12 @@ use crate::extras::js::skills::lifecycle::{
     EvidenceSnapshot, HumanApproval, LifecycleService, LifecycleStatus,
 };
 use crate::extras::js::skills::store::{
-    AdminIdentity, EnqueueStatus, EvaluationReportRecord, HeldOutSuiteRecord, ProposalStatus,
-    SkillStore, StoreError,
+    AdminIdentity, CURRENT_SCHEMA_VERSION, EnqueueStatus, EvaluationReportRecord,
+    HeldOutSuiteRecord, ProposalStatus, SkillStore, StoreError,
 };
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -126,14 +126,38 @@ fn seed_v2(paths: &AppPaths, generations: &str) {
 fn skill_admission_schema_migrates_and_reopens() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("fresh store");
-    assert_eq!(store.schema_version().expect("version"), 6);
-    drop(store);
     assert_eq!(
-        SkillStore::open_at(&paths)
-            .expect("reopen")
-            .schema_version()
-            .expect("version"),
-        6
+        store.schema_version().expect("version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    drop(store);
+    let reopened = SkillStore::open_at(&paths).expect("reopen");
+    assert_eq!(
+        reopened.schema_version().expect("version"),
+        CURRENT_SCHEMA_VERSION
+    );
+    let query_plan = reopened
+        .conn()
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT r.id, r.status, r.supersedes_id, r.superseded_by_id, r.row_version,
+                    e.dimensions, e.normalized, e.embedding
+               FROM skill_revisions r
+               LEFT JOIN skill_embeddings e
+                 ON e.skill_id = r.id AND e.model_id = ? AND e.model_revision = ?
+              WHERE r.status = 'active' AND r.identity_version = 2
+              ORDER BY r.id",
+        )
+        .expect("prepare snapshot plan")
+        .query_map(params!["model", "revision"], |row| row.get::<_, String>(3))
+        .expect("query snapshot plan")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect snapshot plan");
+    assert!(
+        query_plan
+            .iter()
+            .any(|detail| detail.contains("skill_revisions_status_identity_version_idx")),
+        "snapshot query did not use the composite eligibility index: {query_plan:?}"
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -183,7 +207,7 @@ fn skill_admission_schema_v6_backfills_v5_awaiting_approval_report_binding() {
         )
         .unwrap();
     assert_eq!(bound.as_deref(), Some(evaluation.report_id.as_str()));
-    assert_eq!(migrated.schema_version().unwrap(), 6);
+    assert_eq!(migrated.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -466,7 +490,7 @@ fn skill_admission_schema_upgrades_phase3_v2_without_losing_generation_shape() {
     );
 
     let store = SkillStore::open_at(&paths).expect("upgrade Phase 3 v2");
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let state = store.generation_state().expect("generation state");
     assert_eq!(state.desired_generation, 7);
     assert_eq!(state.applied_generation, 6);
@@ -491,7 +515,7 @@ fn skill_admission_schema_upgrades_legacy_phase4_v2_collision() {
     );
 
     let store = SkillStore::open_at(&paths).expect("upgrade legacy Phase 4 v2");
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let state = store
         .generation_state()
         .expect("normalized generation state");
@@ -540,7 +564,7 @@ fn skill_admission_schema_quarantines_all_identity_v1_tiers_without_inference() 
     drop(connection);
 
     let mut store = SkillStore::open_at(&paths).expect("migrate identity v1");
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     assert!(store.list_retrievable().unwrap().is_empty());
 
     let rows = store

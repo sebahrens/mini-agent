@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::extras::js::skills::coordinator::IndexCoordinator;
-use crate::extras::js::skills::embed::{Embedder, ModelMetadata};
+use crate::extras::js::skills::embed::{Embedder, ModelMetadata, SkillDocument};
 use crate::extras::js::skills::index::{ImmutableSkillIndex, RetrievalPolicy, SkillIndex};
 use crate::extras::js::skills::store::SkillStore;
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
@@ -202,6 +202,65 @@ fn skill_index_generations_publish_complete_snapshots_and_recover() {
         reopened.lease().unwrap().is_empty(),
         "durably retired skills must not resurrect after restart"
     );
+}
+
+#[test]
+fn skill_index_rebuild_batches_and_refreshes_embedding_only_rows() {
+    let temp = TempPaths::new();
+    let skill = artifact("slugify", "Create URL-safe slugs.", "text");
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store.insert_verified(&skill).unwrap();
+    let before = store
+        .snapshot_embeddings_only("mini-agent-deterministic", "v1")
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    assert!(before[0].1.is_none());
+    drop(store);
+
+    let embedder = Arc::new(Embedder::new().unwrap());
+    let expected_document = SkillDocument::new(skill.description.clone())
+        .with_exports(
+            skill
+                .exports
+                .iter()
+                .map(|export| (export.name.clone(), export.signature.clone()))
+                .collect(),
+        )
+        .with_tags(skill.tags.clone())
+        .with_identifiers(
+            skill
+                .exports
+                .iter()
+                .map(|export| export.name.clone())
+                .collect(),
+        )
+        .render();
+    let expected = embedder
+        .embed_documents(&[expected_document])
+        .unwrap()
+        .remove(0);
+    let model = embedder.model_metadata().clone();
+    let coordinator = IndexCoordinator::open(&temp.paths, embedder).unwrap();
+    coordinator.rebuild_and_publish().unwrap();
+    drop(coordinator);
+
+    let store = SkillStore::open_at(&temp.paths).unwrap();
+    let after = store
+        .snapshot_embeddings_only(&model.model_id, &model.model_revision)
+        .unwrap();
+    assert_eq!(after.len(), 1);
+    let embedding = after[0].1.as_ref().expect("compatible embedding");
+    assert_eq!(embedding.values, expected);
+    let stored_bytes: Vec<u8> = store
+        .conn()
+        .query_row(
+            "SELECT embedding FROM skill_embeddings
+              WHERE skill_id = ?1 AND model_id = ?2 AND model_revision = ?3",
+            (&skill.id, &model.model_id, &model.model_revision),
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_bytes, vector_bytes(&expected));
 }
 
 #[test]

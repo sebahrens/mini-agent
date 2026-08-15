@@ -18,7 +18,7 @@ use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact,
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
 #[derive(Debug, Clone, PartialEq)]
@@ -631,6 +631,89 @@ impl SkillStore {
         Ok(snapshot)
     }
 
+    /// Load lifecycle and embedding data without fetching artifact bodies.
+    ///
+    /// Index rebuilds already hold an identity-checked artifact snapshot. This
+    /// lean second scan refreshes compatible vectors and lifecycle metadata
+    /// without reading source, tests, exports, tags, or capability JSON again.
+    pub fn snapshot_embeddings_only(
+        &self,
+        model_id: &str,
+        model_revision: &str,
+    ) -> Result<Vec<(String, Option<StoredEmbedding>, SkillRecordMetadata)>, StoreError> {
+        let mut statement = self.db.prepare(
+            "SELECT r.id, r.status, r.supersedes_id, r.superseded_by_id, r.row_version,
+                    e.dimensions, e.normalized, e.embedding
+             FROM skill_revisions r
+             LEFT JOIN skill_embeddings e
+               ON e.skill_id = r.id AND e.model_id = ? AND e.model_revision = ?
+             WHERE r.status = 'active' AND r.identity_version = 2
+             ORDER BY r.id",
+        )?;
+        let rows = statement.query_map(params![model_id, model_revision], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+            ))
+        })?;
+
+        let mut snapshot = Vec::new();
+        for row in rows {
+            let (
+                id,
+                status,
+                supersedes_id,
+                superseded_by_id,
+                row_version,
+                dimensions,
+                normalized,
+                bytes,
+            ) = row?;
+            let metadata = SkillRecordMetadata {
+                status,
+                quarantine_reason: None,
+                supersedes_id,
+                superseded_by_id,
+                row_version: u64::try_from(row_version).unwrap_or(0),
+            };
+            let embedding = match (dimensions, normalized, bytes) {
+                (None, None, None) => None,
+                (Some(dimensions), Some(normalized), Some(bytes)) => {
+                    let dimensions = usize::try_from(dimensions).map_err(|_| {
+                        StoreError::MalformedEmbedding {
+                            skill_id: id.clone(),
+                            reason: "dimensions are outside the supported range".to_string(),
+                        }
+                    })?;
+                    let normalized = normalized == 1;
+                    validate_embedding_bytes(&id, dimensions, normalized, &bytes)?;
+                    Some(StoredEmbedding {
+                        skill_id: id.clone(),
+                        model_id: model_id.to_string(),
+                        model_revision: model_revision.to_string(),
+                        dimensions,
+                        normalized,
+                        values: decode_embedding(&bytes),
+                    })
+                }
+                _ => {
+                    return Err(StoreError::MalformedEmbedding {
+                        skill_id: id.clone(),
+                        reason: "embedding row is partially null".to_string(),
+                    });
+                }
+            };
+            snapshot.push((id, embedding, metadata));
+        }
+        Ok(snapshot)
+    }
+
     /// Store an embedding vector for a skill.
     ///
     /// Keyed by (skill_id, model_id, model_revision). Incompatible vectors remain
@@ -666,6 +749,50 @@ impl SkillStore {
             ],
         )?;
 
+        Ok(())
+    }
+
+    /// Store one embedding batch atomically, encoding each f32 vector with a
+    /// single sized allocation. Used by off-request-path index rebuilds.
+    pub(super) fn store_embedding_batch(
+        &mut self,
+        model_id: &str,
+        model_revision: &str,
+        dimensions: usize,
+        normalized: bool,
+        embeddings: &[(String, Vec<f32>)],
+    ) -> Result<(), StoreError> {
+        let encoded = embeddings
+            .iter()
+            .map(|(skill_id, values)| {
+                let bytes = encode_embedding(values);
+                validate_embedding_bytes(skill_id, dimensions, normalized, &bytes)?;
+                Ok((skill_id, bytes))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let now = current_timestamp()?;
+        let normalized = if normalized { 1 } else { 0 };
+        let transaction = self.db.transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT OR REPLACE INTO skill_embeddings (
+                    skill_id, model_id, model_revision, dimensions,
+                    normalized, embedding, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for (skill_id, bytes) in encoded {
+                statement.execute(params![
+                    skill_id,
+                    model_id,
+                    model_revision,
+                    dimensions as i64,
+                    normalized,
+                    bytes,
+                    now,
+                ])?;
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -3016,6 +3143,21 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
         }
     }
 
+    // Migration 6 -> 7: add index for efficient identity_version filtering in snapshot queries.
+    // The snapshot queries filter by status='active' AND identity_version=2, but the schema only
+    // indexed (status, id). Adding (status, identity_version, id) eliminates post-index filtering.
+    if current_version < 7 {
+        db.execute_batch(
+            "
+            BEGIN IMMEDIATE;
+            CREATE INDEX IF NOT EXISTS skill_revisions_status_identity_version_idx
+                ON skill_revisions(status, identity_version, id);
+            PRAGMA user_version = 7;
+            COMMIT;
+            ",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -3287,6 +3429,14 @@ fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(std::mem::size_of::<f32>())
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+fn encode_embedding(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
 }
 
 /// Get current Unix timestamp in seconds.
