@@ -144,6 +144,41 @@ mod tests {
         }
     }
 
+    const TEST_MUTATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(15);
+
+    async fn wait_for_mutation_marker(path: &Path, task_finished: impl Fn() -> bool, label: &str) {
+        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, async {
+            while !path.exists() {
+                assert!(
+                    !task_finished(),
+                    "{label} stopped before its marker was written"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{label} did not acquire the process Git mutation lock within {:?}",
+                TEST_MUTATION_ADMISSION_TIMEOUT
+            )
+        });
+    }
+
+    async fn acquire_released_mutation_lock(label: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        tokio::time::timeout(
+            TEST_MUTATION_ADMISSION_TIMEOUT,
+            crate::git::runner::acquire_process_git_mutation(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{label} did not release the process Git mutation lock within {:?}",
+                TEST_MUTATION_ADMISSION_TIMEOUT
+            )
+        })
+    }
+
     #[test]
     fn production_worktree_module_never_mutates_process_cwd() {
         let source = include_str!("../extras/git_worktree/mod.rs");
@@ -1467,14 +1502,17 @@ mod tests {
             )
             .await
         });
-        for _ in 0..200 {
-            if started.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(started.exists(), "post-checkout hook did not start");
-        std::thread::sleep(Duration::from_millis(1100));
+        wait_for_mutation_marker(
+            &started,
+            || create_task.is_finished(),
+            "timed worktree create",
+        )
+        .await;
+        // Keep the Tokio timer driver running while the hook sleeps. Blocking
+        // this current-thread test runtime makes the 500 ms production
+        // deadline and the one-second hook completion become ready together,
+        // which can let the child-success branch win under a loaded suite.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
 
         let error = create_task
             .await
@@ -1682,30 +1720,18 @@ mod tests {
         };
         let task = tokio::spawn(async move { try_merge(&info, "main").await });
 
-        for _ in 0..200 {
-            if started.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        if !started.exists() && task.is_finished() {
-            let (_, outcome) = task.await.expect("merge task join");
-            panic!("merge stopped before delayed fetch started: {outcome:?}");
-        }
-        assert!(started.exists(), "delayed fetch did not start");
+        wait_for_mutation_marker(&started, || task.is_finished(), "delayed merge fetch").await;
         task.abort();
         let _ = task.await;
-        tokio::time::timeout(
-            Duration::from_secs(4),
-            run_locked_git_with_limits_for_test(
-                repo.path(),
-                &["status", "--porcelain"],
-                test_limits(Duration::from_secs(2)),
-            ),
+        let admission = acquire_released_mutation_lock("caller-drop rollback").await;
+        run_git_with_limits_for_test(
+            repo.path(),
+            &["status", "--porcelain"],
+            test_limits(Duration::from_secs(2)),
         )
         .await
-        .expect("caller-drop rollback did not release repository lock")
         .expect("status after caller-drop rollback");
+        drop(admission);
 
         assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
         assert_eq!(
@@ -2467,13 +2493,11 @@ mod tests {
         assert!(retained_conflict.contains("main\n"));
         assert!(retained_conflict.contains("feature\n"));
         assert!(has_merge_conflict(repo.path()).await);
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            cleanup_worktree(&worktree, "feature", repo.path(), true),
-        )
-        .await
-        .expect("repository lock was not released after cancellation")
-        .expect("cleanup test worktree");
+        let admission = acquire_released_mutation_lock("cancelled squash merge").await;
+        drop(admission);
+        cleanup_worktree(&worktree, "feature", repo.path(), true)
+            .await
+            .expect("cleanup test worktree");
         assert_eq!(std::env::current_dir().unwrap(), original_cwd);
         assert!(!worktree.exists(), "cancelled worktree was not cleaned up");
         let _ = std::fs::remove_dir_all(remote);
