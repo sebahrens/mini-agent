@@ -6,6 +6,7 @@ pub(crate) mod grep;
 pub(crate) mod list_dir;
 #[cfg(feature = "lsp")]
 pub(crate) mod lsp;
+pub(crate) mod memoize;
 pub(crate) mod normalize;
 pub(crate) mod read;
 pub(crate) mod todo;

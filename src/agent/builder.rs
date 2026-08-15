@@ -643,6 +643,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         }
 
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
+        let all_tools = tools::memoize::definitions(all_tools);
 
         #[cfg(feature = "hooks")]
         let all_tools = crate::extras::hooks::wrap_from_global(all_tools, permission.clone());
@@ -1312,6 +1313,7 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
                 .with_workspace_binding(workspace.clone()),
         ),
     ];
+    let read_tools = tools::memoize::definitions(read_tools);
 
     let mut builder = AgentBuilder::new(model)
         .preamble(&preamble)

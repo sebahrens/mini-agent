@@ -155,6 +155,7 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
         tools.extend(subagent_memory_tools(authorization));
         tools
     };
+    let tools = tools::memoize::definitions(tools);
 
     #[cfg(feature = "hooks")]
     let tools = crate::extras::hooks::wrap_from_global(tools, authorization.permission.clone());
