@@ -1670,7 +1670,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/extras/js/skills/store.rs", "status,", 3, "NON-PROCESS"),
+    ("src/extras/js/skills/store.rs", "status,", 5, "NON-PROCESS"),
     (
         "src/extras/js/skills/telemetry.rs",
         "if !matches!(status, LifecycleStatus::Canary | LifecycleStatus::Active) {",

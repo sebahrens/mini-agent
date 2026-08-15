@@ -119,9 +119,11 @@ async fn worker_effect_cancellation_drains_reconciliation_then_recycles_and_reco
 
 #[tokio::test]
 async fn worker_effect_cancellation_deadline_drains_unknown_outcome_before_returning() {
+    // The watchdog must comfortably include a fresh debug worker launch; the
+    // behavior under test begins only after the worker requests its effect.
     let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
         TestWorkerLauncher::scripted_internal_worker(0),
-        Duration::from_millis(75),
+        Duration::from_millis(500),
     );
     let witness = CancellationWitness::default();
     let result = supervisor
