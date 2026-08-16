@@ -1579,17 +1579,15 @@ mod tests {
         assert!(started.exists(), "post-checkout hook did not start");
         task.abort();
         let _ = task.await;
-        tokio::time::timeout(
-            Duration::from_secs(4),
-            run_locked_git_with_limits_for_test(
-                repo.path(),
-                &["status", "--porcelain"],
-                test_limits(Duration::from_secs(2)),
-            ),
+        let admission = acquire_released_mutation_lock("dropped worktree create").await;
+        run_git_with_limits_for_test(
+            repo.path(),
+            &["status", "--porcelain"],
+            test_limits(Duration::from_secs(2)),
         )
         .await
-        .expect("create rollback did not release the repository lock")
         .expect("status after dropped create");
+        drop(admission);
 
         assert!(
             !target.exists(),
