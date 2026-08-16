@@ -77,9 +77,16 @@ try {
             valid = instance.validate(values[0], values[1]);
         } catch (error) {
             try { instance.removeSchema(); } catch (_) {}
-            return error === 1
-                ? '[false,[{"instancePath":"","schemaPath":"","keyword":"schemaCompilation","params":{}}]]'
-                : '[false,[{"instancePath":"","schemaPath":"","keyword":"schemaExecution","params":{}}]]';
+            let keyword = 'schemaExecution';
+            if (error === 1) keyword = 'schemaCompilation';
+            else if (error === 2) keyword = 'schemaFactoryExecution';
+            else if (error instanceof RangeError) keyword = 'schemaExecutionRange';
+            else if (error instanceof ReferenceError) keyword = 'schemaExecutionReference';
+            else if (error instanceof TypeError) keyword = 'schemaExecutionType';
+            else if (error instanceof SyntaxError) keyword = 'schemaExecutionSyntax';
+            return stringify([false,[{
+                instancePath: '', schemaPath: '', keyword, params: {}
+            }]]);
         }
         const result = stringify([valid, valid ? null : instance.errors]);
         try {
@@ -198,7 +205,7 @@ fn build_private_skill_library_bridge(
             .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
         let constructor_factory = ctx
             .eval::<Function, _>(
-                "((stringify) => compile => function (...parts) { try { return compile(stringify(parts)); } catch (_) { throw 1; } })(JSON.stringify)",
+                "((stringify, apply) => compile => function (...parts) { let generated; try { generated = compile(stringify(parts)); } catch (_) { throw 1; } return function (...values) { try { return apply(generated, this, values); } catch (_) { throw 2; } }; })(JSON.stringify, Reflect.apply)",
             )
             .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
         let function_constructor = constructor_factory
