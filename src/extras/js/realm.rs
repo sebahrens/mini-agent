@@ -50,13 +50,14 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
 
 // AJV's compiler intentionally uses `Function` to turn schemas into validators. The trusted
 // loader captures that constructor lexically before the private realm is hardened. Bundle
-// initialization is lazy so skills that do not validate JSON retain the existing resource
-// envelope; the learned skill still receives only the frozen facade installed below. Neither the
-// constructor nor AJV's mutable instance is reachable from stored source or the model realm.
+// initialization happens only for artifacts that reference AJV, and it completes before private
+// realm hardening so the vendored bootstrap has the same deterministic intrinsics on every
+// platform. Skills that do not validate JSON retain the existing resource envelope. The learned
+// skill still receives only the frozen facade installed below; neither the constructor nor AJV's
+// mutable instance is reachable from stored source or the model realm.
 const PRIVATE_SKILL_LIBRARY_MODULE_NAME: &str = "mini-agent:private-skill-library";
 const PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE: &str = concat!(
     r#"(function (Function) {
-let instance;
 const initialize = function () {
 const self = globalThis;
 "#,
@@ -72,6 +73,7 @@ try {
     delete globalThis.ajv7;
 }
 };
+const instance = initialize();
 const freeze = Object.freeze;
 let validationErrors = null;
 const freezeErrors = errors => {
@@ -84,10 +86,9 @@ const freezeErrors = errors => {
 };
 const validate = freeze(function (schema, data) {
     try {
-        const validator = instance || (instance = initialize());
-        const valid = validator.validate(schema, data);
+        const valid = instance.validate(schema, data);
         validationErrors = freezeErrors(
-            valid ? null : JSON.parse(JSON.stringify(validator.errors))
+            valid ? null : JSON.parse(JSON.stringify(instance.errors))
         );
         return valid;
     } catch (_) {
