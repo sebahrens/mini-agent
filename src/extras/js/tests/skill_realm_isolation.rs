@@ -966,7 +966,7 @@ fn bundled_ajv_is_available_only_inside_private_skill_realms() {
     let runtime = bounded_runtime();
     let model = Context::full(&runtime).expect("create model context");
     let skill = SkillArtifact::new(
-        "function inspectAjv(value) { const valid = Ajv.validate({$id: 'urn:mini-agent:ajv-fixture', $schema: 'http://json-schema.org/draft-07/schema#', type: 'string'}, value); return {valid, errors: Ajv.errors, facadeFrozen: Object.isFrozen(Ajv), errorsFrozen: Ajv.errors === null || Object.isFrozen(Ajv.errors), constructorHidden: typeof Ajv.constructor === 'undefined' && typeof Ajv.validate.constructor === 'undefined'}; }".into(),
+        "function inspectAjv(value) { const valid = Ajv.validate({type: 'string'}, value); return {valid, errors: Ajv.errors, facadeFrozen: Object.isFrozen(Ajv), errorsFrozen: Ajv.errors === null || Object.isFrozen(Ajv.errors), constructorHidden: typeof Ajv.constructor === 'undefined' && typeof Ajv.validate.constructor === 'undefined'}; }".into(),
         "AJV private realm fixture".into(),
         vec![],
         vec![SkillExport {

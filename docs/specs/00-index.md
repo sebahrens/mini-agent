@@ -153,10 +153,9 @@ source or tests use the exact `Ajv` global, preserving the existing resource env
 skills. A string-only JSON bridge connects that compiler context to the frozen skill facade, so
 realm hardening never has to retain a dynamic-code capability. AJV's internal `Function` calls use
 a trusted native-eval shim inside that sibling context for cross-platform QuickJS compatibility.
-Runtime schema meta-validation, messages, and optimizer passes are disabled; a boolean draft-07
-dialect marker preserves explicit `$schema` resolution without compiling the full meta-schema, so
-schema compilation stays inside the normative 512 KiB QuickJS stack ceiling. Non-meta schemas are
-removed after every call so repeated `$id` values cannot collide and compiler caches cannot grow
+Schemas use AJV's bundled default draft-07 vocabulary. Runtime schema meta-validation, messages,
+and optimizer passes are disabled so schema compilation stays inside the normative 512 KiB
+QuickJS stack ceiling. Non-meta schemas are removed after every call so compiler caches cannot grow
 across invocations; invalid or unsupported schemas return `false` with a closed schema-stage
 keyword. The committed bundle and MIT notice live in `src/extras/js/vendor/`.
 
