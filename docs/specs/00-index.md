@@ -150,9 +150,9 @@ a false result. The facade is absent from the model-authored realm, and neither 
 instance nor its dynamic-code constructor is exposed. The trusted bundle is compiled to
 process-local bytecode once and instantiated by the trusted loader before hardening only when
 canonical source or tests use the exact `Ajv` global, preserving the existing resource envelope for
-other skills. A string-only JSON bridge connects the mutable instance to the frozen skill facade.
-AJV's internal `Function` calls use a lexically captured native-eval shim that stored source cannot
-reach; realm hardening still removes every ambient dynamic-code capability before source runs.
+other skills. A frozen lexical facade is the only reference to the mutable instance. AJV's internal
+`Function` calls use a lexically captured native-eval shim that stored source cannot reach; realm
+hardening still removes every ambient dynamic-code capability before source runs.
 Schemas use AJV's bundled default draft-07 vocabulary. Runtime schema meta-validation, messages,
 and optimizer passes are disabled, and AJV emits its equivalent ES5 validator form for Windows
 QuickJS portability. Schema compilation stays inside the

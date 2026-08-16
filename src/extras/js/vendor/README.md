@@ -11,5 +11,5 @@ The vendored copy adds only a conventional final newline.
 - upstream license: `AJV-LICENSE.txt`
 
 The Rust loader wraps this UMD artifact in a trusted lexical scope before hardening and exposes only
-a frozen string-bridged facade to stored skill source; do not add the bundle as a model-authored
-global or introduce `require()`/`import()` support.
+a frozen facade to stored skill source; do not add the bundle as a model-authored global or
+introduce `require()`/`import()` support.

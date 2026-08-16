@@ -67,79 +67,58 @@ try {
         allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
         code: {es5: true, optimize: false}, logger: false, meta: false
     });
+    const freeze = Object.freeze;
     const parse = JSON.parse;
     const stringify = JSON.stringify;
-    return function (encodedArguments) {
-        let valid;
+    let validationErrors = null;
+    const freezeErrors = errors => {
+        if (errors === null) return null;
+        for (const error of errors) {
+            if (error.params && typeof error.params === 'object') freeze(error.params);
+            freeze(error);
+        }
+        return freeze(errors);
+    };
+    const validate = freeze(function (schema, data) {
         try {
-            const values = parse(encodedArguments);
-            valid = instance.validate(values[0], values[1]);
+            const valid = instance.validate(schema, data);
+            validationErrors = freezeErrors(
+                valid ? null : parse(stringify(instance.errors))
+            );
+            try { instance.removeSchema(); } catch (_) {}
+            return valid;
         } catch (error) {
             try { instance.removeSchema(); } catch (_) {}
             let keyword = 'schemaExecution';
-            if (error === 1) keyword = 'schemaCompilation';
-            else if (error === 2) keyword = 'schemaFactoryExecution';
-            else if (error instanceof RangeError) keyword = 'schemaExecutionRange';
+            if (error instanceof RangeError) keyword = 'schemaExecutionRange';
             else if (error instanceof ReferenceError) keyword = 'schemaExecutionReference';
             else if (error instanceof TypeError) keyword = 'schemaExecutionType';
             else if (error instanceof SyntaxError) keyword = 'schemaExecutionSyntax';
-            return stringify([false,[{
+            validationErrors = freezeErrors([{
                 instancePath: '', schemaPath: '', keyword, params: {}
-            }]]);
+            }]);
+            return false;
         }
-        const result = stringify([valid, valid ? null : instance.errors]);
-        try {
-            instance.removeSchema();
-        } catch (_) {
-            return '[false,[{"instancePath":"","schemaPath":"","keyword":"schemaCleanup","params":{}}]]';
-        }
-        return result;
-    };
+    });
+    const api = Object.create(null);
+    Object.defineProperty(api, 'validate', {
+    value: validate, enumerable: true, writable: false, configurable: false
+    });
+    Object.defineProperty(api, 'errors', {
+    get: freeze(() => validationErrors), enumerable: true, configurable: false
+    });
+    freeze(api);
+    Object.defineProperty(globalThis, 'Ajv', {
+    value: api, enumerable: false, writable: false, configurable: false
+    });
 } finally {
     delete globalThis.ajv7;
 }
 };
-return initialize();
+initialize();
 })
 "#,
 );
-
-const PRIVATE_SKILL_LIBRARY_FACADE_SOURCE: &str = r#"
-((freeze, parse, stringify, create, defineProperty) => invoke => {
-let validationErrors = null;
-const freezeErrors = errors => {
-    if (errors === null) return null;
-    for (const error of errors) {
-        if (error.params && typeof error.params === 'object') freeze(error.params);
-        freeze(error);
-    }
-    return freeze(errors);
-};
-const validate = freeze(function (schema, data) {
-    try {
-        const result = parse(invoke(stringify([schema, data])));
-        validationErrors = freezeErrors(result[1]);
-        return result[0] === true;
-    } catch (_) {
-        validationErrors = freezeErrors([{
-            instancePath: '', schemaPath: '', keyword: 'schema', params: {}
-        }]);
-        return false;
-    }
-});
-const api = create(null);
-defineProperty(api, 'validate', {
-    value: validate, enumerable: true, writable: false, configurable: false
-});
-defineProperty(api, 'errors', {
-    get: freeze(() => validationErrors), enumerable: true, configurable: false
-});
-freeze(api);
-defineProperty(globalThis, 'Ajv', {
-    value: api, enumerable: false, writable: false, configurable: false
-});
-})(Object.freeze, JSON.parse, JSON.stringify, Object.create, Object.defineProperty)
-"#;
 
 static PRIVATE_SKILL_LIBRARY_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
@@ -179,10 +158,7 @@ fn compile_private_library_function<'js>(
 }
 
 #[allow(unsafe_code)]
-fn build_private_skill_library_bridge<'js>(
-    ctx: &Ctx<'js>,
-    bytecode: &[u8],
-) -> Result<Function<'js>, RealmError> {
+fn install_private_skill_library<'js>(ctx: &Ctx<'js>, bytecode: &[u8]) -> Result<(), RealmError> {
     // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
     // with the same linked QuickJS ABI, and are never accepted from disk, IPC, or model output.
     let module = unsafe { Module::load(ctx.clone(), bytecode) }
@@ -200,19 +176,7 @@ fn build_private_skill_library_bridge<'js>(
         .map_err(|_| RealmError::PrivateLibraryExportLookup)?
         .with_constructor(true);
     install
-        .call::<_, Function>((function_constructor,))
-        .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
-}
-
-fn install_private_skill_library_facade<'js>(
-    ctx: &Ctx<'js>,
-    bridge: Function<'js>,
-) -> Result<(), RealmError> {
-    let factory = ctx
-        .eval::<Function, _>(PRIVATE_SKILL_LIBRARY_FACADE_SOURCE)
-        .map_err(|_| RealmError::PrivateLibraryFactoryExecution)?;
-    factory
-        .call::<_, ()>((bridge,))
+        .call::<_, ()>((function_constructor,))
         .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
 }
 
@@ -596,10 +560,7 @@ fn load_artifact_internal(
         })
         .map_err(|_| RealmError::Initialization)?;
     if let Some(bytecode) = private_skill_library {
-        private_context.with(|ctx| {
-            let bridge = build_private_skill_library_bridge(&ctx, bytecode)?;
-            install_private_skill_library_facade(&ctx, bridge)
-        })?;
+        private_context.with(|ctx| install_private_skill_library(&ctx, bytecode))?;
     }
     private_context
         .with(|ctx| {
