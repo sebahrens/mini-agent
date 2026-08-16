@@ -52,9 +52,12 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
 // loader captures that constructor lexically before the private realm is hardened. Bundle
 // initialization happens only for artifacts that reference AJV, and it completes before private
 // realm hardening so the vendored bootstrap has the same deterministic intrinsics on every
-// platform. Skills that do not validate JSON retain the existing resource envelope. The learned
-// skill still receives only the frozen facade installed below; neither the constructor nor AJV's
-// mutable instance is reachable from stored source or the model realm.
+// platform. Default meta-schema registration is disabled because input-schema self-validation is
+// already disabled and that unnecessary startup path fails inside the fixed Windows MSVC runtime
+// envelope; draft-07 `$schema` declarations remain accepted and are covered by the realm test.
+// Skills that do not validate JSON retain the existing resource envelope. The learned skill still
+// receives only the frozen facade installed below; neither the constructor nor AJV's mutable
+// instance is reachable from stored source or the model realm.
 const PRIVATE_SKILL_LIBRARY_MODULE_NAME: &str = "mini-agent:private-skill-library";
 const PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE: &str = concat!(
     r#"(function (Function) {
@@ -66,7 +69,8 @@ const self = globalThis;
 const AjvConstructor = globalThis.ajv7.default || globalThis.ajv7;
 try {
     return new AjvConstructor({
-        allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
+        allErrors: false, strict: false, meta: false, validateSchema: false,
+        verbose: false, messages: false,
         code: {optimize: false}, logger: false
     });
 } finally {

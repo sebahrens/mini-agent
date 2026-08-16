@@ -149,10 +149,12 @@ skill source can call `Ajv.validate(schema, data)` and inspect the frozen `Ajv.e
 a false result. The facade is absent from the model-authored realm, and neither AJV's mutable
 instance nor its captured dynamic-code constructor is exposed. The trusted bundle is compiled to
 process-local bytecode once and instantiated only for artifacts whose canonical source or tests use
-the exact `Ajv` global, preserving the existing resource envelope for other skills. Runtime schema
-meta-validation, messages, and optimizer passes are disabled so schema compilation stays inside the
-normative 512 KiB QuickJS stack ceiling; invalid or unsupported schemas return `false` with a closed
-`keyword: "schema"` error. The committed bundle and MIT notice live in `src/extras/js/vendor/`.
+the exact `Ajv` global, preserving the existing resource envelope for other skills. Default
+meta-schema registration, runtime schema meta-validation, messages, and optimizer passes are
+disabled so startup and schema compilation stay inside the normative 512 KiB QuickJS stack
+ceiling. Draft-07 `$schema` declarations remain accepted; invalid or unsupported schemas return
+`false` with a closed `keyword: "schema"` error. The committed bundle and MIT notice live in
+`src/extras/js/vendor/`.
 
 ## Build commands (mandatory)
 
