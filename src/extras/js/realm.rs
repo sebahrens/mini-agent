@@ -55,7 +55,7 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
 // JSON retain the existing resource envelope.
 const PRIVATE_SKILL_LIBRARY_MODULE_NAME: &str = "mini-agent:private-skill-library";
 const PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE: &str = concat!(
-    r#"(function (Function) {
+    r#"(function (Function, validateFallback) {
 const initialize = function () {
 const self = globalThis;
 "#,
@@ -82,6 +82,11 @@ try {
     };
     const validate = freeze(function (schema, data) {
         try {
+            if (validateFallback !== undefined) {
+                const result = parse(validateFallback(stringify([schema, data])));
+                validationErrors = freezeErrors(result[1]);
+                return result[0] === true;
+            }
             const valid = instance.validate(schema, data);
             validationErrors = freezeErrors(
                 valid ? null : parse(stringify(instance.errors))
@@ -162,6 +167,43 @@ fn compile_private_library_function<'js>(
     ctx.eval(source)
 }
 
+#[cfg(windows)]
+fn validate_schema_without_codegen(encoded: String) -> String {
+    let generic = || {
+        r#"[false,[{"instancePath":"","schemaPath":"","keyword":"schema","params":{}}]]"#.to_owned()
+    };
+    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(&encoded) else {
+        return generic();
+    };
+    let [schema, data]: [serde_json::Value; 2] = match values.try_into() {
+        Ok(values) => values,
+        Err(_) => return generic(),
+    };
+    let Ok(validator) = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft7)
+        .build(&schema)
+    else {
+        return generic();
+    };
+    let Some(error) = validator.iter_errors(&data).next() else {
+        return "[true,null]".to_owned();
+    };
+    let instance_path = error.instance_path().to_string();
+    let schema_location = error.schema_path().to_string();
+    let keyword = schema_location
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("schema");
+    serde_json::to_string(&serde_json::json!([false, [{
+        "instancePath": instance_path,
+        "schemaPath": format!("#{schema_location}"),
+        "keyword": keyword,
+        "params": {},
+    }]]))
+    .unwrap_or_else(|_| generic())
+}
+
 #[allow(unsafe_code)]
 fn install_private_skill_library<'js>(ctx: &Ctx<'js>, bytecode: &[u8]) -> Result<(), RealmError> {
     // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
@@ -180,6 +222,15 @@ fn install_private_skill_library<'js>(ctx: &Ctx<'js>, bytecode: &[u8]) -> Result
     let function_constructor = Function::new(ctx.clone(), compile_private_library_function)
         .map_err(|_| RealmError::PrivateLibraryExportLookup)?
         .with_constructor(true);
+    #[cfg(windows)]
+    {
+        let fallback = Function::new(ctx.clone(), validate_schema_without_codegen)
+            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+        install
+            .call::<_, ()>((function_constructor, fallback))
+            .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
+    }
+    #[cfg(not(windows))]
     install
         .call::<_, ()>((function_constructor,))
         .map_err(|_| RealmError::PrivateLibraryFactoryExecution)

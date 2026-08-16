@@ -154,11 +154,12 @@ other skills. A frozen lexical facade is the only reference to the mutable insta
 `Function` calls use a lexically captured native-eval shim that stored source cannot reach; realm
 hardening still removes every ambient dynamic-code capability before source runs.
 Schemas use AJV's bundled default draft-07 vocabulary. Runtime schema meta-validation, messages,
-and optimizer passes are disabled, and AJV emits its equivalent ES5 validator form for Windows
-QuickJS portability. Schema compilation stays inside the
-normative 512 KiB QuickJS stack ceiling. Non-meta schemas are removed after every call so compiler
+and optimizer passes are disabled, and AJV emits its equivalent ES5 validator form. Windows
+QuickJS exceeds the normative 512 KiB stack even for that minimal generated validator, so the same
+frozen facade uses `jsonschema` 0.49.9's non-codegen Draft 7 validator there; its default network
+and file resolvers are disabled. Non-meta AJV schemas are removed after every call so compiler
 caches cannot grow across invocations; invalid or unsupported schemas return `false` with a closed
-schema-stage keyword. The committed bundle and MIT notice live in `src/extras/js/vendor/`.
+schema-stage keyword. The committed AJV bundle and MIT notice live in `src/extras/js/vendor/`.
 
 ## Build commands (mandatory)
 
