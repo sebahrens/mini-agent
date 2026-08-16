@@ -48,12 +48,11 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
 })(JSON.parse, Reflect.apply)
 "#;
 
-// AJV's compiler intentionally uses `Function` to turn schemas into validators. It therefore
-// lives in a trusted sibling context that evaluates only the vendored bundle and JSON strings;
-// its constructor calls route through native QuickJS eval for Windows portability.
-// The hardened skill realm receives a frozen facade over a string-only bridge, so neither the
-// constructor nor AJV's mutable instance is reachable from stored source or the model realm.
-// Skills that do not validate JSON retain the existing resource envelope.
+// AJV's compiler intentionally uses `Function` to turn schemas into validators. The trusted
+// loader initializes it before hardening and routes those constructor calls through native
+// QuickJS eval for Windows portability. Stored source receives only a frozen JSON facade, so
+// neither the compiler shim nor AJV's mutable instance is reachable. Skills that do not validate
+// JSON retain the existing resource envelope.
 const PRIVATE_SKILL_LIBRARY_MODULE_NAME: &str = "mini-agent:private-skill-library";
 const PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE: &str = concat!(
     r#"(function (Function) {
@@ -182,51 +181,44 @@ fn compile_private_library_function<'js>(
 }
 
 #[allow(unsafe_code)]
-fn build_private_skill_library_bridge(
-    runtime: &Runtime,
+fn build_private_skill_library_bridge<'js>(
+    ctx: &Ctx<'js>,
     bytecode: &[u8],
-) -> Result<Persistent<Function<'static>>, RealmError> {
-    let context = Context::full(runtime).map_err(|_| RealmError::PrivateLibraryBytecodeLoad)?;
-    context.with(|ctx| {
-        // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
-        // with the same linked QuickJS ABI, and are never accepted from disk, IPC, or model output.
-        let module = unsafe { Module::load(ctx.clone(), bytecode) }
-            .map_err(|_| RealmError::PrivateLibraryBytecodeLoad)?;
-        let (module, evaluation) = module
-            .eval()
-            .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
-        evaluation
-            .finish::<()>()
-            .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
-        let install = module
-            .get::<_, Function>("install")
-            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-        let compiler = Function::new(ctx.clone(), compile_private_library_function)
-            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-        let constructor_factory = ctx
-            .eval::<Function, _>(
-                "((stringify, apply) => compile => function (...parts) { let generated; try { generated = compile(stringify(parts)); } catch (_) { throw 1; } return function (...values) { try { return apply(generated, this, values); } catch (_) { throw 2; } }; })(JSON.stringify, Reflect.apply)",
-            )
-            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-        let function_constructor = constructor_factory
-            .call::<_, Function>((compiler,))
-            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-        let bridge = install
-            .call::<_, Function>((function_constructor,))
-            .map_err(|_| RealmError::PrivateLibraryFactoryExecution)?;
-        Ok(Persistent::save(&ctx, bridge))
-    })
+) -> Result<Function<'js>, RealmError> {
+    // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
+    // with the same linked QuickJS ABI, and are never accepted from disk, IPC, or model output.
+    let module = unsafe { Module::load(ctx.clone(), bytecode) }
+        .map_err(|_| RealmError::PrivateLibraryBytecodeLoad)?;
+    let (module, evaluation) = module
+        .eval()
+        .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
+    evaluation
+        .finish::<()>()
+        .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
+    let install = module
+        .get::<_, Function>("install")
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+    let compiler = Function::new(ctx.clone(), compile_private_library_function)
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+    let constructor_factory = ctx
+        .eval::<Function, _>(
+            "((stringify, apply) => compile => function (...parts) { let generated; try { generated = compile(stringify(parts)); } catch (_) { throw 1; } return function (...values) { try { return apply(generated, this, values); } catch (_) { throw 2; } }; })(JSON.stringify, Reflect.apply)",
+        )
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+    let function_constructor = constructor_factory
+        .call::<_, Function>((compiler,))
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+    install
+        .call::<_, Function>((function_constructor,))
+        .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
 }
 
-fn install_private_skill_library_facade(
-    ctx: &Ctx<'_>,
-    bridge: Persistent<Function<'static>>,
+fn install_private_skill_library_facade<'js>(
+    ctx: &Ctx<'js>,
+    bridge: Function<'js>,
 ) -> Result<(), RealmError> {
     let factory = ctx
         .eval::<Function, _>(PRIVATE_SKILL_LIBRARY_FACADE_SOURCE)
-        .map_err(|_| RealmError::PrivateLibraryFactoryExecution)?;
-    let bridge = bridge
-        .restore(ctx)
         .map_err(|_| RealmError::PrivateLibraryFactoryExecution)?;
     factory
         .call::<_, ()>((bridge,))
@@ -613,8 +605,10 @@ fn load_artifact_internal(
         })
         .map_err(|_| RealmError::Initialization)?;
     if let Some(bytecode) = private_skill_library {
-        let bridge = build_private_skill_library_bridge(runtime, bytecode)?;
-        private_context.with(|ctx| install_private_skill_library_facade(&ctx, bridge))?;
+        private_context.with(|ctx| {
+            let bridge = build_private_skill_library_bridge(&ctx, bytecode)?;
+            install_private_skill_library_facade(&ctx, bridge)
+        })?;
     }
     private_context
         .with(|ctx| {

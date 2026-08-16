@@ -148,14 +148,14 @@ Identity-v2 private learned-skill realms also include the vendored AJV 8.12.0 va
 skill source can call `Ajv.validate(schema, data)` and inspect the frozen `Ajv.errors` array after
 a false result. The facade is absent from the model-authored realm, and neither AJV's mutable
 instance nor its dynamic-code constructor is exposed. The trusted bundle is compiled to
-process-local bytecode once and instantiated in a per-artifact sibling context only when canonical
-source or tests use the exact `Ajv` global, preserving the existing resource envelope for other
-skills. A string-only JSON bridge connects that compiler context to the frozen skill facade, so
-realm hardening never has to retain a dynamic-code capability. AJV's internal `Function` calls use
-a trusted native-eval shim inside that sibling context for cross-platform QuickJS compatibility.
+process-local bytecode once and instantiated by the trusted loader before hardening only when
+canonical source or tests use the exact `Ajv` global, preserving the existing resource envelope for
+other skills. A string-only JSON bridge connects the mutable instance to the frozen skill facade.
+AJV's internal `Function` calls use a lexically captured native-eval shim that stored source cannot
+reach; realm hardening still removes every ambient dynamic-code capability before source runs.
 Schemas use AJV's bundled default draft-07 vocabulary. Runtime schema meta-validation, messages,
-and optimizer passes are disabled, and AJV emits its equivalent ES5 validator form to avoid a
-Windows QuickJS failure on destructured default parameters. Schema compilation stays inside the
+and optimizer passes are disabled, and AJV emits its equivalent ES5 validator form for Windows
+QuickJS portability. Schema compilation stays inside the
 normative 512 KiB QuickJS stack ceiling. Non-meta schemas are removed after every call so compiler
 caches cannot grow across invocations; invalid or unsupported schemas return `false` with a closed
 schema-stage keyword. The committed bundle and MIT notice live in `src/extras/js/vendor/`.
