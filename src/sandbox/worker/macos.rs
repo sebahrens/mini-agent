@@ -36,6 +36,8 @@ const HOSTED_ONE_TIME_IMAGE: &str = "MINI_AGENT_MACOS_ONE_TIME_IMAGE";
 const HOSTED_GUARDIAN_PGID: &str = "MINI_AGENT_MACOS_GUARDIAN_PGID";
 const HOSTED_DESCRIPTOR_BOUND: &str = "MINI_AGENT_MACOS_DESCRIPTOR_BOUND";
 const HOSTED_PASS_RECORD: &str = "MACOS_CONTAINMENT_MATRIX_V1=passed";
+const HOSTED_SENTINEL_CONTENT: &[u8] = b"macos-containment-sentinel-v1";
+const GUARDIAN_NORMAL_RELEASE: u8 = 0xa5;
 // Only majors that passed the exact non-libtest production-binary matrix are enabled. Ready alone
 // is never availability evidence. macOS 26 passed on 26.5.2; other majors remain fail closed.
 const VALIDATED_MACOS_MAJORS: &[u32] = &[26];
@@ -86,14 +88,7 @@ impl HostedProbePaths {
             create_private_directory(&paths.skill_directory)?;
             create_private_directory(&paths.credential_directory)?;
             for path in [&paths.workspace, &paths.skill, &paths.credential] {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(path)?;
-                file.write_all(b"macos-containment-sentinel-v1")?;
-                file.sync_all()?;
-                sync_parent_directory(path)?;
+                create_hosted_sentinel(path)?;
             }
             Ok(())
         })();
@@ -117,11 +112,23 @@ impl HostedProbePaths {
 
     fn verify_unchanged(&self) -> io::Result<()> {
         for path in [&self.workspace, &self.skill, &self.credential] {
-            if std::fs::read(path)? != b"macos-containment-sentinel-v1" {
+            if std::fs::read(path)? != HOSTED_SENTINEL_CONTENT {
                 return Err(io::Error::other("macOS containment sentinel changed"));
             }
         }
         Ok(())
+    }
+
+    fn restore_workspace_after_parent_death(&self) -> io::Result<()> {
+        match std::fs::symlink_metadata(&self.workspace) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                create_hosted_sentinel(&self.workspace)
+            }
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(
+                "macOS parent-death workspace sentinel survived guardian cleanup",
+            )),
+        }
     }
 
     fn cleanup(mut self) -> io::Result<()> {
@@ -148,6 +155,17 @@ impl HostedProbePaths {
     }
 }
 
+fn create_hosted_sentinel(path: &Path) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(HOSTED_SENTINEL_CONTENT)?;
+    file.sync_all()?;
+    sync_parent_directory(path)
+}
+
 impl Drop for HostedProbePaths {
     fn drop(&mut self) {
         if !self.root.as_os_str().is_empty() {
@@ -167,6 +185,57 @@ fn sync_parent_directory(path: &Path) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("probe path has no parent"))?,
     )?
     .sync_all()
+}
+
+fn guardian_heartbeat_released_normally(heartbeat: &mut impl Read) -> bool {
+    let mut byte = [0_u8; 1];
+    loop {
+        match heartbeat.read(&mut byte) {
+            Ok(0) => return false,
+            Ok(_) => return byte[0] == GUARDIAN_NORMAL_RELEASE,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+fn cleanup_abandoned_workspace_sentinel(workspace: &Path, sentinel: &Path) -> io::Result<()> {
+    let workspace = std::fs::canonicalize(workspace)?;
+    let parent = sentinel
+        .parent()
+        .ok_or_else(|| io::Error::other("workspace sentinel has no parent"))?;
+    if std::fs::canonicalize(parent)? != workspace {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "workspace sentinel escaped the attested workspace",
+        ));
+    }
+    let name = sentinel
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|name| name.strip_prefix(".mini-agent-macos-workspace-sentinel-"))
+        .ok_or_else(|| io::Error::other("workspace sentinel name was invalid"))?;
+    uuid::Uuid::parse_str(name)
+        .map_err(|_| io::Error::other("workspace sentinel identity was invalid"))?;
+
+    let metadata = match std::fs::symlink_metadata(sentinel) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != current_uid()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o600
+        || std::fs::read(sentinel)? != HOSTED_SENTINEL_CONTENT
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "workspace sentinel identity changed",
+        ));
+    }
+    std::fs::remove_file(sentinel)?;
+    sync_parent_directory(sentinel)
 }
 
 fn required_probe_path(key: &'static str) -> io::Result<PathBuf> {
@@ -717,6 +786,9 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
                     "macOS parent-death publication identity survived recovery",
                 ));
             }
+            probes
+                .restore_workspace_after_parent_death()
+                .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=workspace_cleanup"))?;
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -906,6 +978,17 @@ fn run_guardian() -> io::Result<ExitStatus> {
     } else {
         None
     };
+    let abandoned_workspace_sentinel = probe_environment
+        .as_ref()
+        .and_then(|environment| {
+            environment
+                .iter()
+                .find(|(key, _)| *key == HOSTED_WORKSPACE_SENTINEL)
+        })
+        .map(|(_, value)| {
+            std::env::current_dir().map(|workspace| (workspace, PathBuf::from(value)))
+        })
+        .transpose()?;
 
     let heartbeat = guardian_heartbeat().inspect_err(|_error| {
         eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=guardian_heartbeat");
@@ -920,10 +1003,16 @@ fn run_guardian() -> io::Result<ExitStatus> {
         .name("macos-worker-parent-death".into())
         .spawn(move || {
             let mut heartbeat = heartbeat;
-            let mut byte = [0_u8; 1];
-            while heartbeat.read(&mut byte).is_ok_and(|read| read != 0) {}
+            if guardian_heartbeat_released_normally(&mut heartbeat) {
+                return;
+            }
+            if let Some((workspace, sentinel)) = abandoned_workspace_sentinel {
+                if cleanup_abandoned_workspace_sentinel(&workspace, &sentinel).is_err() {
+                    eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=workspace_cleanup");
+                }
+            }
             // SAFETY: the guardian owns this dedicated process group. EOF means its parent died
-            // or intentionally dropped ownership, so killing the complete group is fail closed.
+            // without releasing a reaped worker, so killing the complete group is fail closed.
             unsafe { libc::kill(-process_group, libc::SIGKILL) };
         })
         .inspect_err(|_error| {
@@ -1737,11 +1826,13 @@ impl WorkerChild {
     }
 
     pub(super) fn retire_after_reap(&mut self) -> io::Result<()> {
-        let Some(image) = self.image.as_mut() else {
-            return Ok(());
-        };
-        image.retire_after_reap()?;
-        self.image.take();
+        if let Some(image) = self.image.as_mut() {
+            image.retire_after_reap()?;
+            self.image.take();
+        }
+        if let Some(mut heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.write_all(&[GUARDIAN_NORMAL_RELEASE]);
+        }
         Ok(())
     }
 
@@ -4122,5 +4213,53 @@ mod tests {
         assert_eq!(bounded_limit(64, 32), 32);
         assert_eq!(bounded_limit(64, 128), 64);
         assert_eq!(bounded_limit(0, 128), 0);
+    }
+
+    #[test]
+    fn guardian_heartbeat_distinguishes_normal_release_from_parent_loss() {
+        let (mut parent, mut guardian) = UnixStream::pair().unwrap();
+        parent.write_all(&[GUARDIAN_NORMAL_RELEASE]).unwrap();
+        drop(parent);
+        assert!(guardian_heartbeat_released_normally(&mut guardian));
+
+        let (parent, mut guardian) = UnixStream::pair().unwrap();
+        drop(parent);
+        assert!(!guardian_heartbeat_released_normally(&mut guardian));
+    }
+
+    #[test]
+    fn abandoned_workspace_sentinel_cleanup_is_exact_and_workspace_bound() {
+        let workspace = std::env::temp_dir().join(format!(
+            "mini-agent-workspace-sentinel-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&workspace).unwrap();
+        let sentinel = workspace.join(format!(
+            ".mini-agent-macos-workspace-sentinel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&sentinel)
+            .unwrap();
+        file.write_all(HOSTED_SENTINEL_CONTENT).unwrap();
+        drop(file);
+
+        cleanup_abandoned_workspace_sentinel(&workspace, &sentinel).unwrap();
+        assert!(!sentinel.exists());
+
+        let outside = std::env::temp_dir().join(format!(
+            "mini-agent-outside-sentinel-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&outside, b"outside").unwrap();
+        let error = cleanup_abandoned_workspace_sentinel(&workspace, &outside)
+            .expect_err("cleanup must not escape the attested workspace");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(outside.exists());
+        std::fs::remove_file(outside).unwrap();
+        std::fs::remove_dir(workspace).unwrap();
     }
 }
