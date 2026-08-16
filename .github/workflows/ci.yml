@@ -59,6 +59,11 @@ jobs:
       - name: Test release workflow policy
         run: python3 -m unittest scripts.tests.test_check_package_metadata
 
+      - name: Test Windows MSI policy
+        run: |
+          python3 -m unittest scripts.tests.test_check_windows_msi
+          python3 scripts/check_windows_msi.py
+
       - name: Test package version synchronization
         run: python3 -m unittest scripts.tests.test_sync_version
 
@@ -1720,6 +1725,54 @@ jobs:
 
       - name: Install locally (debug)
         run: cargo install --locked --path . --debug
+
+  windows-msi:
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate MSI policy
+        run: python scripts/check_windows_msi.py
+
+      - name: Stage deterministic installer fixtures
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force msi-fixtures | Out-Null
+          Copy-Item $env:ComSpec msi-fixtures/mini-agent.exe
+          'CI fixture for WiX authoring validation' | Set-Content -Encoding ascii msi-fixtures/mini-agent-win32-x64.vsix
+
+      - name: Compile MSI with pinned WiX
+        shell: pwsh
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($manifest, '(?m)^version = "([^"-]+\.[^"-]+\.[^"-]+)').Groups[1].Value
+          if (-not $version) { throw 'could not read MSI-compatible package version' }
+          $binary = (Resolve-Path msi-fixtures/mini-agent.exe).Path
+          $vsix = (Resolve-Path msi-fixtures/mini-agent-win32-x64.vsix).Path
+          dotnet build packaging/windows/installer.wixproj `
+            --configuration Release `
+            --output msi-output `
+            -p:ProductVersion=$version `
+            -p:BinaryPath=$binary `
+            -p:VsixPath=$vsix
+          if ($LASTEXITCODE -ne 0) { throw "WiX build failed with exit code $LASTEXITCODE" }
+
+      - name: Quiet install and uninstall
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path msi-output/mini-agent-windows-x64.msi).Path
+          $installLog = Join-Path $env:RUNNER_TEMP mini-agent-msi-ci.log
+          & msiexec.exe /i $msi /quiet /norestart /l*v $installLog
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content $installLog
+            throw "MSI install failed with exit code $LASTEXITCODE"
+          }
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\mini-agent\mini-agent.exe'
+          if (-not (Test-Path $installed)) { throw "MSI did not install $installed" }
+          & msiexec.exe /x $msi /quiet /norestart
+          if ($LASTEXITCODE -ne 0) { throw "MSI uninstall failed with exit code $LASTEXITCODE" }
+          if (Test-Path $installed) { throw 'MSI uninstall left the installed binary behind' }
 
   package:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')

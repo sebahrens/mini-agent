@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="mini-agent"
+    Manufacturer="mini-agent contributors"
+    Version="$(var.ProductVersion)"
+    Language="1033"
+    InstallerVersion="500"
+    Scope="perUserOrMachine"
+    UpgradeCode="D69F78E4-6308-43D2-A944-6CB8E2A68765">
+
+    <SummaryInformation
+      Description="mini-agent and its native VS Code extension"
+      Manufacturer="mini-agent contributors" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of mini-agent is already installed." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="mini-agent">
+        <Component Id="MiniAgentPayload" Guid="*" Bitness="always64">
+          <File Id="MiniAgentExe" Source="$(var.BinaryPath)" Name="mini-agent.exe" KeyPath="yes" Checksum="yes" />
+          <File Id="MiniAgentVsix" Source="$(var.VsixPath)" Name="mini-agent-win32-x64.vsix" />
+          <File Id="InstallVsCodeExtensionScript" Source="install-vscode-extension.cmd" />
+          <File Id="LicenseText" Source="$(var.RepositoryRoot)\LICENSE" Name="LICENSE.txt" />
+          <File Id="NoticeText" Source="$(var.RepositoryRoot)\NOTICE" Name="NOTICE.txt" />
+          <File Id="SourceDirections" Source="$(var.RepositoryRoot)\SOURCE.md" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Complete" Title="mini-agent" Level="1">
+      <ComponentRef Id="MiniAgentPayload" />
+    </Feature>
+
+    <SetProperty
+      Id="InstallVsCodeExtension"
+      Value="&quot;[%ComSpec]&quot; /d /s /c &quot;&quot;[#InstallVsCodeExtensionScript]&quot;&quot;"
+      Before="InstallVsCodeExtension"
+      Sequence="execute"
+      Condition="NOT Installed AND ALLUSERS &lt;&gt; 1" />
+    <CustomAction
+      Id="InstallVsCodeExtension"
+      BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+      DllEntry="WixQuietExec"
+      Execute="commit"
+      Impersonate="yes"
+      Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="InstallVsCodeExtension" Before="InstallFinalize" Condition="NOT Installed AND ALLUSERS &lt;&gt; 1" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

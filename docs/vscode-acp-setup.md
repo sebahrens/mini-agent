@@ -14,6 +14,12 @@ Release packaging rejects wrong-architecture or ACP-disabled binaries, then driv
 each native artifact through initialize/new/prompt/cancel/close over stdio before
 assembling its platform VSIX.
 
+On x86-64 Windows, `mini-agent-windows-x64.msi` provides a no-terminal alternative. It installs
+per-user without elevation by default and attempts to side-load the bundled win32-x64 VSIX when
+VS Code is detected. Enterprise deployment can use
+`msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart`; a service-account install
+does not modify another user's VS Code profile. Verify the artifact against `MSI_SHA256SUMS`.
+
 Open a trusted local workspace and address `@mini-agent` in VS Code Chat. The
 extension starts its bundled native binary lazily, keeps one ACP session for
 subsequent prompts, streams assistant/tool/status updates, displays permission

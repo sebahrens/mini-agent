@@ -449,9 +449,87 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  windows-msi:
+    name: Windows MSI
+    needs: [build-windows, vscode-vsix]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download Windows binary archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: archives-x86_64-pc-windows-msvc
+          path: msi-input
+
+      - name: Download Windows VSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: vsix-win32-x64
+          path: msi-input
+
+      - name: Validate MSI policy
+        run: python3 scripts/check_windows_msi.py
+
+      - name: Build MSI with pinned WiX
+        shell: pwsh
+        run: |
+          tar.exe -xzf msi-input/mini-agent-x86_64-pc-windows-msvc.tar.gz -C msi-input
+          $productVersion = ($env:GITHUB_REF_NAME.TrimStart('v') -split '-')[0]
+          $binary = (Resolve-Path msi-input/mini-agent.exe).Path
+          $vsixCandidates = @(Get-ChildItem msi-input/mini-agent-*-win32-x64.vsix)
+          if ($vsixCandidates.Count -ne 1) {
+            throw "Expected exactly one win32-x64 VSIX, found $($vsixCandidates.Count)"
+          }
+          $vsix = $vsixCandidates[0].FullName
+          dotnet build packaging/windows/installer.wixproj `
+            --configuration Release `
+            --output msi-output `
+            -p:ProductVersion=$productVersion `
+            -p:BinaryPath=$binary `
+            -p:VsixPath=$vsix
+          if ($LASTEXITCODE -ne 0) { throw "WiX build failed with exit code $LASTEXITCODE" }
+
+      - name: Quiet install, smoke, and uninstall
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path msi-output/mini-agent-windows-x64.msi).Path
+          $installLog = Join-Path $env:RUNNER_TEMP mini-agent-msi-install.log
+          & msiexec.exe /i $msi /quiet /norestart /l*v $installLog
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content $installLog
+            throw "MSI install failed with exit code $LASTEXITCODE"
+          }
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\mini-agent\mini-agent.exe'
+          if (-not (Test-Path $installed)) { throw "MSI did not install $installed" }
+          $version = & $installed --version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^mini-agent ') {
+            throw "installed MSI binary failed its version smoke"
+          }
+          & msiexec.exe /x $msi /quiet /norestart
+          if ($LASTEXITCODE -ne 0) { throw "MSI uninstall failed with exit code $LASTEXITCODE" }
+          if (Test-Path $installed) { throw "MSI uninstall left the installed binary behind" }
+
+      - name: Generate MSI checksum
+        shell: pwsh
+        run: |
+          $msi = 'msi-output/mini-agent-windows-x64.msi'
+          $hash = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  mini-agent-windows-x64.msi" | Set-Content -Encoding ascii msi-output/MSI_SHA256SUMS
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-installer
+          path: |
+            msi-output/mini-agent-windows-x64.msi
+            msi-output/MSI_SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
   publish-release:
     name: Publish GitHub release
-    needs: [build, build-static, build-windows, corresponding-source, checksums, vscode-candidates]
+    needs: [build, build-static, build-windows, corresponding-source, checksums, vscode-candidates, windows-msi]
     runs-on: ubuntu-latest
     steps:
       - name: Download all archives
@@ -475,6 +553,11 @@ jobs:
         with:
           name: vscode-candidates
 
+      - name: Download Windows installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-installer
+
       - name: Verify complete release set
         run: |
           expected=(
@@ -495,6 +578,8 @@ jobs:
             mini-agent-${GITHUB_REF_NAME}-source.tar.gz
             SHA256SUMS
             VSIX_SHA256SUMS
+            MSI_SHA256SUMS
+            mini-agent-windows-x64.msi
             mini-agent-1.7.2-linux-x64.vsix
             mini-agent-1.7.2-linux-arm64.vsix
             mini-agent-1.7.2-darwin-x64.vsix
@@ -509,10 +594,10 @@ jobs:
           for f in "${expected[@]}"; do
             [ -f "$f" ] || { echo "ERROR: Missing expected file: $f"; exit 1; }
           done
-          actual_count=$(ls *.tar.gz *.vsix *.cdx.json SHA256SUMS VSIX_SHA256SUMS 2>/dev/null | wc -l)
+          actual_count=$(ls *.tar.gz *.vsix *.cdx.json *.msi SHA256SUMS VSIX_SHA256SUMS MSI_SHA256SUMS 2>/dev/null | wc -l)
           if [ "$actual_count" -ne "${#expected[@]}" ]; then
             echo "ERROR: Unexpected files present (got $actual_count, expected ${#expected[@]})"
-            ls *.tar.gz *.vsix *.cdx.json SHA256SUMS VSIX_SHA256SUMS
+            ls *.tar.gz *.vsix *.cdx.json *.msi SHA256SUMS VSIX_SHA256SUMS MSI_SHA256SUMS
             exit 1
           fi
 
@@ -528,7 +613,7 @@ jobs:
           # Remove any partial release from a prior failed attempt so reruns are clean
           gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           gh release create "$tag" \
-            *.tar.gz *.vsix *.cdx.json SHA256SUMS VSIX_SHA256SUMS \
+            *.tar.gz *.vsix *.cdx.json *.msi SHA256SUMS VSIX_SHA256SUMS MSI_SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "$tag" \
             --generate-notes \

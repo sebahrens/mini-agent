@@ -186,6 +186,8 @@ EXPECTED_RELEASE_ARCHIVES = (
 )
 EXPECTED_VSCODE_RELEASE_ARTIFACTS = (
     "VSIX_SHA256SUMS",
+    "MSI_SHA256SUMS",
+    "mini-agent-windows-x64.msi",
     "mini-agent-1.7.2-linux-x64.vsix",
     "mini-agent-1.7.2-linux-arm64.vsix",
     "mini-agent-1.7.2-darwin-x64.vsix",
