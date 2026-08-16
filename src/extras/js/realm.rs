@@ -49,7 +49,8 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
 "#;
 
 // AJV's compiler intentionally uses `Function` to turn schemas into validators. It therefore
-// lives in a trusted sibling context that evaluates only the vendored bundle and JSON strings.
+// lives in a trusted sibling context that evaluates only the vendored bundle and JSON strings;
+// its constructor calls route through native QuickJS eval for Windows portability.
 // The hardened skill realm receives a frozen facade over a string-only bridge, so neither the
 // constructor nor AJV's mutable instance is reachable from stored source or the model realm.
 // Skills that do not validate JSON retain the existing resource envelope.
@@ -153,6 +154,19 @@ fn artifact_uses_ajv(artifact: &SkillArtifact) -> bool {
     artifact.source.contains("Ajv") || artifact.tests.iter().any(|test| test.contains("Ajv"))
 }
 
+fn compile_private_library_function<'js>(
+    ctx: Ctx<'js>,
+    encoded_parts: String,
+) -> rquickjs::Result<Function<'js>> {
+    let parts: Vec<String> =
+        serde_json::from_str(&encoded_parts).map_err(|_| rquickjs::Error::Unknown)?;
+    let (body, parameters) = parts.split_last().ok_or(rquickjs::Error::Unknown)?;
+    // AJV supplies the same parameter/body strings it would pass to the standard Function
+    // constructor. This trusted shim changes only the QuickJS API used to compile them.
+    let source = format!("(function({}) {{\n{}\n}})", parameters.join(","), body);
+    ctx.eval(source)
+}
+
 #[allow(unsafe_code)]
 fn build_private_skill_library_bridge(
     runtime: &Runtime,
@@ -173,9 +187,15 @@ fn build_private_skill_library_bridge(
         let install = module
             .get::<_, Function>("install")
             .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-        let function_constructor = ctx
-            .globals()
-            .get::<_, Function>("Function")
+        let compiler = Function::new(ctx.clone(), compile_private_library_function)
+            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+        let constructor_factory = ctx
+            .eval::<Function, _>(
+                "((stringify) => compile => function (...parts) { return compile(stringify(parts)); })(JSON.stringify)",
+            )
+            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+        let function_constructor = constructor_factory
+            .call::<_, Function>((compiler,))
             .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
         let bridge = install
             .call::<_, Function>((function_constructor,))

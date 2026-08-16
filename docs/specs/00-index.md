@@ -151,12 +151,13 @@ instance nor its dynamic-code constructor is exposed. The trusted bundle is comp
 process-local bytecode once and instantiated in a per-artifact sibling context only when canonical
 source or tests use the exact `Ajv` global, preserving the existing resource envelope for other
 skills. A string-only JSON bridge connects that compiler context to the frozen skill facade, so
-realm hardening never has to retain a dynamic-code capability. Runtime schema meta-validation,
-messages, and optimizer passes are disabled so schema compilation stays inside the normative 512
-KiB QuickJS stack ceiling. Non-meta schemas are removed after every call so repeated `$id` values
-cannot collide and compiler caches cannot grow across invocations; invalid or unsupported schemas
-return `false` with a closed `keyword: "schema"` error. The committed bundle and MIT notice live in
-`src/extras/js/vendor/`.
+realm hardening never has to retain a dynamic-code capability. AJV's internal `Function` calls use
+a trusted native-eval shim inside that sibling context for cross-platform QuickJS compatibility.
+Runtime schema meta-validation, messages, and optimizer passes are disabled so schema compilation
+stays inside the normative 512 KiB QuickJS stack ceiling. Non-meta schemas are removed after every
+call so repeated `$id` values cannot collide and compiler caches cannot grow across invocations;
+invalid or unsupported schemas return `false` with a closed `keyword: "schema"` error. The
+committed bundle and MIT notice live in `src/extras/js/vendor/`.
 
 ## Build commands (mandatory)
 
