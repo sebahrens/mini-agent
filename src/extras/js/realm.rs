@@ -48,13 +48,11 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
 })(JSON.parse, Reflect.apply)
 "#;
 
-// AJV's compiler intentionally uses `Function` to turn schemas into validators. The trusted
-// loader captures that constructor lexically before the private realm is hardened. Bundle
-// initialization happens only for artifacts that reference AJV, and it completes before private
-// realm hardening so the vendored bootstrap has the same deterministic intrinsics on every
-// platform. Skills that do not validate JSON retain the existing resource envelope. The learned
-// skill still receives only the frozen facade installed below; neither the constructor nor AJV's
-// mutable instance is reachable from stored source or the model realm.
+// AJV's compiler intentionally uses `Function` to turn schemas into validators. It therefore
+// lives in a trusted sibling context that evaluates only the vendored bundle and JSON strings.
+// The hardened skill realm receives a frozen facade over a string-only bridge, so neither the
+// constructor nor AJV's mutable instance is reachable from stored source or the model realm.
+// Skills that do not validate JSON retain the existing resource envelope.
 const PRIVATE_SKILL_LIBRARY_MODULE_NAME: &str = "mini-agent:private-skill-library";
 const PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE: &str = concat!(
     r#"(function (Function) {
@@ -65,16 +63,35 @@ const self = globalThis;
     r#"
 const AjvConstructor = globalThis.ajv7.default || globalThis.ajv7;
 try {
-    return new AjvConstructor({
+    const instance = new AjvConstructor({
         allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
         code: {optimize: false}, logger: false
     });
+    const parse = JSON.parse;
+    const stringify = JSON.stringify;
+    return function (encodedArguments) {
+        try {
+            const values = parse(encodedArguments);
+            const valid = instance.validate(values[0], values[1]);
+            const result = stringify([valid, valid ? null : instance.errors]);
+            instance.removeSchema();
+            return result;
+        } catch (_) {
+            try { instance.removeSchema(); } catch (_) {}
+            return '[false,[{"instancePath":"","schemaPath":"","keyword":"schema","params":{}}]]';
+        }
+    };
 } finally {
     delete globalThis.ajv7;
 }
 };
-const instance = initialize();
-const freeze = Object.freeze;
+return initialize();
+})
+"#,
+);
+
+const PRIVATE_SKILL_LIBRARY_FACADE_SOURCE: &str = r#"
+((freeze, parse, stringify, create, defineProperty) => invoke => {
 let validationErrors = null;
 const freezeErrors = errors => {
     if (errors === null) return null;
@@ -86,11 +103,9 @@ const freezeErrors = errors => {
 };
 const validate = freeze(function (schema, data) {
     try {
-        const valid = instance.validate(schema, data);
-        validationErrors = freezeErrors(
-            valid ? null : JSON.parse(JSON.stringify(instance.errors))
-        );
-        return valid;
+        const result = parse(invoke(stringify([schema, data])));
+        validationErrors = freezeErrors(result[1]);
+        return result[0] === true;
     } catch (_) {
         validationErrors = freezeErrors([{
             instancePath: '', schemaPath: '', keyword: 'schema', params: {}
@@ -98,20 +113,19 @@ const validate = freeze(function (schema, data) {
         return false;
     }
 });
-const api = Object.create(null);
-Object.defineProperty(api, 'validate', {
+const api = create(null);
+defineProperty(api, 'validate', {
     value: validate, enumerable: true, writable: false, configurable: false
 });
-Object.defineProperty(api, 'errors', {
+defineProperty(api, 'errors', {
     get: freeze(() => validationErrors), enumerable: true, configurable: false
 });
 freeze(api);
-Object.defineProperty(globalThis, 'Ajv', {
+defineProperty(globalThis, 'Ajv', {
     value: api, enumerable: false, writable: false, configurable: false
 });
-})
-"#,
-);
+})(Object.freeze, JSON.parse, JSON.stringify, Object.create, Object.defineProperty)
+"#;
 
 static PRIVATE_SKILL_LIBRARY_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
@@ -140,26 +154,48 @@ fn artifact_uses_ajv(artifact: &SkillArtifact) -> bool {
 }
 
 #[allow(unsafe_code)]
-fn install_private_skill_library(ctx: &Ctx<'_>, bytecode: &[u8]) -> Result<(), RealmError> {
-    // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
-    // with the same linked QuickJS ABI, and are never accepted from disk, IPC, or model output.
-    let module = unsafe { Module::load(ctx.clone(), bytecode) }
-        .map_err(|_| RealmError::PrivateLibraryBytecodeLoad)?;
-    let (module, evaluation) = module
-        .eval()
-        .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
-    evaluation
-        .finish::<()>()
-        .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
-    let install = module
-        .get::<_, Function>("install")
-        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-    let function_constructor = ctx
-        .globals()
-        .get::<_, Function>("Function")
-        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-    install
-        .call::<_, ()>((function_constructor,))
+fn build_private_skill_library_bridge(
+    runtime: &Runtime,
+    bytecode: &[u8],
+) -> Result<Persistent<Function<'static>>, RealmError> {
+    let context = Context::full(runtime).map_err(|_| RealmError::PrivateLibraryBytecodeLoad)?;
+    context.with(|ctx| {
+        // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
+        // with the same linked QuickJS ABI, and are never accepted from disk, IPC, or model output.
+        let module = unsafe { Module::load(ctx.clone(), bytecode) }
+            .map_err(|_| RealmError::PrivateLibraryBytecodeLoad)?;
+        let (module, evaluation) = module
+            .eval()
+            .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
+        evaluation
+            .finish::<()>()
+            .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
+        let install = module
+            .get::<_, Function>("install")
+            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+        let function_constructor = ctx
+            .globals()
+            .get::<_, Function>("Function")
+            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+        let bridge = install
+            .call::<_, Function>((function_constructor,))
+            .map_err(|_| RealmError::PrivateLibraryFactoryExecution)?;
+        Ok(Persistent::save(&ctx, bridge))
+    })
+}
+
+fn install_private_skill_library_facade(
+    ctx: &Ctx<'_>,
+    bridge: Persistent<Function<'static>>,
+) -> Result<(), RealmError> {
+    let factory = ctx
+        .eval::<Function, _>(PRIVATE_SKILL_LIBRARY_FACADE_SOURCE)
+        .map_err(|_| RealmError::PrivateLibraryFactoryExecution)?;
+    let bridge = bridge
+        .restore(ctx)
+        .map_err(|_| RealmError::PrivateLibraryFactoryExecution)?;
+    factory
+        .call::<_, ()>((bridge,))
         .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
 }
 
@@ -543,7 +579,8 @@ fn load_artifact_internal(
         })
         .map_err(|_| RealmError::Initialization)?;
     if let Some(bytecode) = private_skill_library {
-        private_context.with(|ctx| install_private_skill_library(&ctx, bytecode))?;
+        let bridge = build_private_skill_library_bridge(runtime, bytecode)?;
+        private_context.with(|ctx| install_private_skill_library_facade(&ctx, bridge))?;
     }
     private_context
         .with(|ctx| {

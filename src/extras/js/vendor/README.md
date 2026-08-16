@@ -10,5 +10,6 @@ The vendored copy adds only a conventional final newline.
 - vendored bundle SHA-256: `2866583ce03b97b6a6c04ffae0cc5399cf54444cc5e2b098449e7a85b372afa1`
 - upstream license: `AJV-LICENSE.txt`
 
-The Rust loader wraps this UMD artifact in a private lexical scope; do not add the bundle as a
-model-authored global or introduce `require()`/`import()` support.
+The Rust loader wraps this UMD artifact in a trusted sibling-context lexical scope and exposes only
+a string bridge to the hardened skill realm; do not add the bundle as a model-authored global or
+introduce `require()`/`import()` support.
