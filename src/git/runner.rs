@@ -93,10 +93,12 @@ impl GitRunner {
     pub(crate) fn discover() -> Result<Self, String> {
         #[cfg(not(test))]
         {
-            return Self::discover_cached(&CACHED_GIT_RUNNER);
+            Self::discover_cached(&CACHED_GIT_RUNNER)
         }
         #[cfg(test)]
-        Self::discover_uncached(std::env::var_os("PATH").as_deref())
+        {
+            Self::discover_uncached(std::env::var_os("PATH").as_deref())
+        }
     }
 
     fn discover_cached(cache: &OnceLock<Result<Self, String>>) -> Result<Self, String> {

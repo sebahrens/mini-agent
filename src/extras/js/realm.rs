@@ -8,15 +8,19 @@
 use rquickjs::context::EvalOptions;
 use rquickjs::function::{Args, IntoArgs, Rest};
 use rquickjs::object::Property;
-use rquickjs::{Context, Ctx, FromJs, Function, Object, Persistent, Runtime, Value};
+use rquickjs::{
+    Context, Ctx, FromJs, Function, Module, Object, Persistent, Runtime, Value, WriteOptions,
+};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use thiserror::Error;
 
 use super::skills::capability::{InvocationCapabilityRuntime, PreparedInvocationHandle};
 use super::skills::{
     HostCapability, SKILL_REALM_HARDENING_JS, SkillArtifact, private_skill_source,
 };
+use super::types::{MEMORY_LIMIT, STACK_LIMIT, STEP_TIMEOUT};
 use super::worker::STRICT_CLONE_SOURCE;
 
 type CallAuthorization =
@@ -43,6 +47,194 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
     }
 })(JSON.parse, Reflect.apply)
 "#;
+
+// AJV's compiler intentionally uses `Function` to turn schemas into validators. The trusted
+// loader initializes it before hardening and routes those constructor calls through native
+// QuickJS eval for Windows portability. Stored source receives only a frozen JSON facade, so
+// neither the compiler shim nor AJV's mutable instance is reachable. Skills that do not validate
+// JSON retain the existing resource envelope.
+const PRIVATE_SKILL_LIBRARY_MODULE_NAME: &str = "mini-agent:private-skill-library";
+const PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE: &str = concat!(
+    r#"(function (Function, validateFallback) {
+const initialize = function () {
+const self = globalThis;
+"#,
+    include_str!("vendor/ajv.min.js"),
+    r#"
+const AjvConstructor = globalThis.ajv7.default || globalThis.ajv7;
+try {
+    const instance = new AjvConstructor({
+        allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
+        code: {es5: true, optimize: false}, logger: false, meta: false
+    });
+    const freeze = Object.freeze;
+    const parse = JSON.parse;
+    const stringify = JSON.stringify;
+    const render = String;
+    let validationErrors = null;
+    const freezeErrors = errors => {
+        if (errors === null) return null;
+        for (const error of errors) {
+            if (error.params && typeof error.params === 'object') freeze(error.params);
+            freeze(error);
+        }
+        return freeze(errors);
+    };
+    const validate = freeze(function (schema, data) {
+        try {
+            if (validateFallback !== undefined) {
+                const result = parse(validateFallback(stringify([schema, data])));
+                validationErrors = freezeErrors(result[1]);
+                return result[0] === true;
+            }
+            const valid = instance.validate(schema, data);
+            validationErrors = freezeErrors(
+                valid ? null : parse(stringify(instance.errors))
+            );
+            try { instance.removeSchema(); } catch (_) {}
+            return valid;
+        } catch (error) {
+            try { instance.removeSchema(); } catch (_) {}
+            let keyword = 'schemaExecution';
+            if (error instanceof RangeError) {
+                keyword = render(error).toLowerCase().includes('stack')
+                    ? 'schemaExecutionStack'
+                    : 'schemaExecutionRange';
+            }
+            else if (error instanceof ReferenceError) keyword = 'schemaExecutionReference';
+            else if (error instanceof TypeError) keyword = 'schemaExecutionType';
+            else if (error instanceof SyntaxError) keyword = 'schemaExecutionSyntax';
+            validationErrors = freezeErrors([{
+                instancePath: '', schemaPath: '', keyword, params: {}
+            }]);
+            return false;
+        }
+    });
+    const api = Object.create(null);
+    Object.defineProperty(api, 'validate', {
+    value: validate, enumerable: true, writable: false, configurable: false
+    });
+    Object.defineProperty(api, 'errors', {
+    get: freeze(() => validationErrors), enumerable: true, configurable: false
+    });
+    freeze(api);
+    Object.defineProperty(globalThis, 'Ajv', {
+    value: api, enumerable: false, writable: false, configurable: false
+    });
+} finally {
+    delete globalThis.ajv7;
+}
+};
+initialize();
+})
+"#,
+);
+
+static PRIVATE_SKILL_LIBRARY_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+
+fn compile_private_skill_library_bytecode() -> rquickjs::Result<Vec<u8>> {
+    let runtime = Runtime::new()?;
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let context = Context::full(&runtime)?;
+    context.with(|ctx| {
+        let source = format!("export const install = {PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE};");
+        Module::declare(ctx, PRIVATE_SKILL_LIBRARY_MODULE_NAME, source)?
+            .write(WriteOptions::default())
+    })
+}
+
+fn private_skill_library_bytecode() -> Option<&'static [u8]> {
+    PRIVATE_SKILL_LIBRARY_BYTECODE
+        .get_or_init(|| compile_private_skill_library_bytecode().ok())
+        .as_deref()
+}
+
+fn artifact_uses_ajv(artifact: &SkillArtifact) -> bool {
+    artifact.source.contains("Ajv") || artifact.tests.iter().any(|test| test.contains("Ajv"))
+}
+
+fn compile_private_library_function<'js>(
+    ctx: Ctx<'js>,
+    Rest(parts): Rest<String>,
+) -> rquickjs::Result<Function<'js>> {
+    let (body, parameters) = parts.split_last().ok_or(rquickjs::Error::Unknown)?;
+    // AJV supplies the same parameter/body strings it would pass to the standard Function
+    // constructor. This trusted shim changes only the QuickJS API used to compile them.
+    let source = format!("(function({}) {{\n{}\n}})", parameters.join(","), body);
+    ctx.eval(source)
+}
+
+#[cfg(windows)]
+fn validate_schema_without_codegen(encoded: String) -> String {
+    let generic = || {
+        r#"[false,[{"instancePath":"","schemaPath":"","keyword":"schema","params":{}}]]"#.to_owned()
+    };
+    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(&encoded) else {
+        return generic();
+    };
+    let [schema, data]: [serde_json::Value; 2] = match values.try_into() {
+        Ok(values) => values,
+        Err(_) => return generic(),
+    };
+    let Ok(validator) = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft7)
+        .build(&schema)
+    else {
+        return generic();
+    };
+    let Some(error) = validator.iter_errors(&data).next() else {
+        return "[true,null]".to_owned();
+    };
+    let instance_path = error.instance_path().to_string();
+    let schema_location = error.schema_path().to_string();
+    let keyword = schema_location
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("schema");
+    serde_json::to_string(&serde_json::json!([false, [{
+        "instancePath": instance_path,
+        "schemaPath": format!("#{schema_location}"),
+        "keyword": keyword,
+        "params": {},
+    }]]))
+    .unwrap_or_else(|_| generic())
+}
+
+#[allow(unsafe_code)]
+fn install_private_skill_library<'js>(ctx: &Ctx<'js>, bytecode: &[u8]) -> Result<(), RealmError> {
+    // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
+    // with the same linked QuickJS ABI, and are never accepted from disk, IPC, or model output.
+    let module = unsafe { Module::load(ctx.clone(), bytecode) }
+        .map_err(|_| RealmError::PrivateLibraryBytecodeLoad)?;
+    let (module, evaluation) = module
+        .eval()
+        .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
+    evaluation
+        .finish::<()>()
+        .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
+    let install = module
+        .get::<_, Function>("install")
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+    let function_constructor = Function::new(ctx.clone(), compile_private_library_function)
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?
+        .with_constructor(true);
+    #[cfg(windows)]
+    {
+        let fallback = Function::new(ctx.clone(), validate_schema_without_codegen)
+            .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+        install
+            .call::<_, ()>((function_constructor, fallback))
+            .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
+    }
+    #[cfg(not(windows))]
+    install
+        .call::<_, ()>((function_constructor,))
+        .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
+}
 
 const PURE_MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
 ((freeze, parse) => (invoke, encode) => freeze(function (...values) {
@@ -206,6 +398,16 @@ pub(crate) enum RealmError {
     ExportCollision,
     #[error("artifact initialization failed")]
     Initialization,
+    #[error("trusted private skill library compilation failed")]
+    PrivateLibraryCompilation,
+    #[error("trusted private skill library bytecode load failed")]
+    PrivateLibraryBytecodeLoad,
+    #[error("trusted private skill library module evaluation failed")]
+    PrivateLibraryModuleEvaluation,
+    #[error("trusted private skill library export lookup failed")]
+    PrivateLibraryExportLookup,
+    #[error("trusted private skill library factory execution failed")]
+    PrivateLibraryFactoryExecution,
     #[error("artifact initialization scheduled pending jobs")]
     PendingInitializationJobs,
     #[error("artifact does not define every declared export as a function")]
@@ -393,6 +595,11 @@ fn load_artifact_internal(
         .map(|_| Arc::new(ModelSettlementRegistry::default()));
 
     let private_context = Context::full(runtime).map_err(|_| RealmError::Initialization)?;
+    let private_skill_library = if artifact_uses_ajv(artifact) {
+        Some(private_skill_library_bytecode().ok_or(RealmError::PrivateLibraryCompilation)?)
+    } else {
+        None
+    };
     let (bridge_factory, private_encoder) = private_context
         .with(|ctx| {
             // Capture every boundary primitive before stored source can replace a global.
@@ -402,6 +609,17 @@ fn load_artifact_internal(
                 BRIDGE_FACTORY_SOURCE
             })?;
             let encoder: Function = ctx.eval(STRICT_CLONE_SOURCE)?;
+            Ok::<_, rquickjs::Error>((
+                Persistent::save(&ctx, bridge_factory),
+                Persistent::save(&ctx, encoder),
+            ))
+        })
+        .map_err(|_| RealmError::Initialization)?;
+    if let Some(bytecode) = private_skill_library {
+        private_context.with(|ctx| install_private_skill_library(&ctx, bytecode))?;
+    }
+    private_context
+        .with(|ctx| {
             ctx.eval::<(), _>(SKILL_REALM_HARDENING_JS)?;
 
             let mut options = EvalOptions::default();
@@ -411,10 +629,7 @@ fn load_artifact_internal(
             // make source-created namespace objects part of the trusted loader boundary.
             let _: Value =
                 ctx.eval_with_options(private_skill_source(artifact).as_bytes(), options)?;
-            Ok::<_, rquickjs::Error>((
-                Persistent::save(&ctx, bridge_factory),
-                Persistent::save(&ctx, encoder),
-            ))
+            Ok::<_, rquickjs::Error>(())
         })
         .map_err(|_| RealmError::Initialization)?;
 

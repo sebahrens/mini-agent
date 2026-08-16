@@ -510,7 +510,7 @@ outside this task absent a source-proven production defect.
 ### REL-03 — Establish canonical repository/product coordinates without breaking data compatibility (P1)
 
 **Defect:** the actual repository is `sebahrens/mini-agent`, but installer, package URLs, docs,
-OpenRouter identity, and welcome links target `gi-dellav/zerostack`. The public binary is
+OpenRouter identity, and welcome links target `sebahrens/mini-agent`. The public binary is
 `mini-agent`, while `zerostack` is also used as a persisted compatibility namespace and package brand.
 Unclassified global replacement would be destructive; leaving wrong network coordinates is broken.
 
@@ -537,7 +537,7 @@ Unclassified global replacement would be destructive; leaving wrong network coor
    preserve an alias only when a compatibility test demonstrates it is required.
 4. Keep package-channel names only where registry compatibility requires them; document the binary
    installed by each.
-5. Add a static check that rejects `gi-dellav/zerostack` in active source, scripts, packaging, and user
+5. Add a static check that rejects legacy repository coordinates in active source, scripts, packaging, and user
    docs while allowlisting explicitly historical superseded specs.
 6. Smoke the installer against a test release from the canonical repository.
 

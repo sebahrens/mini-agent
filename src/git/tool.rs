@@ -333,7 +333,6 @@ impl GitTool {
                     self.run("show", command, TEXT_LIMITS, true).await?,
                 )
             }
-            _ => Err(ToolError::Msg("operation is not read-only".to_string())),
         }
     }
 }

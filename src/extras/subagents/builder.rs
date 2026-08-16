@@ -177,11 +177,11 @@ fn build_explore_preamble(
     specialization: Option<&str>,
 ) -> String {
     let mut preamble = String::new();
-    if let Some(spec) = specialization {
-        if !spec.is_empty() {
-            preamble.push_str(spec);
-            preamble.push_str("\n\n---\n\n");
-        }
+    if let Some(spec) = specialization
+        && !spec.is_empty()
+    {
+        preamble.push_str(spec);
+        preamble.push_str("\n\n---\n\n");
     }
     preamble.push_str(&prompt::explore_prompt());
     #[cfg(feature = "archmd")]

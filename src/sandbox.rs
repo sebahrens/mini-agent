@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -27,6 +27,11 @@ pub(crate) type SandboxCommand = Command;
 #[cfg(unix)]
 const WORKSPACE_AUTHORITY_FD: i32 = 197;
 
+type EssentialEnvironment = Arc<[(&'static str, String)]>;
+type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
+type SeatbeltProfileKey = (String, String, bool);
+type SeatbeltProfileCache = Arc<Mutex<HashMap<SeatbeltProfileKey, Arc<str>>>>;
+
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     enabled: bool,
@@ -46,12 +51,11 @@ pub struct Sandbox {
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
     /// Lazily captured environment snapshot shared by all clones.
-    cached_essential_env: Arc<OnceLock<Arc<[(&'static str, String)]>>>,
+    cached_essential_env: EssentialEnvironmentCache,
     /// Canonicalized cache directory computed once per instance.
     cached_cache_dir: Arc<Mutex<Option<Arc<PathBuf>>>>,
     /// Cached seatbelt profiles keyed by escaped workspace/cache and network policy.
-    cached_seatbelt_profiles:
-        Arc<Mutex<std::collections::HashMap<(String, String, bool), Arc<str>>>>,
+    cached_seatbelt_profiles: SeatbeltProfileCache,
     #[cfg(test)]
     complete_process_tree_for_test: bool,
     #[cfg(test)]
@@ -1451,23 +1455,6 @@ impl Sandbox {
 
         let cache_dir = self.get_cached_cache_dir()?;
 
-        #[cfg(target_os = "windows")]
-        if self.backend == "appcontainer" {
-            if deny_network {
-                return windows::build_direct_helper(
-                    program,
-                    args,
-                    &cwd,
-                    &cache_dir,
-                    &self.windows_appcontainer_read_roots,
-                    &self.windows_appcontainer_write_roots,
-                );
-            }
-            return Err(
-                "Windows workspace-service launch without network denial is unsupported".into(),
-            );
-        }
-
         if self.backend == "seatbelt" {
             let seatbelt = seatbelt_path().ok_or_else(|| {
                 "sandbox backend 'seatbelt' is not a trusted system executable — refusing to run unsandboxed"
@@ -1653,6 +1640,23 @@ impl Sandbox {
 
         let cwd = canonical_non_root(cwd, "workspace-service working directory")?;
         let cache_dir = self.get_cached_cache_dir()?;
+
+        #[cfg(target_os = "windows")]
+        if self.backend == "appcontainer" {
+            if deny_network {
+                return windows::build_direct_helper(
+                    program,
+                    args,
+                    &cwd,
+                    &cache_dir,
+                    &self.windows_appcontainer_read_roots,
+                    &self.windows_appcontainer_write_roots,
+                );
+            }
+            return Err(
+                "Windows workspace-service launch without network denial is unsupported".into(),
+            );
+        }
 
         if self.backend == "seatbelt" {
             let seatbelt = seatbelt_path().ok_or_else(|| {

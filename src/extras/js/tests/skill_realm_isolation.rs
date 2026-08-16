@@ -962,6 +962,47 @@ fn production_loader_installs_only_frozen_declared_wrappers() {
 }
 
 #[test]
+fn bundled_ajv_is_available_only_inside_private_skill_realms() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let skill = SkillArtifact::new(
+        "function inspectAjv(value) { const valid = Ajv.validate({type: 'string'}, value); return {valid, errors: Ajv.errors, facadeFrozen: Object.isFrozen(Ajv), errorsFrozen: Ajv.errors === null || Object.isFrozen(Ajv.errors), constructorHidden: typeof Ajv.constructor === 'undefined' && typeof Ajv.validate.constructor === 'undefined'}; }".into(),
+        "AJV private realm fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "inspectAjv".into(),
+            signature: "inspectAjv(value)".into(),
+        }],
+        vec!["inspectAjv('hello').valid === true".into()],
+        CapabilityManifest::pure(),
+    )
+    .expect("create AJV fixture");
+
+    load_artifact(&runtime, &model, &skill).expect("load AJV skill");
+
+    model.with(|ctx| {
+        assert_eq!(
+            ctx.eval::<String, _>("typeof Ajv")
+                .expect("inspect model global"),
+            "undefined"
+        );
+        assert_eq!(
+            ctx.eval::<String, _>("JSON.stringify(inspectAjv('hello'))")
+                .expect("validate string"),
+            r#"{"valid":true,"errors":null,"facadeFrozen":true,"errorsFrozen":true,"constructorHidden":true}"#
+        );
+        let invalid = ctx
+            .eval::<String, _>("JSON.stringify(inspectAjv(42))")
+            .expect("reject number");
+        assert!(invalid.contains(r#""valid":false"#));
+        assert!(invalid.contains(r#""keyword":"type""#));
+        assert!(invalid.contains(r#""facadeFrozen":true"#));
+        assert!(invalid.contains(r#""errorsFrozen":true"#));
+        assert!(invalid.contains(r#""constructorHidden":true"#));
+    });
+}
+
+#[test]
 fn loader_rejects_collisions_and_missing_exports_without_partial_publication() {
     let runtime = bounded_runtime();
     let model = Context::full(&runtime).expect("create model context");

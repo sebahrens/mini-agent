@@ -23,6 +23,10 @@ function write(level: Level, message: string): void {
   channel.appendLine(`[${ts}] [${level.toUpperCase()}] ${message}`);
 }
 
+export function showOutput(): void {
+  channel.show(true);
+}
+
 export const log = {
   error: (msg: string) => write('error', msg),
   warn:  (msg: string) => write('warn', msg),

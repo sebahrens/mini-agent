@@ -25,6 +25,13 @@ The extension fails closed in Restricted Mode and virtual workspaces. In a
 Remote Development window, install it on the remote/workspace side so the ACP
 process and selected `file:` workspace share the same authority.
 
+The Command Palette exposes **Mini Agent: Open Config**, **Mini Agent: Restart
+Session**, and **Mini Agent: Show Output**. Open Config follows the same
+platform-native global `zerostack` configuration root and `ZS_CONFIG_DIR`
+override as the binary, opens an existing TOML/YAML/JSON config when present,
+and otherwise creates an inert owner-private `config.toml`. Show Output reveals
+the existing Mini Agent output channel without moving keyboard focus.
+
 ## Prerequisites
 
 - mini-agent installed: `cargo install --path . --debug`
@@ -54,7 +61,9 @@ openssl rand -hex 32
 
 ### 2. Configure mini-agent
 
-Add to your `~/.config/mini-agent/config.toml` (or project-local `.mini-agent/config.toml`):
+Add to your platform global config (for example
+`~/.config/zerostack/config.toml` on Linux) or project-local
+`.zerostack/config.toml`:
 
 ```toml
 [acp_servers.default]

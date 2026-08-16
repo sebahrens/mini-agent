@@ -4389,31 +4389,31 @@ mod tests {
         use std::io::Write as _;
 
         let transport = FetchTransport::with_limits(test_fetch_limits(), None).unwrap();
-        let (slow_headers_url, slow_headers_server) = serve_fetch_once(|mut stream| {
+        let (release_headers_tx, release_headers_rx) = std::sync::mpsc::channel();
+        let (slow_headers_url, slow_headers_server) = serve_fetch_once(move |mut stream| {
             read_fetch_request(&mut stream);
-            std::thread::sleep(Duration::from_millis(100));
+            let _ = release_headers_rx.recv_timeout(Duration::from_secs(1));
             let _ = stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         });
-        assert_eq!(
-            transport.execute(slow_headers_url, &FetchRequest::get(), || false),
-            Err(FetchError::TimedOut)
-        );
+        let slow_headers = transport.execute(slow_headers_url, &FetchRequest::get(), || false);
+        let _ = release_headers_tx.send(());
+        assert_eq!(slow_headers, Err(FetchError::TimedOut));
         slow_headers_server.join().unwrap();
 
-        let (slow_body_url, slow_body_server) = serve_fetch_once(|mut stream| {
+        let (release_body_tx, release_body_rx) = std::sync::mpsc::channel();
+        let (slow_body_url, slow_body_server) = serve_fetch_once(move |mut stream| {
             read_fetch_request(&mut stream);
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
                 .unwrap();
             stream.flush().unwrap();
-            std::thread::sleep(Duration::from_millis(100));
+            let _ = release_body_rx.recv_timeout(Duration::from_secs(1));
             let _ = stream.write_all(b"hello");
         });
-        assert_eq!(
-            transport.execute(slow_body_url, &FetchRequest::get(), || false),
-            Err(FetchError::TimedOut)
-        );
+        let slow_body = transport.execute(slow_body_url, &FetchRequest::get(), || false);
+        let _ = release_body_tx.send(());
+        assert_eq!(slow_body, Err(FetchError::TimedOut));
         slow_body_server.join().unwrap();
 
         let (endless_url, endless_server) = serve_fetch_once(|mut stream| {

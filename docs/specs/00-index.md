@@ -144,6 +144,23 @@ aggregated those records into the reviewed baseline in `docs/benchmarks/results/
 numbers are intentionally omitted here because they drift; tracker tasks must resolve current
 symbols before editing.
 
+Identity-v2 private learned-skill realms also include the vendored AJV 8.12.0 validator. Stored
+skill source can call `Ajv.validate(schema, data)` and inspect the frozen `Ajv.errors` array after
+a false result. The facade is absent from the model-authored realm, and neither AJV's mutable
+instance nor its dynamic-code constructor is exposed. The trusted bundle is compiled to
+process-local bytecode once and instantiated by the trusted loader before hardening only when
+canonical source or tests use the exact `Ajv` global, preserving the existing resource envelope for
+other skills. A frozen lexical facade is the only reference to the mutable instance. AJV's internal
+`Function` calls use a lexically captured native-eval shim that stored source cannot reach; realm
+hardening still removes every ambient dynamic-code capability before source runs.
+Schemas use AJV's bundled default draft-07 vocabulary. Runtime schema meta-validation, messages,
+and optimizer passes are disabled, and AJV emits its equivalent ES5 validator form. Windows
+QuickJS exceeds the normative 512 KiB stack even for that minimal generated validator, so the same
+frozen facade uses `jsonschema` 0.49.9's non-codegen Draft 7 validator there; its default network
+and file resolvers are disabled. Non-meta AJV schemas are removed after every call so compiler
+caches cannot grow across invocations; invalid or unsupported schemas return `false` with a closed
+schema-stage keyword. The committed AJV bundle and MIT notice live in `src/extras/js/vendor/`.
+
 ## Build commands (mandatory)
 
 ```bash

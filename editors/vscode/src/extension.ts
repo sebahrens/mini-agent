@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
+import * as os from 'node:os';
 import type * as acp from '@agentclientprotocol/sdk';
 import { ChatUpdateRenderer, stopResult } from './chat';
+import { ensureConfigFile, resolveConfigDirectory } from './config';
 import { AgentSession } from './session';
-import { log, setLogLevel } from './log';
+import { log, setLogLevel, showOutput } from './log';
 import { assertExecutableScope, gatedFolderPick, onTrustRevoked } from './trust';
 
 let session: AgentSession | undefined;
@@ -15,11 +17,14 @@ export function activate(context: vscode.ExtensionContext): void {
   assertExecutableScope();
 
   context.subscriptions.push(
+    log.channel,
     registerChatParticipant(context),
     vscode.commands.registerCommand('mini-agent.start', () => cmdStart(context)),
     vscode.commands.registerCommand('mini-agent.stop', () => cmdStop()),
     vscode.commands.registerCommand('mini-agent.restart', () => cmdRestart(context)),
     vscode.commands.registerCommand('mini-agent.selectFolder', () => cmdSelectFolder(context)),
+    vscode.commands.registerCommand('mini-agent.openConfig', () => cmdOpenConfig()),
+    vscode.commands.registerCommand('mini-agent.showOutput', () => showOutput()),
     vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('mini-agent.logLevel')) {
         setLogLevel(vscode.workspace.getConfiguration('mini-agent').get<string>('logLevel', 'info'));
@@ -85,6 +90,19 @@ async function cmdRestart(context: vscode.ExtensionContext): Promise<void> {
 
 async function cmdSelectFolder(context: vscode.ExtensionContext): Promise<void> {
   await cmdStart(context);
+}
+
+async function cmdOpenConfig(): Promise<void> {
+  try {
+    const configDirectory = resolveConfigDirectory(process.platform, os.homedir(), process.env);
+    const configPath = await ensureConfigFile(configDirectory);
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(configPath));
+    await vscode.window.showTextDocument(document);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log.error(`Unable to open Mini Agent config: ${message}`);
+    void vscode.window.showErrorMessage(`Unable to open Mini Agent config: ${message}`);
+  }
 }
 
 function resolveExecutable(context: vscode.ExtensionContext): string | undefined {

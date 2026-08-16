@@ -572,6 +572,12 @@ jobs:
         with:
           rustflags: ''
 
+      - name: Test Windows private-skill library bootstrap
+        run: >-
+          cargo test --locked --no-default-features --features skills
+          extras::js::tests::skill_realm_isolation::bundled_ajv_is_available_only_inside_private_skill_realms
+          -- --exact --test-threads=1
+
       - name: Verify exact Windows production launcher test discovery
         shell: pwsh
         run: |
