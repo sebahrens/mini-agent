@@ -45,6 +45,14 @@
       {
         "command": "mini-agent.selectFolder",
         "title": "Mini Agent: Select Workspace Folder"
+      },
+      {
+        "command": "mini-agent.openConfig",
+        "title": "Mini Agent: Open Config"
+      },
+      {
+        "command": "mini-agent.showOutput",
+        "title": "Mini Agent: Show Output"
       }
     ],
     "configuration": {
