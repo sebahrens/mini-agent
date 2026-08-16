@@ -10,8 +10,10 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 

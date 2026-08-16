@@ -1006,10 +1006,10 @@ fn run_guardian() -> io::Result<ExitStatus> {
             if guardian_heartbeat_released_normally(&mut heartbeat) {
                 return;
             }
-            if let Some((workspace, sentinel)) = abandoned_workspace_sentinel {
-                if cleanup_abandoned_workspace_sentinel(&workspace, &sentinel).is_err() {
-                    eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=workspace_cleanup");
-                }
+            if let Some((workspace, sentinel)) = abandoned_workspace_sentinel
+                && cleanup_abandoned_workspace_sentinel(&workspace, &sentinel).is_err()
+            {
+                eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=workspace_cleanup");
             }
             // SAFETY: the guardian owns this dedicated process group. EOF means its parent died
             // without releasing a reaped worker, so killing the complete group is fail closed.

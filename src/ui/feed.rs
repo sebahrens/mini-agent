@@ -576,7 +576,7 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEn
         let mut lines = cached;
         if block.running && completed_len < block.text.len() {
             append_agent_tail(Arc::make_mut(&mut lines), block, completed_len, width);
-            prefix_agent_first_line(Arc::make_mut(&mut lines));
+            prefix_agent_first_line(Arc::make_mut(&mut lines).as_mut_slice());
         }
         return lines;
     }
@@ -636,7 +636,7 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEn
         let mut rendered = cached_lines;
         if block.running && completed_len < block.text.len() {
             append_agent_tail(Arc::make_mut(&mut rendered), block, completed_len, width);
-            prefix_agent_first_line(Arc::make_mut(&mut rendered));
+            prefix_agent_first_line(Arc::make_mut(&mut rendered).as_mut_slice());
         }
         return rendered;
     }
@@ -670,12 +670,12 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEn
     let mut rendered = cached_lines;
     if block.running && completed_len < block.text.len() {
         append_agent_tail(Arc::make_mut(&mut rendered), block, completed_len, width);
-        prefix_agent_first_line(Arc::make_mut(&mut rendered));
+        prefix_agent_first_line(Arc::make_mut(&mut rendered).as_mut_slice());
     }
     rendered
 }
 
-fn prefix_agent_first_line(lines: &mut Vec<LineEntry>) {
+fn prefix_agent_first_line(lines: &mut [LineEntry]) {
     if let Some(first) = lines.first_mut()
         && !first.text.starts_with("< ")
     {

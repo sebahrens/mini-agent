@@ -47,6 +47,10 @@ APPROVED_RELEASE_ACTIONS = {
         "actions/download-artifact",
         "v4.3.0",
     ): "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    (
+        "actions/setup-node",
+        "v4.4.0",
+    ): "49933ea5288caeca8642d1e84afbd3f7d6820020",
 }
 DISTRIBUTION_NOTICE_FRAGMENTS: dict[str, tuple[str, ...]] = {
     "packaging/homebrew/zerostack.rb": (
@@ -179,6 +183,19 @@ EXPECTED_RELEASE_ARCHIVES = (
     "mini-agent-lite-aarch64-unknown-linux-musl.tar.gz",
     "mini-agent-lite-x86_64-pc-windows-msvc.tar.gz",
     "mini-agent-${GITHUB_REF_NAME}-source.tar.gz",
+)
+EXPECTED_VSCODE_RELEASE_ARTIFACTS = (
+    "VSIX_SHA256SUMS",
+    "mini-agent-1.7.2-linux-x64.vsix",
+    "mini-agent-1.7.2-linux-arm64.vsix",
+    "mini-agent-1.7.2-darwin-x64.vsix",
+    "mini-agent-1.7.2-darwin-arm64.vsix",
+    "mini-agent-1.7.2-win32-x64.vsix",
+    "mini-agent-1.7.2-linux-x64.cdx.json",
+    "mini-agent-1.7.2-linux-arm64.cdx.json",
+    "mini-agent-1.7.2-darwin-x64.cdx.json",
+    "mini-agent-1.7.2-darwin-arm64.cdx.json",
+    "mini-agent-1.7.2-win32-x64.cdx.json",
 )
 EXPECTED_CROSS_IMAGES = {
     "aarch64-unknown-linux-musl": (
@@ -411,7 +428,12 @@ def validate_release_archive_gates(text: str) -> list[str]:
     expected_archives = set(EXPECTED_RELEASE_ARCHIVES)
     gates = (
         ("checksum", expected_archives),
-        ("publication", expected_archives | {"SHA256SUMS"}),
+        (
+            "publication",
+            expected_archives
+            | {"SHA256SUMS"}
+            | set(EXPECTED_VSCODE_RELEASE_ARTIFACTS),
+        ),
     )
     errors: list[str] = []
     for match, (gate_name, expected) in zip(matches, gates, strict=True):

@@ -3428,7 +3428,7 @@ fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
 }
 
 fn encode_embedding(values: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
