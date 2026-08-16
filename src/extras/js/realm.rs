@@ -65,15 +65,10 @@ const self = globalThis;
     r#"
 const AjvConstructor = globalThis.ajv7.default || globalThis.ajv7;
 try {
-    const instance = new AjvConstructor({
+    return new AjvConstructor({
         allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
-        code: {optimize: false}, logger: false, meta: false
+        code: {optimize: false}, logger: false
     });
-    // Schema validation is deliberately disabled above, but AJV still resolves an explicit
-    // dialect declaration before compiling the user schema. Register a constant-time dialect
-    // marker instead of compiling AJV's full draft-07 meta-schema inside the fixed JS stack.
-    instance.addMetaSchema(true, 'http://json-schema.org/draft-07/schema');
-    return instance;
 } finally {
     delete globalThis.ajv7;
 }
