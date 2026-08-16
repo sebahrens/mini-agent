@@ -66,8 +66,12 @@ const AjvConstructor = globalThis.ajv7.default || globalThis.ajv7;
 try {
     const instance = new AjvConstructor({
         allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
-        code: {optimize: false}, logger: false
+        code: {optimize: false}, logger: false, meta: false
     });
+    // Schema meta-validation is disabled, but AJV still resolves an explicit draft declaration.
+    // A boolean marker preserves that dialect lookup without compiling the full draft-07
+    // meta-schema inside the normative 512 KiB QuickJS stack.
+    instance.addMetaSchema(true, 'http://json-schema.org/draft-07/schema');
     const parse = JSON.parse;
     const stringify = JSON.stringify;
     return function (encodedArguments) {
