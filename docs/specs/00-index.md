@@ -144,6 +144,16 @@ aggregated those records into the reviewed baseline in `docs/benchmarks/results/
 numbers are intentionally omitted here because they drift; tracker tasks must resolve current
 symbols before editing.
 
+Identity-v2 private learned-skill realms also include the vendored AJV 8.12.0 validator. Stored
+skill source can call `Ajv.validate(schema, data)` and inspect the frozen `Ajv.errors` array after
+a false result. The facade is absent from the model-authored realm, and neither AJV's mutable
+instance nor its captured dynamic-code constructor is exposed. The trusted bundle is compiled to
+process-local bytecode once and instantiated only for artifacts whose canonical source or tests use
+the exact `Ajv` global, preserving the existing resource envelope for other skills. Runtime schema
+meta-validation, messages, and optimizer passes are disabled so schema compilation stays inside the
+normative 512 KiB QuickJS stack ceiling; invalid or unsupported schemas return `false` with a closed
+`keyword: "schema"` error. The committed bundle and MIT notice live in `src/extras/js/vendor/`.
+
 ## Build commands (mandatory)
 
 ```bash

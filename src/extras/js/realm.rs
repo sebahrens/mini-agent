@@ -8,15 +8,19 @@
 use rquickjs::context::EvalOptions;
 use rquickjs::function::{Args, IntoArgs, Rest};
 use rquickjs::object::Property;
-use rquickjs::{Context, Ctx, FromJs, Function, Object, Persistent, Runtime, Value};
+use rquickjs::{
+    Context, Ctx, FromJs, Function, Module, Object, Persistent, Runtime, Value, WriteOptions,
+};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use thiserror::Error;
 
 use super::skills::capability::{InvocationCapabilityRuntime, PreparedInvocationHandle};
 use super::skills::{
     HostCapability, SKILL_REALM_HARDENING_JS, SkillArtifact, private_skill_source,
 };
+use super::types::{MEMORY_LIMIT, STACK_LIMIT, STEP_TIMEOUT};
 use super::worker::STRICT_CLONE_SOURCE;
 
 type CallAuthorization =
@@ -43,6 +47,108 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
     }
 })(JSON.parse, Reflect.apply)
 "#;
+
+// AJV's compiler intentionally uses `Function` to turn schemas into validators. The trusted
+// loader captures that constructor lexically before the private realm is hardened. Bundle
+// initialization is lazy so skills that do not validate JSON retain the existing resource
+// envelope; the learned skill still receives only the frozen facade installed below. Neither the
+// constructor nor AJV's mutable instance is reachable from stored source or the model realm.
+const PRIVATE_SKILL_LIBRARY_MODULE_NAME: &str = "mini-agent:private-skill-library";
+const PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE: &str = concat!(
+    r#"(function (Function) {
+let instance;
+const initialize = function () {
+const self = globalThis;
+"#,
+    include_str!("vendor/ajv.min.js"),
+    r#"
+const AjvConstructor = globalThis.ajv7.default || globalThis.ajv7;
+try {
+    return new AjvConstructor({
+        allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
+        code: {optimize: false}, logger: false
+    });
+} finally {
+    delete globalThis.ajv7;
+}
+};
+const freeze = Object.freeze;
+let validationErrors = null;
+const freezeErrors = errors => {
+    if (errors === null) return null;
+    for (const error of errors) {
+        if (error.params && typeof error.params === 'object') freeze(error.params);
+        freeze(error);
+    }
+    return freeze(errors);
+};
+const validate = freeze(function (schema, data) {
+    try {
+        const validator = instance || (instance = initialize());
+        const valid = validator.validate(schema, data);
+        validationErrors = freezeErrors(
+            valid ? null : JSON.parse(JSON.stringify(validator.errors))
+        );
+        return valid;
+    } catch (_) {
+        validationErrors = freezeErrors([{
+            instancePath: '', schemaPath: '', keyword: 'schema', params: {}
+        }]);
+        return false;
+    }
+});
+const api = Object.create(null);
+Object.defineProperty(api, 'validate', {
+    value: validate, enumerable: true, writable: false, configurable: false
+});
+Object.defineProperty(api, 'errors', {
+    get: freeze(() => validationErrors), enumerable: true, configurable: false
+});
+freeze(api);
+Object.defineProperty(globalThis, 'Ajv', {
+    value: api, enumerable: false, writable: false, configurable: false
+});
+})
+"#,
+);
+
+static PRIVATE_SKILL_LIBRARY_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+
+fn compile_private_skill_library_bytecode() -> rquickjs::Result<Vec<u8>> {
+    let runtime = Runtime::new()?;
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let context = Context::full(&runtime)?;
+    context.with(|ctx| {
+        let source = format!("export const install = {PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE};");
+        Module::declare(ctx, PRIVATE_SKILL_LIBRARY_MODULE_NAME, source)?
+            .write(WriteOptions::default())
+    })
+}
+
+fn private_skill_library_bytecode() -> Option<&'static [u8]> {
+    PRIVATE_SKILL_LIBRARY_BYTECODE
+        .get_or_init(|| compile_private_skill_library_bytecode().ok())
+        .as_deref()
+}
+
+fn artifact_uses_ajv(artifact: &SkillArtifact) -> bool {
+    artifact.source.contains("Ajv") || artifact.tests.iter().any(|test| test.contains("Ajv"))
+}
+
+#[allow(unsafe_code)]
+fn install_private_skill_library(ctx: &Ctx<'_>, bytecode: &[u8]) -> rquickjs::Result<()> {
+    // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
+    // with the same linked QuickJS ABI, and are never accepted from disk, IPC, or model output.
+    let module = unsafe { Module::load(ctx.clone(), bytecode)? };
+    let (module, evaluation) = module.eval()?;
+    evaluation.finish::<()>()?;
+    let install = module.get::<_, Function>("install")?;
+    let function_constructor = ctx.globals().get::<_, Function>("Function")?;
+    install.call::<_, ()>((function_constructor,))
+}
 
 const PURE_MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
 ((freeze, parse) => (invoke, encode) => freeze(function (...values) {
@@ -393,6 +499,11 @@ fn load_artifact_internal(
         .map(|_| Arc::new(ModelSettlementRegistry::default()));
 
     let private_context = Context::full(runtime).map_err(|_| RealmError::Initialization)?;
+    let private_skill_library = if artifact_uses_ajv(artifact) {
+        Some(private_skill_library_bytecode().ok_or(RealmError::Initialization)?)
+    } else {
+        None
+    };
     let (bridge_factory, private_encoder) = private_context
         .with(|ctx| {
             // Capture every boundary primitive before stored source can replace a global.
@@ -402,6 +513,9 @@ fn load_artifact_internal(
                 BRIDGE_FACTORY_SOURCE
             })?;
             let encoder: Function = ctx.eval(STRICT_CLONE_SOURCE)?;
+            if let Some(bytecode) = private_skill_library {
+                install_private_skill_library(&ctx, bytecode)?;
+            }
             ctx.eval::<(), _>(SKILL_REALM_HARDENING_JS)?;
 
             let mut options = EvalOptions::default();
