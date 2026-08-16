@@ -71,16 +71,23 @@ try {
     const parse = JSON.parse;
     const stringify = JSON.stringify;
     return function (encodedArguments) {
+        let valid;
         try {
             const values = parse(encodedArguments);
-            const valid = instance.validate(values[0], values[1]);
-            const result = stringify([valid, valid ? null : instance.errors]);
-            instance.removeSchema();
-            return result;
-        } catch (_) {
+            valid = instance.validate(values[0], values[1]);
+        } catch (error) {
             try { instance.removeSchema(); } catch (_) {}
-            return '[false,[{"instancePath":"","schemaPath":"","keyword":"schema","params":{}}]]';
+            return error === 1
+                ? '[false,[{"instancePath":"","schemaPath":"","keyword":"schemaCompilation","params":{}}]]'
+                : '[false,[{"instancePath":"","schemaPath":"","keyword":"schemaExecution","params":{}}]]';
         }
+        const result = stringify([valid, valid ? null : instance.errors]);
+        try {
+            instance.removeSchema();
+        } catch (_) {
+            return '[false,[{"instancePath":"","schemaPath":"","keyword":"schemaCleanup","params":{}}]]';
+        }
+        return result;
     };
 } finally {
     delete globalThis.ajv7;
@@ -191,7 +198,7 @@ fn build_private_skill_library_bridge(
             .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
         let constructor_factory = ctx
             .eval::<Function, _>(
-                "((stringify) => compile => function (...parts) { return compile(stringify(parts)); })(JSON.stringify)",
+                "((stringify) => compile => function (...parts) { try { return compile(stringify(parts)); } catch (_) { throw 1; } })(JSON.stringify)",
             )
             .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
         let function_constructor = constructor_factory

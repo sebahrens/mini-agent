@@ -156,8 +156,8 @@ a trusted native-eval shim inside that sibling context for cross-platform QuickJ
 Runtime schema meta-validation, messages, and optimizer passes are disabled so schema compilation
 stays inside the normative 512 KiB QuickJS stack ceiling. Non-meta schemas are removed after every
 call so repeated `$id` values cannot collide and compiler caches cannot grow across invocations;
-invalid or unsupported schemas return `false` with a closed `keyword: "schema"` error. The
-committed bundle and MIT notice live in `src/extras/js/vendor/`.
+invalid or unsupported schemas return `false` with a closed schema-stage keyword. The committed
+bundle and MIT notice live in `src/extras/js/vendor/`.
 
 ## Build commands (mandatory)
 
