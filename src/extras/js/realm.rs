@@ -70,6 +70,7 @@ try {
     const freeze = Object.freeze;
     const parse = JSON.parse;
     const stringify = JSON.stringify;
+    const render = String;
     let validationErrors = null;
     const freezeErrors = errors => {
         if (errors === null) return null;
@@ -90,7 +91,11 @@ try {
         } catch (error) {
             try { instance.removeSchema(); } catch (_) {}
             let keyword = 'schemaExecution';
-            if (error instanceof RangeError) keyword = 'schemaExecutionRange';
+            if (error instanceof RangeError) {
+                keyword = render(error).toLowerCase().includes('stack')
+                    ? 'schemaExecutionStack'
+                    : 'schemaExecutionRange';
+            }
             else if (error instanceof ReferenceError) keyword = 'schemaExecutionReference';
             else if (error instanceof TypeError) keyword = 'schemaExecutionType';
             else if (error instanceof SyntaxError) keyword = 'schemaExecutionSyntax';
