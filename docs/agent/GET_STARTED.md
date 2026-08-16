@@ -207,11 +207,10 @@ or separate consent prompt. The local attestation does not test general host fil
 denial; the delivered hosted canaries record those broader observations only for their reference
 runner and do not prove identical ACL visibility on every Windows host.
 
-Everything else above ships in the default build. A few extras are compiled in
+Everything else above, including ACP editor integration, ships in the default build. A few extras are compiled in
 only when you ask for them: lifecycle hooks (`--features hooks`), a
 second-model advisor (`--features advisor`), image/PDF message attachments
-(`--features multimodal,pdf`), and ACP editor integration
-(`--features acp`). See the root [README](https://github.com/sebahrens/mini-agent) for what each one
+(`--features multimodal,pdf`). See the root [README](https://github.com/sebahrens/mini-agent) for what each one
 does and how to enable it.
 
 # Conclusions

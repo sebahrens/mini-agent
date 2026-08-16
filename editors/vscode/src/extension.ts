@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import type * as acp from '@agentclientprotocol/sdk';
+import { ChatUpdateRenderer, stopResult } from './chat';
 import { AgentSession } from './session';
 import { log, setLogLevel } from './log';
 import { assertExecutableScope, gatedFolderPick, onTrustRevoked } from './trust';
@@ -13,6 +15,7 @@ export function activate(context: vscode.ExtensionContext): void {
   assertExecutableScope();
 
   context.subscriptions.push(
+    registerChatParticipant(context),
     vscode.commands.registerCommand('mini-agent.start', () => cmdStart(context)),
     vscode.commands.registerCommand('mini-agent.stop', () => cmdStop()),
     vscode.commands.registerCommand('mini-agent.restart', () => cmdRestart(context)),
@@ -28,6 +31,12 @@ export function activate(context: vscode.ExtensionContext): void {
     onTrustRevoked(async () => {
       await session?.stop();
       session = undefined;
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(async event => {
+      if (session && event.removed.some(folder => folder.uri.toString() === session?.workspaceFolder.uri.toString())) {
+        await session.stop();
+        session = undefined;
+      }
     }),
   );
 }
@@ -56,7 +65,7 @@ async function cmdStart(context: vscode.ExtensionContext): Promise<void> {
   const executablePath = resolveExecutable(context);
   if (!executablePath) { return; }
 
-  session = new AgentSession(executablePath, folder, context);
+  session = new AgentSession(executablePath, folder, context, requestPermission);
   await session.start();
 }
 
@@ -97,4 +106,85 @@ function resolveExecutable(context: vscode.ExtensionContext): string | undefined
     process.platform === 'win32' ? 'mini-agent.exe' : 'mini-agent',
   );
   return bundled.fsPath;
+}
+
+function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatParticipant {
+  const participant = vscode.chat.createChatParticipant(
+    'mini-agent.chat',
+    async (request, _chatContext, response, token): Promise<vscode.ChatResult> => {
+      if (!request.prompt.trim()) {
+        return { errorDetails: { message: 'Enter a prompt for Mini Agent.' } };
+      }
+
+      const active = await ensureSession(context);
+      if (!active) {
+        return { errorDetails: { message: 'Mini Agent requires a trusted local workspace folder.' } };
+      }
+
+      const cancellation = new AbortController();
+      if (token.isCancellationRequested) { cancellation.abort(); }
+      const cancellationSubscription = token.onCancellationRequested(() => cancellation.abort());
+      const renderer = new ChatUpdateRenderer();
+      response.progress('Connecting to Mini Agent…');
+
+      try {
+        const reason = await active.prompt(request.prompt, update => {
+          for (const event of renderer.render(update)) {
+            if (event.kind === 'markdown') { response.markdown(event.value); }
+            else { response.progress(event.value); }
+          }
+        }, cancellation.signal);
+        return stopResult(reason);
+      } catch (error) {
+        if (cancellation.signal.aborted) { return stopResult('cancelled'); }
+        const message = error instanceof Error ? error.message : String(error);
+        log.error(`Chat request failed: ${message}`);
+        return { errorDetails: { message: `Mini Agent request failed: ${message}` } };
+      } finally {
+        cancellationSubscription.dispose();
+      }
+    },
+  );
+  participant.iconPath = new vscode.ThemeIcon('sparkle');
+  return participant;
+}
+
+async function ensureSession(context: vscode.ExtensionContext): Promise<AgentSession | undefined> {
+  if (!vscode.workspace.isTrusted) {
+    await session?.stop();
+    session = undefined;
+    return undefined;
+  }
+  if (session) { return session; }
+  const folder = await gatedFolderPick();
+  if (!folder) { return undefined; }
+  const executablePath = resolveExecutable(context);
+  if (!executablePath) { return undefined; }
+  session = new AgentSession(executablePath, folder, context, requestPermission);
+  return session;
+}
+
+async function requestPermission(
+  request: acp.RequestPermissionRequest,
+  signal: AbortSignal,
+): Promise<acp.RequestPermissionResponse> {
+  if (signal.aborted || !vscode.workspace.isTrusted) {
+    return { outcome: { outcome: 'cancelled' } };
+  }
+
+  interface PermissionItem extends vscode.MessageItem { readonly optionIndex: number }
+  const items = request.options.map((option, index): PermissionItem => ({
+    title: `${option.name} (${option.kind.replaceAll('_', ' ')})`,
+    isCloseAffordance: option.kind.startsWith('reject'),
+    optionIndex: index,
+  }));
+  const selected = await vscode.window.showWarningMessage(
+    `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
+    { modal: true, detail: `Tool call ${request.toolCall.toolCallId}` },
+    ...items,
+  );
+  if (!selected || signal.aborted) { return { outcome: { outcome: 'cancelled' } }; }
+  const option = request.options[selected.optionIndex];
+  if (!option) { return { outcome: { outcome: 'cancelled' } }; }
+  return { outcome: { outcome: 'selected', optionId: option.optionId } };
 }

@@ -328,9 +328,130 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  vscode-vsix:
+    name: VSIX ${{ matrix.vscode-target }}
+    needs: [build, build-windows]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            vscode-target: linux-x64
+          - os: ubuntu-24.04-arm
+            rust-target: aarch64-unknown-linux-gnu
+            vscode-target: linux-arm64
+          - os: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            vscode-target: darwin-x64
+          - os: macos-latest
+            rust-target: aarch64-apple-darwin
+            vscode-target: darwin-arm64
+          - os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            vscode-target: win32-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: editors/vscode/.nvmrc
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Verify pinned npm
+        run: test "$(npm --version)" = "10.8.2"
+
+      - name: Download native release binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: archives-${{ matrix.rust-target }}
+          path: release-input
+
+      - name: Populate matching extension binary
+        env:
+          RUST_TARGET: ${{ matrix.rust-target }}
+          VSCODE_TARGET: ${{ matrix.vscode-target }}
+        run: |
+          mkdir -p "editors/vscode/bin/$VSCODE_TARGET"
+          tar -xzf "release-input/mini-agent-$RUST_TARGET.tar.gz" \
+            -C "editors/vscode/bin/$VSCODE_TARGET"
+
+      - name: Install locked extension dependencies
+        working-directory: editors/vscode
+        run: npm ci --no-audit --no-fund
+
+      - name: Test and package candidate
+        working-directory: editors/vscode
+        env:
+          VSCODE_TARGET: ${{ matrix.vscode-target }}
+        run: |
+          npm run typecheck
+          npm run lint
+          npm test
+          node scripts/package-target.mjs "$VSCODE_TARGET"
+          npm run sbom
+          mv dist/mini-agent-vscode.cdx.json \
+            "dist/mini-agent-1.7.2-$VSCODE_TARGET.cdx.json"
+
+      - name: Install candidate into clean VS Code
+        working-directory: editors/vscode
+        env:
+          VSCODE_TARGET: ${{ matrix.vscode-target }}
+        run: |
+          node scripts/run-integration-tests.mjs \
+            "dist/mini-agent-1.7.2-$VSCODE_TARGET.vsix" \
+            "$VSCODE_TARGET"
+
+      - name: Upload native candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vsix-${{ matrix.vscode-target }}
+          path: |
+            editors/vscode/dist/mini-agent-1.7.2-${{ matrix.vscode-target }}.vsix
+            editors/vscode/dist/mini-agent-1.7.2-${{ matrix.vscode-target }}.cdx.json
+          if-no-files-found: error
+          retention-days: 1
+
+  vscode-candidates:
+    name: Assemble VSIX candidates
+    needs: vscode-vsix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download native candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+
+      - name: Verify candidate set and checksums
+        run: |
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            test -f "mini-agent-1.7.2-$target.vsix"
+            test -f "mini-agent-1.7.2-$target.cdx.json"
+          done
+          test "$(find . -maxdepth 1 -name '*.vsix' | wc -l)" -eq 5
+          sha256sum *.vsix *.cdx.json | sort > VSIX_SHA256SUMS
+
+      - name: Upload side-loadable candidate set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vscode-candidates
+          path: |
+            *.vsix
+            *.cdx.json
+            VSIX_SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
   publish-release:
     name: Publish GitHub release
-    needs: [build, build-static, build-windows, corresponding-source, checksums]
+    needs: [build, build-static, build-windows, corresponding-source, checksums, vscode-candidates]
     runs-on: ubuntu-latest
     steps:
       - name: Download all archives
@@ -348,6 +469,11 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: checksums
+
+      - name: Download VSIX candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: vscode-candidates
 
       - name: Verify complete release set
         run: |
@@ -368,14 +494,25 @@ jobs:
             mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
             mini-agent-${GITHUB_REF_NAME}-source.tar.gz
             SHA256SUMS
+            VSIX_SHA256SUMS
+            mini-agent-1.7.2-linux-x64.vsix
+            mini-agent-1.7.2-linux-arm64.vsix
+            mini-agent-1.7.2-darwin-x64.vsix
+            mini-agent-1.7.2-darwin-arm64.vsix
+            mini-agent-1.7.2-win32-x64.vsix
+            mini-agent-1.7.2-linux-x64.cdx.json
+            mini-agent-1.7.2-linux-arm64.cdx.json
+            mini-agent-1.7.2-darwin-x64.cdx.json
+            mini-agent-1.7.2-darwin-arm64.cdx.json
+            mini-agent-1.7.2-win32-x64.cdx.json
           )
           for f in "${expected[@]}"; do
             [ -f "$f" ] || { echo "ERROR: Missing expected file: $f"; exit 1; }
           done
-          actual_count=$(ls *.tar.gz SHA256SUMS 2>/dev/null | wc -l)
+          actual_count=$(ls *.tar.gz *.vsix *.cdx.json SHA256SUMS VSIX_SHA256SUMS 2>/dev/null | wc -l)
           if [ "$actual_count" -ne "${#expected[@]}" ]; then
             echo "ERROR: Unexpected files present (got $actual_count, expected ${#expected[@]})"
-            ls *.tar.gz SHA256SUMS
+            ls *.tar.gz *.vsix *.cdx.json SHA256SUMS VSIX_SHA256SUMS
             exit 1
           fi
 
@@ -391,7 +528,7 @@ jobs:
           # Remove any partial release from a prior failed attempt so reruns are clean
           gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           gh release create "$tag" \
-            *.tar.gz SHA256SUMS \
+            *.tar.gz *.vsix *.cdx.json SHA256SUMS VSIX_SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "$tag" \
             --generate-notes \

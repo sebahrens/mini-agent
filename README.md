@@ -233,7 +233,7 @@ See [Getting started](docs/agent/GET_STARTED.md),
 
 ## Feature flags
 
-The default build includes the core ZeroStack experience plus `js`, `sandbox`, and `memory`.
+The default build includes the core ZeroStack experience plus `acp`, `js`, `sandbox`, and `memory`.
 Learned-skill storage is opt-in because it adds SQLite and retrieval dependencies.
 
 Pre-built release archives include JavaScript execution but not learned-skill storage. To install a
@@ -252,7 +252,8 @@ cargo install --git https://github.com/sebahrens/mini-agent --features skills
 | `skills-embed-dynamic` | Runtime ONNX linkage for hosts without a prebuilt `ort-sys` binary |
 | `memory` | Persistent project and user memory |
 | `mcp` | MCP client transports and tool discovery |
-| `acp`, `hooks`, `lsp`, `advisor`, `multimodal`, `pdf` | Optional integrations inherited from and built around the ZeroStack core |
+| `acp` | Stable Agent Client Protocol server over stdio or authenticated TCP; included by default |
+| `hooks`, `lsp`, `advisor`, `multimodal`, `pdf` | Optional integrations inherited from and built around the ZeroStack core |
 
 For the full feature graph, see [Cargo.toml](Cargo.toml).
 

@@ -2,18 +2,33 @@
   "name": "mini-agent",
   "displayName": "Mini Agent",
   "description": "Mini Agent — AI coding agent with ACP stdio integration",
-  "version": "0.1.0",
+  "version": "1.7.2",
   "publisher": "mini-agent",
-  "engines": {
-    "vscode": "^1.90.0"
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sebahrens/mini-agent.git"
   },
-  "categories": ["AI", "Other"],
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=20.0.0"
+  },
+  "categories": ["AI", "Chat", "Other"],
   "extensionKind": ["workspace", "ui"],
   "activationEvents": [
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "chatParticipants": [
+      {
+        "id": "mini-agent.chat",
+        "name": "mini-agent",
+        "fullName": "Mini Agent",
+        "description": "Work with Mini Agent in the current trusted workspace.",
+        "isSticky": true
+      }
+    ],
     "commands": [
       {
         "command": "mini-agent.start",
@@ -49,17 +64,7 @@
           "scope": "machine"
         }
       }
-    },
-    "views": {
-      "explorer": [
-        {
-          "id": "mini-agent.panel",
-          "name": "Mini Agent",
-          "when": "workspaceFolderCount > 0"
-        }
-      ]
-    },
-    "viewsContainers": {}
+    }
   },
   "capabilities": {
     "untrustedWorkspaces": {
@@ -73,26 +78,36 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
     "dev": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext ts",
+    "test": "vitest run",
+    "test:integration": "node ./scripts/run-integration-tests.mjs",
     "package": "vsce package",
-    "package:win32-x64": "vsce package --target win32-x64",
-    "package:darwin-arm64": "vsce package --target darwin-arm64",
-    "package:linux-x64": "vsce package --target linux-x64"
+    "package:win32-x64": "node ./scripts/package-target.mjs win32-x64",
+    "package:darwin-x64": "node ./scripts/package-target.mjs darwin-x64",
+    "package:darwin-arm64": "node ./scripts/package-target.mjs darwin-arm64",
+    "package:linux-x64": "node ./scripts/package-target.mjs linux-x64",
+    "package:linux-arm64": "node ./scripts/package-target.mjs linux-arm64",
+    "sbom": "node ./scripts/generate-sbom.mjs"
   },
+  "packageManager": "npm@10.8.2",
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "@types/vscode": "^1.90.0",
-    "@typescript-eslint/eslint-plugin": "^7.0.0",
-    "@typescript-eslint/parser": "^7.0.0",
-    "esbuild": "^0.21.0",
-    "eslint": "^8.0.0",
-    "typescript": "^5.4.0",
-    "@vscode/vsce": "^2.26.0"
+    "@types/node": "20.17.30",
+    "@types/vscode": "1.90.0",
+    "@typescript-eslint/eslint-plugin": "7.18.0",
+    "@typescript-eslint/parser": "7.18.0",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.21.5",
+    "eslint": "8.57.1",
+    "fflate": "0.8.2",
+    "typescript": "5.4.5",
+    "vitest": "2.1.9"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.0.0"
+    "@agentclientprotocol/sdk": "1.3.0",
+    "zod": "4.4.3"
   }
 }

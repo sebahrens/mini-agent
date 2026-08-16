@@ -1,11 +1,34 @@
 # VS Code ACP Setup Guide
 
-mini-agent speaks the [Agent-Client Protocol (ACP)](https://github.com/anthropics/agent-client-protocol) v1.3.0 over stdio or TCP. Any ACP-compatible VS Code extension can drive it.
+mini-agent speaks stable Agent Client Protocol (ACP) v1 over stdio or TCP. The
+repository includes a native VS Code Chat Participant extension in
+`editors/vscode`; other ACP-compatible clients can also drive the agent.
+
+## Native Mini Agent extension
+
+Install the platform-specific `mini-agent-<version>-<target>.vsix` from a GitHub
+release. VS Code's **Extensions: Install from VSIX...** command installs the
+candidate without a Marketplace connection. Each release includes SHA-256
+checksums, a CycloneDX SBOM, the GPL notice, and corresponding-source directions.
+Release packaging rejects wrong-architecture or ACP-disabled binaries, then drives
+each native artifact through initialize/new/prompt/cancel/close over stdio before
+assembling its platform VSIX.
+
+Open a trusted local workspace and address `@mini-agent` in VS Code Chat. The
+extension starts its bundled native binary lazily, keeps one ACP session for
+subsequent prompts, streams assistant/tool/status updates, displays permission
+requests as modal editor choices, and forwards Chat cancellation to
+`session/cancel`. Stopping the extension, closing the session, revoking its
+workspace context, or deactivating VS Code reaps the child process.
+
+The extension fails closed in Restricted Mode and virtual workspaces. In a
+Remote Development window, install it on the remote/workspace side so the ACP
+process and selected `file:` workspace share the same authority.
 
 ## Prerequisites
 
 - mini-agent installed: `cargo install --path . --debug`
-- An ACP-compatible VS Code extension (e.g. Claude Dev, Cline, or any extension that supports ACP)
+- The native Mini Agent extension or another stable ACP v1 client
 
 ## Stdio transport (recommended)
 
@@ -62,6 +85,7 @@ In your extension's settings:
 | `session/new` | Yes |
 | `session/close` | Yes |
 | `session/prompt` | Yes |
+| `session/cancel` | Yes |
 | `session/request_permission` | Yes — prompts appear in the editor UI |
 | Max concurrent sessions | 64 |
 
@@ -74,6 +98,10 @@ If no ACP client is connected, or if the session is non-interactive, tool calls 
 ## Troubleshooting
 
 **Agent not found**: make sure `mini-agent` is on your PATH (`which mini-agent`).
+
+For the native extension, leave `mini-agent.executablePath` empty to use the
+bundled binary. A custom path is accepted only from User/Remote machine settings;
+workspace settings cannot replace the executable.
 
 **TCP connection refused**: confirm the agent is running (`mini-agent --acp-port <port>`) and the port matches.
 
