@@ -169,10 +169,8 @@ fn artifact_uses_ajv(artifact: &SkillArtifact) -> bool {
 
 fn compile_private_library_function<'js>(
     ctx: Ctx<'js>,
-    encoded_parts: String,
+    Rest(parts): Rest<String>,
 ) -> rquickjs::Result<Function<'js>> {
-    let parts: Vec<String> =
-        serde_json::from_str(&encoded_parts).map_err(|_| rquickjs::Error::Unknown)?;
     let (body, parameters) = parts.split_last().ok_or(rquickjs::Error::Unknown)?;
     // AJV supplies the same parameter/body strings it would pass to the standard Function
     // constructor. This trusted shim changes only the QuickJS API used to compile them.
@@ -198,16 +196,9 @@ fn build_private_skill_library_bridge<'js>(
     let install = module
         .get::<_, Function>("install")
         .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-    let compiler = Function::new(ctx.clone(), compile_private_library_function)
-        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-    let constructor_factory = ctx
-        .eval::<Function, _>(
-            "((stringify, apply) => compile => function (...parts) { let generated; try { generated = compile(stringify(parts)); } catch (_) { throw 1; } return function (...values) { try { return apply(generated, this, values); } catch (_) { throw 2; } }; })(JSON.stringify, Reflect.apply)",
-        )
-        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
-    let function_constructor = constructor_factory
-        .call::<_, Function>((compiler,))
-        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+    let function_constructor = Function::new(ctx.clone(), compile_private_library_function)
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?
+        .with_constructor(true);
     install
         .call::<_, Function>((function_constructor,))
         .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
