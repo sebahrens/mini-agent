@@ -168,8 +168,13 @@ def validate(root: Path) -> list[str]:
         _require(errors, fragment in workflow, f"release workflow is missing MSI gate {fragment!r}")
     _require(
         errors,
-        workflow.count("msiexec.exe") >= 2,
-        "release workflow must run msiexec.exe for both install and uninstall",
+        workflow.count("Start-Process msiexec.exe") >= 2,
+        "release workflow must start msiexec.exe for both install and uninstall",
+    )
+    _require(
+        errors,
+        workflow.count("-Wait -PassThru") >= 2,
+        "release workflow must wait for both msiexec.exe processes and capture their exit codes",
     )
 
     ci = ci_path.read_text(encoding="utf-8")
@@ -177,10 +182,15 @@ def validate(root: Path) -> list[str]:
         "windows-msi:",
         "python scripts/check_windows_msi.py",
         "dotnet build packaging/windows/installer.wixproj",
-        "msiexec.exe /i",
-        "msiexec.exe /x",
+        "Start-Process msiexec.exe",
+        "-Wait -PassThru",
     ):
         _require(errors, fragment in ci, f"CI workflow is missing MSI gate {fragment!r}")
+    _require(
+        errors,
+        ci.count("Start-Process msiexec.exe") >= 2 and ci.count("-Wait -PassThru") >= 2,
+        "CI workflow must wait for install and uninstall and capture both exit codes",
+    )
 
     return errors
 

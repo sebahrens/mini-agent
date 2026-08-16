@@ -495,10 +495,12 @@ jobs:
         run: |
           $msi = (Resolve-Path msi-output/mini-agent-windows-x64.msi).Path
           $installLog = Join-Path $env:RUNNER_TEMP mini-agent-msi-install.log
-          & msiexec.exe /i $msi /quiet /norestart /l*v $installLog
-          if ($LASTEXITCODE -ne 0) {
-            Get-Content $installLog
-            throw "MSI install failed with exit code $LASTEXITCODE"
+          $installResult = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart /l*v `"$installLog`"" `
+            -Wait -PassThru
+          if ($installResult.ExitCode -ne 0) {
+            if (Test-Path $installLog) { Get-Content $installLog }
+            throw "MSI install failed with exit code $($installResult.ExitCode)"
           }
           $installed = Join-Path $env:LOCALAPPDATA 'Programs\mini-agent\mini-agent.exe'
           if (-not (Test-Path $installed)) { throw "MSI did not install $installed" }
@@ -506,8 +508,12 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $version -notmatch '^mini-agent ') {
             throw "installed MSI binary failed its version smoke"
           }
-          & msiexec.exe /x $msi /quiet /norestart
-          if ($LASTEXITCODE -ne 0) { throw "MSI uninstall failed with exit code $LASTEXITCODE" }
+          $uninstallResult = Start-Process msiexec.exe `
+            -ArgumentList "/x `"$msi`" /quiet /norestart" `
+            -Wait -PassThru
+          if ($uninstallResult.ExitCode -ne 0) {
+            throw "MSI uninstall failed with exit code $($uninstallResult.ExitCode)"
+          }
           if (Test-Path $installed) { throw "MSI uninstall left the installed binary behind" }
 
       - name: Generate MSI checksum
