@@ -2321,6 +2321,8 @@ fn execute_isolated_skill_verification_case(
                 | super::realm::RealmError::MissingExport
                 | super::realm::RealmError::PendingInitializationJobs => DiagnosticClass::Contract,
                 super::realm::RealmError::Initialization
+                | super::realm::RealmError::PrivateLibraryCompilation
+                | super::realm::RealmError::PrivateLibraryInstallation
                 | super::realm::RealmError::WrapperInstallation => DiagnosticClass::Exception,
             };
             return VerificationCaseResult {

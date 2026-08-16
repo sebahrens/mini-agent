@@ -52,12 +52,9 @@ const BRIDGE_FACTORY_SOURCE: &str = r#"
 // loader captures that constructor lexically before the private realm is hardened. Bundle
 // initialization happens only for artifacts that reference AJV, and it completes before private
 // realm hardening so the vendored bootstrap has the same deterministic intrinsics on every
-// platform. Default meta-schema registration is disabled because input-schema self-validation is
-// already disabled and that unnecessary startup path fails inside the fixed Windows MSVC runtime
-// envelope; draft-07 `$schema` declarations remain accepted and are covered by the realm test.
-// Skills that do not validate JSON retain the existing resource envelope. The learned skill still
-// receives only the frozen facade installed below; neither the constructor nor AJV's mutable
-// instance is reachable from stored source or the model realm.
+// platform. Skills that do not validate JSON retain the existing resource envelope. The learned
+// skill still receives only the frozen facade installed below; neither the constructor nor AJV's
+// mutable instance is reachable from stored source or the model realm.
 const PRIVATE_SKILL_LIBRARY_MODULE_NAME: &str = "mini-agent:private-skill-library";
 const PRIVATE_SKILL_LIBRARY_FACTORY_SOURCE: &str = concat!(
     r#"(function (Function) {
@@ -69,8 +66,7 @@ const self = globalThis;
 const AjvConstructor = globalThis.ajv7.default || globalThis.ajv7;
 try {
     return new AjvConstructor({
-        allErrors: false, strict: false, meta: false, validateSchema: false,
-        verbose: false, messages: false,
+        allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
         code: {optimize: false}, logger: false
     });
 } finally {
@@ -317,6 +313,10 @@ pub(crate) enum RealmError {
     ExportCollision,
     #[error("artifact initialization failed")]
     Initialization,
+    #[error("trusted private skill library compilation failed")]
+    PrivateLibraryCompilation,
+    #[error("trusted private skill library installation failed")]
+    PrivateLibraryInstallation,
     #[error("artifact initialization scheduled pending jobs")]
     PendingInitializationJobs,
     #[error("artifact does not define every declared export as a function")]
@@ -505,7 +505,7 @@ fn load_artifact_internal(
 
     let private_context = Context::full(runtime).map_err(|_| RealmError::Initialization)?;
     let private_skill_library = if artifact_uses_ajv(artifact) {
-        Some(private_skill_library_bytecode().ok_or(RealmError::Initialization)?)
+        Some(private_skill_library_bytecode().ok_or(RealmError::PrivateLibraryCompilation)?)
     } else {
         None
     };
@@ -518,9 +518,19 @@ fn load_artifact_internal(
                 BRIDGE_FACTORY_SOURCE
             })?;
             let encoder: Function = ctx.eval(STRICT_CLONE_SOURCE)?;
-            if let Some(bytecode) = private_skill_library {
-                install_private_skill_library(&ctx, bytecode)?;
-            }
+            Ok::<_, rquickjs::Error>((
+                Persistent::save(&ctx, bridge_factory),
+                Persistent::save(&ctx, encoder),
+            ))
+        })
+        .map_err(|_| RealmError::Initialization)?;
+    if let Some(bytecode) = private_skill_library {
+        private_context
+            .with(|ctx| install_private_skill_library(&ctx, bytecode))
+            .map_err(|_| RealmError::PrivateLibraryInstallation)?;
+    }
+    private_context
+        .with(|ctx| {
             ctx.eval::<(), _>(SKILL_REALM_HARDENING_JS)?;
 
             let mut options = EvalOptions::default();
@@ -530,10 +540,7 @@ fn load_artifact_internal(
             // make source-created namespace objects part of the trusted loader boundary.
             let _: Value =
                 ctx.eval_with_options(private_skill_source(artifact).as_bytes(), options)?;
-            Ok::<_, rquickjs::Error>((
-                Persistent::save(&ctx, bridge_factory),
-                Persistent::save(&ctx, encoder),
-            ))
+            Ok::<_, rquickjs::Error>(())
         })
         .map_err(|_| RealmError::Initialization)?;
 
