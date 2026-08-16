@@ -66,7 +66,7 @@ const AjvConstructor = globalThis.ajv7.default || globalThis.ajv7;
 try {
     const instance = new AjvConstructor({
         allErrors: false, strict: false, validateSchema: false, verbose: false, messages: false,
-        code: {optimize: false}, logger: false, meta: false
+        code: {es5: true, optimize: false}, logger: false, meta: false
     });
     const parse = JSON.parse;
     const stringify = JSON.stringify;
