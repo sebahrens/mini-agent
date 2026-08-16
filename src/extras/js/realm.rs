@@ -140,15 +140,27 @@ fn artifact_uses_ajv(artifact: &SkillArtifact) -> bool {
 }
 
 #[allow(unsafe_code)]
-fn install_private_skill_library(ctx: &Ctx<'_>, bytecode: &[u8]) -> rquickjs::Result<()> {
+fn install_private_skill_library(ctx: &Ctx<'_>, bytecode: &[u8]) -> Result<(), RealmError> {
     // SAFETY: the bytes are compiled once in this process from the checked-in trusted bundle,
     // with the same linked QuickJS ABI, and are never accepted from disk, IPC, or model output.
-    let module = unsafe { Module::load(ctx.clone(), bytecode)? };
-    let (module, evaluation) = module.eval()?;
-    evaluation.finish::<()>()?;
-    let install = module.get::<_, Function>("install")?;
-    let function_constructor = ctx.globals().get::<_, Function>("Function")?;
-    install.call::<_, ()>((function_constructor,))
+    let module = unsafe { Module::load(ctx.clone(), bytecode) }
+        .map_err(|_| RealmError::PrivateLibraryBytecodeLoad)?;
+    let (module, evaluation) = module
+        .eval()
+        .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
+    evaluation
+        .finish::<()>()
+        .map_err(|_| RealmError::PrivateLibraryModuleEvaluation)?;
+    let install = module
+        .get::<_, Function>("install")
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+    let function_constructor = ctx
+        .globals()
+        .get::<_, Function>("Function")
+        .map_err(|_| RealmError::PrivateLibraryExportLookup)?;
+    install
+        .call::<_, ()>((function_constructor,))
+        .map_err(|_| RealmError::PrivateLibraryFactoryExecution)
 }
 
 const PURE_MODEL_WRAPPER_FACTORY_SOURCE: &str = r#"
@@ -315,8 +327,14 @@ pub(crate) enum RealmError {
     Initialization,
     #[error("trusted private skill library compilation failed")]
     PrivateLibraryCompilation,
-    #[error("trusted private skill library installation failed")]
-    PrivateLibraryInstallation,
+    #[error("trusted private skill library bytecode load failed")]
+    PrivateLibraryBytecodeLoad,
+    #[error("trusted private skill library module evaluation failed")]
+    PrivateLibraryModuleEvaluation,
+    #[error("trusted private skill library export lookup failed")]
+    PrivateLibraryExportLookup,
+    #[error("trusted private skill library factory execution failed")]
+    PrivateLibraryFactoryExecution,
     #[error("artifact initialization scheduled pending jobs")]
     PendingInitializationJobs,
     #[error("artifact does not define every declared export as a function")]
@@ -525,9 +543,7 @@ fn load_artifact_internal(
         })
         .map_err(|_| RealmError::Initialization)?;
     if let Some(bytecode) = private_skill_library {
-        private_context
-            .with(|ctx| install_private_skill_library(&ctx, bytecode))
-            .map_err(|_| RealmError::PrivateLibraryInstallation)?;
+        private_context.with(|ctx| install_private_skill_library(&ctx, bytecode))?;
     }
     private_context
         .with(|ctx| {
