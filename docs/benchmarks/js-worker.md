@@ -1,5 +1,24 @@
 # JavaScript worker resource benchmark
 
+## Focused trusted-bootstrap latency
+
+Use the bounded local benchmark when changing the trusted `strictClone`/`stringGate` bootstrap:
+
+```bash
+MINI_AGENT_JS_BOOTSTRAP_BENCH=1 cargo test --locked --no-default-features --features js \
+  trusted_bootstrap_latency_benchmark -- --ignored --nocapture
+```
+
+It performs five warmups and 50 samples per path. `source_eval_*` includes a fresh limited
+runtime/context plus trusted source compilation, module evaluation, and export lookup.
+`bytecode_*` precompiles the trusted module once outside the measurements, then includes the same
+fresh runtime/context plus bytecode load, evaluation, and export lookup. The command prints p50 and
+p95 microseconds and normally completes in seconds. It is a developer comparison, not release
+evidence and not a performance gate.
+
+The full reference-host benchmark below is deliberately unchanged; it remains the source of
+cross-platform process, containment, IPC, recovery, and memory evidence.
+
 This debug-profile benchmark measures whether mini-agent's single contained JavaScript worker is
 small and responsive. It does not turn host-sensitive timings into a shared-runner gate, and it
 does not treat observed memory or CPU use as a security boundary. The native 256 MiB address-space

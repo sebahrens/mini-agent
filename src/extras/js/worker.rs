@@ -749,6 +749,13 @@ pub(super) const STRICT_CLONE_SOURCE: &str = r#"
 const TRUSTED_BOOTSTRAP_MODULE_NAME: &str = "mini-agent:trusted-bootstrap";
 static TRUSTED_BOOTSTRAP_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
+fn trusted_bootstrap_source() -> String {
+    format!(
+        "export const strictClone = {STRICT_CLONE_SOURCE};\n\
+         export const stringGate = {STRING_GATE_SOURCE};"
+    )
+}
+
 fn compile_trusted_bootstrap_bytecode() -> rquickjs::Result<Vec<u8>> {
     let runtime = Runtime::new()?;
     runtime.set_memory_limit(MEMORY_LIMIT);
@@ -757,11 +764,12 @@ fn compile_trusted_bootstrap_bytecode() -> rquickjs::Result<Vec<u8>> {
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let context = Context::full(&runtime)?;
     context.with(|ctx| {
-        let source = format!(
-            "export const strictClone = {STRICT_CLONE_SOURCE};\n\
-             export const stringGate = {STRING_GATE_SOURCE};"
-        );
-        Module::declare(ctx, TRUSTED_BOOTSTRAP_MODULE_NAME, source)?.write(WriteOptions::default())
+        Module::declare(
+            ctx,
+            TRUSTED_BOOTSTRAP_MODULE_NAME,
+            trusted_bootstrap_source(),
+        )?
+        .write(WriteOptions::default())
     })
 }
 
@@ -796,6 +804,50 @@ fn load_trusted_bootstrap_functions(
 mod trusted_bootstrap_bytecode_tests {
     use super::*;
 
+    const BENCHMARK_WARMUPS: usize = 5;
+    const BENCHMARK_SAMPLES: usize = 50;
+
+    fn configure_benchmark_runtime() -> rquickjs::Result<(Runtime, Context)> {
+        let runtime = Runtime::new()?;
+        runtime.set_memory_limit(MEMORY_LIMIT);
+        runtime.set_max_stack_size(STACK_LIMIT);
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+        let context = Context::full(&runtime)?;
+        Ok((runtime, context))
+    }
+
+    fn evaluate_trusted_bootstrap_source() -> rquickjs::Result<()> {
+        let (_runtime, context) = configure_benchmark_runtime()?;
+        context.with(|ctx| {
+            let (module, evaluation) = Module::declare(
+                ctx,
+                TRUSTED_BOOTSTRAP_MODULE_NAME,
+                trusted_bootstrap_source(),
+            )?
+            .eval()?;
+            evaluation.finish::<()>()?;
+            let _: Function = module.get("strictClone")?;
+            let _: Function = module.get("stringGate")?;
+            Ok(())
+        })
+    }
+
+    fn load_trusted_bootstrap_bytecode_for_benchmark(bytecode: &[u8]) -> rquickjs::Result<()> {
+        let (_runtime, context) = configure_benchmark_runtime()?;
+        let _ = load_trusted_bootstrap_functions(&context, bytecode)?;
+        Ok(())
+    }
+
+    fn percentile_microseconds(samples: &[Duration], percentile: usize) -> f64 {
+        assert!(!samples.is_empty());
+        assert!((1..=100).contains(&percentile));
+        let mut ordered = samples.to_vec();
+        ordered.sort_unstable();
+        let rank = (ordered.len() * percentile).div_ceil(100);
+        ordered[rank.saturating_sub(1)].as_secs_f64() * 1_000_000.0
+    }
+
     #[test]
     fn trusted_bootstrap_bytecode_loads_into_distinct_fresh_runtimes() {
         let bytecode = compile_trusted_bootstrap_bytecode().expect("compile trusted bootstrap");
@@ -823,6 +875,71 @@ mod trusted_bootstrap_bytecode_tests {
                 assert_eq!(gated, expected);
             });
         }
+    }
+
+    #[test]
+    fn bootstrap_benchmark_percentiles_use_nearest_rank() {
+        let samples = [
+            Duration::from_micros(1),
+            Duration::from_micros(2),
+            Duration::from_micros(3),
+            Duration::from_micros(4),
+            Duration::from_micros(100),
+        ];
+        assert_eq!(percentile_microseconds(&samples, 50), 3.0);
+        assert_eq!(percentile_microseconds(&samples, 95), 100.0);
+    }
+
+    #[test]
+    #[ignore = "run explicitly for bounded trusted-bootstrap before/after measurements"]
+    fn trusted_bootstrap_latency_benchmark() {
+        assert_eq!(
+            std::env::var("MINI_AGENT_JS_BOOTSTRAP_BENCH").as_deref(),
+            Ok("1"),
+            "set MINI_AGENT_JS_BOOTSTRAP_BENCH=1 for an intentional benchmark run"
+        );
+        let bytecode = compile_trusted_bootstrap_bytecode().expect("compile trusted bootstrap");
+        let mut source_samples = Vec::with_capacity(BENCHMARK_SAMPLES);
+        let mut bytecode_samples = Vec::with_capacity(BENCHMARK_SAMPLES);
+
+        println!(
+            "trusted bootstrap benchmark: {} warmups + {} samples per path",
+            BENCHMARK_WARMUPS, BENCHMARK_SAMPLES
+        );
+        for iteration in 0..(BENCHMARK_WARMUPS + BENCHMARK_SAMPLES) {
+            let (source_elapsed, bytecode_elapsed) = if iteration % 2 == 0 {
+                let source_started = Instant::now();
+                evaluate_trusted_bootstrap_source().expect("evaluate trusted bootstrap source");
+                let source_elapsed = source_started.elapsed();
+
+                let bytecode_started = Instant::now();
+                load_trusted_bootstrap_bytecode_for_benchmark(&bytecode)
+                    .expect("load trusted bootstrap bytecode");
+                (source_elapsed, bytecode_started.elapsed())
+            } else {
+                let bytecode_started = Instant::now();
+                load_trusted_bootstrap_bytecode_for_benchmark(&bytecode)
+                    .expect("load trusted bootstrap bytecode");
+                let bytecode_elapsed = bytecode_started.elapsed();
+
+                let source_started = Instant::now();
+                evaluate_trusted_bootstrap_source().expect("evaluate trusted bootstrap source");
+                (source_started.elapsed(), bytecode_elapsed)
+            };
+
+            if iteration >= BENCHMARK_WARMUPS {
+                source_samples.push(source_elapsed);
+                bytecode_samples.push(bytecode_elapsed);
+            }
+        }
+
+        println!(
+            "TRUSTED_BOOTSTRAP_BENCHMARK source_eval_p50_us={:.1} source_eval_p95_us={:.1} bytecode_p50_us={:.1} bytecode_p95_us={:.1}",
+            percentile_microseconds(&source_samples, 50),
+            percentile_microseconds(&source_samples, 95),
+            percentile_microseconds(&bytecode_samples, 50),
+            percentile_microseconds(&bytecode_samples, 95),
+        );
     }
 }
 

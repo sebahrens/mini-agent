@@ -1,0 +1,19 @@
+<Project Sdk="WixToolset.Sdk/6.0.2">
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <OutputName>mini-agent-windows-x64</OutputName>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <RepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..'))</RepositoryRoot>
+    <DefineConstants>BinaryPath=$(BinaryPath);VsixPath=$(VsixPath);ProductVersion=$(ProductVersion);RepositoryRoot=$(RepositoryRoot)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="6.0.2" />
+  </ItemGroup>
+
+  <Target Name="RequireInstallerInputs" BeforeTargets="BeforeBuild">
+    <Error Condition="'$(ProductVersion)' == ''" Text="ProductVersion is required." />
+    <Error Condition="'$(BinaryPath)' == '' Or !Exists('$(BinaryPath)')" Text="BinaryPath must name mini-agent.exe." />
+    <Error Condition="'$(VsixPath)' == '' Or !Exists('$(VsixPath)')" Text="VsixPath must name the win32-x64 VSIX." />
+  </Target>
+</Project>

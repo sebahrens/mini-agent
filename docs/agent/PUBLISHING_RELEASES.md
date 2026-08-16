@@ -18,7 +18,9 @@ before upload. Full archives use the supported default Cargo feature set; lite a
 use `--no-default-features`. Opt-in native features such as `skills-embed` are not silently bundled
 into cross-platform archives and keep their platform-specific installation requirements.
 
-Every release also includes `mini-agent-vX.Y.Z-source.tar.gz`. This Corresponding Source archive is
+Every release also includes five platform VSIX candidates, the dual-purpose
+`mini-agent-windows-x64.msi`, their checksum manifests, and
+`mini-agent-vX.Y.Z-source.tar.gz`. This Corresponding Source archive is
 made from the exact tagged commit and adds the complete locked Cargo dependency graph under
 `vendor/` plus a generated `.cargo/config.toml`. CI validates that Cargo can resolve the bundle with
 `--locked --offline`, includes the source archive in `SHA256SUMS`, and publishes it in the same
@@ -44,6 +46,8 @@ deliberately explicit:
 |---|---|
 | Source/Cargo | Install only from this repository checkout. The crates.io `mini-agent` package is unrelated and must never be advertised or published by this project. |
 | GitHub release archives and shell installer | Supported only after the exact-version archive and `SHA256SUMS` smoke passes against the public canonical repository. |
+| Windows MSI | Supported x86-64 dual-purpose installer. Defaults to a no-admin per-user install, supports `ALLUSERS=1` enterprise deployment, and side-loads the bundled VSIX when VS Code exists in the installing account. |
+| Native VS Code VSIX | Supported local-install candidates for five release targets; Marketplace/Open VSX publication remains a separate deferred step. |
 | AUR and Conda | Repository-maintained recipes; publication remains the manual downstream step described below. |
 | Homebrew | Compatibility formula retained, but no end-user install command is supported until a canonical tap exists and its archive smoke passes. |
 
@@ -122,8 +126,10 @@ never become a public release identity. Tags containing a prerelease suffix (for
 
 If a tagged run needs recovery, use **Re-run jobs** on that tag's existing Actions run. Do not
 start the release workflow from a branch. Publication still happens only after every expected full
-and lite archive, the tag-matched Corresponding Source archive, and `SHA256SUMS` have been assembled
-and checked.
+and lite archive, the tag-matched Corresponding Source archive, five platform VSIX candidates, the
+Windows MSI, and all three checksum manifests have been assembled and checked. The MSI job uses
+pinned WiX 6.0.2, performs a quiet per-user install, runs the installed binary, and uninstalls it
+before upload.
 
 ## GPL release checklist
 
@@ -133,7 +139,9 @@ Before treating a release as complete, verify that:
 - `NOTICE` identifies the imported ZeroStack commit and the date mini-agent modifications began;
 - the same release contains the source asset named by `SOURCE.md`;
 - the source asset contains the tagged tree, locked vendored dependencies, and offline Cargo config;
-- `SHA256SUMS` covers all binary and source archives; and
+- `SHA256SUMS` covers all binary and source archives;
+- `VSIX_SHA256SUMS` and `MSI_SHA256SUMS` cover the editor and Windows installer artifacts;
+- the MSI installs `LICENSE.txt`, `NOTICE.txt`, and `SOURCE.md` beside its binary and VSIX; and
 - the shell installer and downstream recipes install `NOTICE` and `SOURCE.md` alongside the GPL text.
 
 For an older noncompliant release, attach its exact vendored source bundle, standalone compliance
