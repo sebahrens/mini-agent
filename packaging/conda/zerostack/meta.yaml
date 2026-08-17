@@ -1,13 +1,13 @@
 package:
   name: zerostack
-  version: 1.7.2
+  version: 1.8.0
 
 source:
-  url: https://github.com/sebahrens/mini-agent/releases/download/v1.7.2/mini-agent-v1.7.2-source.tar.gz
+  url: https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-v1.8.0-source.tar.gz
   sha256: 340bcf05c0a3f2b47b5f6a5b68eff89ff3400e4192e4a2371e9301f9558f0011
 
 build:
-  number: 1
+  number: 0
   script_env:
     - CARGO_PROFILE_RELEASE_STRIP=symbols
     - CARGO_PROFILE_RELEASE_LTO=fat

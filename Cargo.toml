@@ -10,7 +10,7 @@ max-exception-days = 90
 
 [package]
 name = "mini-agent"
-version = "1.7.2"
+version = "1.8.0"
 edition = "2024"
 description = "Minimalistic coding agent with built-in JS engine"
 license = "GPL-3.0-only"

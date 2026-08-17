@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "mini-agent"
-version = "1.7.2"
+version = "1.8.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",

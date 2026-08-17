@@ -1,19 +1,19 @@
 pkgbase = zerostack-bin
 	pkgdesc = Minimalistic coding agent written in Rust, optimized for memory footprint and performance
-	pkgver = 1.7.2
-	pkgrel = 2
+	pkgver = 1.8.0
+	pkgrel = 1
 	url = https://github.com/sebahrens/mini-agent
 	arch = x86_64
 	arch = aarch64
 	license = GPL-3.0-only
 	provides = mini-agent
 	conflicts = mini-agent
-	source_x86_64 = zerostack-bin-1.7.2-x86_64.tar.gz::https://github.com/sebahrens/mini-agent/releases/download/v1.7.2/mini-agent-x86_64-unknown-linux-musl.tar.gz
-	source_x86_64 = LICENSE::https://raw.githubusercontent.com/sebahrens/mini-agent/v1.7.2/LICENSE
+	source_x86_64 = zerostack-bin-1.8.0-x86_64.tar.gz::https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-x86_64-unknown-linux-musl.tar.gz
+	source_x86_64 = LICENSE::https://raw.githubusercontent.com/sebahrens/mini-agent/v1.8.0/LICENSE
 	sha256sums_x86_64 = d0bae6b5b7813f4a4fe1aebf1ee5aeaac97e64698781a16cd00728c3d14f3f97
 	sha256sums_x86_64 = 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-	source_aarch64 = zerostack-bin-1.7.2-aarch64.tar.gz::https://github.com/sebahrens/mini-agent/releases/download/v1.7.2/mini-agent-aarch64-unknown-linux-musl.tar.gz
-	source_aarch64 = LICENSE::https://raw.githubusercontent.com/sebahrens/mini-agent/v1.7.2/LICENSE
+	source_aarch64 = zerostack-bin-1.8.0-aarch64.tar.gz::https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-aarch64-unknown-linux-musl.tar.gz
+	source_aarch64 = LICENSE::https://raw.githubusercontent.com/sebahrens/mini-agent/v1.8.0/LICENSE
 	sha256sums_aarch64 = eb62b7cbe74f21ed0aea74dc9ce79a0675a0bfbdbb42799e0e6c7122c5866604
 	sha256sums_aarch64 = 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 

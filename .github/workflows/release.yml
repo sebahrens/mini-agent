@@ -397,7 +397,7 @@ jobs:
           node scripts/package-target.mjs "$VSCODE_TARGET"
           npm run sbom
           mv dist/mini-agent-vscode.cdx.json \
-            "dist/mini-agent-1.7.2-$VSCODE_TARGET.cdx.json"
+            "dist/mini-agent-1.8.0-$VSCODE_TARGET.cdx.json"
 
       - name: Install candidate into clean VS Code
         working-directory: editors/vscode
@@ -405,7 +405,7 @@ jobs:
           VSCODE_TARGET: ${{ matrix.vscode-target }}
         run: |
           node scripts/run-integration-tests.mjs \
-            "dist/mini-agent-1.7.2-$VSCODE_TARGET.vsix" \
+            "dist/mini-agent-1.8.0-$VSCODE_TARGET.vsix" \
             "$VSCODE_TARGET"
 
       - name: Upload native candidate
@@ -413,8 +413,8 @@ jobs:
         with:
           name: vsix-${{ matrix.vscode-target }}
           path: |
-            editors/vscode/dist/mini-agent-1.7.2-${{ matrix.vscode-target }}.vsix
-            editors/vscode/dist/mini-agent-1.7.2-${{ matrix.vscode-target }}.cdx.json
+            editors/vscode/dist/mini-agent-1.8.0-${{ matrix.vscode-target }}.vsix
+            editors/vscode/dist/mini-agent-1.8.0-${{ matrix.vscode-target }}.cdx.json
           if-no-files-found: error
           retention-days: 1
 
@@ -432,8 +432,8 @@ jobs:
       - name: Verify candidate set and checksums
         run: |
           for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            test -f "mini-agent-1.7.2-$target.vsix"
-            test -f "mini-agent-1.7.2-$target.cdx.json"
+            test -f "mini-agent-1.8.0-$target.vsix"
+            test -f "mini-agent-1.8.0-$target.cdx.json"
           done
           test "$(find . -maxdepth 1 -name '*.vsix' | wc -l)" -eq 5
           sha256sum *.vsix *.cdx.json | sort > VSIX_SHA256SUMS
@@ -586,16 +586,16 @@ jobs:
             VSIX_SHA256SUMS
             MSI_SHA256SUMS
             mini-agent-windows-x64.msi
-            mini-agent-1.7.2-linux-x64.vsix
-            mini-agent-1.7.2-linux-arm64.vsix
-            mini-agent-1.7.2-darwin-x64.vsix
-            mini-agent-1.7.2-darwin-arm64.vsix
-            mini-agent-1.7.2-win32-x64.vsix
-            mini-agent-1.7.2-linux-x64.cdx.json
-            mini-agent-1.7.2-linux-arm64.cdx.json
-            mini-agent-1.7.2-darwin-x64.cdx.json
-            mini-agent-1.7.2-darwin-arm64.cdx.json
-            mini-agent-1.7.2-win32-x64.cdx.json
+            mini-agent-1.8.0-linux-x64.vsix
+            mini-agent-1.8.0-linux-arm64.vsix
+            mini-agent-1.8.0-darwin-x64.vsix
+            mini-agent-1.8.0-darwin-arm64.vsix
+            mini-agent-1.8.0-win32-x64.vsix
+            mini-agent-1.8.0-linux-x64.cdx.json
+            mini-agent-1.8.0-linux-arm64.cdx.json
+            mini-agent-1.8.0-darwin-x64.cdx.json
+            mini-agent-1.8.0-darwin-arm64.cdx.json
+            mini-agent-1.8.0-win32-x64.cdx.json
           )
           for f in "${expected[@]}"; do
             [ -f "$f" ] || { echo "ERROR: Missing expected file: $f"; exit 1; }

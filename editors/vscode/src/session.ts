@@ -181,7 +181,7 @@ export class AgentSession {
       const initialized = await connection.agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
         clientCapabilities: {},
-        clientInfo: { name: 'mini-agent-vscode', version: '1.7.2' },
+        clientInfo: { name: 'mini-agent-vscode', version: '1.8.0' },
       }, { cancellationSignal: AbortSignal.timeout(10_000) });
       log.info(`ACP initialized at protocol ${initialized.protocolVersion}`);
       this.setState('running');

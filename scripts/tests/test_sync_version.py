@@ -1,3 +1,4 @@
+import re
 import shutil
 import subprocess
 import tempfile
@@ -31,8 +32,12 @@ class SyncVersionTests(unittest.TestCase):
 
             cargo = root / "Cargo.toml"
             cargo.write_text(
-                cargo.read_text(encoding="utf-8").replace(
-                    'version = "1.7.2"', 'version = "9.8.7"', 1
+                re.sub(
+                    r'^version = "[^"]+"$',
+                    'version = "9.8.7"',
+                    cargo.read_text(encoding="utf-8"),
+                    count=1,
+                    flags=re.MULTILINE,
                 ),
                 encoding="utf-8",
             )
