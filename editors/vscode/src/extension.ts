@@ -8,6 +8,15 @@ import { log, setLogLevel, showOutput } from './log';
 import { assertExecutableScope, gatedFolderPick, onTrustRevoked } from './trust';
 
 let session: AgentSession | undefined;
+let sessionCreation: Promise<AgentSession | undefined> | undefined;
+
+async function discardSession(): Promise<void> {
+  const current = session;
+  session = undefined;
+  if (!current) { return; }
+  await current.stop();
+  current.dispose();
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   const cfg = vscode.workspace.getConfiguration('mini-agent');
@@ -33,14 +42,10 @@ export function activate(context: vscode.ExtensionContext): void {
         assertExecutableScope();
       }
     }),
-    onTrustRevoked(async () => {
-      await session?.stop();
-      session = undefined;
-    }),
+    onTrustRevoked(() => discardSession()),
     vscode.workspace.onDidChangeWorkspaceFolders(async event => {
       if (session && event.removed.some(folder => folder.uri.toString() === session?.workspaceFolder.uri.toString())) {
-        await session.stop();
-        session = undefined;
+        await discardSession();
       }
     }),
   );
@@ -48,8 +53,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export async function deactivate(): Promise<void> {
   log.info('Mini Agent extension deactivating');
-  await session?.stop();
-  session = undefined;
+  await discardSession();
 }
 
 async function cmdStart(context: vscode.ExtensionContext): Promise<void> {
@@ -63,8 +67,7 @@ async function cmdStart(context: vscode.ExtensionContext): Promise<void> {
       'Replace',
     );
     if (confirm !== 'Replace') { return; }
-    await session.stop();
-    session = undefined;
+    await discardSession();
   }
 
   const executablePath = resolveExecutable(context);
@@ -79,8 +82,7 @@ async function cmdStop(): Promise<void> {
     void vscode.window.showInformationMessage('No Mini Agent session is running.');
     return;
   }
-  await session.stop();
-  session = undefined;
+  await discardSession();
 }
 
 async function cmdRestart(context: vscode.ExtensionContext): Promise<void> {
@@ -169,11 +171,17 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
 
 async function ensureSession(context: vscode.ExtensionContext): Promise<AgentSession | undefined> {
   if (!vscode.workspace.isTrusted) {
-    await session?.stop();
-    session = undefined;
+    await discardSession();
     return undefined;
   }
   if (session) { return session; }
+  // Latch concurrent callers onto one creation attempt so rapid chat requests
+  // cannot each spawn a session for the same workspace.
+  sessionCreation ??= createSession(context).finally(() => { sessionCreation = undefined; });
+  return sessionCreation;
+}
+
+async function createSession(context: vscode.ExtensionContext): Promise<AgentSession | undefined> {
   const folder = await gatedFolderPick();
   if (!folder) { return undefined; }
   const executablePath = resolveExecutable(context);

@@ -1003,6 +1003,36 @@ fn bundled_ajv_is_available_only_inside_private_skill_realms() {
 }
 
 #[test]
+fn bundled_ajv_rejects_pathological_schema_depth_with_bounded_sanitized_failure() {
+    let runtime = bounded_runtime();
+    let model = Context::full(&runtime).expect("create model context");
+    let skill = artifact(
+        "function probeDeepSchema(depth) { let schema = {type: 'number'}; let data = 5; for (let i = 0; i < depth; i++) { schema = {type: 'object', properties: {a: schema}, required: ['a']}; data = {a: data}; } const valid = Ajv.validate(schema, data); const errors = Ajv.errors; const keyword = errors === null ? null : errors[0].keyword; const recovered = Ajv.validate({type: 'string'}, 'ok') === true && Ajv.validate({type: 'string'}, 7) === false; return {valid, keyword, recovered}; }",
+        &["probeDeepSchema"],
+    );
+
+    load_artifact(&runtime, &model, &skill).expect("load deep-schema probe skill");
+
+    model.with(|ctx| {
+        let report = ctx
+            .eval::<String, _>("JSON.stringify(probeDeepSchema(20000))")
+            .expect("deep schema validation must return a bounded result, not crash the realm");
+        assert!(
+            report.contains(r#""valid":false"#),
+            "pathological depth must fail closed: {report}"
+        );
+        assert!(
+            report.contains(r#""keyword":"schemaExecution"#),
+            "failure must map to a sanitized schemaExecution keyword: {report}"
+        );
+        assert!(
+            report.contains(r#""recovered":true"#),
+            "realm must keep validating after the bounded failure: {report}"
+        );
+    });
+}
+
+#[test]
 fn loader_rejects_collisions_and_missing_exports_without_partial_publication() {
     let runtime = bounded_runtime();
     let model = Context::full(&runtime).expect("create model context");

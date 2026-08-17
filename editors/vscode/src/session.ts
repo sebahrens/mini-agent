@@ -79,6 +79,12 @@ class AcpProtocolSession implements ConversationSession {
   }
 }
 
+function extensionVersion(context: vscode.ExtensionContext): string {
+  const manifest = context.extension.packageJSON as Record<string, unknown>;
+  const version = manifest['version'];
+  return typeof version === 'string' ? version : '0.0.0';
+}
+
 /** Supervises one mini-agent ACP process and one reusable workspace conversation. */
 export class AgentSession {
   private proc: cp.ChildProcessWithoutNullStreams | undefined;
@@ -121,6 +127,11 @@ export class AgentSession {
 
   async stop(): Promise<void> {
     return this.transitions.run(() => this.doStop());
+  }
+
+  /** Release UI resources. Call after stop() when discarding the session. */
+  dispose(): void {
+    this.statusBar.dispose();
   }
 
   private async doStop(): Promise<void> {
@@ -181,7 +192,7 @@ export class AgentSession {
       const initialized = await connection.agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
         clientCapabilities: {},
-        clientInfo: { name: 'mini-agent-vscode', version: '1.8.0' },
+        clientInfo: { name: 'mini-agent-vscode', version: extensionVersion(this.context) },
       }, { cancellationSignal: AbortSignal.timeout(10_000) });
       log.info(`ACP initialized at protocol ${initialized.protocolVersion}`);
       this.setState('running');
