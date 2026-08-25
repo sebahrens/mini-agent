@@ -1390,13 +1390,14 @@ fn select_interactive_auto_trigger(cli: &Cli, fallback: Option<String>) -> Optio
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "multithread")]
+    use super::ACTIVE_OPENROUTER_PRICING_REAPERS;
     use super::{
-        ACTIVE_OPENROUTER_PRICING_REAPERS, OpenRouterPricingRefresh, ResumeProviderDecision,
-        apply_openrouter_pricing_refresh_result, apply_resume_provider_decision,
-        interactive_initial_message, needs_openrouter_context_refresh,
-        resolve_resume_provider_decision, run_startup_probes_concurrently,
-        select_interactive_auto_trigger, unavailable_sandbox_must_fail,
-        validate_startup_permission_policy,
+        OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
+        apply_resume_provider_decision, interactive_initial_message,
+        needs_openrouter_context_refresh, resolve_resume_provider_decision,
+        run_startup_probes_concurrently, select_interactive_auto_trigger,
+        unavailable_sandbox_must_fail, validate_startup_permission_policy,
     };
     use crate::cli::Cli;
     use crate::config::Config;
@@ -1627,20 +1628,22 @@ mod tests {
 
     #[test]
     fn quick_model_context_prevents_live_context_refresh() {
-        let mut cfg = Config::default();
-        cfg.quick_models = Some(std::collections::HashMap::from([(
-            "test".to_string(),
-            crate::config::QuickModelConfig {
-                provider: "openrouter".into(),
-                model: "uncatalogued/model".into(),
-                input_token_cost: 0.0,
-                output_token_cost: 0.0,
-                reserve_tokens: None,
-                temperature: None,
-                extra_body: None,
-                context_window: Some(64_000),
-            },
-        )]));
+        let cfg = Config {
+            quick_models: Some(std::collections::HashMap::from([(
+                "test".to_string(),
+                crate::config::QuickModelConfig {
+                    provider: "openrouter".into(),
+                    model: "uncatalogued/model".into(),
+                    input_token_cost: 0.0,
+                    output_token_cost: 0.0,
+                    reserve_tokens: None,
+                    temperature: None,
+                    extra_body: None,
+                    context_window: Some(64_000),
+                },
+            )])),
+            ..Config::default()
+        };
 
         assert!(!needs_openrouter_context_refresh(
             &cfg,

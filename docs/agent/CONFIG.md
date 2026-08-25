@@ -923,7 +923,8 @@ Example:
 Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping patterns to actions. Supported
 permission tool keys are `bash`, `js/fetch`, `read`, `write`, `edit`, `grep`,
-`find_files`, `list_dir`, and `todo_write`. MCP-backed tools are checked under
+`find_files`, `list_dir`, `todo_write`, `git/status`, `git/diff`, `git/log`,
+`git/show`, `git/stage`, `git/unstage`, and `git/commit`. MCP-backed tools are checked under
 `mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the default action,
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
@@ -932,6 +933,12 @@ omitted, zerostack installs built-in exact-script allows (for commands such as
 An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
 inherited `read` access used by `lsp_diagnostics`.
+
+The structured Git tool accepts only those seven fixed local operations. Read operations use a
+canonical structured revision, path, and count identity for permission matching. `stage` and
+`unstage` authorize each literal repository-relative path with their exact verb, while `commit`
+uses the bounded commit message as its permission identity. The tool exposes no raw arguments,
+shell commands, remotes, or network operations.
 
 Bash uses a fail-closed, opaque full-script permission model. The exact string
 passed to `bash -c` is also the permission key. An `allow` entry authorizes Bash

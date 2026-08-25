@@ -157,11 +157,12 @@ fn skill_lifecycle_transitions_are_atomic_optimistic_and_idempotent() {
         )
         .unwrap();
 
-    let mut service = LifecycleService::new(&mut store);
-    service
-        .register_policy("phase5-test-v1", r#"{"min":25,"rate":0.05}"#, 1)
-        .unwrap();
-    drop(service);
+    {
+        let mut service = LifecycleService::new(&mut store);
+        service
+            .register_policy("phase5-test-v1", r#"{"min":25,"rate":0.05}"#, 1)
+            .unwrap();
+    }
     for evidence_id in ["evidence-a", "evidence-b"] {
         store
             .conn_mut()

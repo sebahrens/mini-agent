@@ -58,6 +58,7 @@ mod skill_targeted_feedback;
 mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
+mod vendor_integrity;
 mod worker_broker;
 mod worker_containment;
 mod worker_effect_cancellation;

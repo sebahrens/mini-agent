@@ -165,7 +165,7 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
         for (offset, ((artifact, values), query_text)) in artifacts
             .into_iter()
             .zip(vectors)
-            .zip(documents.into_iter())
+            .zip(documents)
             .enumerate()
         {
             let id = artifact.id.clone();

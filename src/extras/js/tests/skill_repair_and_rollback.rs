@@ -94,9 +94,10 @@ fn request(predecessor: &SkillArtifact, candidate: &SkillArtifact) -> Replacemen
 #[test]
 fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
     let (paths, mut store, predecessor, candidate) = fixture();
-    let mut service = LifecycleService::new(&mut store);
-    service.register_policy("v1", r#"{"min":25}"#, 0).unwrap();
-    drop(service);
+    {
+        let mut service = LifecycleService::new(&mut store);
+        service.register_policy("v1", r#"{"min":25}"#, 0).unwrap();
+    }
     for evidence_id in ["promotion-evidence", "rollback-evidence"] {
         store
             .conn_mut()

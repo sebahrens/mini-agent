@@ -457,6 +457,8 @@ fn broker_with_normalized_target(
     )
 }
 
+// Keeping each denial input explicit makes this cross-product test legible at its call sites.
+#[allow(clippy::too_many_arguments)]
 async fn assert_denied_before_execute(
     case: &OperationCase,
     expected: HostEffectError,
@@ -2393,7 +2395,7 @@ fn js_effect_audit_storage_private_path_and_exclusive_writer_fail_closed() {
     let owner = root.owner();
     let audit = EffectAudit::open(owner.clone()).unwrap();
 
-    assert!(owner.directory().starts_with(&owner.state_root()));
+    assert!(owner.directory().starts_with(owner.state_root()));
     assert!(owner.directory().is_dir());
     assert!(owner.lock_file().is_file());
     assert!(matches!(
@@ -2707,7 +2709,7 @@ fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fa
         "hash fixture did not create linked segments"
     );
     let last = hash_segments.last().unwrap();
-    let mut bytes = std::fs::read(&last).unwrap();
+    let mut bytes = std::fs::read(last).unwrap();
     let marker = b"record_hash";
     let offset = bytes
         .windows(marker.len())
@@ -2724,7 +2726,7 @@ fn js_effect_audit_storage_rotation_missing_segments_replay_and_hash_mismatch_fa
     } else {
         b'a'
     };
-    std::fs::write(&last, bytes).unwrap();
+    std::fs::write(last, bytes).unwrap();
     assert!(matches!(
         EffectAudit::open_with_options(hash_owner, options.clone()),
         Err(AuditError::HashMismatch)

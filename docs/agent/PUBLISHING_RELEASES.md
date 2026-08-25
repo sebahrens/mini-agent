@@ -107,6 +107,11 @@ binaries and Corresponding Source, run `just post-release` to update packaging c
 
 ## What `just release` does
 
+Before running the release command, update the matching version section in `CHANGELOG.md`. Confirm
+that it calls out breaking changes, security exceptions, manual follow-up, and any benchmark state
+that still lacks evidence. The release workflow extracts that section and uses it as the GitHub
+release body, so the heading must match the Cargo version.
+
 1. Verifies the working tree is clean
 2. Bumps the version in `Cargo.toml`
 3. Syncs the new version to `Cargo.lock` and all packaging files (AUR, conda, Homebrew)

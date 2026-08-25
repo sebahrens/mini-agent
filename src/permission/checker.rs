@@ -559,13 +559,13 @@ impl PermissionChecker {
             tool,
             policy_input.len()
         );
-        if tool == "todo_write" {
-            return CheckResult::Allowed;
-        }
         // Deny rules are the security baseline — evaluate before the session
         // allowlist and allow_all_mcp_calls so neither can bypass a deny.
         if self.matches_deny_rule(tool, &[policy_input, identity]) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
+        }
+        if tool == "todo_write" {
+            return CheckResult::Allowed;
         }
         #[cfg(feature = "hooks")]
         if let Some(result) = self.take_pending_one_shot(tool) {
@@ -610,10 +610,6 @@ impl PermissionChecker {
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {
         let tool = canonical_permission_tool(tool);
         tracing::debug!("perm check path: tool={}, path={}", tool, path);
-        if tool == "todo_write" {
-            return CheckResult::Allowed;
-        }
-
         let expanded = crate::fs::expand_tilde(path);
         let abs_path = resolve_absolute(&expanded, &self.working_dir);
 
@@ -657,6 +653,9 @@ impl PermissionChecker {
         // Deny rules first — security baseline, cannot be bypassed.
         if self.matches_deny_rule(tool, &[abs_path, expanded]) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
+        }
+        if tool == "todo_write" {
+            return CheckResult::Allowed;
         }
         // External-directory denies are the same kind of security baseline as
         // tool-specific denies. Evaluate them before hook one-shots and the
@@ -1749,7 +1748,7 @@ mod tests {
         )
         .expect("valid permission fixture");
 
-        let test_paths = vec![
+        let test_paths = [
             workspace.join("inside.txt").to_string_lossy().to_string(),
             external.join("outside.txt").to_string_lossy().to_string(),
             workspace
@@ -1828,7 +1827,7 @@ mod tests {
             .collect();
 
         assert!(
-            write_entries.len() >= 1,
+            !write_entries.is_empty(),
             "should have write entry for docs/**"
         );
     }

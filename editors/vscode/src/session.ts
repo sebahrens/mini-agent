@@ -103,7 +103,6 @@ export class AgentSession {
   ) {
     this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     this.statusBar.command = 'mini-agent.stop';
-    this.context.subscriptions.push(this.statusBar);
     this.conversation = new Conversation(() => this.createProtocolSession());
   }
 

@@ -5,17 +5,23 @@ import { ChatUpdateRenderer, stopResult } from './chat';
 import { ensureConfigFile, resolveConfigDirectory } from './config';
 import { AgentSession } from './session';
 import { log, setLogLevel, showOutput } from './log';
-import { assertExecutableScope, gatedFolderPick, onTrustRevoked } from './trust';
+import { assertExecutableScope, gatedFolderPick } from './trust';
 
 let session: AgentSession | undefined;
 let sessionCreation: Promise<AgentSession | undefined> | undefined;
+let sessionGeneration = 0;
 
-async function discardSession(): Promise<void> {
+export async function discardSession(): Promise<void> {
+  sessionGeneration += 1;
+  sessionCreation = undefined;
   const current = session;
   session = undefined;
   if (!current) { return; }
-  await current.stop();
-  current.dispose();
+  try {
+    await current.stop();
+  } finally {
+    current.dispose();
+  }
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -42,9 +48,10 @@ export function activate(context: vscode.ExtensionContext): void {
         assertExecutableScope();
       }
     }),
-    onTrustRevoked(() => discardSession()),
     vscode.workspace.onDidChangeWorkspaceFolders(async event => {
       if (session && event.removed.some(folder => folder.uri.toString() === session?.workspaceFolder.uri.toString())) {
+        await discardSession();
+      } else if (sessionCreation && event.removed.length > 0) {
         await discardSession();
       }
     }),
@@ -56,10 +63,7 @@ export async function deactivate(): Promise<void> {
   await discardSession();
 }
 
-async function cmdStart(context: vscode.ExtensionContext): Promise<void> {
-  const folder = await gatedFolderPick();
-  if (!folder) { return; }
-
+export async function cmdStart(context: vscode.ExtensionContext): Promise<void> {
   if (session) {
     const confirm = await vscode.window.showWarningMessage(
       'A Mini Agent session is already running. Replace it?',
@@ -70,15 +74,12 @@ async function cmdStart(context: vscode.ExtensionContext): Promise<void> {
     await discardSession();
   }
 
-  const executablePath = resolveExecutable(context);
-  if (!executablePath) { return; }
-
-  session = new AgentSession(executablePath, folder, context, requestPermission);
-  await session.start();
+  const active = await ensureSession(context);
+  await active?.start();
 }
 
 async function cmdStop(): Promise<void> {
-  if (!session) {
+  if (!session && !sessionCreation) {
     void vscode.window.showInformationMessage('No Mini Agent session is running.');
     return;
   }
@@ -169,25 +170,35 @@ function registerChatParticipant(context: vscode.ExtensionContext): vscode.ChatP
   return participant;
 }
 
-async function ensureSession(context: vscode.ExtensionContext): Promise<AgentSession | undefined> {
+export async function ensureSession(context: vscode.ExtensionContext): Promise<AgentSession | undefined> {
   if (!vscode.workspace.isTrusted) {
     await discardSession();
     return undefined;
   }
   if (session) { return session; }
-  // Latch concurrent callers onto one creation attempt so rapid chat requests
-  // cannot each spawn a session for the same workspace.
-  sessionCreation ??= createSession(context).finally(() => { sessionCreation = undefined; });
+  if (sessionCreation) { return sessionCreation; }
+  // Latch chat and command callers onto one creation attempt. The generation
+  // invalidates a folder picker that resolves after stop, restart, trust loss,
+  // or workspace-folder removal.
+  const generation = sessionGeneration;
+  const tracked = createSession(context, generation).finally(() => {
+    if (sessionCreation === tracked) { sessionCreation = undefined; }
+  });
+  sessionCreation = tracked;
   return sessionCreation;
 }
 
-async function createSession(context: vscode.ExtensionContext): Promise<AgentSession | undefined> {
+async function createSession(
+  context: vscode.ExtensionContext,
+  generation: number,
+): Promise<AgentSession | undefined> {
   const folder = await gatedFolderPick();
-  if (!folder) { return undefined; }
+  if (!folder || generation !== sessionGeneration) { return undefined; }
   const executablePath = resolveExecutable(context);
-  if (!executablePath) { return undefined; }
-  session = new AgentSession(executablePath, folder, context, requestPermission);
-  return session;
+  if (!executablePath || generation !== sessionGeneration) { return undefined; }
+  const created = new AgentSession(executablePath, folder, context, requestPermission);
+  session = created;
+  return created;
 }
 
 async function requestPermission(

@@ -5,7 +5,9 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{ToolError, check_perm, check_perm_bound_path};
-use crate::git::runner::{GitRunner, QUERY_LIMITS};
+use crate::git::runner::{
+    GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS, acquire_process_git_mutation,
+};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::sandbox::{CommandOutput, CommandStatus, Sandbox};
@@ -24,6 +26,9 @@ pub(crate) enum GitOperation {
     Diff,
     Log,
     Show,
+    Stage,
+    Unstage,
+    Commit,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +47,8 @@ pub(crate) struct GitTool {
     sandbox: Sandbox,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    #[cfg(test)]
+    test_uncontained: bool,
 }
 
 impl GitTool {
@@ -59,6 +66,8 @@ impl GitTool {
             sandbox,
             permission,
             ask_tx,
+            #[cfg(test)]
+            test_uncontained: false,
         })
     }
 
@@ -69,6 +78,29 @@ impl GitTool {
         limits: crate::sandbox::CommandLimits,
         allow_nonzero_or_truncated: bool,
     ) -> Result<CommandOutput, ToolError> {
+        #[cfg(test)]
+        if self.test_uncontained {
+            let result = if allow_nonzero_or_truncated {
+                self.runner
+                    .run_allow_exit(
+                        self.workspace.root(),
+                        operation,
+                        hardened_args(args),
+                        limits,
+                    )
+                    .await
+            } else {
+                self.runner
+                    .run(
+                        self.workspace.root(),
+                        operation,
+                        hardened_args(args),
+                        limits,
+                    )
+                    .await
+            };
+            return result.map_err(ToolError::Msg);
+        }
         self.runner
             .run_contained(
                 &self.workspace,
@@ -88,6 +120,70 @@ impl GitTool {
         identity: &str,
     ) -> Result<Option<String>, ToolError> {
         check_perm(&self.permission, &self.ask_tx, verb, identity).await
+    }
+
+    async fn run_mutation(
+        &self,
+        operation: &'static str,
+        args: Vec<String>,
+    ) -> Result<CommandOutput, ToolError> {
+        #[cfg(test)]
+        if self.test_uncontained {
+            return self
+                .runner
+                .run_observed(
+                    self.workspace.root(),
+                    operation,
+                    hardened_args(args),
+                    LOCAL_MUTATION_LIMITS,
+                )
+                .await
+                .map_err(ToolError::Msg);
+        }
+        self.runner
+            .run_contained_observed(
+                &self.workspace,
+                &self.sandbox,
+                operation,
+                hardened_args(args),
+                LOCAL_MUTATION_LIMITS,
+            )
+            .await
+            .map_err(ToolError::Msg)
+    }
+
+    async fn run_with_input(
+        &self,
+        operation: &'static str,
+        args: Vec<String>,
+        input: Vec<u8>,
+        limits: crate::sandbox::CommandLimits,
+    ) -> Result<CommandOutput, ToolError> {
+        #[cfg(test)]
+        if self.test_uncontained {
+            return self
+                .runner
+                .run_with_input_observed(
+                    self.workspace.root(),
+                    operation,
+                    hardened_args(args),
+                    input,
+                    limits,
+                )
+                .await
+                .map_err(ToolError::Msg);
+        }
+        self.runner
+            .run_contained_with_input_observed(
+                &self.workspace,
+                &self.sandbox,
+                operation,
+                hardened_args(args),
+                input,
+                limits,
+            )
+            .await
+            .map_err(ToolError::Msg)
     }
 
     async fn validate_revision(&self, revision: &str) -> Result<(), ToolError> {
@@ -219,6 +315,98 @@ impl GitTool {
         Ok(())
     }
 
+    async fn stage(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, false, false)?;
+        require_paths(&args.paths, "stage")?;
+        let paths = self.validate_paths(&args.paths, Some("git/stage")).await?;
+        let _mutation = acquire_process_git_mutation().await;
+        let before = self.status_snapshot().await?;
+        self.ensure_no_external_filters(&paths).await?;
+        let mut command = vec!["add".into(), "--".into()];
+        command.extend(paths);
+        let output = self.run_mutation("stage", command).await?;
+        let after = self.status_snapshot().await?;
+        Ok(render_mutation_result("stage", None, before, after, output))
+    }
+
+    async fn unstage(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, false, false, false)?;
+        require_paths(&args.paths, "unstage")?;
+        let paths = self
+            .validate_paths(&args.paths, Some("git/unstage"))
+            .await?;
+        let _mutation = acquire_process_git_mutation().await;
+        let before = self.status_snapshot().await?;
+        let head = self
+            .run(
+                "resolve-head",
+                vec![
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "--quiet".into(),
+                    "HEAD".into(),
+                ],
+                QUERY_LIMITS,
+                true,
+            )
+            .await?;
+        let mut command = if head.exit_status.is_some_and(|status| status.success()) {
+            vec!["restore".into(), "--staged".into(), "--".into()]
+        } else {
+            vec![
+                "rm".into(),
+                "--cached".into(),
+                "-r".into(),
+                "--ignore-unmatch".into(),
+                "--".into(),
+            ]
+        };
+        command.extend(paths);
+        let output = self.run_mutation("unstage", command).await?;
+        let after = self.status_snapshot().await?;
+        Ok(render_mutation_result(
+            "unstage", None, before, after, output,
+        ))
+    }
+
+    async fn commit(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
+        reject_irrelevant_fields(&args, true, false, false)?;
+        if !args.paths.is_empty() {
+            return Err(ToolError::Msg(
+                "commit operates on the existing index and does not accept paths".to_string(),
+            ));
+        }
+        let message = args
+            .message
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| ToolError::Msg("commit requires a non-empty message".to_string()))?;
+        if message.len() > 16 * 1024 || message.contains('\0') {
+            return Err(ToolError::Msg(
+                "commit message exceeds 16 KiB or contains NUL".to_string(),
+            ));
+        }
+        let coaching = self.permission("git/commit", message).await?;
+        let _mutation = acquire_process_git_mutation().await;
+        let before = self.status_snapshot().await?;
+        let output = self
+            .run_with_input(
+                "commit",
+                vec![
+                    "commit".into(),
+                    "--file=-".into(),
+                    "--cleanup=verbatim".into(),
+                ],
+                message.as_bytes().to_vec(),
+                LOCAL_MUTATION_LIMITS,
+            )
+            .await?;
+        let after = self.status_snapshot().await?;
+        Ok(render_mutation_result(
+            "commit", coaching, before, after, output,
+        ))
+    }
+
     async fn read_operation(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
         match args.operation {
             GitOperation::Status => {
@@ -333,6 +521,9 @@ impl GitTool {
                     self.run("show", command, TEXT_LIMITS, true).await?,
                 )
             }
+            GitOperation::Stage => self.stage(args).await,
+            GitOperation::Unstage => self.unstage(args).await,
+            GitOperation::Commit => self.commit(args).await,
         }
     }
 }
@@ -353,7 +544,7 @@ impl Tool for GitTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "show"]
+                    "enum": ["status", "diff", "log", "show", "stage", "unstage", "commit"]
                 },
                 "paths": {
                     "type": "array",
@@ -362,7 +553,7 @@ impl Tool for GitTool {
                     "description": "Literal repository-relative paths; never options or globs"
                 },
                 "revision": { "type": "string", "description": "Revision for diff, log, or show" },
-                "message": { "type": "string", "description": "Commit message for commit only" },
+                "message": { "type": "string", "maxLength": 16384, "description": "Required commit message for commit only" },
                 "max_count": { "type": "integer", "minimum": 1, "maximum": 100 }
             },
             "required": ["operation"],
@@ -424,16 +615,360 @@ fn render_text_result(
     }))
 }
 
-trait Pipe: Sized {
-    fn pipe<T>(self, apply: impl FnOnce(Self) -> T) -> T {
-        apply(self)
+fn require_paths(paths: &[String], operation: &str) -> Result<(), ToolError> {
+    if paths.is_empty() {
+        Err(ToolError::Msg(format!(
+            "{operation} requires at least one repository-relative path"
+        )))
+    } else {
+        Ok(())
     }
 }
-impl<T> Pipe for T {}
+
+fn reject_irrelevant_fields(
+    args: &GitArgs,
+    allow_message: bool,
+    allow_revision: bool,
+    allow_max_count: bool,
+) -> Result<(), ToolError> {
+    if !allow_message && args.message.is_some() {
+        return Err(ToolError::Msg(
+            "message is supported only by commit".to_string(),
+        ));
+    }
+    if !allow_revision && args.revision.is_some() {
+        return Err(ToolError::Msg(
+            "revision is not supported by this Git operation".to_string(),
+        ));
+    }
+    if !allow_max_count && args.max_count.is_some() {
+        return Err(ToolError::Msg(
+            "max_count is supported only by log".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn render_mutation_result(
+    operation: &str,
+    coaching: Option<String>,
+    before: serde_json::Value,
+    after: serde_json::Value,
+    output: CommandOutput,
+) -> serde_json::Value {
+    let CommandOutput {
+        exit_status,
+        stdout,
+        stderr,
+        status: command_status,
+    } = output;
+    serde_json::json!({
+        "operation": operation,
+        "before": before,
+        "after": after,
+        "stdout": String::from_utf8_lossy(&stdout),
+        "stderr": String::from_utf8_lossy(&stderr),
+        "status": mutation_status(command_status, exit_status),
+        "truncated": matches!(command_status, CommandStatus::OutputLimitExceeded(_)),
+        "exit_code": exit_status.and_then(|exit| exit.code()),
+        "coaching": coaching,
+    })
+}
+
+fn mutation_status(
+    status: CommandStatus,
+    exit_status: Option<std::process::ExitStatus>,
+) -> &'static str {
+    match status {
+        CommandStatus::Completed if exit_status.is_some_and(|value| value.success()) => "success",
+        CommandStatus::Completed => "nonzero",
+        CommandStatus::TimedOut => "timed_out",
+        CommandStatus::Cancelled => "cancelled",
+        CommandStatus::OutputLimitExceeded(_) => "output_limit_exceeded",
+        CommandStatus::Failed => "failed",
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::hardened_args;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    use rig::tool::Tool;
+
+    use super::{
+        GitArgs, GitOperation, GitTool, hardened_args, mutation_status, render_mutation_result,
+    };
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+
+    struct TestRepo {
+        root: std::path::PathBuf,
+    }
+
+    impl TestRepo {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("mini-agent-git-tool-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).expect("create test repository");
+            let repo = Self { root };
+            repo.git(["init", "--quiet"]);
+            repo.git(["config", "user.name", "Mini Agent Test"]);
+            repo.git(["config", "user.email", "mini-agent@example.invalid"]);
+            repo
+        }
+
+        fn path(&self) -> &Path {
+            &self.root
+        }
+
+        fn git<const N: usize>(&self, args: [&str; N]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(args)
+                .output()
+                .expect("run git fixture command");
+            let std::process::Output {
+                status: exit,
+                stdout,
+                stderr,
+            } = output;
+            assert!(
+                exit.success(),
+                "git fixture command failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            String::from_utf8(stdout).expect("git fixture output is UTF-8")
+        }
+
+        fn write(&self, path: &str, contents: &str) {
+            std::fs::write(self.root.join(path), contents).expect("write test repository file");
+        }
+
+        fn tool(&self) -> GitTool {
+            let workspace = Arc::new(
+                crate::paths::WorkspaceBinding::capture(&self.root)
+                    .expect("capture test repository"),
+            );
+            GitTool {
+                runner: crate::git::runner::GitRunner::discover().expect("discover Git"),
+                workspace: workspace.clone(),
+                sandbox: crate::sandbox::Sandbox::new(false, "bwrap")
+                    .with_workspace_binding(workspace),
+                permission: None,
+                ask_tx: None,
+                test_uncontained: true,
+            }
+        }
+
+        fn tool_with_permission(&self, config: PermissionConfig) -> GitTool {
+            let mut tool = self.tool();
+            let checker = PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(self.root.clone()),
+                Some(vec!["standard".to_string()]),
+            )
+            .expect("create permission checker");
+            tool.permission = Some(Arc::new(Mutex::new(checker)));
+            tool
+        }
+    }
+
+    impl Drop for TestRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn args(operation: GitOperation, paths: &[&str], message: Option<&str>) -> GitArgs {
+        GitArgs {
+            operation,
+            paths: paths.iter().map(|path| (*path).to_string()).collect(),
+            revision: None,
+            message: message.map(str::to_string),
+            max_count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_and_unstage_mutate_only_the_index() {
+        let repo = TestRepo::new();
+        repo.write("tracked.txt", "first\n");
+        let tool = repo.tool();
+
+        let staged = tool
+            .call(args(GitOperation::Stage, &["tracked.txt"], None))
+            .await
+            .expect("stage path");
+        assert_eq!(staged["operation"], "stage");
+        assert_eq!(staged["exit_code"], 0);
+        assert_eq!(
+            repo.git(["diff", "--cached", "--name-only"]),
+            "tracked.txt\n"
+        );
+
+        let unstaged = tool
+            .call(args(GitOperation::Unstage, &["tracked.txt"], None))
+            .await
+            .expect("unstage path");
+        assert_eq!(unstaged["operation"], "unstage");
+        assert_eq!(unstaged["exit_code"], 0);
+        assert!(repo.git(["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+            "first\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_reads_a_bounded_message_from_stdin() {
+        let repo = TestRepo::new();
+        repo.write("committed.txt", "content\n");
+        let tool = repo.tool();
+        tool.call(args(GitOperation::Stage, &["committed.txt"], None))
+            .await
+            .expect("stage path");
+
+        let committed = tool
+            .call(args(
+                GitOperation::Commit,
+                &[],
+                Some("subject from stdin\n\nbody remains intact"),
+            ))
+            .await
+            .expect("commit index");
+        assert_eq!(committed["operation"], "commit");
+        assert_eq!(committed["status"], "success");
+        assert_eq!(committed["exit_code"], 0);
+        assert_eq!(
+            repo.git(["log", "-1", "--format=%B"]),
+            "subject from stdin\n\nbody remains intact\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_commit_still_reports_the_post_operation_snapshot() {
+        let repo = TestRepo::new();
+        let committed = repo
+            .tool()
+            .call(args(GitOperation::Commit, &[], Some("empty index")))
+            .await
+            .expect("a completed non-zero mutation remains an observed result");
+
+        assert_eq!(committed["status"], "nonzero");
+        assert!(
+            committed["exit_code"]
+                .as_i64()
+                .is_some_and(|code| code != 0)
+        );
+        assert!(committed["before"]["records"].is_array());
+        assert!(committed["after"]["records"].is_array());
+    }
+
+    #[test]
+    fn interrupted_mutation_result_preserves_the_post_operation_snapshot() {
+        let after = serde_json::json!({"records": ["? changed.txt"]});
+        let rendered = render_mutation_result(
+            "stage",
+            None,
+            serde_json::json!({"records": []}),
+            after.clone(),
+            crate::sandbox::CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: crate::sandbox::CommandStatus::TimedOut,
+            },
+        );
+
+        assert_eq!(rendered["status"], "timed_out");
+        assert_eq!(rendered["after"], after);
+        assert_eq!(
+            mutation_status(crate::sandbox::CommandStatus::Cancelled, None),
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutations_reject_missing_operands() {
+        let repo = TestRepo::new();
+        let tool = repo.tool();
+        let stage_error = tool
+            .call(args(GitOperation::Stage, &[], None))
+            .await
+            .expect_err("stage must require paths");
+        assert!(stage_error.to_string().contains("requires at least one"));
+
+        let commit_error = tool
+            .call(args(GitOperation::Commit, &[], Some("   ")))
+            .await
+            .expect_err("commit must require a non-empty message");
+        assert!(commit_error.to_string().contains("non-empty message"));
+
+        let option_error = tool
+            .call(args(GitOperation::Stage, &["-option"], None))
+            .await
+            .expect_err("stage must reject option-like paths");
+        assert!(
+            option_error
+                .to_string()
+                .contains("invalid repository-relative")
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_denial_has_no_index_effect() {
+        let repo = TestRepo::new();
+        repo.write("denied.txt", "content\n");
+        let tool = repo.tool_with_permission(PermissionConfig {
+            git_stage: Some(ToolPerm::Simple(Action::Deny)),
+            ..PermissionConfig::default()
+        });
+
+        let error = tool
+            .call(args(GitOperation::Stage, &["denied.txt"], None))
+            .await
+            .expect_err("stage permission must deny the mutation");
+
+        assert!(error.to_string().contains("Permission denied"));
+        assert!(repo.git(["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn stage_rejects_paths_with_external_filters() {
+        let repo = TestRepo::new();
+        repo.write(".gitattributes", "filtered.txt filter=external\n");
+        repo.write("filtered.txt", "content\n");
+
+        let error = repo
+            .tool()
+            .call(args(GitOperation::Stage, &["filtered.txt"], None))
+            .await
+            .expect_err("stage must reject external transforms");
+
+        assert!(error.to_string().contains("external transform"));
+        assert!(repo.git(["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stage_rejects_symbolic_link_operands() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TestRepo::new();
+        repo.write("target.txt", "target\n");
+        symlink("target.txt", repo.path().join("link.txt")).expect("create symlink fixture");
+        let error = repo
+            .tool()
+            .call(args(GitOperation::Stage, &["link.txt"], None))
+            .await
+            .expect_err("stage must reject symlink operands");
+        assert!(error.to_string().contains("symbolic-link"));
+        assert!(repo.git(["diff", "--cached", "--name-only"]).is_empty());
+    }
 
     #[test]
     fn hardened_args_starts_with_no_optional_locks() {

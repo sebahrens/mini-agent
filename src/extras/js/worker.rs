@@ -964,10 +964,10 @@ impl ExecutionLimits {
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|value| *value > 0)
                 .unwrap_or(MAX_PENDING_JOBS);
-            return Self {
+            Self {
                 timeout,
                 max_pending_jobs,
-            };
+            }
         }
         #[cfg(not(test))]
         Self {

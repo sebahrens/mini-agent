@@ -1169,7 +1169,7 @@ mod tests {
     fn test_deterministic_backend_consistent() {
         let backend = DeterministicBackend::new();
         let doc = "same text".to_string();
-        let emb1 = backend.embed_documents(&[doc.clone()]).unwrap()[0].clone();
+        let emb1 = backend.embed_documents(std::slice::from_ref(&doc)).unwrap()[0].clone();
         let emb2 = backend.embed_documents(&[doc]).unwrap()[0].clone();
         assert_eq!(
             emb1, emb2,

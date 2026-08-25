@@ -766,8 +766,7 @@ mod import_tests {
             &Config::default(),
             Path::new("active-workspace"),
         )
-        .err()
-        .expect("malformed input must fail");
+        .expect_err("malformed input must fail");
         assert!(error.to_string().contains("not valid JSON"));
         assert_eq!(current.id, original_id);
         assert_eq!(current.messages.len(), original_messages);

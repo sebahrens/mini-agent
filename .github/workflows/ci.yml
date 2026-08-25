@@ -56,8 +56,14 @@ jobs:
       - name: Test Phase 6 cross-platform CI gate
         run: python3 -m unittest scripts.tests.test_phase6_ci_workflow
 
+      - name: Test VS Code CI policy
+        run: python3 -m unittest scripts.tests.test_vscode_ci_workflow
+
       - name: Test release workflow policy
-        run: python3 -m unittest scripts.tests.test_check_package_metadata
+        run: |
+          python3 -m unittest \
+            scripts.tests.test_check_package_metadata \
+            scripts.tests.test_extract_changelog
 
       - name: Test Windows MSI policy
         run: |
@@ -108,6 +114,32 @@ jobs:
       - name: Stage package recipes and verify GPL payloads
         run: python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}
 
+  vscode:
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: editors/vscode/.nvmrc
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install locked extension dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Check extension and dependency policy
+        run: |
+          npm run typecheck
+          npm run lint
+          npm test
+          npm audit --audit-level=high
+
   clippy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
@@ -139,7 +171,7 @@ jobs:
         # are consumed only by another supported row. Keep Clippy strict for
         # real diagnostics without treating that cross-row dead code as an
         # error in every individual configuration.
-        run: cargo clippy --locked ${{ matrix.features }} -- -D warnings -A dead-code
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings -A dead-code
 
   test:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')

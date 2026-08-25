@@ -104,6 +104,8 @@ impl SkillServiceOwner {
     }
 }
 
+// These cache tests sit next to the private cache they exercise; production services follow below.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::WorkspaceServiceCache;

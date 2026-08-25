@@ -272,6 +272,49 @@ impl GitRunner {
         }
     }
 
+    /// Runs a local mutation and returns every observed terminal outcome.
+    ///
+    /// Callers use this only when they must take a post-operation snapshot
+    /// after a timeout, cancellation, output limit, or non-zero exit.
+    #[cfg(test)]
+    pub(crate) async fn run_observed<I, S>(
+        &self,
+        repo_path: &Path,
+        operation: &'static str,
+        args: I,
+        limits: CommandLimits,
+    ) -> Result<CommandOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let command = self.internal_command(repo_path, args)?;
+        Sandbox::new(false, "git")
+            .output_built_command_with_limits(command, limits)
+            .await
+            .map_err(|_| format!("git {operation} runner failed"))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_with_input_observed<I, S>(
+        &self,
+        repo_path: &Path,
+        operation: &'static str,
+        args: I,
+        input: Vec<u8>,
+        limits: CommandLimits,
+    ) -> Result<CommandOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let command = self.internal_command(repo_path, args)?;
+        Sandbox::new(false, "git")
+            .output_built_command_with_input_and_limits(command, input, limits)
+            .await
+            .map_err(|_| format!("git {operation} runner failed"))
+    }
+
     pub(crate) async fn run_contained<I, S>(
         &self,
         workspace: &crate::paths::WorkspaceBinding,
@@ -297,6 +340,47 @@ impl GitRunner {
             return Ok(output);
         }
         command_result(operation, limits, output)
+    }
+
+    /// Runs a contained mutation and returns every observed terminal outcome
+    /// so the caller can capture the truthful post-operation repository state.
+    pub(crate) async fn run_contained_observed<I, S>(
+        &self,
+        workspace: &crate::paths::WorkspaceBinding,
+        sandbox: &Sandbox,
+        operation: &'static str,
+        args: I,
+        limits: CommandLimits,
+    ) -> Result<CommandOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let command = self.contained_command(workspace, sandbox, args)?;
+        sandbox
+            .output_built_command_with_limits(command, limits)
+            .await
+            .map_err(|_| format!("git {operation} runner failed"))
+    }
+
+    pub(crate) async fn run_contained_with_input_observed<I, S>(
+        &self,
+        workspace: &crate::paths::WorkspaceBinding,
+        sandbox: &Sandbox,
+        operation: &'static str,
+        args: I,
+        input: Vec<u8>,
+        limits: CommandLimits,
+    ) -> Result<CommandOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let command = self.contained_command(workspace, sandbox, args)?;
+        sandbox
+            .output_built_command_with_input_and_limits(command, input, limits)
+            .await
+            .map_err(|_| format!("git {operation} runner failed"))
     }
 }
 

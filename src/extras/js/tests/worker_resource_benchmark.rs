@@ -64,11 +64,11 @@ struct BenchmarkReport {
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum PlatformEvidence {
     Measured {
-        run: BenchmarkRun,
+        run: Box<BenchmarkRun>,
     },
     ContainmentUnavailable {
-        machine: Machine,
-        containment: Containment,
+        machine: Box<Machine>,
+        containment: Box<Containment>,
         reason_code: String,
     },
 }
@@ -466,7 +466,7 @@ fn validate_report(value: &Value) -> Result<(), String> {
     for evidence in &report.platform_evidence {
         let machine = match evidence {
             PlatformEvidence::Measured { run } => &run.machine,
-            PlatformEvidence::ContainmentUnavailable { machine, .. } => machine,
+            PlatformEvidence::ContainmentUnavailable { machine, .. } => machine.as_ref(),
         };
         if machine.binary_profile != "debug"
             || machine.package_version != env!("CARGO_PKG_VERSION")
@@ -478,7 +478,7 @@ fn validate_report(value: &Value) -> Result<(), String> {
         }
         let containment = match evidence {
             PlatformEvidence::Measured { run } => &run.containment,
-            PlatformEvidence::ContainmentUnavailable { containment, .. } => containment,
+            PlatformEvidence::ContainmentUnavailable { containment, .. } => containment.as_ref(),
         };
         if !containment_matches_platform(evidence.operating_system(), containment) {
             return Err("platform evidence contains non-canonical containment metadata".into());
@@ -1089,10 +1089,12 @@ async fn run_production_benchmark(
     backend: String,
     assurance: String,
 ) -> Result<BenchmarkRun, Box<dyn std::error::Error>> {
-    assert!(
-        cfg!(debug_assertions),
-        "worker benchmark must use a debug binary"
-    );
+    const {
+        assert!(
+            cfg!(debug_assertions),
+            "worker benchmark must use a debug binary"
+        )
+    };
 
     let mut process_counts = ProcessCountAccumulator::default();
     let mut cold = Vec::with_capacity(SAMPLES);
@@ -1232,7 +1234,7 @@ fn add_comparison(
             PlatformEvidence::Measured { run: candidate }
                 if candidate.machine.os == run.machine.os =>
             {
-                Some(candidate)
+                Some(candidate.as_ref())
             }
             _ => None,
         })
@@ -1465,7 +1467,7 @@ fn parse_scaled_bytes(value: &str) -> Option<u64> {
     let value = value.trim();
     let split = value.find(|character: char| !character.is_ascii_digit() && character != '.')?;
     let amount = value[..split].parse::<f64>().ok()?;
-    let unit = value[split..].trim().split_whitespace().next()?;
+    let unit = value[split..].split_whitespace().next()?;
     let multiplier = match unit {
         "B" => 1.0,
         "K" | "KB" => 1024.0,
@@ -1512,16 +1514,16 @@ async fn js_worker_resource_benchmark() -> Result<(), Box<dyn std::error::Error>
             if let Some(previous) = std::env::var_os("MINI_AGENT_JS_WORKER_BENCH_COMPARE") {
                 add_comparison(&mut run, Path::new(&previous))?;
             }
-            PlatformEvidence::Measured { run }
+            PlatformEvidence::Measured { run: Box::new(run) }
         }
         WorkerContainmentStatus::Unavailable {
             backend, assurance, ..
         } => PlatformEvidence::ContainmentUnavailable {
-            machine: machine(),
-            containment: Containment {
+            machine: Box::new(machine()),
+            containment: Box::new(Containment {
                 backend: backend.to_string(),
                 assurance: assurance_label(assurance),
-            },
+            }),
             reason_code: "containment_unavailable".into(),
         },
     };
@@ -1715,7 +1717,7 @@ fn unavailable_report_for_test(os: &str) -> BenchmarkReport {
     report
         .platform_evidence
         .push(PlatformEvidence::ContainmentUnavailable {
-            machine: Machine {
+            machine: Box::new(Machine {
                 host: "reference".into(),
                 os: os.into(),
                 arch: "x86_64".into(),
@@ -1728,8 +1730,8 @@ fn unavailable_report_for_test(os: &str) -> BenchmarkReport {
                 build_identity: crate::extras::js::protocol::BuildIdentity::current()
                     .as_str()
                     .into(),
-            },
-            containment: Containment {
+            }),
+            containment: Box::new(Containment {
                 backend: match os {
                     "linux" => "bubblewrap",
                     "macos" => "seatbelt",
@@ -1743,7 +1745,7 @@ fn unavailable_report_for_test(os: &str) -> BenchmarkReport {
                     "enforced"
                 }
                 .into(),
-            },
+            }),
             reason_code: "containment_unavailable".into(),
         });
     report

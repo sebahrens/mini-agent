@@ -402,6 +402,27 @@ def validate_workflow(text: str, binary: str) -> list[str]:
             ".github/workflows/release.yml full archives must use the "
             "supported default feature set, not --all-features"
         )
+    publish_release_start = text.find("\n  publish-release:")
+    publish_release_job = (
+        text[publish_release_start:] if publish_release_start >= 0 else ""
+    )
+    release_notes_fragments = (
+        "actions/checkout@",
+        "scripts/extract-changelog.py",
+        '--version "$version"',
+        "--output release-notes.md",
+        "--notes-file release-notes.md",
+    )
+    missing_release_notes = [
+        fragment
+        for fragment in release_notes_fragments
+        if fragment not in publish_release_job
+    ]
+    if missing_release_notes:
+        errors.append(
+            ".github/workflows/release.yml must publish the versioned "
+            f"CHANGELOG section; missing={missing_release_notes}"
+        )
     forbidden = (
         "target/${{ matrix.target }}/release/zerostack",
         "zerostack-${{ matrix.target }}.tar.gz",

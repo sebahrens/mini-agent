@@ -1252,7 +1252,7 @@ fn allow_all_mcp_does_not_affect_non_mcp_tools() {
     );
 }
 
-// --- todo_write always allowed ---
+// --- todo_write convenience allowance ---
 
 #[test]
 fn todo_write_always_allowed_in_restrictive() {
@@ -1296,6 +1296,46 @@ fn todo_write_path_check_always_allowed() {
     assert!(matches!(
         checker.check_path("todo_write", "/any/path"),
         CheckResult::Allowed
+    ));
+}
+
+#[test]
+fn todo_write_explicit_deny_overrides_convenience_allowance() {
+    let configs = configs_from(PermissionConfig {
+        todo_write: Some(ToolPerm::Simple(Action::Deny)),
+        ..PermissionConfig::default()
+    });
+    let mut checker = PermissionChecker::new(
+        &configs,
+        SecurityMode::Standard,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        checker.check("todo_write", "session todos"),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[test]
+fn todo_write_path_explicit_deny_overrides_convenience_allowance() {
+    let configs = configs_from(PermissionConfig {
+        todo_write: Some(ToolPerm::Simple(Action::Deny)),
+        ..PermissionConfig::default()
+    });
+    let mut checker = PermissionChecker::new(
+        &configs,
+        SecurityMode::Standard,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        checker.check_path("todo_write", &workspace_path("todos.json")),
+        CheckResult::Denied(_)
     ));
 }
 

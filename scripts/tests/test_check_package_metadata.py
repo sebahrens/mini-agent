@@ -296,6 +296,34 @@ steps:
 
         self.assertTrue(any("all-features" in error for error in errors))
 
+    def test_release_requires_versioned_changelog_notes(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            "--notes-file release-notes.md", "--generate-notes", 1
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("CHANGELOG section" in error for error in errors))
+
+    def test_release_notes_job_requires_checkout(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        publish_start = workflow.index("\n  publish-release:")
+        prefix, publish_job = workflow[:publish_start], workflow[publish_start:]
+        publish_job = publish_job.replace(
+            "      - uses: actions/checkout@", "      - uses: removed/checkout@", 1
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(
+            prefix + publish_job, "mini-agent"
+        )
+
+        self.assertTrue(any("CHANGELOG section" in error for error in errors))
+
     def test_release_requires_vendored_corresponding_source(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github/workflows/release.yml"

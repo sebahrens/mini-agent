@@ -127,7 +127,7 @@ fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
         )
         .unwrap();
     let vector = embedder
-        .embed_documents(&[candidate.description.clone()])
+        .embed_documents(std::slice::from_ref(&candidate.description))
         .unwrap()
         .pop()
         .unwrap();

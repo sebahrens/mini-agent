@@ -18,7 +18,8 @@ still authoritative and lock contention fails closed.
 
 Paths are non-empty, repository-relative, literal components (no options,
 absolute paths, traversal, globs, or symlinks), and are passed after `--`.
-Commit messages are bounded UTF-8 values and are passed as one `-m` argument.
+Commit messages are bounded UTF-8 values and are passed through stdin with
+`--file=-`, avoiding command-line disclosure and argument-size limits.
 The runner pins the discovered Git executable, uses `-C` with the captured
 workspace, removes repository-redirection environment variables, disables
 optional locks, hooks, external diff/textconv, credential helpers, signing,

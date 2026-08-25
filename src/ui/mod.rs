@@ -1,5 +1,5 @@
 mod app;
-#[cfg(test)]
+#[cfg(all(test, feature = "git-worktree"))]
 pub(crate) use app::retire_scoped_task;
 #[cfg(test)]
 pub(crate) use app::{ClipboardShortcut, InterruptTarget, clipboard_shortcut, interrupt_target};

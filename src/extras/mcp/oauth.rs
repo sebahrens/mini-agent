@@ -1446,16 +1446,6 @@ fn listen_for_callback(port: u16, timeout: Duration) -> anyhow::Result<CapturedC
     }
 }
 
-#[cfg(test)]
-mod product_identity_tests {
-    #[test]
-    fn oauth_completion_uses_public_product_name() {
-        let body = super::authorization_complete_body();
-        assert!(body.contains(crate::product::PUBLIC_NAME));
-        assert!(!body.contains(crate::product::LEGACY_APP_COMPONENT));
-    }
-}
-
 fn read_request_line(stream: &mut std::net::TcpStream) -> anyhow::Result<String> {
     let mut buf = [0u8; 4096];
     let n = stream
@@ -1531,4 +1521,14 @@ pub(crate) fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod product_identity_tests {
+    #[test]
+    fn oauth_completion_uses_public_product_name() {
+        let body = super::authorization_complete_body();
+        assert!(body.contains(crate::product::PUBLIC_NAME));
+        assert!(!body.contains(crate::product::LEGACY_APP_COMPONENT));
+    }
 }

@@ -51,6 +51,7 @@ each.
 | QuickJS, not a Node sidecar | The JavaScript engine is small and embeddable; there is no package manager, module loader, or background Node service. |
 | One cross-platform action contract | The same JavaScript and typed effects are available on Linux, macOS, and Windows. OS-specific code is confined to launch and containment. |
 | Parent-owned capability broker | JavaScript cannot directly open the filesystem, network, or processes. Every real effect is typed, narrowed, permission-checked, audited, and executed by Rust. |
+| Structured local Git | The agent can inspect history and safely stage, unstage, or commit through seven fixed permission-checked operations without raw shell arguments, remotes, or network access. |
 | Fresh runtimes | Every step and every complete verification request receives a new bounded QuickJS runtime. No JavaScript heap survives between requests. |
 | Curated skill library | The agent can propose useful JavaScript snippets, verify them, retrieve them by meaning, and improve the library from attributable evidence. |
 | Evidence-based lifecycle | Skills can progress through proposal, verification, human-gated canary, promotion, quarantine, repair, supersession, and rollback. |

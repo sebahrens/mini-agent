@@ -452,7 +452,7 @@ fn streaming_correctness_with_stable_boundary_enabled() {
 
     // Append more lines after the stable boundary.
     for i in 3..10 {
-        assert!(feed.append_to_last(&format!("line {}\n", i)));
+        assert!(feed.append_to_last(format!("line {}\n", i)));
         let _ = feed.lines(80);
     }
 

@@ -1981,6 +1981,13 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    (
+        "src/git/tool.rs",
+        "let output = Command::new(\"git\")",
+        1,
+        "TEST-ONLY",
+    ),
+    ("src/git/tool.rs", ".output()", 1, "TEST-ONLY"),
 ];
 
 /// SHA-256 of the length-framed structural macro path and complete token tree.
@@ -3295,7 +3302,7 @@ fn validate_class_assignments(
         }
     }
 
-    for ((path, source, occurrence), _) in &exact {
+    for (path, source, occurrence) in exact.keys() {
         if !inventory.contains_key(&(path.clone(), source.clone(), *occurrence)) {
             return Err(format!(
                 "stale exact ownership rule for {path} occurrence {occurrence}: {source}"

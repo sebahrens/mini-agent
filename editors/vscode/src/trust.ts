@@ -34,21 +34,6 @@ export function assertExecutableScope(): void {
   }
 }
 
-/**
- * Revokes the current session when workspace trust is revoked.
- * Call this from activate() to subscribe to trust change events.
- */
-export function onTrustRevoked(callback: () => Promise<void>): vscode.Disposable {
-  return vscode.workspace.onDidGrantWorkspaceTrust(async () => {
-    // onDidGrantWorkspaceTrust fires when trust is granted or revoked.
-    // If trust is now false, invoke the revocation callback.
-    if (!vscode.workspace.isTrusted) {
-      log.warn('Workspace trust revoked — stopping Mini Agent session');
-      await callback();
-    }
-  });
-}
-
 function assertTrusted(): boolean {
   if (vscode.workspace.isTrusted) { return true; }
 

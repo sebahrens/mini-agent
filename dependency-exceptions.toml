@@ -7,9 +7,9 @@ kind = "advisory"
 id = "RUSTSEC-2026-0187"
 crate = "lopdf@0.41.0"
 owner = "@sebahrens"
-rationale = "rig-core's opt-in PDF feature still requires lopdf 0.41; upgrade rig-core as soon as it accepts lopdf >=0.42, and do not enable PDF ingestion for untrusted documents in the interim."
-created = "2026-08-02"
-expires = "2026-08-30"
+rationale = "rig-core 0.42 splits the agent runtime into rig-agent and removes the generic Agent, public ToolDyn dispatch, and OneOrMany APIs used throughout mini-agent; complete that migration before enabling untrusted PDF ingestion."
+created = "2026-08-25"
+expires = "2026-11-23"
 
 # Example only:
 #

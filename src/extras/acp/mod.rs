@@ -2503,8 +2503,7 @@ mod protocol_tests {
                         let empty = {
                             let sessions = state_for_control.sessions.lock().await;
                             let turns = sessions.get(&session).unwrap().turns.clone();
-                            let empty = turns.lock().unwrap().queue.is_empty();
-                            empty
+                            turns.lock().unwrap().queue.is_empty()
                         };
                         if empty {
                             break;
@@ -3133,8 +3132,7 @@ mod protocol_tests {
                         let registered = {
                             let sessions = state_for_control.sessions.lock().await;
                             let turns = sessions.get(&session).unwrap().turns.clone();
-                            let registered = !turns.lock().unwrap().queue.is_empty();
-                            registered
+                            !turns.lock().unwrap().queue.is_empty()
                         };
                         if registered {
                             break;

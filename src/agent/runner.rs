@@ -887,9 +887,9 @@ impl RunnerStreamPolicy {
                             ))
                         );
                         std::future::ready(
-                            !(drop_terminal && is_terminal)
-                                && !(drop_completion_calls && is_completion)
-                                && !(drop_tool_results && is_tool_result),
+                            !(drop_terminal && is_terminal
+                                || drop_completion_calls && is_completion
+                                || drop_tool_results && is_tool_result),
                         )
                     })
                     .boxed();

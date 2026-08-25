@@ -2713,6 +2713,8 @@ fn worker_supervisor_transport_rejects_verify_blocking_inside_tokio_and_keeps_st
     assert_send_sync::<JsWorkerSupervisor>();
 }
 
+// The stale-response case deliberately leaves a descendant for the supervisor to reap.
+#[allow(clippy::zombie_processes)]
 fn run_scripted_supervisor_worker() -> ! {
     let startup =
         std::env::var("MINI_AGENT_TEST_SUPERVISOR_STARTUP").unwrap_or_else(|_| "healthy".into());

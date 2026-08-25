@@ -902,71 +902,73 @@ fn authenticated_approval_authorization_cannot_cross_transition_or_replay() {
         .revision_row_version(&artifact.id)
         .unwrap()
         .unwrap() as i64;
-    let mut lifecycle = LifecycleService::new(evaluator.store_mut());
-    lifecycle
-        .register_policy("authorization-v1", "{}", 22)
+    let (snapshot, approval_a, authorization_a) = {
+        let mut lifecycle = LifecycleService::new(evaluator.store_mut());
+        lifecycle
+            .register_policy("authorization-v1", "{}", 22)
+            .unwrap();
+        let snapshot = EvidenceSnapshot::new(
+            artifact.id.clone(),
+            None,
+            "authorization-v1",
+            vec![],
+            BTreeMap::new(),
+            row_version,
+            None,
+            1,
+        )
         .unwrap();
-    let snapshot = EvidenceSnapshot::new(
-        artifact.id.clone(),
-        None,
-        "authorization-v1",
-        vec![],
-        BTreeMap::new(),
-        row_version,
-        None,
-        1,
-    )
-    .unwrap();
-    let reused = HumanApproval::verified(
-        "distinct-root-review",
-        "reviewer",
-        report_id.clone(),
-        row_version,
-    )
-    .unwrap();
-    assert!(matches!(
-        lifecycle.activate_root(
-            "cross-transition",
-            &artifact.id,
-            &reused,
-            &authorization,
-            &snapshot,
-            23,
-        ),
-        Err(LifecycleError::Store(
-            crate::extras::js::skills::store::StoreError::Unauthorized
-        ))
-    ));
+        let reused = HumanApproval::verified(
+            "distinct-root-review",
+            "reviewer",
+            report_id.clone(),
+            row_version,
+        )
+        .unwrap();
+        assert!(matches!(
+            lifecycle.activate_root(
+                "cross-transition",
+                &artifact.id,
+                &reused,
+                &authorization,
+                &snapshot,
+                23,
+            ),
+            Err(LifecycleError::Store(
+                crate::extras::js::skills::store::StoreError::Unauthorized
+            ))
+        ));
 
-    let approval_a = HumanApproval::verified(
-        "root-review-a",
-        "reviewer-a",
-        report_id.clone(),
-        row_version,
-    )
-    .unwrap();
-    let approval_b =
-        HumanApproval::verified("root-review-b", "reviewer-b", report_id, row_version).unwrap();
-    let authorization_a = lifecycle
-        .authorize_root_for_test(&artifact.id, &approval_a, 23)
+        let approval_a = HumanApproval::verified(
+            "root-review-a",
+            "reviewer-a",
+            report_id.clone(),
+            row_version,
+        )
         .unwrap();
-    let authorization_b = lifecycle
-        .authorize_root_for_test(&artifact.id, &approval_b, 23)
-        .unwrap();
-    assert!(matches!(
-        lifecycle.activate_root(
-            "cross-paired-root-authority",
-            &artifact.id,
-            &approval_a,
-            &authorization_b,
-            &snapshot,
-            24,
-        ),
-        Err(LifecycleError::Store(
-            crate::extras::js::skills::store::StoreError::Unauthorized
-        ))
-    ));
-    drop(lifecycle);
+        let approval_b =
+            HumanApproval::verified("root-review-b", "reviewer-b", report_id, row_version).unwrap();
+        let authorization_a = lifecycle
+            .authorize_root_for_test(&artifact.id, &approval_a, 23)
+            .unwrap();
+        let authorization_b = lifecycle
+            .authorize_root_for_test(&artifact.id, &approval_b, 23)
+            .unwrap();
+        assert!(matches!(
+            lifecycle.activate_root(
+                "cross-paired-root-authority",
+                &artifact.id,
+                &approval_a,
+                &authorization_b,
+                &snapshot,
+                24,
+            ),
+            Err(LifecycleError::Store(
+                crate::extras::js::skills::store::StoreError::Unauthorized
+            ))
+        ));
+        (snapshot, approval_a, authorization_a)
+    };
     let consumed: (Option<i64>, Option<i64>) = evaluator
         .store()
         .conn()

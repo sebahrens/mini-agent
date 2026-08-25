@@ -6,7 +6,7 @@ use crate::extras::js::skills::{
 };
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ============================================================================
 // Test Fixtures and Helpers
@@ -36,7 +36,7 @@ fn temp_app_paths() -> PathBuf {
 }
 
 /// Resolve test AppPaths from a temporary base directory.
-fn resolve_test_paths(temp_base: &PathBuf) -> Result<AppPaths, Box<dyn std::error::Error>> {
+fn resolve_test_paths(temp_base: &Path) -> Result<AppPaths, Box<dyn std::error::Error>> {
     let env = PathEnvironment {
         platform: if cfg!(target_os = "linux") {
             PathPlatform::Linux
@@ -48,11 +48,11 @@ fn resolve_test_paths(temp_base: &PathBuf) -> Result<AppPaths, Box<dyn std::erro
             PathPlatform::Linux
         },
         home_dir: None,
-        config_base: Some(temp_base.clone()),
-        data_base: Some(temp_base.clone()),
-        local_data_base: Some(temp_base.clone()),
-        state_base: Some(temp_base.clone()),
-        cache_base: Some(temp_base.clone()),
+        config_base: Some(temp_base.to_path_buf()),
+        data_base: Some(temp_base.to_path_buf()),
+        local_data_base: Some(temp_base.to_path_buf()),
+        state_base: Some(temp_base.to_path_buf()),
+        cache_base: Some(temp_base.to_path_buf()),
         workspace_root: None,
         overrides: Default::default(),
     };
@@ -443,7 +443,7 @@ fn test_embedding_storage_and_retrieval() -> Result<(), Box<dyn std::error::Erro
         store.insert_verified(&skill)?;
 
         // Store an embedding.
-        let embedding_vec = vec![1.0f32, 0.0, 0.0, 0.0];
+        let embedding_vec = [1.0f32, 0.0, 0.0, 0.0];
         let embedding_bytes = embedding_vec
             .iter()
             .flat_map(|f| f.to_le_bytes())
