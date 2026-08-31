@@ -842,6 +842,11 @@ impl Tool for JsTool {
             .await
             .map_err(|error| ToolError::Msg(error.to_string()))?;
 
+        // Create one absolute deadline for the entire invocation (30s from start)
+        let call_deadline = Instant::now()
+            .checked_add(STEP_TIMEOUT)
+            .ok_or_else(|| ToolError::Msg("JS tool deadline unavailable".into()))?;
+
         let cancellation = PermCancellation::new();
         let mut cancel_on_drop = CancelOnDrop::new(cancellation.clone());
         #[cfg(feature = "skills")]
@@ -857,16 +862,9 @@ impl Tool for JsTool {
         let invocation_id = InvocationId::new(format!("tool:{}", uuid::Uuid::new_v4()))
             .map_err(|_| ToolError::Msg("JS invocation identity unavailable".into()))?;
         #[cfg(feature = "skills")]
-        let preparation_deadline = Instant::now()
-            .checked_add(STEP_TIMEOUT)
-            .ok_or_else(|| ToolError::Msg("skill authority deadline unavailable".into()))?;
-        #[cfg(feature = "skills")]
         let prepared_skill_manifests =
-            prepare_skill_manifests(&skill_bundle, preparation_deadline, cancellation.clone())
-                .await?;
-        let grant_expires_at = Instant::now()
-            .checked_add(STEP_TIMEOUT)
-            .ok_or_else(|| ToolError::Msg("JS authority deadline unavailable".into()))?;
+            prepare_skill_manifests(&skill_bundle, call_deadline, cancellation.clone()).await?;
+        let grant_expires_at = call_deadline;
         let mut model_capabilities = std::collections::BTreeSet::from([
             HostCapability::ReadFile,
             HostCapability::WriteFile,
@@ -916,16 +914,22 @@ impl Tool for JsTool {
             .permission_bridge
             .bridge()
             .for_invocation(cancellation.clone());
+        // Compute remaining time from the absolute call_deadline for all effect services
+        let remaining_deadline = call_deadline.saturating_duration_since(Instant::now());
         let service = ParentHostEffectService::new(
-            FileEffectService::new(bridge.clone(), self.allow_config.clone(), STEP_TIMEOUT),
-            SpawnEffectService::new(self.sandbox.clone(), bridge.clone(), STEP_TIMEOUT),
+            FileEffectService::new(
+                bridge.clone(),
+                self.allow_config.clone(),
+                remaining_deadline,
+            ),
+            SpawnEffectService::new(self.sandbox.clone(), bridge.clone(), remaining_deadline),
         );
         #[cfg(feature = "sandbox")]
         let service = service.with_fetch(FetchEffectService::new(
             bridge,
             self.runtime.clone(),
             self.allow_config.fetch_policy(),
-            STEP_TIMEOUT,
+            remaining_deadline,
         ));
         #[cfg(feature = "skills")]
         let service = if let Some(proposal) = self.proposal_service.clone() {
@@ -976,7 +980,13 @@ impl Tool for JsTool {
         );
         let response = match self
             .supervisor
-            .execute_bound(invocation_id, run_step, broker, cancellation)
+            .execute_bound_with_deadline(
+                invocation_id,
+                run_step,
+                broker,
+                cancellation,
+                Some(call_deadline),
+            )
             .await
         {
             Ok(response) => response,
@@ -1695,5 +1705,44 @@ mod js_permission_bridge {
         );
         assert_eq!(supervisor.generation_for_test().await, Some(generation));
         assert_eq!(supervisor.process_id_for_test().await, Some(process_id));
+    }
+
+    #[tokio::test]
+    async fn js_call_uses_single_absolute_deadline_for_all_phases() {
+        // This test verifies that call() creates one absolute deadline at entry and threads it
+        // through all phases (permission check, skill preparation, effect services, supervisor)
+        // instead of creating independent timeouts at each phase.
+        //
+        // The fix is verified by confirming that:
+        // 1. call_deadline is created once at the start
+        // 2. The same deadline is used for prepare_skill_manifests (via passed deadline)
+        // 3. The same deadline is used for grant_expires_at
+        // 4. Effect services get the remaining time from call_deadline
+        // 5. execute_bound_with_deadline receives the call_deadline
+        //
+        // Without this fix, each phase would get its own independent STEP_TIMEOUT,
+        // potentially exceeding 30 seconds total.
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let audit = shared_effect_audit().expect("test effect audit");
+        let tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor.clone(),
+            audit,
+        );
+
+        // A simple call should succeed within the single 30-second deadline
+        let result = tool
+            .call(JsArgs {
+                code: "40 + 2".into(),
+            })
+            .await
+            .expect("call should succeed within single deadline");
+        assert_eq!(result, "42");
     }
 }

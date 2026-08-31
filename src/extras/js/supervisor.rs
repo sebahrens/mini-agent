@@ -492,7 +492,7 @@ impl JsWorkerSupervisor {
         mut effects: impl InvocationEffectHandler,
         cancellation: PermCancellation,
     ) -> Result<StepResult, WorkerError> {
-        self.execute_inner(request, &mut effects, cancellation, None)
+        self.execute_inner(request, &mut effects, cancellation, None, None)
             .await
     }
 
@@ -503,11 +503,29 @@ impl JsWorkerSupervisor {
         &self,
         invocation: InvocationId,
         request: RunStep,
-        mut effects: impl InvocationEffectHandler,
+        effects: impl InvocationEffectHandler,
         cancellation: PermCancellation,
     ) -> Result<StepResult, WorkerError> {
-        self.execute_inner(request, &mut effects, cancellation, Some(invocation))
+        self.execute_bound_with_deadline(invocation, request, effects, cancellation, None)
             .await
+    }
+
+    pub(crate) async fn execute_bound_with_deadline(
+        &self,
+        invocation: InvocationId,
+        request: RunStep,
+        mut effects: impl InvocationEffectHandler,
+        cancellation: PermCancellation,
+        deadline: Option<Instant>,
+    ) -> Result<StepResult, WorkerError> {
+        self.execute_inner(
+            request,
+            &mut effects,
+            cancellation,
+            Some(invocation),
+            deadline,
+        )
+        .await
     }
 
     async fn execute_inner(
@@ -516,6 +534,7 @@ impl JsWorkerSupervisor {
         effects: &mut impl InvocationEffectHandler,
         cancellation: PermCancellation,
         invocation: Option<InvocationId>,
+        deadline_override: Option<Instant>,
     ) -> Result<StepResult, WorkerError> {
         match self
             .invoke_interactive(
@@ -523,6 +542,7 @@ impl JsWorkerSupervisor {
                 Some(effects),
                 cancellation,
                 invocation,
+                deadline_override,
             )
             .await?
         {
@@ -568,10 +588,13 @@ impl JsWorkerSupervisor {
         mut effects: Option<&mut H>,
         cancellation: PermCancellation,
         invocation: Option<InvocationId>,
+        deadline_override: Option<Instant>,
     ) -> Result<InvocationTerminal, WorkerError> {
         // The single deadline starts before lease acquisition and therefore bounds queueing,
         // startup, protocol I/O, JavaScript execution, and parent-brokered effect handling.
-        let deadline = Instant::now() + self.0.watchdog;
+        // If a deadline is provided from the caller (e.g., from JsTool::call), use that absolute
+        // deadline. Otherwise, create a fresh deadline from the watchdog duration.
+        let deadline = deadline_override.unwrap_or_else(|| Instant::now() + self.0.watchdog);
         let waiter = self.0.priority.register_interactive();
         let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
         let _active_interactive = waiter.activate();

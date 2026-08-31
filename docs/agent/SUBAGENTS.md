@@ -105,7 +105,6 @@ stem is the `agent_type` value. Update the `agent_type` description in
 | `grep`     | Regex search in files         |
 | `find_files` | Find files by glob pattern |
 | `list_dir` | List directory contents       |
-| `todo`     | Track exploration steps       |
 
 ### Memory tools (when `memory` feature is enabled)
 
@@ -122,19 +121,29 @@ stem is the `agent_type` value. Update the `agent_type` description in
 | `edit`         | Subagent is read-only by design         |
 | `bash`         | Not needed — read tools cover exploration |
 | `memory_write` | Subagent should not persist memory      |
+| `todo`         | Not registered — no planning tool in child context |
+| `task`         | Nested subagents are deliberately unsupported |
 | `mcp_tool`     | External, unpredictable — out of scope  |
 
 ## Security & Permissions
 
-The subagent is built with **no permission system** (`permission: None` on all
-its tools). This is safe because it only has read tools:
+The subagent **inherits** the parent's authorization context
+(`SubagentAuthorization`), which carries the parent's `PermCheck`, approval
+channel (`AskSender`), and workspace binding. Every child tool respects the
+same path-containment and approval rules as the parent:
 
-- **Read tools with `None` permission** will read any path without checks,
-  but they cannot write, edit, or execute commands.
-- The worst a subagent can do is read files, which is exactly what it is
-  designed for.
+- **Path containment**: reads outside the workspace binding are denied or sent
+  through the parent approval channel, exactly as they would be for the main
+  agent.
+- **No mutation tools**: the child has no `write`, `edit`, `bash`, or
+  `mcp_tool`, so it cannot modify files, run shell commands, or reach external
+  MCP servers regardless of permissions.
+- **No memory writes**: `memory_write` and `memory_edit` are deliberately
+  absent; a subagent can only read persistent memory.
+- **No nested tasks**: `task` itself is not registered for child agents, so
+  nesting is impossible.
 
-The main agent's `task` tool itself goes through the normal permission check
+The main agent's `task` tool goes through the normal permission check
 (`check_perm("task", …)`), so users can allow/ask/deny it via their
 `opencode.json` permission rules.
 
@@ -213,9 +222,9 @@ Main Agent                               Subagent(s)
 │ edit/bash    │  calls "task" tool      │ grep                │
 │ grep/find_files│ ──────────────────────→│ find_files          │
 │ list_dir     │   with prompt(s)        │ list_dir            │
-│ todo         │                         │ todo                │
-│ task  ───────┤   spawns parallel       │ memory_read         │
-│              │   subagents via         │ memory_search       │
+│ todo         │                         │ memory_read         │
+│ task  ───────┤   spawns parallel       │ memory_search       │
+│              │   subagents via         │                     │
 │              │   tokio::spawn          │                     │
 │              │   ──────────────        │ runs ≤ max_turns    │
 │              │   returns findings ────→│ returns summary     │
