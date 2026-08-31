@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn specialization_prepended_before_base_prompt() {
+    fn specialization_is_the_only_authoritative_persona() {
         let preamble = build_explore_preamble(
             #[cfg(feature = "archmd")]
             None,
@@ -371,11 +371,20 @@ mod tests {
         );
         let spec_pos = preamble.find("You are a Rust async specialist.").unwrap();
         let base_pos = preamble
-            .find("You are a precise code investigation agent.")
+            .find("When a specialization appears above this base prompt")
             .unwrap();
         assert!(
             spec_pos < base_pos,
             "specialization must precede base prompt"
+        );
+        assert_eq!(
+            preamble.matches("You are a ").count(),
+            1,
+            "the base prompt must not install a second persona"
+        );
+        assert!(
+            preamble.contains("persona, scope, method, and report format are authoritative"),
+            "the base prompt must make the specialization contract authoritative"
         );
     }
 

@@ -29,4 +29,4 @@ Every `unsafe` block must have `// SAFETY:` stating the exact precondition. Bad:
 4. Worker stdout is protocol-only — no arbitrary bytes interpreted as trusted data
 5. Broker-only fail-closed launcher for the JS worker — general `Sandbox::wrap_command` not available to the worker
 
-Verify invariant 1 with: does any field or local in JsTool implement neither Send nor Sync? Check with `static_assertions::assert_impl_all!(JsTool: Send, Sync)` if not already present.
+Verify invariant 1 from the `JsTool` field types and their trait bounds. If a compile-time assertion is missing, recommend that the calling agent add and run `static_assertions::assert_impl_all!(JsTool: Send, Sync)`; do not claim to have compiled or executed it.

@@ -46,6 +46,49 @@ The main agent has a new tool called `task`. It accepts:
 - The complete request is rejected before permission checking or execution if
   it is empty, contains a blank prompt, or exceeds `task_max_prompts`.
 
+## Specialist Agent Types
+
+`task` also accepts an optional `agent_type`. When set, the named definition is
+prepended to the base explore prompt as the authoritative persona, scope,
+method, and output contract. Unknown names are silently ignored and fall back
+to the default explore prompt.
+
+| `agent_type` | Domain |
+|--------------|--------|
+| `rust-async-concurrency` | Tokio runtime, `Send`/`Sync` bounds, `Pin`/`Unpin`, cancel-safety |
+| `rust-unsafe-code-audit` | UB categories, SAFETY comments, FFI soundness, Phase 6 invariants |
+| `rust-security-review` | Trust boundaries, injection, secrets, supply chain, crypto, resource exhaustion |
+| `vscode-extension-developer` | VS Code API, webview CSP, postMessage, ACP stdio, vsce packaging |
+| `informatica-mapplet-to-fabric-sql` | PowerCenter/IDMC mapplet → Fabric T-SQL, order-dependence audit, reconciliation |
+| `azure-cloud-architect` | Azure topology, identity, reliability, cost shape, IaC |
+
+`rust-unsafe-code-audit` owns memory safety and `unsafe`; `rust-security-review`
+owns everything that is safe Rust and still a vulnerability. They are
+deliberately disjoint — use both when a review needs both.
+
+`azure-cloud-architect` remains a read-only specialist for repository-backed
+architecture investigations. Because a child receives no conversation history,
+its report starts with constraints and marks unverified values as assumptions;
+it makes a recommendation only when those stated constraints support one.
+
+Definitions are plain markdown resolved by `src/context/agents.rs`, highest
+priority first:
+
+```
+.zerostack/agents/<name>.md      # project override
+data_dir/agents/<name>.md        # user global
+data/agents/<name>.md            # compiled-in default
+```
+
+When a project definition wins, the host prefixes the task result with its
+`.zerostack/agents/<name>.md` source. This makes a repository-controlled
+replacement visible to the calling agent instead of silently presenting it as
+the compiled-in specialist.
+
+Adding a file to `data/agents/` is enough to register a new type; the filename
+stem is the `agent_type` value. Update the `agent_type` description in
+`src/extras/subagents/task_tool.rs` so the main agent knows the type exists.
+
 ## What the Subagent Can Do
 
 ### Read tools (always available)

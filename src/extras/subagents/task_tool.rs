@@ -219,7 +219,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 },
                 "agent_type": {
                     "type": "string",
-                    "description": "Optional specialist agent type. Sets a specialization system prompt prepended before the base explore prompt. Known types: 'rust-async-concurrency' (Tokio, Send/Sync, Pin/Unpin, cancel-safety), 'rust-unsafe-code-audit' (UB categories, SAFETY comments, FFI, Phase 6 invariants), 'vscode-extension-developer' (VS Code API, webview CSP, postMessage, vsce packaging). Omit for general codebase exploration."
+                    "description": "Optional specialist agent type. Sets a specialization system prompt prepended before the base explore prompt. Known types: 'rust-async-concurrency' (Tokio, Send/Sync, Pin/Unpin, cancel-safety), 'rust-unsafe-code-audit' (UB categories, SAFETY comments, FFI, Phase 6 invariants), 'rust-security-review' (trust boundaries, injection, secrets, supply chain, crypto, resource exhaustion), 'vscode-extension-developer' (VS Code API, webview CSP, postMessage, vsce packaging), 'informatica-mapplet-to-fabric-sql' (PowerCenter/IDMC mapplet to Microsoft Fabric T-SQL, order-dependence audit, reconciliation), 'azure-cloud-architect' (Azure topology, identity, reliability, cost, IaC). Omit for general codebase exploration."
                 }
             },
             "required": ["prompts"]
@@ -258,10 +258,21 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(not(feature = "archmd"))]
         let architecture: Option<String> = None;
 
+        let agent_type = args.agent_type.clone();
         let specialization = args
             .agent_type
             .as_deref()
             .and_then(crate::context::agents::lookup);
+        let project_override_notice = specialization.as_ref().and_then(|definition| {
+            (definition.source == crate::context::agents::AgentDefinitionSource::ProjectOverride)
+                .then(|| {
+                    format!(
+                        "[specialist source: project override .zerostack/agents/{}.md]",
+                        agent_type.as_deref().unwrap_or_default()
+                    )
+                })
+        });
+        let specialization = specialization.map(|definition| definition.prompt);
 
         let authorization = SubagentAuthorization::new(
             self.permission.clone(),
@@ -365,7 +376,7 @@ editing in a known location, grepping for a literal you will act on immediately.
         });
 
         let report = execute_tasks(args.prompts, limits, executor).await;
-        Ok(report.render())
+        Ok(report.render_with_notice(project_override_notice.as_deref()))
     }
 }
 
@@ -484,8 +495,17 @@ struct TaskReport {
 }
 
 impl TaskReport {
+    #[cfg(test)]
     fn render(&self) -> String {
+        self.render_with_notice(None)
+    }
+
+    fn render_with_notice(&self, notice: Option<&str>) -> String {
         let mut rendered = String::new();
+        if let Some(notice) = notice {
+            rendered.push_str(notice);
+            rendered.push('\n');
+        }
         if let Some(reason) = &self.stop_reason {
             rendered.push_str(&format!(
                 "[partial: {}; started={}; completed={}; cost_units={}/{}]\n",
@@ -837,6 +857,54 @@ mod tests {
     fn task_tool_limits_reject_blank_prompt_before_execution() {
         let error = validate_prompts(&["valid".into(), "  ".into()], limits()).unwrap_err();
         assert!(error.to_string().contains("prompt 2 must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn project_override_notice_is_host_rendered_before_subagent_output() {
+        let counters = Arc::new(FakeCounters::default());
+        let step = FakeStep {
+            delay: Duration::ZERO,
+            output: Ok("review result".into()),
+            cost_units: 1,
+        };
+        let report = execute_tasks(prompts(1), limits(), fake_executor(vec![step], counters)).await;
+
+        let rendered = report.render_with_notice(Some(
+            "[specialist source: project override .zerostack/agents/review.md]",
+        ));
+        assert!(rendered.starts_with("[specialist source: project override"));
+        assert!(rendered.contains("review result"));
+    }
+
+    #[tokio::test]
+    async fn project_override_notice_and_near_limit_results_share_one_output_bound() {
+        let counters = Arc::new(FakeCounters::default());
+        let notice = "[specialist source: project override .zerostack/agents/review.md]";
+        let max_output_bytes = notice.len() + 48;
+        let step = FakeStep {
+            delay: Duration::ZERO,
+            output: Ok("result ".repeat(100)),
+            cost_units: 1,
+        };
+        let report = execute_tasks(
+            prompts(1),
+            TaskLimits {
+                max_output_bytes,
+                ..limits()
+            },
+            fake_executor(vec![step], counters),
+        )
+        .await;
+
+        let rendered = report.render_with_notice(Some(notice));
+        assert!(rendered.starts_with(notice));
+        assert!(rendered.len() <= max_output_bytes);
+        assert_eq!(
+            rendered
+                .matches("…[task output truncated at aggregate limit]")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
