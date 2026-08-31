@@ -142,6 +142,23 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
     Ok(())
 }
 
+fn resolve_specialization(
+    agent_type: Option<&str>,
+    workspace: Option<&crate::paths::WorkspaceBinding>,
+) -> (Option<String>, Option<String>) {
+    let Some(agent_type) = agent_type else {
+        return (None, None);
+    };
+    let Some(definition) = crate::context::agents::lookup_for_workspace(agent_type, workspace)
+    else {
+        return (None, None);
+    };
+    let notice = definition
+        .project_override_path(agent_type)
+        .map(|path| format!("[specialist source: project override {}]", path.display()));
+    (Some(definition.prompt), notice)
+}
+
 pub struct TaskTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
@@ -259,20 +276,8 @@ editing in a known location, grepping for a literal you will act on immediately.
         let architecture: Option<String> = None;
 
         let agent_type = args.agent_type.clone();
-        let specialization = args
-            .agent_type
-            .as_deref()
-            .and_then(crate::context::agents::lookup);
-        let project_override_notice = specialization.as_ref().and_then(|definition| {
-            (definition.source == crate::context::agents::AgentDefinitionSource::ProjectOverride)
-                .then(|| {
-                    format!(
-                        "[specialist source: project override .zerostack/agents/{}.md]",
-                        agent_type.as_deref().unwrap_or_default()
-                    )
-                })
-        });
-        let specialization = specialization.map(|definition| definition.prompt);
+        let (specialization, project_override_notice) =
+            resolve_specialization(agent_type.as_deref(), self.workspace.as_deref());
 
         let authorization = SubagentAuthorization::new(
             self.permission.clone(),
@@ -874,6 +879,54 @@ mod tests {
         ));
         assert!(rendered.starts_with("[specialist source: project override"));
         assert!(rendered.contains("review result"));
+    }
+
+    #[test]
+    fn task_specialization_and_provenance_follow_each_session_workspace() {
+        let container = std::env::temp_dir().join(format!(
+            "mini-agent-task-specialization-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first = container.join("first");
+        let second = container.join("second");
+        for (workspace, prompt) in [(&first, "FIRST_TASK"), (&second, "SECOND_TASK")] {
+            std::fs::create_dir_all(workspace.join(".zerostack/agents")).unwrap();
+            std::fs::write(workspace.join(".zerostack/agents/review.md"), prompt).unwrap();
+        }
+        let first_binding = crate::paths::WorkspaceBinding::capture(&first).unwrap();
+        let second_binding = crate::paths::WorkspaceBinding::capture(&second).unwrap();
+
+        let (first_prompt, first_notice) =
+            resolve_specialization(Some("review"), Some(&first_binding));
+        let (second_prompt, second_notice) =
+            resolve_specialization(Some("review"), Some(&second_binding));
+
+        assert_eq!(first_prompt.as_deref(), Some("FIRST_TASK"));
+        assert_eq!(second_prompt.as_deref(), Some("SECOND_TASK"));
+        assert_eq!(
+            first_notice,
+            Some(format!(
+                "[specialist source: project override {}]",
+                first_binding
+                    .root()
+                    .join(".zerostack/agents/review.md")
+                    .display()
+            ))
+        );
+        assert_eq!(
+            second_notice,
+            Some(format!(
+                "[specialist source: project override {}]",
+                second_binding
+                    .root()
+                    .join(".zerostack/agents/review.md")
+                    .display()
+            ))
+        );
+
+        drop(first_binding);
+        drop(second_binding);
+        std::fs::remove_dir_all(container).unwrap();
     }
 
     #[tokio::test]
