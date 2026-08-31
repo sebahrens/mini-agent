@@ -29,13 +29,17 @@ the broker. Phase 5's completed evidence policy and transactional lifecycle rema
 while Phase 6 adds the identity-v1 quarantine migration and forbids rollback to identity v1. The
 index contains the exhaustive concern-level supersession map.
 
-The following invariants are unconditional:
+## Phase 6 security invariants (canonical)
 
-- One parent-created worker process is the native-code containment unit.
-- One `RunStep` or whole `VerifyArtifact` request is the QuickJS `Runtime` lifetime unit.
-- Stored-skill source initialization has no effects and no writer API.
-- Parent policy is authoritative even when every worker-supplied attribution field is malicious.
-- No supported production path launches an uncontained worker.
+This is the single canonical checklist for Phase 6 containment. Agent instructions and audit prompts point here instead of maintaining copies.
+
+1. One parent-created, contained worker process is the native-code containment unit. The parent lazily keeps at most one worker live and reuses its process-wide supervisor across `JsTool` and agent rebuilds. No supported production or verification path executes QuickJS in the parent or launches an uncontained worker.
+2. `JsTool` and every parent-owned field are `Send + Sync`; no QuickJS `Runtime`, `Context`, value, or derived handle exists in the production parent process.
+3. One `RunStep` or whole `VerifyArtifact` request is the complete QuickJS `Runtime` lifetime. The worker drops and recreates the runtime for every request, including after success, failure, timeout, cancellation, or OOM.
+4. Every runtime receives the 64 MiB heap limit, 512 KiB JavaScript stack limit, and interrupt deadline before evaluation. Pending-job draining is bounded.
+5. All JavaScript effects are typed requests executed by the parent capability broker under parent-created, invocation-bound grants and target narrowing. A brokered `spawn()` creates its general command through `Sandbox::wrap_command`; the worker itself uses only the separate broker-only, fail-closed launcher and never the workspace-readable general-process profile.
+6. Worker stdout is protocol-only. Production results, logs, and diagnostics expose only closed error classes/codes and validated source-free stage/script-role/line/column metadata—never arbitrary exception messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
+7. Stored-skill source initialization has no effects and no writer API. Parent policy remains authoritative even when every worker-supplied identity or attribution field is malicious.
 
 ## Threat model
 

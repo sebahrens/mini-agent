@@ -18,15 +18,7 @@ Write tests for new non-TUI production code and update `docs/` when adding modul
 
 ## JS engine implementation
 
-The integration lives at `src/extras/js/`. Key Phase 6 invariants to uphold:
-
-1. **Parent-owned contained worker** — lazily keep at most one JS worker process live at a time and reuse its supervisor across `JsTool`/agent rebuilds. Never execute untrusted JS in the parent or fall back to an uncontained worker.
-2. **`JsTool` is `Send + Sync`** — never store a QuickJS `Context`, `Runtime`, or value in `JsTool` or anywhere in the production parent process.
-3. **Fresh `Runtime` per request** — recreate it for every `RunStep` and every whole `VerifyArtifact`; never reuse after success, OOM, timeout, or cancellation.
-4. **Install limits before eval** — every runtime gets the 64 MiB heap limit, 512 KiB JS stack limit, and interrupt deadline before `ctx.eval(...)`.
-5. **Drain bounded pending jobs and sanitize errors** — use `eval::<Value, _>`, bound the microtask drain, and return only a closed error class/code plus validated source-free stage/script-role/line/column metadata. Never disclose arbitrary JS messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
-6. **Broker every effect in the parent** — worker hosts emit typed requests. Parent policy, permissions, target narrowing, deadlines, output limits, and audit are authoritative.
-7. **Brokered spawn uses the general sandbox** — the parent creates a requested command through `Sandbox::wrap_command`. The JS worker itself uses the separate broker-only fail-closed launcher, never the workspace-readable general-process profile.
+The integration lives at `src/extras/js/`. The single authoritative Phase 6 containment checklist is **Phase 6 security invariants (canonical)** in `docs/specs/phase-6-brokered-js-runtime.md`. Read and preserve that checklist for every change to the JS runtime, broker, protocol, or sandbox; do not maintain a second copy here.
 
 ## Feature gate
 

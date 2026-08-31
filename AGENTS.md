@@ -44,13 +44,7 @@ Register `JsTool` in `src/agent/builder.rs` under `#[cfg(feature = "js")]`, alon
 
 ## Invariants — never break these
 
-1. `JsTool` struct fields must all be `Send + Sync`. QuickJS types (`Runtime`, `Context`) must never be fields or exist in the production parent process.
-2. The parent lazily keeps at most one contained JS worker process live at a time and reuses its process-wide supervisor across `JsTool`/agent rebuilds. No production in-process or uncontained fallback is allowed.
-3. The worker drops and recreates `Runtime` for **every** `RunStep` and every whole `VerifyArtifact` request. No QuickJS heap survives a request.
-4. `set_memory_limit(64 * 1024 * 1024)` and `set_max_stack_size(512 * 1024)` on every new `Runtime`.
-5. `set_interrupt_handler` deadline must be set before `ctx.eval(...)` is called.
-6. All JS effects are typed requests executed by the parent capability broker. A brokered `spawn()` must create its general command through `Sandbox::wrap_command`; the JS worker itself uses the separate broker-only fail-closed launcher and never the workspace-readable general-process profile.
-7. Production diagnostics expose only a closed error class/code and validated source-free stage/script-role/line/column metadata. Never return or log arbitrary JS exception messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
+The single authoritative Phase 6 containment checklist is **Phase 6 security invariants (canonical)** in `docs/specs/phase-6-brokered-js-runtime.md`. Read and preserve that checklist for every change to the JS runtime, broker, protocol, or sandbox; do not maintain a second copy here.
 
 ## Skill library (Phase 3) invariants
 

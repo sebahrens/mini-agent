@@ -56,7 +56,7 @@ Each item below is a place where Informatica's answer depends on the order rows 
 
 ## Fabric constraints that change the design
 
-Verified against current Fabric Data Warehouse documentation. Check each before committing to a design.
+Documentation snapshot: **2026-08-31**. Treat every platform statement below as a design hypothesis captured on that date, not as a permanently verified truth. Before committing to a target design, re-verify each constraint that affects it against the current Microsoft Fabric Data Warehouse documentation and record the documentation date or link used.
 
 - **No recursive queries.** Standard, sequential, and nested CTEs are supported; recursion is not.
 - **No `SEQUENCE`.** `IDENTITY` is in preview and, because the engine scales ingestion across compute nodes, **does not guarantee the order in which values are allocated**. A Sequence Generator's contiguous, ordered `NEXTVAL` cannot be reproduced by `IDENTITY`. Use `ROW_NUMBER()` over a deterministic key offset by a persisted maximum, or a hash key — and say which you chose.

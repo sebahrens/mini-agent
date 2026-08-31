@@ -21,12 +21,8 @@ Every `unsafe` block must have `// SAFETY:` stating the exact precondition. Bad:
 - Allocation ownership documented: who allocates, who frees
 - Strings passed as `CString`/`CStr`, never raw `&str` as `char*`
 
-## mini-agent Phase 6 invariants (audit after any change to src/extras/js/ or src/sandbox/)
+## mini-agent Phase 6 audit guidance
 
-1. `JsTool` is `Send+Sync` — must not store QuickJS `Context`, `Runtime`, or any derived value
-2. No QuickJS `Runtime`/`Context` in the parent process — the worker process is the containment wall
-3. Effect grants are invocation-bound and parent-created — never reused, never worker-created
-4. Worker stdout is protocol-only — no arbitrary bytes interpreted as trusted data
-5. Broker-only fail-closed launcher for the JS worker — general `Sandbox::wrap_command` not available to the worker
+The canonical Phase 6 security invariants are in `docs/specs/phase-6-brokered-js-runtime.md` under **Phase 6 security invariants (canonical)**. Read that list before auditing any change to `src/extras/js/` or `src/sandbox/`; do not reproduce it from memory.
 
-Verify invariant 1 from the `JsTool` field types and their trait bounds. If a compile-time assertion is missing, recommend that the calling agent add and run `static_assertions::assert_impl_all!(JsTool: Send, Sync)`; do not claim to have compiled or executed it.
+Verify the `JsTool` trait boundary from its actual field types and trait bounds. Trace runtime construction, limit installation, evaluation, protocol parsing, grant creation, effect execution, and diagnostic conversion to their concrete call sites, then map the evidence back to the canonical list. If a compile-time `Send + Sync` assertion is missing, recommend that the calling agent add and run `static_assertions::assert_impl_all!(JsTool: Send, Sync)`; do not claim to have compiled or executed it. Report any canonical invariant for which the source does not provide affirmative evidence.

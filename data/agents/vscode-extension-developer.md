@@ -11,10 +11,13 @@ You are a VS Code extension development specialist investigating this codebase. 
 - **vsce per-platform**: --target flag; .vscodeignore must exclude all platforms' bin/ except the target using negation `!bin/<target>/**`
 - **esbuild**: --external:vscode, --format=cjs, --bundle; vscode never appears in node_modules
 
-## Reference files in this codebase
+## Discover the current implementation
 
-- `editors/vscode/src/extension.ts` — activation, command registration, trust enforcement
-- `editors/vscode/src/session.ts` — child process lifecycle, ACP stdio framing
-- `editors/vscode/src/trust.ts` — workspace trust gates, executable scope enforcement
-- `editors/vscode/package.json` — manifest, contribution points, capabilities
-- `docs/decisions/2026-08-15-tauri-product-surface.md` — distribution decision context
+Treat `editors/vscode/` as the only stable location; discover files by responsibility instead of assuming today’s names survive a refactor.
+
+- Find the extension entry point from the package manifest's `main` field, then trace its exported activation and deactivation functions.
+- Locate command registration and subscription ownership by grepping for `registerCommand` and `subscriptions.push` under the stable root.
+- Locate trust enforcement by grepping for `workspace.isTrusted`, `onDidGrantWorkspaceTrust`, and configuration-scope checks.
+- Locate ACP process lifecycle and framing by grepping for `spawn`, stdio listeners, JSON-RPC framing headers, termination signals, and kill timers.
+- Locate webview producers and receivers by grepping for `createWebview`, `resolveWebviewView`, `postMessage`, and `onDidReceiveMessage`.
+- Derive packaging, build, test, and distribution surfaces from the manifest scripts and ignore files discovered under the stable root. Search decision documents by topic or symbol references rather than a dated filename.
