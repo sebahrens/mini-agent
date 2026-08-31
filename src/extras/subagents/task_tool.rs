@@ -44,8 +44,8 @@ pub struct TaskArgs {
     pub prompts: Vec<String>,
     /// Optional named agent type. When set the subagent receives a
     /// specialization system prompt prepended before the base explore prompt.
-    /// Recognized names correspond to files in data/agents/. Unknown names
-    /// are silently ignored and fall back to the default explore prompt.
+    /// Recognized names correspond to the resolved embedded, user-global, and
+    /// project agent definitions. Unknown names are rejected.
     #[serde(default)]
     pub agent_type: Option<String>,
 }
@@ -145,18 +145,21 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
 fn resolve_specialization(
     agent_type: Option<&str>,
     workspace: Option<&crate::paths::WorkspaceBinding>,
-) -> (Option<String>, Option<String>) {
+) -> Result<(Option<String>, Option<String>), ToolError> {
     let Some(agent_type) = agent_type else {
-        return (None, None);
+        return Ok((None, None));
     };
     let Some(definition) = crate::context::agents::lookup_for_workspace(agent_type, workspace)
     else {
-        return (None, None);
+        let valid = crate::context::agents::available_names_for_workspace(workspace).join(", ");
+        return Err(ToolError::Msg(format!(
+            "task: unknown agent_type '{agent_type}'; valid types: {valid}"
+        )));
     };
     let notice = definition
         .project_override_path(agent_type)
         .map(|path| format!("[specialist source: project override {}]", path.display()));
-    (Some(definition.prompt), notice)
+    Ok((Some(definition.prompt), notice))
 }
 
 pub struct TaskTool {
@@ -260,6 +263,10 @@ editing in a known location, grepping for a literal you will act on immediately.
         let limits = limits.validate()?;
         validate_prompts(&args.prompts, limits)?;
 
+        let agent_type = args.agent_type.clone();
+        let (specialization, project_override_notice) =
+            resolve_specialization(agent_type.as_deref(), self.workspace.as_deref())?;
+
         check_perm(
             &self.permission,
             &self.ask_tx,
@@ -274,10 +281,6 @@ editing in a known location, grepping for a literal you will act on immediately.
         let architecture = self.architecture.clone();
         #[cfg(not(feature = "archmd"))]
         let architecture: Option<String> = None;
-
-        let agent_type = args.agent_type.clone();
-        let (specialization, project_override_notice) =
-            resolve_specialization(agent_type.as_deref(), self.workspace.as_deref());
 
         let authorization = SubagentAuthorization::new(
             self.permission.clone(),
@@ -897,9 +900,9 @@ mod tests {
         let second_binding = crate::paths::WorkspaceBinding::capture(&second).unwrap();
 
         let (first_prompt, first_notice) =
-            resolve_specialization(Some("review"), Some(&first_binding));
+            resolve_specialization(Some("review"), Some(&first_binding)).unwrap();
         let (second_prompt, second_notice) =
-            resolve_specialization(Some("review"), Some(&second_binding));
+            resolve_specialization(Some("review"), Some(&second_binding)).unwrap();
 
         assert_eq!(first_prompt.as_deref(), Some("FIRST_TASK"));
         assert_eq!(second_prompt.as_deref(), Some("SECOND_TASK"));
@@ -927,6 +930,24 @@ mod tests {
         drop(first_binding);
         drop(second_binding);
         std::fs::remove_dir_all(container).unwrap();
+    }
+
+    #[test]
+    fn unknown_agent_type_is_rejected_with_valid_names() {
+        let workspace = std::env::temp_dir().join(format!(
+            "mini-agent-unknown-specialization-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
+
+        let error = resolve_specialization(Some("rust-security"), Some(&binding)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unknown agent_type 'rust-security'"));
+        assert!(message.contains("rust-security-review"));
+
+        drop(binding);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[tokio::test]

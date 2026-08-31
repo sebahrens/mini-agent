@@ -102,11 +102,22 @@ pub(crate) fn load_for_workspace_binding(
     agents
 }
 
-/// Look up the system prompt and its provenance for a named agent type. Returns
-/// `None` when the name is not registered so callers can fall back to the
-/// default explore prompt.
+/// Look up the system prompt and its provenance for a named agent type.
 pub fn lookup(name: &str) -> Option<AgentDefinition> {
     load().remove(name)
+}
+
+pub(crate) fn available_names_for_workspace(
+    workspace: Option<&crate::paths::WorkspaceBinding>,
+) -> Vec<String> {
+    let mut names: Vec<_> = match workspace {
+        Some(workspace) => load_for_workspace_binding(workspace),
+        None => load(),
+    }
+    .into_keys()
+    .collect();
+    names.sort_unstable();
+    names
 }
 
 pub(crate) fn lookup_for_workspace(
@@ -199,12 +210,21 @@ mod tests {
         let azure = embedded_prompt("azure-cloud-architect");
         assert!(azure.contains("stated and verified constraints support that decision"));
         assert!(azure.contains("**Constraints assumed**"));
+        assert!(
+            azure.find("**Unknown constraints").unwrap() < azure.find("**Architecture**").unwrap()
+        );
 
         let informatica = embedded_prompt("informatica-mapplet-to-fabric-sql");
         assert!(informatica.contains("**Queries not executed**"));
         assert!(informatica.contains("caller or operator to run"));
         assert!(informatica.contains("Documentation snapshot: **2026-08-31**"));
         assert!(informatica.contains("design hypothesis"));
+        assert!(
+            informatica
+                .find("**Assumptions requiring human confirmation**")
+                .unwrap()
+                < informatica.find("**The T-SQL**").unwrap()
+        );
 
         let security = embedded_prompt("rust-security-review");
         assert!(security.contains("Recommend that the calling agent run `cargo deny check`"));

@@ -125,13 +125,13 @@ Produce every query below as part of the deliverable. This read-only agent canno
 
 Return, in this order:
 
-1. **Mapplet inventory** — name, active/passive, input groups, output groups, transformation list, and external dependencies (lookups, sequences, stored procedures, `$$` parameters).
+1. **Assumptions requiring human confirmation** — session settings, parameter values, collation, source uniqueness.
 2. **Order-dependence findings** — each one named to the specific transformation and port that carries it, with the tiebreak key chosen or marked unresolved.
-3. **Fabric target decision** — which surface, and which documented Fabric constraint drove it.
-4. **The T-SQL** — one named CTE per transformation, CTE names derived from the original transformation names, so the SQL can be diffed against the mapplet by eye.
-5. **Unconverted constructs** — explicit list with reasons. Never silently approximate.
+3. **Unconverted constructs** — explicit list with reasons. Never silently approximate.
+4. **Fabric target decision** — which surface, and which documented Fabric constraint drove it.
+5. **Mapplet inventory** — name, active/passive, input groups, output groups, transformation list, and external dependencies (lookups, sequences, stored procedures, `$$` parameters).
 6. **Reconciliation queries** — ready to run, preceded by an explicit **Queries not executed** disclaimer.
-7. **Assumptions requiring human confirmation** — session settings, parameter values, collation, source uniqueness.
+7. **The T-SQL** — one named CTE per transformation, CTE names derived from the original transformation names, so the SQL can be diffed against the mapplet by eye.
 
 ## Never do this
 

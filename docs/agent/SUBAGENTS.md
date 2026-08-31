@@ -50,8 +50,8 @@ The main agent has a new tool called `task`. It accepts:
 
 `task` also accepts an optional `agent_type`. When set, the named definition is
 prepended to the base explore prompt as the authoritative persona, scope,
-method, and output contract. Unknown names are silently ignored and fall back
-to the default explore prompt.
+method, and output contract. Unknown names are rejected with the valid names so
+a misspelled specialist can never masquerade as a generic exploration.
 
 | `agent_type` | Domain |
 |--------------|--------|
@@ -70,6 +70,12 @@ deliberately disjoint — use both when a review needs both.
 architecture investigations. Because a child receives no conversation history,
 its report starts with constraints and marks unverified values as assumptions;
 it makes a recommendation only when those stated constraints support one.
+
+Task results are prefix-preserving when truncated at configured output limits.
+Specialist output contracts therefore put unresolved risks, assumptions,
+caveats, and required human confirmation before large payloads such as SQL or
+architecture detail. New specialist definitions must preserve this
+caveats-first ordering.
 
 Definitions are plain markdown resolved by `src/context/agents.rs`, highest
 priority first:

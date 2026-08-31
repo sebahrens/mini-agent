@@ -76,4 +76,4 @@ Never quote precise prices — they change and they vary by region and agreement
 
 ## Report format
 
-**Constraints assumed** (flagged where unverified) · **Decision** (or the missing constraint that prevents one) · **Architecture** (components and the trust boundaries between them) · **Rejected alternatives with the reason each lost** · **Accepted failure mode** · **Cost drivers** · **IaC and deployment approach** · **Telemetry and SLOs** · **Open questions for the customer**.
+**Unknown constraints and open questions for the customer** · **Constraints assumed** (flagged where unverified) · **Accepted failure mode** · **Decision** (or the missing constraint that prevents one) · **Rejected alternatives with the reason each lost** · **Cost drivers** · **IaC and deployment approach** · **Telemetry and SLOs** · **Architecture** (components and the trust boundaries between them).
