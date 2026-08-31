@@ -435,7 +435,7 @@ pub async fn handle_compress(
     let messages_to_summarize = &ui.session.messages[..cut_idx];
     let previous_summary = ui.session.compactions.last().map(|c| c.summary.as_str());
 
-    let summary = ui
+    let (summary, messages_included) = ui
         .client
         .compress_messages(
             &ui.session.model,
@@ -447,6 +447,10 @@ pub async fn handle_compress(
         )
         .await?;
 
+    // Only delete messages that were actually included in the summarizer input.
+    // messages_included is the count of messages from the end of messages_to_summarize.
+    let first_kept_index = cut_idx.saturating_sub(messages_included);
+
     let tokens_before: u64 = messages_to_summarize
         .iter()
         .map(|m| m.estimated_tokens)
@@ -454,15 +458,16 @@ pub async fn handle_compress(
 
     #[cfg(feature = "memory")]
     if let Some(pending) = run.pending_turn.as_mut() {
-        pending.stage_memory_summary(summary.clone(), Some(cut_idx));
+        pending.stage_memory_summary(summary.clone(), Some(first_kept_index));
     } else {
         crate::extras::memory::flush_compaction_summary(
             &crate::extras::memory::Mem::open(),
             &summary,
-            Some(cut_idx), // = first_kept_index: how many messages were summarized
+            Some(first_kept_index),
         );
     }
-    ui.session.compress(summary, cut_idx, tokens_before);
+    ui.session
+        .compress(summary, first_kept_index, tokens_before);
 
     run.agent = Some(
         ui.agent_build_ctx()
@@ -474,7 +479,7 @@ pub async fn handle_compress(
     renderer.write_line(
         &format!(
             "compressed {} messages (saved ~{} tokens)",
-            cut_idx, tokens_before,
+            first_kept_index, tokens_before,
         ),
         C_AGENT,
     )?;

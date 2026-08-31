@@ -403,7 +403,7 @@ async fn compact_headless_session_with<S, F>(
 ) -> anyhow::Result<Option<(String, usize)>>
 where
     S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
-    F: std::future::Future<Output = anyhow::Result<String>>,
+    F: std::future::Future<Output = anyhow::Result<(String, usize)>>,
 {
     let Some(plan) = headless_compaction_plan(
         session,
@@ -421,7 +421,7 @@ where
         .compactions
         .last()
         .map(|compaction| compaction.summary.to_string());
-    let summary = summarize(
+    let (summary, messages_included) = summarize(
         model,
         messages,
         previous_summary,
@@ -429,8 +429,11 @@ where
         plan.response_token_budget,
     )
     .await?;
-    session.compress(summary.clone(), plan.cut_idx, plan.tokens_before);
-    Ok(Some((summary, plan.cut_idx)))
+    // Only delete messages that were actually included in the summarizer input.
+    // messages_included is the count of messages from the end of messages_to_summarize.
+    let first_kept_index = plan.cut_idx.saturating_sub(messages_included);
+    session.compress(summary.clone(), first_kept_index, plan.tokens_before);
+    Ok(Some((summary, first_kept_index)))
 }
 
 fn reap_aborted_openrouter_pricing_refresh(
