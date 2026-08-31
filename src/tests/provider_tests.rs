@@ -125,8 +125,16 @@ async fn bounded_compaction_splits_only_at_utf8_boundaries() {
     assert_eq!(summary, "s");
     assert_eq!(prompts.len(), 2);
     // With XML-based format, the conversation is wrapped in <transcript> tags
-    assert!(prompts[0].contains("<transcript>") && prompts[0].contains("記") && prompts[0].contains("</transcript>"));
-    assert!(prompts[1].contains("<transcript>") && prompts[1].contains("憶") && prompts[1].contains("</transcript>"));
+    assert!(
+        prompts[0].contains("<transcript>")
+            && prompts[0].contains("記")
+            && prompts[0].contains("</transcript>")
+    );
+    assert!(
+        prompts[1].contains("<transcript>")
+            && prompts[1].contains("憶")
+            && prompts[1].contains("</transcript>")
+    );
     assert!(prompts.iter().all(|prompt| prompt.len() <= budget));
 }
 
@@ -389,9 +397,11 @@ fn serialize_injection_attack_fake_role_label_contained_in_data() {
     assert!(result.contains("</message>"));
     // Ensure the fake System role label is not in a separate role attribute
     let fake_system_escape = "<message role=\"system\">";
-    assert!(!result.contains(fake_system_escape) ||
-            result.find(fake_system_escape).unwrap() > result.find("[System]:").unwrap(),
-            "Injected role label must not escape its data container");
+    assert!(
+        !result.contains(fake_system_escape)
+            || result.find(fake_system_escape).unwrap() > result.find("[System]:").unwrap(),
+        "Injected role label must not escape its data container"
+    );
 }
 
 #[test]

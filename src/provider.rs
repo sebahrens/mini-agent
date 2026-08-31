@@ -868,7 +868,10 @@ pub(crate) fn serialize_conversation(messages: &[SessionMessage]) -> String {
         };
         // XML-based format prevents injection: untrusted content cannot escape
         // the <message> tag, and the role attribute is never injectable.
-        result.push_str(&format!("<message role=\"{}\">\n{}\n</message>\n", role_tag, msg.content));
+        result.push_str(&format!(
+            "<message role=\"{}\">\n{}\n</message>\n",
+            role_tag, msg.content
+        ));
     }
     result
 }
