@@ -60,6 +60,42 @@ fn canonical_tool_name(name: &str) -> &str {
     if name == "bash" { "shell" } else { name }
 }
 
+/// Per-file byte cap for `/add`ed context files. Exported so `add.rs` can use
+/// the same value without duplicating the constant.
+pub(crate) const MAX_EXTRA_FILE_BYTES: usize = 524_288;
+
+/// Read at most `cap` bytes from `path`, decoding as UTF-8 (lossy) and appending
+/// a truncation notice when the file is larger. Returns `None` if the file cannot
+/// be opened, so the caller can silently skip unreadable files.
+pub(crate) fn read_extra_file_bounded(path: &std::path::Path, cap: usize) -> Option<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    // Take cap+1 bytes so we know whether the file is larger than cap without
+    // reading the whole thing.
+    file.take(cap.saturating_add(1) as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let truncated = buf.len() > cap;
+    if truncated {
+        buf.truncate(cap);
+    }
+    let raw = String::from_utf8_lossy(&buf);
+    let body = if truncated {
+        let s: &str = raw.as_ref();
+        let mut end = s.len().min(cap);
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        let mut t = s[..end].to_string();
+        t.push_str("\n\n[truncated — file exceeded preamble size limit]");
+        t
+    } else {
+        raw.into_owned()
+    };
+    Some(body)
+}
+
 /// Assemble the tool-independent system-prompt context: the base
 /// `SYSTEM_PROMPT`, context files (AGENTS.md, ARCHITECTURE.md, active mode
 /// prompt), working directory, `/add`ed files, memory, and the user `SUFFIX.md`.
@@ -120,31 +156,21 @@ pub(crate) fn build_preamble_for_workspace(
 
     let total_len = total_len + suffix.as_ref().map_or(0, |s| s.len() + 6); // "\n\n---\n\n"
 
-    // Add extra files content to preamble budget. Cap each file to prevent a
-    // huge file from blowing up the system prompt past the context window.
-    const MAX_EXTRA_FILE_BYTES: usize = 524_288;
+    // Add extra files content to preamble budget. Content is preloaded at /add
+    // time via spawn_blocking; the fallback bounded sync read handles files that
+    // were injected without going through the /add path (e.g. tests).
     let extra_files_content: Vec<String> = context
         .extra_files
         .iter()
         .filter_map(|p| {
-            let content = std::fs::read_to_string(p).ok()?;
-            let truncated = if content.len() > MAX_EXTRA_FILE_BYTES {
-                tracing::warn!(
-                    "extra file {} exceeds {} bytes, truncated for preamble",
-                    p.display(),
-                    MAX_EXTRA_FILE_BYTES
-                );
-                let mut end = MAX_EXTRA_FILE_BYTES;
-                while !content.is_char_boundary(end) && end > 0 {
-                    end -= 1;
-                }
-                let mut t = content[..end].to_string();
-                t.push_str("\n\n[truncated — file exceeded preamble size limit]");
-                t
+            let body = if let Some(cached) = context.extra_file_contents.get(p) {
+                cached.as_ref().clone()
             } else {
-                content
+                // Fallback: bounded sync read. This path should only be reached in
+                // tests or when files are added without going through /add.
+                read_extra_file_bounded(p, MAX_EXTRA_FILE_BYTES)?
             };
-            Some(format!("Content of {}:\n{}", p.display(), truncated))
+            Some(format!("Content of {}:\n{}", p.display(), body))
         })
         .collect();
     let extra_files_len: usize = extra_files_content.iter().map(|s| s.len() + 2).sum();
@@ -679,6 +705,99 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     }
 }
 
+#[cfg(test)]
+mod extra_file_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::context::ContextFiles;
+
+    fn temp_file_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mini-agent-extra-file-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn empty_ctx() -> ContextFiles {
+        ContextFiles {
+            workspace_root: std::path::PathBuf::from("."),
+            agents: None,
+            prompts: HashMap::new(),
+            current_prompt: None,
+            current_prompt_name: None,
+            themes: HashMap::new(),
+            current_theme_name: None,
+            extra_files: Vec::new(),
+            extra_file_contents: HashMap::new(),
+            one_shot_restore: None,
+            chain_declined: Vec::new(),
+            #[cfg(feature = "memory")]
+            memory: None,
+            #[cfg(feature = "archmd")]
+            architecture: None,
+        }
+    }
+
+    #[test]
+    fn bounded_read_returns_full_content_under_cap() {
+        let path = temp_file_path("under-cap");
+        std::fs::write(&path, "hello world").unwrap();
+        let content = super::read_extra_file_bounded(&path, 512).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(content, "hello world");
+        assert!(!content.contains("[truncated"));
+    }
+
+    #[test]
+    fn bounded_read_truncates_at_cap_without_full_allocation() {
+        let path = temp_file_path("over-cap");
+        let long = "a".repeat(2000);
+        std::fs::write(&path, &long).unwrap();
+        let cap = 1000;
+        let content = super::read_extra_file_bounded(&path, cap).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(content.contains("[truncated — file exceeded preamble size limit]"));
+        assert!(content.len() <= cap + 100);
+    }
+
+    #[test]
+    fn bounded_read_returns_none_for_missing_file() {
+        let result = super::read_extra_file_bounded(
+            std::path::Path::new("/nonexistent/path/file.txt"),
+            1024,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn preamble_uses_preloaded_content_without_disk_read() {
+        // File does not exist on disk; preamble must use preloaded content.
+        let fake_path = std::path::PathBuf::from("/dev/null/nonexistent.txt");
+        let mut ctx = empty_ctx();
+        ctx.extra_files.push(fake_path.clone());
+        ctx.extra_file_contents
+            .insert(fake_path, Arc::new("preloaded content".to_string()));
+        let preamble = super::build_preamble_for_workspace(&ctx, false, None);
+        assert!(
+            preamble.contains("preloaded content"),
+            "preamble must use cached content, not attempt a disk read"
+        );
+    }
+
+    #[test]
+    fn preamble_falls_back_to_bounded_read_for_uncached_file() {
+        let path = temp_file_path("fallback");
+        std::fs::write(&path, "fallback content").unwrap();
+        let mut ctx = empty_ctx();
+        ctx.extra_files.push(path.clone());
+        // No entry in extra_file_contents — forces fallback read path
+        let preamble = super::build_preamble_for_workspace(&ctx, false, None);
+        std::fs::remove_file(&path).ok();
+        assert!(preamble.contains("fallback content"));
+    }
+}
+
 #[cfg(all(test, feature = "js"))]
 mod js_tests {
     use std::collections::HashMap;
@@ -704,6 +823,7 @@ mod js_tests {
             themes: HashMap::new(),
             current_theme_name: None,
             extra_files: Vec::new(),
+            extra_file_contents: HashMap::new(),
             one_shot_restore: None,
             chain_declined: Vec::new(),
             #[cfg(feature = "memory")]

@@ -1,6 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
+
+/// Maximum number of text files that can be /add'ed in one session.
+const MAX_EXTRA_FILES: usize = 20;
+/// Total byte budget across all /add'ed text files (bounded before allocation).
+const MAX_AGGREGATE_EXTRA_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
 
 pub(crate) fn resolve_path(workspace: &std::path::Path, s: &str) -> PathBuf {
     let p = PathBuf::from(s);
@@ -108,12 +114,64 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         return Ok(());
     }
 
-    let size = std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0);
+    // Count limit: reject before any I/O.
+    if ctx.context.extra_files.len() >= MAX_EXTRA_FILES {
+        write_error(
+            ctx.renderer,
+            format!(
+                "file limit reached: at most {MAX_EXTRA_FILES} files can be added \
+                 (use /drop to remove one first)"
+            ),
+        );
+        return Ok(());
+    }
+
+    // Aggregate byte budget: sum already-added file sizes plus this file's metadata size.
+    let file_size = std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0);
+    let current_aggregate: u64 = ctx
+        .context
+        .extra_files
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    if current_aggregate.saturating_add(file_size) > MAX_AGGREGATE_EXTRA_BYTES {
+        write_error(
+            ctx.renderer,
+            format!(
+                "aggregate file size would exceed {MAX_AGGREGATE_EXTRA_BYTES} bytes: \
+                 use /drop to remove files before adding more"
+            ),
+        );
+        return Ok(());
+    }
+
+    // Preload content via spawn_blocking so agent-rebuild paths never block Tokio workers
+    // with synchronous filesystem reads.
+    let cap = crate::agent::builder::MAX_EXTRA_FILE_BYTES;
+    let path_for_task = canonical.clone();
+    let content = tokio::task::spawn_blocking(move || {
+        crate::agent::builder::read_extra_file_bounded(&path_for_task, cap)
+    })
+    .await
+    .unwrap_or(None);
+
+    let Some(content) = content else {
+        write_error(
+            ctx.renderer,
+            format!("failed to read file: {}", canonical.display()),
+        );
+        return Ok(());
+    };
+
     ctx.context.extra_files.push(canonical.clone());
+    ctx.context
+        .extra_file_contents
+        .insert(canonical.clone(), Arc::new(content));
     ctx.rebuild_agent().await;
     write_ok(
         ctx.renderer,
-        format!("added: {} ({size}B)", canonical.display()),
+        format!("added: {} ({file_size}B)", canonical.display()),
     );
     Ok(())
 }
@@ -130,6 +188,7 @@ async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
     // Try extra_files first.
     if let Some(i) = ctx.context.extra_files.iter().position(|f| f == &canonical) {
         ctx.context.extra_files.remove(i);
+        ctx.context.extra_file_contents.remove(&canonical);
         ctx.rebuild_agent().await;
         write_ok(ctx.renderer, format!("dropped: {}", canonical.display()));
         return Ok(());
@@ -186,6 +245,7 @@ async fn handle_drop_all(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 
     if file_count > 0 {
         ctx.context.extra_files.clear();
+        ctx.context.extra_file_contents.clear();
         ctx.rebuild_agent().await;
     }
     #[cfg(feature = "multimodal")]

@@ -275,11 +275,16 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
     let fts_build_duration = fts_started.elapsed();
 
     let rebuild_rows = rows.clone();
-    let snapshot_started = Instant::now();
-    let index = Arc::new(
-        ImmutableSkillIndex::build(1, model.clone(), store.database_path(), rows).unwrap(),
-    );
-    let snapshot_build_duration = snapshot_started.elapsed();
+    // Phase-level timing: separate exact/FTS index construction from ANN graph build.
+    let exact_build_started = Instant::now();
+    let index_without_ann =
+        ImmutableSkillIndex::build_without_ann(1, model.clone(), store.database_path(), rows)
+            .unwrap();
+    let exact_build_duration = exact_build_started.elapsed();
+    let ann_build_started = Instant::now();
+    let index = Arc::new(index_without_ann.with_ann());
+    let ann_build_duration = ann_build_started.elapsed();
+    let snapshot_build_duration = exact_build_duration + ann_build_duration;
     assert_eq!(index.len(), corpus_size);
 
     embedder.clear_cache().await;
@@ -397,10 +402,19 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
         }
         samples
     });
-    let rebuild_started = Instant::now();
-    let rebuilt =
-        ImmutableSkillIndex::build(2, model.clone(), store.database_path(), rebuild_rows).unwrap();
-    let rebuild_duration = rebuild_started.elapsed();
+    let exact_rebuild_started = Instant::now();
+    let rebuilt_without_ann = ImmutableSkillIndex::build_without_ann(
+        2,
+        model.clone(),
+        store.database_path(),
+        rebuild_rows,
+    )
+    .unwrap();
+    let exact_rebuild_duration = exact_rebuild_started.elapsed();
+    let ann_rebuild_started = Instant::now();
+    let rebuilt = rebuilt_without_ann.with_ann();
+    let ann_rebuild_duration = ann_rebuild_started.elapsed();
+    let rebuild_duration = exact_rebuild_duration + ann_rebuild_duration;
     let concurrent_samples = reader.join().unwrap();
     assert_eq!(rebuilt.len(), corpus_size);
     let mut rebuild_recall_at_ten = 0.0_f64;
@@ -450,6 +464,8 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
 
     let rss_after = peak_rss_kib();
     let search_p99_us = percentile(&total, 0.99);
+    let build_us = snapshot_build_duration.as_secs_f64() * 1_000_000.0;
+    let rebuild_us = rebuild_duration.as_secs_f64() * 1_000_000.0;
     let report_path = std::env::temp_dir().join("mini-agent-skill-retrieval-latest.json");
     let report = serde_json::json!({
         "schema_version": 1,
@@ -477,8 +493,16 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
         "latency": {
             "corpus_document_embedding_us": corpus_embedding_duration.as_secs_f64() * 1_000_000.0,
             "fts_build_us": fts_build_duration.as_secs_f64() * 1_000_000.0,
-            "snapshot_build_us": snapshot_build_duration.as_secs_f64() * 1_000_000.0,
-            "snapshot_rebuild_us": rebuild_duration.as_secs_f64() * 1_000_000.0,
+            "snapshot_build_us": build_us,
+            "snapshot_build_phases": {
+                "exact_fts_us": exact_build_duration.as_secs_f64() * 1_000_000.0,
+                "ann_construction_us": ann_build_duration.as_secs_f64() * 1_000_000.0,
+            },
+            "snapshot_rebuild_us": rebuild_us,
+            "snapshot_rebuild_phases": {
+                "exact_fts_us": exact_rebuild_duration.as_secs_f64() * 1_000_000.0,
+                "ann_construction_us": ann_rebuild_duration.as_secs_f64() * 1_000_000.0,
+            },
             "lifecycle_removal_refresh_us": removal_duration.as_secs_f64() * 1_000_000.0,
             "query_embedding_cold_us": cold_query_duration.as_secs_f64() * 1_000_000.0,
             "query_embedding_warm_us": warm_query_duration.as_secs_f64() * 1_000_000.0,
@@ -507,6 +531,12 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
             "p99_target_us": 5000,
             "observed_p99_us": search_p99_us,
             "recall_at_10_target": 0.95,
+            "build_budget_us": 180_000_000u64,
+            "observed_build_us": build_us,
+            "rebuild_budget_us": 220_000_000u64,
+            "observed_rebuild_us": rebuild_us,
+            "rss_budget_kib": 3_000_000u64,
+            "observed_rss_kib": rss_after,
             "passed": search_p99_us <= 5000.0 && recall_at_ten >= 0.95,
         },
         "raw_result": report_path,
@@ -523,6 +553,18 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
         assert!(
             search_p99_us <= 5000.0 && recall_at_ten >= 0.95,
             "full retrieval gate failed: p99={search_p99_us:.1}us recall@10={recall_at_ten:.3}"
+        );
+        assert!(
+            build_us <= 180_000_000.0,
+            "full build gate failed: {build_us:.0}us > 180s budget"
+        );
+        assert!(
+            rebuild_us <= 220_000_000.0,
+            "full rebuild gate failed: {rebuild_us:.0}us > 220s budget"
+        );
+        assert!(
+            rss_after <= 3_000_000,
+            "full RSS gate failed: {rss_after}KiB > 3_000_000KiB budget"
         );
     }
 }

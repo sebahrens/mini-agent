@@ -246,5 +246,53 @@ mod tests {
         assert!(vscode.contains("Treat `editors/vscode/` as the only stable location"));
         assert!(vscode.contains("grepping for `workspace.isTrusted`"));
         assert!(!vscode.contains("editors/vscode/src/extension.ts"));
+
+        let rust_maintainer = embedded_prompt("rust-maintainer");
+        assert!(rust_maintainer.contains("delegate Tokio cancel-safety"));
+        assert!(rust_maintainer.contains("Derive every command from the repository's actual"));
+        assert!(rust_maintainer.contains("State explicitly which checks you cannot run"));
+        assert!(rust_maintainer.contains("Do not claim to have compiled, tested, or executed"));
+        assert!(
+            rust_maintainer
+                .find("Caveats and unverified assumptions")
+                .unwrap()
+                < rust_maintainer
+                    .find("Lifecycle investigation method")
+                    .unwrap()
+        );
+
+        let python_maintainer = embedded_prompt("python-maintainer");
+        assert!(python_maintainer.contains("Derive every command from the repository's actual"));
+        assert!(python_maintainer.contains("Do not claim to have executed code"));
+        assert!(python_maintainer.contains("You do not assume any specific framework"));
+        assert!(
+            python_maintainer
+                .contains("Derive the interpreter and tool invocation from what you find")
+        );
+        assert!(
+            python_maintainer
+                .find("Caveats and unverified assumptions")
+                .unwrap()
+                < python_maintainer
+                    .find("Lifecycle investigation method")
+                    .unwrap()
+        );
+
+        let node_ts_maintainer = embedded_prompt("node-typescript-maintainer");
+        assert!(node_ts_maintainer.contains("hand those off explicitly"));
+        assert!(node_ts_maintainer.contains("Do not claim to have executed code"));
+        assert!(node_ts_maintainer.contains("You do not assume npm, ESM, or React"));
+        assert!(
+            node_ts_maintainer
+                .contains("Derive the package manager and script invocations from what you find")
+        );
+        assert!(
+            node_ts_maintainer
+                .find("Caveats and unverified assumptions")
+                .unwrap()
+                < node_ts_maintainer
+                    .find("Lifecycle investigation method")
+                    .unwrap()
+        );
     }
 }

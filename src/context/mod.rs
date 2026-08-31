@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use include_dir::Dir;
 use smallvec::SmallVec;
@@ -65,6 +66,9 @@ pub struct ContextFiles {
     pub themes: HashMap<String, String>,
     pub current_theme_name: Option<String>,
     pub extra_files: Vec<std::path::PathBuf>,
+    /// Preloaded file contents keyed by canonical path. Populated at /add time using
+    /// spawn_blocking so agent-build paths never perform synchronous filesystem reads.
+    pub extra_file_contents: HashMap<PathBuf, Arc<String>>,
     pub one_shot_restore: Option<String>,
     pub chain_declined: Vec<String>,
     #[cfg(feature = "memory")]
@@ -250,6 +254,7 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
         themes: theme_map,
         current_theme_name: theme_name,
         extra_files: Vec::new(),
+        extra_file_contents: HashMap::new(),
         one_shot_restore: None,
         chain_declined: Vec::new(),
         #[cfg(feature = "memory")]

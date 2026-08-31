@@ -19,6 +19,7 @@ fn make_context(prompts: &[(&str, &str)]) -> ContextFiles {
         themes: HashMap::new(),
         current_theme_name: None,
         extra_files: Vec::new(),
+        extra_file_contents: HashMap::new(),
         one_shot_restore: None,
         chain_declined: Vec::new(),
         #[cfg(feature = "memory")]

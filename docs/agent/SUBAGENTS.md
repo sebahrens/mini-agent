@@ -55,16 +55,27 @@ a misspelled specialist can never masquerade as a generic exploration.
 
 | `agent_type` | Domain |
 |--------------|--------|
+| `rust-maintainer` | Broad Rust SDLC: toolchain, API/semver, ownership, tests, deps, CI, packaging |
 | `rust-async-concurrency` | Tokio runtime, `Send`/`Sync` bounds, `Pin`/`Unpin`, cancel-safety |
 | `rust-unsafe-code-audit` | UB categories, SAFETY comments, FFI soundness, Phase 6 invariants |
 | `rust-security-review` | Trust boundaries, injection, secrets, supply chain, crypto, resource exhaustion |
+| `python-maintainer` | Broad Python SDLC: interpreter compat, types, async, tests, deps, packaging, CI |
+| `node-typescript-maintainer` | Broad Node.js/TS SDLC: module system, types, event loop, tests, deps, CI |
 | `vscode-extension-developer` | VS Code API, webview CSP, postMessage, ACP stdio, vsce packaging |
 | `informatica-mapplet-to-fabric-sql` | PowerCenter/IDMC mapplet → Fabric T-SQL, order-dependence audit, reconciliation |
 | `azure-cloud-architect` | Azure topology, identity, reliability, cost shape, IaC |
 
+`rust-maintainer` covers the full Rust SDLC as a broad first-pass reviewer.
 `rust-unsafe-code-audit` owns memory safety and `unsafe`; `rust-security-review`
 owns everything that is safe Rust and still a vulnerability. They are
-deliberately disjoint — use both when a review needs both.
+deliberately disjoint — use both when a review needs both. `rust-maintainer`
+delegates to all three specialists explicitly rather than absorbing their domains.
+
+`python-maintainer` covers the full Python SDLC without assuming any particular
+framework, package manager, or layout — it derives commands from the actual
+project configuration. `node-typescript-maintainer` does the same for Node.js
+and TypeScript projects; VS Code API and vsce packaging remain with
+`vscode-extension-developer`.
 
 `azure-cloud-architect` remains a read-only specialist for repository-backed
 architecture investigations. Because a child receives no conversation history,
