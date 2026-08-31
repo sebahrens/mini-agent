@@ -38,7 +38,7 @@ async fn resumed_session_history_reaches_model_initial_turn() {
 
     // Mirrors `dispatch_print`'s own `convert_history(&self.session)` call:
     // this is the `-p --continue` code path being exercised end to end.
-    let (_response, _usage) = run_print(
+    let (_response, _usage, _) = run_print(
         &agent,
         "continue",
         false,

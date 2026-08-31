@@ -1,6 +1,6 @@
 use compact_str::CompactString;
 use rig::completion::Message;
-use rig::message::AssistantContent;
+use rig::message::{AssistantContent, UserContent};
 
 use crate::agent::tools;
 use crate::cli::Cli;
@@ -423,7 +423,7 @@ where
         .compactions
         .last()
         .map(|compaction| compaction.summary.to_string());
-    let (summary, messages_included) = summarize(
+    let (summary, _messages_included) = summarize(
         model,
         messages,
         previous_summary,
@@ -431,9 +431,9 @@ where
         plan.response_token_budget,
     )
     .await?;
-    // Only delete messages that were actually included in the summarizer input.
-    // messages_included is the count of messages from the end of messages_to_summarize.
-    let first_kept_index = plan.cut_idx.saturating_sub(messages_included);
+    // Delete all messages up to the cut point. compress() drains from the front,
+    // so first_kept_index = plan.cut_idx removes all pre-cut messages.
+    let first_kept_index = plan.cut_idx;
     session.compress(summary.clone(), first_kept_index, plan.tokens_before);
     Ok(Some((summary, first_kept_index)))
 }
@@ -1399,7 +1399,7 @@ impl Startup {
                 for interaction in &interactions {
                     match interaction {
                         Message::Assistant { content, .. } => {
-                            for item in content {
+                            for item in content.clone() {
                                 if let AssistantContent::ToolCall(call) = item {
                                     session.add_tool_call_with_id(
                                         &call.id,
@@ -1409,16 +1409,20 @@ impl Startup {
                                 }
                             }
                         }
-                        Message::ToolResult {
-                            id: _,
-                            call_id,
-                            content,
-                        } => {
-                            // Extract tool result content with its call ID for proper pairing
-                            if let rig::message::ToolResultContent::Text(output) = content {
-                                // use the call_id to correlate with the corresponding tool call
-                                let call_id_str = call_id.as_deref().unwrap_or("");
-                                session.add_tool_result_with_id(call_id_str, "unknown", output);
+                        Message::User { content, .. } => {
+                            for user_item in content.clone() {
+                                if let UserContent::ToolResult(tr) = user_item {
+                                    let call_id = tr.call_id.as_deref().unwrap_or(&tr.id);
+                                    for result_content in tr.content.clone() {
+                                        if let rig::message::ToolResultContent::Text(text) =
+                                            result_content
+                                        {
+                                            session.add_tool_result_with_id(
+                                                call_id, "unknown", &text.text,
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -1633,7 +1637,7 @@ mod tests {
                 assert!(previous_summary.is_none());
                 assert_eq!(input_budget, 80);
                 assert_eq!(response_budget, 20);
-                Ok("HEADLESS_SUMMARY".to_string())
+                Ok(("HEADLESS_SUMMARY".to_string(), 1usize))
             },
         )
         .await

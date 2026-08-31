@@ -1,7 +1,7 @@
 use compact_str::CompactString;
 use crossterm::style::Color;
 use rig::completion::Message;
-use rig::message::AssistantContent;
+use rig::message::{AssistantContent, UserContent};
 
 use crate::agent::tools::todo::TODO_LIST;
 use crate::cli::Cli;
@@ -331,7 +331,7 @@ async fn handle_agent_done(
     for interaction in &interactions {
         match interaction {
             Message::Assistant { content, .. } => {
-                for item in content {
+                for item in content.clone() {
                     if let AssistantContent::ToolCall(call) = item {
                         ui.session.add_tool_call_with_id(
                             &call.id,
@@ -341,17 +341,17 @@ async fn handle_agent_done(
                     }
                 }
             }
-            Message::ToolResult {
-                id: _,
-                call_id,
-                content,
-            } => {
-                // Extract tool result content with its call ID for proper pairing
-                if let rig::message::ToolResultContent::Text(output) = content {
-                    // use the call_id to correlate with the corresponding tool call
-                    let call_id_str = call_id.as_deref().unwrap_or("");
-                    ui.session
-                        .add_tool_result_with_id(call_id_str, "unknown", output);
+            Message::User { content, .. } => {
+                for user_item in content.clone() {
+                    if let UserContent::ToolResult(tr) = user_item {
+                        let call_id = tr.call_id.as_deref().unwrap_or(&tr.id);
+                        for result_content in tr.content.clone() {
+                            if let rig::message::ToolResultContent::Text(text) = result_content {
+                                ui.session
+                                    .add_tool_result_with_id(call_id, "unknown", &text.text);
+                            }
+                        }
+                    }
                 }
             }
             _ => {}

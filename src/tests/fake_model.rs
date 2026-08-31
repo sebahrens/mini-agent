@@ -91,7 +91,7 @@ async fn run_print_returns_scripted_text() {
     let model = text_chunks(["hello, ", "world"]);
     let agent = rig::agent::AgentBuilder::new(model).build();
 
-    let (response, _usage) = crate::agent::runner::run_print(
+    let (response, _usage, _) = crate::agent::runner::run_print(
         &agent,
         "hi",
         false,

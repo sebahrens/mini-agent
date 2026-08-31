@@ -3842,7 +3842,7 @@ mod tests {
                 .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
                 .default_max_turns(3)
                 .build();
-            let (response, _) = super::run_print_with_stream_policy(
+            let (response, _, _) = super::run_print_with_stream_policy(
                 &agent,
                 "start",
                 false,
@@ -4057,7 +4057,7 @@ mod tests {
             .default_max_turns(2)
             .build();
 
-        let (response, _) = super::run_print_with_stream_policy(
+        let (response, _, _) = super::run_print_with_stream_policy(
             &agent,
             "start",
             false,
@@ -4890,7 +4890,7 @@ mod tests {
             .default_max_turns(2)
             .build();
 
-        let (response, usage) = super::run_print(
+        let (response, usage, _) = super::run_print(
             &agent,
             "start",
             false,
@@ -5038,7 +5038,7 @@ mod tests {
             MockStreamEvent::final_response(over_budget),
         ]]);
         let headless_agent = AgentBuilder::new(headless_model).max_tokens(50).build();
-        let (headless_response, headless_usage) = super::run_print(
+        let (headless_response, headless_usage, _) = super::run_print(
             &headless_agent,
             "start",
             false,
@@ -5180,7 +5180,7 @@ mod tests {
             .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
             .default_max_turns(2)
             .build();
-        let (_, headless_usage) = super::run_print(
+        let (_, headless_usage, _) = super::run_print(
             &headless_agent,
             "start",
             false,
@@ -5243,7 +5243,7 @@ mod tests {
             MockStreamEvent::final_response(aggregate),
         ]]);
         let headless_agent = AgentBuilder::new(headless_model).build();
-        let (_, headless_usage) = super::run_print_with_stream_policy(
+        let (_, headless_usage, _) = super::run_print_with_stream_policy(
             &headless_agent,
             "start",
             false,

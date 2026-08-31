@@ -399,8 +399,13 @@ fn serialize_conversation_bounded(
     messages: &[SessionMessage],
     prompt_budget_bytes: usize,
 ) -> anyhow::Result<(String, usize)> {
-    let (summary_budget, conversation_budget) =
-        compaction_payload_budgets(None, prompt_budget_bytes)?;
+    // Use the full prompt budget as the conversation budget when the overhead
+    // computation fails (e.g. budget is smaller than the compaction prompt
+    // wrapper). The "always include at least one message" fallback below
+    // guarantees the function never returns an empty result.
+    let conversation_budget = compaction_payload_budgets(None, prompt_budget_bytes)
+        .map(|(_, c)| c)
+        .unwrap_or(prompt_budget_bytes);
 
     // Calculate how many recent messages fit within the budget, keeping those messages.
     // We work backwards from the end (most recent) to include as much recent context
