@@ -335,7 +335,7 @@ async fn handle_agent_done(
     run.response_start_block = None;
 
     #[cfg(feature = "loop")]
-    let loop_running = chain.loop_state.as_ref().is_some_and(|ls| ls.active);
+    let loop_running = chain.loop_state.as_ref().is_some_and(|state| state.active);
     #[cfg(not(feature = "loop"))]
     let loop_running = false;
 
@@ -352,11 +352,11 @@ async fn handle_agent_done(
         .cfg
         .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window);
 
-    if !loop_running
-        && ui.cfg.resolve_compact_enabled()
-        && ui.session.needs_compaction(reserve)
-        && !ui.cli.no_session
-    {
+    if should_auto_compact_between_turns(
+        ui.cfg.resolve_compact_enabled(),
+        ui.session.needs_compaction(reserve),
+        loop_running,
+    ) {
         let compress_result = handle_compress(None, true, run, renderer, ui, true).await;
         if let Err(e) = compress_result {
             renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;
@@ -411,6 +411,16 @@ async fn handle_agent_done(
     }
 
     Ok(())
+}
+
+fn should_auto_compact_between_turns(
+    compact_enabled: bool,
+    needs_compaction: bool,
+    _loop_running: bool,
+) -> bool {
+    // A completed assistant response is a safe boundary regardless of whether
+    // the next action is ordinary input or another loop iteration.
+    compact_enabled && needs_compaction
 }
 
 #[cfg(feature = "loop")]
@@ -549,9 +559,17 @@ fn finalize_response_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_usage_delta;
+    use super::{apply_usage_delta, should_auto_compact_between_turns};
     use crate::event::UsageDelta;
     use crate::session::Session;
+
+    #[test]
+    fn loop_iterations_allow_between_turn_compaction() {
+        // Loop continuation is intentionally absent from this gate: a
+        // completed response is a safe between-iteration compaction boundary.
+        assert!(should_auto_compact_between_turns(true, true, true));
+        assert!(!should_auto_compact_between_turns(false, true, true));
+    }
 
     #[test]
     fn ui_usage_delta_accounting_updates_status_cost_and_persisted_totals_once() {

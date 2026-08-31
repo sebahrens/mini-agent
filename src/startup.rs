@@ -313,6 +313,126 @@ const OPENROUTER_PRICING_ABORT_JOIN_GRACE: std::time::Duration =
 static ACTIVE_OPENROUTER_PRICING_REAPERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeadlessCompactionPlan {
+    cut_idx: usize,
+    tokens_before: u64,
+    input_token_budget: u64,
+    response_token_budget: u64,
+}
+
+fn headless_compaction_plan(
+    session: &Session,
+    cfg: &Config,
+    #[cfg(feature = "memory")] memory: Option<&str>,
+) -> Option<HeadlessCompactionPlan> {
+    if !cfg.resolve_compact_enabled() {
+        return None;
+    }
+    let quick_models = config::quick_models_map(cfg);
+    let configured_reserve =
+        cfg.resolve_reserve_tokens(&session.model, &quick_models, session.context_window);
+    #[cfg(feature = "memory")]
+    let reserve = crate::extras::memory::effective_reserve(configured_reserve, memory);
+    #[cfg(not(feature = "memory"))]
+    let reserve = configured_reserve;
+    if !session.needs_compaction(reserve) {
+        return None;
+    }
+
+    let keep_recent = cfg.resolve_keep_recent_tokens(session.context_window);
+    let cut_idx = Session::select_compaction_cut(&session.messages, keep_recent);
+    if cut_idx == 0 {
+        return None;
+    }
+    let tokens_before = session.messages[..cut_idx]
+        .iter()
+        .map(|message| message.estimated_tokens)
+        .sum();
+    Some(HeadlessCompactionPlan {
+        cut_idx,
+        tokens_before,
+        input_token_budget: session.context_window.saturating_sub(reserve),
+        response_token_budget: reserve,
+    })
+}
+
+async fn compact_headless_session_if_needed(
+    session: &mut Session,
+    client: &AnyClient,
+    cfg: &Config,
+    context: &ContextFiles,
+) -> anyhow::Result<bool> {
+    let compacted = compact_headless_session_with(
+        session,
+        cfg,
+        #[cfg(feature = "memory")]
+        context.memory.as_deref(),
+        |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
+            client
+                .compress_messages(
+                    &model,
+                    &messages,
+                    previous_summary.as_deref(),
+                    None,
+                    input_token_budget,
+                    response_token_budget,
+                )
+                .await
+        },
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("headless auto-compaction failed: {error}"))?;
+
+    #[cfg(feature = "memory")]
+    if let Some((summary, cut_idx)) = &compacted {
+        crate::extras::memory::flush_compaction_summary(
+            &crate::extras::memory::Mem::open(),
+            summary,
+            Some(*cut_idx),
+        );
+    }
+    Ok(compacted.is_some())
+}
+
+async fn compact_headless_session_with<S, F>(
+    session: &mut Session,
+    cfg: &Config,
+    #[cfg(feature = "memory")] memory: Option<&str>,
+    summarize: S,
+) -> anyhow::Result<Option<(String, usize)>>
+where
+    S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
+    F: std::future::Future<Output = anyhow::Result<String>>,
+{
+    let Some(plan) = headless_compaction_plan(
+        session,
+        cfg,
+        #[cfg(feature = "memory")]
+        memory,
+    ) else {
+        return Ok(None);
+    };
+
+    eprintln!("auto-compacting headless session...");
+    let model = session.model.to_string();
+    let messages = session.messages[..plan.cut_idx].to_vec();
+    let previous_summary = session
+        .compactions
+        .last()
+        .map(|compaction| compaction.summary.to_string());
+    let summary = summarize(
+        model,
+        messages,
+        previous_summary,
+        plan.input_token_budget,
+        plan.response_token_budget,
+    )
+    .await?;
+    session.compress(summary.clone(), plan.cut_idx, plan.tokens_before);
+    Ok(Some((summary, plan.cut_idx)))
+}
+
 fn reap_aborted_openrouter_pricing_refresh(
     handle: tokio::task::JoinHandle<anyhow::Result<OpenRouterPricingMap>>,
 ) {
@@ -1166,7 +1286,7 @@ impl Startup {
         }
     }
 
-    async fn dispatch_print(self) -> anyhow::Result<()> {
+    async fn dispatch_print(mut self) -> anyhow::Result<()> {
         let msg = self.cli.message.join(" ");
         if msg.starts_with('!') {
             if msg
@@ -1198,6 +1318,13 @@ impl Startup {
                 eprintln!("error: empty command after '!'");
             }
         } else {
+            compact_headless_session_if_needed(
+                &mut self.session,
+                &self.client,
+                &self.cfg,
+                &self.context,
+            )
+            .await?;
             let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
             let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
             let completion_model = self.client.completion_model(self.model.to_string());
@@ -1394,12 +1521,92 @@ mod tests {
     use super::ACTIVE_OPENROUTER_PRICING_REAPERS;
     use super::{
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
-        apply_resume_provider_decision, interactive_initial_message,
-        needs_openrouter_context_refresh, resolve_resume_provider_decision,
-        run_startup_probes_concurrently, select_interactive_auto_trigger,
-        unavailable_sandbox_must_fail, validate_startup_permission_policy,
+        apply_resume_provider_decision, compact_headless_session_with, headless_compaction_plan,
+        interactive_initial_message, needs_openrouter_context_refresh,
+        resolve_resume_provider_decision, run_startup_probes_concurrently,
+        select_interactive_auto_trigger, unavailable_sandbox_must_fail,
+        validate_startup_permission_policy,
     };
     use crate::cli::Cli;
+
+    #[test]
+    fn headless_print_plans_compaction_for_an_over_budget_resumed_session() {
+        let mut session = crate::session::Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 90;
+        session.add_message(crate::session::MessageRole::User, &"a".repeat(40));
+        session.add_message(crate::session::MessageRole::Assistant, &"b".repeat(40));
+        let cfg = crate::config::Config {
+            compact_enabled: Some(true),
+            reserve_tokens: Some(20),
+            keep_recent_tokens: Some(5),
+            ..crate::config::Config::default()
+        };
+
+        let plan = headless_compaction_plan(
+            &session,
+            &cfg,
+            #[cfg(feature = "memory")]
+            None,
+        )
+        .expect("enabled over-budget headless history must compact before dispatch");
+
+        assert_eq!(plan.cut_idx, 1);
+        assert_eq!(plan.tokens_before, 10);
+        assert_eq!(plan.input_token_budget, 80);
+        assert_eq!(plan.response_token_budget, 20);
+    }
+
+    #[test]
+    fn headless_print_does_not_plan_compaction_when_disabled() {
+        let mut session = crate::session::Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 100;
+        session.add_message(crate::session::MessageRole::User, &"a".repeat(80));
+        assert!(
+            headless_compaction_plan(
+                &session,
+                &crate::config::Config::default(),
+                #[cfg(feature = "memory")]
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_print_compacts_resumed_history_before_provider_dispatch() {
+        let mut session = crate::session::Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 90;
+        session.add_message(crate::session::MessageRole::User, &"a".repeat(40));
+        session.add_message(crate::session::MessageRole::Assistant, &"b".repeat(40));
+        let cfg = crate::config::Config {
+            compact_enabled: Some(true),
+            reserve_tokens: Some(20),
+            keep_recent_tokens: Some(5),
+            ..crate::config::Config::default()
+        };
+
+        let result = compact_headless_session_with(
+            &mut session,
+            &cfg,
+            #[cfg(feature = "memory")]
+            None,
+            |model, messages, previous_summary, input_budget, response_budget| async move {
+                assert_eq!(model, "model");
+                assert_eq!(messages.len(), 1);
+                assert!(previous_summary.is_none());
+                assert_eq!(input_budget, 80);
+                assert_eq!(response_budget, 20);
+                Ok("HEADLESS_SUMMARY".to_string())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, Some(("HEADLESS_SUMMARY".to_string(), 1)));
+        assert_eq!(session.compactions.len(), 1);
+        assert_eq!(session.messages[0].content, "HEADLESS_SUMMARY");
+        assert_eq!(session.messages.len(), 2);
+    }
     use crate::config::Config;
     use crate::sandbox::{Sandbox, SandboxPolicy};
     use crate::session::Session;
