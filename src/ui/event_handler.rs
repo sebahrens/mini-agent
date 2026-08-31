@@ -341,11 +341,17 @@ async fn handle_agent_done(
                     }
                 }
             }
-            Message::ToolResult { content, .. } => {
-                // Extract tool result content (name and output come from the message)
+            Message::ToolResult {
+                id: _,
+                call_id,
+                content,
+            } => {
+                // Extract tool result content with its call ID for proper pairing
                 if let rig::message::ToolResultContent::Text(output) = content {
-                    // Note: we don't have the tool name here, so we use a fallback
-                    ui.session.add_tool_result_with_id("", "unknown", output);
+                    // use the call_id to correlate with the corresponding tool call
+                    let call_id_str = call_id.as_deref().unwrap_or("");
+                    ui.session
+                        .add_tool_result_with_id(call_id_str, "unknown", output);
                 }
             }
             _ => {}
