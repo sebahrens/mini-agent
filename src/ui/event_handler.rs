@@ -278,6 +278,8 @@ fn apply_usage_delta(
     let context_input_tokens = Session::real_input_tokens(
         anthropic_native,
         usage.input_tokens,
+        usage.total_tokens,
+        usage.output_tokens,
         usage.cached_input_tokens,
         usage.cache_creation_input_tokens,
     );

@@ -49,6 +49,30 @@ use super::{C_PERM, apply_current_prompt_mode};
 const TURN_TRACE_MAX: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MidTurnPressureAction {
+    Ignore,
+    ClearReliefLatch,
+    Compact,
+    StopContextExhausted,
+}
+
+fn mid_turn_pressure_action(
+    awaiting_compaction_relief: bool,
+    context_complete: bool,
+    over_threshold: bool,
+) -> MidTurnPressureAction {
+    if !context_complete {
+        MidTurnPressureAction::Ignore
+    } else if !over_threshold {
+        MidTurnPressureAction::ClearReliefLatch
+    } else if awaiting_compaction_relief {
+        MidTurnPressureAction::StopContextExhausted
+    } else {
+        MidTurnPressureAction::Compact
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptTarget {
     Btw,
     Validation,
@@ -997,8 +1021,14 @@ impl<'a> App<'a> {
         #[cfg(not(feature = "loop"))]
         let loop_running = false;
 
-        let is_usage_delta = matches!(&event, AgentEvent::UsageDelta { .. });
-        let mid_turn_pressure = if let AgentEvent::UsageDelta {
+        let context_complete_usage_delta = matches!(
+            &event,
+            AgentEvent::UsageDelta {
+                context_complete: true,
+                ..
+            }
+        );
+        let mid_turn_observation = if let AgentEvent::UsageDelta {
             usage,
             context_complete: true,
         } = &event
@@ -1012,14 +1042,18 @@ impl<'a> App<'a> {
             let real_input_tokens = crate::session::Session::real_input_tokens(
                 self.ui.cfg.is_anthropic_native(&self.ui.session.provider),
                 usage.input_tokens,
+                usage.total_tokens,
+                usage.output_tokens,
                 usage.cached_input_tokens,
                 usage.cache_creation_input_tokens,
             );
             let pressure = real_input_tokens as f64 / self.ui.session.context_window as f64;
-            (pressure > threshold).then_some((real_input_tokens, threshold, pressure))
+            Some((real_input_tokens, threshold, pressure))
         } else {
             None
         };
+        let mid_turn_pressure =
+            mid_turn_observation.filter(|(_, threshold, pressure)| pressure > threshold);
 
         // A failed turn is never an authoritative session state. Restore the
         // pre-turn transcript before the error handler performs its one
@@ -1076,28 +1110,40 @@ impl<'a> App<'a> {
             self.input.load_text(&text);
         }
 
-        if let Some((real_input_tokens, threshold, pressure)) = mid_turn_pressure {
-            if self.run.awaiting_compaction_relief {
+        match mid_turn_pressure_action(
+            self.run.awaiting_compaction_relief,
+            context_complete_usage_delta && mid_turn_observation.is_some(),
+            mid_turn_pressure.is_some(),
+        ) {
+            MidTurnPressureAction::StopContextExhausted => {
+                let (real_input_tokens, threshold, _) =
+                    mid_turn_pressure.expect("over-threshold action requires measured pressure");
                 if let Err(error) = self.stop_context_exhausted(real_input_tokens, threshold) {
                     self.fail_pending_main_turn();
                     return Err(error);
                 }
                 self.run.awaiting_compaction_relief = false;
-            } else {
+            }
+            MidTurnPressureAction::Compact => {
+                let (_, _, pressure) =
+                    mid_turn_pressure.expect("over-threshold action requires measured pressure");
                 if let Err(error) = self.mid_turn_compact(pressure).await {
                     self.fail_pending_main_turn();
                     return Err(error);
                 }
                 self.run.awaiting_compaction_relief = true;
             }
+            MidTurnPressureAction::ClearReliefLatch => {
+                self.run.awaiting_compaction_relief = false;
+            }
+            MidTurnPressureAction::Ignore => {}
+        }
+        if mid_turn_pressure.is_some() {
             if let Err(error) = self.refresh() {
                 self.fail_pending_main_turn();
                 return Err(error.into());
             }
             return Ok(());
-        }
-        if is_usage_delta {
-            self.run.awaiting_compaction_relief = false;
         }
 
         self.finalize_turn().await?;
@@ -2742,5 +2788,23 @@ mod initial_turn_tests {
 
         assert_eq!(session.pending_media.len(), 1);
         assert_eq!(session.pending_media[0].size(), 4);
+    }
+}
+
+#[cfg(test)]
+mod mid_turn_pressure_tests {
+    use super::{MidTurnPressureAction, mid_turn_pressure_action};
+
+    #[test]
+    fn partial_reconciliation_preserves_relief_latch_until_complete_snapshot() {
+        let first = mid_turn_pressure_action(false, true, true);
+        assert_eq!(first, MidTurnPressureAction::Compact);
+        let awaiting_relief = true;
+
+        let partial = mid_turn_pressure_action(awaiting_relief, false, false);
+        assert_eq!(partial, MidTurnPressureAction::Ignore);
+
+        let still_over = mid_turn_pressure_action(awaiting_relief, true, true);
+        assert_eq!(still_over, MidTurnPressureAction::StopContextExhausted);
     }
 }

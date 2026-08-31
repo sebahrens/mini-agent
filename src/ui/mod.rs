@@ -658,12 +658,11 @@ wide ones until pressure subsides.";
 /// (`CompletionCall` usage / context window) crosses
 /// `mid_turn_compact_threshold`, and only when `compact_enabled` is true.
 ///
-/// The in-flight run is aborted at the `CompletionCall` boundary — the model's
-/// just-returned tool calls have not executed yet, so nothing is left half
-/// applied. This turn's progress is recorded as a recap message (tool traffic
-/// lives only in the now-aborted runner and never reaches the session, so
-/// without this the agent would redo the turn), the session is compacted, and
-/// the agent is respawned on the compacted history with a continuation prompt.
+/// The pressure event crosses an asynchronous channel, so aborting the in-flight
+/// run is best-effort: a just-returned tool may have started and may be
+/// interrupted after partially applying changes. This turn's observed progress
+/// is recorded as a capped recap message, the session is compacted, and the
+/// agent is respawned on the compacted history with a continuation prompt.
 /// The dominant pressure relief is dropping the aborted run's in-flight tool
 /// context, which the respawn achieves even when the session itself is under the
 /// between-turn limit and `handle_compress` is a no-op.
@@ -690,7 +689,9 @@ pub(crate) async fn mid_turn_compact_and_respawn(
         recap.push_str("\n\n");
     }
     if !run.turn_trace.is_empty() {
-        recap.push_str("[Progress this turn before context compaction]\n");
+        recap.push_str(
+            "[Best-effort progress before context compaction; the last tool may have been interrupted and its changes may be partial]\n",
+        );
         for line in run.turn_trace.iter() {
             recap.push_str(line);
             recap.push('\n');

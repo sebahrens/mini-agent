@@ -184,8 +184,11 @@ impl Session {
                 narrow += 1;
             }
         }
-        // wide * 0.9 + narrow / 4, min 1
-        ((wide * 9 / 10) + narrow / 4).max(1)
+        // Wide text remains close to one token per character. For narrow text,
+        // 4 chars/token undercounts code and JSON before provider calibration;
+        // 13/4 (3.25 chars/token) is a deliberate conservative midpoint of the
+        // commonly observed 3-3.5 range for syntax-heavy content.
+        ((wide * 9 / 10) + narrow.saturating_mul(4) / 13).max(1)
     }
 
     fn is_wide_char(ch: char) -> bool {
@@ -506,9 +509,11 @@ impl Session {
     /// uncached portion of the prompt; the cache-read and cache-creation tokens
     /// are reported in separate fields even though they still occupy the context
     /// window. So there the real prompt size is the sum of all three. The
-    /// OpenAI, Gemini and OpenRouter shapes instead fold the cached subset into
-    /// `input_tokens` and report no cache-creation, so `input_tokens` is already
-    /// the full prompt size and adding the cache fields would double-count.
+    /// OpenAI, Gemini and OpenRouter fold the cached subset into `input_tokens`,
+    /// so adding cache-detail fields would double-count. Some compatible
+    /// gateways report a smaller `input_tokens` value but preserve the full
+    /// prompt in `total_tokens - output_tokens`; that normalized total is used
+    /// when it is larger than the primary input count.
     ///
     /// `anthropic_native` must be the *resolved protocol route*, not a literal
     /// provider-name comparison — a custom gateway with `provider_type =
@@ -518,6 +523,8 @@ impl Session {
     pub fn real_input_tokens(
         anthropic_native: bool,
         input_tokens: u64,
+        total_tokens: u64,
+        output_tokens: u64,
         cached_input_tokens: u64,
         cache_creation_input_tokens: u64,
     ) -> u64 {
@@ -526,7 +533,7 @@ impl Session {
                 .saturating_add(cached_input_tokens)
                 .saturating_add(cache_creation_input_tokens)
         } else {
-            input_tokens
+            input_tokens.max(total_tokens.saturating_sub(output_tokens))
         }
     }
 

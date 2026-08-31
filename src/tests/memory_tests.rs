@@ -1281,9 +1281,12 @@ fn multiple_compactions_stay_separated_and_ordered() {
 fn effective_reserve_adds_block_estimate() {
     // no memory -> base unchanged
     assert_eq!(effective_reserve(1000, None), 1000);
-    // some memory -> base + estimate_tokens(block) (chars/4)
+    // some memory -> base + estimate_tokens(block) (conservative narrow-text estimate)
     let block = "x".repeat(400);
-    assert_eq!(effective_reserve(1000, Some(&block)), 1000 + 100);
+    assert_eq!(
+        effective_reserve(1000, Some(&block)),
+        1000 + crate::session::Session::estimate_tokens(&block)
+    );
     // never drops below base
     assert!(effective_reserve(1000, Some("tiny")) >= 1000);
 }

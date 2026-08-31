@@ -625,8 +625,30 @@ context limit, the error points to `/compress` and `compact_enabled` recovery.
 
 `mid_turn_compact_threshold` opts in to a second, *within-turn* check. On every
 provider call zerostack compares the real provider-reported prompt size against
-`context_window`; when the ratio crosses the threshold it stops the run at a
-clean boundary, compacts, and resumes the same task on the compacted history.
+`context_window`; when the ratio crosses the threshold it aborts the current
+run, compacts, and resumes the same task on the compacted history. The usage
+event and abort cross an asynchronous channel, so a tool may already have
+started and may be interrupted after partial effects. The continuation receives
+a capped best-effort recap that labels this risk; inspect the working tree when
+the last tool may have mutated files.
+
+Provider usage is normalized without double-counting cache detail. Anthropic's
+native Messages API reports uncached `input_tokens`, cache reads, and cache
+writes separately, so all three count toward prompt pressure. OpenAI input
+counts [include cached tokens](https://platform.openai.com/docs/api-reference/usage/audio_transcriptions_object),
+OpenRouter returns cached tokens as a breakdown of
+[`prompt_tokens`](https://openrouter.ai/docs/guides/best-practices/prompt-caching),
+and Gemini says
+[`promptTokenCount` includes cached content](https://ai.google.dev/api/generate-content).
+Those routes therefore use the primary input count. For a non-native compatible
+gateway that reports cache components separately, zerostack uses the larger
+normalized `total_tokens - output_tokens` prompt count rather than adding cache
+details blindly.
+
+Before the first provider usage calibration, narrow text is estimated at a
+conservative 3.25 characters per token instead of 4. This safety margin targets
+code and JSON, which tokenize more densely; real usage replaces the estimate as
+soon as a complete provider snapshot arrives.
 
 - **Unset by default.** With no value set, behavior is unchanged: no mid-turn
   compaction. Setting a value is the opt-in.

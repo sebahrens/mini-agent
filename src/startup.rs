@@ -1551,7 +1551,10 @@ mod tests {
         .expect("enabled over-budget headless history must compact before dispatch");
 
         assert_eq!(plan.cut_idx, 1);
-        assert_eq!(plan.tokens_before, 10);
+        assert_eq!(
+            plan.tokens_before,
+            crate::session::Session::estimate_tokens(&"a".repeat(40))
+        );
         assert_eq!(plan.input_token_budget, 80);
         assert_eq!(plan.response_token_budget, 20);
     }

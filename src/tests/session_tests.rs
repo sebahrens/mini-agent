@@ -24,7 +24,7 @@ fn estimate_tokens_rounds_down() {
 
 #[test]
 fn estimate_tokens_long() {
-    assert_eq!(Session::estimate_tokens(&"x".repeat(100)), 25);
+    assert_eq!(Session::estimate_tokens(&"x".repeat(100)), 30);
 }
 
 #[test]
@@ -50,9 +50,21 @@ fn estimate_tokens_mixed_cjk_and_latin() {
 }
 
 #[test]
-fn estimate_tokens_pure_ascii_matches_old_formula() {
+fn estimate_tokens_ascii_uses_code_safe_divisor() {
     let text = "the quick brown fox jumps over the lazy dog";
-    assert_eq!(Session::estimate_tokens(text), text.len() as u64 / 4);
+    assert_eq!(Session::estimate_tokens(text), text.len() as u64 * 4 / 13);
+}
+
+#[test]
+fn estimate_tokens_code_fixture_has_documented_pre_calibration_margin() {
+    let code = r#"{"users":[{"id":1,"active":true},{"id":2,"active":false}],"next":null}"#;
+    let old_chars_over_four = code.chars().count() as u64 / 4;
+
+    assert!(Session::estimate_tokens(code) > old_chars_over_four);
+    assert_eq!(
+        Session::estimate_tokens(code),
+        code.chars().count() as u64 * 4 / 13
+    );
 }
 
 #[test]
@@ -103,16 +115,29 @@ fn real_input_tokens_native_route_adds_cache_fields() {
     // The Anthropic-native route reports input_tokens excluding cached/
     // cache-creation tokens, so the real prompt size is the sum of all three.
     // A cache hit (input ~0, cached large) must NOT collapse the measured context.
-    assert_eq!(Session::real_input_tokens(true, 10, 7000, 0), 7010);
-    assert_eq!(Session::real_input_tokens(true, 0, 7000, 0), 7000);
-    assert_eq!(Session::real_input_tokens(true, 50, 0, 6000), 6050);
+    assert_eq!(Session::real_input_tokens(true, 10, 0, 0, 7000, 0), 7010);
+    assert_eq!(Session::real_input_tokens(true, 0, 0, 0, 7000, 0), 7000);
+    assert_eq!(Session::real_input_tokens(true, 50, 0, 0, 0, 6000), 6050);
 }
 
 #[test]
-fn real_input_tokens_non_native_uses_input_only() {
+fn real_input_tokens_non_native_uses_cache_inclusive_input_only() {
     // OpenAI/Gemini/OpenRouter fold the cached subset into input_tokens and
     // report no cache-creation; adding the cache fields would double-count.
-    assert_eq!(Session::real_input_tokens(false, 7000, 5600, 0), 7000);
+    assert_eq!(
+        Session::real_input_tokens(false, 7000, 7010, 10, 5600, 0),
+        7000
+    );
+}
+
+#[test]
+fn real_input_tokens_non_native_recovers_separately_reported_cache_from_total() {
+    // Some compatible gateways expose uncached input and cached components
+    // separately while retaining their sum in total_tokens.
+    assert_eq!(
+        Session::real_input_tokens(false, 400, 1110, 10, 600, 100),
+        1100
+    );
 }
 
 #[test]
@@ -215,7 +240,7 @@ fn charge_usage_delta_saturates_persisted_token_totals() {
 }
 
 // Helper: a session with `n` ASCII messages of `len` chars each, so every
-// message has a predictable estimated_tokens == len/4.
+// message has the same predictable narrow-text estimate.
 fn session_with_messages(n: usize, len: usize) -> Session {
     let mut s = Session::new("openai", "gpt-4", 128000, "");
     for _ in 0..n {
@@ -226,16 +251,19 @@ fn session_with_messages(n: usize, len: usize) -> Session {
 
 #[test]
 fn compaction_cut_keeps_recent_within_budget() {
-    // 4 messages × 10 tokens = 40 total. keep_recent=15 reaches back across
-    // the last two (20 tokens), so the first two are summarized.
+    // 4 messages × 12 tokens = 48 total. keep_recent=15 reaches back across
+    // the last two (24 tokens), so the first two are summarized.
     let s = session_with_messages(4, 40);
-    assert_eq!(s.messages[0].estimated_tokens, 10);
+    assert_eq!(
+        s.messages[0].estimated_tokens,
+        Session::estimate_tokens(&"x".repeat(40))
+    );
     assert_eq!(Session::select_compaction_cut(&s.messages, 15), 2);
 }
 
 #[test]
 fn compaction_cut_oversized_keep_recent_summarizes_nothing() {
-    // Regression: keep_recent (100) larger than the whole history (40) must
+    // Regression: keep_recent (100) larger than the whole history must
     // keep the recent messages, NOT summarize everything (cut == 0, which the
     // caller treats as "entire context is recent").
     let s = session_with_messages(4, 40);
@@ -250,7 +278,7 @@ fn compaction_cut_zero_keep_recent_summarizes_all() {
 
 #[test]
 fn compaction_cut_single_message_is_kept() {
-    let s = session_with_messages(1, 40); // 1 msg, 10 tokens
+    let s = session_with_messages(1, 40);
     assert_eq!(Session::select_compaction_cut(&s.messages, 5), 0);
 }
 
