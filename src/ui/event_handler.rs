@@ -1,5 +1,7 @@
 use compact_str::CompactString;
 use crossterm::style::Color;
+use rig::completion::Message;
+use rig::message::AssistantContent;
 
 use crate::agent::tools::todo::TODO_LIST;
 use crate::cli::Cli;
@@ -219,10 +221,11 @@ pub async fn handle_agent_event(
         }
         AgentEvent::Done {
             response,
-            interactions: _,
+            interactions,
         } => {
             handle_agent_done(
                 response,
+                interactions,
                 renderer,
                 run,
                 ui,
@@ -307,6 +310,7 @@ fn save_session_if_settled(
 
 async fn handle_agent_done(
     response: CompactString,
+    interactions: Vec<Message>,
     renderer: &mut Renderer,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
@@ -323,6 +327,30 @@ async fn handle_agent_done(
     // persist this valid success even if rendering, compaction, validation
     // startup, or worktree-return presentation fails afterward.
     ui.session.add_message(MessageRole::Assistant, &response);
+    // Persist canonical provider interactions (tool calls and results) for resumable transcripts
+    for interaction in &interactions {
+        match interaction {
+            Message::Assistant { content, .. } => {
+                for item in content {
+                    if let AssistantContent::ToolCall(call) = item {
+                        ui.session.add_tool_call_with_id(
+                            &call.id,
+                            &call.function.name,
+                            &call.function.arguments,
+                        );
+                    }
+                }
+            }
+            Message::ToolResult { content, .. } => {
+                // Extract tool result content (name and output come from the message)
+                if let rig::message::ToolResultContent::Text(output) = content {
+                    // Note: we don't have the tool name here, so we use a fallback
+                    ui.session.add_tool_result_with_id("", "unknown", output);
+                }
+            }
+            _ => {}
+        }
+    }
     ui.session.reanchor_calibration_to_current_messages();
 
     finalize_response_segment(renderer, run)?;

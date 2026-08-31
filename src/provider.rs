@@ -995,7 +995,7 @@ impl AnyAgent {
         // `--loop` iteration/active state; see `runner::run_print`. `None`
         // for plain `-p` one-shot runs.
         #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-    ) -> anyhow::Result<(String, rig::completion::Usage)> {
+    ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)> {
         #[cfg(feature = "skills")]
         let _turn_guard = if self.skills.is_some() {
             Some(self.turn_gate.lock().await)

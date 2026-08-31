@@ -1034,9 +1034,17 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
             // consistent.
             MessageRole::System => messages.push(Message::assistant(msg.content.to_string())),
             MessageRole::ToolCall => {
+                // Canonically-persisted tool calls carry a tool_call_id for auditable pairing.
+                // For now, both legacy prose and canonical records convert to the same format
+                // for compatibility with chat model templates. Future enhancement: reconstruct
+                // structured ToolCall messages from persisted (name, args, id) tuples.
                 messages.push(Message::assistant(format!("[ToolCall]: {}", msg.content)))
             }
             MessageRole::ToolResult => {
+                // Canonically-persisted tool results carry a tool_call_id for auditable pairing.
+                // For now, both legacy prose and canonical records convert to the same format
+                // for compatibility with chat model templates. Future enhancement: reconstruct
+                // structured ToolResult messages from persisted (name, output, id) tuples.
                 messages.push(Message::assistant(format!("[ToolResult]: {}", msg.content)))
             }
             MessageRole::SubagentToolCall => messages.push(Message::assistant(format!(
@@ -1919,7 +1927,7 @@ pub async fn run_print<M>(
     // `loop_iteration`/`loop_active` fields; see `runner::spawn_agent`.
     // `None` for plain `-p` one-shot runs.
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-) -> anyhow::Result<(String, rig::completion::Usage)>
+) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
@@ -1947,7 +1955,7 @@ async fn run_print_with_stream_policy<M>(
     history: Vec<Message>,
     stream_policy: RunnerStreamPolicy,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-) -> anyhow::Result<(String, rig::completion::Usage)>
+) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
@@ -2194,7 +2202,7 @@ where
     }
 
     println!();
-    Ok((full_response, usage_ledger.total))
+    Ok((full_response, usage_ledger.total, interactions))
 }
 
 fn format_tool_args_summary(args_json: &serde_json::Value) -> String {

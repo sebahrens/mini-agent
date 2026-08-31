@@ -106,7 +106,7 @@ pub(crate) async fn run_headless_loop(
             )
             .await
         {
-            Ok((r, _usage)) => {
+            Ok((r, _usage, _interactions)) => {
                 if let Some(ss) = status_signals.as_ref() {
                     ss.send_stop();
                 }

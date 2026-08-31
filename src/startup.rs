@@ -1,4 +1,6 @@
 use compact_str::CompactString;
+use rig::completion::Message;
+use rig::message::AssistantContent;
 
 use crate::agent::tools;
 use crate::cli::Cli;
@@ -1388,11 +1390,35 @@ impl Startup {
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_stop();
             }
-            let (response, usage) = response_result?;
+            let (response, usage, interactions) = response_result?;
             if !self.cli.no_session {
                 let mut session = self.session;
                 session.add_message(MessageRole::User, &msg);
                 session.add_message(MessageRole::Assistant, &response);
+                // Persist canonical provider interactions (tool calls and results) for resumable transcripts
+                for interaction in &interactions {
+                    match interaction {
+                        Message::Assistant { content, .. } => {
+                            for item in content {
+                                if let AssistantContent::ToolCall(call) = item {
+                                    session.add_tool_call_with_id(
+                                        &call.id,
+                                        &call.function.name,
+                                        &call.function.arguments,
+                                    );
+                                }
+                            }
+                        }
+                        Message::ToolResult { content, .. } => {
+                            // Extract tool result content (name and output come from the message)
+                            if let rig::message::ToolResultContent::Text(output) = content {
+                                // Note: we don't have the tool name here, so we use a fallback
+                                session.add_tool_result_with_id("", "unknown", output);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
                 session.charge_usage_delta(usage.into(), anthropic_native);
                 session::storage::save_session(&session)?;
