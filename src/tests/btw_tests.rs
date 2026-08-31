@@ -71,3 +71,36 @@ fn snapshot_does_not_mutate_session() {
     session.add_message(MessageRole::User, "again");
     assert_eq!(session.messages.len(), before_len + 1);
 }
+
+#[cfg(all(test, feature = "git-worktree"))]
+mod btw_lifecycle_tests {
+    use std::time::Duration;
+
+    use crate::ui::retire_scoped_task;
+
+    #[tokio::test]
+    async fn retire_scoped_task_cancels_and_settles_within_timeout() {
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let task = tokio::spawn(async {
+            // Infinite sleep — only abort() stops this.
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        // retire_scoped_task aborts the task and awaits it; must complete < 1 s.
+        let result = retire_scoped_task(task, scope, "test", Duration::from_secs(1)).await;
+        assert!(result.is_ok(), "retire must succeed within 1s: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn abort_handle_finishes_task_immediately() {
+        let task = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        task.abort_handle().abort();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(task.is_finished(), "task must be finished after abort");
+    }
+}

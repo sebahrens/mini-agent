@@ -47,6 +47,7 @@ use super::{
 use super::{C_PERM, apply_current_prompt_mode};
 
 const TURN_TRACE_MAX: usize = 64;
+const BTW_MAX_INFLIGHT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MidTurnPressureAction {
@@ -575,8 +576,17 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    pub(crate) async fn teardown(self) {
+    pub(crate) async fn teardown(mut self) {
         self.running.store(false, Ordering::Relaxed);
+
+        // Cancel and await all in-flight btw tasks with a timeout
+        const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+        for (_, abort, task, scope) in self.btw_abort.drain(..) {
+            abort.abort();
+            scope.cancellation_handle().cancel();
+            let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, task).await;
+        }
+
         if let Some(h) = self.event_handle {
             let _ = h.join();
         }
@@ -1507,6 +1517,16 @@ impl<'a> App<'a> {
             .unwrap_or("");
         if btw_text.is_empty() {
             self.renderer.write_line("usage: /btw <message>", C_AGENT)?;
+            return Ok(());
+        }
+        if self.btw_inflight >= BTW_MAX_INFLIGHT {
+            self.renderer.write_line(
+                &format!(
+                    "[btw] too many side questions in flight (max {}); try again when one completes",
+                    BTW_MAX_INFLIGHT
+                ),
+                C_ERROR,
+            )?;
             return Ok(());
         }
         let id = self.btw_next_id;
