@@ -690,6 +690,30 @@ impl Session {
         self.effective_context_tokens() > self.context_window.saturating_sub(reserve_tokens)
     }
 
+    /// Like `needs_compaction` but also accounts for `pending_tokens` that
+    /// will be added to the request (pending user prompt, pending media).
+    /// Use this for pre-dispatch preflight so compaction decisions include
+    /// the payload that is about to be sent.
+    pub fn needs_compaction_with_pending(&self, reserve_tokens: u64, pending_tokens: u64) -> bool {
+        if self.context_window == 0 {
+            return false;
+        }
+        self.effective_context_tokens()
+            .saturating_add(pending_tokens)
+            > self.context_window.saturating_sub(reserve_tokens)
+    }
+
+    /// Returns true when the pending payload cannot fit even if the entire
+    /// message history were removed. When this is true, compaction cannot
+    /// create enough room and the request must be rejected locally.
+    pub fn is_irreducible_with_pending(&self, reserve_tokens: u64, pending_tokens: u64) -> bool {
+        if self.context_window == 0 {
+            return false;
+        }
+        self.overhead_tokens.saturating_add(pending_tokens)
+            >= self.context_window.saturating_sub(reserve_tokens)
+    }
+
     pub fn update_context_window(&mut self, cw: u64) {
         self.context_window = cw;
     }
@@ -743,6 +767,93 @@ impl Session {
         self.reset_calibration();
         self.rewind_undo = None;
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+
+    fn session_with(context_window: u64, overhead: u64, message_tokens: u64) -> Session {
+        let mut s = Session::new("openai", "model", context_window, "");
+        s.overhead_tokens = overhead;
+        if message_tokens > 0 {
+            s.add_message(MessageRole::User, &"x".repeat(message_tokens as usize));
+        }
+        s
+    }
+
+    #[test]
+    fn needs_compaction_with_pending_zero_window_never_triggers() {
+        let s = session_with(0, 0, 0);
+        assert!(!s.needs_compaction_with_pending(0, 999_999));
+    }
+
+    #[test]
+    fn needs_compaction_with_pending_fits_when_sum_under_budget() {
+        // window=100, reserve=20, budget=80; effective=30, pending=40 => 70 <= 80
+        let s = session_with(100, 20, 10);
+        assert!(!s.needs_compaction_with_pending(20, 40));
+    }
+
+    #[test]
+    fn needs_compaction_with_pending_triggers_when_pending_overflows() {
+        // window=100, reserve=20, budget=80; effective=30, pending=60 => 90 > 80
+        let s = session_with(100, 20, 10);
+        assert!(s.needs_compaction_with_pending(20, 60));
+    }
+
+    #[test]
+    fn needs_compaction_with_pending_saturates_arithmetic_safely() {
+        let s = session_with(100, 0, 0);
+        // Huge pending: saturating_add must not panic or wrap.
+        assert!(s.needs_compaction_with_pending(0, u64::MAX));
+    }
+
+    #[test]
+    fn is_irreducible_zero_window_never_triggers() {
+        let s = session_with(0, 0, 0);
+        assert!(!s.is_irreducible_with_pending(0, 999_999));
+    }
+
+    #[test]
+    fn is_irreducible_when_overhead_plus_pending_fills_window() {
+        // window=100, reserve=20, budget=80; overhead=40, pending=40 => 80 >= 80
+        let s = session_with(100, 40, 0);
+        assert!(s.is_irreducible_with_pending(20, 40));
+    }
+
+    #[test]
+    fn is_irreducible_false_when_overhead_plus_pending_fits() {
+        // window=100, reserve=20, budget=80; overhead=20, pending=30 => 50 < 80
+        let s = session_with(100, 20, 0);
+        assert!(!s.is_irreducible_with_pending(20, 30));
+    }
+
+    #[test]
+    fn is_irreducible_saturates_arithmetic_safely() {
+        let s = session_with(100, 0, 0);
+        assert!(s.is_irreducible_with_pending(0, u64::MAX));
+    }
+
+    #[test]
+    fn calibrated_session_needs_compaction_with_pending_uses_calibrated_anchor() {
+        let mut s = session_with(200, 0, 0);
+        // Simulate calibration: 150 tokens used, 5 messages counted.
+        s.calibrated_tokens = 150;
+        s.calibrated_msg_count = 0;
+        // calibrated=150, pending=30 => 180; window=200, reserve=10, budget=190 => no compact
+        assert!(!s.needs_compaction_with_pending(10, 30));
+        // pending=60 => 210 > 190 => compact needed
+        assert!(s.needs_compaction_with_pending(10, 60));
+    }
+
+    #[test]
+    fn unknown_context_window_zero_never_triggers() {
+        // A session where context_window is still 0 (unknown) must not fire.
+        let s = session_with(0, 50, 20);
+        assert!(!s.needs_compaction_with_pending(10, 100));
+        assert!(!s.is_irreducible_with_pending(10, 100));
     }
 }
 

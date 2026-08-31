@@ -1336,6 +1336,47 @@ impl<'a> App<'a> {
     }
 
     async fn start_main_run(&mut self, text: &str) {
+        // Preflight: if the pending payload is irreducibly too large, reject
+        // locally before any provider I/O or session mutation.
+        let text_tokens = crate::session::Session::estimate_tokens(text);
+        // Rough conservative estimate: treat each media attachment as ~2 KiB of
+        // token-equivalent overhead regardless of content type. Exact accounting
+        // is provider-specific and not available at preflight time.
+        #[cfg(feature = "multimodal")]
+        const MEDIA_TOKENS_PER_ATTACHMENT: u64 = 2048;
+        #[cfg(feature = "multimodal")]
+        let pending_tokens = text_tokens.saturating_add(
+            self.ui.session.pending_media.len() as u64 * MEDIA_TOKENS_PER_ATTACHMENT,
+        );
+        #[cfg(not(feature = "multimodal"))]
+        let pending_tokens = text_tokens;
+        let quick_models = config::quick_models_map(self.ui.cfg);
+        let reserve = self.ui.cfg.resolve_reserve_tokens(
+            &self.ui.session.model,
+            &quick_models,
+            self.ui.session.context_window,
+        );
+        if self
+            .ui
+            .session
+            .is_irreducible_with_pending(reserve, pending_tokens)
+        {
+            let available = self
+                .ui
+                .session
+                .context_window
+                .saturating_sub(reserve)
+                .saturating_sub(self.ui.session.overhead_tokens);
+            let _ = self.renderer.write_line(
+                &format!(
+                    "message too large to fit: estimated {pending_tokens} tokens, \
+                     only ~{available} tokens available after overhead and reserve \
+                     (use /clear to free space or reduce message size)"
+                ),
+                C_ERROR,
+            );
+            return;
+        }
         start_main_run(
             text,
             true,

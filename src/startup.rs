@@ -323,9 +323,12 @@ struct HeadlessCompactionPlan {
     response_token_budget: u64,
 }
 
+// `pending_tokens`: estimated tokens in the pending request payload (user
+// prompt + media) to include in the compaction decision.
 fn headless_compaction_plan(
     session: &Session,
     cfg: &Config,
+    pending_tokens: u64,
     #[cfg(feature = "memory")] memory: Option<&str>,
 ) -> Option<HeadlessCompactionPlan> {
     if !cfg.resolve_compact_enabled() {
@@ -338,7 +341,7 @@ fn headless_compaction_plan(
     let reserve = crate::extras::memory::effective_reserve(configured_reserve, memory);
     #[cfg(not(feature = "memory"))]
     let reserve = configured_reserve;
-    if !session.needs_compaction(reserve) {
+    if !session.needs_compaction_with_pending(reserve, pending_tokens) {
         return None;
     }
 
@@ -364,10 +367,12 @@ async fn compact_headless_session_if_needed(
     client: &AnyClient,
     cfg: &Config,
     context: &ContextFiles,
+    pending_tokens: u64,
 ) -> anyhow::Result<bool> {
     let compacted = compact_headless_session_with(
         session,
         cfg,
+        pending_tokens,
         #[cfg(feature = "memory")]
         context.memory.as_deref(),
         |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
@@ -400,6 +405,7 @@ async fn compact_headless_session_if_needed(
 async fn compact_headless_session_with<S, F>(
     session: &mut Session,
     cfg: &Config,
+    pending_tokens: u64,
     #[cfg(feature = "memory")] memory: Option<&str>,
     summarize: S,
 ) -> anyhow::Result<Option<(String, usize)>>
@@ -410,6 +416,7 @@ where
     let Some(plan) = headless_compaction_plan(
         session,
         cfg,
+        pending_tokens,
         #[cfg(feature = "memory")]
         memory,
     ) else {
@@ -1323,11 +1330,35 @@ impl Startup {
                 eprintln!("error: empty command after '!'");
             }
         } else {
+            let pending_tokens = Session::estimate_tokens(&msg);
+            // Preflight: reject locally when the payload cannot fit even after
+            // a full compaction. This avoids a provider call that would fail or
+            // silently truncate context.
+            let quick_models = config::quick_models_map(&self.cfg);
+            let reserve = self.cfg.resolve_reserve_tokens(
+                &self.session.model,
+                &quick_models,
+                self.session.context_window,
+            );
+            if self
+                .session
+                .is_irreducible_with_pending(reserve, pending_tokens)
+            {
+                anyhow::bail!(
+                    "message is too large to fit in the context window \
+                     (estimated {pending_tokens} tokens; overhead {oh} tokens; \
+                     window {cw} tokens; reserve {reserve} tokens): \
+                     reduce the message size or clear the session with /clear",
+                    oh = self.session.overhead_tokens,
+                    cw = self.session.context_window,
+                );
+            }
             compact_headless_session_if_needed(
                 &mut self.session,
                 &self.client,
                 &self.cfg,
                 &self.context,
+                pending_tokens,
             )
             .await?;
             let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
@@ -1583,6 +1614,7 @@ mod tests {
         let plan = headless_compaction_plan(
             &session,
             &cfg,
+            0,
             #[cfg(feature = "memory")]
             None,
         )
@@ -1598,6 +1630,50 @@ mod tests {
     }
 
     #[test]
+    fn headless_compaction_plan_includes_pending_prompt_tokens() {
+        // Session well within budget on its own, but pending prompt pushes it over.
+        // Two messages are needed so select_compaction_cut can return a non-zero cut.
+        let mut session = crate::session::Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 10;
+        // Older message (to be cut) + recent message (to be kept).
+        session.add_message(crate::session::MessageRole::User, &"a".repeat(40));
+        session.add_message(crate::session::MessageRole::Assistant, &"b".repeat(10));
+        let cfg = crate::config::Config {
+            compact_enabled: Some(true),
+            reserve_tokens: Some(20),
+            // keep_recent_tokens must be <= the assistant message's estimated tokens
+            // so that select_compaction_cut finds a non-zero cut index (the older
+            // user message gets summarized, the recent assistant message is kept).
+            keep_recent_tokens: Some(3),
+            ..crate::config::Config::default()
+        };
+        // Without pending tokens: overhead(10)+msgs ~25 tokens, well under budget=80.
+        assert!(
+            headless_compaction_plan(
+                &session,
+                &cfg,
+                0,
+                #[cfg(feature = "memory")]
+                None,
+            )
+            .is_none(),
+            "session alone must not trigger compaction"
+        );
+        // With pending=60 the total ~25+60=85 > 80; plan must be produced.
+        assert!(
+            headless_compaction_plan(
+                &session,
+                &cfg,
+                60,
+                #[cfg(feature = "memory")]
+                None,
+            )
+            .is_some(),
+            "pending prompt must trigger compaction"
+        );
+    }
+
+    #[test]
     fn headless_print_does_not_plan_compaction_when_disabled() {
         let mut session = crate::session::Session::new("openai", "model", 100, "");
         session.overhead_tokens = 100;
@@ -1606,6 +1682,7 @@ mod tests {
             headless_compaction_plan(
                 &session,
                 &crate::config::Config::default(),
+                0,
                 #[cfg(feature = "memory")]
                 None,
             )
@@ -1629,6 +1706,7 @@ mod tests {
         let result = compact_headless_session_with(
             &mut session,
             &cfg,
+            0,
             #[cfg(feature = "memory")]
             None,
             |model, messages, previous_summary, input_budget, response_budget| async move {
