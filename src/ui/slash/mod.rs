@@ -370,6 +370,14 @@ pub fn undo_last(session: &mut Session) -> usize {
     removed
 }
 
+fn summarizer_input_budget(context_window: u64, reserve: u64) -> u64 {
+    if context_window == 0 {
+        128_000
+    } else {
+        context_window.saturating_sub(reserve)
+    }
+}
+
 pub async fn handle_compress(
     instructions: Option<&str>,
     auto: bool,
@@ -394,6 +402,7 @@ pub async fn handle_compress(
         .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window);
     let keep_recent = ui.cfg.resolve_keep_recent_tokens(ui.session.context_window);
     let max_tokens = ui.session.context_window.saturating_sub(reserve);
+    let summarizer_input_budget = summarizer_input_budget(ui.session.context_window, reserve);
 
     // Auto-compaction only makes sense when actually over budget; manual
     // /compress is the user's explicit intent, so it skips the budget gate and
@@ -433,6 +442,8 @@ pub async fn handle_compress(
             messages_to_summarize,
             previous_summary,
             instructions,
+            summarizer_input_budget,
+            reserve,
         )
         .await?;
 
@@ -469,6 +480,17 @@ pub async fn handle_compress(
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod compaction_budget_tests {
+    use super::summarizer_input_budget;
+
+    #[test]
+    fn known_exhausted_window_does_not_use_unknown_window_fallback() {
+        assert_eq!(summarizer_input_budget(8_000, 8_000), 0);
+        assert_eq!(summarizer_input_budget(0, 0), 128_000);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

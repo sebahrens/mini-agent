@@ -1455,8 +1455,9 @@ where
                     }
                     Some(Err(e)) => {
                         tracing::error!("agent non-retryable error on attempt {attempt}: {e}");
+                        let error = retry::with_context_length_hint(&e.to_string());
                         let _ = event_tx
-                            .send(AgentEvent::Error(CompactString::new(e.to_string())))
+                            .send(AgentEvent::Error(CompactString::new(error)))
                             .await;
                         return;
                     }
@@ -1770,8 +1771,9 @@ where
                             &event_tx,
                         )
                         .await;
+                        let error = retry::with_context_length_hint(&e.to_string());
                         let _ = event_tx
-                            .send(AgentEvent::Error(CompactString::new(e.to_string())))
+                            .send(AgentEvent::Error(CompactString::new(error)))
                             .await;
                         return;
                     }
@@ -1961,7 +1963,7 @@ where
         async move { agent.stream_chat(p, h).max_turns(max_turns).await }
     })
     .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    .map_err(|e| anyhow::anyhow!(retry::with_context_length_hint(&e.to_string())))?;
     let mut stream = stream_policy.apply(stream);
 
     let retry_history: Vec<Message> = history;
@@ -2128,7 +2130,9 @@ where
                     // non-zero and must never persist an empty assistant turn
                     // (which would then be replayed as history on `--continue`).
                     tool_calls.finalize_unresolved(&mut interactions);
-                    return Err(anyhow::anyhow!("{e}"));
+                    return Err(anyhow::anyhow!(retry::with_context_length_hint(
+                        &e.to_string()
+                    )));
                 }
             }
         }
@@ -2381,6 +2385,59 @@ mod tests {
             model.requests().is_empty(),
             "aborting before start must never enter provider work"
         );
+    }
+
+    #[tokio::test]
+    async fn context_length_stream_errors_include_compaction_guidance_on_both_surfaces() {
+        let interactive_model =
+            MockCompletionModel::from_stream_turns(vec![vec![MockStreamEvent::error(
+                "context_length_exceeded",
+            )]]);
+        let mut runner = super::spawn_agent(
+            AgentBuilder::new(interactive_model).build(),
+            "oversized prompt".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let interactive_error = loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Error(error) => break error.to_string(),
+                crate::event::AgentEvent::Done { .. } => {
+                    panic!("context overflow must not produce interactive success")
+                }
+                _ => {}
+            }
+        };
+        assert!(interactive_error.contains("context_length_exceeded"));
+        assert!(interactive_error.contains("/compress"));
+        assert!(interactive_error.contains("compact_enabled = true"));
+
+        let headless_model =
+            MockCompletionModel::from_stream_turns(vec![vec![MockStreamEvent::error(
+                "context_length_exceeded",
+            )]]);
+        let headless_agent = AgentBuilder::new(headless_model).build();
+        let headless_error = super::run_print(
+            &headless_agent,
+            "oversized prompt",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect_err("context overflow must not produce headless success")
+        .to_string();
+        assert!(headless_error.contains("context_length_exceeded"));
+        assert!(headless_error.contains("/compress"));
+        assert!(headless_error.contains("compact_enabled = true"));
     }
 
     impl<M: CompletionModel> AgentHook<M> for RetryInvalidTool {

@@ -71,6 +71,35 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// Provider-neutral recognition for errors that mean the submitted prompt did
+/// not fit the model context window. These are non-retryable without changing
+/// the conversation, so callers should surface compaction guidance instead of
+/// suggesting an ordinary retry.
+pub fn is_context_length_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("max context length")
+        || lower.contains("prompt is too long")
+        || lower.contains("request too large for model")
+        || (lower.contains("context window")
+            && (lower.contains("exceed")
+                || lower.contains("too long")
+                || lower.contains("too large")))
+        || (lower.contains("context limit")
+            && (lower.contains("exceed") || lower.contains("too long")))
+}
+
+pub fn with_context_length_hint(message: &str) -> String {
+    if is_context_length_error_message(message) {
+        format!(
+            "{message}\nContext limit reached. Run /compress before retrying. To compact automatically before future requests, set compact_enabled = true."
+        )
+    } else {
+        message.to_string()
+    }
+}
+
 pub async fn retry_stream_chat<T, E, Fut, S>(
     config: &RetryConfig,
     mut factory: impl FnMut() -> Fut,
@@ -170,5 +199,34 @@ mod tests {
         let inner = io::Error::new(io::ErrorKind::TimedOut, "timed out");
         let outer = io::Error::other(inner);
         assert!(is_retryable(&outer));
+    }
+
+    #[test]
+    fn context_length_classifier_covers_provider_variants() {
+        for message in [
+            "Anthropic API error: prompt is too long: 201000 tokens > 200000 maximum",
+            "OpenAI: This model's maximum context length is 128000 tokens",
+            "OpenRouter upstream error: context_length_exceeded",
+            "input exceeds the context window for this model",
+        ] {
+            assert!(
+                is_context_length_error_message(message),
+                "missed provider variant: {message}"
+            );
+        }
+        assert!(!is_context_length_error_message(
+            "HTTP 400: invalid temperature"
+        ));
+    }
+
+    #[test]
+    fn context_length_hint_names_manual_and_automatic_recovery() {
+        let hinted = with_context_length_hint("context_length_exceeded");
+        assert!(hinted.contains("/compress"));
+        assert!(hinted.contains("compact_enabled = true"));
+        assert_eq!(
+            with_context_length_hint("permission denied"),
+            "permission denied"
+        );
     }
 }

@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::future::Future;
 use std::time::Duration;
 
 use compact_str::CompactString;
@@ -28,6 +30,33 @@ use crate::permission::checker::PermCheck;
 use crate::retry::{self, RetryConfig};
 use crate::sandbox::Sandbox;
 use crate::session::SessionMessage;
+
+const MAX_COMPACTION_REQUESTS: usize = 16;
+const MAX_ROLLING_SUMMARY_BYTES: usize = 16 * 1024;
+const COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
+const PROVIDER_ENVELOPE_TOKEN_RESERVE: u64 = 512;
+const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 256;
+const MAX_SUMMARY_OUTPUT_TOKENS: u64 = 4_096;
+const NO_PREVIOUS_SUMMARY: &str = "(none)";
+const OLDER_HISTORY_OMITTED: &str = "[older history omitted to bound compaction work]\n";
+
+pub(crate) fn compaction_request_limits(
+    input_token_budget: u64,
+    response_token_budget: u64,
+    preamble_bytes: usize,
+) -> (usize, u64) {
+    let max_output_tokens =
+        response_token_budget.clamp(MIN_SUMMARY_OUTPUT_TOKENS, MAX_SUMMARY_OUTPUT_TOKENS);
+    let borrowed_output_headroom = max_output_tokens.saturating_sub(response_token_budget);
+    let bounded_input_tokens = input_token_budget
+        .saturating_sub(borrowed_output_headroom)
+        .saturating_sub(PROVIDER_ENVELOPE_TOKEN_RESERVE);
+    let request_budget = bounded_input_tokens.try_into().unwrap_or(usize::MAX);
+    (
+        request_budget.saturating_sub(preamble_bytes),
+        max_output_tokens,
+    )
+}
 
 pub struct ProviderConfig {
     pub kind: ProviderKind,
@@ -239,17 +268,193 @@ impl AnyClient {
         messages: &[SessionMessage],
         previous_summary: Option<&str>,
         instructions: Option<&str>,
+        input_token_budget: u64,
+        response_token_budget: u64,
     ) -> anyhow::Result<String> {
         let conversation = serialize_conversation(messages);
+        let preamble = summarizer_preamble();
+        let (prompt_budget, max_output_tokens) =
+            compaction_request_limits(input_token_budget, response_token_budget, preamble.len());
+        // Without a provider tokenizer, one UTF-8 byte per configured token is
+        // the provider-neutral conservative fallback. `input_token_budget`
+        // already excludes the configured response reserve. We also reserve a
+        // provider-envelope allowance and borrow enough input headroom to keep
+        // a useful response cap when a custom reserve is smaller than 256.
+        tokio::time::timeout(
+            COMPACTION_TIMEOUT,
+            summarize_conversation_bounded(
+                &conversation,
+                previous_summary,
+                instructions,
+                prompt_budget,
+                |summary_prompt| {
+                    let preamble = preamble.clone();
+                    async move {
+                        let model = self.completion_model(model_name.to_string());
+                        summarize_with_model(model, summary_prompt, preamble, max_output_tokens)
+                            .await
+                    }
+                },
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Compression timed out after 300 seconds"))?
+    }
+}
 
-        let prompt = prompt::COMPACTION_PROMPT
-            .replace("{conversation}", &conversation)
-            .replace("{previous_summary}", previous_summary.unwrap_or("(none)"))
-            .replace("{instructions}", instructions.unwrap_or("(none)"));
+fn compaction_prompt(
+    conversation: &str,
+    previous_summary: Option<&str>,
+    instructions: Option<&str>,
+) -> String {
+    let template = prompt::COMPACTION_PROMPT;
+    let (before_summary, after_summary) = template
+        .split_once("{previous_summary}")
+        .expect("compaction prompt has previous-summary placeholder");
+    let (before_instructions, after_instructions) = after_summary
+        .split_once("{instructions}")
+        .expect("compaction prompt has instructions placeholder");
+    let (before_conversation, after_conversation) = after_instructions
+        .split_once("{conversation}")
+        .expect("compaction prompt has conversation placeholder");
+    let previous_summary = previous_summary.unwrap_or(NO_PREVIOUS_SUMMARY);
+    let instructions = instructions.unwrap_or("(none)");
 
-        let model = self.completion_model(model_name.to_string());
-        let response = summarize_with_model(model, prompt).await?;
-        Ok(response)
+    let mut rendered = String::with_capacity(
+        template.len() + previous_summary.len() + instructions.len() + conversation.len(),
+    );
+    rendered.push_str(before_summary);
+    rendered.push_str(previous_summary);
+    rendered.push_str(before_instructions);
+    rendered.push_str(instructions);
+    rendered.push_str(before_conversation);
+    rendered.push_str(conversation);
+    rendered.push_str(after_conversation);
+    rendered
+}
+
+fn prefix_at_most(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn suffix_at_most(value: &str, max_bytes: usize) -> &str {
+    let mut start = value.len().saturating_sub(max_bytes);
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
+fn bound_summary(value: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "\n...[summary truncated]...\n";
+
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes <= MARKER.len() {
+        return prefix_at_most(MARKER, max_bytes).to_string();
+    }
+
+    let content_budget = max_bytes - MARKER.len();
+    let head = prefix_at_most(value, content_budget / 2);
+    let tail = suffix_at_most(value, content_budget.saturating_sub(head.len()));
+    format!("{head}{MARKER}{tail}")
+}
+
+fn compaction_payload_budgets(
+    instructions: Option<&str>,
+    prompt_budget_bytes: usize,
+) -> anyhow::Result<(usize, usize)> {
+    let fixed_overhead = compaction_prompt("", Some(""), instructions).len();
+    let available = prompt_budget_bytes.saturating_sub(fixed_overhead);
+    if available <= NO_PREVIOUS_SUMMARY.len() + 4 {
+        anyhow::bail!("Compression prompt metadata exceeds the bounded summarizer input budget");
+    }
+
+    let summary_budget = (available / 2)
+        .max(NO_PREVIOUS_SUMMARY.len())
+        .min(MAX_ROLLING_SUMMARY_BYTES);
+    let conversation_budget = available.saturating_sub(summary_budget);
+    if conversation_budget < 4 {
+        anyhow::bail!("Compression input budget cannot fit one UTF-8 character");
+    }
+    Ok((summary_budget, conversation_budget))
+}
+
+fn bounded_recent_conversation<'a>(
+    conversation: &'a str,
+    conversation_budget: usize,
+) -> anyhow::Result<Cow<'a, str>> {
+    // A UTF-8 boundary can leave at most three unused bytes in each request.
+    let usable_per_request = conversation_budget.saturating_sub(3);
+    let retained_budget = usable_per_request.saturating_mul(MAX_COMPACTION_REQUESTS);
+    if conversation.len() <= retained_budget {
+        return Ok(Cow::Borrowed(conversation));
+    }
+    if retained_budget <= OLDER_HISTORY_OMITTED.len() {
+        anyhow::bail!("Compression input budget is too small for bounded history processing");
+    }
+
+    let tail = suffix_at_most(conversation, retained_budget - OLDER_HISTORY_OMITTED.len());
+    Ok(Cow::Owned(format!("{OLDER_HISTORY_OMITTED}{tail}")))
+}
+
+/// Summarizes bounded recent slices of a conversation through a rolling
+/// reduction. Every request has a fixed history and summary partition, and the
+/// total number of provider calls is capped.
+pub(crate) async fn summarize_conversation_bounded<F, Fut>(
+    conversation: &str,
+    previous_summary: Option<&str>,
+    instructions: Option<&str>,
+    prompt_budget_bytes: usize,
+    mut summarize: F,
+) -> anyhow::Result<String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<String>>,
+{
+    let (summary_budget, conversation_budget) =
+        compaction_payload_budgets(instructions, prompt_budget_bytes)?;
+    let conversation = bounded_recent_conversation(conversation, conversation_budget)?;
+    let mut offset = 0usize;
+    let mut rolling_summary =
+        previous_summary.map(|summary| bound_summary(summary, summary_budget));
+    let mut made_request = false;
+    let mut requests = 0usize;
+
+    loop {
+        let remaining = &conversation[offset..];
+        if remaining.is_empty() && made_request {
+            return rolling_summary
+                .filter(|summary| !summary.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Compression returned empty response"));
+        }
+
+        let chunk = prefix_at_most(remaining, conversation_budget);
+        if !remaining.is_empty() && chunk.is_empty() {
+            anyhow::bail!("Compression input budget cannot fit one UTF-8 character");
+        }
+        let request = compaction_prompt(chunk, rolling_summary.as_deref(), instructions);
+        debug_assert!(request.len() <= prompt_budget_bytes);
+        if request.len() > prompt_budget_bytes {
+            anyhow::bail!("Compression request exceeded its bounded input budget");
+        }
+        if requests >= MAX_COMPACTION_REQUESTS {
+            anyhow::bail!("Compression exceeded its bounded provider request count");
+        }
+
+        let next_summary = summarize(request).await?;
+        if next_summary.is_empty() {
+            anyhow::bail!("Compression returned empty response");
+        }
+        rolling_summary = Some(bound_summary(&next_summary, summary_budget));
+        made_request = true;
+        requests += 1;
+        offset = offset.saturating_add(chunk.len());
     }
 }
 
@@ -496,32 +701,41 @@ pub(crate) async fn fetch_openrouter_pricing_from_url(
     Ok(map)
 }
 
-async fn summarize_with_model(model: AnyModel, prompt: String) -> anyhow::Result<String> {
+async fn summarize_with_model(
+    model: AnyModel,
+    prompt: String,
+    preamble: String,
+    max_output_tokens: u64,
+) -> anyhow::Result<String> {
     match model {
-        AnyModel::OpenRouter(m, _) => run_summarizer(m, prompt).await,
+        AnyModel::OpenRouter(m, _) => run_summarizer(m, prompt, preamble, max_output_tokens).await,
         AnyModel::OpenAI(m) => match m {
-            OpenAiModel::Responses(m) => run_summarizer(m, prompt).await,
-            OpenAiModel::Completions(m) => run_summarizer(m, prompt).await,
+            OpenAiModel::Responses(m) => {
+                run_summarizer(m, prompt, preamble, max_output_tokens).await
+            }
+            OpenAiModel::Completions(m) => {
+                run_summarizer(m, prompt, preamble, max_output_tokens).await
+            }
         },
-        AnyModel::Anthropic(m) => run_summarizer(m, prompt).await,
-        AnyModel::Gemini(m) => run_summarizer(m, prompt).await,
-        AnyModel::Ollama(m) => run_summarizer(m, prompt).await,
+        AnyModel::Anthropic(m) => run_summarizer(m, prompt, preamble, max_output_tokens).await,
+        AnyModel::Gemini(m) => run_summarizer(m, prompt, preamble, max_output_tokens).await,
+        AnyModel::Ollama(m) => run_summarizer(m, prompt, preamble, max_output_tokens).await,
     }
 }
 
-async fn run_summarizer<M>(model: M, prompt: String) -> anyhow::Result<String>
+async fn run_summarizer<M>(
+    model: M,
+    prompt: String,
+    preamble: String,
+    max_output_tokens: u64,
+) -> anyhow::Result<String>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
-    let mut preamble = "You are a conversation summarizer.".to_string();
-    if let Some(s) = crate::session::storage::load_suffix() {
-        preamble.push_str("\n\n---\n\n");
-        preamble.push_str(&s);
-    }
-
     let agent = rig::agent::AgentBuilder::new(model)
         .preamble(&preamble)
+        .max_tokens(max_output_tokens)
         .build();
 
     let agent_ref = &agent;
@@ -558,6 +772,15 @@ where
     }
 
     Ok(response)
+}
+
+fn summarizer_preamble() -> String {
+    let mut preamble = "You are a conversation summarizer.".to_string();
+    if let Some(s) = crate::session::storage::load_suffix() {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(&s);
+    }
+    preamble
 }
 
 pub(crate) fn serialize_conversation(messages: &[SessionMessage]) -> String {

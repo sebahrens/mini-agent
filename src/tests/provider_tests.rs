@@ -2,9 +2,9 @@ use crate::auth::ProviderKind;
 use crate::config::{ApiStyle, CustomProviderConfig};
 use crate::provider::ModelEntry;
 use crate::provider::{
-    AnyClient, create_client, expand_env, is_agent_model, merge_extra_body,
-    openrouter_anthropic_routing, resolve_api_style, resolve_provider_config,
-    serialize_conversation,
+    AnyClient, compaction_request_limits, create_client, expand_env, is_agent_model,
+    merge_extra_body, openrouter_anthropic_routing, resolve_api_style, resolve_provider_config,
+    serialize_conversation, summarize_conversation_bounded,
 };
 use crate::session::{MessageRole, SessionMessage};
 use compact_str::CompactString;
@@ -15,6 +15,194 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::Duration;
+
+#[test]
+fn compaction_limits_reserve_provider_envelope_and_output_headroom() {
+    let input_budget = 127_000;
+    let response_budget = 1_000;
+    let preamble_bytes = 200;
+    let (prompt_bytes, output_tokens) =
+        compaction_request_limits(input_budget, response_budget, preamble_bytes);
+
+    assert_eq!(output_tokens, response_budget);
+    assert!(
+        prompt_bytes as u64 + preamble_bytes as u64 + 512 + output_tokens
+            <= input_budget + response_budget
+    );
+
+    let (prompt_bytes, output_tokens) = compaction_request_limits(128_000, 0, preamble_bytes);
+    assert_eq!(output_tokens, 256);
+    assert!(prompt_bytes as u64 + preamble_bytes as u64 + 512 + output_tokens <= 128_000);
+}
+
+#[tokio::test]
+async fn bounded_compaction_chunks_history_larger_than_the_prompt_budget() {
+    let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = prompts.clone();
+    let conversation = "history line with code and json {}\n".repeat(400);
+    let budget = 1_024;
+
+    let summary = summarize_conversation_bounded(
+        &conversation,
+        None,
+        Some("preserve decisions"),
+        budget,
+        move |prompt| {
+            let observed = observed.clone();
+            async move {
+                let mut prompts = observed.lock().unwrap();
+                prompts.push(prompt);
+                Ok(format!("partial summary {}", prompts.len()))
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let prompts = prompts.lock().unwrap();
+    assert!(prompts.len() > 1, "over-window history must be chunked");
+    assert!(prompts.iter().all(|prompt| prompt.len() <= budget));
+    assert_eq!(summary, format!("partial summary {}", prompts.len()));
+    assert!(
+        prompts
+            .last()
+            .unwrap()
+            .contains(&format!("partial summary {}", prompts.len() - 1)),
+        "each request must roll the prior partial summary forward"
+    );
+}
+
+#[tokio::test]
+async fn bounded_compaction_rejects_metadata_over_budget_without_calling_summarizer() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+
+    let error = summarize_conversation_bounded(
+        "conversation",
+        Some("metadata that cannot fit"),
+        Some("more metadata"),
+        1,
+        move |_| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("must not be called".to_string())
+            }
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("metadata exceeds"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bounded_compaction_splits_only_at_utf8_boundaries() {
+    let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = prompts.clone();
+    let fixed_prompt = crate::agent::prompt::COMPACTION_PROMPT
+        .replace("{conversation}", "")
+        .replace("{previous_summary}", "")
+        .replace("{instructions}", "i");
+    // Eleven payload bytes partition into six bytes for rolling summary and
+    // five for conversation, forcing each three-byte character into its own
+    // request without allowing a split inside either code point.
+    let budget = fixed_prompt.len() + 11;
+
+    let summary =
+        summarize_conversation_bounded("記憶", Some("s"), Some("i"), budget, move |prompt| {
+            let observed = observed.clone();
+            async move {
+                observed.lock().unwrap().push(prompt);
+                Ok("s".to_string())
+            }
+        })
+        .await
+        .unwrap();
+
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(summary, "s");
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("---\n記\n---"));
+    assert!(prompts[1].contains("---\n憶\n---"));
+    assert!(prompts.iter().all(|prompt| prompt.len() <= budget));
+}
+
+#[tokio::test]
+async fn bounded_compaction_limits_verbose_rolling_summaries() {
+    let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = prompts.clone();
+    let budget = 1_024;
+
+    let summary = summarize_conversation_bounded(
+        &"dense:{}[](),;!\n".repeat(1_000),
+        None,
+        None,
+        budget,
+        move |prompt| {
+            let observed = observed.clone();
+            async move {
+                observed.lock().unwrap().push(prompt);
+                Ok("verbose summary ".repeat(10_000))
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let prompts = prompts.lock().unwrap();
+    assert!(prompts.len() > 1);
+    assert!(prompts.iter().all(|prompt| prompt.len() <= budget));
+    assert!(summary.len() < budget);
+    assert!(summary.contains("summary truncated"));
+}
+
+#[tokio::test]
+async fn bounded_compaction_caps_requests_and_keeps_recent_history() {
+    let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = prompts.clone();
+    let conversation = format!("{}LATEST DECISION", "old history\n".repeat(100_000));
+    let budget = 1_024;
+
+    summarize_conversation_bounded(&conversation, None, None, budget, move |prompt| {
+        let observed = observed.clone();
+        async move {
+            observed.lock().unwrap().push(prompt);
+            Ok("summary".to_string())
+        }
+    })
+    .await
+    .unwrap();
+
+    let prompts = prompts.lock().unwrap();
+    assert!(prompts.len() <= 16);
+    assert!(prompts.iter().all(|prompt| prompt.len() <= budget));
+    assert!(prompts[0].contains("older history omitted"));
+    assert!(prompts.last().unwrap().contains("LATEST DECISION"));
+}
+
+#[tokio::test]
+async fn bounded_compaction_rejects_empty_summarizer_output() {
+    let error = summarize_conversation_bounded("conversation", None, None, usize::MAX, |_| async {
+        Ok(String::new())
+    })
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "Compression returned empty response");
+}
+
+#[tokio::test]
+async fn bounded_compaction_propagates_summarizer_errors() {
+    let error = summarize_conversation_bounded("conversation", None, None, usize::MAX, |_| async {
+        anyhow::bail!("summarizer unavailable")
+    })
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "summarizer unavailable");
+}
 
 fn cfg(api_style: Option<ApiStyle>) -> CustomProviderConfig {
     CustomProviderConfig {

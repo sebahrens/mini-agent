@@ -618,6 +618,11 @@ tool results) can still blow past the model's real context limit before that
 check ever runs, because the in-flight tool traffic never enters the session's
 token estimate.
 
+The summarizer processes oversized history as bounded recent chunks with a
+rolling summary, at most 16 provider requests, and a five-minute aggregate
+deadline. If a provider still rejects an ordinary request for exceeding its
+context limit, the error points to `/compress` and `compact_enabled` recovery.
+
 `mid_turn_compact_threshold` opts in to a second, *within-turn* check. On every
 provider call zerostack compares the real provider-reported prompt size against
 `context_window`; when the ratio crosses the threshold it stops the run at a
