@@ -604,6 +604,11 @@ pub enum AnyAgentInner {
 #[derive(Clone)]
 pub struct AnyAgent {
     inner: AnyAgentInner,
+    /// Cumulative input+output token cap enforced per spawned turn. `None`
+    /// disables it. Kept here, not on the rig agent, because the rig agent's
+    /// `max_tokens` is the per-response output cap sent to the provider — a
+    /// different unit entirely.
+    turn_token_budget: Option<u64>,
     #[cfg(feature = "skills")]
     skills: Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>>,
     #[cfg(feature = "skills")]
@@ -614,11 +619,17 @@ impl AnyAgent {
     pub(crate) fn without_skills(inner: AnyAgentInner) -> Self {
         Self {
             inner,
+            turn_token_budget: None,
             #[cfg(feature = "skills")]
             skills: None,
             #[cfg(feature = "skills")]
             turn_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub(crate) fn with_turn_token_budget(mut self, budget: Option<u64>) -> Self {
+        self.turn_token_budget = budget;
+        self
     }
 
     fn with_runtime(
@@ -634,6 +645,7 @@ impl AnyAgent {
             .unwrap_or_else(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
         Self {
             inner,
+            turn_token_budget: None,
             #[cfg(feature = "skills")]
             skills,
             #[cfg(feature = "skills")]
@@ -708,6 +720,7 @@ impl AnyAgent {
                     &prompt,
                     pure_stdout,
                     retry_config,
+                    self.turn_token_budget,
                     history,
                     #[cfg(feature = "hooks")]
                     loop_info,
@@ -721,6 +734,7 @@ impl AnyAgent {
                         &prompt,
                         pure_stdout,
                         retry_config,
+                        self.turn_token_budget,
                         history,
                         #[cfg(feature = "hooks")]
                         loop_info,
@@ -733,6 +747,7 @@ impl AnyAgent {
                         &prompt,
                         pure_stdout,
                         retry_config,
+                        self.turn_token_budget,
                         history,
                         #[cfg(feature = "hooks")]
                         loop_info,
@@ -746,6 +761,7 @@ impl AnyAgent {
                     &prompt,
                     pure_stdout,
                     retry_config,
+                    self.turn_token_budget,
                     history,
                     #[cfg(feature = "hooks")]
                     loop_info,
@@ -758,6 +774,7 @@ impl AnyAgent {
                     &prompt,
                     pure_stdout,
                     retry_config,
+                    self.turn_token_budget,
                     history,
                     #[cfg(feature = "hooks")]
                     loop_info,
@@ -770,6 +787,7 @@ impl AnyAgent {
                     &prompt,
                     pure_stdout,
                     retry_config,
+                    self.turn_token_budget,
                     history,
                     #[cfg(feature = "hooks")]
                     loop_info,
@@ -920,12 +938,14 @@ impl AnyAgent {
         } else {
             prompt
         };
+        let turn_token_budget = self.turn_token_budget;
         match self.inner {
             AnyAgentInner::OpenRouter(a) => runner::spawn_agent_paused_in_scope(
                 a,
                 prompt,
                 history,
                 retry_config,
+                turn_token_budget,
                 #[cfg(feature = "skills")]
                 turn_guard,
                 #[cfg(feature = "hooks")]
@@ -938,6 +958,7 @@ impl AnyAgent {
                     prompt,
                     history,
                     retry_config,
+                    turn_token_budget,
                     #[cfg(feature = "skills")]
                     turn_guard,
                     #[cfg(feature = "hooks")]
@@ -949,6 +970,7 @@ impl AnyAgent {
                     prompt,
                     history,
                     retry_config,
+                    turn_token_budget,
                     #[cfg(feature = "skills")]
                     turn_guard,
                     #[cfg(feature = "hooks")]
@@ -961,6 +983,7 @@ impl AnyAgent {
                 prompt,
                 history,
                 retry_config,
+                turn_token_budget,
                 #[cfg(feature = "skills")]
                 turn_guard,
                 #[cfg(feature = "hooks")]
@@ -972,6 +995,7 @@ impl AnyAgent {
                 prompt,
                 history,
                 retry_config,
+                turn_token_budget,
                 #[cfg(feature = "skills")]
                 turn_guard,
                 #[cfg(feature = "hooks")]
@@ -983,6 +1007,7 @@ impl AnyAgent {
                 prompt,
                 history,
                 retry_config,
+                turn_token_budget,
                 #[cfg(feature = "skills")]
                 turn_guard,
                 #[cfg(feature = "hooks")]
@@ -1469,6 +1494,7 @@ pub async fn build_agent_in_workspace(
         #[cfg(feature = "skills")]
         skills,
     )
+    .with_turn_token_budget(cfg.resolve_turn_token_budget())
 }
 
 #[cfg(feature = "skills")]

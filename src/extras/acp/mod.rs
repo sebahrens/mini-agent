@@ -1498,6 +1498,7 @@ mod history_tests {
             prompt.to_string(),
             history,
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -2372,6 +2373,7 @@ mod protocol_tests {
                     prompt,
                     history,
                     crate::retry::RetryConfig::default(),
+                    None,
                     #[cfg(feature = "skills")]
                     None,
                     #[cfg(feature = "hooks")]

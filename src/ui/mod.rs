@@ -791,9 +791,12 @@ pub(crate) fn stop_turn_context_exhausted(
         prompt_tokens,
         threshold,
         ui.session.context_window,
-        ui.cfg
-            .resolve_reserve_tokens(&ui.session.model, &crate::config::quick_models_map(ui.cfg)),
-        ui.cfg.resolve_keep_recent_tokens(),
+        ui.cfg.resolve_reserve_tokens(
+            &ui.session.model,
+            &crate::config::quick_models_map(ui.cfg),
+            ui.session.context_window,
+        ),
+        ui.cfg.resolve_keep_recent_tokens(ui.session.context_window),
     ) {
         renderer.write_line(&line, Color::White)?;
     }

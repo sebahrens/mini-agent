@@ -43,6 +43,7 @@ async fn resumed_session_history_reaches_model_initial_turn() {
         "continue",
         false,
         &RetryConfig::default(),
+        None,
         expected_history.clone(),
         #[cfg(feature = "hooks")]
         None,
@@ -122,6 +123,7 @@ async fn resumed_session_history_survives_stop_hook_continuation() {
         "continue",
         false,
         &RetryConfig::default(),
+        None,
         expected_history.clone(),
         None,
     )

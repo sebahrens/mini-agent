@@ -737,7 +737,7 @@ fn exhausted_token_budget(usage: Usage, budget: Option<u64>) -> Option<(u64, u64
 fn token_budget_exhaustion_message(used: u64, budget: u64) -> String {
     format!(
         "Agent exhausted its cumulative token budget ({used}/{budget}) before completing. \
-         Compact the session or increase max_tokens before retrying."
+         Compact the session or raise turn_token_budget before retrying."
     )
 }
 
@@ -1205,6 +1205,9 @@ pub fn spawn_agent<M>(
     prompt: String,
     history: Vec<Message>,
     retry_config: RetryConfig,
+    // Cumulative input+output token cap for this turn; `None` disables it.
+    // Deliberately not `agent.max_tokens`, which caps a single response.
+    turn_token_budget: Option<u64>,
     #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     // `--loop` iteration/active state, for the `Stop` hook envelope's
     // `loop_iteration`/`loop_active` fields (per-iteration reset of
@@ -1222,6 +1225,7 @@ where
         prompt,
         history,
         retry_config,
+        turn_token_budget,
         RunnerStreamPolicy::default(),
         #[cfg(feature = "skills")]
         turn_guard,
@@ -1239,6 +1243,7 @@ pub(crate) fn spawn_agent_paused<M>(
     prompt: String,
     history: Vec<Message>,
     retry_config: RetryConfig,
+    turn_token_budget: Option<u64>,
     #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
 ) -> PausedAgentRunner
@@ -1251,6 +1256,7 @@ where
         prompt,
         history,
         retry_config,
+        turn_token_budget,
         #[cfg(feature = "skills")]
         turn_guard,
         #[cfg(feature = "hooks")]
@@ -1264,6 +1270,7 @@ pub(crate) fn spawn_agent_paused_in_scope<M>(
     prompt: String,
     history: Vec<Message>,
     retry_config: RetryConfig,
+    turn_token_budget: Option<u64>,
     #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
     work_scope: Arc<AgentWorkScope>,
@@ -1277,6 +1284,7 @@ where
         prompt,
         history,
         retry_config,
+        turn_token_budget,
         RunnerStreamPolicy::default(),
         #[cfg(feature = "skills")]
         turn_guard,
@@ -1298,6 +1306,7 @@ fn spawn_agent_with_stream_policy<M>(
     prompt: String,
     history: Vec<Message>,
     retry_config: RetryConfig,
+    turn_token_budget: Option<u64>,
     stream_policy: RunnerStreamPolicy,
     #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
@@ -1312,6 +1321,7 @@ where
         prompt,
         history,
         retry_config,
+        turn_token_budget,
         stream_policy,
         #[cfg(feature = "skills")]
         turn_guard,
@@ -1329,6 +1339,7 @@ fn spawn_agent_with_start_mode<M>(
     prompt: String,
     history: Vec<Message>,
     retry_config: RetryConfig,
+    turn_token_budget: Option<u64>,
     stream_policy: RunnerStreamPolicy,
     #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
@@ -1726,7 +1737,7 @@ where
                                 .await;
                         }
                         if let Some((used, budget)) =
-                            exhausted_token_budget(usage_ledger.total, agent.max_tokens)
+                            exhausted_token_budget(usage_ledger.total, turn_token_budget)
                         {
                             if completion_had_tool_call {
                                 tracing::warn!(
@@ -1798,7 +1809,7 @@ where
                 return;
             }
             if let Some((used, budget)) =
-                exhausted_token_budget(usage_ledger.total, agent.max_tokens)
+                exhausted_token_budget(usage_ledger.total, turn_token_budget)
             {
                 tracing::warn!(
                     "agent: cumulative token budget exhausted before continuation ({used}/{budget})"
@@ -1806,7 +1817,7 @@ where
                 let _ = event_tx
                     .send(AgentEvent::Error(CompactString::from(format!(
                         "Agent exhausted its cumulative token budget ({used}/{budget}) before \
-                         completing. Compact the session or increase max_tokens before retrying."
+                         completing. Compact the session or raise turn_token_budget before retrying."
                     ))))
                     .await;
                 return;
@@ -1895,6 +1906,8 @@ pub async fn run_print<M>(
     prompt: &str,
     pure_stdout: bool,
     retry_config: &RetryConfig,
+    // Cumulative input+output token cap for this run; `None` disables it.
+    turn_token_budget: Option<u64>,
     // Prior turns from a resumed session (e.g. `--continue`), converted via
     // `convert_history`. Fed to the initial `stream_chat` call below and
     // seeded into `retry_history` for the hooks `Stop`-continuation retry,
@@ -1914,6 +1927,7 @@ where
         prompt,
         pure_stdout,
         retry_config,
+        turn_token_budget,
         history,
         RunnerStreamPolicy::default(),
         #[cfg(feature = "hooks")]
@@ -1927,6 +1941,7 @@ async fn run_print_with_stream_policy<M>(
     prompt: &str,
     pure_stdout: bool,
     retry_config: &RetryConfig,
+    turn_token_budget: Option<u64>,
     history: Vec<Message>,
     stream_policy: RunnerStreamPolicy,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
@@ -2060,7 +2075,7 @@ where
                         observed_tokens(usage_ledger.total),
                     );
                     if let Some((used, budget)) =
-                        exhausted_token_budget(usage_ledger.total, agent.max_tokens)
+                        exhausted_token_budget(usage_ledger.total, turn_token_budget)
                     {
                         if completion_had_tool_call {
                             tool_calls.finalize_unresolved(&mut interactions);
@@ -2134,11 +2149,11 @@ where
                 );
             }
             if let Some((used, budget)) =
-                exhausted_token_budget(usage_ledger.total, agent.max_tokens)
+                exhausted_token_budget(usage_ledger.total, turn_token_budget)
             {
                 anyhow::bail!(
                     "Agent exhausted its cumulative token budget ({used}/{budget}) before \
-                     completing. Compact the session or increase max_tokens before retrying."
+                     completing. Compact the session or raise turn_token_budget before retrying."
                 );
             }
             #[cfg(feature = "hooks")]
@@ -2346,6 +2361,7 @@ mod tests {
             "start only after publication".to_owned(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -2482,6 +2498,7 @@ mod tests {
             "invoke the blocking tool".to_owned(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -2592,6 +2609,7 @@ mod tests {
             "invoke blocking tool".to_owned(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -2729,6 +2747,7 @@ mod tests {
             "start one".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -2739,6 +2758,7 @@ mod tests {
             "start two".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -2790,6 +2810,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -2849,6 +2870,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -2944,6 +2966,7 @@ mod tests {
             "run both".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -3027,6 +3050,7 @@ mod tests {
             "run duplicates".to_owned(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -3172,6 +3196,7 @@ mod tests {
             "structured answer".to_owned(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -3218,6 +3243,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            Some(100),
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -3375,6 +3401,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -3419,6 +3446,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -3457,6 +3485,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             RunnerStreamPolicy::drop_next_terminal_responses(3),
             #[cfg(feature = "skills")]
             None,
@@ -3507,6 +3536,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             RunnerStreamPolicy::drop_next_terminal_responses(1),
             #[cfg(feature = "skills")]
             None,
@@ -3573,6 +3603,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             RunnerStreamPolicy::drop_next_terminal_responses(1),
             #[cfg(feature = "skills")]
             None,
@@ -3685,6 +3716,7 @@ mod tests {
                 "start".to_string(),
                 Vec::new(),
                 crate::retry::RetryConfig::default(),
+                None,
                 RunnerStreamPolicy::tool_call_text_eof(),
                 #[cfg(feature = "skills")]
                 None,
@@ -3750,6 +3782,7 @@ mod tests {
                 "start",
                 false,
                 &crate::retry::RetryConfig::default(),
+                None,
                 Vec::new(),
                 RunnerStreamPolicy::tool_call_text_eof(),
                 #[cfg(feature = "hooks")]
@@ -3798,6 +3831,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             RunnerStreamPolicy::without_tool_results(),
             #[cfg(feature = "skills")]
             None,
@@ -3847,6 +3881,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
             RunnerStreamPolicy::without_tool_results(),
             #[cfg(feature = "hooks")]
@@ -3885,6 +3920,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             RunnerStreamPolicy::drop_next_terminal_responses(1),
             #[cfg(feature = "skills")]
             None,
@@ -3961,6 +3997,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
             RunnerStreamPolicy::drop_next_terminal_responses(1),
             #[cfg(feature = "hooks")]
@@ -4012,6 +4049,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -4092,6 +4130,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -4133,6 +4172,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
             RunnerStreamPolicy::drop_next_terminal_responses(2),
             #[cfg(feature = "hooks")]
@@ -4171,6 +4211,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -4199,6 +4240,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
             #[cfg(feature = "hooks")]
             None,
@@ -4788,6 +4830,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
             #[cfg(feature = "hooks")]
             None,
@@ -4835,6 +4878,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            Some(50),
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -4876,6 +4920,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            Some(50),
             Vec::new(),
             #[cfg(feature = "hooks")]
             None,
@@ -4904,6 +4949,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            Some(50),
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -4932,6 +4978,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            Some(50),
             Vec::new(),
             #[cfg(feature = "hooks")]
             None,
@@ -4942,6 +4989,56 @@ mod tests {
         assert_eq!(interactive_response, "done");
         assert_eq!(headless_response, "done");
         assert_eq!(headless_usage, over_budget);
+    }
+
+    #[tokio::test]
+    async fn cumulative_usage_beyond_max_tokens_completes_without_a_turn_budget() {
+        // Regression: `max_tokens` is the per-response output cap and must not
+        // double as the cumulative turn budget. Two completion calls whose
+        // summed input+output (55) exceeds max_tokens (50) finish normally
+        // when `turn_token_budget` is `None`.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("call-1", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response(usage(40, 15, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response(usage(45, 5, 0, 0)),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .max_tokens(50)
+            .default_max_turns(2)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let response = loop {
+            match runner.event_rx.recv().await {
+                Some(crate::event::AgentEvent::Done { response, .. }) => {
+                    break response.to_string();
+                }
+                Some(crate::event::AgentEvent::Error(error)) => {
+                    panic!("run without a turn budget must not exhaust: {error}")
+                }
+                Some(_) => {}
+                None => panic!("runner ended without a terminal response"),
+            }
+        };
+        assert_eq!(response, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.requests().len(), 2);
     }
 
     #[tokio::test]
@@ -4968,6 +5065,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
@@ -5022,6 +5120,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
             #[cfg(feature = "hooks")]
             None,
@@ -5044,6 +5143,7 @@ mod tests {
             "start".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
+            None,
             RunnerStreamPolicy::without_completion_calls(),
             #[cfg(feature = "skills")]
             None,
@@ -5083,6 +5183,7 @@ mod tests {
             "start",
             false,
             &crate::retry::RetryConfig::default(),
+            None,
             Vec::new(),
             RunnerStreamPolicy::without_completion_calls(),
             #[cfg(feature = "hooks")]

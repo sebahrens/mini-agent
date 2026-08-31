@@ -37,6 +37,15 @@ pub struct Config {
     pub provider: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Cumulative fail-closed token budget for one agentic turn: the sum of
+    /// input+output tokens across every completion call the turn makes. `None`
+    /// (default) disables the cap — turns are still bounded by
+    /// `max_agent_turns`. This is deliberately a separate knob from
+    /// `max_tokens`, which is the per-response output cap sent to the
+    /// provider; a single multi-tool-call turn legitimately accumulates far
+    /// more than one response's worth of prompt tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_token_budget: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     /// Provider-specific JSON shallow-merged into every completion request body
@@ -368,10 +377,19 @@ impl Config {
             .and_then(|e| e.input_price.zip(e.output_price))
     }
 
+    /// Headroom kept free before between-turn compaction triggers. When unset
+    /// (globally and on the active quick model), the default scales with the
+    /// context window instead of being a fixed constant: a fixed 8k reserve on
+    /// a 1M-token model would defer compaction until the window is ~99% full,
+    /// leaving the summarizer an impossibly large history to compress in one
+    /// call. `window/10` bounded below by the default response cap (16_384, so
+    /// one maximal response can never overshoot the window) and above by
+    /// `window/2` (so tiny windows keep most of their space usable).
     pub fn resolve_reserve_tokens(
         &self,
         model_id: &str,
         qm: &HashMap<String, types::QuickModelConfig>,
+        context_window: u64,
     ) -> u64 {
         if let Some(rt) = self.reserve_tokens {
             return rt;
@@ -383,11 +401,34 @@ impl Config {
                 return rt;
             }
         }
-        8_192
+        (context_window / 10).max(16_384).min(context_window / 2)
     }
 
-    pub fn resolve_keep_recent_tokens(&self) -> u64 {
-        self.keep_recent_tokens.unwrap_or(10_000)
+    /// Recent-token budget kept verbatim through a compaction. When unset the
+    /// default scales with the context window — keeping only 10k of a 1M-token
+    /// conversation would discard far more working context than the window
+    /// requires — bounded to `[10_000, 50_000]` and never more than a quarter
+    /// of the window.
+    pub fn resolve_keep_recent_tokens(&self, context_window: u64) -> u64 {
+        if let Some(kr) = self.keep_recent_tokens {
+            return kr;
+        }
+        if context_window == 0 {
+            // Window 0 disables auto-compaction; keep the historical default
+            // for a manual /compress rather than degenerating to "keep
+            // nothing".
+            return 10_000;
+        }
+        (context_window / 20)
+            .clamp(10_000, 50_000)
+            .min(context_window / 4)
+    }
+
+    /// Cumulative per-turn input+output token cap. `None` (default) means no
+    /// cap; see the field docs. Never derived from `max_tokens`, which caps a
+    /// single response, not a turn.
+    pub fn resolve_turn_token_budget(&self) -> Option<u64> {
+        self.turn_token_budget
     }
 
     pub fn resolve_chat_left_margin(&self) -> u16 {
@@ -737,6 +778,54 @@ mod tests {
             prompt_to_model: Some(map),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn reserve_tokens_default_scales_with_context_window() {
+        let cfg = Config::default();
+        let qm = HashMap::new();
+        // Small/medium windows keep the response-cap floor.
+        assert_eq!(cfg.resolve_reserve_tokens("m", &qm, 128_000), 16_384);
+        // Large windows scale to a tenth so compaction is not deferred to 99%.
+        assert_eq!(cfg.resolve_reserve_tokens("m", &qm, 1_000_000), 100_000);
+        // Tiny windows never reserve more than half the window.
+        assert_eq!(cfg.resolve_reserve_tokens("m", &qm, 8_000), 4_000);
+        // An explicit config value always wins.
+        let explicit = Config {
+            reserve_tokens: Some(9_999),
+            ..Default::default()
+        };
+        assert_eq!(explicit.resolve_reserve_tokens("m", &qm, 1_000_000), 9_999);
+    }
+
+    #[test]
+    fn keep_recent_tokens_default_scales_with_context_window() {
+        let cfg = Config::default();
+        assert_eq!(cfg.resolve_keep_recent_tokens(128_000), 10_000);
+        assert_eq!(cfg.resolve_keep_recent_tokens(1_000_000), 50_000);
+        // Tiny windows keep at most a quarter of the window.
+        assert_eq!(cfg.resolve_keep_recent_tokens(8_000), 2_000);
+        // Window 0 (auto-compaction disabled) keeps the historical default.
+        assert_eq!(cfg.resolve_keep_recent_tokens(0), 10_000);
+        let explicit = Config {
+            keep_recent_tokens: Some(1_234),
+            ..Default::default()
+        };
+        assert_eq!(explicit.resolve_keep_recent_tokens(1_000_000), 1_234);
+    }
+
+    #[test]
+    fn turn_token_budget_is_never_derived_from_max_tokens() {
+        let cfg = Config {
+            max_tokens: Some(16_384),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_turn_token_budget(), None);
+        let explicit = Config {
+            turn_token_budget: Some(200_000),
+            ..Default::default()
+        };
+        assert_eq!(explicit.resolve_turn_token_budget(), Some(200_000));
     }
 
     #[test]

@@ -343,11 +343,14 @@ async fn handle_agent_done(
 
     #[cfg(feature = "memory")]
     let reserve = crate::extras::memory::effective_reserve(
-        ui.cfg.resolve_reserve_tokens(&ui.session.model, &qm),
+        ui.cfg
+            .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window),
         ui.context.memory.as_deref(),
     );
     #[cfg(not(feature = "memory"))]
-    let reserve = ui.cfg.resolve_reserve_tokens(&ui.session.model, &qm);
+    let reserve = ui
+        .cfg
+        .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window);
 
     if !loop_running
         && ui.cfg.resolve_compact_enabled()

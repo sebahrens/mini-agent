@@ -384,12 +384,15 @@ pub async fn handle_compress(
     let qm = crate::config::quick_models_map(ui.cfg);
     #[cfg(feature = "memory")]
     let reserve = crate::extras::memory::effective_reserve(
-        ui.cfg.resolve_reserve_tokens(&ui.session.model, &qm),
+        ui.cfg
+            .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window),
         ui.context.memory.as_deref(),
     );
     #[cfg(not(feature = "memory"))]
-    let reserve = ui.cfg.resolve_reserve_tokens(&ui.session.model, &qm);
-    let keep_recent = ui.cfg.resolve_keep_recent_tokens();
+    let reserve = ui
+        .cfg
+        .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window);
+    let keep_recent = ui.cfg.resolve_keep_recent_tokens(ui.session.context_window);
     let max_tokens = ui.session.context_window.saturating_sub(reserve);
 
     // Auto-compaction only makes sense when actually over budget; manual

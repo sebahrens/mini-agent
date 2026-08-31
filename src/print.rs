@@ -354,7 +354,8 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
         ("context-window", context_window.to_string()),
         (
             "reserve-tokens",
-            cfg.resolve_reserve_tokens(&model, &qm_map).to_string(),
+            cfg.resolve_reserve_tokens(&model, &qm_map, context_window)
+                .to_string(),
         ),
         ("max-read-lines", cfg.resolve_max_read_lines().to_string()),
         (

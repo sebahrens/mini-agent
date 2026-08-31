@@ -106,6 +106,7 @@ async fn headless_ask_denies_instead_of_hanging() {
             "please write to /etc/passwd",
             false,
             &RetryConfig::default(),
+            None,
             Vec::new(),
             #[cfg(feature = "hooks")]
             None,
