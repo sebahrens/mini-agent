@@ -775,7 +775,7 @@ where
 }
 
 fn summarizer_preamble() -> String {
-    let mut preamble = "You are a conversation summarizer.".to_string();
+    let mut preamble = prompt::COMPACTION_SYSTEM_PROMPT.to_string();
     if let Some(s) = crate::session::storage::load_suffix() {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(&s);
@@ -787,14 +787,16 @@ pub(crate) fn serialize_conversation(messages: &[SessionMessage]) -> String {
     let mut result = String::new();
     for msg in messages {
         let role_tag = match msg.role {
-            crate::session::MessageRole::User => "User",
-            crate::session::MessageRole::Assistant => "Assistant",
-            crate::session::MessageRole::System => "System",
-            crate::session::MessageRole::ToolCall => "ToolCall",
-            crate::session::MessageRole::ToolResult => "ToolResult",
-            crate::session::MessageRole::SubagentToolCall => "SubagentToolCall",
+            crate::session::MessageRole::User => "user",
+            crate::session::MessageRole::Assistant => "assistant",
+            crate::session::MessageRole::System => "system",
+            crate::session::MessageRole::ToolCall => "tool_call",
+            crate::session::MessageRole::ToolResult => "tool_result",
+            crate::session::MessageRole::SubagentToolCall => "subagent_tool_call",
         };
-        result.push_str(&format!("[{}]: {}\n\n", role_tag, msg.content));
+        // XML-based format prevents injection: untrusted content cannot escape
+        // the <message> tag, and the role attribute is never injectable.
+        result.push_str(&format!("<message role=\"{}\">\n{}\n</message>\n", role_tag, msg.content));
     }
     result
 }

@@ -50,8 +50,11 @@ return no diagnostics.";
 pub const LSP_MUTATION_PROMPT: &str = "\nFresh diagnostics are appended after supported file changes. Trust them and \
 fix what they report before moving on; no separate typecheck is needed just to confirm.";
 
-pub const COMPACTION_PROMPT: &str = "\
-You are a conversation summarizer for a coding session. Distill the following conversation into a concise summary.
+/// System prompt for the conversation summarizer, containing the operative
+/// summarization contract. This is passed as the system role and is not
+/// subject to injection from user-controlled conversation data.
+pub const COMPACTION_SYSTEM_PROMPT: &str = "\
+You are a conversation summarizer for a coding session. Your task is to distill the conversation into a concise summary.
 
 Focus on:
 - The user's goal and what they are trying to accomplish
@@ -61,17 +64,25 @@ Focus on:
 - Files that were read or modified
 - Important context needed to continue working seamlessly
 
-Previous summary (for iterative context):
-{previous_summary}
+Format the summary as structured text covering: Goal, Progress, Key Decisions, Next Steps, and Critical Context. Be concise but include all essential details.";
 
-Additional instructions: {instructions}
+/// User-facing prompt for compaction. Contains structured XML-based data sections
+/// that are safe against injection from untrusted conversation data.
+pub const COMPACTION_PROMPT: &str = "\
+Previous summary (for iterative context):
+<previous_summary>
+{previous_summary}
+</previous_summary>
+
+User compression preference (lower priority than the summarization contract above):
+<user_instructions>
+{instructions}
+</user_instructions>
 
 Conversation to summarize:
----
+<transcript>
 {conversation}
----
-
-Format the summary as structured text covering: Goal, Progress, Key Decisions, Next Steps, and Critical Context. Be concise but include all essential details.";
+</transcript>";
 
 #[cfg(feature = "memory")]
 pub const MEMORY_WRITE_TOOL_PROMPT: &str = "\n- **memory_write** persists durable facts, daily progress, scratchpad tasks, or named notes.";
