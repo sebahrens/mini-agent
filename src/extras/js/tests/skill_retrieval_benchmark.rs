@@ -562,10 +562,12 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
             rebuild_us <= 220_000_000.0,
             "full rebuild gate failed: {rebuild_us:.0}us > 220s budget"
         );
-        assert!(
-            rss_after <= 3_000_000,
-            "full RSS gate failed: {rss_after}KiB > 3_000_000KiB budget"
-        );
+        if let Some(rss) = rss_after {
+            assert!(
+                rss <= 3_000_000,
+                "full RSS gate failed: {rss}KiB > 3_000_000KiB budget"
+            );
+        }
     }
 }
 
