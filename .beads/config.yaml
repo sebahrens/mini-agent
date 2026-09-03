@@ -53,4 +53,4 @@
 # - github.org
 # - github.repo
 
-sync.remote: "git+ssh://git@github.com/sebahrens/mini-agent.git"
+sync.remote: "git+https://github.com/sebahrens/mini-agent.git"
