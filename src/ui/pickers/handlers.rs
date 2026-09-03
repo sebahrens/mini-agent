@@ -8,6 +8,28 @@ use super::models::ModelsPicker;
 use crate::ui::input::Picker;
 use crate::ui::input::cursor::prev_char_boundary;
 
+/// Replace the `@<query>` span that starts at byte offset `at` with
+/// `replacement` and return the byte cursor just after the inserted text.
+///
+/// Every offset here is a byte offset: `at` comes from `str::rfind`, and
+/// `query_len` is `picker.query.len()` (bytes). Slicing by chars with these
+/// values corrupted any buffer containing multi-byte text before the `@`.
+fn replace_at_span(
+    buffer: &mut CompactString,
+    at: usize,
+    query_len: usize,
+    replacement: &str,
+) -> usize {
+    let before = &buffer[..at];
+    let after = buffer.get(at + 1 + query_len..).unwrap_or("");
+    let mut next = String::with_capacity(before.len() + replacement.len() + after.len());
+    next.push_str(before);
+    next.push_str(replacement);
+    next.push_str(after);
+    *buffer = next.into();
+    at + replacement.len()
+}
+
 pub fn handle_file_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
@@ -23,12 +45,8 @@ pub fn handle_file_key(
                 *cursor = prev_char_boundary(buffer, *cursor);
                 buffer.remove(*cursor);
             } else {
-                let at_pos = buffer.rfind('@');
-                if let Some(at) = at_pos {
-                    let before: String = buffer.chars().take(at).collect();
-                    let after: String = buffer.chars().skip(at + 1).collect();
-                    *buffer = format!("{}{}", before, after).into();
-                    *cursor = at;
+                if let Some(at) = buffer.rfind('@') {
+                    *cursor = replace_at_span(buffer, at, 0, "");
                 }
                 picker.deactivate();
             }
@@ -47,12 +65,8 @@ pub fn handle_file_key(
                 buffer.remove(*cursor);
                 true
             } else {
-                let at_pos = buffer.rfind('@');
-                if let Some(at) = at_pos {
-                    let before: String = buffer.chars().take(at).collect();
-                    let after: String = buffer.chars().skip(at + 1).collect();
-                    *buffer = format!("{}{}", before, after).into();
-                    *cursor = at;
+                if let Some(at) = buffer.rfind('@') {
+                    *cursor = replace_at_span(buffer, at, 0, "");
                 }
                 picker.deactivate();
                 true
@@ -80,26 +94,16 @@ pub fn handle_file_key(
         KeyCode::Enter => {
             if let Some(path) = picker.selected_path() {
                 let path_str = path.to_string_lossy().to_string();
-                let at_pos = buffer.rfind('@');
-                if let Some(at) = at_pos {
-                    let before: String = buffer.chars().take(at).collect();
-                    let after_offset = at + 1 + picker.query.len();
-                    let after: String = buffer.chars().skip(after_offset).collect();
-                    let new_len = before.len() + path_str.len();
-                    *buffer = format!("{}{}{}", before, path_str, after).into();
-                    *cursor = new_len;
+                if let Some(at) = buffer.rfind('@') {
+                    *cursor = replace_at_span(buffer, at, picker.query.len(), &path_str);
                 }
             }
             picker.deactivate();
             true
         }
         KeyCode::Esc => {
-            let at_pos = buffer.rfind('@');
-            if let Some(at) = at_pos {
-                let before: String = buffer.chars().take(at).collect();
-                let after: String = buffer.chars().skip(at + 1 + picker.query.len()).collect();
-                *buffer = format!("{}{}", before, after).into();
-                *cursor = at;
+            if let Some(at) = buffer.rfind('@') {
+                *cursor = replace_at_span(buffer, at, picker.query.len(), "");
             }
             picker.deactivate();
             true

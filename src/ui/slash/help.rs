@@ -25,6 +25,10 @@ pub fn handle_tutor(
     }
 }
 
+/// Hands the tty to `less` (or prints the document when no pager exists).
+/// The app stops the crossterm event thread before dispatching `/tutor` and
+/// rebinds it afterwards (see `App::run_slash_command`), so the pager is the
+/// only stdin reader while the terminal is suspended.
 fn run_tutor(terminal_guard: &mut TerminalGuard) -> anyhow::Result<()> {
     terminal_guard.suspend()?;
     let result = crate::docs::show_get_started();
@@ -133,7 +137,10 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
         );
     }
     write_result(ctx.renderer, "  /clear [/new]          clear screen");
-    write_result(ctx.renderer, "  /undo                  undo last exchange");
+    write_result(
+        ctx.renderer,
+        "  /undo [stash]          undo last exchange (stash only when asked; never prompts)",
+    );
     write_result(
         ctx.renderer,
         "  /redo                  restore the last /undo or rewind",

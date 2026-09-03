@@ -12,7 +12,8 @@ All slash commands are available from the TUI input prompt.
 | ------- | ----------- |
 | `/clear` | Clear the current session (all messages, tokens, compactions) and persist the change immediately. |
 | `/new` | Alias for `/clear`. |
-| `/undo` | Remove the last exchange (user message + assistant response), persisting both the shorter history and its redo point immediately. |
+| `/undo` | Remove the last exchange (user message + assistant response), persisting both the shorter history and its redo point immediately. The working tree is never touched. |
+| `/undo stash` | Same as `/undo`, then `git stash` the working tree. There is no interactive prompt; stashing only happens when asked for explicitly. |
 | `/redo` | Restore whatever the most recent `/undo` or `/rewind` removed and persist the restored history immediately. |
 | `/rewind` | Open a picker to jump the session back to an earlier point. |
 | `/retry` | Load the last user message into the input editor for editing. |

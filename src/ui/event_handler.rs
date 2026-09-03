@@ -1,7 +1,6 @@
 use compact_str::CompactString;
 use crossterm::style::Color;
 use rig::completion::Message;
-use rig::message::{AssistantContent, UserContent};
 
 use crate::agent::tools::todo::TODO_LIST;
 use crate::cli::Cli;
@@ -88,14 +87,20 @@ pub async fn handle_agent_event(
                 return Ok(());
             }
 
-            if run.response_start_block.is_none() {
-                renderer.feed_mut().push_streaming_block(BlockStyle::Agent);
-                run.response_start_block = Some(renderer.feed().block_count() - 1);
-            }
-            // Append the token to the running block: layout renders the
-            // unfinished tail line as plain text and parses markdown only for
-            // completed lines, instead of re-parsing the whole response.
-            renderer.feed_mut().append_to_last(&safe);
+            // Append the token to the tracked running block, never to whatever
+            // block happens to be last: `/btw` answers and "queued:" notices
+            // push blocks mid-stream. Layout renders the unfinished tail line
+            // as plain text and parses markdown only for completed lines.
+            let idx = match run.response_start_block {
+                Some(idx) if renderer.feed().is_streaming(idx) => idx,
+                _ => {
+                    renderer.feed_mut().push_streaming_block(BlockStyle::Agent);
+                    let idx = renderer.feed().block_count() - 1;
+                    run.response_start_block = Some(idx);
+                    idx
+                }
+            };
+            renderer.feed_mut().append_to(idx, &safe);
 
             // Throttle repaints: redraw when a line completed (markdown
             // structure changes at line boundaries) or while the buffer is
@@ -308,6 +313,29 @@ fn save_session_if_settled(
     Ok(())
 }
 
+/// Commit a completed turn's final assistant response to the session.
+///
+/// `interactions` is the runner's canonical provider transcript for the turn
+/// (`AgentEvent::Done { interactions }`). The interactive path has already
+/// persisted every tool call and result live, as it streamed
+/// (`handle_agent_event`'s `ToolCall` / `ToolResult` arms record the real tool
+/// name under the runner's lifecycle id, and intermediate assistant text
+/// before each call), so the batch is deliberately NOT written here: doing so
+/// persisted every tool interaction twice, the second copy attributed to
+/// "unknown" (mini-agent-h41j). Only the headless `-p` path, which has no live
+/// events, persists from the batch (`print::persist_headless_turn`).
+pub(crate) fn commit_turn_response(
+    session: &mut Session,
+    response: &str,
+    interactions: &[Message],
+) {
+    tracing::debug!(
+        canonical_interactions = interactions.len(),
+        "committing turn response; tool records were persisted live"
+    );
+    session.add_message(MessageRole::Assistant, response);
+}
+
 async fn handle_agent_done(
     response: CompactString,
     interactions: Vec<Message>,
@@ -326,37 +354,7 @@ async fn handle_agent_done(
     // fallible presentation or post-processing. The App wrapper can then
     // persist this valid success even if rendering, compaction, validation
     // startup, or worktree-return presentation fails afterward.
-    ui.session.add_message(MessageRole::Assistant, &response);
-    // Persist canonical provider interactions (tool calls and results) for resumable transcripts
-    for interaction in &interactions {
-        match interaction {
-            Message::Assistant { content, .. } => {
-                for item in content.clone() {
-                    if let AssistantContent::ToolCall(call) = item {
-                        ui.session.add_tool_call_with_id(
-                            &call.id,
-                            &call.function.name,
-                            &call.function.arguments,
-                        );
-                    }
-                }
-            }
-            Message::User { content, .. } => {
-                for user_item in content.clone() {
-                    if let UserContent::ToolResult(tr) = user_item {
-                        let call_id = tr.call_id.as_deref().unwrap_or(&tr.id);
-                        for result_content in tr.content.clone() {
-                            if let rig::message::ToolResultContent::Text(text) = result_content {
-                                ui.session
-                                    .add_tool_result_with_id(call_id, "unknown", &text.text);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    commit_turn_response(ui.session, &response, &interactions);
     ui.session.reanchor_calibration_to_current_messages();
 
     finalize_response_segment(renderer, run)?;
@@ -580,10 +578,11 @@ fn finalize_response_segment(
     }
 
     if let Some(start) = run.response_start_block {
-        // Drop anything interleaved after the streaming block, then finalize
-        // the full segment (including its last line) as markdown.
-        renderer.feed_mut().truncate_blocks(start + 1);
-        renderer.feed_mut().finalize_last();
+        // Finalize the full segment (including its last line) as markdown in
+        // place. Blocks interleaved after it (`/btw` answers, queue notices)
+        // are left alone: tokens were appended by index, so nothing is glued
+        // to them and nothing is lost by keeping them.
+        renderer.feed_mut().finalize_block(start);
     } else {
         renderer
             .feed_mut()

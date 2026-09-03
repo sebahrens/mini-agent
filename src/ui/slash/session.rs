@@ -1,9 +1,14 @@
-use std::io::Read;
-
 use compact_str::CompactString;
 
 use crate::ui::events::render_session;
 use crate::ui::slash::{SlashCtx, undo_last, write_error, write_ok, write_result};
+
+/// Char-safe display prefix of a session id. Session ids are UUIDs, but
+/// imported or hand-edited ids may be short or contain multi-byte characters;
+/// byte slicing (`&id[..8]`) panics on both.
+pub(crate) fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
 
 fn format_session_line(s: &crate::session::Session) -> String {
     let last = s
@@ -19,7 +24,7 @@ fn format_session_line(s: &crate::session::Session) -> String {
     };
     format!(
         "  {}  {}  {}msgs  {}  {}{}",
-        &s.id[..8],
+        short_id(&s.id),
         time,
         s.messages.len(),
         s.model,
@@ -33,7 +38,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/sessions" => handle_sessions(parts, ctx).await,
         "/rename" => handle_rename(parts, ctx).await,
         "/clear" | "/new" => handle_clear(ctx).await,
-        "/undo" => handle_undo(ctx).await,
+        "/undo" => handle_undo(parts, ctx).await,
         "/redo" => handle_redo(ctx).await,
         "/rewind" => handle_rewind(ctx).await,
         "/retry" => handle_retry(ctx).await,
@@ -51,10 +56,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
 
 #[cfg(feature = "export")]
 async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    let default_name = format!(
-        "zerostack-session-{}.html",
-        &ctx.session.id[..8.min(ctx.session.id.len())]
-    );
+    let default_name = format!("zerostack-session-{}.html", short_id(&ctx.session.id));
     let path = parts
         .get(1)
         .map(|p| p.trim())
@@ -176,6 +178,8 @@ fn commit_staged_import<S, C, A>(
 
 #[cfg(feature = "export")]
 fn read_bounded_import(path: &str) -> anyhow::Result<String> {
+    use std::io::Read;
+
     let file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
     file.take((crate::extras::export::MAX_SESSION_IMPORT_BYTES + 1) as u64)
@@ -189,6 +193,20 @@ fn read_bounded_import(path: &str) -> anyhow::Result<String> {
     String::from_utf8(bytes).map_err(|error| anyhow::anyhow!("session file is not UTF-8: {error}"))
 }
 
+/// Imported session ids become on-disk file names and are displayed by an
+/// 8-character prefix, so only accept ids shaped like the UUIDs zerostack
+/// generates itself (36 chars, hyphenated hex).
+#[cfg_attr(not(feature = "export"), allow(dead_code))]
+fn validate_imported_session_id(id: &str) -> anyhow::Result<()> {
+    if uuid::Uuid::try_parse(id).is_ok() && id.len() == 36 && id.is_ascii() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "session id {:?} is not a UUID (expected 36 hyphenated hex characters, e.g. 123e4567-e89b-12d3-a456-426614174000)",
+        id.chars().take(48).collect::<String>()
+    )
+}
+
 #[cfg(feature = "export")]
 fn parse_imported_session(
     content: &str,
@@ -198,6 +216,7 @@ fn parse_imported_session(
 ) -> anyhow::Result<crate::session::Session> {
     match crate::extras::export::parse_session_file(content)? {
         crate::extras::export::ParsedSessionFile::Native(mut session) => {
+            validate_imported_session_id(&session.id)?;
             // Native imports are external input, unlike private storage reloads.
             // Never accept a concealed redo payload that is absent from the
             // visible top-level history.
@@ -206,6 +225,7 @@ fn parse_imported_session(
             Ok(session)
         }
         crate::extras::export::ParsedSessionFile::Jsonl(import) => {
+            validate_imported_session_id(&import.id)?;
             crate::paths::validate_portable_component(&import.id)?;
             let mut session = crate::session::Session::new(
                 import.provider.as_str(),
@@ -320,7 +340,7 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
                 } else {
                     write_ok(
                         ctx.renderer,
-                        format!("deleted session {} {}", &id[..8], preview),
+                        format!("deleted session {} {}", short_id(&id), preview),
                     );
                 }
             }
@@ -390,7 +410,22 @@ async fn handle_clear(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_undo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+async fn handle_undo(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    // The stash decision is taken from the command line rather than from a
+    // blocking stdin prompt: the crossterm event thread owns the tty while the
+    // TUI runs, so any synchronous stdin read here either freezes the UI or
+    // has its answer key stolen. Default is the safe choice (no stash).
+    let stash = match parts.get(1).map(|p| p.trim()) {
+        None | Some("") => false,
+        Some("stash") => true,
+        Some(other) => {
+            write_error(
+                ctx.renderer,
+                format!("unknown /undo option '{}' (usage: /undo [stash])", other),
+            );
+            return Ok(());
+        }
+    };
     let removed = match mutate_and_persist_session(
         ctx.session,
         undo_session_mutation,
@@ -417,13 +452,12 @@ async fn handle_undo(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     write_ok(ctx.renderer, format!("removed {} message(s)", removed));
 
-    write_ok(ctx.renderer, "  git stash working changes? [y/N] ");
-
-    let mut buf = [0u8; 1];
-    let do_stash =
-        std::io::stdin().read_exact(&mut buf).is_ok() && (buf[0] == b'y' || buf[0] == b'Y');
-
-    if do_stash {
+    if !stash {
+        write_ok(
+            ctx.renderer,
+            "working tree left untouched (use `/undo stash` to also git stash changes)",
+        );
+    } else {
         match crate::ui::git_stash_in_workspace(ctx.workspace.root()) {
             Ok(out) if out.status.success() => {
                 write_ok(ctx.renderer, "git stash done");
@@ -812,6 +846,39 @@ mod import_tests {
         assert_eq!(session, "new session");
         assert_eq!(client, "new client");
         assert_eq!(agent.as_deref(), Some("new agent"));
+    }
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::{short_id, validate_imported_session_id};
+
+    #[test]
+    fn short_id_is_char_safe_for_short_and_non_ascii_ids() {
+        assert_eq!(short_id("123e4567-e89b-12d3-a456-426614174000"), "123e4567");
+        assert_eq!(short_id("abc"), "abc");
+        assert_eq!(short_id(""), "");
+        // 8 chars, not 8 bytes: byte slicing would panic inside 'é'.
+        assert_eq!(short_id("éééééééééé"), "éééééééé");
+        assert_eq!(short_id("日本語テスト"), "日本語テスト");
+    }
+
+    #[test]
+    fn imported_session_id_must_be_uuid_shaped() {
+        assert!(validate_imported_session_id("123e4567-e89b-12d3-a456-426614174000").is_ok());
+        assert!(validate_imported_session_id("123E4567-E89B-12D3-A456-426614174000").is_ok());
+        for bad in [
+            "",
+            "abc",
+            "123e4567e89b12d3a456426614174000",
+            "../../etc/passwd",
+            "日本語テスト-e89b-12d3-a456-426614174000",
+            "{123e4567-e89b-12d3-a456-426614174000}",
+            "urn:uuid:123e4567-e89b-12d3-a456-426614174000",
+        ] {
+            let error = validate_imported_session_id(bad).unwrap_err().to_string();
+            assert!(error.contains("not a UUID"), "{bad}: {error}");
+        }
     }
 }
 

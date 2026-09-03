@@ -3,7 +3,7 @@ mod app;
 pub(crate) use app::retire_scoped_task;
 #[cfg(test)]
 pub(crate) use app::{ClipboardShortcut, InterruptTarget, clipboard_shortcut, interrupt_target};
-mod event_handler;
+pub(crate) mod event_handler;
 pub(crate) mod events;
 pub(crate) mod feed;
 pub(crate) mod input;
@@ -53,7 +53,8 @@ use crate::ui::state::{
 /// callers can report the change without re-parsing the prompt.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PromptModeOutcome {
-    /// No directive, an unrecognized mode name, or no permission checker.
+    /// No directive, an unrecognized mode name, a directive that would raise
+    /// the mode above the user's own selection, or no permission checker.
     None,
     /// `%%mode=last_user_mode`: the user-selected mode was restored.
     RestoredUserMode,
@@ -95,8 +96,13 @@ fn apply_mode_directive(
         guard.restore_user_mode();
         PromptModeOutcome::RestoredUserMode
     } else if let Some(mode) = SecurityMode::from_str(mode_str) {
-        guard.set_prompt_mode(mode);
-        PromptModeOutcome::Applied(mode)
+        // Downgrade-only: the checker refuses any directive that would widen
+        // the user's CLI/config/`/mode` selection.
+        if guard.set_prompt_mode(mode) {
+            PromptModeOutcome::Applied(mode)
+        } else {
+            PromptModeOutcome::None
+        }
     } else {
         PromptModeOutcome::None
     }
@@ -297,13 +303,13 @@ pub(crate) fn spawn_event_thread(
                     }
                 }
                 Ok(event::Event::Mouse(m)) => match m.kind {
-                    MouseEventKind::ScrollUp => {
-                        if user_tx.blocking_send(UserEvent::ScrollUp).is_err() {
-                            break;
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if user_tx.blocking_send(UserEvent::ScrollDown).is_err() {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let scroll = if matches!(m.kind, MouseEventKind::ScrollUp) {
+                            UserEvent::ScrollUp
+                        } else {
+                            UserEvent::ScrollDown
+                        };
+                        if user_tx.blocking_send(scroll).is_err() {
                             break;
                         }
                     }

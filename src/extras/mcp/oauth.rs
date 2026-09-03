@@ -1316,10 +1316,17 @@ pub fn logout(server_name: &str, url: &str, settings: &OAuthSettings) -> anyhow:
 ///
 /// Returns an error (without prompting) when no usable token is stored, so the
 /// caller can tell the user to run `/mcp login`.
+///
+/// `transport_client` carries the MCP traffic (see
+/// [`super::client::http_client`] for its connect bound). The manager's own
+/// OAuth HTTP client keeps rmcp's built-in whole-request timeout, and the
+/// caller bounds this whole function with the initialize timeout because
+/// restoring stored credentials may refresh a token over the network.
 pub async fn build_auth_client(
     server_name: &str,
     url: &str,
     settings: &OAuthSettings,
+    transport_client: reqwest::Client,
 ) -> anyhow::Result<AuthClient<reqwest::Client>> {
     let mut manager = AuthorizationManager::new(url)
         .await
@@ -1334,7 +1341,7 @@ pub async fn build_auth_client(
         anyhow::bail!("no OAuth token stored; run `/mcp login {server_name}`");
     }
 
-    Ok(AuthClient::new(reqwest::Client::new(), manager))
+    Ok(AuthClient::new(transport_client, manager))
 }
 
 /// Result of starting an interactive login: the URL to open and the live session.

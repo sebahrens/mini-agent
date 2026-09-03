@@ -70,43 +70,70 @@ impl AuthResolver {
         self.resolve_with_env(|name| std::env::var(name))
     }
 
+    /// A custom provider is any name that is not a built-in provider alias.
+    /// Its credentials are isolated: only its own `api_key_env` and its own
+    /// `api_keys[<name>]` entry are consulted, never the built-in kind's
+    /// environment variable or config slot, so a real vendor key is never
+    /// sent to a third-party `base_url` that merely speaks the same protocol.
+    fn custom_provider(&self) -> Option<&str> {
+        self.custom_provider_name
+            .as_deref()
+            .filter(|name| ProviderKind::from_name(name).is_none())
+    }
+
     pub fn resolve_with_env<F: Fn(&str) -> Result<String, VarError>>(
         &self,
         get_env: F,
     ) -> anyhow::Result<String> {
+        let custom = self.custom_provider();
+
         // Priority 1: CLI argument
         if let Some(ref key) = self.cli_key {
             tracing::warn!(
                 "API key provided via --api-key is visible in process listings. \
                  Use the {} environment variable instead.",
-                self.env_var_name()
+                self.api_key_env_override
+                    .as_deref()
+                    .unwrap_or_else(|| self.env_var_name())
             );
             return Ok(key.clone());
         }
 
-        // Priority 2: Environment variable
-        let env_var = self
-            .api_key_env_override
-            .as_deref()
-            .unwrap_or_else(|| self.env_var_name());
-
-        if let Ok(key) = get_env(env_var)
+        // Priority 2: Environment variable. Custom providers only ever read
+        // their explicitly configured `api_key_env`.
+        let env_var = match (custom, self.api_key_env_override.as_deref()) {
+            (_, Some(configured)) => Some(configured),
+            (Some(_), None) => None,
+            (None, None) => Some(self.env_var_name()),
+        };
+        if let Some(env_var) = env_var
+            && let Ok(key) = get_env(env_var)
             && !key.is_empty()
         {
             return Ok(key);
         }
 
-        // Priority 3: Config file (try provider slug first, then custom provider name)
+        // Priority 3: Config file. Built-ins use their slug (and, for
+        // compatibility, the name they were referenced by); custom providers
+        // use exactly their own name.
         if let Some(ref keys) = self.config_api_keys {
-            let slug = self.provider_slug();
-            if let Some(key) = keys.get(slug).filter(|k| !k.is_empty()) {
-                return Ok(key.clone());
-            }
-            // Fallback to custom provider name for custom providers
-            if let Some(ref custom_name) = self.custom_provider_name
-                && let Some(key) = keys.get(custom_name).filter(|k| !k.is_empty())
-            {
-                return Ok(key.clone());
+            let lookup = |name: &str| keys.get(name).filter(|k| !k.is_empty()).cloned();
+            match custom {
+                Some(name) => {
+                    if let Some(key) = lookup(name) {
+                        return Ok(key);
+                    }
+                }
+                None => {
+                    if let Some(key) = lookup(self.provider_slug()) {
+                        return Ok(key);
+                    }
+                    if let Some(name) = self.custom_provider_name.as_deref()
+                        && let Some(key) = lookup(name)
+                    {
+                        return Ok(key);
+                    }
+                }
             }
         }
 
@@ -115,14 +142,21 @@ impl AuthResolver {
             return Ok(String::new());
         }
 
-        anyhow::bail!(
-            "No API key found. Set the {} environment variable, add it to config.api_keys under '{}' or '{}', pass --api-key, or run `mini-agent --setup` to configure interactively.",
-            env_var,
-            self.provider_slug(),
-            self.custom_provider_name
-                .as_deref()
-                .unwrap_or("provider_name")
-        )
+        match custom {
+            Some(name) => anyhow::bail!(
+                "No API key found for custom provider '{name}'. {}Add it to config.api_keys under '{name}', pass --api-key, or run `mini-agent --setup` to configure interactively.",
+                match env_var {
+                    Some(env_var) => format!("Set the {env_var} environment variable, "),
+                    None =>
+                        "Set `api_key_env` for the provider and export that variable, ".to_string(),
+                }
+            ),
+            None => anyhow::bail!(
+                "No API key found. Set the {} environment variable, add it to config.api_keys under '{}', pass --api-key, or run `mini-agent --setup` to configure interactively.",
+                env_var.unwrap_or_else(|| self.env_var_name()),
+                self.provider_slug(),
+            ),
+        }
     }
 
     fn env_var_name(&self) -> &'static str {

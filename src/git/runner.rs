@@ -194,6 +194,22 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.contained_command_with_env(workspace, sandbox, args, &[])
+    }
+
+    /// Like [`Self::contained_command`] but with additional environment
+    /// entries appended to the hardened, non-credential base environment.
+    fn contained_command_with_env<I, S>(
+        &self,
+        workspace: &crate::paths::WorkspaceBinding,
+        sandbox: &Sandbox,
+        args: I,
+        extra_env: &[(OsString, OsString)],
+    ) -> Result<Command, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         self.validate()?;
         workspace.validate()?;
         let argv = self
@@ -201,13 +217,100 @@ impl GitRunner {
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        sandbox.wrap_workspace_service(
-            self.program.as_path(),
-            &argv,
-            workspace.root(),
-            git_environment(),
-            true,
-        )
+        let mut env = git_environment().to_vec();
+        env.extend_from_slice(extra_env);
+        sandbox.wrap_workspace_service(self.program.as_path(), &argv, workspace.root(), &env, true)
+    }
+
+    /// Resolves the commit author/committer identity on the host.
+    ///
+    /// The contained environment deliberately carries no `HOME`, XDG, or
+    /// global/system config access, so `git commit` inside the sandbox cannot
+    /// discover `user.name` / `user.email` on its own. The identity is
+    /// resolved here with uncontained `git config --get` calls (honouring
+    /// `GIT_AUTHOR_*` / `GIT_COMMITTER_*` overrides from the parent process
+    /// environment) and injected as explicit values.
+    pub(crate) async fn resolve_commit_identity(
+        &self,
+        repo_path: &Path,
+    ) -> Result<CommitIdentity, String> {
+        self.resolve_commit_identity_with(repo_path, |name| std::env::var_os(name), &[])
+            .await
+    }
+
+    /// Identity resolution with an explicit environment lookup and extra
+    /// environment for the host `git config` query. `env` supplies the
+    /// `GIT_AUTHOR_*` / `GIT_COMMITTER_*` overrides; `config_env` lets tests
+    /// isolate the lookup from the developer's global config.
+    pub(crate) async fn resolve_commit_identity_with(
+        &self,
+        repo_path: &Path,
+        env: impl Fn(&str) -> Option<OsString>,
+        config_env: &[(String, OsString)],
+    ) -> Result<CommitIdentity, String> {
+        let override_for = |name: &str| {
+            env(name)
+                .and_then(|value| value.into_string().ok())
+                .and_then(|value| identity_value(&value))
+        };
+        let author_name = override_for("GIT_AUTHOR_NAME");
+        let author_email = override_for("GIT_AUTHOR_EMAIL");
+        let committer_name = override_for("GIT_COMMITTER_NAME");
+        let committer_email = override_for("GIT_COMMITTER_EMAIL");
+
+        let user_name = if author_name.is_none() || committer_name.is_none() {
+            self.host_config_value(repo_path, "user.name", config_env)
+                .await?
+        } else {
+            None
+        };
+        let user_email = if author_email.is_none() || committer_email.is_none() {
+            self.host_config_value(repo_path, "user.email", config_env)
+                .await?
+        } else {
+            None
+        };
+
+        let resolve = |explicit: Option<String>, configured: &Option<String>| {
+            explicit
+                .or_else(|| configured.clone())
+                .ok_or_else(|| COMMIT_IDENTITY_UNRESOLVED.to_string())
+        };
+        Ok(CommitIdentity {
+            author_name: resolve(author_name, &user_name)?,
+            author_email: resolve(author_email, &user_email)?,
+            committer_name: resolve(committer_name, &user_name)?,
+            committer_email: resolve(committer_email, &user_email)?,
+        })
+    }
+
+    /// Reads one config key with an uncontained `git config --get` in the
+    /// repository. Returns `Ok(None)` when the key is unset.
+    async fn host_config_value(
+        &self,
+        repo_path: &Path,
+        key: &str,
+        config_env: &[(String, OsString)],
+    ) -> Result<Option<String>, String> {
+        let mut command = self.internal_command(repo_path, ["config", "--get", key])?;
+        for (name, value) in config_env {
+            command.env(name, value);
+        }
+        let output = Sandbox::new(false, "git")
+            .output_built_command_with_limits(command, QUERY_LIMITS)
+            .await
+            .map_err(|_| "git config runner failed".to_string())?;
+        if output.status == CommandStatus::Completed {
+            match output.exit_status.and_then(|status| status.code()) {
+                Some(0) => {
+                    return Ok(identity_value(&String::from_utf8_lossy(&output.stdout)));
+                }
+                // `git config --get` exits 1 when the key is absent.
+                Some(1) => return Ok(None),
+                _ => {}
+            }
+        }
+        command_result("config", QUERY_LIMITS, output).map(|_| None)
     }
 
     pub(crate) async fn run<I, S>(
@@ -376,11 +479,78 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let command = self.contained_command(workspace, sandbox, args)?;
+        // A contained commit has no HOME or global config to learn its
+        // author from; resolve the identity on the host first and fail
+        // before anything is spawned when it cannot be resolved.
+        let extra_env = if operation == "commit" {
+            let identity = self.resolve_commit_identity(workspace.root()).await?;
+            identity.environment()
+        } else {
+            Vec::new()
+        };
+        let command = self.contained_command_with_env(workspace, sandbox, args, &extra_env)?;
         sandbox
             .output_built_command_with_input_and_limits(command, input, limits)
             .await
             .map_err(|_| format!("git {operation} runner failed"))
+    }
+}
+
+/// Author and committer identity resolved on the host for a contained commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommitIdentity {
+    pub(crate) author_name: String,
+    pub(crate) author_email: String,
+    pub(crate) committer_name: String,
+    pub(crate) committer_email: String,
+}
+
+impl CommitIdentity {
+    /// Environment entries that hand the identity to `git commit` without
+    /// any config-file access inside the sandbox.
+    pub(crate) fn environment(&self) -> Vec<(OsString, OsString)> {
+        vec![
+            (
+                OsString::from("GIT_AUTHOR_NAME"),
+                OsString::from(&self.author_name),
+            ),
+            (
+                OsString::from("GIT_AUTHOR_EMAIL"),
+                OsString::from(&self.author_email),
+            ),
+            (
+                OsString::from("GIT_COMMITTER_NAME"),
+                OsString::from(&self.committer_name),
+            ),
+            (
+                OsString::from("GIT_COMMITTER_EMAIL"),
+                OsString::from(&self.committer_email),
+            ),
+        ]
+    }
+}
+
+pub(crate) const COMMIT_IDENTITY_UNRESOLVED: &str = "git commit requires an author identity: \
+the contained git process has no HOME or global config, so set user.name and user.email in \
+this repository (`git config user.name ...` / `git config user.email ...`) or export \
+GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL (and GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL) before starting";
+
+/// The complete environment a contained commit runs with: the hardened base
+/// plus the resolved identity, and nothing else.
+#[cfg(test)]
+pub(crate) fn contained_commit_environment(identity: &CommitIdentity) -> Vec<(OsString, OsString)> {
+    let mut env = git_environment().to_vec();
+    env.extend(identity.environment());
+    env
+}
+
+/// Normalises a config/env identity value: trimmed, non-empty, single line.
+fn identity_value(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() || value.contains(['\0', '\n', '\r']) {
+        None
+    } else {
+        Some(value.to_owned())
     }
 }
 

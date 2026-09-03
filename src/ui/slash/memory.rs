@@ -6,10 +6,33 @@ use crate::ui::slash::write_error;
 use crate::ui::slash::write_ok;
 #[cfg(feature = "memory")]
 use crate::ui::slash::write_result;
+use smallvec::SmallVec;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::process_creation::StdCommandCreationExt;
+
+/// Splits a `/memory` command line into at most four fields. The generic
+/// slash dispatcher splits into three, which cannot express
+/// `write <target> <content>` or `read daily <date>` / `read note <name>`;
+/// the fourth field keeps the remainder verbatim so free-form content
+/// survives with its internal spacing.
+pub(crate) fn split_command(text: &str) -> SmallVec<[&str; 4]> {
+    let mut parts = SmallVec::new();
+    let mut rest = text.trim();
+    for _ in 0..3 {
+        if rest.is_empty() {
+            break;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        parts.push(&rest[..end]);
+        rest = rest[end..].trim_start();
+    }
+    if !rest.is_empty() {
+        parts.push(rest);
+    }
+    parts
+}
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     #[cfg(not(feature = "memory"))]
@@ -453,6 +476,28 @@ mod tests {
     }
 
     #[test]
+    fn memory_read_daily_date_is_reachable_through_slash_splitting() {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-memory-split-{}", uuid::Uuid::new_v4()));
+        let mem = Mem {
+            root: root.clone(),
+            project: "proj".to_string(),
+            today: "2026-05-25".to_string(),
+        };
+        std::fs::create_dir_all(mem.daily_file(&mem.today).parent().unwrap()).unwrap();
+        std::fs::write(mem.daily_file("2026-05-15"), "SPLIT DAILY CONTENT").unwrap();
+
+        let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+        let parts = super::split_command("/memory read daily 2026-05-15");
+        handle_read_with_mem(&parts, &mut renderer, &mem);
+        let output = rendered_text(&renderer);
+        assert!(output.contains("2026-05-15.md (daily):"));
+        assert!(output.contains("SPLIT DAILY CONTENT"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn memory_editor_preserves_existing_content_on_unsuccessful_outcomes() {
         for (label, editor) in [
             ("nonzero", "printf 'discarded' > \"$1\"; false"),
@@ -552,5 +597,48 @@ mod tests {
         assert_eq!(std::fs::read(&referent).unwrap(), b"referent bytes");
         assert_no_editor_temp(parent);
         cleanup(&path);
+    }
+}
+
+#[cfg(test)]
+mod command_split_tests {
+    use super::split_command;
+
+    #[test]
+    fn memory_write_keeps_content_remainder_as_fourth_field() {
+        let parts = split_command("  /memory write note:plan  first line   of content ");
+        assert_eq!(
+            parts.as_slice(),
+            ["/memory", "write", "note:plan", "first line   of content"]
+        );
+    }
+
+    #[test]
+    fn memory_read_exposes_optional_fourth_argument() {
+        assert_eq!(
+            split_command("/memory read daily 2026-05-15").as_slice(),
+            ["/memory", "read", "daily", "2026-05-15"]
+        );
+        assert_eq!(
+            split_command("/memory read note ideas").as_slice(),
+            ["/memory", "read", "note", "ideas"]
+        );
+        assert_eq!(
+            split_command("/memory read scratchpad").as_slice(),
+            ["/memory", "read", "scratchpad"]
+        );
+    }
+
+    #[test]
+    fn memory_bare_and_search_forms_split_like_the_generic_dispatcher() {
+        assert_eq!(split_command("/memory").as_slice(), ["/memory"]);
+        assert_eq!(
+            split_command("/memory status").as_slice(),
+            ["/memory", "status"]
+        );
+        assert_eq!(
+            split_command("/memory search rust async traits").as_slice(),
+            ["/memory", "search", "rust", "async traits"]
+        );
     }
 }

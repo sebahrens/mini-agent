@@ -11,9 +11,9 @@ use compact_str::CompactString;
 use rig::tool::ToolDyn;
 
 use crate::config::{Config, merge_config_override};
-use crate::extras::mcp::McpClientManager;
 use crate::extras::mcp::client::McpClientHandle;
 use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
+use crate::extras::mcp::{McpClientManager, McpToolTimeouts};
 use crate::permission::checker::PermissionChecker;
 use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
@@ -178,7 +178,19 @@ fn main() {
                 ),
             );
         } else if compact.contains("\"method\":\"tools/list\"") {
+            if mode == "hang-tools-list" {
+                continue;
+            }
             let id = request_id(&compact);
+            if mode == "error-tools-list" {
+                write_response(
+                    &mut stdout,
+                    &format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32603,\"message\":\"fixture tools/list failure\"}}}}"
+                    ),
+                );
+                continue;
+            }
             write_response(
                 &mut stdout,
                 &format!(
@@ -186,6 +198,9 @@ fn main() {
                 ),
             );
         } else if compact.contains("\"method\":\"tools/call\"") {
+            if mode == "hang-tools-call" {
+                continue;
+            }
             let id = request_id(&compact);
             let payload = escape(&tool_payload());
             write_response(
@@ -508,10 +523,7 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
         .await
         .expect("absolute fixture executable must initialize");
     assert_eq!(absolute.list_tools().await.unwrap()[0].name, "probe");
-    let absolute_manager = McpClientManager {
-        handles: vec![absolute],
-        notices: Vec::new(),
-    };
+    let absolute_manager = McpClientManager::from_handles(vec![absolute]);
     let payload = call_fixture_tool(&absolute_manager).await;
     assert_eq!(payload["args"][0], "argument with spaces");
     assert_eq!(payload["args"][1], metacharacter);
@@ -550,10 +562,7 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
         let path_handle = McpClientHandle::connect(CompactString::new("fixture"), &path_config)
             .await
             .expect("bare PATH fixture command must initialize");
-        let path_manager = McpClientManager {
-            handles: vec![path_handle],
-            notices: Vec::new(),
-        };
+        let path_manager = McpClientManager::from_handles(vec![path_handle]);
         assert_eq!(
             call_fixture_tool(&path_manager).await["args"][0],
             "from-path"
@@ -578,10 +587,7 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
         McpClientHandle::connect(CompactString::new("fixture"), &inherited_config)
             .await
             .unwrap();
-    let inherited_manager = McpClientManager {
-        handles: vec![inherited_handle],
-        notices: Vec::new(),
-    };
+    let inherited_manager = McpClientManager::from_handles(vec![inherited_handle]);
     assert_eq!(
         call_fixture_tool(&inherited_manager).await["inherited_home"],
         std::env::var(home_variable).unwrap()
@@ -600,10 +606,7 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
     let denied_handle = McpClientHandle::connect(CompactString::new("fixture"), &denied_config)
         .await
         .unwrap();
-    let denied_manager = McpClientManager {
-        handles: vec![denied_handle],
-        notices: Vec::new(),
-    };
+    let denied_manager = McpClientManager::from_handles(vec![denied_handle]);
     let mut denied_tools = denied_manager
         .collect_tools(Some(permission_for(Action::Deny)), None)
         .await;
@@ -639,10 +642,7 @@ async fn mcp_command_transport_uses_the_explicit_workspace() {
     let handle = McpClientHandle::connect_in(CompactString::new("fixture"), &config, &workspace)
         .await
         .unwrap();
-    let manager = McpClientManager {
-        handles: vec![handle],
-        notices: Vec::new(),
-    };
+    let manager = McpClientManager::from_handles(vec![handle]);
 
     assert_eq!(
         call_fixture_tool(&manager).await["cwd"],
@@ -801,11 +801,7 @@ async fn mcp_stdio_failure_cleanup_is_bounded_and_leaves_no_child() {
             .await
             .unwrap();
         let pid = wait_for_pid(&lease).await;
-        shutdown(McpClientManager {
-            handles: vec![handle],
-            notices: Vec::new(),
-        })
-        .await;
+        shutdown(McpClientManager::from_handles(vec![handle])).await;
         assert_process_reaped(pid).await;
     }
 
@@ -900,10 +896,7 @@ async fn mcp_stdio_drop_and_reconnect_reap_process_trees() {
     let first_handle = McpClientHandle::connect(CompactString::new("fixture"), &first)
         .await
         .unwrap();
-    let mut manager = McpClientManager {
-        handles: vec![first_handle],
-        notices: Vec::new(),
-    };
+    let mut manager = McpClientManager::from_handles(vec![first_handle]);
     let first_pid = wait_for_pid(&first_lease).await;
 
     let second_lease = fixture.lease("reconnect-second");
@@ -931,5 +924,303 @@ async fn mcp_stdio_drop_and_reconnect_reap_process_trees() {
     shutdown(manager).await;
     assert_process_reaped(second_pid).await;
 
+    fixture.cleanup();
+}
+
+fn permission_for_servers(entries: &[(&str, Action)]) -> Arc<Mutex<PermissionChecker>> {
+    let permission = PermissionConfig {
+        default: Some(Action::Deny),
+        mcp_tool: Some(ToolPerm::Granular(
+            entries
+                .iter()
+                .map(|(server, action)| (format!("mcp_tool:{server}:probe"), *action))
+                .collect(),
+        )),
+        ..PermissionConfig::default()
+    };
+    Arc::new(Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::from(permission),
+            SecurityMode::Standard,
+            None,
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid permission test configuration"),
+    ))
+}
+
+#[tokio::test]
+async fn mcp_tools_list_hang_times_out_and_produces_notice() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("hang-tools-list");
+    let config = fixture.config(
+        fixture.executable.display().to_string(),
+        Vec::new(),
+        "hang-tools-list",
+        &lease,
+    );
+    let handle = McpClientHandle::connect(CompactString::new("slow"), &config)
+        .await
+        .expect("fixture initializes normally before hanging tools/list");
+    let mut manager = McpClientManager::from_handles(vec![handle]);
+
+    let timeouts = McpToolTimeouts {
+        list: Duration::from_millis(300),
+        call: Duration::from_secs(5),
+    };
+    let started = std::time::Instant::now();
+    let tools = tokio::time::timeout(
+        Duration::from_secs(5),
+        manager.collect_tools_with_timeouts(Some(permission_for(Action::Allow)), None, timeouts),
+    )
+    .await
+    .expect("tools/list against a hung server must be bounded");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "collect_tools must return shortly after the list timeout"
+    );
+    assert!(tools.is_empty(), "a hung server contributes no tools");
+    let notices = manager.take_notices();
+    assert_eq!(notices.len(), 1, "notices: {notices:?}");
+    assert!(notices[0].contains("slow"), "{}", notices[0]);
+    assert!(notices[0].contains("timed out"), "{}", notices[0]);
+
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_tools_list_hang_does_not_block_other_servers() {
+    let fixture = FixtureBuild::compile();
+    let slow_lease = fixture.lease("hang-tools-list-slow");
+    let slow = McpClientHandle::connect(
+        CompactString::new("slow"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "hang-tools-list",
+            &slow_lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let fast_lease = fixture.lease("hang-tools-list-fast");
+    let fast = McpClientHandle::connect(
+        CompactString::new("fast"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "normal",
+            &fast_lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut manager = McpClientManager::from_handles(vec![fast, slow]);
+    let timeouts = McpToolTimeouts {
+        list: Duration::from_millis(300),
+        call: Duration::from_secs(5),
+    };
+    let tools = manager
+        .collect_tools_with_timeouts(Some(permission_for(Action::Allow)), None, timeouts)
+        .await;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].server_name, "fast");
+    assert_eq!(tools[0].name(), "probe");
+    let notices = manager.take_notices();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("slow"));
+
+    let slow_pid = wait_for_pid(&slow_lease).await;
+    let fast_pid = wait_for_pid(&fast_lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(slow_pid).await;
+    assert_process_reaped(fast_pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_tools_list_error_produces_notice() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("error-tools-list");
+    let handle = McpClientHandle::connect(
+        CompactString::new("broken"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "error-tools-list",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut manager = McpClientManager::from_handles(vec![handle]);
+    let tools = manager
+        .collect_tools(Some(permission_for(Action::Allow)), None)
+        .await;
+    assert!(tools.is_empty());
+    let notices = manager.take_notices();
+    assert_eq!(notices.len(), 1, "notices: {notices:?}");
+    assert!(notices[0].contains("broken"), "{}", notices[0]);
+    assert!(
+        notices[0].contains("fixture tools/list failure"),
+        "{}",
+        notices[0]
+    );
+    assert!(manager.take_notices().is_empty(), "notices drain once");
+
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_tool_call_hang_times_out_with_tool_error() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("hang-tools-call");
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "hang-tools-call",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let timeouts = McpToolTimeouts {
+        list: Duration::from_secs(5),
+        call: Duration::from_millis(300),
+    };
+    let mut tools = manager
+        .collect_tools_with_timeouts(Some(permission_for(Action::Allow)), None, timeouts)
+        .await;
+    let tool = tools
+        .iter_mut()
+        .find(|tool| tool.name() == "probe")
+        .expect("fixture tool must be listed");
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(5), tool.call("{}".to_string()))
+        .await
+        .expect("a hung tools/call must be bounded by the call timeout")
+        .expect_err("a hung tools/call must fail");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let message = error.to_string();
+    assert!(message.contains("timed out"), "{message}");
+    assert!(message.contains("probe"), "{message}");
+    assert!(message.contains("mcp_tool_timeout_secs"), "{message}");
+
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
+    let fixture = FixtureBuild::compile();
+    let alpha_lease = fixture.lease("dup-alpha");
+    let alpha = McpClientHandle::connect(
+        CompactString::new("alpha"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            vec!["alpha".to_string()],
+            "normal",
+            &alpha_lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let beta_lease = fixture.lease("dup-beta");
+    let beta = McpClientHandle::connect(
+        CompactString::new("beta"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            vec!["beta".to_string()],
+            "normal",
+            &beta_lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut manager = McpClientManager::from_handles(vec![alpha, beta]);
+
+    // Permission keys stay `mcp_tool:{server}:{tool}` with the bare tool name.
+    let permission = permission_for_servers(&[("alpha", Action::Allow), ("beta", Action::Deny)]);
+    let mut tools = manager.collect_tools(Some(permission), None).await;
+    let mut names: Vec<String> = tools.iter().map(|tool| tool.name()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["alpha__probe".to_string(), "beta__probe".to_string()]
+    );
+    assert!(
+        tools.iter().all(|tool| tool.definition.name == "probe"),
+        "the wire-level tool name must not change"
+    );
+
+    let notices = manager.take_notices();
+    assert_eq!(notices.len(), 1, "notices: {notices:?}");
+    assert!(notices[0].contains("probe"), "{}", notices[0]);
+    assert!(notices[0].contains("alpha__probe"), "{}", notices[0]);
+    assert!(notices[0].contains("beta__probe"), "{}", notices[0]);
+
+    let alpha_output = tools
+        .iter_mut()
+        .find(|tool| tool.name() == "alpha__probe")
+        .unwrap()
+        .call("{}".to_string())
+        .await
+        .expect("alpha is allowed");
+    let payload: serde_json::Value = serde_json::from_str(&alpha_output).unwrap();
+    assert_eq!(payload["args"][0], "alpha");
+
+    let beta_error = tools
+        .iter_mut()
+        .find(|tool| tool.name() == "beta__probe")
+        .unwrap()
+        .call("{}".to_string())
+        .await
+        .expect_err("beta is denied under its unchanged permission key");
+    assert!(beta_error.to_string().contains("Permission denied"));
+
+    let alpha_pid = wait_for_pid(&alpha_lease).await;
+    let beta_pid = wait_for_pid(&beta_lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(alpha_pid).await;
+    assert_process_reaped(beta_pid).await;
+    fixture.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_distinct_tool_names_keep_bare_names() {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("single");
+    let handle = McpClientHandle::connect(
+        CompactString::new("only"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "normal",
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut manager = McpClientManager::from_handles(vec![handle]);
+    let tools = manager
+        .collect_tools(Some(permission_for(Action::Allow)), None)
+        .await;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name(), "probe");
+    assert!(manager.take_notices().is_empty());
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
     fixture.cleanup();
 }

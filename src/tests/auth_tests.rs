@@ -159,3 +159,94 @@ fn provider_kind_from_name_case_insensitive() {
 fn provider_kind_from_name_returns_none_for_unknown() {
     assert_eq!(ProviderKind::from_name("unknown"), None);
 }
+
+// --- Custom providers must not borrow built-in credentials (mini-agent-afj7) ---
+
+#[test]
+fn custom_provider_does_not_fall_back_to_kind_env_var() {
+    // A real OpenAI key in the environment must never be sent to a
+    // third-party base_url just because the custom provider is OpenAI-shaped.
+    let env = mock_env(vec![("OPENAI_API_KEY", "sk-real-openai-key")]);
+    let resolver = AuthResolver::new(ProviderKind::OpenAI)
+        .with_cli_key(None)
+        .with_env_override(Some("VLLM_API_KEY"))
+        .with_config_keys(None)
+        .with_custom_provider_name(Some("local-vllm"));
+    let error = resolver
+        .resolve_with_env(env)
+        .expect_err("custom provider must not inherit OPENAI_API_KEY");
+    let message = error.to_string();
+    assert!(message.contains("VLLM_API_KEY"), "{message}");
+    assert!(message.contains("local-vllm"), "{message}");
+}
+
+#[test]
+fn custom_provider_without_api_key_env_does_not_use_kind_env_var() {
+    let env = mock_env(vec![("OPENAI_API_KEY", "sk-real-openai-key")]);
+    let resolver = AuthResolver::new(ProviderKind::OpenAI)
+        .with_cli_key(None)
+        .with_env_override(None)
+        .with_config_keys(None)
+        .with_custom_provider_name(Some("local-vllm"));
+    assert!(resolver.resolve_with_env(env).is_err());
+}
+
+#[test]
+fn custom_provider_does_not_fall_back_to_kind_config_key() {
+    let env = mock_env(vec![]);
+    let mut keys = HashMap::new();
+    keys.insert("openai".to_string(), "sk-real-openai-key".to_string());
+    let resolver = AuthResolver::new(ProviderKind::OpenAI)
+        .with_cli_key(None)
+        .with_env_override(Some("VLLM_API_KEY"))
+        .with_config_keys(Some(&keys))
+        .with_custom_provider_name(Some("local-vllm"));
+    assert!(resolver.resolve_with_env(env).is_err());
+}
+
+#[test]
+fn custom_provider_uses_its_own_env_var_and_config_entry() {
+    let env = mock_env(vec![
+        ("OPENAI_API_KEY", "sk-real-openai-key"),
+        ("VLLM_API_KEY", "vllm-key"),
+    ]);
+    let resolver = AuthResolver::new(ProviderKind::OpenAI)
+        .with_cli_key(None)
+        .with_env_override(Some("VLLM_API_KEY"))
+        .with_config_keys(None)
+        .with_custom_provider_name(Some("local-vllm"));
+    assert_eq!(resolver.resolve_with_env(env).unwrap(), "vllm-key");
+
+    let env = mock_env(vec![("OPENAI_API_KEY", "sk-real-openai-key")]);
+    let mut keys = HashMap::new();
+    keys.insert("openai".to_string(), "sk-real-openai-key".to_string());
+    keys.insert("local-vllm".to_string(), "vllm-config-key".to_string());
+    let resolver = AuthResolver::new(ProviderKind::OpenAI)
+        .with_cli_key(None)
+        .with_env_override(Some("VLLM_API_KEY"))
+        .with_config_keys(Some(&keys))
+        .with_custom_provider_name(Some("local-vllm"));
+    assert_eq!(resolver.resolve_with_env(env).unwrap(), "vllm-config-key");
+}
+
+#[test]
+fn builtin_provider_named_by_slug_keeps_kind_fallbacks() {
+    // provider.rs passes the provider name for built-ins too; they keep the
+    // ordinary env var / api_keys[<slug>] resolution.
+    let env = mock_env(vec![("OPENROUTER_API_KEY", "or-env-key")]);
+    let resolver = AuthResolver::new(ProviderKind::OpenRouter)
+        .with_cli_key(None)
+        .with_env_override(None)
+        .with_config_keys(None)
+        .with_custom_provider_name(Some("openrouter"));
+    assert_eq!(resolver.resolve_with_env(env).unwrap(), "or-env-key");
+
+    let env = mock_env(vec![]);
+    let mut keys = HashMap::new();
+    keys.insert("gemini".to_string(), "gemini-config-key".to_string());
+    let resolver = AuthResolver::new(ProviderKind::Gemini)
+        .with_cli_key(None)
+        .with_config_keys(Some(&keys))
+        .with_custom_provider_name(Some("google"));
+    assert_eq!(resolver.resolve_with_env(env).unwrap(), "gemini-config-key");
+}

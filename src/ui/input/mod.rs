@@ -344,26 +344,22 @@ impl InputEditor {
                     return None;
                 }
                 KeyCode::Char('u') => {
+                    // `cursor` is a byte offset; slice bytes, never chars.
                     if self.cursor > 0 {
-                        let deleted: String = self.buffer.chars().take(self.cursor).collect();
-                        let remaining: String = self.buffer.chars().skip(self.cursor).collect();
-                        self.buffer = CompactString::new(&remaining);
+                        let deleted: CompactString = self.buffer[..self.cursor].into();
+                        let remaining: CompactString = self.buffer[self.cursor..].into();
+                        self.buffer = remaining;
                         self.cursor = 0;
-                        if !deleted.is_empty() {
-                            self.push_kill(CompactString::new(&deleted));
-                        }
+                        self.push_kill(deleted);
                     }
                     self.yank_pos = None;
                     return None;
                 }
                 KeyCode::Char('k') => {
                     if self.cursor < self.buffer.len() {
-                        let deleted: String = self.buffer.chars().skip(self.cursor).collect();
-                        let before: String = self.buffer.chars().take(self.cursor).collect();
-                        self.buffer = CompactString::new(&before);
-                        if !deleted.is_empty() {
-                            self.push_kill(CompactString::new(&deleted));
-                        }
+                        let deleted: CompactString = self.buffer[self.cursor..].into();
+                        self.buffer.truncate(self.cursor);
+                        self.push_kill(deleted);
                     }
                     self.yank_pos = None;
                     return None;
@@ -415,11 +411,19 @@ impl InputEditor {
                     if let Some(pos) = self.yank_pos
                         && self.kill_ring.len() > 1
                     {
+                        // Byte offsets throughout: `yank_len` is the byte
+                        // length of the previously yanked text.
                         let start = self.cursor.saturating_sub(self.yank_len);
-                        if start <= self.cursor {
-                            let before: String = self.buffer.chars().take(start).collect();
-                            let after: String = self.buffer.chars().skip(self.cursor).collect();
-                            self.buffer = CompactString::new(format!("{}{}", before, after));
+                        if start <= self.cursor
+                            && self.buffer.is_char_boundary(start)
+                            && self.buffer.is_char_boundary(self.cursor)
+                        {
+                            let before = &self.buffer[..start];
+                            let after = &self.buffer[self.cursor..];
+                            let mut new_buf = String::with_capacity(before.len() + after.len());
+                            new_buf.push_str(before);
+                            new_buf.push_str(after);
+                            self.buffer = CompactString::new(&new_buf);
                             self.cursor = start;
                         }
                         let new_pos = if pos == 0 {

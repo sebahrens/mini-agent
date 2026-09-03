@@ -768,6 +768,39 @@ impl Session {
         self.rewind_undo = None;
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     }
+
+    /// Number of leading messages to drain after a compaction whose summarizer
+    /// reported `messages_included` summarized messages for a cut of
+    /// `cut_idx`. The summarizer contract (`provider::compress_messages`)
+    /// counts an oldest prefix of the cut slice, so with full coverage this is
+    /// `cut_idx`; a partial count drains only the summarized prefix and leaves
+    /// the unsummarized remainder for a later pass. Zero is an error because
+    /// inserting a summary without removing anything grows the session and
+    /// re-triggers auto-compaction on every turn.
+    pub fn compaction_drain_len(cut_idx: usize, messages_included: usize) -> anyhow::Result<usize> {
+        let drain = messages_included.min(cut_idx);
+        if drain == 0 {
+            anyhow::bail!("compaction summarized no messages; nothing to drain");
+        }
+        Ok(drain)
+    }
+}
+
+fn format_truncated_tool_result(
+    name: &str,
+    output: &str,
+    output_chars: usize,
+    path: &Path,
+) -> String {
+    let head: String = output.chars().take(TOOL_RESULT_HEAD_CHARS).collect();
+    let tail_start = output_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS);
+    let tail: String = output.chars().skip(tail_start).collect();
+    let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
+
+    format!(
+        "{name}:\n{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n[full output saved to: {}; use the read tool on this path to inspect the complete output]\n\n{tail}",
+        path.display()
+    )
 }
 
 #[cfg(test)]
@@ -855,21 +888,4 @@ mod preflight_tests {
         assert!(!s.needs_compaction_with_pending(10, 100));
         assert!(!s.is_irreducible_with_pending(10, 100));
     }
-}
-
-fn format_truncated_tool_result(
-    name: &str,
-    output: &str,
-    output_chars: usize,
-    path: &Path,
-) -> String {
-    let head: String = output.chars().take(TOOL_RESULT_HEAD_CHARS).collect();
-    let tail_start = output_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS);
-    let tail: String = output.chars().skip(tail_start).collect();
-    let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
-
-    format!(
-        "{name}:\n{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n[full output saved to: {}; use the read tool on this path to inspect the complete output]\n\n{tail}",
-        path.display()
-    )
 }

@@ -22,12 +22,26 @@ pub fn show_get_started() -> anyhow::Result<()> {
             crate::product::PUBLIC_NAME
         );
     }
-    let status = std::process::Command::new("less")
+    // Never `process::exit` from here: the TUI's `/tutor` calls this with the
+    // terminal suspended and must get control back to restore it.
+    match std::process::Command::new("less")
         .arg(&doc_path)
-        .status_guarded()?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        .status_guarded()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => anyhow::bail!("less exited with {}", status),
+        // No pager on this system (typical on Windows): print the document.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => print_document(&doc_path),
+        Err(error) => Err(anyhow::Error::new(error).context("failed to launch less")),
     }
+}
+
+fn print_document(path: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    let text = std::fs::read_to_string(path)?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()?;
     Ok(())
 }
 

@@ -15,6 +15,10 @@ Keep it focused and actionable for a coding agent.";
 const AGENTS_DESC: &str = "tells coding agents how to build, test, and work with this codebase";
 const ARCHITECTURE_DESC: &str = "documents high-level codebase architecture for AI agents";
 
+/// Synchronous y/N prompt on the real stdin. Only valid while the terminal is
+/// suspended AND the crossterm event thread is stopped; the app guarantees the
+/// latter around `/init` dispatch (see `App::run_slash_command`), otherwise the
+/// event thread and this read would compete for the same tty.
 fn ask_yn(question: &str) -> bool {
     print!("{question} ");
     std::io::stdout().flush().ok();

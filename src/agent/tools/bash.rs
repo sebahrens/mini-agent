@@ -11,8 +11,11 @@ pub struct ShellTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub sandbox: Sandbox,
-    /// `None` = no truncation (matches the historical behaviour). `Some(n)`
-    /// = head-only truncation after `n` lines with a recovery hint.
+    /// `None` = no line truncation (only the byte-level command limits
+    /// apply). `Some(n)` = keep the head and tail of the output within `n`
+    /// lines with an omitted-count marker, on both the success path and the
+    /// partial output embedded in a resource-limit error. The config default
+    /// is [`crate::config::DEFAULT_MAX_BASH_OUTPUT_LINES`].
     pub max_output_lines: Option<u64>,
 }
 
@@ -95,7 +98,7 @@ impl Tool for ShellTool {
 
         if output.status != CommandStatus::Completed {
             tracing::warn!("tool shell stopped before completion: {:?}", output.status);
-            return Err(resource_limit_error(output, limits));
+            return Err(resource_limit_error(output, limits, self.max_output_lines));
         }
 
         let exit_code = output
@@ -113,22 +116,7 @@ impl Tool for ShellTool {
             result.push_str(&format!("\nExit code: {}", exit_code));
         }
 
-        let result = if let Some(cap) = self.max_output_lines {
-            let cap = cap as usize;
-            let (head, total) = head_lines(&result, cap);
-            if total > cap {
-                format!(
-                    "{}\n\n[truncated after {} lines — {} more lines elided; re-run with a narrower invocation or pipe through `tail`/`grep` to see trailing output]",
-                    head,
-                    cap,
-                    total - cap,
-                )
-            } else {
-                result
-            }
-        } else {
-            result
-        };
+        let result = bound_output_lines(result, self.max_output_lines);
 
         let result = match coaching {
             Some(msg) => format!("{}\n\n{}", msg, result),
@@ -163,7 +151,45 @@ fn render_streams(stdout: &[u8], stderr: &[u8]) -> String {
     result
 }
 
-fn resource_limit_error(output: CommandOutput, limits: CommandLimits) -> ToolError {
+/// Bound `text` to at most `max_output_lines` lines, keeping the head and a
+/// short tail around an omitted-count marker so the model sees how the output
+/// starts and ends (exit codes and final errors live at the end). `None`
+/// returns the text unchanged.
+fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
+    let Some(cap) = max_output_lines else {
+        return text;
+    };
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX).max(1);
+    // Keep roughly 80 % of the budget for the head and 20 % for the tail.
+    let tail = cap / 5;
+    let head = cap - tail;
+    let (mut bounded, total) = head_lines(&text, head);
+    if total <= cap {
+        return text;
+    }
+    let omitted = total - head - tail;
+    bounded.push_str(&format!(
+        "\n\n[... {omitted} lines omitted — showing the first {head} and last {tail} of {total} lines; \
+         re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest ...]\n"
+    ));
+    if tail > 0 {
+        bounded.push('\n');
+        bounded.push_str(
+            &text
+                .lines()
+                .skip(total - tail)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    bounded
+}
+
+fn resource_limit_error(
+    output: CommandOutput,
+    limits: CommandLimits,
+    max_output_lines: Option<u64>,
+) -> ToolError {
     let metadata = match output.status {
         CommandStatus::TimedOut => format!(
             "[status: timed_out; timeout_ms: {}]",
@@ -181,7 +207,10 @@ fn resource_limit_error(output: CommandOutput, limits: CommandLimits) -> ToolErr
         CommandStatus::Failed => "[status: failed]".to_string(),
         CommandStatus::Completed => unreachable!("completed output is handled before this helper"),
     };
-    let partial = render_streams(&output.stdout, &output.stderr);
+    let partial = bound_output_lines(
+        render_streams(&output.stdout, &output.stderr),
+        max_output_lines,
+    );
     let message = if partial.is_empty() {
         metadata
     } else {

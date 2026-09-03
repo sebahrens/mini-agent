@@ -113,6 +113,8 @@ mod lsp_tests;
 #[cfg(test)]
 mod markdown_tests;
 #[cfg(all(test, feature = "mcp"))]
+mod mcp_http_tests;
+#[cfg(all(test, feature = "mcp"))]
 mod mcp_oauth_tests;
 #[cfg(all(test, feature = "mcp"))]
 mod mcp_stdio_tests;
@@ -170,5 +172,7 @@ mod todo_tests;
 mod tools_filter_tests;
 #[cfg(test)]
 mod tools_mod_tests;
+#[cfg(test)]
+mod turn_persistence_tests;
 #[cfg(all(test, feature = "git-worktree"))]
 mod worktree_tests;

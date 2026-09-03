@@ -346,6 +346,7 @@ Accepted top-level keys:
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. When unset globally, falls back to the active quick model's `reserve_tokens` field, then to a default that scales with the context window: `window/10`, never below `16384` (so one maximal response cannot overshoot the window) and never above half the window. Examples: 128k window → 16384, 1M window → 100000. |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. When unset, scales with the context window: `window/20` clamped to `[10000, 50000]` and at most a quarter of the window. Examples: 128k window → 10000, 1M window → 50000.                          |
 | `max_text_file_size`      | integer | Maximum allowed file size in bytes for read/write tool operations. Default: `1048576` (1 MB).                                                                               |
+| `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
 | `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section within one logical session until that session edits or writes the target. Agent rebuilds retain that session's history; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, and opt-in mid-turn compaction). Default: `false`. When `false`, nothing is ever compacted automatically.            |
@@ -370,14 +371,14 @@ Accepted top-level keys:
 | `windows-appcontainer-write-roots` | array of paths | Additional Windows AppContainer read/write roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they overlap the read-only cache/configured roots, another writable root, or the private AppContainer control sibling. Deterministic conflicts are rejected before profile/journal creation. CLI: repeat `--windows-appcontainer-write-root PATH`. |
 | `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
 | `js-fetch-allow-http`     | boolean | Permit public-address HTTP origins for JS `fetch()` in addition to HTTPS. Default: `false`. Private, loopback, link-local, metadata, multicast, and reserved destinations remain denied. |
-| `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`.                               |
+| `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo` (`accept` is an alias for `standard`). Any other value is rejected at startup with the list of accepted values. |
 | `show_tool_details`       | boolean or integer | Show tool-result previews in the TUI. `false` hides output, `true` shows all lines, an integer limits to that many lines (e.g. `3`). Default: `3`. |
 | `show_reasoning`          | boolean | Show streamed reasoning text in the TUI. Can still be toggled at runtime with `Ctrl+R` or `/reasoning`. Default: `false`. |
 | `statusline`              | table   | Configurable status bar (up to 3 lines of colored segments). When absent, a built-in default layout is used. See Status bar below. |
 | `chat_left_margin`        | integer | Left padding (columns) for the chat area only; input and status rows are unaffected. Default: `0`. |
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
 | `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` env var, then `editor`, then `nano`).                                                                                        |
-| `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set.                                                   |
+| `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. |
 | `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "input_token_cost"?, "output_token_cost"?, "temperature"?, "extra_body"? }`. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
 | `prompt_to_model`         | object  | Map of prompt names to quick-model names (e.g. `plan = "glm-52"`). When switching to a prompt, zerostack automatically switches to the corresponding quick model. Empty-string values are treated as "no change". See Prompt-to-model switching below. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, recommended MCPs are auto-configured (see below).                                                   |
@@ -385,6 +386,7 @@ Accepted top-level keys:
 | `enable-context7-mcp`     | boolean | Auto-configure the Context7 MCP server. Default: `false`.                                                                                                              |
 | `enable-grepapp-mcp`      | boolean | Auto-configure the Grep.app MCP server. Default: `false`.                                                                                                              |
 | `allow_all_mcp_calls`     | boolean | When `true`, permission checks are skipped for all MCP tool calls. Default: `false`.                                                                                   |
+| `mcp_tool_timeout_secs`   | integer | Bound on one MCP `tools/call` round trip, in seconds. A call that exceeds it is cancelled and reported to the model as a tool error. Default: `120` (minimum `1`).       |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
 | `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
@@ -1025,6 +1027,28 @@ never degrade to a match-all rule.
 Both fields can be used together; rules from both are merged. If both define a
 default action (`"*"`), the glob default takes precedence.
 
+### Rule precedence
+
+When several rules for one tool match the same input, the outcome is
+deterministic and independent of the order in which the rules are written:
+
+1. Any matching `deny` wins. Deny rules are also evaluated before session
+   `AllowAlways` grants and hook one-shot verdicts.
+2. Otherwise the most specific matching pattern wins. Specificity is the
+   number of literal characters in the pattern: everything except `*`, `**`,
+   and `?` for globs, and everything except regex metacharacters for
+   `permission-regex` rules. A single action (`read = "allow"`) counts as `**`
+   with specificity `0`, so any pattern beats it.
+3. On equal specificity `ask` beats `allow`.
+
+In the example above, `src/main.rs` is allowed because `**/*.rs` (four literal
+characters) is more specific than `**` (none), while `README.md` falls through
+to the `**` ask rule. Path rules are matched against the absolute path, the
+path as the tool received it, and the workspace-relative spelling, so a
+relative rule such as `secrets/**` also applies when a tool passes the
+canonical absolute path. Bash scripts are checked as a whole and line by line
+against deny rules: a deny that matches any line denies the entire script.
+
 As a TOML-friendly alternative to the nested `permission` object, you can use
 `permission-allow`, `permission-ask`, and `permission-deny` at the top level.
 Each is a map from tool name to a list of glob patterns. These work side by
@@ -1098,8 +1122,21 @@ otherwise also denies launch. Server launch trust, service sandbox/network
 authority, and permission to call each exposed MCP tool are independent.
 
 The server must reserve stdout for MCP protocol messages and write diagnostics
-to stderr. Local servers must complete the MCP initialization handshake within
-10 seconds. Resolution, spawn, handshake, malformed-output, and early-exit
+to stderr. Every server must complete the MCP initialization handshake within
+10 seconds; for URL servers that budget also covers the TCP/TLS connect and,
+with OAuth, restoring (and refreshing) the stored token. Each server's
+`tools/list` enumeration is bounded to 30 seconds and 64 pages. A server that
+exceeds either budget is reported in a startup notice and skipped without
+delaying the others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
+(default 120); on expiry zerostack cancels the request and returns a tool error
+the model can act on instead of stalling the turn.
+
+When two servers expose a tool with the same name, both are registered under
+`<server>__<tool>` (for example `alpha__search` and `beta__search`) and a
+startup notice lists the renames. The permission key stays
+`mcp_tool:{server_name}:{tool_name}` with the bare tool name.
+
+Resolution, spawn, handshake, malformed-output, and early-exit
 failures identify the configured server and include at most 8 KiB of captured
 stderr (including invalid UTF-8 replacement) so startup diagnostics stay useful
 and bounded. The transport owns a Unix process group or Windows Job Object;
@@ -1442,6 +1479,21 @@ is activated (via `/prompt <name>` or as the `default_prompt`).
 
 Valid modes: `standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`.
 
+A directive can only narrow the mode. The user's own selection (a CLI flag,
+`default_permission_mode`, or `/mode`) is the ceiling: a prompt asking for a
+more permissive mode (for example `%%mode=yolo` while running `--guarded`) is
+ignored and the current mode is kept. Ranking from least to most permissive:
+`readonly`, `planwrite`, `restrictive`, `guarded`, `standard`, `yolo`.
+
+Prompts are loaded from three sources and the source decides whether a
+directive is honored at all. Embedded prompts and the user's own prompts
+directory are trusted like the global config. Prompts from the project's
+`.zerostack/prompts/` are repository content: their `%%mode=` directive is
+dropped (with a warning) unless the project's `.zerostack/config.toml` has
+been explicitly trusted through the project-config trust store described
+under Trust model; `%%mode=last_user_mode` is always kept because it can
+only restore the user's selection.
+
 Use `%%mode=last_user_mode` to keep (or restore) the mode the user last
 set explicitly via `/mode` or startup config — useful when a prompt wants
 to avoid overriding the user's chosen mode.
@@ -1782,12 +1834,20 @@ The standard `RUST_LOG` environment variable is still supported for backward
 compatibility:
 
 ```bash
-RUST_LOG=zerostack=debug mini-agent          # debug level for zerostack
+RUST_LOG=mini_agent=debug mini-agent          # debug level for this crate
 RUST_LOG=debug,rig=off mini-agent             # debug for everything except rig
-RUST_LOG=zerostack::agent::tools=trace mini-agent  # trace only tool execution
+RUST_LOG=mini_agent::agent::tools=trace mini-agent  # trace only tool execution
 ```
 
+The crate's tracing target is the crate name, `mini_agent` (the `mini-agent`
+package name with `-` mapped to `_`), not `zerostack`; only the explicit audit
+events use `zerostack::audit::*` targets.
+
 Priority (highest wins): `--log-level` > `RUST_LOG` env > default `warn,rig=off`.
+
+The `-v` / `--log-file` file layer is not affected by `RUST_LOG`: it always
+uses `mini_agent=trace,zerostack=trace,rig=off`, so every event from this
+crate plus the `zerostack::audit::*` targets reaches the file.
 
 ### Logged subsystems
 

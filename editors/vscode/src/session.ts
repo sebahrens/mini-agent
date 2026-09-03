@@ -8,6 +8,13 @@ import {
   SerialTransitionQueue,
   SessionUnavailableError,
 } from './conversation';
+import {
+  LineRingBuffer,
+  formatStderrBlock,
+  probeFailureMessage,
+  unexpectedExitMessage,
+  withRecentStderr,
+} from './diagnostics';
 import { log } from './log';
 
 type SessionState = 'stopped' | 'starting' | 'running' | 'stopping';
@@ -94,6 +101,8 @@ export class AgentSession {
   private readonly transitions = new SerialTransitionQueue();
   private readonly statusBar: vscode.StatusBarItem;
   private readonly conversation: Conversation;
+  /** Last stderr lines of the current child, surfaced on unexpected exit. */
+  private stderr = new LineRingBuffer();
 
   constructor(
     private readonly executablePath: string,
@@ -169,12 +178,17 @@ export class AgentSession {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.proc = proc;
+    const stderr = new LineRingBuffer();
+    this.stderr = stderr;
     proc.once('error', error => this.onError(proc, error));
     proc.once('exit', (code, signal) => this.onExit(proc, code, signal));
+    // Info, not debug: the default log level is info and a startup failure
+    // (e.g. a missing provider key) is only ever reported on stderr.
     proc.stderr.on('data', (chunk: Buffer) => {
-      for (const line of chunk.toString().split('\n').filter(Boolean)) {
-        log.debug(`[stderr] ${line}`);
-      }
+      for (const line of stderr.push(chunk)) { log.info(`[stderr] ${line}`); }
+    });
+    proc.stderr.once('end', () => {
+      for (const line of stderr.flush()) { log.info(`[stderr] ${line}`); }
     });
 
     const output = Writable.toWeb(proc.stdin) as WritableStream<Uint8Array>;
@@ -202,7 +216,9 @@ export class AgentSession {
       this.connection = undefined;
       this.client = undefined;
       this.setState('stopped');
-      throw error;
+      const recent = stderr.lines();
+      log.error(`ACP initialize failed for ${this.executablePath}: ${errorMessage(error)}\n${formatStderrBlock(recent)}`);
+      throw new Error(withRecentStderr(`ACP initialize failed: ${errorMessage(error)}.`, recent), { cause: error });
     }
   }
 
@@ -218,8 +234,10 @@ export class AgentSession {
 
   private onError(proc: cp.ChildProcessWithoutNullStreams, error: Error): void {
     if (this.proc !== proc) { return; }
-    log.error(`mini-agent process error: ${error.message}`);
-    void vscode.window.showErrorMessage(`Mini Agent process error: ${error.message}`);
+    log.error(`mini-agent process error (${this.executablePath}): ${error.message}`);
+    void vscode.window.showErrorMessage(
+      `Mini Agent process error (${this.executablePath}): ${error.message}`,
+    );
     this.resetAfterExit(proc);
   }
 
@@ -230,10 +248,12 @@ export class AgentSession {
   ): void {
     if (this.proc !== proc) { return; }
     if (this.state !== 'stopping') {
-      log.warn(`mini-agent exited unexpectedly: code=${code ?? 'null'} signal=${signal ?? 'none'}`);
-      void vscode.window.showWarningMessage(
-        `Mini Agent exited unexpectedly (code ${code ?? signal ?? 'unknown'}). The next chat request will restart it.`,
+      const recent = this.stderr.lines();
+      log.warn(
+        `mini-agent exited unexpectedly: code=${code ?? 'null'} signal=${signal ?? 'none'}\n`
+        + formatStderrBlock(recent),
       );
+      void vscode.window.showWarningMessage(unexpectedExitMessage(code, signal, recent));
     }
     this.resetAfterExit(proc);
   }
@@ -256,23 +276,27 @@ export class AgentSession {
       });
       let settled = false;
       let stdout = '';
+      const stderr = new LineRingBuffer();
       const finish = (result: boolean): void => {
         if (settled) { return; }
         settled = true;
         resolve(result);
       };
       probe.stdout?.on('data', (data: Buffer) => { stdout += data.toString(); });
+      probe.stderr?.on('data', (data: Buffer) => { stderr.push(data); });
       probe.once('error', error => {
-        log.error(`mini-agent --version failed: ${error.message}`);
-        void vscode.window.showErrorMessage(`Cannot start Mini Agent: ${error.message}`);
+        log.error(`mini-agent --version failed (${this.executablePath}): ${error.message}`);
+        void vscode.window.showErrorMessage(
+          `Cannot start Mini Agent at "${this.executablePath}": ${error.message}`,
+        );
         finish(false);
       });
-      probe.once('exit', code => {
+      probe.once('exit', (code, signal) => {
+        stderr.flush();
         if (code !== 0) {
-          log.error(`mini-agent --version exited with code ${code}`);
-          void vscode.window.showErrorMessage(
-            `The executable at "${this.executablePath}" failed the Mini Agent version check.`,
-          );
+          const message = probeFailureMessage(this.executablePath, code, signal, stderr.lines());
+          log.error(`${message}\n${formatStderrBlock(stderr.lines())}`);
+          void vscode.window.showErrorMessage(message);
           finish(false);
           return;
         }

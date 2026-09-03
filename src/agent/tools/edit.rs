@@ -2,6 +2,7 @@ use rig::tool::Tool;
 use tokio::io::AsyncReadExt;
 
 use crate::agent::tools::crc::crc32_hex;
+use crate::agent::tools::normalize::NormalizedText;
 use crate::agent::tools::{
     AskSender, EditArgs, EditBlock, EditOp, PermCheck, ReadTracker, ToolError,
     check_perm_bound_path, check_perm_path, edit_system, levenshtein_similarity,
@@ -136,74 +137,20 @@ enum MatchResult {
     NotFound,
 }
 
-fn compute_byte_range(content: &str, norm_pos: usize, norm_len: usize) -> (usize, usize) {
-    let content_norm = normalize_whitespace(content);
-    let norm_end = (norm_pos + norm_len).min(content_norm.len());
-
-    let mut orig_pos = 0usize;
-    let mut norm_rem = 0usize;
-    let mut byte_start = None;
-
-    while orig_pos < content.len() && norm_rem < norm_end {
-        if norm_rem >= content_norm.len() {
-            break;
-        }
-
-        let b = content.as_bytes()[orig_pos];
-
-        // Tab -> space expansion: 1 tab byte maps to 4 spaces in normalized
-        if b == b'\t' {
-            let tab_spaces = 4usize;
-            if norm_rem < norm_pos {
-                orig_pos += 1;
-                norm_rem = (norm_rem + tab_spaces).min(content_norm.len());
-                continue;
-            }
-            if byte_start.is_none() {
-                byte_start = Some(orig_pos);
-            }
-            orig_pos += 1;
-            norm_rem = (norm_rem + tab_spaces).min(content_norm.len());
-            continue;
-        }
-
-        if norm_rem < norm_pos {
-            orig_pos += 1;
-            norm_rem += 1;
-            continue;
-        }
-
-        if byte_start.is_none() {
-            byte_start = Some(orig_pos);
-        }
-
-        // CRLF edge case: original \r\n maps to a single \n in normalized
-        if b == b'\r' && norm_rem < content_norm.len() && content_norm.as_bytes()[norm_rem] == b'\n'
-        {
-            orig_pos += 1;
-            continue;
-        }
-
-        orig_pos += 1;
-        norm_rem += 1;
-    }
-
-    // Fallback: no match region found — return zero-length range at end of file
-    let start = byte_start.unwrap_or(content.len());
-    (start, orig_pos)
-}
-
 fn find_best_match(content: &str, search: &str) -> MatchResult {
     // Step 1: exact match in original content
     if let Some(pos) = content.find(search) {
         return MatchResult::Exact(pos);
     }
 
-    // Step 2: normalized match in full text
-    let content_norm = normalize_whitespace(content);
+    // Step 2: normalized match in full text. Normalization drops and merges
+    // bytes (trailing whitespace, collapsed blank lines, tab expansion), so the
+    // match span is translated back through the normalizer's byte map rather
+    // than by arithmetic on the original text.
+    let content_norm = NormalizedText::new(content);
     let search_norm = normalize_whitespace(search);
-    if let Some(norm_pos) = content_norm.find(&search_norm) {
-        let (byte_start, byte_end) = compute_byte_range(content, norm_pos, search_norm.len());
+    if let Some(norm_pos) = content_norm.text.find(&search_norm) {
+        let (byte_start, byte_end) = content_norm.source_range(norm_pos, search_norm.len());
         return MatchResult::Normalized(byte_start, byte_end);
     }
 
@@ -413,7 +360,12 @@ fn extract_line_info(lines_raw: &str) -> Result<Vec<(usize, String)>, ToolError>
 }
 
 fn validate_tag(content_lines: &[&str], line_num: usize, tag: &str) -> Result<(), ToolError> {
-    let idx = line_num.saturating_sub(1);
+    if line_num == 0 {
+        return Err(ToolError::Msg(
+            "Line 0 is invalid: tagged lines are numbered from 1. Copy the line number from the read output.".to_string(),
+        ));
+    }
+    let idx = line_num - 1;
     let actual = content_lines.get(idx).ok_or_else(|| {
         ToolError::Msg(format!(
             "Line {} is out of range (file has {} lines)",
@@ -506,6 +458,27 @@ async fn handle_hashedit(
                     validate_tag(&content_lines, line_num, tag)
                         .map_err(|e| ToolError::Msg(format!("{}{}", label, e)))?;
                 }
+                // The range is `first..=last`, so the entries must describe
+                // exactly that span: strictly ascending with no gaps.
+                for pair in entries.windows(2) {
+                    let (prev, next) = (pair[0].0, pair[1].0);
+                    if next <= prev {
+                        return Err(ToolError::Msg(format!(
+                            "{}tagged lines must be in ascending order, but line {} follows line {}. Copy the lines from the read output in file order.",
+                            label, next, prev
+                        )));
+                    }
+                    if next != prev + 1 {
+                        return Err(ToolError::Msg(format!(
+                            "{}tagged lines must be contiguous, but line {} follows line {} (lines {}-{} are missing). Include every line of the range, or use separate edits.",
+                            label,
+                            next,
+                            prev,
+                            prev + 1,
+                            next - 1
+                        )));
+                    }
+                }
                 let start_line = entries[0].0;
                 let end_line = entries[entries.len() - 1].0;
                 let (byte_start, byte_end) =
@@ -528,6 +501,44 @@ async fn handle_hashedit(
     }
 
     Ok((notes, ranges))
+}
+
+/// Reject edits whose byte ranges overlap. Ranges are applied independently
+/// last-to-first, so overlapping ones would splice into each other's text and
+/// garble the file; adjacent ranges (one ending where the next starts) are fine.
+fn reject_overlapping_ranges(
+    ranges: &[(usize, usize, String)],
+    content: &str,
+    label: &str,
+) -> Result<(), ToolError> {
+    let line_of = |byte: usize| content[..byte.min(content.len())].matches('\n').count() + 1;
+    let mut ordered: Vec<(usize, usize, usize)> = ranges
+        .iter()
+        .enumerate()
+        .map(|(i, (start, end, _))| (*start, *end, i))
+        .collect();
+    ordered.sort();
+    for pair in ordered.windows(2) {
+        let (a_start, a_end, a_idx) = pair[0];
+        let (b_start, b_end, b_idx) = pair[1];
+        if b_start < a_end || (a_start == b_start && a_end == b_end) {
+            let (first, second) = if a_idx < b_idx {
+                (pair[0], pair[1])
+            } else {
+                (pair[1], pair[0])
+            };
+            return Err(ToolError::Msg(format!(
+                "{label} {} (lines {}-{}) and {label} {} (lines {}-{}) overlap. Each edit must target a distinct region; merge them into one edit.",
+                first.2 + 1,
+                line_of(first.0),
+                line_of(first.1),
+                second.2 + 1,
+                line_of(second.0),
+                line_of(second.1),
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ── Tool implementation ──────────────────────────────────────────────────
@@ -651,7 +662,19 @@ impl Tool for EditTool {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
-        let content = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+        // Fail closed on invalid UTF-8: the whole file is rewritten, so a lossy
+        // decode would replace every invalid byte (even in untouched regions)
+        // with U+FFFD and silently corrupt e.g. Latin-1 files.
+        let content = match String::from_utf8(bytes) {
+            Ok(text) => text.replace("\r\n", "\n"),
+            Err(e) => {
+                return Err(ToolError::Msg(format!(
+                    "Cannot edit '{}': file is not valid UTF-8 (invalid byte at offset {}). The edit tool only handles UTF-8 text; convert the file first or use bash for binary/legacy encodings.",
+                    expanded,
+                    e.utf8_error().valid_up_to(),
+                )));
+            }
+        };
 
         // Determine mode: V1 (block) or V2 (edits)
         let (notes, mut ranges) = if let Some(ref block) = args.block {
@@ -669,6 +692,13 @@ impl Tool for EditTool {
         };
 
         let edit_count = ranges.len();
+
+        let edit_label = if args.block.is_some() {
+            "Block"
+        } else {
+            "Edit"
+        };
+        reject_overlapping_ranges(&ranges, &content, edit_label)?;
 
         // Apply last-to-first so earlier byte positions remain valid
         ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));

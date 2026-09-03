@@ -753,3 +753,67 @@ fn mcp_read_only_exemption_custom_named_like_builtin_stays_untrusted() {
     let context7 = cfg.mcp_servers.unwrap().remove("Context7").unwrap();
     assert_eq!(context7.trusted_identity(), None);
 }
+
+// --- default_permission_mode validation (mini-agent-dobf) ---
+
+mod default_permission_mode {
+    use crate::cli::Cli;
+    use crate::config::Config;
+    use crate::permission::{SecurityMode, resolve_execution_authority};
+    use crate::sandbox::SandboxPolicy;
+
+    fn resolve(mode: &str) -> Result<SecurityMode, String> {
+        let cfg = Config {
+            default_permission_mode: Some(mode.to_string()),
+            ..Config::default()
+        };
+        resolve_execution_authority(&Cli::default(), &cfg, SandboxPolicy::Disabled, "unused")
+            .map(|authority| authority.mode)
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn every_documented_mode_is_accepted() {
+        assert_eq!(resolve("standard"), Ok(SecurityMode::Standard));
+        assert_eq!(resolve("accept"), Ok(SecurityMode::Standard));
+        assert_eq!(resolve("restrictive"), Ok(SecurityMode::Restrictive));
+        assert_eq!(resolve("readonly"), Ok(SecurityMode::ReadOnly));
+        assert_eq!(resolve("planwrite"), Ok(SecurityMode::PlanWrite));
+        assert_eq!(resolve("guarded"), Ok(SecurityMode::Guarded));
+        assert_eq!(resolve("yolo"), Ok(SecurityMode::Yolo));
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected_with_the_accepted_values() {
+        let error = resolve("bogus").expect_err("unknown modes must not degrade to standard");
+        assert!(error.contains("default_permission_mode"), "{error}");
+        assert!(error.contains("bogus"), "{error}");
+        for accepted in [
+            "standard",
+            "restrictive",
+            "readonly",
+            "planwrite",
+            "guarded",
+            "yolo",
+        ] {
+            assert!(error.contains(accepted), "{error} lacks {accepted}");
+        }
+    }
+
+    #[test]
+    fn explicit_mode_flags_still_outrank_an_invalid_default() {
+        // A CLI flag selects the mode outright; the config value is still
+        // validated so a typo never lingers unnoticed.
+        let cfg = Config {
+            default_permission_mode: Some("bogus".to_string()),
+            ..Config::default()
+        };
+        let cli = Cli {
+            guarded: true,
+            ..Cli::default()
+        };
+        assert!(
+            resolve_execution_authority(&cli, &cfg, SandboxPolicy::Disabled, "unused").is_err()
+        );
+    }
+}

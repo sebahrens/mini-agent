@@ -118,7 +118,7 @@ async fn resumed_session_history_survives_stop_hook_continuation() {
     );
     init_dispatcher(HookDispatcher::from_config(&config).unwrap());
 
-    let (response, _usage) = run_print(
+    let (response, _usage, _history) = run_print(
         &agent,
         "continue",
         false,

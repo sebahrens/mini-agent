@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -25,6 +26,33 @@ class FeatureGraphTests(unittest.TestCase):
         cls.workflow_matrices = feature_graph.load_workflow_matrices(
             REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
         )
+
+    MATRIX_INTERPOLATION = "${{ matrix.features }}"
+
+    def cargo_command_line(self, subcommand: str) -> str:
+        """Return the checked-in single-line run command that consumes the matrix.
+
+        The exact Cargo flags around the interpolation change over time, so tests
+        locate the line by its subcommand instead of hard-coding the flag list.
+        """
+        pattern = re.compile(
+            rf"^ *run: cargo {re.escape(subcommand)} --locked\b[^\n]*"
+            rf"{re.escape(self.MATRIX_INTERPOLATION)}[^\n]*$",
+            re.MULTILINE,
+        )
+        matches = pattern.findall(self.workflow_text)
+        self.assertEqual(
+            1,
+            len(matches),
+            f"expected exactly one single-line cargo {subcommand} matrix command",
+        )
+        return matches[0]
+
+    def mutate_cargo_command(self, subcommand: str, replacement: str) -> str:
+        line = self.cargo_command_line(subcommand)
+        mutated = self.workflow_text.replace(line, replacement, 1)
+        self.assertNotEqual(self.workflow_text, mutated, "mutation must change the workflow")
+        return mutated
 
     def test_repository_manifest_encodes_supported_relationships(self) -> None:
         self.assertEqual([], feature_graph.validate_manifest(self.manifest))
@@ -88,6 +116,35 @@ class FeatureGraphTests(unittest.TestCase):
             },
             rows["skills-embed-dynamic"].required,
         )
+
+    def test_extras_row_covers_every_otherwise_uncompiled_feature(self) -> None:
+        rows = {row.name: row for row in feature_graph.FEATURE_ROWS}
+        extras = rows["extras"]
+
+        self.assertEqual(
+            {"hooks", "advisor", "lsp", "multimodal", "pdf"},
+            set(extras.features.split(",")),
+        )
+        self.assertEqual({"lsp-types", "process-wrap", "url", "which"}, extras.required)
+        self.assertNotIn("skills-embed", extras.features)
+        for job, names in (
+            ("test", feature_graph.TEST_MATRIX_ROWS),
+            ("clippy", feature_graph.CLIPPY_MATRIX_ROWS),
+        ):
+            with self.subTest(job=job):
+                self.assertIn("extras", names)
+                self.assertNotIn("skills-embed", names)
+
+    def test_workflow_rejects_missing_extras_row(self) -> None:
+        extras = "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
+        for job in ("test", "clippy"):
+            with self.subTest(job=job):
+                matrices = copy.deepcopy(feature_graph.expected_workflow_matrices())
+                matrices[job].remove(extras)
+                self.assertIn(
+                    f"{job} matrix is missing focused row 'extras'",
+                    feature_graph.validate_workflow_matrices(matrices),
+                )
 
     def test_every_optional_dependency_must_be_classified(self) -> None:
         manifest = copy.deepcopy(self.manifest)
@@ -189,10 +246,11 @@ class FeatureGraphTests(unittest.TestCase):
                 "cargo test --locked ${{ matrix.features }}",
                 "cargo test --locked",
             ),
-            "clippy": self.workflow_text.replace(
-                "cargo clippy --locked ${{ matrix.features }}",
-                "cargo clippy --locked ${{ matrix.feature_args }}",
-                1,
+            "clippy": self.mutate_cargo_command(
+                "clippy",
+                self.cargo_command_line("clippy").replace(
+                    self.MATRIX_INTERPOLATION, "${{ matrix.feature_args }}", 1
+                ),
             ),
         }
         for job, workflow in mutations.items():
@@ -207,10 +265,12 @@ class FeatureGraphTests(unittest.TestCase):
         mutations = {
             "clippy YAML comment": (
                 "clippy",
-                self.workflow_text.replace(
-                    "cargo clippy --locked ${{ matrix.features }} -- -D warnings",
-                    "cargo clippy --locked -- -D warnings # ${{ matrix.features }}",
-                    1,
+                self.mutate_cargo_command(
+                    "clippy",
+                    self.cargo_command_line("clippy").replace(
+                        f" {self.MATRIX_INTERPOLATION}", "", 1
+                    )
+                    + f" # {self.MATRIX_INTERPOLATION}",
                 ),
             ),
             "test block shell comment": (

@@ -708,3 +708,83 @@ fn finalized_streaming_block_equals_from_scratch_parse() {
         assert_eq!(inc.color, fresh.color, "line {} color mismatch", i);
     }
 }
+
+// --- indexed streaming: foreign blocks pushed mid-stream must survive ---
+
+#[test]
+fn append_to_targets_tracked_block_not_last() {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    let idx = feed.block_count() - 1;
+    assert!(feed.append_to(idx, "hello"));
+    // A `/btw` answer lands after the streaming block mid-stream.
+    feed.push_line(BlockStyle::System, "[btw #1] answer");
+    assert!(feed.append_to(idx, " world"));
+    assert_eq!(feed.block_text(idx), Some("hello world"));
+    assert_eq!(feed.block_text(idx + 1), Some("[btw #1] answer"));
+}
+
+#[test]
+fn append_to_returns_false_for_missing_block() {
+    let mut feed = Feed::new();
+    assert!(!feed.append_to(0, "orphan"));
+    feed.push_block(BlockStyle::Agent, "x");
+    assert!(!feed.append_to(5, "orphan"));
+    assert!(feed.append_to(0, "y"));
+    assert_eq!(feed.block_text(0), Some("xy"));
+}
+
+#[test]
+fn streaming_block_finalized_in_place_keeps_foreign_blocks_and_tokens() {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    let idx = feed.block_count() - 1;
+    assert!(feed.is_streaming(idx));
+    assert!(feed.append_to(idx, "first **bold**\n"));
+    feed.push_line(BlockStyle::System, "queued: next question");
+    assert!(feed.append_to(idx, "second **par**"));
+
+    let before = feed.generation();
+    feed.finalize_block(idx);
+    assert!(!feed.is_streaming(idx));
+    assert!(feed.generation() > before);
+    // Nothing truncated, nothing glued to the foreign block.
+    assert_eq!(feed.block_count(), 2);
+    assert_eq!(feed.block_text(idx), Some("first **bold**\nsecond **par**"));
+    assert_eq!(feed.block_text(idx + 1), Some("queued: next question"));
+
+    // Finalized text is parsed as markdown (bold markers consumed), and the
+    // foreign block still renders after it.
+    let lines = feed.lines(80);
+    let joined: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+    assert!(
+        joined.iter().any(|t| t.contains("first bold")),
+        "{joined:?}"
+    );
+    assert!(
+        joined.iter().any(|t| t.contains("second par")),
+        "{joined:?}"
+    );
+    assert!(
+        joined.iter().any(|t| t.contains("queued: next question")),
+        "{joined:?}"
+    );
+    let agent_pos = joined
+        .iter()
+        .position(|t| t.contains("second par"))
+        .unwrap();
+    let foreign_pos = joined.iter().position(|t| t.contains("queued:")).unwrap();
+    assert!(agent_pos < foreign_pos);
+}
+
+#[test]
+fn finalize_block_is_noop_out_of_range_or_not_running() {
+    let mut feed = Feed::new();
+    feed.push_block(BlockStyle::Agent, "done");
+    let before = feed.generation();
+    feed.finalize_block(0);
+    feed.finalize_block(7);
+    assert_eq!(feed.generation(), before);
+    assert!(!feed.is_streaming(0));
+    assert!(!feed.is_streaming(7));
+}

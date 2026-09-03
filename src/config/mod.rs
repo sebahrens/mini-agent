@@ -28,6 +28,10 @@ use crate::extras::acp::config::AcpServerConfig;
 #[serde(transparent)]
 pub struct PreservedConfig(BTreeMap<String, toml::Value>);
 
+/// Default `max_bash_output_lines` when the config does not set one. Output
+/// beyond this many lines keeps its head and tail with an omitted-count marker.
+pub const DEFAULT_MAX_BASH_OUTPUT_LINES: u64 = 2000;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -182,6 +186,10 @@ pub struct Config {
     pub js_fetch_allow_http: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_all_mcp_calls: Option<bool>,
+    /// Bound on one MCP `tools/call` round trip, in seconds. Default: 120.
+    #[cfg(feature = "mcp")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_timeout_secs: Option<u64>,
     #[cfg(feature = "mcp")]
     #[serde(skip_serializing_if = "Option::is_none", rename = "enable-exa-mcp")]
     pub enable_exa_mcp: Option<bool>,
@@ -500,10 +508,18 @@ impl Config {
         self.max_read_lines.unwrap_or(2000)
     }
 
-    /// Returns `None` when no cap is configured — preserves the historical
-    /// "no bash output truncation" behaviour.
+    /// Line cap applied to shell tool output returned to the model.
+    ///
+    /// Defaults to [`DEFAULT_MAX_BASH_OUTPUT_LINES`] so successful output is
+    /// bounded even when the config never mentions it; an explicit value
+    /// overrides the default and an explicit `0` disables line truncation
+    /// (`None`) while the byte-level command limits still apply.
     pub fn resolve_max_bash_output_lines(&self) -> Option<u64> {
-        self.max_bash_output_lines
+        match self.max_bash_output_lines {
+            Some(0) => None,
+            Some(lines) => Some(lines),
+            None => Some(DEFAULT_MAX_BASH_OUTPUT_LINES),
+        }
     }
 
     /// LSP configuration, `Some` only when an `[lsp]` table exists with

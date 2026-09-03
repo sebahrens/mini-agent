@@ -451,6 +451,27 @@ fn compress_drains_messages_before_first_kept_index() {
 }
 
 #[test]
+fn compaction_drain_len_covers_whole_cut_with_full_coverage() {
+    assert_eq!(Session::compaction_drain_len(5, 5).unwrap(), 5);
+}
+
+#[test]
+fn compaction_drain_len_keeps_unsummarized_tail_for_partial_coverage() {
+    // Only the oldest three of five cut messages were summarized: drain
+    // exactly those, never the unsummarized newer ones.
+    assert_eq!(Session::compaction_drain_len(5, 3).unwrap(), 3);
+    // A summarizer can never have covered more than the cut slice.
+    assert_eq!(Session::compaction_drain_len(5, 9).unwrap(), 5);
+}
+
+#[test]
+fn compaction_drain_len_rejects_empty_coverage() {
+    // Draining nothing would insert a summary without shrinking the session
+    // and re-trigger auto-compaction on every turn.
+    assert!(Session::compaction_drain_len(5, 0).is_err());
+}
+
+#[test]
 fn compacted_context_returns_summary_after_compress() {
     let mut s = Session::new("openai", "gpt-4", 128000, "");
     s.add_message(MessageRole::User, "msg1");

@@ -555,3 +555,50 @@ mod dirty {
         assert_eq!(renderer.statusline_builds(), 2);
     }
 }
+
+// --- scroll / input-row arithmetic must never underflow ---
+
+mod viewport_math {
+    use crate::ui::renderer::{clamp_scroll_offset, input_top_row, scroll_percent};
+
+    #[test]
+    fn clamp_scroll_offset_stays_within_scrollable_range() {
+        assert_eq!(clamp_scroll_offset(0, 100, 20), 0);
+        assert_eq!(clamp_scroll_offset(80, 100, 20), 80);
+        // Viewport grew after scrolling to the top (input shrank via Ctrl+U):
+        // the old offset exceeds the new range and would have underflowed.
+        assert_eq!(clamp_scroll_offset(80, 100, 40), 60);
+        // Content fits entirely: nothing to scroll.
+        assert_eq!(clamp_scroll_offset(5, 10, 20), 0);
+        assert_eq!(clamp_scroll_offset(usize::MAX, 0, 0), 0);
+    }
+
+    #[test]
+    fn scroll_percent_is_saturating_and_bounded() {
+        assert_eq!(scroll_percent(0, 100, 20), 100);
+        assert_eq!(scroll_percent(80, 100, 20), 0);
+        assert_eq!(scroll_percent(40, 100, 20), 50);
+        // Stale offset larger than the range (the debug-panic case).
+        assert_eq!(scroll_percent(80, 100, 40), 0);
+        assert_eq!(scroll_percent(usize::MAX, 100, 40), 0);
+        // Viewport taller than the content.
+        assert_eq!(scroll_percent(3, 10, 20), 0);
+        assert_eq!(scroll_percent(3, 0, 0), 0);
+        for offset in 0..=200usize {
+            let pct = scroll_percent(offset, 150, 30);
+            assert!(pct <= 100, "offset {offset} -> {pct}");
+        }
+    }
+
+    #[test]
+    fn input_top_row_saturates_on_short_terminals() {
+        // 24 rows, 1 reserved, 1-line input -> input on row 23.
+        assert_eq!(input_top_row(24, 1, 1), 23);
+        assert_eq!(input_top_row(24, 1, 5), 19);
+        // rows <= reserve used to underflow u16.
+        assert_eq!(input_top_row(1, 1, 1), 1);
+        assert_eq!(input_top_row(0, 3, 1), 1);
+        assert_eq!(input_top_row(2, 1, 5), 1);
+        assert_eq!(input_top_row(24, 1, usize::MAX), 1);
+    }
+}

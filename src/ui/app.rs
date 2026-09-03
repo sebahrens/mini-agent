@@ -999,25 +999,23 @@ impl<'a> App<'a> {
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
         match &event {
-            AgentEvent::ToolCall { name, args, .. } => {
-                if self.run.turn_trace.len() < TURN_TRACE_MAX {
-                    self.run
-                        .turn_trace
-                        .push(compact_str::CompactString::from(format!(
-                            "→ {}",
-                            crate::ui::utils::format_tool_call_summary(name, args)
-                        )));
-                }
+            AgentEvent::ToolCall { name, args, .. }
+                if self.run.turn_trace.len() < TURN_TRACE_MAX =>
+            {
+                self.run
+                    .turn_trace
+                    .push(compact_str::CompactString::from(format!(
+                        "→ {}",
+                        crate::ui::utils::format_tool_call_summary(name, args)
+                    )));
             }
-            AgentEvent::ToolResult { output, .. } => {
-                if self.run.turn_trace.len() < TURN_TRACE_MAX {
-                    self.run
-                        .turn_trace
-                        .push(compact_str::CompactString::from(format!(
-                            "← {}",
-                            crate::extras::truncate::truncate_cjk(output, 500, "…")
-                        )));
-                }
+            AgentEvent::ToolResult { output, .. } if self.run.turn_trace.len() < TURN_TRACE_MAX => {
+                self.run
+                    .turn_trace
+                    .push(compact_str::CompactString::from(format!(
+                        "← {}",
+                        crate::extras::truncate::truncate_cjk(output, 500, "…")
+                    )));
             }
             AgentEvent::Done { .. } | AgentEvent::Error(_) => {
                 self.run.turn_trace.clear();
@@ -1619,6 +1617,13 @@ impl<'a> App<'a> {
         }
         self.renderer.write_line("", Color::White)?;
 
+        // Commands that hand the tty to a synchronous stdin consumer must not
+        // race the crossterm event thread for keystrokes (same pattern as
+        // `run_lazygit`): stop it before, rebind it after.
+        let needs_tty = slash_command_needs_tty(text);
+        if needs_tty {
+            self.pause_event_thread();
+        }
         let result = handle_slash(
             text,
             &mut self.renderer,
@@ -1630,6 +1635,9 @@ impl<'a> App<'a> {
             &mut self.terminal_guard,
         )
         .await;
+        if needs_tty {
+            self.rebind_event_thread();
+        }
 
         if result.as_ref().is_err_and(|error| {
             error
@@ -1905,10 +1913,15 @@ impl<'a> App<'a> {
                     .clone()
                     .or_else(|| std::env::var("EDITOR").ok())
                     .unwrap_or_else(|| "editor".to_string());
+                // The editor owns the tty: stop the event thread first so it
+                // cannot steal keystrokes, rebind it once the terminal is back.
+                self.pause_event_thread();
                 self.terminal_guard.suspend()?;
                 let edit_result =
                     crate::ui::slash::edit_memory_file(std::path::Path::new(&path), &editor);
-                self.terminal_guard.resume()?;
+                let resume_result = self.terminal_guard.resume();
+                self.rebind_event_thread();
+                resume_result?;
                 render_session(
                     &mut self.renderer,
                     self.ui.session,
@@ -2199,11 +2212,18 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    fn rebind_event_thread(&mut self) {
+    /// Stop and join the crossterm event thread so a synchronous stdin
+    /// consumer (editor, pager, y/N prompt) is the only tty reader. Pair with
+    /// `rebind_event_thread` once the terminal is resumed.
+    fn pause_event_thread(&mut self) {
         if let Some(h) = self.event_handle.take() {
             self.running.store(false, Ordering::Relaxed);
             let _ = h.join();
         }
+    }
+
+    fn rebind_event_thread(&mut self) {
+        self.pause_event_thread();
         self.running = Arc::new(AtomicBool::new(true));
         let (new_tx, new_rx) = mpsc::channel(64);
         self.user_tx = new_tx;
@@ -2867,5 +2887,33 @@ mod mid_turn_pressure_tests {
 
         let still_over = mid_turn_pressure_action(awaiting_relief, true, true);
         assert_eq!(still_over, MidTurnPressureAction::StopContextExhausted);
+    }
+}
+
+/// Slash commands that read the tty synchronously while the terminal is
+/// suspended: `/tutor` runs a pager, `/init` (without `force`) asks y/N on
+/// stdin. The event thread must be paused around them.
+fn slash_command_needs_tty(text: &str) -> bool {
+    let mut parts = text.split_whitespace();
+    match parts.next() {
+        Some("/tutor") => true,
+        Some("/init") => parts.next() != Some("force"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod slash_tty_tests {
+    use super::slash_command_needs_tty;
+
+    #[test]
+    fn slash_command_needs_tty_matches_only_stdin_consumers() {
+        assert!(slash_command_needs_tty("/tutor"));
+        assert!(slash_command_needs_tty("/init"));
+        assert!(slash_command_needs_tty("  /init  "));
+        assert!(!slash_command_needs_tty("/init force"));
+        assert!(!slash_command_needs_tty("/undo"));
+        assert!(!slash_command_needs_tty("/memory editor"));
+        assert!(!slash_command_needs_tty(""));
     }
 }

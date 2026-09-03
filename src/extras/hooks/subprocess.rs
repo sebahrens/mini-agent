@@ -297,11 +297,20 @@ pub(crate) async fn run_hook(
         stdin_json,
         timeout,
         project_dir,
-        &policy,
-        DEFAULT_HOOK_LIMITS,
-        None,
+        HookRunControls {
+            policy: &policy,
+            limits: DEFAULT_HOOK_LIMITS,
+            execution_root: None,
+        },
     )
     .await
+}
+
+/// Policy-bound inputs shared by every hook launch path.
+struct HookRunControls<'a> {
+    policy: &'a HookPolicy,
+    limits: HookLimits,
+    execution_root: Option<&'a super::dispatcher::HookExecutionRootLease>,
 }
 
 async fn run_hook_with_policy_and_limits(
@@ -310,10 +319,13 @@ async fn run_hook_with_policy_and_limits(
     stdin_json: &[u8],
     timeout: std::time::Duration,
     project_dir: &str,
-    policy: &HookPolicy,
-    limits: HookLimits,
-    execution_root: Option<&super::dispatcher::HookExecutionRootLease>,
+    controls: HookRunControls<'_>,
 ) -> HookOutput {
+    let HookRunControls {
+        policy,
+        limits,
+        execution_root,
+    } = controls;
     let (program, args) = match build_hook_invocation(command, args) {
         Ok(invocation) => invocation,
         Err(message) => {
@@ -460,12 +472,12 @@ async fn run_hook_with_policy_and_limits(
     let outcome = {
         let run = async {
             let write_stdin = async move {
-                if let Some(mut stdin) = stdin_pipe {
-                    if let Err(e) = stdin.write_all(stdin_json).await {
-                        // Preserve the existing best-effort stdin semantics: a hook
-                        // that closes stdin may still produce a valid result.
-                        tracing::warn!("hooks: failed to write hook stdin: {e}");
-                    }
+                if let Some(mut stdin) = stdin_pipe
+                    && let Err(e) = stdin.write_all(stdin_json).await
+                {
+                    // Preserve the existing best-effort stdin semantics: a hook
+                    // that closes stdin may still produce a valid result.
+                    tracing::warn!("hooks: failed to write hook stdin: {e}");
                 }
                 Ok::<(), RunError>(())
             };
@@ -606,9 +618,11 @@ pub(crate) async fn run_hook_with_policy(
         stdin_json,
         timeout,
         project_dir,
-        policy,
-        DEFAULT_HOOK_LIMITS,
-        None,
+        HookRunControls {
+            policy,
+            limits: DEFAULT_HOOK_LIMITS,
+            execution_root: None,
+        },
     )
     .await
 }
@@ -628,9 +642,11 @@ pub(crate) async fn run_hook_with_policy_at_root(
         stdin_json,
         timeout,
         project_dir,
-        policy,
-        DEFAULT_HOOK_LIMITS,
-        Some(execution_root),
+        HookRunControls {
+            policy,
+            limits: DEFAULT_HOOK_LIMITS,
+            execution_root: Some(execution_root),
+        },
     )
     .await
 }
@@ -655,9 +671,11 @@ pub(crate) async fn run_hook_with_limits(
         stdin_json,
         timeout,
         project_dir,
-        &policy,
-        limits,
-        None,
+        HookRunControls {
+            policy: &policy,
+            limits,
+            execution_root: None,
+        },
     )
     .await
 }

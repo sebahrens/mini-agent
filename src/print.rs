@@ -1,12 +1,86 @@
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write as IoWrite};
+
+use rig::completion::Message;
+use rig::message::{AssistantContent, ToolResultContent, UserContent};
 
 use crate::cli;
 use crate::config;
 use crate::sandbox::Sandbox;
 use crate::session;
+use crate::session::{MessageRole, Session};
 
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
+
+/// Char-safe short preview of a session id for listings. Ids are normally
+/// 32 hex chars, but imported sessions (`/import`) may carry shorter or
+/// non-ASCII ids, where a byte slice (`&id[..8]`) would panic.
+pub(crate) fn short_session_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Persist one completed headless (`-p`) turn in the same record order the
+/// interactive UI produces while a turn streams: the user prompt, then every
+/// tool call and result in provider order, then the final assistant message.
+/// `--continue` replays the session in record order, so tool records written
+/// after the assistant text would be replayed out of sequence.
+///
+/// `interactions` is the runner's canonical provider transcript for the turn
+/// (`run_print`'s third return value), accumulated across every stream of the
+/// turn. Tool results are attributed to their tool by provider id so the
+/// record carries the real tool name; assistant text inside `interactions` is
+/// not persisted separately because `response` already carries the turn's
+/// complete text.
+pub(crate) fn persist_headless_turn(
+    session: &mut Session,
+    prompt: &str,
+    response: &str,
+    interactions: &[Message],
+) {
+    session.add_message(MessageRole::User, prompt);
+    let mut tool_names: HashMap<&str, &str> = HashMap::new();
+    for interaction in interactions {
+        match interaction {
+            Message::Assistant { content, .. } => {
+                for item in content.iter() {
+                    if let AssistantContent::ToolCall(call) = item {
+                        tool_names.insert(call.id.as_str(), call.function.name.as_str());
+                        session.add_tool_call_with_id(
+                            &call.id,
+                            &call.function.name,
+                            &call.function.arguments,
+                        );
+                    }
+                }
+            }
+            Message::User { content } => {
+                for item in content.iter() {
+                    let UserContent::ToolResult(result) = item else {
+                        continue;
+                    };
+                    let name = tool_names
+                        .get(result.id.as_str())
+                        .copied()
+                        .unwrap_or("unknown");
+                    let output = result
+                        .content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ToolResultContent::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    session.add_tool_result_with_id(&result.id, name, &output);
+                }
+            }
+            Message::System { .. } => {}
+        }
+    }
+    session.add_message(MessageRole::Assistant, response);
+}
+
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
 const CHAT_HISTORY_PATH_POLICY_LABEL: &str = "chat history path policy";
 const INSTALLED_BUILD_LABEL: &str = "installed binary provenance";
@@ -244,7 +318,7 @@ pub(crate) fn print_sessions() {
             };
             println!(
                 "  {}  {}  {}msgs  {}  {}{}",
-                &s.id[..8],
+                short_session_id(&s.id),
                 time,
                 s.messages.len(),
                 s.model,

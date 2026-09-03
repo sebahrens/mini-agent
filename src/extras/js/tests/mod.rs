@@ -58,6 +58,7 @@ mod skill_targeted_feedback;
 mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
+mod tool_console_output;
 mod vendor_integrity;
 mod worker_broker;
 mod worker_containment;
@@ -449,7 +450,10 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         })
         .await
         .expect("read call failed");
-    assert_eq!(read_result, "JS error: exception");
+    assert!(
+        read_result.starts_with("JS error: exception"),
+        "unexpected: {read_result}"
+    );
 
     let write_result = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -457,7 +461,10 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         })
         .await
         .expect("write call failed");
-    assert_eq!(write_result, "JS error: exception");
+    assert!(
+        write_result.starts_with("JS error: exception"),
+        "unexpected: {write_result}"
+    );
     assert!(
         !path.exists(),
         "denied write_file created {}",
@@ -470,7 +477,10 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         })
         .await
         .expect("spawn call failed");
-    assert_eq!(spawn_result, "JS error: exception");
+    assert!(
+        spawn_result.starts_with("JS error: exception"),
+        "unexpected: {spawn_result}"
+    );
     assert!(!path.exists(), "denied spawn created {}", path.display());
 }
 
@@ -501,7 +511,10 @@ async fn test_exception_is_a_source_free_closed_error() {
         .await
         .expect("exception call failed");
 
-    assert_eq!(result, "JS error: exception");
+    assert!(
+        result.starts_with("JS error: exception"),
+        "unexpected: {result}"
+    );
     assert!(!result.contains("test exception"));
     assert!(!result.contains("at "));
 }
@@ -539,9 +552,9 @@ async fn test_oom() {
         .await
         .expect("OOM call failed");
 
-    assert_eq!(
-        result, "JS error: out of memory (64 MiB limit exceeded)",
-        "memory limit did not produce the classified OOM response"
+    assert!(
+        result.starts_with("JS error: out of memory (64 MiB limit exceeded)"),
+        "memory limit did not produce the classified OOM response: {result}"
     );
 }
 

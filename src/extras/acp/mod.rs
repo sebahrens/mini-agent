@@ -31,7 +31,7 @@ use crate::event::AgentEvent;
 #[cfg(test)]
 use crate::sandbox::Sandbox;
 
-const AGENT_VERSION: &str = "1.0.5";
+const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_TCP_HOST: &str = "127.0.0.1";
 const DEFAULT_TCP_PORT: u16 = 7243;
 const MAX_PENDING_AUTHENTICATIONS: usize = 16;

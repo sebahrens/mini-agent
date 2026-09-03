@@ -293,9 +293,9 @@ impl FixtureBuild {
             match fs::remove_dir_all(&self.root) {
                 Ok(()) => return,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                #[cfg(windows)]
                 Err(error)
-                    if matches!(error.raw_os_error(), Some(32 | 33))
+                    if cfg!(windows)
+                        && matches!(error.raw_os_error(), Some(32 | 33))
                         && Instant::now() < deadline =>
                 {
                     // Windows can retain a reaped child's executable handle for

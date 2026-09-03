@@ -4,9 +4,9 @@ package:
 
 source:
   - url: https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-x86_64-unknown-linux-musl.tar.gz  # [linux and x86_64]
-    sha256: d0bae6b5b7813f4a4fe1aebf1ee5aeaac97e64698781a16cd00728c3d14f3f97
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
   - url: https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-aarch64-unknown-linux-musl.tar.gz  # [linux and aarch64]
-    sha256: eb62b7cbe74f21ed0aea74dc9ce79a0675a0bfbdbb42799e0e6c7122c5866604
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
   - url: https://raw.githubusercontent.com/sebahrens/mini-agent/v1.8.0/LICENSE
     sha256: 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 

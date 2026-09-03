@@ -92,11 +92,15 @@ pub(crate) struct ResolvedExecutionAuthority {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error(
-    "sandbox backend '{backend}' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
-)]
-pub(crate) struct ExecutionAuthorityError {
-    backend: String,
+pub(crate) enum ExecutionAuthorityError {
+    #[error(
+        "sandbox backend '{backend}' was not found — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
+    )]
+    SandboxUnavailable { backend: String },
+    #[error(
+        "invalid `default_permission_mode` value `{value}`: expected one of {accepted} (or `accept` as an alias for `standard`)"
+    )]
+    InvalidDefaultPermissionMode { value: String, accepted: String },
 }
 
 /// Resolve every user/config input that changes model execution authority.
@@ -110,6 +114,22 @@ pub(crate) fn resolve_execution_authority(
     sandbox_policy: crate::sandbox::SandboxPolicy,
     sandbox_backend: &str,
 ) -> Result<ResolvedExecutionAuthority, ExecutionAuthorityError> {
+    // Validate the configured default before any flag can mask a typo: an
+    // unknown mode name must never silently degrade to `standard`.
+    let configured_default = match cfg.default_permission_mode.as_deref() {
+        None => SecurityMode::Standard,
+        Some(value) => SecurityMode::from_config_value(value).ok_or_else(|| {
+            ExecutionAuthorityError::InvalidDefaultPermissionMode {
+                value: value.to_string(),
+                accepted: SecurityMode::NAMES
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
+        })?,
+    };
+
     let mode = if cli.yolo || cfg.yolo.unwrap_or(false) {
         SecurityMode::Yolo
     } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
@@ -121,14 +141,7 @@ pub(crate) fn resolve_execution_authority(
     } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
         SecurityMode::Restrictive
     } else {
-        match cfg.default_permission_mode.as_deref() {
-            Some("yolo") => SecurityMode::Yolo,
-            Some("accept" | "standard") => SecurityMode::Standard,
-            Some("guarded") => SecurityMode::Guarded,
-            Some("readonly") => SecurityMode::ReadOnly,
-            Some("restrictive") => SecurityMode::Restrictive,
-            _ => SecurityMode::Standard,
-        }
+        configured_default
     };
 
     let tools_enabled = !cli.resolve_no_tools(cfg);
@@ -139,7 +152,7 @@ pub(crate) fn resolve_execution_authority(
         crate::sandbox::SandboxPolicy::RequiredButUnavailable
             if cli.sandbox_explicitly_requested(cfg) =>
         {
-            return Err(ExecutionAuthorityError {
+            return Err(ExecutionAuthorityError::SandboxUnavailable {
                 backend: sandbox_backend.to_string(),
             });
         }
@@ -325,6 +338,16 @@ pub enum SecurityMode {
 }
 
 impl SecurityMode {
+    /// Every accepted mode name, in the order documented in CONFIG.md.
+    pub const NAMES: [&'static str; 6] = [
+        "standard",
+        "restrictive",
+        "readonly",
+        "planwrite",
+        "guarded",
+        "yolo",
+    ];
+
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "standard" => Some(SecurityMode::Standard),
@@ -334,6 +357,29 @@ impl SecurityMode {
             "guarded" => Some(SecurityMode::Guarded),
             "yolo" => Some(SecurityMode::Yolo),
             _ => None,
+        }
+    }
+
+    /// Parse a `default_permission_mode` config value. `accept` is a legacy
+    /// alias for `standard`.
+    pub fn from_config_value(s: &str) -> Option<Self> {
+        match s {
+            "accept" => Some(SecurityMode::Standard),
+            other => Self::from_str(other),
+        }
+    }
+
+    /// Relative authority granted by a mode. A prompt `%%mode=` directive may
+    /// only move to a mode whose rank is at most the user's selected mode, so
+    /// prompt content can narrow but never widen what the model may do.
+    pub(crate) fn privilege_rank(self) -> u8 {
+        match self {
+            SecurityMode::ReadOnly => 0,
+            SecurityMode::PlanWrite => 1,
+            SecurityMode::Restrictive => 2,
+            SecurityMode::Guarded => 3,
+            SecurityMode::Standard => 4,
+            SecurityMode::Yolo => 5,
         }
     }
 }

@@ -1230,9 +1230,8 @@ pub(super) fn run_containment_child_probe() -> io::Result<()> {
             continue;
         }
         let target = std::fs::read_link(entry.path())?;
-        if target != Path::new("/proc/self/fd")
-            && target != PathBuf::from(format!("/proc/{}/fd", std::process::id()))
-        {
+        let own_fd_dir = format!("/proc/{}/fd", std::process::id());
+        if target != Path::new("/proc/self/fd") && target != Path::new(&own_fd_dir) {
             return Err(io::Error::other(format!(
                 "worker inherited unexpected descriptor {descriptor} -> {}",
                 target.display()

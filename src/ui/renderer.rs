@@ -124,6 +124,38 @@ struct StatuslineCache {
 
 const SPINNER: &[&str] = &["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
 
+/// Clamp a chat scroll offset to the scrollable range `0..=total - visible`.
+///
+/// The offset is set while scrolling but the viewport can grow afterwards
+/// (input box shrinks, terminal resized), which would otherwise leave
+/// `total - offset - visible` underflowing.
+pub(crate) fn clamp_scroll_offset(offset: usize, total: usize, visible: usize) -> usize {
+    offset.min(total.saturating_sub(visible))
+}
+
+/// Position of a scrolled viewport as a percentage: 0 at the top of the
+/// scrollback, 100 at the bottom. Saturating on every operand so a stale
+/// offset or a viewport taller than the content never panics.
+pub(crate) fn scroll_percent(offset: usize, total: usize, visible: usize) -> usize {
+    let range = total.saturating_sub(visible);
+    if range == 0 {
+        return 0;
+    }
+    let offset = offset.min(range);
+    ((range - offset).saturating_mul(100) / range).min(100)
+}
+
+/// First terminal row of the input box for a terminal with `rows` rows,
+/// `reserve` rows kept for the status line, and an input `visible_line_count`
+/// rows tall. Saturating: terminals shorter than the reserved area yield row 1
+/// instead of a `u16` underflow.
+pub(crate) fn input_top_row(rows: u16, reserve: u16, visible_line_count: usize) -> u16 {
+    let input_rows = u16::try_from(visible_line_count).unwrap_or(u16::MAX);
+    rows.saturating_sub(reserve)
+        .saturating_sub(input_rows)
+        .saturating_add(1)
+}
+
 pub struct Renderer {
     spinner_frame: u8,
     feed: Feed,
@@ -629,6 +661,10 @@ impl Renderer {
         let visible = self.visible_lines();
         let buffer = self.chat_lines(max_width);
         let total = buffer.len();
+        // The viewport may have grown since the offset was set (the input box
+        // shrank, the terminal was resized); keep the offset inside the
+        // scrollable range so the arithmetic below never underflows.
+        self.scroll_offset = clamp_scroll_offset(self.scroll_offset, total, visible);
         let mut stdout = io::stdout();
         write!(stdout, "{}", Hide)?;
 
@@ -707,11 +743,7 @@ impl Renderer {
         }
 
         if self.scroll_offset > 0 {
-            let pct = if total > visible {
-                ((total - self.scroll_offset - visible) * 100 / (total - visible)).min(100)
-            } else {
-                0
-            };
+            let pct = scroll_percent(self.scroll_offset, total, visible);
             let indicator = format!(" SCROLL {}% ", pct);
             let x = cols.saturating_sub(indicator.len() as u16);
             stdout.execute(MoveTo(x, 0))?;
@@ -1259,10 +1291,7 @@ impl Renderer {
         self.prev_input_height = visible_line_count;
 
         // Thin separator line above input
-        let input_top = rows
-            .saturating_sub(reserve)
-            .saturating_sub(visible_line_count as u16)
-            .saturating_add(1);
+        let input_top = input_top_row(rows, reserve, visible_line_count);
         let sep_above = input_top.saturating_sub(1);
         if sep_above < input_top {
             self.draw_separator(sep_above, cols)?;
@@ -1283,8 +1312,7 @@ impl Renderer {
             .skip(first_visible)
             .take(visible_line_count)
         {
-            let render_row = (rows.saturating_sub(reserve) - visible_line_count as u16 + 1)
-                + (i - first_visible) as u16;
+            let render_row = input_top.saturating_add((i - first_visible) as u16);
             stdout.execute(MoveTo(0, render_row))?;
 
             if let Some(bg) = self.input_bg {
@@ -1345,8 +1373,7 @@ impl Renderer {
         let cursor_render_idx = cursor_line
             .saturating_sub(first_visible)
             .min(visible_line_count.saturating_sub(1));
-        let cursor_row = (rows.saturating_sub(reserve) - visible_line_count as u16 + 1)
-            + cursor_render_idx as u16;
+        let cursor_row = input_top.saturating_add(cursor_render_idx as u16);
         let cursor_x = (prompt_width + cursor_display_col.saturating_sub(h_scroll)) as u16;
         stdout.execute(MoveTo(cursor_x, cursor_row))?;
         write!(stdout, "{}", Show)?;

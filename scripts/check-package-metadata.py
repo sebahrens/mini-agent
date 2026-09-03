@@ -184,21 +184,43 @@ EXPECTED_RELEASE_ARCHIVES = (
     "mini-agent-lite-x86_64-pc-windows-msvc.tar.gz",
     "mini-agent-${GITHUB_REF_NAME}-source.tar.gz",
 )
+# The release workflow reads the version once from Cargo.toml in the
+# package-metadata job and every later job consumes that output; artifact
+# names must never carry a hard-coded version literal.
+RELEASE_VERSION_OUTPUT = "version: ${{ steps.version.outputs.version }}"
+RELEASE_VERSION_EXPORT = 'echo "version=$version" >> "$GITHUB_OUTPUT"'
+RELEASE_VERSION_CONSUMER = (
+    "RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}"
+)
+RELEASE_VERSION_CONSUMER_JOBS = ("vscode-vsix", "vscode-candidates", "publish-release")
+HARDCODED_RELEASE_VERSION = re.compile(r"mini-agent-v?\d+\.\d+\.\d+")
 EXPECTED_VSCODE_RELEASE_ARTIFACTS = (
     "VSIX_SHA256SUMS",
     "MSI_SHA256SUMS",
     "mini-agent-windows-x64.msi",
-    "mini-agent-1.8.0-linux-x64.vsix",
-    "mini-agent-1.8.0-linux-arm64.vsix",
-    "mini-agent-1.8.0-darwin-x64.vsix",
-    "mini-agent-1.8.0-darwin-arm64.vsix",
-    "mini-agent-1.8.0-win32-x64.vsix",
-    "mini-agent-1.8.0-linux-x64.cdx.json",
-    "mini-agent-1.8.0-linux-arm64.cdx.json",
-    "mini-agent-1.8.0-darwin-x64.cdx.json",
-    "mini-agent-1.8.0-darwin-arm64.cdx.json",
-    "mini-agent-1.8.0-win32-x64.cdx.json",
+    "mini-agent-${RELEASE_VERSION}-linux-x64.vsix",
+    "mini-agent-${RELEASE_VERSION}-linux-arm64.vsix",
+    "mini-agent-${RELEASE_VERSION}-darwin-x64.vsix",
+    "mini-agent-${RELEASE_VERSION}-darwin-arm64.vsix",
+    "mini-agent-${RELEASE_VERSION}-win32-x64.vsix",
+    "mini-agent-${RELEASE_VERSION}-linux-x64.cdx.json",
+    "mini-agent-${RELEASE_VERSION}-linux-arm64.cdx.json",
+    "mini-agent-${RELEASE_VERSION}-darwin-x64.cdx.json",
+    "mini-agent-${RELEASE_VERSION}-darwin-arm64.cdx.json",
+    "mini-agent-${RELEASE_VERSION}-win32-x64.cdx.json",
 )
+# `just sync-version` writes this digest into every recipe when the version
+# changes; `just post-release` replaces it with the published artifact digests.
+RELEASE_DIGEST_PLACEHOLDER = "0" * 64
+RECIPE_DIGEST_FILES = (
+    "packaging/homebrew/zerostack.rb",
+    "packaging/aur/PKGBUILD",
+    "packaging/aur/.SRCINFO",
+    "packaging/conda/zerostack-bin/meta.yaml",
+    "packaging/conda/zerostack/meta.yaml",
+)
+SHA256_DIGEST = re.compile(r"\b[0-9a-f]{64}\b")
+RELEASE_BUILD_COMMAND = re.compile(r"^\s*run:\s*(?:cargo|cross) build\b.*$", re.MULTILINE)
 EXPECTED_CROSS_IMAGES = {
     "aarch64-unknown-linux-musl": (
         "ghcr.io/cross-rs/aarch64-unknown-linux-musl@"
@@ -342,8 +364,10 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         f"CANONICAL_BINARY: {binary}": 1,
         'RUSTFLAGS: ""': 1,
         "tool: cross@0.2.5": 1,
-        "run: cargo build --release --target ${{ matrix.target }}": 2,
-        "run: cross build --release --target ${{ matrix.target }}": 1,
+        "run: cargo build --locked --release --target ${{ matrix.target }}": 2,
+        "run: cargo build --locked --release --no-default-features --target ${{ matrix.target }}": 2,
+        "run: cross build --locked --release --target ${{ matrix.target }}": 1,
+        "run: cross build --locked --release --no-default-features --target ${{ matrix.target }}": 1,
         # 3 jobs produce archives: build (Linux/macOS), build-static (musl), build-windows
         'archive="${CANONICAL_BINARY}-${{ matrix.target }}.tar.gz"': 3,
         'archive="${CANONICAL_BINARY}-lite-${{ matrix.target }}.tar.gz"': 3,
@@ -397,11 +421,19 @@ def validate_workflow(text: str, binary: str) -> list[str]:
             "ubuntu-latest x86_64 hosts"
         )
 
-    if "build --release --all-features" in text:
+    build_commands = RELEASE_BUILD_COMMAND.findall(text)
+    if any("--all-features" in command for command in build_commands):
         errors.append(
             ".github/workflows/release.yml full archives must use the "
             "supported default feature set, not --all-features"
         )
+    for command in build_commands:
+        if "--locked" not in command.split():
+            errors.append(
+                ".github/workflows/release.yml release builds must pass "
+                f"--locked so Cargo.lock is authoritative: {command.strip()!r}"
+            )
+    errors.extend(validate_release_version_source(text))
     publish_release_start = text.find("\n  publish-release:")
     publish_release_job = (
         text[publish_release_start:] if publish_release_start >= 0 else ""
@@ -436,6 +468,47 @@ def validate_workflow(text: str, binary: str) -> list[str]:
             )
     errors.extend(validate_release_archive_gates(text))
     errors.extend(validate_release_action_pins(text))
+    return errors
+
+
+def _workflow_job(text: str, job: str) -> str:
+    start = text.find(f"\n  {job}:")
+    if start < 0:
+        return ""
+    end = re.compile(r"\n  [A-Za-z0-9_-]+:").search(text, start + 1)
+    return text[start : end.start()] if end else text[start:]
+
+
+def validate_release_version_source(text: str) -> list[str]:
+    """Require one Cargo.toml-derived version shared by every VSIX/SBOM job."""
+    errors: list[str] = []
+    package_metadata_job = _workflow_job(text, "package-metadata")
+    for fragment in (RELEASE_VERSION_OUTPUT, RELEASE_VERSION_EXPORT):
+        if fragment not in package_metadata_job:
+            errors.append(
+                ".github/workflows/release.yml package-metadata job must export "
+                f"the Cargo.toml version; missing {fragment!r}"
+            )
+    for job in RELEASE_VERSION_CONSUMER_JOBS:
+        job_text = _workflow_job(text, job)
+        if RELEASE_VERSION_CONSUMER not in job_text:
+            errors.append(
+                f".github/workflows/release.yml {job} job must consume "
+                f"{RELEASE_VERSION_CONSUMER!r}"
+            )
+        elif not re.search(
+            rf"needs:\s*\[?[^\n]*\bpackage-metadata\b", job_text
+        ):
+            errors.append(
+                f".github/workflows/release.yml {job} job must list "
+                "package-metadata in needs to read its version output"
+            )
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if HARDCODED_RELEASE_VERSION.search(line):
+            errors.append(
+                f".github/workflows/release.yml line {line_number} hard-codes a "
+                "release version; use RELEASE_VERSION instead"
+            )
     return errors
 
 
@@ -762,6 +835,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         "justfile": (
             "bash scripts/update-release-checksums.sh all",
             "bash scripts/smoke-canonical-installer.sh",
+            "python3 scripts/check-package-metadata.py --require-release-digests",
             '--release-tag "v${VERSION}"',
             '--release-tag "v${NEW_VERSION}"',
             "--require-clean",
@@ -993,10 +1067,104 @@ def cargo_version(metadata: dict[str, Any], root: Path) -> str | None:
     return package.get("version") if package else None
 
 
-def validate_versions(root: Path, version: str) -> list[str]:
-    """Check that AUR, Conda, and Homebrew metadata agree with Cargo version."""
-    import re
+def recipe_release_digests(text: str) -> list[str]:
+    """Return the release-artifact digests in a recipe, in source order.
 
+    The GPL LICENSE digest is version-independent and therefore excluded.
+    """
+    return [
+        digest
+        for digest in SHA256_DIGEST.findall(text)
+        if digest != CANONICAL_GPL3_LICENSE_SHA256
+    ]
+
+
+def _parse_release_version(tag: str) -> tuple[int, ...] | None:
+    if not RELEASE_TAG_PATTERN.fullmatch(tag):
+        return None
+    core = tag[1:].split("-", 1)[0]
+    return tuple(int(part) for part in core.split("."))
+
+
+def previous_release_digests(root: Path, version: str) -> tuple[str | None, set[str]]:
+    """Collect recipe digests recorded at the newest release tag before `version`."""
+    current = _parse_release_version(f"v{version}")
+    try:
+        result = subprocess.run(
+            ["git", "tag", "--list", "v*"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None, set()
+    if result.returncode != 0:
+        return None, set()
+    candidates = [
+        (parsed, tag)
+        for tag in result.stdout.split()
+        if (parsed := _parse_release_version(tag)) is not None
+        and (current is None or parsed < current)
+    ]
+    if not candidates:
+        return None, set()
+    _, previous_tag = max(candidates)
+    digests: set[str] = set()
+    for relative_path in RECIPE_DIGEST_FILES:
+        shown = subprocess.run(
+            ["git", "show", f"{previous_tag}:{relative_path}"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if shown.returncode == 0:
+            digests.update(recipe_release_digests(shown.stdout))
+    return previous_tag, digests
+
+
+def validate_release_digests(
+    root: Path,
+    version: str,
+    *,
+    previous: tuple[str | None, set[str]] | None = None,
+    require_release_digests: bool = False,
+) -> list[str]:
+    """Reject recipe digests copied from an older release or left as placeholders.
+
+    Before `just post-release` the recipes legitimately carry the placeholder
+    written by `just sync-version`; a digest that still equals one recorded at
+    the previous release tag is stale in every state.
+    """
+    previous_tag, previous_digests = (
+        previous_release_digests(root, version) if previous is None else previous
+    )
+    previous_digests = previous_digests - {RELEASE_DIGEST_PLACEHOLDER}
+    errors: list[str] = []
+    for relative_path in RECIPE_DIGEST_FILES:
+        path = root / relative_path
+        if not path.is_file():
+            continue
+        digests = recipe_release_digests(path.read_text(encoding="utf-8"))
+        if require_release_digests and RELEASE_DIGEST_PLACEHOLDER in digests:
+            errors.append(
+                f"{relative_path} still carries the pending-release placeholder "
+                f"digest for v{version}; run `just post-release` after the "
+                "GitHub release is published"
+            )
+        for digest in digests:
+            if digest in previous_digests:
+                errors.append(
+                    f"{relative_path} reuses release digest {digest[:12]}... "
+                    f"recorded for {previous_tag} under v{version} URLs; run "
+                    "`just post-release` to refresh the recipe"
+                )
+    return errors
+
+
+def validate_versions(root: Path, version: str) -> list[str]:
+    """Check that every version literal outside Cargo.toml matches the Cargo version."""
     errors: list[str] = []
 
     checks: list[tuple[str, str]] = [
@@ -1005,6 +1173,26 @@ def validate_versions(root: Path, version: str) -> list[str]:
         ("packaging/conda/zerostack/meta.yaml", rf"^\s+version: {re.escape(version)}$"),
         ("packaging/conda/zerostack-bin/meta.yaml", rf"^\s+version: {re.escape(version)}$"),
         ("packaging/homebrew/zerostack.rb", rf'^\s+version "{re.escape(version)}"$'),
+        (
+            "editors/vscode/SOURCE.md",
+            rf"^The complete corresponding source for version {re.escape(version)} is the `v{re.escape(version)}` tree at$",
+        ),
+        (
+            "editors/vscode/SOURCE.md",
+            rf"{re.escape(CANONICAL_REPOSITORY_URL)}/tree/v{re.escape(version)}>",
+        ),
+        (
+            "editors/vscode/SOURCE.md",
+            rf"`mini-agent-v{re.escape(version)}-source\.tar\.gz`",
+        ),
+        (
+            "packaging/windows/README.md",
+            rf"^  -p:ProductVersion={re.escape(version)} `$",
+        ),
+        (
+            "packaging/windows/README.md",
+            rf"mini-agent-{re.escape(version)}-win32-x64\.vsix",
+        ),
     ]
 
     for relative_path, pattern in checks:
@@ -1019,10 +1207,39 @@ def validate_versions(root: Path, version: str) -> list[str]:
                 f" (pattern {pattern!r})"
             )
 
+    json_checks: list[tuple[str, tuple[str, ...]]] = [
+        ("editors/vscode/package.json", ("version",)),
+        ("editors/vscode/package-lock.json", ("version",)),
+        ("editors/vscode/package-lock.json", ("packages", "", "version")),
+        ("docs/acp-registry.json", ("agent", "version")),
+    ]
+    for relative_path, keys in json_checks:
+        path = root / relative_path
+        if not path.is_file():
+            errors.append(f"packaging file missing: {relative_path}")
+            continue
+        try:
+            document: Any = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            errors.append(f"{relative_path} is not valid JSON: {error}")
+            continue
+        for key in keys:
+            document = document.get(key) if isinstance(document, dict) else None
+        if document != version:
+            label = ".".join(key or '""' for key in keys)
+            errors.append(
+                f"{relative_path} {label} is {document!r}, expected {version!r}"
+            )
+
     return errors
 
 
-def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
+def validate(
+    root: Path,
+    metadata: dict[str, Any],
+    *,
+    require_release_digests: bool = False,
+) -> list[str]:
     binary, errors = canonical_binary(metadata, root)
     if binary is None:
         return errors
@@ -1060,6 +1277,11 @@ def validate(root: Path, metadata: dict[str, Any]) -> list[str]:
     version = cargo_version(metadata, root)
     if version:
         errors.extend(validate_versions(root, version))
+        errors.extend(
+            validate_release_digests(
+                root, version, require_release_digests=require_release_digests
+            )
+        )
 
     return errors
 
@@ -1081,6 +1303,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="require tracked worktree and index content to match HEAD",
     )
+    parser.add_argument(
+        "--require-release-digests",
+        action="store_true",
+        help=(
+            "reject the pending-release placeholder digest in package recipes; "
+            "used by `just post-release` once real checksums are recorded"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1100,7 +1330,9 @@ def main() -> int:
         print(f"package metadata check failed: {error}", file=sys.stderr)
         return 1
 
-    errors = validate(ROOT, metadata)
+    errors = validate(
+        ROOT, metadata, require_release_digests=args.require_release_digests
+    )
     if args.require_clean:
         errors.extend(validate_clean_tracked_worktree(ROOT))
     version = cargo_version(metadata, ROOT)

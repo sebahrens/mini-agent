@@ -722,16 +722,12 @@ fn make_provider_detail_state(
         .cloned()
         .unwrap_or_default();
 
-    let env_key_value = if !api_key_env.is_empty() {
-        let env_val = std::env::var(&api_key_env).unwrap_or_default();
-        if !env_val.is_empty() {
-            env_val
-        } else {
-            api_key_value.clone()
-        }
-    } else {
-        api_key_value.clone()
-    };
+    // Environment-sourced keys are shown as a status only. The editable
+    // value field carries exactly what is (or will be) persisted in config,
+    // so saving never copies a key the user did not type into the file.
+    let env_key_configured = !api_key_env.is_empty();
+    let env_key_present =
+        env_key_configured && std::env::var(&api_key_env).is_ok_and(|value| !value.is_empty());
 
     let mut fields: Vec<FieldDef> = Vec::new();
 
@@ -767,9 +763,22 @@ fn make_provider_detail_state(
         masked: false,
     });
 
+    if env_key_configured {
+        fields.push(FieldDef {
+            label: "Env Key Status",
+            value: if env_key_present {
+                "set in environment (used at runtime, never saved to config)".to_string()
+            } else {
+                "not set in environment".to_string()
+            },
+            editable: false,
+            masked: false,
+        });
+    }
+
     fields.push(FieldDef {
         label: "API Key Value",
-        value: env_key_value,
+        value: api_key_value,
         editable: true,
         masked: true,
     });
@@ -815,17 +824,11 @@ fn run_inner(cfg: &mut Config) -> anyhow::Result<SetupOutcome> {
         let event = crossterm::event::read()?;
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                let outcome = handle_key(&ctx, key)?;
-                match outcome {
-                    KeyResult::Screen(new_screen) => {
-                        ctx.screen = new_screen;
-                        ctx.message = None;
-                    }
-                    KeyResult::Outcome(outcome, new_cfg) => {
-                        *cfg = new_cfg.clone();
-                        crate::config::save_config(cfg)?;
-                        return Ok(outcome);
-                    }
+                let result = handle_key(&ctx, key)?;
+                if let Some((outcome, new_cfg)) = apply_key_result(&mut ctx, result) {
+                    *cfg = new_cfg;
+                    crate::config::save_config(cfg)?;
+                    return Ok(outcome);
                 }
             }
             Event::Resize(c, r) => {
@@ -840,7 +843,30 @@ fn run_inner(cfg: &mut Config) -> anyhow::Result<SetupOutcome> {
 #[allow(clippy::large_enum_variant)]
 enum KeyResult {
     Screen(Screen),
+    /// A screen transition that also commits an edited configuration to the
+    /// wizard state. Every handler that mutates the config must use this so
+    /// the edit survives until Launch/Quit persists `ctx.cfg`.
+    ScreenWithConfig(Screen, Config),
     Outcome(SetupOutcome, Config),
+}
+
+/// Apply one key-handler result to the wizard state. Returns the final
+/// outcome (and the config to persist) once the wizard is done.
+fn apply_key_result(ctx: &mut Ctx, result: KeyResult) -> Option<(SetupOutcome, Config)> {
+    match result {
+        KeyResult::Screen(new_screen) => {
+            ctx.screen = new_screen;
+            ctx.message = None;
+            None
+        }
+        KeyResult::ScreenWithConfig(new_screen, new_cfg) => {
+            ctx.cfg = new_cfg;
+            ctx.screen = new_screen;
+            ctx.message = None;
+            None
+        }
+        KeyResult::Outcome(outcome, new_cfg) => Some((outcome, new_cfg)),
+    }
 }
 
 fn handle_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult> {
@@ -912,10 +938,13 @@ fn handle_manage_providers_key(
                     }
                 }
                 let new_selected = selected.min(count.saturating_sub(2));
-                Ok(KeyResult::Screen(Screen::ManageProviders {
-                    selected: new_selected,
-                    confirm_delete: false,
-                }))
+                Ok(KeyResult::ScreenWithConfig(
+                    Screen::ManageProviders {
+                        selected: new_selected,
+                        confirm_delete: false,
+                    },
+                    new_cfg,
+                ))
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 Ok(KeyResult::Screen(Screen::ManageProviders {
@@ -1187,7 +1216,7 @@ fn handle_provider_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyRes
                     } else if let Some(ref mut keys) = new_cfg.api_keys {
                         keys.remove(&name);
                     }
-                    return Ok(KeyResult::Screen(Screen::MainMenu));
+                    return Ok(KeyResult::ScreenWithConfig(Screen::MainMenu, new_cfg));
                 }
 
                 if is_new && new_name.is_empty() {
@@ -1245,7 +1274,7 @@ fn handle_provider_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyRes
                     keys.insert(final_name.clone(), new_api_key_value);
                 }
 
-                Ok(KeyResult::Screen(Screen::MainMenu))
+                Ok(KeyResult::ScreenWithConfig(Screen::MainMenu, new_cfg))
             }
             KeyCode::Esc => Ok(KeyResult::Screen(Screen::MainMenu)),
             _ => Ok(KeyResult::Screen(ctx.screen.clone())),
@@ -1272,10 +1301,13 @@ fn handle_manage_models_key(
                     m.remove(name);
                 }
                 let new_selected = selected.min(count.saturating_sub(2));
-                Ok(KeyResult::Screen(Screen::ManageModels {
-                    selected: new_selected,
-                    confirm_delete: false,
-                }))
+                Ok(KeyResult::ScreenWithConfig(
+                    Screen::ManageModels {
+                        selected: new_selected,
+                        confirm_delete: false,
+                    },
+                    new_cfg,
+                ))
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 Ok(KeyResult::Screen(Screen::ManageModels {
@@ -1644,12 +1676,15 @@ fn handle_model_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult
                 );
 
                 if is_new && name != new_name {
-                    Ok(KeyResult::Screen(Screen::ManageModels {
-                        selected: 0,
-                        confirm_delete: false,
-                    }))
+                    Ok(KeyResult::ScreenWithConfig(
+                        Screen::ManageModels {
+                            selected: 0,
+                            confirm_delete: false,
+                        },
+                        new_cfg,
+                    ))
                 } else {
-                    Ok(KeyResult::Screen(Screen::MainMenu))
+                    Ok(KeyResult::ScreenWithConfig(Screen::MainMenu, new_cfg))
                 }
             }
             KeyCode::Esc => Ok(KeyResult::Screen(Screen::MainMenu)),
@@ -1675,5 +1710,191 @@ fn apply_autoconfigure(cfg: &mut Config) {
                 keys.insert(provider.to_string(), val.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn wizard(cfg: Config) -> Ctx {
+        Ctx {
+            cfg,
+            screen: Screen::MainMenu,
+            cols: 80,
+            rows: 24,
+            message: None,
+        }
+    }
+
+    fn press(ctx: &mut Ctx, code: KeyCode) -> Option<(SetupOutcome, Config)> {
+        let result = handle_key(ctx, KeyEvent::new(code, KeyModifiers::NONE)).expect("key handled");
+        apply_key_result(ctx, result)
+    }
+
+    /// Edit the selected field: Enter, type, Enter.
+    fn type_field(ctx: &mut Ctx, text: &str) {
+        assert!(press(ctx, KeyCode::Enter).is_none());
+        for c in text.chars() {
+            assert!(press(ctx, KeyCode::Char(c)).is_none());
+        }
+        assert!(press(ctx, KeyCode::Enter).is_none());
+    }
+
+    fn field_value(ctx: &Ctx, label: &str) -> Option<String> {
+        match &ctx.screen {
+            Screen::ProviderDetail { fields, .. } | Screen::ModelDetail { fields, .. } => fields
+                .iter()
+                .find(|field| field.label == label)
+                .map(|field| field.value.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn provider_add_and_save_survives_until_launch() {
+        let mut ctx = wizard(Config::default());
+        assert!(press(&mut ctx, KeyCode::Char('p')).is_none());
+        assert!(press(&mut ctx, KeyCode::Char('a')).is_none());
+        assert!(matches!(
+            ctx.screen,
+            Screen::ProviderDetail { is_new: true, .. }
+        ));
+
+        type_field(&mut ctx, "local-vllm");
+        assert!(press(&mut ctx, KeyCode::Down).is_none());
+        type_field(&mut ctx, "openai");
+        assert!(press(&mut ctx, KeyCode::Down).is_none());
+        type_field(&mut ctx, "http://localhost:8000/v1");
+        assert!(press(&mut ctx, KeyCode::Down).is_none());
+        type_field(&mut ctx, "VLLM_API_KEY");
+        assert!(press(&mut ctx, KeyCode::Down).is_none());
+        type_field(&mut ctx, "typed-secret");
+        assert!(press(&mut ctx, KeyCode::Char('s')).is_none());
+        assert!(matches!(ctx.screen, Screen::MainMenu));
+
+        let provider = ctx
+            .cfg
+            .custom_providers
+            .as_ref()
+            .and_then(|providers| providers.get("local-vllm"))
+            .expect("saved provider must be retained in the wizard config");
+        assert_eq!(provider.provider_type, "openai");
+        assert_eq!(provider.base_url, "http://localhost:8000/v1");
+        assert_eq!(provider.api_key_env.as_deref(), Some("VLLM_API_KEY"));
+        assert_eq!(
+            ctx.cfg
+                .api_keys
+                .as_ref()
+                .and_then(|keys| keys.get("local-vllm"))
+                .map(String::as_str),
+            Some("typed-secret")
+        );
+
+        let (outcome, launched) = press(&mut ctx, KeyCode::Char('l')).expect("launch finishes");
+        assert!(matches!(outcome, SetupOutcome::Launch));
+        assert!(
+            launched
+                .custom_providers
+                .as_ref()
+                .is_some_and(|providers| providers.contains_key("local-vllm"))
+        );
+    }
+
+    #[test]
+    fn provider_delete_is_committed() {
+        let mut ctx = wizard(Config::default());
+        let mut providers = HashMap::new();
+        providers.insert(
+            "local-vllm".to_string(),
+            CustomProviderConfig {
+                provider_type: CompactString::new("openai"),
+                base_url: "http://localhost:8000/v1".to_string(),
+                api_key_env: None,
+                danger_accept_invalid_certs: None,
+                api_style: None,
+                headers: HashMap::new(),
+                timeout_secs: None,
+                model: None,
+            },
+        );
+        ctx.cfg.custom_providers = Some(providers);
+        let index = collect_provider_names(&ctx.cfg)
+            .iter()
+            .position(|name| name == "local-vllm")
+            .unwrap();
+        ctx.screen = Screen::ManageProviders {
+            selected: index,
+            confirm_delete: false,
+        };
+        assert!(press(&mut ctx, KeyCode::Char('d')).is_none());
+        assert!(press(&mut ctx, KeyCode::Char('y')).is_none());
+        assert!(
+            !ctx.cfg
+                .custom_providers
+                .as_ref()
+                .is_some_and(|providers| providers.contains_key("local-vllm"))
+        );
+    }
+
+    #[test]
+    fn model_add_save_and_delete_are_committed() {
+        let mut ctx = wizard(Config::default());
+        assert!(press(&mut ctx, KeyCode::Char('m')).is_none());
+        assert!(press(&mut ctx, KeyCode::Char('a')).is_none());
+        type_field(&mut ctx, "fast");
+        assert!(press(&mut ctx, KeyCode::Down).is_none());
+        type_field(&mut ctx, "openai");
+        assert!(press(&mut ctx, KeyCode::Down).is_none());
+        type_field(&mut ctx, "gpt-4o-mini");
+        assert!(press(&mut ctx, KeyCode::Char('s')).is_none());
+
+        let model = ctx
+            .cfg
+            .quick_models
+            .as_ref()
+            .and_then(|models| models.get("fast"))
+            .expect("saved model must be retained in the wizard config");
+        assert_eq!(model.provider, "openai");
+        assert_eq!(model.model, "gpt-4o-mini");
+
+        ctx.screen = Screen::ManageModels {
+            selected: 0,
+            confirm_delete: false,
+        };
+        assert!(press(&mut ctx, KeyCode::Char('d')).is_none());
+        assert!(press(&mut ctx, KeyCode::Char('y')).is_none());
+        assert!(
+            !ctx.cfg
+                .quick_models
+                .as_ref()
+                .is_some_and(|models| models.contains_key("fast"))
+        );
+    }
+
+    #[test]
+    fn env_sourced_api_key_is_never_persisted_unless_typed() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[(
+            "OPENAI_API_KEY",
+            Some(std::ffi::OsString::from("sk-from-environment")),
+        )]);
+        let mut ctx = wizard(Config::default());
+        ctx.screen = make_provider_detail_state(false, true, "openai".to_string(), &ctx.cfg);
+
+        assert_eq!(field_value(&ctx, "API Key Value").as_deref(), Some(""));
+        assert!(
+            field_value(&ctx, "Env Key Status")
+                .is_some_and(|status| status.contains("never saved"))
+        );
+
+        assert!(press(&mut ctx, KeyCode::Char('s')).is_none());
+        assert!(
+            !ctx.cfg
+                .api_keys
+                .as_ref()
+                .is_some_and(|keys| keys.contains_key("openai")),
+            "an untyped environment key must not be written to config"
+        );
     }
 }

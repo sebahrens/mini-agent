@@ -3,6 +3,8 @@ import * as os from 'node:os';
 import type * as acp from '@agentclientprotocol/sdk';
 import { ChatUpdateRenderer, stopResult } from './chat';
 import { ensureConfigFile, resolveConfigDirectory } from './config';
+import { resolveConfiguredExecutable } from './executable';
+import { buildPermissionDetail, permissionOptionTitle } from './permission';
 import { AgentSession } from './session';
 import { log, setLogLevel, showOutput } from './log';
 import { assertExecutableScope, gatedFolderPick } from './trust';
@@ -114,8 +116,17 @@ function resolveExecutable(context: vscode.ExtensionContext): string | undefined
   const configured = cfg.inspect<string>('executablePath');
   const path = configured?.globalValue ?? configured?.defaultValue ?? '';
 
-  if (path) {
-    return path;
+  if (path.trim()) {
+    const resolved = resolveConfiguredExecutable(path, os.homedir(), process.platform);
+    if (!resolved.ok) {
+      log.error(resolved.reason);
+      void vscode.window.showErrorMessage(`Cannot start Mini Agent: ${resolved.reason}`);
+      return undefined;
+    }
+    if (resolved.path !== path) {
+      log.info(`Resolved mini-agent.executablePath "${path}" to "${resolved.path}"`);
+    }
+    return resolved.path;
   }
 
   // Fall back to the bundled artifact co-located with the extension.
@@ -211,13 +222,15 @@ async function requestPermission(
 
   interface PermissionItem extends vscode.MessageItem { readonly optionIndex: number }
   const items = request.options.map((option, index): PermissionItem => ({
-    title: `${option.name} (${option.kind.replaceAll('_', ' ')})`,
+    title: permissionOptionTitle(request, option),
     isCloseAffordance: option.kind.startsWith('reject'),
     optionIndex: index,
   }));
+  // The detail shows the actual command/input (content text blocks and rawInput),
+  // not just the tool name, so "Allow always" never persists an unseen rule.
   const selected = await vscode.window.showWarningMessage(
     `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
-    { modal: true, detail: `Tool call ${request.toolCall.toolCallId}` },
+    { modal: true, detail: buildPermissionDetail(request) },
     ...items,
   );
   if (!selected || signal.aborted) { return { outcome: { outcome: 'cancelled' } }; }

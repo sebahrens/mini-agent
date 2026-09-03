@@ -1,6 +1,4 @@
 use compact_str::CompactString;
-use rig::completion::Message;
-use rig::message::{AssistantContent, UserContent};
 
 use crate::agent::tools;
 use crate::cli::Cli;
@@ -369,6 +367,8 @@ async fn compact_headless_session_if_needed(
     context: &ContextFiles,
     pending_tokens: u64,
 ) -> anyhow::Result<bool> {
+    #[cfg(not(feature = "memory"))]
+    let _ = context;
     let compacted = compact_headless_session_with(
         session,
         cfg,
@@ -430,7 +430,7 @@ where
         .compactions
         .last()
         .map(|compaction| compaction.summary.to_string());
-    let (summary, _messages_included) = summarize(
+    let (summary, messages_included) = summarize(
         model,
         messages,
         previous_summary,
@@ -438,10 +438,19 @@ where
         plan.response_token_budget,
     )
     .await?;
-    // Delete all messages up to the cut point. compress() drains from the front,
-    // so first_kept_index = plan.cut_idx removes all pre-cut messages.
-    let first_kept_index = plan.cut_idx;
-    session.compress(summary.clone(), first_kept_index, plan.tokens_before);
+    // `messages_included` is the length of the oldest prefix of the cut slice
+    // whose content the summarizer saw (`cut_idx` with full coverage). Drain
+    // exactly that prefix so unsummarized history is never discarded.
+    let first_kept_index = Session::compaction_drain_len(plan.cut_idx, messages_included)?;
+    let tokens_before = if first_kept_index == plan.cut_idx {
+        plan.tokens_before
+    } else {
+        session.messages[..first_kept_index]
+            .iter()
+            .map(|message| message.estimated_tokens)
+            .sum()
+    };
+    session.compress(summary.clone(), first_kept_index, tokens_before);
     Ok(Some((summary, first_kept_index)))
 }
 
@@ -655,7 +664,7 @@ impl Startup {
                     };
                     eprintln!(
                         "  {}  {}  {}msgs  {}  {}{}",
-                        &s.id[..8],
+                        crate::print::short_session_id(&s.id),
                         time,
                         s.messages.len(),
                         s.model,
@@ -1241,11 +1250,19 @@ impl Startup {
                 .collect();
             let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
             guard.load_session_allowlist(&allowlist);
+            // Project-sourced prompts only carry a directive when the project
+            // config is trusted (context::prompts), and the checker refuses
+            // any directive that would raise the mode above the user's
+            // CLI/config selection, so this can only narrow authority.
             if let Some(name) = &self.context.current_prompt_name
                 && let Some(mode) =
                     crate::permission::resolve_startup_prompt_mode(&self.context.prompts, name)
+                && !guard.set_prompt_mode(mode)
             {
-                guard.set_prompt_mode(mode);
+                tracing::info!(
+                    "startup prompt '{name}' requested mode {mode}; keeping user-selected {}",
+                    guard.mode()
+                );
             }
         }
 
@@ -1424,41 +1441,10 @@ impl Startup {
             let (response, usage, interactions) = response_result?;
             if !self.cli.no_session {
                 let mut session = self.session;
-                session.add_message(MessageRole::User, &msg);
-                session.add_message(MessageRole::Assistant, &response);
-                // Persist canonical provider interactions (tool calls and results) for resumable transcripts
-                for interaction in &interactions {
-                    match interaction {
-                        Message::Assistant { content, .. } => {
-                            for item in content.clone() {
-                                if let AssistantContent::ToolCall(call) = item {
-                                    session.add_tool_call_with_id(
-                                        &call.id,
-                                        &call.function.name,
-                                        &call.function.arguments,
-                                    );
-                                }
-                            }
-                        }
-                        Message::User { content, .. } => {
-                            for user_item in content.clone() {
-                                if let UserContent::ToolResult(tr) = user_item {
-                                    let call_id = tr.call_id.as_deref().unwrap_or(&tr.id);
-                                    for result_content in tr.content.clone() {
-                                        if let rig::message::ToolResultContent::Text(text) =
-                                            result_content
-                                        {
-                                            session.add_tool_result_with_id(
-                                                call_id, "unknown", &text.text,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                // Prompt, then tool calls/results in provider order, then the
+                // assistant message: the same record order the interactive UI
+                // writes, so `--continue` replays the turn in sequence.
+                crate::print::persist_headless_turn(&mut session, &msg, &response, &interactions);
                 let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
                 session.charge_usage_delta(usage.into(), anthropic_native);
                 session::storage::save_session(&session)?;

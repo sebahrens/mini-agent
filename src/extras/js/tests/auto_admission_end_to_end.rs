@@ -251,7 +251,10 @@ async fn auto_admission_failure_matrix_rejects_bypasses_and_reproposal_is_termin
         })
         .await
         .unwrap();
-    assert_eq!(invalid, "JS error: exception");
+    assert!(
+        invalid.starts_with("JS error: exception"),
+        "unexpected: {invalid}"
+    );
 
     let failing_payload = payload(
         "function normalize(_cap, v) { return String(v); }",

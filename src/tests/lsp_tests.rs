@@ -1277,8 +1277,10 @@ async fn diagnostic_cache_sanitizes_entries_and_enforces_global_byte_budget_on_u
     let mut accepted_uris = Vec::new();
     let mut rejected_uri = None;
 
-    for file_index in 0..32 {
-        let path = root.path().join(format!("oversized-{file_index:02}.rs"));
+    // Sanitization bounds every file well below the global budget, so publish
+    // enough files that the byte budget (not the file cap) is what rejects.
+    for file_index in 0..crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES {
+        let path = root.path().join(format!("oversized-{file_index:03}.rs"));
         std::fs::write(&path, "contents").unwrap();
         let uri = crate::extras::lsp::client::file_uri(&path.canonicalize().unwrap()).unwrap();
         let diagnostics = (0..300)
@@ -1309,6 +1311,10 @@ async fn diagnostic_cache_sanitizes_entries_and_enforces_global_byte_budget_on_u
     assert!(
         rejected_uri.is_some(),
         "global byte budget must reject growth"
+    );
+    assert!(
+        accepted_uris.len() < crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES,
+        "rejection must come from the byte budget, not the file cap"
     );
     assert!(total_bytes <= crate::extras::lsp::client::MAX_DIAGNOSTIC_CACHE_BYTES);
     assert!(max_count <= crate::extras::lsp::client::MAX_DIAGNOSTICS_PER_FILE);

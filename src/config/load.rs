@@ -799,6 +799,42 @@ fn apply_local_override_with_confirmation(
     Ok(ProjectConfigTrustOutcome::Approved)
 }
 
+/// Whether `project_config` is bound in the private trust store with its
+/// exact current content. Consumers other than config loading (for example
+/// project prompt `%%mode=` directives) use this to decide whether repository
+/// content may influence the security posture.
+pub(crate) fn project_config_is_trusted(project_config: Option<&Path>, trust_store: &Path) -> bool {
+    let Some(path) = project_config else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(binding) = project_config_binding(path, &content) else {
+        return false;
+    };
+    let Ok(store) = load_project_config_trust(trust_store) else {
+        return false;
+    };
+    store.bindings.contains(&binding)
+}
+
+/// Record trust for `project_config` exactly as an interactive approval would.
+#[cfg(test)]
+pub(crate) fn trust_project_config(
+    project_config: &Path,
+    trust_store: &Path,
+) -> Result<(), String> {
+    let content = std::fs::read_to_string(project_config).map_err(|error| error.to_string())?;
+    let binding = project_config_binding(project_config, &content)?;
+    let mut store = load_project_config_trust(trust_store).map_err(|error| error.to_string())?;
+    store.bindings.push(binding);
+    if let Some(parent) = trust_store.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    save_project_config_trust(trust_store, &store).map_err(|error| error.to_string())
+}
+
 /// Merge benign `.zerostack/config.toml` keys immediately and keep all other
 /// keys inert until trust is bound to the canonical project/config paths and
 /// exact config bytes.

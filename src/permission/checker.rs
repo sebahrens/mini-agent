@@ -377,8 +377,31 @@ impl PermissionChecker {
         )
     }
 
-    fn resolve_check_action(&self, tool: &str, matched: &SmallVec<[Action; 4]>) -> Action {
-        let base = matched.last().copied();
+    /// Resolve the matched rules for one input into a single action with a
+    /// deterministic precedence that does not depend on rule order:
+    /// 1. any matching `deny` wins;
+    /// 2. otherwise the most specific pattern (most literal characters) wins;
+    /// 3. on equal specificity `ask` beats `allow`.
+    fn resolve_matched(matched: &[(usize, Action)]) -> Option<Action> {
+        let mut best: Option<(usize, Action)> = None;
+        for &(specificity, action) in matched {
+            if action == Action::Deny {
+                return Some(Action::Deny);
+            }
+            best = Some(match best {
+                None => (specificity, action),
+                Some((current, _)) if specificity > current => (specificity, action),
+                Some((current, _)) if specificity == current && action == Action::Ask => {
+                    (current, Action::Ask)
+                }
+                Some(current) => current,
+            });
+        }
+        best.map(|(_, action)| action)
+    }
+
+    fn resolve_check_action(&self, tool: &str, matched: &[(usize, Action)]) -> Action {
+        let base = Self::resolve_matched(matched);
         match self.mode {
             SecurityMode::Restrictive => base.unwrap_or(Action::Ask),
             SecurityMode::ReadOnly | SecurityMode::PlanWrite => base.unwrap_or_else(|| {
@@ -416,7 +439,7 @@ impl PermissionChecker {
     fn resolve_path_action(
         &self,
         tool: &str,
-        matched: &SmallVec<[Action; 4]>,
+        matched: &[(usize, Action)],
         abs_path: &str,
         external: bool,
         external_action: Option<Action>,
@@ -428,7 +451,7 @@ impl PermissionChecker {
         if external && external_action == Some(Action::Deny) {
             return Action::Deny;
         }
-        let base = matched.last().copied();
+        let base = Self::resolve_matched(matched);
         match self.mode {
             SecurityMode::Restrictive => base.unwrap_or(Action::Ask),
             SecurityMode::ReadOnly => base.unwrap_or_else(|| {
@@ -561,7 +584,21 @@ impl PermissionChecker {
         );
         // Deny rules are the security baseline — evaluate before the session
         // allowlist and allow_all_mcp_calls so neither can bypass a deny.
-        if self.matches_deny_rule(tool, &[policy_input, identity]) {
+        // A Bash script is additionally checked line by line: a deny that
+        // matches any single line denies the whole script, so a benign first
+        // line can never smuggle a denied command past an anchored pattern.
+        let mut deny_inputs: SmallVec<[&str; 4]> = SmallVec::new();
+        deny_inputs.push(policy_input);
+        deny_inputs.push(identity);
+        if tool == "shell" {
+            for line in policy_input.lines() {
+                let line = line.trim();
+                if !line.is_empty() && line != policy_input {
+                    deny_inputs.push(line);
+                }
+            }
+        }
+        if self.matches_deny_rule(tool, &deny_inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         if tool == "todo_write" {
@@ -584,7 +621,7 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
-        let mut matched: SmallVec<[Action; 4]> = SmallVec::new();
+        let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
         if self.apply_rules()
             && let Some(rules) = self.rules.get(tool)
         {
@@ -598,7 +635,7 @@ impl PermissionChecker {
                     pattern.matches(policy_input)
                 };
                 if matches {
-                    matched.push(*action);
+                    matched.push((pattern.specificity(), *action));
                 }
             }
         }
@@ -650,8 +687,18 @@ impl PermissionChecker {
         external: bool,
         external_action: Option<Action>,
     ) -> CheckResult {
+        // Tools pass canonical absolute paths, while rules are commonly
+        // authored relative to the workspace (`secrets/**`). Evaluate every
+        // spelling so an absolute path can never bypass a relative rule.
+        let relative = self.workspace_relative(abs_path);
+        let mut inputs: SmallVec<[&str; 3]> = SmallVec::new();
+        inputs.push(abs_path);
+        inputs.push(expanded);
+        if let Some(relative) = relative.as_deref() {
+            inputs.push(relative);
+        }
         // Deny rules first — security baseline, cannot be bypassed.
-        if self.matches_deny_rule(tool, &[abs_path, expanded]) {
+        if self.matches_deny_rule(tool, &inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         if tool == "todo_write" {
@@ -668,17 +715,20 @@ impl PermissionChecker {
         if let Some(result) = self.take_pending_one_shot(tool) {
             return result;
         }
-        if self.is_session_allowed(tool, expanded) || self.is_session_allowed(tool, abs_path) {
+        if inputs
+            .iter()
+            .any(|input| self.is_session_allowed(tool, input))
+        {
             return CheckResult::Allowed;
         }
 
-        let mut matched: SmallVec<[Action; 4]> = SmallVec::new();
+        let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
         if self.apply_rules()
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
-                if pattern.matches_path(abs_path) || pattern.matches_path(expanded) {
-                    matched.push(*action);
+                if inputs.iter().any(|input| pattern.matches_path(input)) {
+                    matched.push((pattern.specificity(), *action));
                 }
             }
         }
@@ -773,13 +823,13 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
-        let mut matched: SmallVec<[Action; 4]> = SmallVec::new();
+        let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
         if self.apply_rules()
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
                 if pattern.matches(&logical) || pattern.matches(&relative) {
-                    matched.push(*action);
+                    matched.push((pattern.specificity(), *action));
                 }
             }
         }
@@ -885,8 +935,32 @@ impl PermissionChecker {
         self.user_mode = mode;
     }
 
-    pub fn set_prompt_mode(&mut self, mode: SecurityMode) {
+    /// Apply a prompt `%%mode=` directive. Prompt content is data, not the
+    /// user's decision: a directive may narrow the active mode but can never
+    /// raise it above the mode the user selected (CLI flag, config, or
+    /// `/mode`). Returns whether the mode was applied.
+    pub fn set_prompt_mode(&mut self, mode: SecurityMode) -> bool {
+        if mode.privilege_rank() > self.user_mode.privilege_rank() {
+            tracing::warn!(
+                "prompt directive requested mode {mode} above the user-selected {}; ignoring",
+                self.user_mode
+            );
+            return false;
+        }
         self.mode = mode;
+        true
+    }
+
+    /// The workspace-relative spelling of an absolute path beneath the bound
+    /// working directory, or `None` when the path lies outside it.
+    fn workspace_relative(&self, abs_path: &str) -> Option<String> {
+        let working_dir = normalize_path(Path::new(&self.working_dir));
+        let normalized = normalize_path(Path::new(abs_path));
+        let relative = normalized.strip_prefix(&working_dir).ok()?;
+        if relative.as_os_str().is_empty() {
+            return None;
+        }
+        Some(relative.to_string_lossy().into_owned())
     }
 
     pub fn restore_user_mode(&mut self) {

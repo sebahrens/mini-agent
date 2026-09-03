@@ -404,25 +404,20 @@ pub async fn handle_compress(
     let max_tokens = ui.session.context_window.saturating_sub(reserve);
     let summarizer_input_budget = summarizer_input_budget(ui.session.context_window, reserve);
 
-    // Auto-compaction only makes sense when actually over budget; manual
-    // /compress is the user's explicit intent, so it skips the budget gate and
-    // proceeds regardless of how full the context is.
-    if auto && ui.session.effective_context_tokens() <= max_tokens {
-        return Ok(());
-    }
-
-    let cut_idx = crate::session::Session::select_compaction_cut(&ui.session.messages, keep_recent);
-
-    // Nothing old enough to summarize (everything is within keep_recent). This
-    // is a real physical limit even when forced, so report it for manual runs;
-    // stay silent under auto so an over-budget-but-unsummarizable turn does not
-    // announce a no-op on every completion.
-    if cut_idx == 0 {
-        if !auto {
-            renderer.write_line("not enough conversation history to compact yet", C_AGENT)?;
+    let cut_idx = match plan_tui_compaction(ui.session, auto, max_tokens, keep_recent) {
+        TuiCompactionGate::WithinBudget => return Ok(()),
+        // Nothing old enough to summarize (everything is within keep_recent). This
+        // is a real physical limit even when forced, so report it for manual runs;
+        // stay silent under auto so an over-budget-but-unsummarizable turn does not
+        // announce a no-op on every completion.
+        TuiCompactionGate::NothingToSummarize => {
+            if !auto {
+                renderer.write_line("not enough conversation history to compact yet", C_AGENT)?;
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
+        TuiCompactionGate::Cut(cut_idx) => cut_idx,
+    };
 
     // Announce only once we know compression will actually run.
     if auto {
@@ -432,42 +427,40 @@ pub async fn handle_compress(
     }
     renderer.write_line("", crossterm::style::Color::White)?;
 
-    let messages_to_summarize = &ui.session.messages[..cut_idx];
-    let previous_summary = ui.session.compactions.last().map(|c| c.summary.as_str());
-
-    let (summary, messages_included) = ui
-        .client
-        .compress_messages(
-            &ui.session.model,
-            messages_to_summarize,
-            previous_summary,
-            instructions,
-            summarizer_input_budget,
-            reserve,
-        )
-        .await?;
-
-    // Only delete messages that were actually included in the summarizer input.
-    // messages_included is the count of messages from the end of messages_to_summarize.
-    let first_kept_index = cut_idx.saturating_sub(messages_included);
-
-    let tokens_before: u64 = messages_to_summarize
-        .iter()
-        .map(|m| m.estimated_tokens)
-        .sum();
-
-    #[cfg(feature = "memory")]
-    if let Some(pending) = run.pending_turn.as_mut() {
-        pending.stage_memory_summary(summary.clone(), Some(first_kept_index));
-    } else {
-        crate::extras::memory::flush_compaction_summary(
-            &crate::extras::memory::Mem::open(),
-            &summary,
-            Some(first_kept_index),
-        );
-    }
-    ui.session
-        .compress(summary, first_kept_index, tokens_before);
+    let client = &ui.client;
+    let (first_kept_index, tokens_before) = compact_session_with(
+        ui.session,
+        cut_idx,
+        summarizer_input_budget,
+        reserve,
+        |model, messages, previous_summary, input_budget, response_budget| async move {
+            client
+                .compress_messages(
+                    &model,
+                    &messages,
+                    previous_summary.as_deref(),
+                    instructions,
+                    input_budget,
+                    response_budget,
+                )
+                .await
+        },
+        |summary, first_kept_index| {
+            #[cfg(feature = "memory")]
+            if let Some(pending) = run.pending_turn.as_mut() {
+                pending.stage_memory_summary(summary.to_string(), Some(first_kept_index));
+            } else {
+                crate::extras::memory::flush_compaction_summary(
+                    &crate::extras::memory::Mem::open(),
+                    summary,
+                    Some(first_kept_index),
+                );
+            }
+            #[cfg(not(feature = "memory"))]
+            let _ = (summary, first_kept_index);
+        },
+    )
+    .await?;
 
     run.agent = Some(
         ui.agent_build_ctx()
@@ -487,15 +480,76 @@ pub async fn handle_compress(
     Ok(())
 }
 
-#[cfg(test)]
-mod compaction_budget_tests {
-    use super::summarizer_input_budget;
+/// Outcome of the TUI compaction gate: whether the session is already within
+/// budget (auto runs only), has nothing old enough to summarize, or should
+/// summarize `messages[..cut_idx]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TuiCompactionGate {
+    WithinBudget,
+    NothingToSummarize,
+    Cut(usize),
+}
 
-    #[test]
-    fn known_exhausted_window_does_not_use_unknown_window_fallback() {
-        assert_eq!(summarizer_input_budget(8_000, 8_000), 0);
-        assert_eq!(summarizer_input_budget(0, 0), 128_000);
+/// Auto-compaction only makes sense when actually over budget; manual
+/// /compress is the user's explicit intent, so it skips the budget gate and
+/// proceeds regardless of how full the context is.
+pub(crate) fn plan_tui_compaction(
+    session: &Session,
+    auto: bool,
+    max_tokens: u64,
+    keep_recent: u64,
+) -> TuiCompactionGate {
+    if auto && session.effective_context_tokens() <= max_tokens {
+        return TuiCompactionGate::WithinBudget;
     }
+    match Session::select_compaction_cut(&session.messages, keep_recent) {
+        0 => TuiCompactionGate::NothingToSummarize,
+        cut_idx => TuiCompactionGate::Cut(cut_idx),
+    }
+}
+
+/// Summarizes `session.messages[..cut_idx]` through `summarize` and replaces
+/// the summarized prefix with the returned summary. The summarizer's count is
+/// the length of the oldest prefix of the cut slice whose content it saw
+/// (`cut_idx` with full coverage); exactly that prefix is drained, so
+/// unsummarized messages are never deleted and summarized ones never linger
+/// to re-trigger compaction. `stage_summary` observes the summary and drain
+/// length before the session is mutated. Returns the drain length and the
+/// estimated tokens it removed.
+pub(crate) async fn compact_session_with<S, F>(
+    session: &mut Session,
+    cut_idx: usize,
+    input_token_budget: u64,
+    response_token_budget: u64,
+    summarize: S,
+    stage_summary: impl FnOnce(&str, usize),
+) -> anyhow::Result<(usize, u64)>
+where
+    S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
+    F: std::future::Future<Output = anyhow::Result<(String, usize)>>,
+{
+    let model = session.model.to_string();
+    let messages = session.messages[..cut_idx].to_vec();
+    let previous_summary = session
+        .compactions
+        .last()
+        .map(|compaction| compaction.summary.to_string());
+    let (summary, messages_included) = summarize(
+        model,
+        messages,
+        previous_summary,
+        input_token_budget,
+        response_token_budget,
+    )
+    .await?;
+    let first_kept_index = Session::compaction_drain_len(cut_idx, messages_included)?;
+    let tokens_before: u64 = session.messages[..first_kept_index]
+        .iter()
+        .map(|message| message.estimated_tokens)
+        .sum();
+    stage_summary(&summary, first_kept_index);
+    session.compress(summary, first_kept_index, tokens_before);
+    Ok((first_kept_index, tokens_before))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -565,7 +619,9 @@ pub async fn handle_slash(
         "/add" | "/drop" | "/drop-all" => add::handle(&parts, &mut ctx).await,
         "/init" => init::handle(&parts, &mut ctx).await,
         "/review" => review::handle(&parts, &mut ctx).await,
-        "/memory" => memory::handle(&parts, &mut ctx).await,
+        // `/memory write <target> <content>` and `/memory read daily <date>`
+        // need more than the three fields the generic split above yields.
+        "/memory" => memory::handle(&memory::split_command(text), &mut ctx).await,
         "/compress" | "/compact" | "/loop" | "/worktree" | "/wt-merge" | "/wt-exit" => {
             features::handle(&parts, &mut ctx).await
         }
@@ -578,5 +634,156 @@ pub async fn handle_slash(
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_budget_tests {
+    use super::{
+        TuiCompactionGate, compact_session_with, plan_tui_compaction, summarizer_input_budget,
+    };
+    use crate::session::{MessageRole, Session};
+
+    #[test]
+    fn known_exhausted_window_does_not_use_unknown_window_fallback() {
+        assert_eq!(summarizer_input_budget(8_000, 8_000), 0);
+        assert_eq!(summarizer_input_budget(0, 0), 128_000);
+    }
+
+    fn over_budget_session() -> Session {
+        let mut session = Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 50;
+        session.add_message(MessageRole::User, &"a".repeat(80));
+        session.add_message(MessageRole::Assistant, &"b".repeat(80));
+        session.add_message(MessageRole::User, &"c".repeat(16));
+        session
+    }
+
+    const MAX_TOKENS: u64 = 80;
+    // Below the ~4-token estimate of the 16-char tail so exactly two messages are cut.
+    const KEEP_RECENT: u64 = 3;
+
+    #[tokio::test]
+    async fn tui_compaction_drains_whole_cut_and_second_pass_is_a_noop() {
+        let mut session = over_budget_session();
+        let tokens_before_expected =
+            session.messages[0].estimated_tokens + session.messages[1].estimated_tokens;
+        assert_eq!(
+            plan_tui_compaction(&session, true, MAX_TOKENS, KEEP_RECENT),
+            TuiCompactionGate::Cut(2)
+        );
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let staged = std::cell::RefCell::new(None);
+        let (first_kept_index, tokens_before) = compact_session_with(
+            &mut session,
+            2,
+            80,
+            20,
+            |model, messages, previous_summary, input_budget, response_budget| async move {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(model, "model");
+                assert_eq!(messages.len(), 2);
+                assert!(previous_summary.is_none());
+                assert_eq!(input_budget, 80);
+                assert_eq!(response_budget, 20);
+                Ok(("TUI_SUMMARY".to_string(), 2usize))
+            },
+            |summary, first_kept_index| {
+                *staged.borrow_mut() = Some((summary.to_string(), first_kept_index));
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_kept_index, 2);
+        assert_eq!(tokens_before, tokens_before_expected);
+        assert_eq!(
+            staged.into_inner(),
+            Some(("TUI_SUMMARY".to_string(), 2)),
+            "memory staging must receive the drained prefix length"
+        );
+        // Three messages minus the two-message cut plus the summary.
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, MessageRole::System);
+        assert_eq!(session.messages[0].content, "TUI_SUMMARY");
+        assert_eq!(session.messages[1].content, "c".repeat(16));
+        assert_eq!(session.compactions.len(), 1);
+        assert_eq!(session.compactions[0].summarized_count, 2);
+
+        // Between-turn auto-compaction must not fire again now that the
+        // session fits: the gate short-circuits before any summarizer call.
+        assert_eq!(
+            plan_tui_compaction(&session, true, MAX_TOKENS, KEEP_RECENT),
+            TuiCompactionGate::WithinBudget
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tui_compaction_with_partial_coverage_keeps_unsummarized_messages() {
+        let mut session = over_budget_session();
+        let (first_kept_index, tokens_before) = compact_session_with(
+            &mut session,
+            2,
+            80,
+            20,
+            |_, messages, _, _, _| async move {
+                assert_eq!(messages.len(), 2);
+                Ok(("PARTIAL".to_string(), 1usize))
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_kept_index, 1);
+        assert_eq!(
+            tokens_before,
+            Session::estimate_tokens(&"a".repeat(80)),
+            "tokens_before must cover only the drained prefix"
+        );
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[0].content, "PARTIAL");
+        assert_eq!(session.messages[1].content, "b".repeat(80));
+        assert_eq!(session.messages[2].content, "c".repeat(16));
+    }
+
+    #[tokio::test]
+    async fn tui_compaction_rejects_a_summary_that_covers_nothing() {
+        let mut session = over_budget_session();
+        let error = compact_session_with(
+            &mut session,
+            2,
+            80,
+            20,
+            |_, _, _, _, _| async move { Ok(("EMPTY".to_string(), 0usize)) },
+            |_, _| panic!("nothing must be staged when nothing is drained"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("nothing to drain"));
+        assert_eq!(session.messages.len(), 3);
+        assert!(session.compactions.is_empty());
+    }
+
+    #[test]
+    fn manual_compress_skips_the_budget_gate_but_respects_keep_recent() {
+        let mut session = Session::new("openai", "model", 100_000, "");
+        session.add_message(MessageRole::User, "old");
+        session.add_message(MessageRole::Assistant, "recent");
+        assert_eq!(
+            plan_tui_compaction(&session, true, 99_000, 1),
+            TuiCompactionGate::WithinBudget
+        );
+        assert_eq!(
+            plan_tui_compaction(&session, false, 99_000, 1),
+            TuiCompactionGate::Cut(1)
+        );
+        assert_eq!(
+            plan_tui_compaction(&session, false, 99_000, 1_000),
+            TuiCompactionGate::NothingToSummarize
+        );
     }
 }

@@ -511,7 +511,10 @@ async fn identity_mismatch_fails_before_skill_source_runs() {
         .await
         .unwrap();
 
-    assert_eq!(result, "JS error: internal error");
+    assert!(
+        result.starts_with("JS error: internal error"),
+        "unexpected: {result}"
+    );
     assert!(!result.contains("source must not execute"));
 }
 
@@ -533,7 +536,10 @@ async fn hidden_capability_abi_mismatch_fails_before_export_source_runs() {
         .await
         .unwrap();
 
-    assert_eq!(result, "JS error: internal error");
+    assert!(
+        result.starts_with("JS error: internal error"),
+        "unexpected: {result}"
+    );
     assert!(!result.contains("ABI-mismatched source must not execute"));
 }
 
@@ -557,7 +563,10 @@ async fn duplicate_and_existing_global_exports_fail_closed() {
         })
         .await
         .unwrap();
-    assert_eq!(duplicate, "JS error: internal error");
+    assert!(
+        duplicate.starts_with("JS error: internal error"),
+        "unexpected: {duplicate}"
+    );
 
     let collision = artifact(
         "function spawn() { return 'shadowed'; }",
@@ -572,7 +581,10 @@ async fn duplicate_and_existing_global_exports_fail_closed() {
         })
         .await
         .unwrap();
-    assert_eq!(collision_result, "JS error: internal error");
+    assert!(
+        collision_result.starts_with("JS error: internal error"),
+        "unexpected: {collision_result}"
+    );
 }
 
 #[tokio::test]
@@ -589,7 +601,10 @@ async fn source_and_agent_failures_are_source_free_closed_errors() {
         })
         .await
         .unwrap();
-    assert_eq!(source_error, "JS error: internal error");
+    assert!(
+        source_error.starts_with("JS error: internal error"),
+        "unexpected: {source_error}"
+    );
     assert!(!source_error.contains(&broken.id));
 
     let agent_tool = make_test_tool();
@@ -599,7 +614,10 @@ async fn source_and_agent_failures_are_source_free_closed_errors() {
         })
         .await
         .unwrap();
-    assert_eq!(agent_error, "JS error: exception");
+    assert!(
+        agent_error.starts_with("JS error: exception"),
+        "unexpected: {agent_error}"
+    );
     assert!(!agent_error.contains("agent.js"));
 }
 
@@ -617,7 +635,10 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
         })
         .await
         .unwrap();
-    assert_eq!(denied, "JS error: exception");
+    assert!(
+        denied.starts_with("JS error: exception"),
+        "unexpected: {denied}"
+    );
 
     let allowed_manifest = CapabilityManifest::new(
         CapabilityTier::ReadOnly,
@@ -794,7 +815,10 @@ async fn selected_skills_have_private_bindings_and_cannot_export_executable_valu
         })
         .await
         .unwrap();
-    assert_eq!(denied, "JS error: exception");
+    assert!(
+        denied.starts_with("JS error: exception"),
+        "unexpected: {denied}"
+    );
 }
 
 #[tokio::test]

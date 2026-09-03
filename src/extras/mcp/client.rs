@@ -8,17 +8,33 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use compact_str::CompactString;
-use rmcp::service::{RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage, serve_client};
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ListToolsRequest,
+    PaginatedRequestParams, ServerResult, Tool,
+};
+use rmcp::service::{
+    Peer, PeerRequestOptions, RoleClient, RunningService, RxJsonRpcMessage, ServiceError,
+    TxJsonRpcMessage, serve_client,
+};
 use rmcp::transport::{Transport, child_process::TokioChildProcess, which_command};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
-use super::config::{McpServerConfig, McpStdioNetwork, TrustedMcpServer};
+use super::config::{McpServerConfig, McpStdioNetwork, OAuthConfig, TrustedMcpServer};
 use crate::process_creation::RmcpCommandCreationExt;
 use crate::sandbox::{Sandbox, owned_workspace_service_tree};
 
-const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on the MCP initialization handshake for every transport. For HTTP
+/// servers this also covers OAuth client construction (stored-token restore
+/// and refresh) and the TCP/TLS connect.
+pub(crate) const MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on a complete `tools/list` enumeration for one server, including
+/// every paginated page.
+pub(crate) const MCP_LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap on `tools/list` pages so a server that keeps returning a cursor cannot
+/// spin the enumeration loop forever within the time budget.
+pub(crate) const MCP_LIST_TOOLS_MAX_PAGES: usize = 64;
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
 const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -214,71 +230,178 @@ impl McpClientHandle {
                 oauth,
             } => {
                 validate_mcp_server_url(url).await?;
-                tracing::debug!(
-                    "MCP HTTP transport: {} ({} headers, OAuth: {})",
-                    url,
-                    headers.len(),
-                    oauth.is_some(),
-                );
-                let custom_headers = parse_headers(headers)?;
-                let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str())
-                    .custom_headers(custom_headers);
-
-                let oauth_settings = oauth.as_ref().and_then(|o| o.settings());
-                let running_service = if let Some(settings) = oauth_settings {
-                    let auth_client =
-                        super::oauth::build_auth_client(&server_name, url, &settings).await?;
-                    type AuthHttpClient = rmcp::transport::StreamableHttpClientTransport<
-                        rmcp::transport::auth::AuthClient<reqwest::Client>,
-                    >;
-                    let transport = AuthHttpClient::with_client(auth_client, cfg);
-                    serve_client((), transport).await.map_err(|e| {
-                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                    })?
-                } else {
-                    type HttpClient =
-                        rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
-                    let transport = HttpClient::from_config(cfg);
-                    serve_client((), transport).await.map_err(|e| {
-                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                    })?
-                };
-                Ok(Self {
+                let mut handle = Self::connect_http_with_timeout(
                     server_name,
-                    trusted_identity: config.trusted_identity(),
-                    running_service,
-                })
+                    url,
+                    headers,
+                    oauth.as_ref(),
+                    initialize_timeout,
+                )
+                .await?;
+                handle.trusted_identity = config.trusted_identity();
+                Ok(handle)
             }
             McpServerConfig::BuiltIn { identity, headers } => {
-                let url = identity.endpoint();
-                tracing::debug!(
-                    "MCP built-in HTTP transport: {} ({} headers)",
-                    url,
-                    headers.len(),
-                );
-                let custom_headers = parse_headers(headers)?;
-                let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url)
-                    .custom_headers(custom_headers);
-                type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
-                let transport = HttpClient::from_config(cfg);
-                let running_service = serve_client((), transport).await.map_err(|e| {
-                    anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                })?;
-                Ok(Self {
+                let mut handle = Self::connect_http_with_timeout(
                     server_name,
-                    trusted_identity: config.trusted_identity(),
-                    running_service,
-                })
+                    identity.endpoint(),
+                    headers,
+                    None,
+                    initialize_timeout,
+                )
+                .await?;
+                handle.trusted_identity = config.trusted_identity();
+                Ok(handle)
             }
         }
+    }
+
+    /// Connect a streamable-HTTP server with every network step bounded by
+    /// `initialize_timeout`: OAuth client construction (stored-token restore,
+    /// which may refresh over the network), the TCP/TLS connect, and the MCP
+    /// initialization handshake.
+    ///
+    /// The caller is responsible for URL validation; this is the transport
+    /// layer only, so tests can drive it against a loopback listener.
+    pub(crate) async fn connect_http_with_timeout(
+        server_name: CompactString,
+        url: &str,
+        headers: &HashMap<String, String>,
+        oauth: Option<&OAuthConfig>,
+        initialize_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        tracing::debug!(
+            "MCP HTTP transport: {} ({} headers, OAuth: {})",
+            url,
+            headers.len(),
+            oauth.is_some(),
+        );
+        let custom_headers = parse_headers(headers)?;
+        let cfg =
+            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                url,
+            )
+            .custom_headers(custom_headers);
+        let oauth_settings = oauth.and_then(|o| o.settings());
+        let http_client = http_client(initialize_timeout)?;
+
+        let connect = async {
+            if let Some(settings) = oauth_settings {
+                let auth_client =
+                    super::oauth::build_auth_client(&server_name, url, &settings, http_client)
+                        .await?;
+                type AuthHttpClient = rmcp::transport::StreamableHttpClientTransport<
+                    rmcp::transport::auth::AuthClient<reqwest::Client>,
+                >;
+                let transport = AuthHttpClient::with_client(auth_client, cfg);
+                serve_client((), transport).await.map_err(|e| {
+                    anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
+                })
+            } else {
+                type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
+                let transport = HttpClient::with_client(http_client, cfg);
+                serve_client((), transport).await.map_err(|e| {
+                    anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
+                })
+            }
+        };
+        let running_service = match tokio::time::timeout(initialize_timeout, connect).await {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!(
+                "MCP HTTP connection failed for '{server_name}': initialization timed out after {} ms",
+                initialize_timeout.as_millis()
+            ),
+        };
+        Ok(Self {
+            server_name,
+            trusted_identity: None,
+            running_service,
+        })
     }
 
     pub fn peer(&self) -> rmcp::service::Peer<RoleClient> {
         self.running_service.peer().clone()
     }
 
-    pub async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>, rmcp::ServiceError> {
-        self.running_service.peer().list_all_tools().await
+    /// Enumerate every tool the server exposes, bounded by
+    /// [`MCP_LIST_TOOLS_TIMEOUT`] and [`MCP_LIST_TOOLS_MAX_PAGES`].
+    pub async fn list_tools(&self) -> Result<Vec<Tool>, ServiceError> {
+        list_all_tools_bounded(self.running_service.peer(), MCP_LIST_TOOLS_TIMEOUT).await
+    }
+}
+
+/// Build the reqwest client used for MCP HTTP transports.
+///
+/// Only the connect phase is bounded here. A whole-request timeout would sever
+/// the long-lived SSE stream and legitimate long tool calls; those are bounded
+/// per RPC through [`PeerRequestOptions`] instead.
+pub(crate) fn http_client(connect_timeout: Duration) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .build()
+        .map_err(|error| anyhow::anyhow!("MCP HTTP client construction failed: {error}"))
+}
+
+/// `tools/list` with a total time budget across every paginated page and a cap
+/// on the number of pages. A timeout cancels the in-flight request on the
+/// server side (rmcp sends `notifications/cancelled`) and surfaces as
+/// [`ServiceError::Timeout`].
+pub(crate) async fn list_all_tools_bounded(
+    peer: &Peer<RoleClient>,
+    timeout: Duration,
+) -> Result<Vec<Tool>, ServiceError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut tools = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0_usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ServiceError::Timeout { timeout });
+        }
+        let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
+            PaginatedRequestParams::default().with_cursor(cursor.take()),
+        ));
+        let handle = peer
+            .send_cancellable_request(request, PeerRequestOptions::with_timeout(remaining))
+            .await?;
+        let result = match handle.await_response().await {
+            Ok(ServerResult::ListToolsResult(result)) => result,
+            Ok(_) => return Err(ServiceError::UnexpectedResponse),
+            // Report the whole budget rather than the remaining slice.
+            Err(ServiceError::Timeout { .. }) => return Err(ServiceError::Timeout { timeout }),
+            Err(error) => return Err(error),
+        };
+        tools.extend(result.tools);
+        pages += 1;
+        match result.next_cursor {
+            None => break,
+            Some(_) if pages >= MCP_LIST_TOOLS_MAX_PAGES => {
+                tracing::debug!(
+                    "MCP tools/list stopped after {pages} pages; ignoring further cursors"
+                );
+                break;
+            }
+            next => cursor = next,
+        }
+    }
+    Ok(tools)
+}
+
+/// `tools/call` bounded by `timeout`. On expiry rmcp notifies the server that
+/// the request was cancelled and the error is [`ServiceError::Timeout`].
+pub(crate) async fn call_tool_bounded(
+    peer: &Peer<RoleClient>,
+    params: CallToolRequestParams,
+    timeout: Duration,
+) -> Result<CallToolResult, ServiceError> {
+    let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+    let handle = peer
+        .send_cancellable_request(request, PeerRequestOptions::with_timeout(timeout))
+        .await?;
+    match handle.await_response().await? {
+        ServerResult::CallToolResult(result) => Ok(result),
+        _ => Err(ServiceError::UnexpectedResponse),
     }
 }
 

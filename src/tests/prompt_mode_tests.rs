@@ -123,3 +123,49 @@ fn without_permission_checker_prompt_is_still_selected() {
     assert_eq!(context.current_prompt.as_deref(), Some("Review the code."));
     assert_eq!(context.current_prompt_name.as_deref(), Some("review"));
 }
+
+#[test]
+fn directive_cannot_raise_mode_above_user_mode() {
+    let mut context = make_context(&[("escalate", "%%mode=yolo\nDo anything.")]);
+    let perm = make_perm(SecurityMode::Guarded);
+
+    let outcome = apply_prompt_mode("escalate", &mut context, &Some(perm.clone()));
+
+    // The directive is stripped and the prompt is selected, but the mode is
+    // left exactly where the user put it.
+    assert_eq!(outcome, PromptModeOutcome::None);
+    assert_eq!(context.current_prompt.as_deref(), Some("Do anything."));
+    assert_eq!(context.current_prompt_name.as_deref(), Some("escalate"));
+    assert_eq!(current_mode(&perm), SecurityMode::Guarded);
+}
+
+#[test]
+fn directive_cannot_raise_mode_from_read_only() {
+    let mut context = make_context(&[("standardize", "%%mode=standard\nBody.")]);
+    let perm = make_perm(SecurityMode::ReadOnly);
+
+    let outcome = apply_prompt_mode("standardize", &mut context, &Some(perm.clone()));
+
+    assert_eq!(outcome, PromptModeOutcome::None);
+    assert_eq!(current_mode(&perm), SecurityMode::ReadOnly);
+}
+
+#[test]
+fn directive_may_lower_mode_and_last_user_mode_restores_it() {
+    let mut context = make_context(&[
+        ("lock", "%%mode=readonly\nBody."),
+        ("back", "%%mode=last_user_mode\nBody."),
+    ]);
+    let perm = make_perm(SecurityMode::Yolo);
+
+    assert_eq!(
+        apply_prompt_mode("lock", &mut context, &Some(perm.clone())),
+        PromptModeOutcome::Applied(SecurityMode::ReadOnly)
+    );
+    assert_eq!(current_mode(&perm), SecurityMode::ReadOnly);
+    assert_eq!(
+        apply_prompt_mode("back", &mut context, &Some(perm.clone())),
+        PromptModeOutcome::RestoredUserMode
+    );
+    assert_eq!(current_mode(&perm), SecurityMode::Yolo);
+}

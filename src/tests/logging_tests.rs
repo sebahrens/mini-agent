@@ -103,3 +103,73 @@ fn test_crash_log_dir_is_under_data_logs() {
     assert!(s.contains("logs"));
     assert!(s.ends_with("crashes"));
 }
+
+#[test]
+fn test_file_filter_directive_targets_this_crate_and_audit_targets() {
+    let directive = logging::file_filter_directive();
+    assert!(
+        directive.contains(&format!("{}=trace", env!("CARGO_CRATE_NAME"))),
+        "file filter must enable this crate's own tracing target: {directive}"
+    );
+    assert!(directive.contains("zerostack=trace"), "{directive}");
+    assert!(directive.contains("rig=off"), "{directive}");
+}
+
+#[test]
+fn test_file_filter_passes_debug_events_from_this_crate() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let buffer = Shared(Arc::new(Mutex::new(Vec::new())));
+    let writer = buffer.clone();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .with_filter(logging::build_file_filter());
+    let subscriber = tracing_subscriber::registry().with(layer);
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::debug!("file-filter-probe-crate-debug");
+        tracing::event!(
+            target: "zerostack::audit::explicit_shell",
+            tracing::Level::TRACE,
+            "file-filter-probe-audit-trace"
+        );
+        tracing::event!(
+            target: "rig::probe",
+            tracing::Level::ERROR,
+            "file-filter-probe-rig-error"
+        );
+    });
+
+    let captured = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        captured.contains("file-filter-probe-crate-debug"),
+        "a tracing::debug! from this crate must reach the log file: {captured:?}"
+    );
+    assert!(
+        captured.contains("file-filter-probe-audit-trace"),
+        "explicit zerostack audit targets must still be captured: {captured:?}"
+    );
+    assert!(
+        !captured.contains("file-filter-probe-rig-error"),
+        "rig must stay silenced: {captured:?}"
+    );
+}

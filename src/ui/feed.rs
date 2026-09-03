@@ -188,7 +188,8 @@ impl Feed {
     /// Push an empty block that a producer will append to incrementally
     /// (e.g. streaming agent tokens). While running, agent blocks parse
     /// markdown only for completed lines and render the unfinished tail line
-    /// as plain text. Call `finalize_last` when the stream ends.
+    /// as plain text. Call `finalize_block` (or `finalize_last`) when the
+    /// stream ends.
     pub fn push_streaming_block(&mut self, style: BlockStyle) {
         self.generation += 1;
         let mut block = Block::new(style, "");
@@ -199,15 +200,36 @@ impl Feed {
     /// Mark the last block as complete: its full text (including the former
     /// tail line) is parsed as markdown on the next layout. No-op when the
     /// last block is not running.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn finalize_last(&mut self) {
-        if let Some(last) = self.blocks.last_mut()
-            && last.running
+        if let Some(idx) = self.blocks.len().checked_sub(1) {
+            self.finalize_block(idx);
+        }
+    }
+
+    /// Mark the block at `idx` as complete (see `finalize_last`). Streaming
+    /// producers track their own block index because other producers (`/btw`
+    /// answers, queued-input notices) may push blocks after it mid-stream.
+    /// No-op when `idx` is out of range or the block is not running.
+    pub fn finalize_block(&mut self, idx: usize) {
+        if let Some(block) = self.blocks.get_mut(idx)
+            && block.running
         {
             self.generation += 1;
-            last.running = false;
+            block.running = false;
             // Force one full re-parse now that the text is complete.
-            *last.md_cache.borrow_mut() = None;
+            *block.md_cache.borrow_mut() = None;
         }
+    }
+
+    /// True when the block at `idx` exists and is still being streamed into.
+    pub fn is_streaming(&self, idx: usize) -> bool {
+        self.blocks.get(idx).is_some_and(|block| block.running)
+    }
+
+    /// Text of the block at `idx`, if it exists.
+    pub fn block_text(&self, idx: usize) -> Option<&str> {
+        self.blocks.get(idx).map(|block| block.text.as_str())
     }
 
     pub fn push_line(&mut self, style: BlockStyle, text: impl Into<String>) {
@@ -216,10 +238,21 @@ impl Feed {
 
     /// Append text to the most recent block. Returns `false` when the feed is
     /// empty and there is no block to append to.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn append_to_last(&mut self, text: impl AsRef<str>) -> bool {
-        if let Some(last) = self.blocks.last_mut() {
+        match self.blocks.len().checked_sub(1) {
+            Some(idx) => self.append_to(idx, text),
+            None => false,
+        }
+    }
+
+    /// Append text to the block at `idx`. Returns `false` when no such block
+    /// exists. Streaming callers use this with their tracked block index so
+    /// tokens never land on a block another producer pushed after theirs.
+    pub fn append_to(&mut self, idx: usize, text: impl AsRef<str>) -> bool {
+        if let Some(block) = self.blocks.get_mut(idx) {
             self.generation += 1;
-            last.text.push_str(text.as_ref());
+            block.text.push_str(text.as_ref());
             true
         } else {
             false
@@ -239,6 +272,7 @@ impl Feed {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn truncate_blocks(&mut self, len: usize) {
         self.generation += 1;
         self.blocks.truncate(len);

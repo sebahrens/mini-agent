@@ -2466,7 +2466,7 @@ mod tests {
         {
             let unreadable = directory.path().join("unreadable.txt");
             std::fs::write(&unreadable, b"metadata only").unwrap();
-            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
             let metadata = checked_path_metadata(&unreadable).expect("O_PATH needs no read access");
             assert!(metadata.is_file());
         }

@@ -1946,6 +1946,12 @@ where
     .await
 }
 
+// Mirrors `run_print`'s public parameter list plus the test-only stream policy;
+// with the `hooks` feature's `loop_info` that is one over clippy's threshold.
+// The arguments are the caller's positional run inputs (matching
+// `spawn_agent_with_start_mode`), so a params struct would only add a second
+// place to keep the two signatures in sync.
+#[allow(clippy::too_many_arguments)]
 async fn run_print_with_stream_policy<M>(
     agent: &Agent<M>,
     prompt: &str,
@@ -1975,7 +1981,13 @@ where
     let mut stream = stream_policy.apply(stream);
 
     let retry_history: Vec<Message> = history;
+    // Interactions of the stream currently being consumed; drained into the
+    // continuation bridge (and `committed_interactions`) at every stream end.
     let mut interactions: Vec<Message> = Vec::new();
+    // Every completed stream's interactions, in order. This is what the caller
+    // persists, so it must span the whole turn, not just the last stream
+    // (mini-agent-ut1v).
+    let mut committed_interactions: Vec<Message> = Vec::new();
     let mut continuation_bridge: Vec<Message> = Vec::new();
     let mut full_response = String::new();
     let mut response_len_at_stream_start = full_response.len();
@@ -1989,6 +2001,10 @@ where
     // Drives the outer loop for either a `Stop`-forced continuation or recovery
     // from a provider stream that ended without a terminal response.
     let mut continue_turn = true;
+    // Bounded retry of empty terminal responses, mirroring `spawn_agent`: an
+    // empty response must never be returned (and persisted) as the turn.
+    let mut empty_response_count: u32 = 0;
+    const MAX_EMPTY_RESPONSES: u32 = 3;
     #[cfg(feature = "hooks")]
     let mut next_instruction: Option<String> = None;
     #[cfg(feature = "hooks")]
@@ -2106,6 +2122,22 @@ where
                     if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
                         anyhow::bail!(UNRESOLVED_TOOL_CALLS_ERROR);
                     }
+                    if full_response.len() == response_len_at_stream_start {
+                        empty_response_count += 1;
+                        if empty_response_count >= MAX_EMPTY_RESPONSES {
+                            tracing::warn!(
+                                "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
+                            );
+                            anyhow::bail!(
+                                "Agent returned empty response too many times, aborting."
+                            );
+                        }
+                        tracing::warn!(
+                            "agent: empty terminal response ({empty_response_count}/{MAX_EMPTY_RESPONSES}), asking the model to continue"
+                        );
+                        continue_turn = true;
+                        break;
+                    }
                     #[cfg(feature = "hooks")]
                     if let crate::extras::hooks::StopGate::Continue { reason } =
                         crate::extras::hooks::dispatch_stop(
@@ -2175,6 +2207,7 @@ where
             #[cfg(not(feature = "hooks"))]
             let continuation_instruction = "Please continue.".to_string();
             let new_interactions = take_new_interactions(&mut interactions);
+            committed_interactions.extend(new_interactions.iter().cloned());
             continuation_bridge = normalized_continuation_bridge(
                 &continuation_bridge,
                 &new_interactions,
@@ -2202,7 +2235,8 @@ where
     }
 
     println!();
-    Ok((full_response, usage_ledger.total, interactions))
+    committed_interactions.append(&mut interactions);
+    Ok((full_response, usage_ledger.total, committed_interactions))
 }
 
 fn format_tool_args_summary(args_json: &serde_json::Value) -> String {
@@ -5280,5 +5314,173 @@ mod tests {
         };
 
         assert!(streamed_reasoning_text(&content).is_none());
+    }
+
+    fn tool_call_ids_of(interactions: &[Message]) -> Vec<&str> {
+        interactions
+            .iter()
+            .flat_map(|message| match message {
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .filter_map(|item| match item {
+                        AssistantContent::ToolCall(call) => Some(call.id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn tool_result_ids_of(interactions: &[Message]) -> Vec<&str> {
+        interactions
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter_map(|item| match item {
+                        UserContent::ToolResult(result) => Some(result.id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    // mini-agent-ut1v: the returned interactions are what `-p` persists for a
+    // resumable transcript. A continuation (non-terminal EOF here; a `Stop`
+    // hook takes the same path) must not discard the earlier stream's tool
+    // calls and results — before the fix only the last stream's were returned.
+    #[tokio::test]
+    async fn headless_returned_interactions_accumulate_across_streams() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("first-call", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![
+                MockStreamEvent::tool_call(
+                    "second-call",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("answer"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(4)
+            .build();
+
+        let (response, _, interactions) = super::run_print_with_stream_policy(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            RunnerStreamPolicy::drop_next_terminal_responses(1),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("headless EOF recovery succeeds");
+
+        assert_eq!(model.requests().len(), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(response, "answer");
+        assert_eq!(
+            tool_call_ids_of(&interactions),
+            ["first-call", "second-call"],
+            "tool calls from both streams must be returned for persistence"
+        );
+        assert_eq!(
+            tool_result_ids_of(&interactions),
+            ["first-call", "second-call"],
+            "tool results from both streams must be returned for persistence"
+        );
+        assert_eq!(interactions.last(), Some(&Message::assistant("answer")));
+        assert!(
+            !interactions
+                .iter()
+                .any(|message| *message == Message::user("Please continue.")),
+            "synthetic continuation prompts are model-visible bridge text, not persisted interactions"
+        );
+    }
+
+    // mini-agent-ut1v: an empty terminal response must be retried like the
+    // interactive path does instead of being returned (and persisted) as an
+    // empty assistant turn.
+    #[tokio::test]
+    async fn headless_empty_terminal_response_is_retried() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![
+                MockStreamEvent::text("second try"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(2)
+            .build();
+
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("an empty terminal response is retried, not returned");
+
+        assert_eq!(model.requests().len(), 2);
+        assert_eq!(response, "second try");
+        assert_eq!(
+            model.requests()[1].chat_history.last_ref(),
+            &Message::user("Please continue.")
+        );
+        assert_eq!(interactions, vec![Message::assistant("second try")]);
+    }
+
+    #[tokio::test]
+    async fn headless_empty_terminal_responses_abort_after_bound() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(3)
+            .build();
+
+        let error = super::run_print(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect_err("repeated empty responses must fail instead of persisting an empty turn");
+
+        assert_eq!(model.requests().len(), 3);
+        assert_eq!(
+            error.to_string(),
+            "Agent returned empty response too many times, aborting."
+        );
     }
 }

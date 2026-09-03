@@ -1,10 +1,16 @@
 # VS Code ACP Setup Guide
 
-mini-agent speaks stable Agent Client Protocol (ACP) v1 over stdio or TCP. The
-repository includes a native VS Code Chat Participant extension in
-`editors/vscode`; other ACP-compatible clients can also drive the agent.
+mini-agent speaks the stable Agent Client Protocol (ACP) protocol version 1 over
+stdio or TCP. The repository includes a native VS Code Chat Participant extension
+in `editors/vscode`; other ACP-compatible clients can also drive the agent.
 
-## Native Mini Agent extension
+## Native VS Code extension
+
+The native extension always talks to its bundled (or configured) binary over
+**stdio**. It never opens a TCP connection, so no host, port, or API key
+configuration exists or is needed.
+
+### Install
 
 Install the platform-specific `mini-agent-<version>-<target>.vsix` from a GitHub
 release. VS Code's **Extensions: Install from VSIX...** command installs the
@@ -20,10 +26,12 @@ VS Code is detected. Enterprise deployment can use
 `msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart`; a service-account install
 does not modify another user's VS Code profile. Verify the artifact against `MSI_SHA256SUMS`.
 
+### Use
+
 Open a trusted local workspace and address `@mini-agent` in VS Code Chat. The
-extension starts its bundled native binary lazily, keeps one ACP session for
-subsequent prompts, streams assistant/tool/status updates, displays permission
-requests as modal editor choices, and forwards Chat cancellation to
+extension spawns `mini-agent --acp` lazily as a child process, keeps one ACP
+session for subsequent prompts, streams assistant/tool/status updates, displays
+permission requests as modal editor choices, and forwards Chat cancellation to
 `session/cancel`. Stopping the extension, closing the session, revoking its
 workspace context, or deactivating VS Code reaps the child process.
 
@@ -31,67 +39,89 @@ The extension fails closed in Restricted Mode and virtual workspaces. In a
 Remote Development window, install it on the remote/workspace side so the ACP
 process and selected `file:` workspace share the same authority.
 
-The Command Palette exposes **Mini Agent: Open Config**, **Mini Agent: Restart
-Session**, and **Mini Agent: Show Output**. Open Config follows the same
-platform-native global `zerostack` configuration root and `ZS_CONFIG_DIR`
-override as the binary, opens an existing TOML/YAML/JSON config when present,
-and otherwise creates an inert owner-private `config.toml`. Show Output reveals
-the existing Mini Agent output channel without moving keyboard focus.
+### Commands
 
-## Prerequisites
+The Command Palette exposes six commands:
 
-- mini-agent installed: `cargo install --path . --debug`
-- The native Mini Agent extension or another stable ACP v1 client
+| Command | Effect |
+|---|---|
+| **Mini Agent: Start Session** | Spawn the binary and open an ACP session for the selected workspace folder. |
+| **Mini Agent: Stop Session** | Close the session and reap the child process. |
+| **Mini Agent: Restart Session** | Stop, then start a fresh session. |
+| **Mini Agent: Select Workspace Folder** | Choose which trusted workspace folder the session is bound to. |
+| **Mini Agent: Open Config** | Open the agent's global config, creating an inert owner-private `config.toml` when none exists. |
+| **Mini Agent: Show Output** | Reveal the Mini Agent output channel without moving keyboard focus. |
 
-## Stdio transport (recommended)
+Open Config follows the same platform-native global `zerostack` configuration
+root and `ZS_CONFIG_DIR` override as the binary and opens an existing
+TOML/YAML/JSON config when present.
 
-Stdio is zero-configuration. The extension spawns mini-agent as a child process and communicates over stdin/stdout.
+### Settings
 
-In your extension's settings, set the agent command to:
+The extension contributes exactly two settings, both machine-scoped:
 
+| Setting | Default | Meaning |
+|---|---|---|
+| `mini-agent.executablePath` | `""` | Path to the `mini-agent` executable. Leave empty to use the binary bundled in the VSIX. A custom path is accepted only from User/Remote machine settings; workspace settings cannot replace the executable. |
+| `mini-agent.logLevel` | `info` | Verbosity of the Mini Agent output channel (`error`, `warn`, `info`, `debug`, `trace`). |
+
+No API key is required: the bundled binary is started over stdio, and the model
+provider key comes from the agent's own config or environment
+(`--api-key` on the CLI is the provider key, not an ACP credential).
+
+## Generic ACP clients over TCP
+
+Other ACP clients can connect over TCP, which is useful when the agent runs on a
+remote host or in a container. TCP always requires authentication.
+
+### 1. Install the agent
+
+```bash
+cargo install --path . --debug
 ```
-mini-agent --acp
-```
 
-No API key or port configuration is required for stdio.
+Make sure `mini-agent` is on the client's `PATH` if the client spawns it, or on
+the host that will run the TCP listener.
 
-## TCP transport
-
-TCP is useful when the agent runs on a remote host or in a container.
-
-### 1. Generate an API key
+### 2. Generate an API key
 
 ```bash
 openssl rand -hex 32
 ```
 
-### 2. Configure mini-agent
+### 3. Configure mini-agent
 
 Add to your platform global config (for example
 `~/.config/zerostack/config.toml` on Linux) or project-local
-`.zerostack/config.toml`:
+`.zerostack/config.toml`. The `type` key selects the transport; the `host`
+and `port` must match the listener you start in the next step:
 
 ```toml
 [acp_servers.default]
-transport = "tcp"
+type = "tcp"
 host = "127.0.0.1"
 port = 7890
 api_key = "<your-key>"
 ```
 
-### 3. Start mini-agent in TCP mode
+Alternatively, export `MINI_AGENT_ACP_API_KEY=<your-key>` instead of storing
+the key in the config file. The environment variable takes precedence.
+
+### 4. Start mini-agent in TCP mode
 
 ```bash
 mini-agent --acp-port 7890
 ```
 
-### 4. Point the VS Code extension to the agent
+`--acp-host` overrides the bind address (default `127.0.0.1`); binding a
+non-loopback address is logged as a warning and still requires the API key.
+The default port when only `--acp-host` is given is `7243`.
 
-In your extension's settings:
+### 5. Point your client at the agent
 
-- **Host**: `127.0.0.1`
-- **Port**: `7890`
-- **API key**: the key you generated above
+Configure the client with host `127.0.0.1`, port `7890`, and the API key you
+generated. The listener performs a nonce/HMAC challenge before accepting ACP
+traffic, so a client without the key is rejected immediately.
 
 ## Capabilities advertised to the client
 
@@ -104,20 +134,26 @@ In your extension's settings:
 | `session/request_permission` | Yes — prompts appear in the editor UI |
 | Max concurrent sessions | 64 |
 
+The machine-readable summary lives in [`docs/acp-registry.json`](acp-registry.json).
+
 ## Permission bridge
 
-When a tool needs authorization, mini-agent sends a `session/request_permission` request to the connected client. The client (your VS Code extension) displays the permission dialog; the user's choice (Allow once / Allow always / Deny) is forwarded back to the agent.
+When a tool needs authorization, mini-agent sends a `session/request_permission` request to the connected client. The client (the native extension or another ACP client) displays the permission dialog; the user's choice (Allow once / Allow always / Deny) is forwarded back to the agent.
 
 If no ACP client is connected, or if the session is non-interactive, tool calls that require a permission prompt are denied automatically.
 
 ## Troubleshooting
 
-**Agent not found**: make sure `mini-agent` is on your PATH (`which mini-agent`).
-
-For the native extension, leave `mini-agent.executablePath` empty to use the
-bundled binary. A custom path is accepted only from User/Remote machine settings;
-workspace settings cannot replace the executable.
+**Native extension cannot start the agent**: leave `mini-agent.executablePath`
+empty to use the bundled binary, or point it at an executable from User/Remote
+machine settings. The extension does not read `PATH`.
 
 **TCP connection refused**: confirm the agent is running (`mini-agent --acp-port <port>`) and the port matches.
 
-**Permission prompts not appearing**: ensure the extension supports `session/request_permission` (ACP schema ≥ 1.5.0). Check the extension's ACP version in its documentation.
+**TCP authentication failed**: the client must present the same key as
+`[acp_servers.<name>].api_key` (or `MINI_AGENT_ACP_API_KEY`) for the bound
+host and port.
+
+**Permission prompts not appearing**: ensure the client implements
+`session/request_permission` for ACP protocol version 1. Check the client's ACP
+support in its documentation.

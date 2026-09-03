@@ -7,6 +7,10 @@ pub struct Pattern {
     regex: Regex,
     pub original: String,
     normalize_path_input: bool,
+    /// Number of literal (non-wildcard) characters in the pattern. Rule
+    /// resolution prefers the most specific matching pattern; see
+    /// `docs/agent/CONFIG.md` ("Rule precedence").
+    specificity: usize,
 }
 
 impl Pattern {
@@ -16,6 +20,7 @@ impl Pattern {
         Pattern {
             regex: Regex::new(&glob_to_regex(&expanded))
                 .expect("glob conversion must always produce a valid regular expression"),
+            specificity: glob_specificity(&expanded),
             original,
             normalize_path_input: false,
         }
@@ -23,13 +28,22 @@ impl Pattern {
 
     pub fn new_regex(pattern: &str) -> Result<Self, regex::Error> {
         let expanded = crate::fs::expand_tilde(pattern);
+        // `(?s)` makes `.` match newlines so a multi-line input can never
+        // slip past an anchored deny rule. Caller flags such as `(?i)` remain
+        // valid after the prefix.
         Ok(Pattern {
-            regex: Regex::new(&expanded)?,
+            regex: Regex::new(&format!("(?s){expanded}"))?,
+            specificity: regex_specificity(&expanded),
             original: pattern.to_string(),
             // Regex syntax is caller-authored and raw: in particular, a
             // Windows deny regex may intentionally match `\\` separators.
             normalize_path_input: false,
         })
+    }
+
+    /// Literal-character count used for deterministic rule precedence.
+    pub fn specificity(&self) -> usize {
+        self.specificity
     }
 
     pub fn matches(&self, input: &str) -> bool {
@@ -62,6 +76,7 @@ impl Pattern {
         };
         Some(Self {
             regex: Regex::new(&regex).ok()?,
+            specificity: path.chars().count(),
             original: encoded.to_string(),
             normalize_path_input: true,
         })
@@ -157,9 +172,31 @@ fn decode_hex_path(encoded: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Count the literal characters of a glob: everything except `*` and `?`.
+fn glob_specificity(pattern: &str) -> usize {
+    pattern.chars().filter(|c| !matches!(c, '*' | '?')).count()
+}
+
+/// Count the literal characters of a regex: everything except metacharacters
+/// and escape backslashes. This is a deterministic heuristic for precedence,
+/// not a full regex analysis.
+fn regex_specificity(pattern: &str) -> usize {
+    pattern
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '.' | '*' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+            )
+        })
+        .count()
+}
+
 fn glob_to_regex(pattern: &str) -> String {
-    let mut re = String::with_capacity(pattern.len() * 2);
-    re.push('^');
+    let mut re = String::with_capacity(pattern.len() * 2 + 4);
+    // Single-line mode: `.` matches `\n`, so an embedded newline can never
+    // make an anchored deny pattern miss (see `multiline_bash_script_*` tests).
+    re.push_str("(?s)^");
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         match c {

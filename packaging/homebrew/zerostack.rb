@@ -7,20 +7,20 @@ class Zerostack < Formula
   on_macos do
     if Hardware::CPU.intel?
       url "https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-x86_64-apple-darwin.tar.gz"
-      sha256 "9d3799415d8598b45e21c7a9b5a3ddd39312c8082b817f1d75f55753bf87ae5c"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     else
       url "https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-aarch64-apple-darwin.tar.gz"
-      sha256 "c5df64defcb761296f28ba84d2011492499819dac09777f8d6ecc857f6483755"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
       url "https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "d0bae6b5b7813f4a4fe1aebf1ee5aeaac97e64698781a16cd00728c3d14f3f97"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     else
       url "https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "eb62b7cbe74f21ed0aea74dc9ce79a0675a0bfbdbb42799e0e6c7122c5866604"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
 

@@ -114,7 +114,11 @@ release body, so the heading must match the Cargo version.
 
 1. Verifies the working tree is clean
 2. Bumps the version in `Cargo.toml`
-3. Syncs the new version to `Cargo.lock` and all packaging files (AUR, conda, Homebrew)
+3. Syncs the new version to `Cargo.lock`, the packaging recipes (AUR, conda, Homebrew), the VS Code
+   extension manifest and lockfile, `editors/vscode/SOURCE.md`, `packaging/windows/README.md`, and
+   `docs/acp-registry.json`. Because a version change invalidates every previously recorded release
+   digest, the sync also replaces each recipe's artifact `sha256` with the placeholder
+   `0000…0000` (64 zeros); only the version-independent GPL `LICENSE` digest is preserved.
 4. Commits as `bump to vX.Y.Z` and pushes the current branch
 5. Validates that the tag is exactly `vX.Y.Z` (or `vX.Y.Z-prerelease`) and matches the Cargo package version
 6. Creates and pushes an annotated tag — this triggers the [GitHub Actions release workflow](../../.github/workflows/release.yml), which builds binaries for all targets
@@ -125,7 +129,10 @@ the metadata they validate is the metadata in the commit they tag.
 
 The release workflow accepts only pushed `v*` tags. Its first job rejects a non-tag ref,
 a malformed tag, or a tag whose version differs from the root Cargo package version before any
-release binary is built. Manual branch dispatch is intentionally disabled, so a branch name can
+release binary is built. The same job reads the version once from `Cargo.toml` (and requires
+`editors/vscode/package.json` to agree) and exports it as a job output; every VSIX and SBOM file
+name downstream is derived from that output, never from a literal in the workflow. All release
+builds run with `--locked` so the committed `Cargo.lock` is authoritative. Manual branch dispatch is intentionally disabled, so a branch name can
 never become a public release identity. Tags containing a prerelease suffix (for example,
 `v2.0.0-rc.1`) remain GitHub prereleases.
 
@@ -181,6 +188,21 @@ then updates SHA256 checksums in:
 
 It also regenerates `packaging/aur/.SRCINFO`.
 
+### Recipe digest lifecycle
+
+Package recipes are refreshed only by `just post-release`; never copy a digest from an older
+release or compute one by hand.
+
+| State | Recipe `sha256` values | `check-package-metadata.py` result |
+|---|---|---|
+| After `just sync-version` / `just release`, before the GitHub release exists | placeholder `0000…0000` under the new `vX.Y.Z` URLs | Passes in default and `--ref-type tag` modes (the pre-tag gate). |
+| After `just post-release` | digests of the published `vX.Y.Z` artifacts | Passes; `just post-release` ends by running the checker with `--require-release-digests`, which rejects any remaining placeholder. |
+| Any state | a digest identical to one recorded at the previous release tag under the new version's URLs | Fails: the recipe is stale and must be refreshed by `just post-release`. |
+
+The stale-digest comparison reads the previous `v*` tag's recipes from Git history, so it needs a
+checkout that has tags (`git fetch --tags`); a shallow, tag-less clone skips that comparison but
+still enforces the placeholder rule.
+
 ### Publishing to package registries
 
 After `post-release`, commit the checksum updates and publish manually:
@@ -200,7 +222,7 @@ These are useful for partial workflows or recovery:
 
 | Command | Purpose |
 |---------|---------|
-| `just sync-version` | Sync `Cargo.toml` version to packaging files (no commit) |
+| `just sync-version` | Sync `Cargo.toml` version to packaging, VS Code, Windows, and ACP registry files; resets recipe digests to the placeholder when the version changes (no commit) |
 | `just pre-release` | Same as `sync-version` (alias used by `release`) |
 | `just add-tag` | Validate, tag, and push the current Cargo version (no version bump) |
 | `just remove-tag [VERSION]` | Delete a local + remote tag (interactive picker if omitted) |

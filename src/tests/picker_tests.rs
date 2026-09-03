@@ -589,3 +589,131 @@ fn test_walk_files_streaming_emit_false_stops_early() {
         );
     });
 }
+
+// --- byte-offset regressions: `rfind('@')` returns a byte index ---
+
+mod file_picker_multibyte {
+    use super::*;
+    use crate::ui::pickers::handlers::handle_file_key;
+    use compact_str::CompactString;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// Buffer "日本語 @" + typed query, picker active with a fixed cache.
+    fn picker_after_at(prefix: &str, query: &str) -> (CompactString, usize, FilePicker) {
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("README.md"),
+        ]);
+        let mut buffer: CompactString = format!("{prefix}@").into();
+        let mut cursor = buffer.len();
+        for c in query.chars() {
+            assert!(handle_file_key(
+                &mut buffer,
+                &mut cursor,
+                &mut picker,
+                key(KeyCode::Char(c))
+            ));
+        }
+        (buffer, cursor, picker)
+    }
+
+    #[test]
+    fn file_picker_char_input_after_cjk_prefix_keeps_bytes_coherent() {
+        let (buffer, cursor, picker) = picker_after_at("日本語 ", "ma");
+        assert_eq!(buffer, "日本語 @ma");
+        assert_eq!(cursor, buffer.len());
+        assert_eq!(picker.query, "ma");
+    }
+
+    #[test]
+    fn file_picker_backspace_on_empty_query_removes_only_the_at_after_cjk() {
+        let (mut buffer, mut cursor, mut picker) = picker_after_at("日本語 ", "");
+        assert!(handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            key(KeyCode::Backspace)
+        ));
+        // Char-based slicing with the byte index of '@' (10) kept 10 *chars*,
+        // i.e. the '@' survived and text was duplicated.
+        assert_eq!(buffer, "日本語 ");
+        assert_eq!(cursor, buffer.len());
+        assert!(buffer.is_char_boundary(cursor));
+    }
+
+    #[test]
+    fn file_picker_ctrl_h_on_empty_query_removes_only_the_at_after_emoji() {
+        let (mut buffer, mut cursor, mut picker) = picker_after_at("🦀 ", "");
+        let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        assert!(handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            ctrl_h
+        ));
+        assert_eq!(buffer, "🦀 ");
+        assert_eq!(cursor, buffer.len());
+    }
+
+    #[test]
+    fn file_picker_esc_drops_at_and_query_after_cjk() {
+        let (mut buffer, mut cursor, mut picker) = picker_after_at("日本語 ", "ma");
+        assert!(handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            key(KeyCode::Esc)
+        ));
+        assert_eq!(buffer, "日本語 ");
+        assert_eq!(cursor, buffer.len());
+    }
+
+    #[test]
+    fn file_picker_esc_with_multibyte_query_and_tail() {
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![PathBuf::from("café.rs")]);
+        let mut buffer: CompactString = "é @ tail".into();
+        let mut cursor = "é @".len();
+        for c in "caf".chars() {
+            handle_file_key(&mut buffer, &mut cursor, &mut picker, key(KeyCode::Char(c)));
+        }
+        assert_eq!(buffer, "é @caf tail");
+        handle_file_key(&mut buffer, &mut cursor, &mut picker, key(KeyCode::Esc));
+        assert_eq!(buffer, "é  tail");
+        assert_eq!(cursor, "é ".len());
+    }
+
+    #[test]
+    fn file_picker_enter_inserts_path_after_cjk_prefix() {
+        let (mut buffer, mut cursor, mut picker) = picker_after_at("日本語 ", "main");
+        assert_eq!(picker.selected_path(), Some(&PathBuf::from("src/main.rs")));
+        assert!(handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            key(KeyCode::Enter)
+        ));
+        assert_eq!(buffer, "日本語 src/main.rs");
+        assert_eq!(cursor, buffer.len());
+    }
+
+    #[test]
+    fn file_picker_enter_keeps_multibyte_tail_after_query() {
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![PathBuf::from("README.md")]);
+        let mut buffer: CompactString = "🦀 @ 日本".into();
+        let mut cursor = "🦀 @".len();
+        for c in "read".chars() {
+            handle_file_key(&mut buffer, &mut cursor, &mut picker, key(KeyCode::Char(c)));
+        }
+        assert_eq!(buffer, "🦀 @read 日本");
+        handle_file_key(&mut buffer, &mut cursor, &mut picker, key(KeyCode::Enter));
+        assert_eq!(buffer, "🦀 README.md 日本");
+        assert_eq!(cursor, "🦀 README.md".len());
+    }
+}

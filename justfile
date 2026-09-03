@@ -179,6 +179,7 @@ canonical-installer-smoke:
     bash scripts/smoke-canonical-installer.sh
 
 post-release: canonical-installer-smoke release-checksums aur-regen-srcinfo
+    python3 scripts/check-package-metadata.py --require-release-digests
     @echo "=== post-release done: all checksums updated + .SRCINFO regenerated ==="
     @echo "Ready for:"
     @echo "  AUR: cd packaging/aur && pkgctl aur publish zerostack-bin"

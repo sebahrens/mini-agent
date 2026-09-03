@@ -1,5 +1,6 @@
 import importlib.util
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -287,14 +288,81 @@ steps:
             SCRIPT.parents[1] / ".github/workflows/release.yml"
         ).read_text(encoding="utf-8")
         workflow = workflow.replace(
-            "build --release --target",
-            "build --release --all-features --target",
+            "build --locked --release --target",
+            "build --locked --release --all-features --target",
             1,
         )
 
         errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
 
         self.assertTrue(any("all-features" in error for error in errors))
+
+    def test_release_builds_must_pass_locked(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        for command in (
+            "run: cargo build --locked --release --target",
+            "run: cargo build --locked --release --no-default-features --target",
+            "run: cross build --locked --release --target",
+            "run: cross build --locked --release --no-default-features --target",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, workflow)
+                mutated = workflow.replace(
+                    command, command.replace("--locked ", ""), 1
+                )
+                errors = CHECK_PACKAGE_METADATA.validate_workflow(
+                    mutated, "mini-agent"
+                )
+                self.assertTrue(
+                    any("--locked" in error for error in errors), errors
+                )
+
+    def test_release_version_is_read_once_from_cargo_manifest(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            [], CHECK_PACKAGE_METADATA.validate_release_version_source(workflow)
+        )
+        self.assertIsNone(
+            CHECK_PACKAGE_METADATA.HARDCODED_RELEASE_VERSION.search(workflow)
+        )
+
+        mutations = {
+            "hard-coded VSIX version": workflow.replace(
+                'test -f "mini-agent-$RELEASE_VERSION-$target.vsix"',
+                'test -f "mini-agent-1.8.0-$target.vsix"',
+                1,
+            ),
+            "missing version output": workflow.replace(
+                CHECK_PACKAGE_METADATA.RELEASE_VERSION_EXPORT, "true", 1
+            ),
+            "consumer without env": workflow.replace(
+                "      RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}\n",
+                "",
+                1,
+            ),
+            "consumer without needs edge": workflow.replace(
+                "needs: [package-metadata, vscode-vsix]", "needs: [vscode-vsix]", 1
+            ),
+        }
+        for name, mutated in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, mutated)
+                errors = CHECK_PACKAGE_METADATA.validate_workflow(
+                    mutated, "mini-agent"
+                )
+                self.assertTrue(
+                    any(
+                        "RELEASE_VERSION" in error
+                        or "package-metadata" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
 
     def test_release_requires_versioned_changelog_notes(self) -> None:
         workflow = (
@@ -703,18 +771,209 @@ class RepositoryCoordinateValidationTests(unittest.TestCase):
             shutil.copy(repository / "packaging/aur/PKGBUILD", destination)
             shutil.copy(repository / "packaging/aur/.SRCINFO", destination)
             srcinfo = destination / ".SRCINFO"
+            text = srcinfo.read_text(encoding="utf-8")
+            first_digest = CHECK_PACKAGE_METADATA.SHA256_DIGEST.search(text)
+            assert first_digest is not None
             srcinfo.write_text(
-                srcinfo.read_text(encoding="utf-8").replace(
-                    "d0bae6b5b7813f4a4fe1aebf1ee5aeaac97e64698781a16cd00728c3d14f3f97",
-                    "0" * 64,
-                    1,
-                ),
+                text.replace(first_digest.group(0), "f" * 64, 1),
                 encoding="utf-8",
             )
 
             errors = CHECK_PACKAGE_METADATA.validate_aur_srcinfo_checksums(root)
 
             self.assertTrue(any("checksums must match" in error for error in errors))
+
+
+class ReleaseDigestValidationTests(unittest.TestCase):
+    PREVIOUS_TAG = "v1.7.2"
+    PREVIOUS_DIGEST = (
+        "d0bae6b5b7813f4a4fe1aebf1ee5aeaac97e64698781a16cd00728c3d14f3f97"
+    )
+    LICENSE = CHECK_PACKAGE_METADATA.CANONICAL_GPL3_LICENSE_SHA256
+
+    def write_recipes(self, root: Path, digest: str) -> None:
+        recipes = {
+            "packaging/homebrew/zerostack.rb": (
+                '  url "https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/x.tar.gz"\n'
+                f'  sha256 "{digest}"\n'
+            ),
+            "packaging/aur/PKGBUILD": (
+                f"sha256sums_x86_64=('{digest}' '{self.LICENSE}')\n"
+            ),
+            "packaging/aur/.SRCINFO": (
+                f"\tsha256sums_x86_64 = {digest}\n"
+                f"\tsha256sums_x86_64 = {self.LICENSE}\n"
+            ),
+            "packaging/conda/zerostack-bin/meta.yaml": (
+                f"    sha256: {digest}\n    sha256: {self.LICENSE}\n"
+            ),
+            "packaging/conda/zerostack/meta.yaml": f"  sha256: {digest}\n",
+        }
+        for relative, text in recipes.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+
+    def test_license_digest_is_not_a_release_digest(self) -> None:
+        self.assertEqual(
+            ["a" * 64],
+            CHECK_PACKAGE_METADATA.recipe_release_digests(
+                f"sha256 {'a' * 64}\nsha256 {self.LICENSE}\n"
+            ),
+        )
+
+    def test_digest_copied_from_previous_release_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_recipes(root, self.PREVIOUS_DIGEST)
+
+            errors = CHECK_PACKAGE_METADATA.validate_release_digests(
+                root,
+                "1.8.0",
+                previous=(self.PREVIOUS_TAG, {self.PREVIOUS_DIGEST, self.LICENSE}),
+            )
+
+            self.assertEqual(5, len(errors), errors)
+            self.assertTrue(
+                all("recorded for v1.7.2" in error for error in errors), errors
+            )
+
+    def test_placeholder_is_allowed_before_post_release_only(self) -> None:
+        placeholder = CHECK_PACKAGE_METADATA.RELEASE_DIGEST_PLACEHOLDER
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_recipes(root, placeholder)
+            previous = (self.PREVIOUS_TAG, {self.PREVIOUS_DIGEST, placeholder})
+
+            self.assertEqual(
+                [],
+                CHECK_PACKAGE_METADATA.validate_release_digests(
+                    root, "1.8.0", previous=previous
+                ),
+            )
+            errors = CHECK_PACKAGE_METADATA.validate_release_digests(
+                root, "1.8.0", previous=previous, require_release_digests=True
+            )
+            self.assertEqual(5, len(errors), errors)
+            self.assertTrue(
+                all("just post-release" in error for error in errors), errors
+            )
+
+    def test_fresh_release_digests_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_recipes(root, "b" * 64)
+
+            self.assertEqual(
+                [],
+                CHECK_PACKAGE_METADATA.validate_release_digests(
+                    root,
+                    "1.8.0",
+                    previous=(self.PREVIOUS_TAG, {self.PREVIOUS_DIGEST}),
+                    require_release_digests=True,
+                ),
+            )
+
+    def test_previous_tag_lookup_ignores_current_and_newer_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+            for key, value in (
+                ("user.email", "release-test@example.invalid"),
+                ("user.name", "Release Test"),
+            ):
+                subprocess.run(["git", "config", key, value], cwd=root, check=True)
+            recipe = root / "packaging/conda/zerostack/meta.yaml"
+            recipe.parent.mkdir(parents=True)
+            for tag, digest in (("v1.7.2", "c" * 64), ("v1.8.0", "d" * 64)):
+                recipe.write_text(f"  sha256: {digest}\n", encoding="utf-8")
+                subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+                subprocess.run(
+                    ["git", "commit", "--quiet", "-m", tag], cwd=root, check=True
+                )
+                subprocess.run(["git", "tag", tag], cwd=root, check=True)
+
+            previous_tag, digests = CHECK_PACKAGE_METADATA.previous_release_digests(
+                root, "1.8.0"
+            )
+
+            self.assertEqual("v1.7.2", previous_tag)
+            self.assertEqual({"c" * 64}, digests)
+
+    def test_checked_in_recipes_carry_no_previous_release_digest(self) -> None:
+        repository = SCRIPT.parents[1]
+        version = tomllib.loads(
+            (repository / "Cargo.toml").read_text(encoding="utf-8")
+        )["package"]["version"]
+
+        self.assertEqual(
+            [],
+            CHECK_PACKAGE_METADATA.validate_release_digests(repository, version),
+        )
+
+
+class VersionLiteralValidationTests(unittest.TestCase):
+    VERSION_FILES = (
+        "packaging/aur/PKGBUILD",
+        "packaging/aur/.SRCINFO",
+        "packaging/conda/zerostack/meta.yaml",
+        "packaging/conda/zerostack-bin/meta.yaml",
+        "packaging/homebrew/zerostack.rb",
+        "editors/vscode/package.json",
+        "editors/vscode/package-lock.json",
+        "editors/vscode/SOURCE.md",
+        "packaging/windows/README.md",
+        "docs/acp-registry.json",
+    )
+
+    def copy_version_files(self, root: Path) -> None:
+        repository = SCRIPT.parents[1]
+        for relative in self.VERSION_FILES:
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(repository / relative, destination)
+
+    def test_checked_in_version_literals_match_cargo(self) -> None:
+        repository = SCRIPT.parents[1]
+        version = tomllib.loads(
+            (repository / "Cargo.toml").read_text(encoding="utf-8")
+        )["package"]["version"]
+
+        self.assertEqual(
+            [], CHECK_PACKAGE_METADATA.validate_versions(repository, version)
+        )
+
+    def test_every_version_bearing_file_is_checked(self) -> None:
+        repository = SCRIPT.parents[1]
+        version = tomllib.loads(
+            (repository / "Cargo.toml").read_text(encoding="utf-8")
+        )["package"]["version"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copy_version_files(root)
+            for relative in self.VERSION_FILES:
+                with self.subTest(relative=relative):
+                    path = root / relative
+                    original = path.read_text(encoding="utf-8")
+                    path.write_text(
+                        original.replace(version, "0.0.1"), encoding="utf-8"
+                    )
+                    errors = CHECK_PACKAGE_METADATA.validate_versions(root, version)
+                    self.assertTrue(
+                        any(relative in error for error in errors), errors
+                    )
+                    path.write_text(original, encoding="utf-8")
+
+    def test_protocol_version_in_registry_is_not_the_agent_version(self) -> None:
+        registry = json.loads(
+            (SCRIPT.parents[1] / "docs/acp-registry.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertNotEqual(
+            registry["agent"]["version"], registry["agent"]["protocol"]["version"]
+        )
 
 
 class ReleaseChecksumUpdateTests(unittest.TestCase):

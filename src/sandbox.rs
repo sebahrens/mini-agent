@@ -908,6 +908,23 @@ impl Sandbox {
         None
     }
 
+    /// Canonical workspace path for the Seatbelt profile's write grant.
+    ///
+    /// Seatbelt evaluates `(subpath ...)` against real filesystem paths, so
+    /// the `/dev/fd/N` authority alias from [`Self::workspace_authority_path`]
+    /// must never reach the profile: it is not mapped to the bound directory
+    /// and would silently make the workspace read-only. The alias remains the
+    /// child's `fchdir` target in [`Self::bind_workspace_cwd`]. The binding's
+    /// canonical root was re-validated (pathname and directory identity) by
+    /// `WorkspaceBinding::validate` at the top of the wrapping call, and the
+    /// filesystem root is refused exactly like the unbound case.
+    fn seatbelt_profile_workspace(&self, requested_cwd: &Path) -> Result<PathBuf, String> {
+        match &self.workspace_binding {
+            Some(workspace) => canonical_non_root(workspace.root(), "working directory"),
+            None => canonical_non_root(requested_cwd, "working directory"),
+        }
+    }
+
     #[cfg(not(unix))]
     fn bind_workspace_cwd(&self, _command: &mut Command) -> Result<(), String> {
         Ok(())
@@ -1460,7 +1477,12 @@ impl Sandbox {
                 "sandbox backend 'seatbelt' is not a trusted system executable — refusing to run unsandboxed"
                     .to_string()
             })?;
-            let mut command = self.build_seatbelt_command(seatbelt, command, &cwd, &cache_dir)?;
+            // The profile needs the real canonical workspace, not the fd
+            // alias in `cwd`; the child's working directory is still bound
+            // through the descriptor below.
+            let profile_workspace = self.seatbelt_profile_workspace(&requested_cwd)?;
+            let mut command =
+                self.build_seatbelt_command(seatbelt, command, &profile_workspace, &cache_dir)?;
             if self.workspace_binding.is_some() && cfg!(unix) {
                 command.current_dir("/");
             }
@@ -4111,6 +4133,163 @@ printf MACOS_SEATBELT_POLICY_PASS
         let matrix = sandbox.capability_matrix();
         assert_eq!(matrix.network, "all Seatbelt network operations denied");
         assert!(matrix.filesystem_reads.contains("not claimed"));
+    }
+
+    /// Shell probe shared by the workspace-binding Seatbelt tests: the child
+    /// must start in the bound workspace, be denied writes outside it (both
+    /// directly and through a symlink escape), and be allowed writes inside.
+    #[cfg(target_os = "macos")]
+    fn seatbelt_workspace_binding_probe_script(
+        workspace_root: &Path,
+        unique: &uuid::Uuid,
+        pass_token: &str,
+    ) -> (String, PathBuf, PathBuf, PathBuf) {
+        let workspace_probe = workspace_root.join(format!(".mini-agent-seatbelt-bound-{unique}"));
+        let workspace_probe_name = workspace_probe.file_name().unwrap().to_string_lossy();
+        let escape_link =
+            workspace_root.join(format!(".mini-agent-seatbelt-bound-escape-{unique}"));
+        let escape_link_name = escape_link.file_name().unwrap().to_string_lossy();
+        let outside_probe = workspace_root
+            .parent()
+            .expect("workspace must not be filesystem root")
+            .join(format!(".mini-agent-seatbelt-bound-denied-{unique}"));
+        let script = format!(
+            r#"
+test "$(pwd -P)" = "{workspace_root}" || exit 20
+if touch "{outside_probe}" 2>/dev/null; then exit 10; fi
+ln -s "{outside_probe}" "{escape_link_name}" || exit 11
+if printf escaped > "{escape_link_name}" 2>/dev/null; then exit 12; fi
+rm -f "{escape_link_name}"
+printf workspace > "{workspace_probe_name}" || exit 21
+test "$(cat "{workspace_probe_name}")" = workspace || exit 13
+rm -f "{workspace_probe_name}"
+printf {pass_token}
+"#,
+            workspace_root = workspace_root.to_string_lossy(),
+            outside_probe = outside_probe.to_string_lossy(),
+        );
+        (script, workspace_probe, escape_link, outside_probe)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_seatbelt_workspace_binding_grants_real_workspace_writes() {
+        if !seatbelt_exists() {
+            panic!("the supported macOS Seatbelt backend is unavailable");
+        }
+
+        let workspace = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let workspace_root = workspace.root().to_path_buf();
+        let unique = uuid::Uuid::new_v4();
+        let (script, workspace_probe, escape_link, outside_probe) =
+            seatbelt_workspace_binding_probe_script(
+                &workspace_root,
+                &unique,
+                "MACOS_SEATBELT_BOUND_WORKSPACE_PASS",
+            );
+
+        let sandbox = Sandbox::new(true, "seatbelt").with_workspace_binding(workspace);
+        let command = sandbox.wrap_command(&script).unwrap();
+
+        // The profile must grant the real canonical workspace; Seatbelt does
+        // not map the `/dev/fd/N` cwd-authority alias onto the directory.
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let profile = args
+            .windows(2)
+            .find_map(|args| (args[0] == "-p").then_some(args[1].as_str()))
+            .expect("Seatbelt profile argument");
+        let workspace_literal =
+            seatbelt_string_literal(&workspace_root, "working directory").unwrap();
+        assert!(
+            profile.contains(&format!(r#"(subpath "{workspace_literal}")"#)),
+            "Seatbelt profile must grant the canonical workspace: {profile}"
+        );
+        assert!(
+            !profile.contains("/dev/fd/"),
+            "Seatbelt profile must not reference the descriptor alias: {profile}"
+        );
+
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&outside_probe);
+        let _ = std::fs::remove_file(&workspace_probe);
+        let _ = std::fs::remove_file(&escape_link);
+        assert_eq!(
+            output.status,
+            CommandStatus::Completed,
+            "bound Seatbelt probe did not complete: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.exit_status.is_some_and(|status| status.success()),
+            "bound Seatbelt probe failed (exit {:?}): {}",
+            output.exit_status.and_then(|status| status.code()),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"MACOS_SEATBELT_BOUND_WORKSPACE_PASS");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_seatbelt_workspace_service_grants_real_workspace_writes() {
+        if !seatbelt_exists() {
+            panic!("the supported macOS Seatbelt backend is unavailable");
+        }
+
+        let workspace = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let workspace_root = workspace.root().to_path_buf();
+        let unique = uuid::Uuid::new_v4();
+        let (script, workspace_probe, escape_link, outside_probe) =
+            seatbelt_workspace_binding_probe_script(
+                &workspace_root,
+                &unique,
+                "MACOS_SEATBELT_SERVICE_WORKSPACE_PASS",
+            );
+
+        let sandbox = Sandbox::new(true, "seatbelt").with_workspace_binding(workspace.clone());
+        // Mirrors the git runner: direct exec, the binding's canonical root as
+        // cwd, and a complete delegated environment.
+        let command = sandbox
+            .wrap_workspace_service(
+                Path::new("/bin/sh"),
+                &["-c".to_string(), script],
+                workspace.root(),
+                &[(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+                true,
+            )
+            .unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&outside_probe);
+        let _ = std::fs::remove_file(&workspace_probe);
+        let _ = std::fs::remove_file(&escape_link);
+        assert_eq!(
+            output.status,
+            CommandStatus::Completed,
+            "workspace-service Seatbelt probe did not complete: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.exit_status.is_some_and(|status| status.success()),
+            "workspace-service Seatbelt probe failed (exit {:?}): {}",
+            output.exit_status.and_then(|status| status.code()),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"MACOS_SEATBELT_SERVICE_WORKSPACE_PASS");
     }
 
     #[cfg(target_os = "macos")]

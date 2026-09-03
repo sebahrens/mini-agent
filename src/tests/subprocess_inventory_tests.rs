@@ -843,11 +843,11 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/docs.rs",
-        "let status = std::process::Command::new(\"less\")",
+        "match std::process::Command::new(\"less\")",
         1,
         "TC-SUPPORT-UTILITY",
     ),
-    ("src/docs.rs", ".status()?;", 1, "TC-SUPPORT-UTILITY"),
+    ("src/docs.rs", ".status()", 1, "TC-SUPPORT-UTILITY"),
     (
         "src/extras/acp/mod.rs",
         ".spawn(move || {",
@@ -1400,6 +1400,48 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/docs.rs",
+        "Ok(status) => anyhow::bail!(\"less exited with {}\", status),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "assert_eq!(output.stdout, b\"MACOS_SEATBELT_BOUND_WORKSPACE_PASS\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "output.exit_status.and_then(|status| status.code()),",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "assert_eq!(output.stdout, b\"MACOS_SEATBELT_SERVICE_WORKSPACE_PASS\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/setup/mod.rs",
+        ".is_some_and(|status| status.contains(\"never saved\"))",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/slash/memory.rs",
+        "assert!(output.contains(\"2026-05-15.md (daily):\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/slash/memory.rs",
+        "assert!(output.contains(\"SPLIT DAILY CONTENT\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/sandbox/windows.rs",
         "assert!(output.status.success());",
         1,
@@ -1880,7 +1922,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox.rs",
         "String::from_utf8_lossy(&output.stderr)",
-        4,
+        8,
         "NON-PROCESS",
     ),
     (
@@ -1904,10 +1946,10 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox.rs",
         "output.exit_status.is_some_and(|status| status.success()),",
-        2,
+        4,
         "NON-PROCESS",
     ),
-    ("src/sandbox.rs", "output.status,", 2, "NON-PROCESS"),
+    ("src/sandbox.rs", "output.status,", 4, "NON-PROCESS"),
     (
         "src/sandbox.rs",
         "output.stdout.is_empty(),",
@@ -2433,6 +2475,30 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/sandbox.rs",
         &[
             (
+                "627b473d9f5eeeebcc106c10f05b0efd5737d4306d9842f566d3b999afe0b605",
+                1,
+            ),
+            (
+                "a1926db5b3e3f1231774fc4347154ba171e577143dc78940bf0596febca78bfa",
+                1,
+            ),
+            (
+                "b259679d1bae5bcc5274fa14b991897494f5fdf88a0b3ce6bcd601cbba5692be",
+                1,
+            ),
+            (
+                "c56e4e7b8f07cb0b1239fb75799362ad1a44fa0e8fbdf5b3b846761765108f74",
+                1,
+            ),
+            (
+                "d36edb6bb8fb94a81802d47d5595b1640211adceaaec11c4ac3bb4e5b0a06b92",
+                1,
+            ),
+            (
+                "d41de9f2559c59c3403416bf0fc72407b08c084cbe2d3086af0e0e4cf4e42c05",
+                1,
+            ),
+            (
                 "1be8b9a093e8b907b6122b21db33a9b30571b75c96e87c7908f804bea7d99d06",
                 1,
             ),
@@ -2562,6 +2628,33 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "b7d3a343dd8cc9b7c5fd729f36f1f77cff90127a7634b70d129a1e15b9a3063d",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/docs.rs",
+        &[(
+            "eaf04cf21084dd8d714729cf31f39143471900f5d86a880cffc12bbfe31be9a0",
+            1,
+        )],
+    ),
+    (
+        "src/setup/mod.rs",
+        &[(
+            "b945ed43b6634d640ac67926eb81d8a86cbeb71a124db0ee8a3c0d9fac65f891",
+            1,
+        )],
+    ),
+    (
+        "src/ui/slash/memory.rs",
+        &[
+            (
+                "31f0448d3ca88e815a10351301f97493f81877893b6a2540b221ff52d4a10a9e",
+                1,
+            ),
+            (
+                "a332259bdc29adc54732a3d79505caf3f2563d38417b9ea523d35e26a19e3a45",
                 1,
             ),
         ],

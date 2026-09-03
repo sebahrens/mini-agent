@@ -1,13 +1,15 @@
 use std::borrow::Cow;
 use std::fmt;
+use std::time::Duration;
 
 use compact_str::CompactString;
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use rmcp::model::{CallToolRequestParams, ContentBlock, JsonObject};
-use rmcp::service::{Peer, RoleClient};
+use rmcp::service::{Peer, RoleClient, ServiceError};
 
 use crate::agent::tools::check_mcp_perm;
+use crate::extras::mcp::client::call_tool_bounded;
 use crate::extras::mcp::config::TrustedMcpServer;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
@@ -30,11 +32,25 @@ pub struct McpTool {
     pub peer: Peer<RoleClient>,
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    /// Name registered with the model. Equals `definition.name` unless another
+    /// server exposes the same tool name, in which case the manager namespaces
+    /// it as `<server>__<tool>`. The wire-level call and the permission key
+    /// always use the bare `definition.name`.
+    pub registered_name: CompactString,
+    /// Bound on one `tools/call` round trip.
+    pub call_timeout: Duration,
+}
+
+impl McpTool {
+    /// Deterministic name used when two servers expose the same tool name.
+    pub fn namespaced_name(server_name: &str, tool_name: &str) -> CompactString {
+        CompactString::new(format!("{server_name}__{tool_name}"))
+    }
 }
 
 impl ToolDyn for McpTool {
     fn name(&self) -> String {
-        self.definition.name.to_string()
+        self.registered_name.to_string()
     }
 
     fn description(&self) -> String {
@@ -56,6 +72,7 @@ impl ToolDyn for McpTool {
         let peer = self.peer.clone();
         let permission = self.permission.clone();
         let ask_tx = self.ask_tx.clone();
+        let call_timeout = self.call_timeout;
 
         Box::pin(async move {
             let perm_key = format!("mcp_tool:{server_name}:{tool_name}");
@@ -76,11 +93,20 @@ impl ToolDyn for McpTool {
                 .map(|a| CallToolRequestParams::new(tool_name.clone()).with_arguments(a))
                 .unwrap_or_else(|| CallToolRequestParams::new(tool_name.clone()));
 
-            let result = peer.call_tool(params).await.map_err(|e| {
-                ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(format!(
-                    "MCP tool error: {e}"
-                )))))
-            })?;
+            let result = call_tool_bounded(&peer, params, call_timeout)
+                .await
+                .map_err(|e| {
+                    let message = match e {
+                        ServiceError::Timeout { .. } => format!(
+                            "MCP tool '{tool_name}' on server '{server_name}' timed out after {} ms; \
+                             the server may be hung or the request too large. Retry with a \
+                             narrower request, or raise `mcp_tool_timeout_secs` in the config.",
+                            call_timeout.as_millis()
+                        ),
+                        other => format!("MCP tool error: {other}"),
+                    };
+                    ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(message))))
+                })?;
 
             if result.is_error.unwrap_or(false) {
                 let error_msg = result

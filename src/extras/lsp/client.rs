@@ -67,9 +67,7 @@ pub(crate) fn file_path(uri: &str) -> Option<PathBuf> {
         return None;
     }
     let path = uri.to_file_path().ok()?;
-    if path.to_str().is_none() {
-        return None;
-    }
+    path.to_str()?;
     Some(path)
 }
 
@@ -404,10 +402,12 @@ impl LspClient {
             child,
             process_group,
             shutdown_rx,
-            reader_task,
-            stderr_task,
-            stopped.clone(),
-            stopped_notify.clone(),
+            SupervisedProtocol {
+                reader_task,
+                stderr_task,
+                stopped: stopped.clone(),
+                stopped_notify: stopped_notify.clone(),
+            },
         ));
 
         let client = Arc::new(Self {
@@ -658,16 +658,27 @@ async fn write_owned_frame(
     result.is_ok()
 }
 
+/// Protocol tasks drained, and stop signals raised, once the server exits.
+struct SupervisedProtocol {
+    reader_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
+    stopped: Arc<AtomicBool>,
+    stopped_notify: Arc<Notify>,
+}
+
 async fn supervise_child(
     name: String,
     mut child: Box<dyn ChildWrapper>,
     process_group: Option<u32>,
     mut shutdown_rx: mpsc::UnboundedReceiver<()>,
-    mut reader_task: JoinHandle<()>,
-    mut stderr_task: JoinHandle<()>,
-    stopped: Arc<AtomicBool>,
-    stopped_notify: Arc<Notify>,
+    protocol: SupervisedProtocol,
 ) {
+    let SupervisedProtocol {
+        mut reader_task,
+        mut stderr_task,
+        stopped,
+        stopped_notify,
+    } = protocol;
     // Poll the direct child as well as protocol tasks. A crashed server can
     // leave a descendant holding inherited stdio open; waiting only for EOF
     // or the whole process group would then hang forever.
@@ -760,13 +771,7 @@ fn lsp_command(cfg: &LspServerConfig, root: &Path) -> anyhow::Result<tokio::proc
     let args = cfg.args.iter().map(ToString::to_string).collect::<Vec<_>>();
     let mut command = if let Some(backend) = cfg.sandbox.as_deref() {
         Sandbox::new(true, backend)
-            .wrap_workspace_service(
-                &program,
-                &args,
-                &root,
-                &env,
-                cfg.network == LspNetwork::Deny,
-            )
+            .wrap_workspace_service(&program, &args, root, &env, cfg.network == LspNetwork::Deny)
             .map_err(anyhow::Error::msg)?
     } else if cfg.network == LspNetwork::Deny {
         anyhow::bail!("LSP network denial requires an available workspace-service sandbox");

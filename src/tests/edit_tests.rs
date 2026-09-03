@@ -445,3 +445,322 @@ async fn test_hash_multi_edit_atomic() {
     assert_eq!(content, "AAA\nbbb\nccc\nDDD\n");
     assert!(result.contains("Applied 2 edit(s)"));
 }
+
+// ── Similarity: whitespace-normalized match must map to exact bytes ─────
+
+async fn sim_edit(tmp: &TempFile, search: &str, replace: &str) -> Result<String, String> {
+    let tool = edit::EditTool::new(None, None);
+    tool.call(EditArgs {
+        path: tmp.path().into(),
+        block: Some(format!(
+            "<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE"
+        )),
+        file_crc: None,
+        edits: None,
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn test_sim_normalized_match_after_trailing_whitespace() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_norm_trailing.txt");
+    std::fs::write(tmp.path(), "foo   \n    bar\n").unwrap();
+    let result = sim_edit(&tmp, "\tbar", "    baz").await.unwrap();
+    assert!(result.contains("whitespace normalization"), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "foo   \n    baz\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_normalized_match_after_collapsed_blank_lines() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_norm_blank.txt");
+    std::fs::write(tmp.path(), "foo\n\n\n\n    bar\nbaz\n").unwrap();
+    let result = sim_edit(&tmp, "\tbar", "    qux").await.unwrap();
+    assert!(result.contains("whitespace normalization"), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "foo\n\n\n\n    qux\nbaz\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_normalized_match_tabs_vs_spaces_inside_match() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_norm_tabs.txt");
+    std::fs::write(tmp.path(), "fn a() {\n\tx = 1;\n\ty = 2;\n}\n").unwrap();
+    let result = sim_edit(&tmp, "    x = 1;\n    y = 2;", "    z = 3;")
+        .await
+        .unwrap();
+    assert!(result.contains("whitespace normalization"), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "fn a() {\n    z = 3;\n}\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_normalized_match_in_crlf_file() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_norm_crlf.txt");
+    std::fs::write(tmp.path(), "foo   \r\n    bar\r\nend\r\n").unwrap();
+    let result = sim_edit(&tmp, "\tbar", "    baz").await.unwrap();
+    assert!(result.contains("whitespace normalization"), "{result}");
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        b"foo   \r\n    baz\r\nend\r\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_normalized_match_at_end_of_file() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+
+    let tmp = TempFile::new("sim_norm_eof_nonl.txt");
+    std::fs::write(tmp.path(), "keep   \n\tlast").unwrap();
+    sim_edit(&tmp, "    last", "LAST").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "keep   \nLAST"
+    );
+
+    let tmp = TempFile::new("sim_norm_eof_nl.txt");
+    std::fs::write(tmp.path(), "keep   \n\tlast\n").unwrap();
+    sim_edit(&tmp, "    last", "LAST").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "keep   \nLAST\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_normalized_match_replaces_exactly_the_matched_lines() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_norm_exact_lines.txt");
+    std::fs::write(tmp.path(), "a\nb   \n\tc\nd\n").unwrap();
+    sim_edit(&tmp, "b\n    c", "X").await.unwrap();
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "a\nX\nd\n");
+}
+
+// ── Hashedit: line-range validation ─────────────────────────────────────
+
+#[tokio::test]
+async fn test_hash_range_rejects_descending_lines() {
+    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_desc.txt");
+    let original = "line1\nline2\nline3\nline4\nline5\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let file_crc = crc32_hex(original.as_bytes());
+
+    let tool = edit::EditTool::new(None, None);
+    let l4 = make_tagged_line(4, "line4");
+    let l2 = make_tagged_line(2, "line2");
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: None,
+            file_crc: Some(file_crc),
+            edits: Some(vec![EditOp {
+                line: None,
+                lines: Some(format!("{}\n{}", l4, l2)),
+                text: "CHANGED".into(),
+            }]),
+        })
+        .await;
+    let msg = result
+        .expect_err("descending range must be rejected")
+        .to_string();
+    assert!(msg.contains("ascending"), "unexpected error: {msg}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
+async fn test_hash_range_rejects_non_contiguous_lines() {
+    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_gap.txt");
+    let original = "line1\nline2\nline3\nline4\nline5\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let file_crc = crc32_hex(original.as_bytes());
+
+    let tool = edit::EditTool::new(None, None);
+    let l2 = make_tagged_line(2, "line2");
+    let l4 = make_tagged_line(4, "line4");
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: None,
+            file_crc: Some(file_crc),
+            edits: Some(vec![EditOp {
+                line: None,
+                lines: Some(format!("{}\n{}", l2, l4)),
+                text: "CHANGED".into(),
+            }]),
+        })
+        .await;
+    let msg = result
+        .expect_err("non-contiguous range must be rejected")
+        .to_string();
+    assert!(msg.contains("contiguous"), "unexpected error: {msg}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
+async fn test_hash_rejects_line_zero() {
+    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_zero.txt");
+    let original = "line1\nline2\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let file_crc = crc32_hex(original.as_bytes());
+
+    let tool = edit::EditTool::new(None, None);
+    // Tag is valid for line 1 but the line number is 0.
+    let l0 = make_tagged_line(0, "line1");
+    for op in [
+        EditOp {
+            line: Some(l0.clone()),
+            lines: None,
+            text: "INSERTED".into(),
+        },
+        EditOp {
+            line: None,
+            lines: Some(l0.clone()),
+            text: "INSERTED".into(),
+        },
+    ] {
+        let result = tool
+            .call(EditArgs {
+                path: tmp.path().into(),
+                block: None,
+                file_crc: Some(file_crc.clone()),
+                edits: Some(vec![op]),
+            })
+            .await;
+        let msg = result.expect_err("line 0 must be rejected").to_string();
+        assert!(msg.contains("Line 0"), "unexpected error: {msg}");
+    }
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
+async fn test_hash_rejects_overlapping_edits() {
+    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_overlap.txt");
+    let original = "line1\nline2\nline3\nline4\nline5\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let file_crc = crc32_hex(original.as_bytes());
+
+    let tool = edit::EditTool::new(None, None);
+    let l2 = make_tagged_line(2, "line2");
+    let l3 = make_tagged_line(3, "line3");
+    let l4 = make_tagged_line(4, "line4");
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: None,
+            file_crc: Some(file_crc.clone()),
+            edits: Some(vec![
+                EditOp {
+                    line: None,
+                    lines: Some(format!("{}\n{}", l2, l3)),
+                    text: "A".into(),
+                },
+                EditOp {
+                    line: None,
+                    lines: Some(format!("{}\n{}", l3.clone(), l4)),
+                    text: "B".into(),
+                },
+            ]),
+        })
+        .await;
+    let msg = result
+        .expect_err("overlapping edits must be rejected")
+        .to_string();
+    assert!(msg.contains("overlap"), "unexpected error: {msg}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+
+    // Two edits targeting the same single line overlap as well.
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: None,
+            file_crc: Some(file_crc),
+            edits: Some(vec![
+                EditOp {
+                    line: Some(l3.clone()),
+                    lines: None,
+                    text: "A".into(),
+                },
+                EditOp {
+                    line: Some(l3),
+                    lines: None,
+                    text: "B".into(),
+                },
+            ]),
+        })
+        .await;
+    let msg = result
+        .expect_err("duplicate edits must be rejected")
+        .to_string();
+    assert!(msg.contains("overlap"), "unexpected error: {msg}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
+async fn test_hash_adjacent_edits_are_allowed() {
+    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_adjacent.txt");
+    let original = "line1\nline2\nline3\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let file_crc = crc32_hex(original.as_bytes());
+
+    let tool = edit::EditTool::new(None, None);
+    let l1 = make_tagged_line(1, "line1");
+    let l2 = make_tagged_line(2, "line2");
+    tool.call(EditArgs {
+        path: tmp.path().into(),
+        block: None,
+        file_crc: Some(file_crc),
+        edits: Some(vec![
+            EditOp {
+                line: Some(l1),
+                lines: None,
+                text: "A".into(),
+            },
+            EditOp {
+                line: Some(l2),
+                lines: None,
+                text: "B".into(),
+            },
+        ]),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "A\nB\nline3\n"
+    );
+}
+
+// ── Non-UTF-8 files must fail closed ────────────────────────────────────
+
+#[tokio::test]
+async fn test_edit_rejects_non_utf8_file() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("latin1.txt");
+    // Latin-1 "café" followed by an ASCII line the edit targets.
+    let original: &[u8] = b"caf\xe9 au lait\nline2\n";
+    std::fs::write(tmp.path(), original).unwrap();
+
+    let result = sim_edit(&tmp, "line2", "modified").await;
+    let msg = result.expect_err("non-UTF-8 file must be rejected");
+    assert!(msg.contains("UTF-8"), "unexpected error: {msg}");
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        original,
+        "file must be left untouched"
+    );
+}

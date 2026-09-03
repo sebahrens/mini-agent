@@ -27,7 +27,10 @@ use crate::extras::js::host::FetchEffectService;
 use crate::extras::js::host::{
     AllowConfig, FileEffectService, ParentHostEffectService, SpawnEffectService,
 };
-use crate::extras::js::protocol::{InvocationId, JsErrorCode, RunStep, StepOutcome};
+use crate::extras::js::protocol::{
+    ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticStage, InvocationId, JsErrorCode, RunStep,
+    ScriptRole, StepOutcome, StepResult,
+};
 #[cfg(feature = "skills")]
 use crate::extras::js::protocol::{
     MAX_SKILL_ARTIFACTS_PER_STEP, MAX_SKILL_CAPABILITY_GRANTS_PER_STEP,
@@ -996,6 +999,7 @@ impl Tool for JsTool {
             Err(error) => return Err(worker_tool_error(error)),
         };
         cancel_on_drop.disarm();
+        validate_step_result_bounds(&response)?;
 
         #[cfg(feature = "skills")]
         dispatch_skill_telemetry(
@@ -1007,15 +1011,7 @@ impl Tool for JsTool {
             response.evidence_complete,
         );
 
-        match response.outcome {
-            StepOutcome::Value(value) => Ok(value),
-            StepOutcome::Void => Ok(String::new()),
-            StepOutcome::Error(code) => Ok(format!("JS error: {}", js_error_code(code))),
-            StepOutcome::Timeout => Ok("JS error: execution timed out (30s limit exceeded)".into()),
-            StepOutcome::OutOfMemory => {
-                Ok("JS error: out of memory (64 MiB limit exceeded)".into())
-            }
-        }
+        Ok(render_step_result(&response))
     }
 }
 
@@ -1194,6 +1190,141 @@ fn record_observability_lost(
 
 fn worker_tool_error(error: WorkerError) -> ToolError {
     ToolError::Msg(error.to_string())
+}
+
+/// Parent-side ceilings for worker-supplied result and console payloads.
+///
+/// They mirror the worker's own bounds (`MAX_RESULT_BYTES`, `MAX_CONSOLE_*`
+/// in `worker.rs`). The parent never trusts the worker to have applied them:
+/// a step result that exceeds them is a protocol violation and is rejected
+/// instead of being forwarded to the model.
+const MAX_RESULT_BYTES: usize = 64 * 1024;
+const MAX_CONSOLE_RECORDS: usize = 256;
+const MAX_CONSOLE_BYTES: usize = 256 * 1024;
+const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
+
+fn validate_step_result_bounds(result: &StepResult) -> Result<(), ToolError> {
+    let violation = || worker_tool_error(WorkerError::Protocol);
+    if let StepOutcome::Value(value) = &result.outcome
+        && value.len() > MAX_RESULT_BYTES
+    {
+        return Err(violation());
+    }
+    if result.console.len() > MAX_CONSOLE_RECORDS {
+        return Err(violation());
+    }
+    let mut console_bytes = 0_usize;
+    for record in &result.console {
+        if record.text.len() > MAX_CONSOLE_RECORD_BYTES {
+            return Err(violation());
+        }
+        console_bytes = console_bytes.saturating_add(record.text.len());
+        if console_bytes > MAX_CONSOLE_BYTES {
+            return Err(violation());
+        }
+    }
+    Ok(())
+}
+
+/// Renders the model-visible text for a bounded step result: console records
+/// in emission order (level-prefixed), the returned value, and on failure the
+/// stable diagnostic stage / script role.
+fn render_step_result(result: &StepResult) -> String {
+    match &result.outcome {
+        StepOutcome::Value(value) => {
+            let mut text = String::with_capacity(value.len());
+            render_console(&result.console, &mut text);
+            text.push_str(value);
+            text
+        }
+        StepOutcome::Void => {
+            let mut text = String::new();
+            render_console(&result.console, &mut text);
+            if text.ends_with('\n') {
+                text.pop();
+            }
+            text
+        }
+        StepOutcome::Error(code) => {
+            render_failure(&format!("JS error: {}", js_error_code(*code)), result)
+        }
+        StepOutcome::Timeout => {
+            render_failure("JS error: execution timed out (30s limit exceeded)", result)
+        }
+        StepOutcome::OutOfMemory => {
+            render_failure("JS error: out of memory (64 MiB limit exceeded)", result)
+        }
+    }
+}
+
+fn render_failure(headline: &str, result: &StepResult) -> String {
+    let mut text = String::from(headline);
+    if let Some(diagnostic) = &result.diagnostic {
+        text.push_str(" (");
+        render_diagnostic(diagnostic, &mut text);
+        text.push(')');
+    }
+    if !result.console.is_empty() {
+        text.push('\n');
+        render_console(&result.console, &mut text);
+        text.pop();
+    }
+    text
+}
+
+fn render_console(records: &[ConsoleRecord], text: &mut String) {
+    for record in records {
+        text.push_str("[console.");
+        text.push_str(console_level_name(record.level));
+        text.push_str("] ");
+        text.push_str(&record.text);
+        if record.truncated {
+            text.push_str(" [truncated]");
+        }
+        text.push('\n');
+    }
+}
+
+fn render_diagnostic(diagnostic: &Diagnostic, text: &mut String) {
+    text.push_str("stage: ");
+    text.push_str(diagnostic_stage_name(diagnostic.stage));
+    text.push_str("; script: ");
+    text.push_str(script_role_name(diagnostic.script_role));
+    if let Some(line) = diagnostic.line {
+        text.push_str(&format!("; line {line}"));
+        if let Some(column) = diagnostic.column {
+            text.push_str(&format!(", column {column}"));
+        }
+    }
+}
+
+fn console_level_name(level: ConsoleLevel) -> &'static str {
+    match level {
+        ConsoleLevel::Log => "log",
+        ConsoleLevel::Warn => "warn",
+        ConsoleLevel::Error => "error",
+    }
+}
+
+fn diagnostic_stage_name(stage: DiagnosticStage) -> &'static str {
+    match stage {
+        DiagnosticStage::Initialization => "initialization",
+        DiagnosticStage::Evaluation => "evaluation",
+        DiagnosticStage::JobDrain => "job_drain",
+        DiagnosticStage::ResultConversion => "result_conversion",
+        DiagnosticStage::Verification => "verification",
+    }
+}
+
+fn script_role_name(role: ScriptRole) -> &'static str {
+    match role {
+        ScriptRole::Model => "model",
+        ScriptRole::SkillSource => "skill_source",
+        ScriptRole::EmbeddedTest => "embedded_test",
+        ScriptRole::MutationTest => "mutation_test",
+        ScriptRole::InheritedTest => "inherited_test",
+        ScriptRole::HeldOutTest => "held_out_test",
+    }
 }
 
 fn js_error_code(code: JsErrorCode) -> &'static str {
@@ -1744,5 +1875,182 @@ mod js_permission_bridge {
             .await
             .expect("call should succeed within single deadline");
         assert_eq!(result, "42");
+    }
+}
+
+#[cfg(test)]
+mod step_result_rendering {
+    use super::*;
+    use crate::extras::js::protocol::DiagnosticClass;
+
+    fn step(
+        outcome: StepOutcome,
+        console: Vec<ConsoleRecord>,
+        diagnostic: Option<Diagnostic>,
+    ) -> StepResult {
+        StepResult {
+            outcome,
+            console,
+            diagnostic,
+            #[cfg(feature = "skills")]
+            skill_events: Vec::new(),
+            #[cfg(feature = "skills")]
+            evidence_complete: true,
+        }
+    }
+
+    fn record(level: ConsoleLevel, text: &str) -> ConsoleRecord {
+        ConsoleRecord {
+            level,
+            text: text.to_string(),
+            truncated: false,
+        }
+    }
+
+    fn diagnostic(stage: DiagnosticStage, line: Option<u32>, column: Option<u32>) -> Diagnostic {
+        Diagnostic {
+            class: DiagnosticClass::Exception,
+            stage,
+            script_role: ScriptRole::Model,
+            line,
+            column,
+        }
+    }
+
+    #[test]
+    fn value_without_console_is_verbatim() {
+        let result = step(StepOutcome::Value("42".into()), Vec::new(), None);
+        assert_eq!(render_step_result(&result), "42");
+        assert_eq!(
+            render_step_result(&step(StepOutcome::Void, Vec::new(), None)),
+            ""
+        );
+    }
+
+    #[test]
+    fn console_records_precede_the_value_in_order() {
+        let result = step(
+            StepOutcome::Value("done".into()),
+            vec![
+                record(ConsoleLevel::Log, "one"),
+                record(ConsoleLevel::Warn, "two"),
+                ConsoleRecord {
+                    level: ConsoleLevel::Error,
+                    text: "thr".into(),
+                    truncated: true,
+                },
+            ],
+            None,
+        );
+        assert_eq!(
+            render_step_result(&result),
+            "[console.log] one\n[console.warn] two\n[console.error] thr [truncated]\ndone"
+        );
+        let void = step(
+            StepOutcome::Void,
+            vec![record(ConsoleLevel::Log, "x")],
+            None,
+        );
+        assert_eq!(render_step_result(&void), "[console.log] x");
+    }
+
+    #[test]
+    fn failures_render_stage_role_position_and_console() {
+        let result = step(
+            StepOutcome::Error(JsErrorCode::Exception),
+            vec![record(ConsoleLevel::Log, "before")],
+            Some(diagnostic(DiagnosticStage::Evaluation, Some(3), Some(7))),
+        );
+        assert_eq!(
+            render_step_result(&result),
+            "JS error: exception (stage: evaluation; script: model; line 3, column 7)\n[console.log] before"
+        );
+        let oom = step(
+            StepOutcome::OutOfMemory,
+            Vec::new(),
+            Some(diagnostic(DiagnosticStage::Initialization, None, None)),
+        );
+        assert_eq!(
+            render_step_result(&oom),
+            "JS error: out of memory (64 MiB limit exceeded) (stage: initialization; script: model)"
+        );
+        let bare = step(StepOutcome::Timeout, Vec::new(), None);
+        assert_eq!(
+            render_step_result(&bare),
+            "JS error: execution timed out (30s limit exceeded)"
+        );
+    }
+
+    #[test]
+    fn worker_payloads_within_bounds_are_accepted() {
+        let result = step(
+            StepOutcome::Value("v".repeat(MAX_RESULT_BYTES)),
+            (0..MAX_CONSOLE_RECORDS)
+                .map(|_| {
+                    record(
+                        ConsoleLevel::Log,
+                        &"c".repeat(MAX_CONSOLE_BYTES / MAX_CONSOLE_RECORDS),
+                    )
+                })
+                .collect(),
+            None,
+        );
+        assert!(validate_step_result_bounds(&result).is_ok());
+    }
+
+    #[test]
+    fn oversized_worker_payloads_are_protocol_errors() {
+        let protocol = WorkerError::Protocol.to_string();
+        let oversize_value = step(
+            StepOutcome::Value("v".repeat(MAX_RESULT_BYTES + 1)),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(
+            validate_step_result_bounds(&oversize_value)
+                .unwrap_err()
+                .to_string(),
+            protocol
+        );
+        let too_many_records = step(
+            StepOutcome::Void,
+            (0..=MAX_CONSOLE_RECORDS)
+                .map(|_| record(ConsoleLevel::Log, "x"))
+                .collect(),
+            None,
+        );
+        assert_eq!(
+            validate_step_result_bounds(&too_many_records)
+                .unwrap_err()
+                .to_string(),
+            protocol
+        );
+        let oversize_record = step(
+            StepOutcome::Void,
+            vec![record(
+                ConsoleLevel::Log,
+                &"x".repeat(MAX_CONSOLE_RECORD_BYTES + 1),
+            )],
+            None,
+        );
+        assert_eq!(
+            validate_step_result_bounds(&oversize_record)
+                .unwrap_err()
+                .to_string(),
+            protocol
+        );
+        let oversize_total = step(
+            StepOutcome::Void,
+            (0..(MAX_CONSOLE_BYTES / MAX_CONSOLE_RECORD_BYTES) + 1)
+                .map(|_| record(ConsoleLevel::Log, &"x".repeat(MAX_CONSOLE_RECORD_BYTES)))
+                .collect(),
+            None,
+        );
+        assert_eq!(
+            validate_step_result_bounds(&oversize_total)
+                .unwrap_err()
+                .to_string(),
+            protocol
+        );
     }
 }

@@ -726,7 +726,10 @@ async fn model_cannot_execute_a_proposal_in_the_same_step() {
         })
         .await
         .expect("closed execution result");
-    assert_eq!(output, "JS error: exception");
+    assert!(
+        output.starts_with("JS error: exception"),
+        "unexpected: {output}"
+    );
     drop(tool);
 
     let store = SkillStore::open_at(&paths).expect("reopen store");
@@ -764,7 +767,10 @@ async fn proposal_host_wiring_enforces_session_budget() {
         })
         .await
         .expect("structured JS error");
-    assert_eq!(exhausted, "JS error: exception");
+    assert!(
+        exhausted.starts_with("JS error: exception"),
+        "unexpected: {exhausted}"
+    );
     drop(tool);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -793,7 +799,10 @@ async fn proposal_host_validation_budget_precedes_canonical_validation() {
             })
             .await
             .expect("structured validation error");
-        assert_eq!(output, "JS error: exception");
+        assert!(
+            output.starts_with("JS error: exception"),
+            "unexpected: {output}"
+        );
     }
     let exhausted = tool
         .call(JsArgs {
@@ -801,7 +810,10 @@ async fn proposal_host_validation_budget_precedes_canonical_validation() {
         })
         .await
         .expect("structured budget error");
-    assert_eq!(exhausted, "JS error: exception");
+    assert!(
+        exhausted.starts_with("JS error: exception"),
+        "unexpected: {exhausted}"
+    );
     drop(tool);
     let _ = std::fs::remove_dir_all(root);
 }

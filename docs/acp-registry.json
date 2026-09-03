@@ -22,10 +22,10 @@
       },
       "tools": [
         "bash",
-        "read_file",
-        "write_file",
-        "edit_file",
-        "list_directory",
+        "read",
+        "write",
+        "edit",
+        "list_dir",
         "git"
       ]
     },
@@ -37,7 +37,7 @@
       "tcp": {
         "command": "mini-agent",
         "args": ["--acp-port", "${port}"],
-        "notes": "Requires --api-key configuration. See docs/vscode-acp-setup.md."
+        "notes": "TCP authentication uses api_key under [acp_servers.<name>] in the mini-agent config (the --api-key flag is the model-provider key, not ACP auth). See docs/vscode-acp-setup.md."
       }
     }
   }

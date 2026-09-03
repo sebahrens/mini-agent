@@ -624,11 +624,13 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     .unwrap_or_else(|e| e.into_inner())
                     .set_allow_all_mcp_calls(true);
             }
+            let timeouts =
+                crate::extras::mcp::McpToolTimeouts::from_config_secs(cfg.mcp_tool_timeout_secs);
             let mcp_tools = manager
-                .collect_tools(permission.clone(), ask_tx.clone())
+                .collect_tools_with_timeouts(permission.clone(), ask_tx.clone(), timeouts)
                 .await;
             for t in mcp_tools {
-                if is_reserved_builtin_tool_name(t.definition.name.as_ref()) {
+                if is_reserved_builtin_tool_name(&rig::tool::ToolDyn::name(&t)) {
                     tracing::warn!(
                         "MCP tool skipped because its name is reserved by a built-in tool"
                     );
@@ -703,6 +705,165 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         Some(tools) => builder.tools(tools).build(),
         None => builder.build(),
     }
+}
+
+/// Dedicated system prompt for the `/btw` side-assistant. Deliberately NOT the
+/// main coding `SYSTEM_PROMPT`: that one is all about using read/write/bash
+/// tools, so pairing it with "you have no tools" made the model refuse and tell
+/// the user to wait for the main agent. This prompt frames `/btw` as a quick,
+/// read-only Q&A helper whose only job is to answer the user's question.
+const BTW_SYSTEM_PROMPT: &str = "\
+You are a fast side-assistant for quick \"by the way\" questions during a coding \
+session. The user pressed /btw to ask you something in parallel with the main \
+assistant, WITHOUT interrupting it.
+
+Your only job: answer the user's question directly, briefly, and helpfully, using \
+the conversation so far and the project context below. Reply in the user's \
+language.
+
+Match your length to the question: greetings, thanks, or yes/no questions get a \
+ONE-LINE reply. Do NOT volunteer project setup, build, run, or test instructions \
+unless the user explicitly asks how to build or run. The project context below is \
+background for answering; it is NOT a script to recite.
+
+This is a read-only side channel: you have read-only tools (read, grep, \
+find_files, list_dir) to look things up, but you CANNOT write files, run \
+commands, or change anything, and your reply is NOT saved to the conversation. \
+Use the read tools when answering needs a file you do not already have in \
+context, and keep it to what the question asks. Do NOT attempt or plan the main \
+task, and do NOT tell the user to wait for the main assistant; just answer what \
+they asked.";
+
+/// Max model turns for a `/btw` side question. Higher than 1 so it can read a
+/// file (or grep) and then answer, but small to keep side questions quick.
+const BTW_MAX_TURNS: usize = 8;
+
+/// Builds the isolated `/btw` agent: a lightweight read-only Q&A helper with the
+/// project context for reference, NO tools, and a single turn. Never mutates the
+/// session.
+#[allow(clippy::too_many_arguments)]
+pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
+    model: M,
+    cli: &Cli,
+    cfg: &Config,
+    context: &ContextFiles,
+    workspace: &Arc<crate::paths::WorkspaceBinding>,
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    _reasoning_enabled: bool,
+    temperature: Option<f64>,
+    // See `build_agent_inner`: OpenRouter `provider.order` pin for `anthropic/*`.
+    additional_params: Option<serde_json::Value>,
+) -> Agent<M> {
+    let cwd = workspace.root().display().to_string();
+
+    let mut preamble = String::new();
+    preamble.push_str(BTW_SYSTEM_PROMPT);
+
+    // Project context, for reference only — NOT instructions to act on.
+    let has_ctx = context.agents.as_deref().is_some_and(|s| !s.is_empty()) || !cwd.is_empty();
+    if has_ctx {
+        preamble.push_str("\n\n## Project context (for reference)\n");
+    }
+    if let Some(agents) = context.agents.as_deref()
+        && !agents.is_empty()
+    {
+        preamble.push('\n');
+        preamble.push_str(agents);
+    }
+    #[cfg(feature = "archmd")]
+    if let Some(arch) = context.architecture.as_deref()
+        && !arch.is_empty()
+    {
+        preamble.push_str("\n\n");
+        preamble.push_str(arch);
+    }
+    if let Some(p) = context.current_prompt.as_deref()
+        && !p.is_empty()
+    {
+        preamble.push_str("\n\n");
+        preamble.push_str(p);
+    }
+    if !cwd.is_empty() {
+        preamble.push_str("\n\nCurrent working directory: ");
+        preamble.push_str(&cwd);
+    }
+    #[cfg(feature = "memory")]
+    crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
+
+    if let Some(s) = crate::session::storage::load_suffix() {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(&s);
+    }
+
+    let max_tokens = cli.resolve_max_tokens(cfg);
+
+    // Honor --no-tools: fall back to a pure-context, single-turn answer.
+    if cli.resolve_no_tools(cfg) {
+        let mut builder = AgentBuilder::new(model)
+            .preamble(&preamble)
+            .default_max_turns(1)
+            .max_tokens(max_tokens);
+        if let Some(params) = additional_params.clone() {
+            builder = builder.additional_params(params);
+        }
+        if let Some(temp) = temperature {
+            builder = builder.temperature(temp);
+        }
+        return builder.build();
+    }
+
+    // Read-only tools only (read/grep/find_files/list_dir): a side question can
+    // look things up, but has no write/edit/bash, so it still has no side
+    // effects to roll back and never mutates the session. Allow multiple turns
+    // so it can read then answer.
+    let max_text_file_size = cfg.max_text_file_size;
+    let max_read_lines = cfg.resolve_max_read_lines();
+    let max_grep_results = cfg.resolve_max_grep_results();
+    let max_find_results = cfg.resolve_max_find_results();
+    let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
+    let read_tracker = tools::ReadTracker::new(cfg.deny_repeated_reads.unwrap_or(true));
+    let read_tools: Vec<Box<dyn rig::tool::ToolDyn>> = vec![
+        Box::new(
+            tools::ReadTool::new_with_tracker(
+                permission.clone(),
+                ask_tx.clone(),
+                max_text_file_size,
+                max_read_lines,
+                read_tracker,
+            )
+            .with_workspace_binding(workspace.clone()),
+        ),
+        Box::new(
+            tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
+                .with_workspace_binding(workspace.clone()),
+        ),
+        Box::new(
+            tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
+                .with_workspace_binding(workspace.clone()),
+        ),
+        Box::new(
+            tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
+                .with_workspace_binding(workspace.clone()),
+        ),
+    ];
+    let read_tools = tools::memoize::definitions(read_tools);
+
+    let mut builder = AgentBuilder::new(model)
+        .preamble(&preamble)
+        .default_max_turns(BTW_MAX_TURNS)
+        .max_tokens(max_tokens)
+        .tools(read_tools);
+
+    if let Some(params) = additional_params {
+        builder = builder.additional_params(params);
+    }
+
+    if let Some(temp) = temperature {
+        builder = builder.temperature(temp);
+    }
+
+    builder.build()
 }
 
 #[cfg(test)]
@@ -1291,163 +1452,4 @@ mod js_tests {
         assert!(names.iter().any(|name| name == "read"));
         assert!(!names.iter().any(|name| name == "js"), "{names:?}");
     }
-}
-
-/// Dedicated system prompt for the `/btw` side-assistant. Deliberately NOT the
-/// main coding `SYSTEM_PROMPT`: that one is all about using read/write/bash
-/// tools, so pairing it with "you have no tools" made the model refuse and tell
-/// the user to wait for the main agent. This prompt frames `/btw` as a quick,
-/// read-only Q&A helper whose only job is to answer the user's question.
-const BTW_SYSTEM_PROMPT: &str = "\
-You are a fast side-assistant for quick \"by the way\" questions during a coding \
-session. The user pressed /btw to ask you something in parallel with the main \
-assistant, WITHOUT interrupting it.
-
-Your only job: answer the user's question directly, briefly, and helpfully, using \
-the conversation so far and the project context below. Reply in the user's \
-language.
-
-Match your length to the question: greetings, thanks, or yes/no questions get a \
-ONE-LINE reply. Do NOT volunteer project setup, build, run, or test instructions \
-unless the user explicitly asks how to build or run. The project context below is \
-background for answering; it is NOT a script to recite.
-
-This is a read-only side channel: you have read-only tools (read, grep, \
-find_files, list_dir) to look things up, but you CANNOT write files, run \
-commands, or change anything, and your reply is NOT saved to the conversation. \
-Use the read tools when answering needs a file you do not already have in \
-context, and keep it to what the question asks. Do NOT attempt or plan the main \
-task, and do NOT tell the user to wait for the main assistant; just answer what \
-they asked.";
-
-/// Max model turns for a `/btw` side question. Higher than 1 so it can read a
-/// file (or grep) and then answer, but small to keep side questions quick.
-const BTW_MAX_TURNS: usize = 8;
-
-/// Builds the isolated `/btw` agent: a lightweight read-only Q&A helper with the
-/// project context for reference, NO tools, and a single turn. Never mutates the
-/// session.
-#[allow(clippy::too_many_arguments)]
-pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
-    model: M,
-    cli: &Cli,
-    cfg: &Config,
-    context: &ContextFiles,
-    workspace: &Arc<crate::paths::WorkspaceBinding>,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    _reasoning_enabled: bool,
-    temperature: Option<f64>,
-    // See `build_agent_inner`: OpenRouter `provider.order` pin for `anthropic/*`.
-    additional_params: Option<serde_json::Value>,
-) -> Agent<M> {
-    let cwd = workspace.root().display().to_string();
-
-    let mut preamble = String::new();
-    preamble.push_str(BTW_SYSTEM_PROMPT);
-
-    // Project context, for reference only — NOT instructions to act on.
-    let has_ctx = context.agents.as_deref().is_some_and(|s| !s.is_empty()) || !cwd.is_empty();
-    if has_ctx {
-        preamble.push_str("\n\n## Project context (for reference)\n");
-    }
-    if let Some(agents) = context.agents.as_deref()
-        && !agents.is_empty()
-    {
-        preamble.push('\n');
-        preamble.push_str(agents);
-    }
-    #[cfg(feature = "archmd")]
-    if let Some(arch) = context.architecture.as_deref()
-        && !arch.is_empty()
-    {
-        preamble.push_str("\n\n");
-        preamble.push_str(arch);
-    }
-    if let Some(p) = context.current_prompt.as_deref()
-        && !p.is_empty()
-    {
-        preamble.push_str("\n\n");
-        preamble.push_str(p);
-    }
-    if !cwd.is_empty() {
-        preamble.push_str("\n\nCurrent working directory: ");
-        preamble.push_str(&cwd);
-    }
-    #[cfg(feature = "memory")]
-    crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
-
-    if let Some(s) = crate::session::storage::load_suffix() {
-        preamble.push_str("\n\n---\n\n");
-        preamble.push_str(&s);
-    }
-
-    let max_tokens = cli.resolve_max_tokens(cfg);
-
-    // Honor --no-tools: fall back to a pure-context, single-turn answer.
-    if cli.resolve_no_tools(cfg) {
-        let mut builder = AgentBuilder::new(model)
-            .preamble(&preamble)
-            .default_max_turns(1)
-            .max_tokens(max_tokens);
-        if let Some(params) = additional_params.clone() {
-            builder = builder.additional_params(params);
-        }
-        if let Some(temp) = temperature {
-            builder = builder.temperature(temp);
-        }
-        return builder.build();
-    }
-
-    // Read-only tools only (read/grep/find_files/list_dir): a side question can
-    // look things up, but has no write/edit/bash, so it still has no side
-    // effects to roll back and never mutates the session. Allow multiple turns
-    // so it can read then answer.
-    let max_text_file_size = cfg.max_text_file_size;
-    let max_read_lines = cfg.resolve_max_read_lines();
-    let max_grep_results = cfg.resolve_max_grep_results();
-    let max_find_results = cfg.resolve_max_find_results();
-    let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
-    let read_tracker = tools::ReadTracker::new(cfg.deny_repeated_reads.unwrap_or(true));
-    let read_tools: Vec<Box<dyn rig::tool::ToolDyn>> = vec![
-        Box::new(
-            tools::ReadTool::new_with_tracker(
-                permission.clone(),
-                ask_tx.clone(),
-                max_text_file_size,
-                max_read_lines,
-                read_tracker,
-            )
-            .with_workspace_binding(workspace.clone()),
-        ),
-        Box::new(
-            tools::GrepTool::new(permission.clone(), ask_tx.clone(), max_grep_results)
-                .with_workspace_binding(workspace.clone()),
-        ),
-        Box::new(
-            tools::FindFilesTool::new(permission.clone(), ask_tx.clone(), max_find_results)
-                .with_workspace_binding(workspace.clone()),
-        ),
-        Box::new(
-            tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
-                .with_workspace_binding(workspace.clone()),
-        ),
-    ];
-    let read_tools = tools::memoize::definitions(read_tools);
-
-    let mut builder = AgentBuilder::new(model)
-        .preamble(&preamble)
-        .default_max_turns(BTW_MAX_TURNS)
-        .max_tokens(max_tokens)
-        .tools(read_tools);
-
-    if let Some(params) = additional_params {
-        builder = builder.additional_params(params);
-    }
-
-    if let Some(temp) = temperature {
-        builder = builder.temperature(temp);
-    }
-
-    builder.build()
 }

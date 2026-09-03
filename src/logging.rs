@@ -108,9 +108,23 @@ pub fn build_stderr_filter(cli: &Cli) -> EnvFilter {
     EnvFilter::new("warn,rig=off")
 }
 
+/// Directive for the `--verbose` / `--log-file` file layer.
+///
+/// The crate's own events carry the crate name as their tracing target
+/// (`mini_agent`, derived from the `mini-agent` package name), so that target
+/// is enabled at `trace` from `CARGO_CRATE_NAME` rather than hard-coded. The
+/// explicit `zerostack::audit::*` targets stay enabled and `rig` stays silent.
+pub fn file_filter_directive() -> String {
+    format!("{}=trace,zerostack=trace,rig=off", env!("CARGO_CRATE_NAME"))
+}
+
+pub fn build_file_filter() -> EnvFilter {
+    EnvFilter::new(file_filter_directive())
+}
+
 pub fn init(cli: &Cli) {
     let stderr_filter = build_stderr_filter(cli);
-    let file_filter = EnvFilter::new("zerostack=trace,rig=off");
+    let file_filter = build_file_filter();
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(io::stderr)

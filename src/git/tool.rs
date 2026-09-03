@@ -1058,4 +1058,122 @@ mod tests {
         assert!(!result.is_empty());
         assert_eq!(result[0], "--no-optional-locks");
     }
+
+    fn isolated_host_config() -> Vec<(String, std::ffi::OsString)> {
+        // Point the host-side `git config` lookup at a global config that does
+        // not exist so the test never observes the developer's real identity.
+        let missing = std::env::temp_dir().join(format!(
+            "mini-agent-git-no-global-config-{}",
+            uuid::Uuid::new_v4()
+        ));
+        vec![("GIT_CONFIG_GLOBAL".to_string(), missing.into_os_string())]
+    }
+
+    #[tokio::test]
+    async fn contained_commit_environment_carries_host_identity_without_home() {
+        use crate::git::runner::{GitRunner, contained_commit_environment};
+
+        let repo = TestRepo::new();
+        let runner = GitRunner::discover().expect("discover Git");
+        let identity = runner
+            .resolve_commit_identity_with(repo.path(), |_| None, &isolated_host_config())
+            .await
+            .expect("repository-local identity resolves on the host");
+        assert_eq!(identity.author_name, "Mini Agent Test");
+        assert_eq!(identity.author_email, "mini-agent@example.invalid");
+        assert_eq!(identity.committer_name, "Mini Agent Test");
+        assert_eq!(identity.committer_email, "mini-agent@example.invalid");
+
+        let env = contained_commit_environment(&identity);
+        let lookup = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            lookup("GIT_AUTHOR_NAME").as_deref(),
+            Some("Mini Agent Test")
+        );
+        assert_eq!(
+            lookup("GIT_AUTHOR_EMAIL").as_deref(),
+            Some("mini-agent@example.invalid")
+        );
+        assert_eq!(
+            lookup("GIT_COMMITTER_NAME").as_deref(),
+            Some("Mini Agent Test")
+        );
+        assert_eq!(
+            lookup("GIT_COMMITTER_EMAIL").as_deref(),
+            Some("mini-agent@example.invalid")
+        );
+        assert_eq!(lookup("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+        for forbidden in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG",
+            "GIT_ASKPASS",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert!(
+                lookup(forbidden).is_none(),
+                "contained commit environment must not carry {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_identity_honours_git_author_and_committer_overrides() {
+        use crate::git::runner::GitRunner;
+
+        let repo = TestRepo::new();
+        let runner = GitRunner::discover().expect("discover Git");
+        let identity = runner
+            .resolve_commit_identity_with(
+                repo.path(),
+                |name| match name {
+                    "GIT_AUTHOR_NAME" => Some("Override Author".into()),
+                    "GIT_COMMITTER_EMAIL" => Some("committer@example.invalid".into()),
+                    _ => None,
+                },
+                &isolated_host_config(),
+            )
+            .await
+            .expect("overrides combine with repository-local identity");
+        assert_eq!(identity.author_name, "Override Author");
+        assert_eq!(identity.author_email, "mini-agent@example.invalid");
+        assert_eq!(identity.committer_name, "Mini Agent Test");
+        assert_eq!(identity.committer_email, "committer@example.invalid");
+    }
+
+    #[tokio::test]
+    async fn commit_without_resolvable_identity_fails_explicitly() {
+        use crate::git::runner::GitRunner;
+
+        let repo = TestRepo::new();
+        repo.git(["config", "--unset", "user.name"]);
+        repo.git(["config", "--unset", "user.email"]);
+        let runner = GitRunner::discover().expect("discover Git");
+
+        let error = runner
+            .resolve_commit_identity_with(repo.path(), |_| None, &isolated_host_config())
+            .await
+            .expect_err("missing identity must be rejected");
+        assert!(
+            error.contains("author identity"),
+            "error must name the missing identity: {error}"
+        );
+        assert!(
+            error.contains("user.name") && error.contains("GIT_AUTHOR_NAME"),
+            "error must explain how to fix it: {error}"
+        );
+
+        // Partial identities (name without email) are rejected too.
+        repo.git(["config", "user.name", "Only Name"]);
+        let error = runner
+            .resolve_commit_identity_with(repo.path(), |_| None, &isolated_host_config())
+            .await
+            .expect_err("name without email must be rejected");
+        assert!(error.contains("author identity"), "{error}");
+    }
 }

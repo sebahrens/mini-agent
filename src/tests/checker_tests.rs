@@ -1975,3 +1975,267 @@ fn windows_raw_permission_regex_deny_preserves_backslash_semantics_for_read_alia
         ));
     }
 }
+
+// --- Rule precedence (mini-agent-wmpq) ---
+
+fn write_rules_checker(rules: &[(&str, Action)], mode: SecurityMode) -> PermissionChecker {
+    let config = PermissionConfig {
+        write: Some(ToolPerm::Granular(
+            rules
+                .iter()
+                .map(|(pattern, action)| (pattern.to_string(), *action))
+                .collect(),
+        )),
+        ..PermissionConfig::default()
+    };
+    PermissionChecker::new(
+        &configs_from(config),
+        mode,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .expect("valid permission test configuration")
+}
+
+#[test]
+fn granular_precedence_is_deterministic_across_rule_orderings_and_rebuilds() {
+    // The CONFIG.md example: a specific allow next to a catch-all ask. The
+    // outcome must not depend on HashMap iteration order.
+    let forward = [("**/*.rs", Action::Allow), ("**", Action::Ask)];
+    let reverse = [("**", Action::Ask), ("**/*.rs", Action::Allow)];
+    for _ in 0..64 {
+        for rules in [&forward[..], &reverse[..]] {
+            let mut checker = write_rules_checker(rules, SecurityMode::Standard);
+            assert_eq!(
+                checker.check_path("write", "src/main.rs"),
+                CheckResult::Allowed,
+                "most specific pattern must win regardless of ordering"
+            );
+            assert_eq!(
+                checker.check_path("write", "README.md"),
+                CheckResult::Ask,
+                "catch-all ask must still apply to non-matching inputs"
+            );
+        }
+    }
+}
+
+#[test]
+fn granular_precedence_ask_beats_allow_on_equal_specificity() {
+    // Both patterns have the same number of literal characters.
+    let rules = [("src/a*.rs", Action::Allow), ("src/*a.rs", Action::Ask)];
+    for _ in 0..16 {
+        let mut checker = write_rules_checker(&rules, SecurityMode::Standard);
+        assert_eq!(checker.check_path("write", "src/a.rs"), CheckResult::Ask);
+    }
+}
+
+#[test]
+fn granular_precedence_deny_beats_more_specific_allow() {
+    let rules = [("src/**", Action::Deny), ("src/main.rs", Action::Allow)];
+    for mode in [SecurityMode::Standard, SecurityMode::Yolo] {
+        let mut checker = write_rules_checker(&rules, mode);
+        assert!(matches!(
+            checker.check_path("write", "src/main.rs"),
+            CheckResult::Denied(_)
+        ));
+    }
+}
+
+#[test]
+fn granular_precedence_specific_allow_beats_broad_ask_for_bash_ask_rules() {
+    // Non-path tools use the same specificity resolution.
+    let config = PermissionConfig {
+        mcp_tool: Some(ToolPerm::Granular(
+            [
+                ("mcp_tool:exa:*".to_string(), Action::Ask),
+                ("mcp_tool:exa:search".to_string(), Action::Allow),
+            ]
+            .into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    for _ in 0..16 {
+        let mut checker = PermissionChecker::new(
+            &configs_from(config.clone()),
+            SecurityMode::Guarded,
+            Some(test_workspace()),
+            default_modes(),
+        )
+        .expect("valid permission test configuration");
+        assert_eq!(
+            checker.check("mcp_tool", "mcp_tool:exa:search"),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check("mcp_tool", "mcp_tool:exa:crawl"),
+            CheckResult::Ask
+        );
+    }
+}
+
+// --- Relative deny patterns vs absolute paths (mini-agent-xhkz) ---
+
+#[test]
+fn relative_deny_pattern_matches_absolute_workspace_path() {
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Granular(
+            [("secrets/**".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    for mode in [
+        SecurityMode::Standard,
+        SecurityMode::Yolo,
+        SecurityMode::Guarded,
+    ] {
+        let mut checker = PermissionChecker::new(
+            &configs_from(config.clone()),
+            mode,
+            Some(test_workspace()),
+            default_modes(),
+        )
+        .expect("valid permission test configuration");
+        assert!(
+            matches!(
+                checker.check_path("read", "secrets/key.txt"),
+                CheckResult::Denied(_)
+            ),
+            "relative spelling must be denied in {mode}"
+        );
+        assert!(
+            matches!(
+                checker.check_path("read", &workspace_path("secrets/key.txt")),
+                CheckResult::Denied(_)
+            ),
+            "absolute spelling must be denied in {mode}"
+        );
+        assert!(
+            matches!(
+                checker.check_path("read", &workspace_path("secrets/nested/deeper.txt")),
+                CheckResult::Denied(_)
+            ),
+            "nested absolute spelling must be denied in {mode}"
+        );
+    }
+}
+
+#[test]
+fn relative_allow_pattern_matches_absolute_workspace_path() {
+    let config = PermissionConfig {
+        write: Some(ToolPerm::Granular(
+            [
+                ("docs/**".to_string(), Action::Allow),
+                ("**".to_string(), Action::Ask),
+            ]
+            .into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Guarded,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+    assert_eq!(
+        checker.check_path("write", &workspace_path("docs/guide.md")),
+        CheckResult::Allowed
+    );
+    assert_eq!(
+        checker.check_path("write", &workspace_path("src/lib.rs")),
+        CheckResult::Ask
+    );
+}
+
+// --- Multi-line bash scripts vs deny rules (mini-agent-sucq) ---
+
+#[test]
+fn multiline_bash_script_cannot_bypass_default_deny_rules() {
+    for payload in ["rm -rf /\n", "echo hi\nrm -rf /", "echo hi\r\nrm -rf /\n"] {
+        for mode in [SecurityMode::Yolo, SecurityMode::Standard] {
+            let mut checker = make_checker(mode);
+            let result = checker.check("bash", payload);
+            assert!(
+                matches!(result, CheckResult::Denied(_)),
+                "expected Denied for {payload:?} in {mode}, got {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn multiline_bash_script_cannot_bypass_configured_deny_rules() {
+    let config = PermissionConfig {
+        bash: Some(ToolPerm::Granular(
+            [("git push **".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    for payload in ["git push --force\n", "ls\ngit push origin main"] {
+        for mode in [SecurityMode::Yolo, SecurityMode::Standard] {
+            let mut checker = PermissionChecker::new(
+                &configs_from(config.clone()),
+                mode,
+                Some(test_workspace()),
+                default_modes(),
+            )
+            .expect("valid permission test configuration");
+            let result = checker.check("bash", payload);
+            assert!(
+                matches!(result, CheckResult::Denied(_)),
+                "expected Denied for {payload:?} in {mode}, got {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn newline_in_path_cannot_bypass_glob_deny() {
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Granular(
+            [("**/.env*".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Yolo,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+    assert!(matches!(
+        checker.check_path("read", "config/.env\n"),
+        CheckResult::Denied(_)
+    ));
+}
+
+// --- Prompt directives never raise the mode (mini-agent-sxsm) ---
+
+#[test]
+fn set_prompt_mode_never_raises_above_user_mode() {
+    let mut checker = make_checker(SecurityMode::Guarded);
+    assert!(!checker.set_prompt_mode(SecurityMode::Yolo));
+    assert_eq!(checker.mode(), SecurityMode::Guarded);
+    assert!(!checker.set_prompt_mode(SecurityMode::Standard));
+    assert_eq!(checker.mode(), SecurityMode::Guarded);
+
+    assert!(checker.set_prompt_mode(SecurityMode::ReadOnly));
+    assert_eq!(checker.mode(), SecurityMode::ReadOnly);
+    // A later directive still cannot climb past the user's mode, even from a
+    // lowered prompt mode.
+    assert!(!checker.set_prompt_mode(SecurityMode::Yolo));
+    assert_eq!(checker.mode(), SecurityMode::ReadOnly);
+    assert!(checker.set_prompt_mode(SecurityMode::Guarded));
+    assert_eq!(checker.mode(), SecurityMode::Guarded);
+
+    checker.restore_user_mode();
+    assert_eq!(checker.mode(), SecurityMode::Guarded);
+
+    // /mode is the user's explicit choice and re-baselines the ceiling.
+    checker.set_mode(SecurityMode::Yolo);
+    assert!(checker.set_prompt_mode(SecurityMode::Standard));
+    assert_eq!(checker.mode(), SecurityMode::Standard);
+}

@@ -23,6 +23,7 @@ const OPEN_READ_WRITE: i32 = 2;
 const AT_REMOVE_DIRECTORY: i32 = 0x80;
 const LOCK_EXCLUSIVE: c_int = 2;
 const LOCK_NONBLOCKING: c_int = 4;
+const LOCK_UNLOCK: c_int = 8;
 const INTERRUPTED_ERRNO: c_int = 4;
 const WOULD_BLOCK_ERRNO: c_int = 35;
 const FILE_DESCRIPTOR_CLOEXEC: i32 = 1;
@@ -98,6 +99,23 @@ type FileIdentity = crate::fs::MacOsFileIdentity;
 struct HeldLock {
     file: std::fs::File,
     identity: FileIdentity,
+}
+
+impl Drop for HeldLock {
+    /// `flock` locks belong to the open file description, not to this descriptor. Closing the
+    /// file therefore releases the lock only once every descriptor sharing that description is
+    /// gone, and any concurrently `fork()`ed child (every subprocess spawn between fork and
+    /// exec) transiently holds such a duplicate. An explicit `LOCK_UN` releases the lock
+    /// regardless of those duplicates. Errors are ignored: the descriptor closes right after.
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            #[link_name = "flock"]
+            fn stale_sweep_unlock(descriptor: c_int, operation: c_int) -> c_int;
+        }
+        // SAFETY: `file` owns a live descriptor and `LOCK_UN` never blocks.
+        let _ = unsafe { stale_sweep_unlock(self.file.as_raw_fd(), LOCK_UNLOCK) };
+    }
 }
 
 #[derive(Debug)]

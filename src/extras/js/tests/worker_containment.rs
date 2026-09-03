@@ -485,7 +485,7 @@ fn linux_descendant_cleanup_probe_child() {
         return;
     }
     let executable = "/mini-agent-worker/mini-agent";
-    let _descendant = std::process::Command::new(executable)
+    let mut descendant = std::process::Command::new(executable)
         .env_clear()
         .env(
             crate::sandbox::worker::INTERNAL_WORKER_MARKER,
@@ -502,6 +502,10 @@ fn linux_descendant_cleanup_probe_child() {
         .spawn()
         .expect("contained cleanup probe must create its controlled descendant");
     std::thread::park_timeout(std::time::Duration::from_secs(30));
+    // The parent test normally kills this probe before the timeout elapses; if
+    // it does not, reap the sleeper ourselves so it is never left as a zombie.
+    let _ = descendant.kill();
+    let _ = descendant.wait();
 }
 
 #[cfg(target_os = "linux")]
