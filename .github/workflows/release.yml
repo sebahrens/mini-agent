@@ -20,6 +20,9 @@ concurrency:
 jobs:
   package-metadata:
     runs-on: ubuntu-latest
+    outputs:
+      # The single source of the VSIX and SBOM version for every later job.
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -36,6 +39,21 @@ jobs:
           python3 scripts/check-package-metadata.py \
             --ref-type "$RELEASE_REF_TYPE" \
             --release-tag "$RELEASE_TAG"
+
+      - name: Read the release version from Cargo.toml
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if [ -z "$version" ]; then
+            echo "ERROR: Cargo.toml has no package version" >&2
+            exit 1
+          fi
+          extension_version=$(sed -n 's/^  "version": "\([^"]*\)",$/\1/p' editors/vscode/package.json | head -1)
+          if [ "$extension_version" != "$version" ]; then
+            echo "ERROR: editors/vscode/package.json version $extension_version != Cargo $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.target }}
@@ -64,7 +82,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package and smoke binary
         run: |
@@ -79,7 +97,7 @@ jobs:
           rm -rf "$smoke_dir"
 
       - name: Build lite
-        run: cargo build --release --no-default-features --target ${{ matrix.target }}
+        run: cargo build --locked --release --no-default-features --target ${{ matrix.target }}
 
       - name: Package and smoke lite binary
         run: |
@@ -129,7 +147,7 @@ jobs:
           tool: cross@0.2.5
 
       - name: Build static binary (${{ matrix.target }})
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Package and validate
         run: |
@@ -153,7 +171,7 @@ jobs:
           rm -rf "$smoke_dir"
 
       - name: Build static lite binary (${{ matrix.target }})
-        run: cross build --release --no-default-features --target ${{ matrix.target }}
+        run: cross build --locked --release --no-default-features --target ${{ matrix.target }}
 
       - name: Package and validate lite
         run: |
@@ -209,7 +227,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package and smoke binary
         run: |
@@ -224,7 +242,7 @@ jobs:
           rm -rf "$smoke_dir"
 
       - name: Build lite
-        run: cargo build --release --no-default-features --target ${{ matrix.target }}
+        run: cargo build --locked --release --no-default-features --target ${{ matrix.target }}
 
       - name: Package and smoke lite binary
         run: |
@@ -330,8 +348,10 @@ jobs:
 
   vscode-vsix:
     name: VSIX ${{ matrix.vscode-target }}
-    needs: [build, build-windows]
+    needs: [package-metadata, build, build-windows]
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}
     defaults:
       run:
         shell: bash
@@ -397,7 +417,7 @@ jobs:
           node scripts/package-target.mjs "$VSCODE_TARGET"
           npm run sbom
           mv dist/mini-agent-vscode.cdx.json \
-            "dist/mini-agent-1.8.0-$VSCODE_TARGET.cdx.json"
+            "dist/mini-agent-$RELEASE_VERSION-$VSCODE_TARGET.cdx.json"
 
       - name: Install candidate into clean VS Code
         working-directory: editors/vscode
@@ -405,7 +425,7 @@ jobs:
           VSCODE_TARGET: ${{ matrix.vscode-target }}
         run: |
           node scripts/run-integration-tests.mjs \
-            "dist/mini-agent-1.8.0-$VSCODE_TARGET.vsix" \
+            "dist/mini-agent-$RELEASE_VERSION-$VSCODE_TARGET.vsix" \
             "$VSCODE_TARGET"
 
       - name: Upload native candidate
@@ -413,15 +433,17 @@ jobs:
         with:
           name: vsix-${{ matrix.vscode-target }}
           path: |
-            editors/vscode/dist/mini-agent-1.8.0-${{ matrix.vscode-target }}.vsix
-            editors/vscode/dist/mini-agent-1.8.0-${{ matrix.vscode-target }}.cdx.json
+            editors/vscode/dist/mini-agent-${{ env.RELEASE_VERSION }}-${{ matrix.vscode-target }}.vsix
+            editors/vscode/dist/mini-agent-${{ env.RELEASE_VERSION }}-${{ matrix.vscode-target }}.cdx.json
           if-no-files-found: error
           retention-days: 1
 
   vscode-candidates:
     name: Assemble VSIX candidates
-    needs: vscode-vsix
+    needs: [package-metadata, vscode-vsix]
     runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}
     steps:
       - name: Download native candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -432,8 +454,8 @@ jobs:
       - name: Verify candidate set and checksums
         run: |
           for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            test -f "mini-agent-1.8.0-$target.vsix"
-            test -f "mini-agent-1.8.0-$target.cdx.json"
+            test -f "mini-agent-$RELEASE_VERSION-$target.vsix"
+            test -f "mini-agent-$RELEASE_VERSION-$target.cdx.json"
           done
           test "$(find . -maxdepth 1 -name '*.vsix' | wc -l)" -eq 5
           sha256sum *.vsix *.cdx.json | sort > VSIX_SHA256SUMS
@@ -535,8 +557,10 @@ jobs:
 
   publish-release:
     name: Publish GitHub release
-    needs: [build, build-static, build-windows, corresponding-source, checksums, vscode-candidates, windows-msi]
+    needs: [package-metadata, build, build-static, build-windows, corresponding-source, checksums, vscode-candidates, windows-msi]
     runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -588,16 +612,16 @@ jobs:
             VSIX_SHA256SUMS
             MSI_SHA256SUMS
             mini-agent-windows-x64.msi
-            mini-agent-1.8.0-linux-x64.vsix
-            mini-agent-1.8.0-linux-arm64.vsix
-            mini-agent-1.8.0-darwin-x64.vsix
-            mini-agent-1.8.0-darwin-arm64.vsix
-            mini-agent-1.8.0-win32-x64.vsix
-            mini-agent-1.8.0-linux-x64.cdx.json
-            mini-agent-1.8.0-linux-arm64.cdx.json
-            mini-agent-1.8.0-darwin-x64.cdx.json
-            mini-agent-1.8.0-darwin-arm64.cdx.json
-            mini-agent-1.8.0-win32-x64.cdx.json
+            mini-agent-${RELEASE_VERSION}-linux-x64.vsix
+            mini-agent-${RELEASE_VERSION}-linux-arm64.vsix
+            mini-agent-${RELEASE_VERSION}-darwin-x64.vsix
+            mini-agent-${RELEASE_VERSION}-darwin-arm64.vsix
+            mini-agent-${RELEASE_VERSION}-win32-x64.vsix
+            mini-agent-${RELEASE_VERSION}-linux-x64.cdx.json
+            mini-agent-${RELEASE_VERSION}-linux-arm64.cdx.json
+            mini-agent-${RELEASE_VERSION}-darwin-x64.cdx.json
+            mini-agent-${RELEASE_VERSION}-darwin-arm64.cdx.json
+            mini-agent-${RELEASE_VERSION}-win32-x64.cdx.json
           )
           for f in "${expected[@]}"; do
             [ -f "$f" ] || { echo "ERROR: Missing expected file: $f"; exit 1; }

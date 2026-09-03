@@ -157,6 +157,9 @@ jobs:
           - "--no-default-features --features memory"
           - "--no-default-features --features sandbox"
           - "--no-default-features --features acp"
+          # Opt-in extras that neither the default set nor any focused row
+          # compiles. Kept as one row so they get at least one strict lint pass.
+          - "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ubuntu-latest
@@ -193,6 +196,9 @@ jobs:
           - "--no-default-features --features js,sandbox"
           - "--no-default-features --features mcp"
           - "--no-default-features --features acp"
+          # Opt-in extras that neither the default set nor any focused row
+          # compiles: hooks, advisor, LSP, multimodal, and PDF ingestion.
+          - "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
         exclude:

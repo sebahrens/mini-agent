@@ -5,7 +5,8 @@ on:
     branches:
       - main
     paths:
-      - 'docs/**'
+      - 'docs/agent/**'
+      - '.github/workflows/pages.yml'
 
 permissions:
   contents: read
@@ -26,25 +27,42 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pandoc
 
       - name: Convert markdown to HTML
+        # The published site is the agent documentation tree under docs/agent
+        # (plus docs/agent/providers). Specs, plans, and benchmarks stay
+        # repository-only.
         run: |
-          cd docs
+          set -euo pipefail
+          cd docs/agent
+          test -f template.html
           # Internal .md links must point at the built .html pages.
-          sed -i -e 's/\.md#/.html#/g' -e 's/\.md)/.html)/g' *.md providers/*.md
+          sed -i -e 's/\.md#/.html#/g' -e 's/\.md)/.html)/g' -- *.md providers/*.md
+          {
+            echo '# mini-agent documentation'
+            echo
+            for md in *.md providers/*.md; do
+              name="${md%.md}"
+              title="$(grep -m1 '^# ' "$md" | sed 's/^# //')"
+              [ -n "$title" ] || title="$name"
+              echo "- [${title}](${name}.html)"
+            done
+          } > index.md
           for md in *.md providers/*.md; do
             name="${md%.md}"
             title="$(grep -m1 '^# ' "$md" | sed 's/^# //')"
+            [ -n "$title" ] || title="$name"
             pandoc "$md" \
               --template=template.html \
               --wrap=none \
               --metadata title="$title" \
-              --metadata pagetitle="$title — zerostack" \
-              --metadata name="$(basename "$name")" \
+              --metadata pagetitle="$title — mini-agent" \
+              --metadata name="$name" \
               -o "${name}.html"
           done
 
-      - name: Generate sitemap.xml
+      - name: Generate sitemap.xml and robots.txt
         run: |
-          cd docs
+          set -euo pipefail
+          cd docs/agent
           base="https://sebahrens.github.io/mini-agent"
           today="$(date +%F)"
           {
@@ -58,6 +76,7 @@ jobs:
             done
             echo '</urlset>'
           } > sitemap.xml
+          printf 'User-agent: *\nAllow: /\n\nSitemap: %s/sitemap.xml\n' "$base" > robots.txt
 
       - name: Setup Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
@@ -65,7 +84,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: docs
+          path: docs/agent
 
       - name: Deploy to GitHub Pages
         id: deployment
