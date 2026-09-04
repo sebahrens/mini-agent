@@ -1483,8 +1483,25 @@ mod feasibility {
         executable: &Path,
         appcontainer_sid: PSID,
         policy: &SidPolicy,
-        _mutation: &crate::sandbox::windows::AclMutationGuard,
+        mutation: &crate::sandbox::windows::AclMutationGuard,
     ) -> Result<(PathBuf, InstallLocation, WinHandle), GateError> {
+        prepare_executable_acl_locked_observed(
+            executable,
+            appcontainer_sid,
+            policy,
+            mutation,
+            |_| {},
+        )
+    }
+
+    fn prepare_executable_acl_locked_observed(
+        executable: &Path,
+        appcontainer_sid: PSID,
+        policy: &SidPolicy,
+        _mutation: &crate::sandbox::windows::AclMutationGuard,
+        mut observe: impl FnMut(RuntimePreflightFailureStage),
+    ) -> Result<(PathBuf, InstallLocation, WinHandle), GateError> {
+        observe(RuntimePreflightFailureStage::AclPath);
         reject_unc_or_remote_syntax(executable)?;
         reject_reparse_components(executable)?;
         let executable = std::fs::canonicalize(executable)
@@ -1507,10 +1524,13 @@ mod feasibility {
         }
 
         reject_unc_or_remote_syntax(&executable)?;
+        observe(RuntimePreflightFailureStage::AclAncestors);
         validate_path_ancestors(&executable, location, policy)?;
 
+        observe(RuntimePreflightFailureStage::AclSecurityRead);
         let security = read_file_security(&executable)?;
         let protected_machine_wide = location == InstallLocation::ProtectedMachineWide;
+        observe(RuntimePreflightFailureStage::AclOwner);
         if !protected_machine_wide && !sid_equal(security.owner, policy.user.as_psid()) {
             return Err(GateError(
                 "current user does not own the executable; ACL mutation refused".to_string(),
@@ -1519,6 +1539,7 @@ mod feasibility {
         // Ordinary per-user installs may inherit host Users read/execute. That
         // is compatible with confinement: broad mutation remains forbidden and
         // the package still receives one exact read/execute ACE.
+        observe(RuntimePreflightFailureStage::AclInspection);
         inspect_acl(security.dacl, policy, appcontainer_sid, false, false)?;
 
         let trustee = trustee_for_sid(appcontainer_sid);
@@ -1547,6 +1568,7 @@ mod feasibility {
             ));
         }
         if !protected_machine_wide && effective & required != required {
+            observe(RuntimePreflightFailureStage::AclCommit);
             let entry = EXPLICIT_ACCESS_W {
                 grfAccessPermissions: required,
                 grfAccessMode: GRANT_ACCESS,
@@ -1588,6 +1610,7 @@ mod feasibility {
 
         // Re-read after mutation: never trust a constructed ACL without
         // checking the state the filesystem actually committed.
+        observe(RuntimePreflightFailureStage::AclCommittedVerification);
         let committed = read_file_security(&executable)?;
         inspect_acl(
             committed.dacl,
@@ -1615,6 +1638,7 @@ mod feasibility {
             ));
         }
 
+        observe(RuntimePreflightFailureStage::AclImageLock);
         let image_lock = lock_executable_image(&executable)?;
         Ok((executable, location, image_lock))
     }
@@ -2998,8 +3022,13 @@ mod feasibility {
         let acl_mutation = crate::sandbox::windows::AclMutationGuard::acquire_until(deadline)
             .map_err(|error| GateError(format!("serialize worker executable ACL: {error}")))?;
         observe(RuntimePreflightFailureStage::LaunchAcl);
-        let (executable, _location, image_lock) =
-            prepare_executable_acl_locked(&executable, profile.sid, &policy, &acl_mutation)?;
+        let (executable, _location, image_lock) = prepare_executable_acl_locked_observed(
+            &executable,
+            profile.sid,
+            &policy,
+            &acl_mutation,
+            &mut observe,
+        )?;
         observe(RuntimePreflightFailureStage::LaunchSynchronization);
         let inheritance_guard = crate::process_creation::creation_guard()?;
         hooks.require_before_deadline()?;
@@ -3625,6 +3654,14 @@ mod feasibility {
         LaunchHandles = 91,
         LaunchVerification = 92,
         LaunchSynchronization = 93,
+        AclPath = 100,
+        AclAncestors = 101,
+        AclSecurityRead = 102,
+        AclOwner = 103,
+        AclInspection = 104,
+        AclCommit = 105,
+        AclCommittedVerification = 106,
+        AclImageLock = 107,
     }
 
     #[derive(Debug)]

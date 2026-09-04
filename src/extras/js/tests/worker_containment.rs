@@ -264,6 +264,7 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5)",
         "RuntimePreflightFailureStage",
         "launch_production_observed",
+        "prepare_executable_acl_locked_observed",
         "Err(failure) => std::process::ExitCode::from(failure.stage as u8)",
         "--mini-agent-windows-worker-preflight-v1",
         "run_supervised_preflight_helper",
