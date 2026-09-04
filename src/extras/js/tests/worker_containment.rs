@@ -261,6 +261,7 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "ProcessChildProcessPolicy",
         "PROCESS_MITIGATION_CHILD_PROCESS_POLICY",
         "run_runtime_preflight_owned",
+        "PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20)",
         "RuntimePreflightFailureStage",
         "classify_runtime_preflight_launch_failure",
         "Err(failure) => std::process::ExitCode::from(failure.stage as u8)",

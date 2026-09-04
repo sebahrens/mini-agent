@@ -562,7 +562,7 @@ mod feasibility {
     const PROBE_NETWORK_POLICY_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY";
     const PROBE_NETWORK_POLICY_VALUE: &str = "zero-capability-no-loopback-v1";
     const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
-    const PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+    const PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
     const PRODUCTION_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
     const PRODUCTION_PREFLIGHT_HELPER_ARG: &str = "--mini-agent-windows-worker-preflight-v1";
     const PRODUCTION_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -3612,7 +3612,9 @@ mod feasibility {
         error: &GateError,
     ) -> RuntimePreflightFailureStage {
         let message = error.0.as_str();
-        if message.contains("profile") || message.contains("loopback exemption") {
+        if message.contains("exceeded its caller deadline") {
+            RuntimePreflightFailureStage::Deadline
+        } else if message.contains("profile") || message.contains("loopback exemption") {
             RuntimePreflightFailureStage::LaunchProfile
         } else if message.contains("location") || message.contains("classified root") {
             RuntimePreflightFailureStage::LaunchLocation
