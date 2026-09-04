@@ -678,15 +678,30 @@ impl LspManager {
         server: &str,
         diagnostics: Vec<lsp_types::Diagnostic>,
     ) {
+        assert!(
+            self.try_inject_diagnostics(uri, server, diagnostics),
+            "test diagnostic injection exceeded the bounded cache",
+        );
+    }
+
+    /// Test hook for cases that intentionally exercise bounded-cache rejection.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn try_inject_diagnostics(
+        &self,
+        uri: &str,
+        server: &str,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) -> bool {
         let identity =
             client::file_path(uri).and_then(|path| crate::fs::checked_path_metadata(&path).ok());
-        let _ = client::commit_diagnostics(
+        client::commit_diagnostics(
             &self.inner.diags,
             uri.to_string(),
             server,
             diagnostics,
             identity,
-        );
+        )
     }
 }
 

@@ -394,7 +394,7 @@ impl Session {
         );
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn add_tool_call(&mut self, name: &str, args: &serde_json::Value) {
         self.add_tool_call_with_id("", name, args);
     }
@@ -447,7 +447,7 @@ impl Session {
         );
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn add_tool_result(&mut self, name: &str, output: &str) -> String {
         self.add_tool_result_with_artifact(name, output).0
     }
@@ -455,6 +455,7 @@ impl Session {
     /// Add a tool result and return the separately persisted artifact, when
     /// the long-output path was used. The interactive UI records that path in
     /// its pending-turn transaction so a later failure can remove it.
+    #[cfg(test)]
     pub(crate) fn add_tool_result_with_artifact(
         &mut self,
         name: &str,

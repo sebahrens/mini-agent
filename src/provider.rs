@@ -235,7 +235,6 @@ pub(crate) fn merge_extra_body(
 }
 
 impl AnyClient {
-    #[allow(dead_code)]
     pub fn provider_name(&self) -> &'static str {
         match self {
             AnyClient::OpenRouter(_) => "openrouter",
@@ -861,6 +860,7 @@ fn summarizer_preamble() -> String {
     preamble
 }
 
+#[cfg(test)]
 pub(crate) fn serialize_conversation(messages: &[SessionMessage]) -> String {
     messages.iter().map(serialize_message).collect()
 }

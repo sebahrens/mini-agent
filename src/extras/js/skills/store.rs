@@ -468,10 +468,6 @@ impl SkillStore {
                 StoreError::Sqlite(e)
             }
         })?;
-
-        // Insert empty embedding records initially; they will be filled by the embed module.
-        // For now just mark the insertion complete.
-
         tx.commit()?;
         Ok(())
     }

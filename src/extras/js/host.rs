@@ -1336,7 +1336,6 @@ impl FetchRequest {
         }
     }
 
-    #[allow(dead_code)] // Protocol integration starts using this in A15.
     pub(crate) fn try_new(
         method: &str,
         headers: &[(String, String)],

@@ -263,7 +263,7 @@ pub(crate) enum ParentFrame {
 pub(crate) enum WorkerFrame {
     Ready(WorkerReady),
     ContainmentAttested(ContainmentAttestation),
-    EffectRequest(EffectRequest),
+    EffectRequest(Box<EffectRequest>),
     #[cfg(feature = "skills")]
     SkillCallRequest(SkillCallRequest),
     StepResult(StepResult),

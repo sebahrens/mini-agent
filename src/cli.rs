@@ -387,13 +387,6 @@ pub struct Cli {
     )]
     pub wt_base_dir: Option<String>,
 
-    #[cfg(feature = "git-worktree")]
-    #[arg(
-        long = "wt-force",
-        help = "Deprecated compatibility flag; cleanup always preserves dirty worktrees"
-    )]
-    pub wt_force: bool,
-
     #[cfg(feature = "advisor")]
     #[arg(
         long = "advisor",
@@ -667,11 +660,6 @@ impl Cli {
             .clone()
             .or_else(|| cfg.wt_base_dir.clone())
             .map(std::path::PathBuf::from)
-    }
-
-    #[cfg(feature = "git-worktree")]
-    pub fn resolve_wt_force(&self, cfg: &config::Config) -> bool {
-        self.wt_force || cfg.wt_force.unwrap_or(false)
     }
 
     #[cfg(feature = "advisor")]

@@ -1584,7 +1584,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     armed: true,
                 };
                 let effect_ordinal = request.effect_ordinal;
-                let mut effect = handler.handle_effect(request, effect_cancellation);
+                let mut effect = handler.handle_effect(*request, effect_cancellation);
                 enum EffectWait {
                     Completed(EffectResult),
                     Cancelled,

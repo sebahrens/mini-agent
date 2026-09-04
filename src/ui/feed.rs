@@ -146,9 +146,6 @@ struct LayoutCache {
     lines: Arc<Vec<LineEntry>>,
 }
 
-// Several helpers exist primarily for unit testing layout/scroll math without
-// a terminal; allow them even when not yet wired into the production path.
-#[allow(dead_code)]
 impl Feed {
     pub fn new() -> Self {
         Self {
@@ -172,6 +169,7 @@ impl Feed {
         self.blocks.clear();
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
@@ -200,7 +198,7 @@ impl Feed {
     /// Mark the last block as complete: its full text (including the former
     /// tail line) is parsed as markdown on the next layout. No-op when the
     /// last block is not running.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn finalize_last(&mut self) {
         if let Some(idx) = self.blocks.len().checked_sub(1) {
             self.finalize_block(idx);
@@ -228,6 +226,7 @@ impl Feed {
     }
 
     /// Text of the block at `idx`, if it exists.
+    #[cfg(test)]
     pub fn block_text(&self, idx: usize) -> Option<&str> {
         self.blocks.get(idx).map(|block| block.text.as_str())
     }
@@ -238,7 +237,7 @@ impl Feed {
 
     /// Append text to the most recent block. Returns `false` when the feed is
     /// empty and there is no block to append to.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn append_to_last(&mut self, text: impl AsRef<str>) -> bool {
         match self.blocks.len().checked_sub(1) {
             Some(idx) => self.append_to(idx, text),
@@ -260,6 +259,7 @@ impl Feed {
     }
 
     /// Replace the last block, or push a new one if the feed is empty.
+    #[cfg(test)]
     pub fn replace_last(&mut self, style: BlockStyle, text: impl Into<String>) {
         self.generation += 1;
         if let Some(last) = self.blocks.last_mut() {
@@ -272,7 +272,7 @@ impl Feed {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn truncate_blocks(&mut self, len: usize) {
         self.generation += 1;
         self.blocks.truncate(len);
@@ -355,6 +355,7 @@ impl Feed {
     }
 
     /// Total number of visible rows for the given width.
+    #[cfg(test)]
     pub fn line_count(&self, width: usize) -> usize {
         self.lines(width).len()
     }
@@ -363,6 +364,7 @@ impl Feed {
     /// in a viewport of `viewport_height` rows with `scroll_offset`.
     ///
     /// `scroll_offset == 0` means "stick to the bottom" (auto-scroll).
+    #[cfg(test)]
     pub fn visible_range(
         &self,
         width: usize,
@@ -387,6 +389,7 @@ impl Feed {
     ///
     /// Returns `None` when the row is padding above bottom-aligned content or
     /// falls past the last visible line.
+    #[cfg(test)]
     pub fn line_at_visual_row(
         &self,
         width: usize,
@@ -431,6 +434,7 @@ impl Feed {
     }
 
     /// Concatenate the text of all visible lines in the given range.
+    #[cfg(test)]
     pub fn selected_text(&self, width: usize, start: usize, end: usize) -> Option<String> {
         let lines = self.lines(width);
         let (lo, hi) = if start <= end {

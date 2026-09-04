@@ -1377,7 +1377,7 @@ impl<R: std::io::Read, W: Write> WorkerTransport<R, W> {
             build.clone(),
             invocation_id.clone(),
             *sequence.lock().map_err(|_| ())?,
-            WorkerFrame::EffectRequest(request.clone()),
+            WorkerFrame::EffectRequest(Box::new(request.clone())),
         );
         self.protocol.on_send(&frame).map_err(|_| ())?;
         write_terminal(&mut self.output, &frame)?;

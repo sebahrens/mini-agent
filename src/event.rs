@@ -108,20 +108,15 @@ pub enum UserEvent {
     Paste(String),
     #[cfg(feature = "loop")]
     LoopValidationDone(LoopValidationEvent),
-    #[allow(dead_code)]
     MouseDown {
         row: u16,
         col: u16,
     },
-    #[allow(dead_code)]
     MouseDrag {
         row: u16,
-        col: u16,
     },
-    #[allow(dead_code)]
     MouseUp {
         row: u16,
-        col: u16,
     },
     /// An interactive MCP OAuth login finished in a background task. `error` is
     /// `None` on success. Handled by the TUI loop to reconnect the server.

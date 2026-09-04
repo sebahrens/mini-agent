@@ -651,14 +651,14 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            UserEvent::MouseDrag { row, col: _ } => {
+            UserEvent::MouseDrag { row } => {
                 if self.renderer.selection_active
                     && let Some(idx) = self.renderer.buffer_line_at_row(row)
                 {
                     self.renderer.selection_end = Some(idx);
                 }
             }
-            UserEvent::MouseUp { row, col: _ } => {
+            UserEvent::MouseUp { row } => {
                 if self.renderer.selection_active {
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
                         self.renderer.selection_end = Some(idx);
@@ -2509,12 +2509,6 @@ impl<'a> App<'a> {
                     self.ui.cli.resolve_no_context_files(self.ui.cfg),
                 )?;
                 self.retire_workspace_owners_before_cleanup().await?;
-                if self.ui.cli.resolve_wt_force(self.ui.cfg) {
-                    let _ = self.renderer.write_line(
-                        "--wt-force is deprecated; cleanup still preserves dirty worktrees",
-                        C_AGENT,
-                    );
-                }
                 let merge_result = crate::extras::git_worktree::complete_merge(&mut state).await;
                 if refresh_ui {
                     self.refresh_worktree_workspace_context().await?;

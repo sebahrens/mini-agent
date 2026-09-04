@@ -865,11 +865,8 @@ mod tests {
         );
         assert!(app.contains("rebind_worktree_workspace"));
         let cli = include_str!("../cli.rs");
-        assert!(
-            cli.contains("Deprecated compatibility flag; cleanup always preserves dirty worktrees")
-        );
-        assert!(!cli.contains("Force worktree remove and branch delete even if dirty"));
-        assert!(app.contains("--wt-force is deprecated; cleanup still preserves dirty worktrees"));
+        assert!(!cli.contains("wt-force"));
+        assert!(!app.contains("wt-force"));
         assert!(ui_module.contains("context.reload_from_binding(no_context_files, &replacement)"));
     }
 
@@ -971,7 +968,6 @@ mod tests {
         assert!(!cli.wt_auto_merge);
         assert!(!cli.parallel);
         assert!(cli.wt_base_dir.is_none());
-        assert!(!cli.wt_force);
     }
 
     #[test]
@@ -979,13 +975,11 @@ mod tests {
         let cli = Cli {
             worktree: Some("feature-x".into()),
             wt_auto_merge: true,
-            wt_force: true,
             wt_base_dir: Some("/tmp".into()),
             ..Default::default()
         };
         assert_eq!(cli.worktree.as_deref(), Some("feature-x"));
         assert!(cli.wt_auto_merge);
-        assert!(cli.wt_force);
         assert_eq!(cli.wt_base_dir.as_deref(), Some("/tmp"));
     }
 
@@ -1024,33 +1018,6 @@ mod tests {
         let cli = Cli::default();
         let cfg = Config::default();
         assert!(!cli.resolve_wt_auto_merge(&cfg));
-    }
-
-    #[test]
-    fn test_resolve_wt_force_cli() {
-        let cli = Cli {
-            wt_force: true,
-            ..Default::default()
-        };
-        let cfg = Config::default();
-        assert!(cli.resolve_wt_force(&cfg));
-    }
-
-    #[test]
-    fn test_resolve_wt_force_config() {
-        let cli = Cli::default();
-        let cfg = Config {
-            wt_force: Some(true),
-            ..Default::default()
-        };
-        assert!(cli.resolve_wt_force(&cfg));
-    }
-
-    #[test]
-    fn test_resolve_wt_force_default_false() {
-        let cli = Cli::default();
-        let cfg = Config::default();
-        assert!(!cli.resolve_wt_force(&cfg));
     }
 
     #[test]

@@ -2851,14 +2851,14 @@ fn run_scripted_supervisor_worker() -> ! {
                         build.clone(),
                         invocation.clone(),
                         sequence,
-                        WorkerFrame::EffectRequest(EffectRequest {
+                        WorkerFrame::EffectRequest(Box::new(EffectRequest {
                             effect_ordinal: ordinal,
                             grant_id: GrantId::new(uuid::Uuid::from_u128(1)).unwrap(),
                             advisory: AdvisoryAttribution::default(),
                             operation: EffectOperation::ReadFile {
                                 path: "fixture".into(),
                             },
-                        }),
+                        })),
                     );
                     protocol.on_send(&effect).unwrap();
                     write_frame(&mut output, &effect).unwrap();

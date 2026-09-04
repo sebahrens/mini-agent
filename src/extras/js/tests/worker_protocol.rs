@@ -122,14 +122,14 @@ fn challenge(value: u128) -> LaunchChallenge {
 fn effect_request(sequence: u64, ordinal: u32) -> WorkerWireFrame {
     invoked(
         sequence,
-        WorkerFrame::EffectRequest(EffectRequest {
+        WorkerFrame::EffectRequest(Box::new(EffectRequest {
             effect_ordinal: ordinal,
             grant_id: grant(),
             advisory: AdvisoryAttribution::default(),
             operation: EffectOperation::ReadFile {
                 path: "README.md".into(),
             },
-        }),
+        })),
     )
 }
 
@@ -522,7 +522,7 @@ fn worker_protocol_bounds_outbound_and_nested_payloads() {
 
     let proposal = invoked(
         3,
-        WorkerFrame::EffectRequest(EffectRequest {
+        WorkerFrame::EffectRequest(Box::new(EffectRequest {
             effect_ordinal: 0,
             grant_id: grant(),
             advisory: AdvisoryAttribution::default(),
@@ -545,7 +545,7 @@ fn worker_protocol_bounds_outbound_and_nested_payloads() {
                     predecessor_id: None,
                 },
             },
-        }),
+        })),
     );
     assert!(matches!(
         write_frame(&mut Vec::new(), &proposal),
@@ -762,12 +762,12 @@ fn worker_protocol_rejects_wrong_invocation_and_effect_identity() {
         build(),
         InvocationId::new("other-invocation").unwrap(),
         3,
-        WorkerFrame::EffectRequest(EffectRequest {
+        WorkerFrame::EffectRequest(Box::new(EffectRequest {
             effect_ordinal: 0,
             grant_id: grant(),
             advisory: AdvisoryAttribution::default(),
             operation: EffectOperation::ReadFile { path: "x".into() },
-        }),
+        })),
     );
     assert!(matches!(
         parent.on_receive(&wrong_invocation),

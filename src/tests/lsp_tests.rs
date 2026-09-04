@@ -1193,6 +1193,7 @@ async fn aggregate_authorization_bounds_open_handles_and_preserves_sorted_result
 async fn aggregate_snapshot_caps_high_cardinality_high_volume_diagnostics_before_cloning() {
     let root = TempRoot::new("bounded-snapshot-volume");
     let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let mut accepted = 0;
     for file_index in 0..96 {
         let path = root.path().join(format!("volume-{file_index:03}.rs"));
         std::fs::write(&path, "contents").unwrap();
@@ -1210,12 +1211,20 @@ async fn aggregate_snapshot_caps_high_cardinality_high_volume_diagnostics_before
                 )
             })
             .collect();
-        manager.inject_diagnostics(
+        accepted += usize::from(manager.try_inject_diagnostics(
             &crate::extras::lsp::client::file_uri(&path).unwrap(),
             "rust",
             diagnostics,
-        );
+        ));
     }
+    assert!(
+        accepted > 0,
+        "bounded cache must accept an initial diagnostic set"
+    );
+    assert!(
+        accepted < 96,
+        "bounded cache must reject an oversized aggregate"
+    );
 
     let first_uri = manager.diagnostic_candidate_uris().remove(0);
     let binding = manager.bind_diagnostic_uri(&first_uri).await.unwrap();

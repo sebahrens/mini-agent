@@ -2470,7 +2470,7 @@ impl Sandbox {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn active_group_count(&self) -> usize {
         self.active_groups
             .lock()

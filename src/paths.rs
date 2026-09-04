@@ -1212,7 +1212,7 @@ impl AppPaths {
         self.config_dir.join("agent").join("ARCHITECTURE.md")
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(feature = "hooks", test))]
     pub fn global_hook_settings_file(&self) -> PathBuf {
         self.config_dir.join("settings.json")
     }
@@ -1229,14 +1229,14 @@ impl AppPaths {
             .map(|directory| directory.join("prompts"))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn project_agent_skills_dir(&self) -> Option<PathBuf> {
         self.project_dir
             .as_ref()
             .map(|directory| directory.join("skills"))
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(feature = "hooks", test))]
     pub fn project_hook_settings_file(&self) -> Option<PathBuf> {
         self.project_dir
             .as_ref()
@@ -1269,7 +1269,7 @@ impl AppPaths {
             .map(|directory| directory.join("agents"))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn portable_agent_skills_dir(&self) -> PathBuf {
         self.data_dir.join("skills")
     }
@@ -1282,17 +1282,17 @@ impl AppPaths {
         self.learned_skills_dir().join("skills.db")
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn embedding_models_dir(&self) -> PathBuf {
         self.cache_dir.join("models")
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn learned_skills_cache_dir(&self) -> PathBuf {
         self.cache_dir.join("skills")
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn import_staging_dir(&self) -> PathBuf {
         self.cache_dir.join("import-staging")
     }
@@ -1309,7 +1309,7 @@ impl AppPaths {
         self.state_dir.join("loops")
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn turn_telemetry_dir(&self) -> PathBuf {
         self.state_dir.join("telemetry")
     }

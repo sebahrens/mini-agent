@@ -87,7 +87,7 @@ async fn run() -> anyhow::Result<()> {
     #[cfg(feature = "js")]
     {
         let shutdown = extras::js::supervisor::JsWorkerSupervisor::shutdown_shared().await;
-        return match (result, shutdown) {
+        match (result, shutdown) {
             (Ok(()), Ok(())) => Ok(()),
             (Ok(()), Err(error)) => Err(anyhow::anyhow!(
                 "failed to shut down JavaScript worker: {error}"
@@ -96,7 +96,7 @@ async fn run() -> anyhow::Result<()> {
             (Err(error), Err(shutdown)) => {
                 Err(error.context(format!("JavaScript worker cleanup also failed: {shutdown}")))
             }
-        };
+        }
     }
     #[cfg(not(feature = "js"))]
     result
