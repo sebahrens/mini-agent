@@ -989,6 +989,9 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             "bash scripts/test-install-checksums.sh",
             "npm run package:linux-x64",
             "npm run sbom",
+            "Install packaged-runtime containment dependency",
+            "sudo apt-get update && sudo apt-get install -y bubblewrap",
+            "kernel.apparmor_restrict_unprivileged_userns=0",
         ),
         "src/product.rs": (
             f'pub const PUBLIC_NAME: &str = "{binary}";',

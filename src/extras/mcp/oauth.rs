@@ -1436,6 +1436,18 @@ fn listen_for_callback(
 ) -> anyhow::Result<CapturedCode> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| anyhow::anyhow!("cannot bind 127.0.0.1:{port} for OAuth redirect: {e}"))?;
+    listen_on_callback_listener(listener, timeout, expected_state)
+}
+
+fn listen_on_callback_listener(
+    listener: std::net::TcpListener,
+    timeout: Duration,
+    expected_state: &str,
+) -> anyhow::Result<CapturedCode> {
+    let port = listener
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("cannot inspect OAuth redirect listener: {e}"))?
+        .port();
     listener.set_nonblocking(false).ok();
 
     let deadline = std::time::Instant::now() + timeout;
@@ -1612,12 +1624,15 @@ mod product_identity_tests {
 
     #[test]
     fn callback_listener_ignores_stray_connection_before_valid_redirect() {
-        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        drop(reservation);
+        let callback_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = callback_listener.local_addr().unwrap().port();
 
         let listener = std::thread::spawn(move || {
-            super::listen_for_callback(port, Duration::from_secs(3), "expected")
+            super::listen_on_callback_listener(
+                callback_listener,
+                Duration::from_secs(3),
+                "expected",
+            )
         });
         send_request(port, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
         send_request(

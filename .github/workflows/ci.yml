@@ -1857,6 +1857,16 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
+      - name: Install packaged-runtime containment dependency
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable the hosted runner's unprivileged namespace boundary
+        shell: bash
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Package crate
         run: cargo package --locked
 

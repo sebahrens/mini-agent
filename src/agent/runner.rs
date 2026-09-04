@@ -2691,13 +2691,21 @@ mod tests {
             ))
             .await;
         assert!(matches!(gate, crate::extras::hooks::PromptGate::Proceed(_)));
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let hook_started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !pid_file.exists() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("configured async hook should start");
+        .await;
+        if hook_started.is_err() {
+            // A failed start assertion must not strand the long-lived hook process on the test
+            // runner. Cancel and drain the same owned scope before reporting the failure.
+            work_scope.cancellation_handle().cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), work_scope.wait_idle())
+                .await;
+            let _ = std::fs::remove_dir_all(&directory);
+            panic!("configured async hook should start within 10 seconds");
+        }
         let hook_pid = std::fs::read_to_string(&pid_file).unwrap();
 
         let model = MockCompletionModel::from_stream_turns(vec![vec![

@@ -5460,7 +5460,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires a real Linux bubblewrap backend"]
-    async fn linux_spawn_in_place_overwrite_during_ask_executes_original_snapshot() {
+    async fn linux_spawn_in_place_overwrite_during_ask_snapshots_post_authorization_bytes() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = TempDir::new();
@@ -5528,13 +5528,16 @@ mod tests {
             (result, broker)
         });
         let prompt = ask_rx.recv().await.expect("spawn should block at Ask");
+        // The canonical broker order authorizes the bounded raw argv before opening the target.
+        // Bytes replaced while Ask is pending therefore become the post-authorization snapshot;
+        // execution must use that sealed snapshot rather than reopening the path later.
         std::fs::write(&executable, "#!/bin/sh\nprintf replacement-bytes").unwrap();
         prompt.reply.send(UserDecision::AllowOnce).unwrap();
         let (result, broker) = dispatch.await.unwrap();
         assert!(matches!(
             result,
             Ok(EffectResult::Spawn { stdout, exit_code: 0, .. })
-                if stdout == "original-snapshot"
+                if stdout == "replacement-bytes"
         ));
         assert_eq!(broker.audit_records_for_test().len(), 2);
     }
