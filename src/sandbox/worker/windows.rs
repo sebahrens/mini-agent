@@ -3586,12 +3586,76 @@ mod feasibility {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     #[repr(u8)]
     enum RuntimePreflightFailureStage {
-        Launch = 65,
+        LaunchUnknown = 65,
         Deadline = 66,
         RuntimeControls = 67,
         Protocol = 68,
         Reap = 69,
         Exit = 70,
+        LaunchProfile = 80,
+        LaunchLocation = 81,
+        LaunchPath = 82,
+        LaunchOwner = 83,
+        LaunchAcl = 84,
+        LaunchImageLock = 85,
+        LaunchPipes = 86,
+        LaunchJob = 87,
+        LaunchAttributes = 88,
+        LaunchEnvironment = 89,
+        LaunchCreateProcess = 90,
+        LaunchHandles = 91,
+        LaunchVerification = 92,
+        LaunchSynchronization = 93,
+    }
+
+    fn classify_runtime_preflight_launch_failure(
+        error: &GateError,
+    ) -> RuntimePreflightFailureStage {
+        let message = error.0.as_str();
+        if message.contains("profile") || message.contains("loopback exemption") {
+            RuntimePreflightFailureStage::LaunchProfile
+        } else if message.contains("location") || message.contains("classified root") {
+            RuntimePreflightFailureStage::LaunchLocation
+        } else if message.contains("reparse")
+            || message.contains("remote")
+            || message.contains("canonicalize")
+            || message.contains("path component")
+            || message.contains("image-path ancestor")
+            || message.contains("supported root")
+        {
+            RuntimePreflightFailureStage::LaunchPath
+        } else if message.contains("does not own") || message.contains("owner") {
+            RuntimePreflightFailureStage::LaunchOwner
+        } else if message.contains("lock inspected executable") {
+            RuntimePreflightFailureStage::LaunchImageLock
+        } else if message.contains("ACL")
+            || message.contains("ACE")
+            || message.contains("rights")
+            || message.contains("AppContainer access")
+        {
+            RuntimePreflightFailureStage::LaunchAcl
+        } else if message.contains("pipe") {
+            RuntimePreflightFailureStage::LaunchPipes
+        } else if message.contains("Job") {
+            RuntimePreflightFailureStage::LaunchJob
+        } else if message.contains("attribute") {
+            RuntimePreflightFailureStage::LaunchAttributes
+        } else if message.contains("environment")
+            || message.contains("AppContainer temp")
+            || message.contains("system Windows directory")
+        {
+            RuntimePreflightFailureStage::LaunchEnvironment
+        } else if message.contains("create zero-capability LPAC JavaScript worker") {
+            RuntimePreflightFailureStage::LaunchCreateProcess
+        } else if message.contains("handle") || message.contains("inherit") {
+            RuntimePreflightFailureStage::LaunchHandles
+        } else if message.contains("verify LPAC") || message.contains("access semantics") {
+            RuntimePreflightFailureStage::LaunchVerification
+        } else if message.contains("serialize") || message.contains("creation lock") {
+            RuntimePreflightFailureStage::LaunchSynchronization
+        } else {
+            RuntimePreflightFailureStage::LaunchUnknown
+        }
     }
 
     #[derive(Debug)]
@@ -3611,7 +3675,7 @@ mod feasibility {
         deadline: Instant,
     ) -> Result<(), RuntimePreflightFailure> {
         let mut process = launch_production(hooks).map_err(|error| {
-            RuntimePreflightFailure::new(RuntimePreflightFailureStage::Launch, error)
+            RuntimePreflightFailure::new(classify_runtime_preflight_launch_failure(&error), error)
         })?;
         let result = (|| {
             if Instant::now() >= deadline {

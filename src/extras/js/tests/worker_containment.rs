@@ -262,6 +262,7 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "PROCESS_MITIGATION_CHILD_PROCESS_POLICY",
         "run_runtime_preflight_owned",
         "RuntimePreflightFailureStage",
+        "classify_runtime_preflight_launch_failure",
         "Err(failure) => std::process::ExitCode::from(failure.stage as u8)",
         "--mini-agent-windows-worker-preflight-v1",
         "run_supervised_preflight_helper",
