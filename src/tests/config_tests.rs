@@ -398,6 +398,28 @@ fn unknown_permission_tool_is_rejected_instead_of_discarded() {
 }
 
 #[test]
+fn unknown_legacy_permission_entry_tool_is_rejected_instead_of_discarded() {
+    for field in ["permission-allow", "permission-ask", "permission-deny"] {
+        let mut cfg = Config::default();
+        let entries = Some(HashMap::from([(
+            "writ".to_string(),
+            vec!["secrets/**".to_string()],
+        )]));
+        match field {
+            "permission-allow" => cfg.permission_allow = entries,
+            "permission-ask" => cfg.permission_ask = entries,
+            "permission-deny" => cfg.permission_deny = entries,
+            _ => unreachable!(),
+        }
+
+        let error = cfg.build_permission_config().unwrap_err().to_string();
+        assert!(error.contains(field), "{error}");
+        assert!(error.contains("writ"), "{error}");
+        assert!(error.contains("unsupported permission tool"), "{error}");
+    }
+}
+
+#[test]
 fn yaml_round_trips_scalar_and_nested_fields() {
     let cfg = Config {
         provider: Some(CompactString::new("openrouter")),

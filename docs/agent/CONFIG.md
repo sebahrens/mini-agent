@@ -23,6 +23,9 @@ Any subset of keys may be set — tables (e.g. `mcp_servers`, `quick_models`,
 keys absent from the local file keep their global values. If sensitive values
 cannot be activated, startup prints a notice identifying the project config;
 an ordinary benign merge is visible only in diagnostic logging.
+Edits made by the setup UI and first-start prompts are applied as a structural
+delta to the global file; unchanged project-local values are never copied into
+global configuration.
 
 ```toml
 # .zerostack/config.toml
@@ -381,7 +384,7 @@ Accepted top-level keys:
 | `restrictive`             | boolean | Select restrictive permission mode (ask for every operation). Overridden by `accept_all`/`yolo` if those are also true.                                                     |
 | `accept_all`              | boolean | Select standard permission mode with auto-allow within CWD (equivalent to `default_permission_mode = "standard"`). Overridden by `yolo` if true.                            |
 | `yolo`                    | boolean | Select yolo mode (allow all, ask for destructive bash commands).                                                                                                            |
-| `permission-modes`        | array   | List of mode names that apply config-based rules. Default: `["guarded", "standard", "yolo"]`. Modes excluded from this list skip config rule matching entirely.             |
+| `permission-modes`        | array   | List of mode names that apply configured `allow` and `ask` rules. Default: `["guarded", "standard", "yolo"]`. Configured `deny` and `external_directory` deny rules are security baselines and remain active in every mode. |
 | `sandbox`                 | boolean | Enforce the configured **general subprocess** sandbox for Bash and parent-brokered JS `spawn`. Default: `true`. Precedence is `--no-sandbox` (disable) > `--sandbox` (explicitly require) > this config value > the default. On non-Windows hosts, an unavailable backend inherited only from the default warns and runs unsandboxed. While sandboxing remains enabled, `--sandbox`, `sandbox = true`, or selecting a backend through the CLI/config fails closed if that backend is unavailable. This setting never disables the mandatory broker-only JS worker containment. |
 | `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux, the system-provided `seatbelt` at `/usr/bin/sandbox-exec` on supported macOS hosts, and `appcontainer` on Windows (`restricted-token` is a compatibility alias). Setting this key or passing `--sandbox-backend` makes an enabled sandbox request explicit and fail-closed. Windows availability requires the cached native AppContainer production preflight. Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by interrupted earlier preflights. The new run phase is limited to five seconds, whole-tree reaping receives up to five seconds, and profile/ACL recovery then receives a fresh five-second ceiling. Failure remains closed unless `--no-sandbox` explicitly opts out. The backend adds package-SID workspace read/write plus read/execute grants for the application cache, exact selected executable, and explicitly configured AppContainer roots; ambient `PATH`, home, Cargo, and Rustup roots are never inferred. As a regular AppContainer it retains standard Windows system resources and any pre-existing object accessible to `ALL APPLICATION PACKAGES`; such an existing ACL can include write authority, so universal filesystem isolation is not claimed. It uses private profile storage, grants no network capability, and retains the private desktop plus bounded creation-time Job. Hosted observations describe the reference runner, not every host's ACL visibility; broader registry/device/session isolation is not claimed. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
 | `windows-appcontainer-read-roots` | array of paths | Additional Windows AppContainer read/execute roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they are remote, reparse-based, multiply linked, overlap a writable root, or contain the private AppContainer control sibling. Conflict diagnostics expose only fixed root roles and containment direction, never paths. CLI: repeat `--windows-appcontainer-read-root PATH`. |
@@ -993,8 +996,9 @@ Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping patterns to actions. Supported
 permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch`, `read`, `write`, `edit`, `grep`,
 `find_files`, `list_dir`, `todo_write`, `git/status`, `git/diff`, `git/log`,
-`git/show`, `git/stage`, `git/unstage`, and `git/commit`. MCP-backed tools are checked under
-`mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the default action,
+`git/show`, `git/stage`, `git/unstage`, `git/commit`, and `mcp_tool`.
+MCP-backed calls use `mcp_tool` as the tool key and
+`{server_name}:{tool_name}` as the matched input. Use `"*"` for the default action,
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
 omitted, zerostack installs built-in exact-script allows (for commands such as
@@ -1056,6 +1060,13 @@ There are two config fields for controlling permissions by pattern:
 - **`permission-regex`** — same structure as `permission`, but patterns are
   treated as regular expressions (e.g. `.*\.rs$`, `^src/`). Regex patterns are
   unanchored — use `^` and `$` to match the full input.
+
+Glob rules match the complete input. `*` matches zero or more characters other
+than `/`; `**` also crosses `/`; `**/` matches zero or more directory levels;
+and `?` matches exactly one character. All other characters—including brackets,
+braces, and backslashes—are literal. A leading `~` is expanded. Filesystem glob
+rules accept `/` on every platform and normalize Windows input separators;
+raw `permission-regex` expressions retain their authored separator semantics.
 
 Permission policy configuration is validated before any provider, model,
 tool, UI, loop runner, or ACP server is constructed. Malformed permission

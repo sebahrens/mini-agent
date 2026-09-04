@@ -1068,6 +1068,7 @@ impl Startup {
             let prompted =
                 self.cfg.enable_context7_mcp.is_none() || self.cfg.enable_grepapp_mcp.is_none();
             if prompted {
+                let config_before_prompts = self.cfg.clone();
                 if self.cfg.enable_context7_mcp.is_none() {
                     let mut input = String::new();
                     eprint!("Enable Context7 MCP (documentation and code context lookup)? [y/N] ");
@@ -1093,7 +1094,7 @@ impl Startup {
                     }
                 }
                 config::inject_mcp_defaults(&mut self.cfg);
-                if let Err(e) = config::save_config(&self.cfg) {
+                if let Err(e) = config::save_config_changes(&config_before_prompts, &self.cfg) {
                     tracing::warn!("Failed to save config with MCP choices: {e}");
                 }
             }

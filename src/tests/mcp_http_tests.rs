@@ -61,6 +61,10 @@ async fn mcp_http_connect_to_silent_server_times_out() {
 
 #[tokio::test]
 async fn mcp_http_oauth_connect_to_silent_server_times_out() {
+    // OAuth resolves the same process paths installed by startup. Hold the
+    // test environment lock so unrelated path-override fixtures cannot swap
+    // those inputs or delete their temporary roots during this connection.
+    let _environment = crate::tests::ScopedProcessEnv::set(&[]);
     let (url, listener) = spawn_silent_listener().await;
     let oauth = crate::extras::mcp::config::OAuthConfig::Enabled(true);
     let started = std::time::Instant::now();

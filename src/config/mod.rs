@@ -668,29 +668,7 @@ impl Config {
                     for (pattern, action) in patterns {
                         validate_action(field, &format!("external_directory.{pattern}"), action)?;
                     }
-                } else if matches!(
-                    tool.as_str(),
-                    "bash"
-                        | "shell"
-                        | "git/status"
-                        | "git/diff"
-                        | "git/log"
-                        | "git/show"
-                        | "git/stage"
-                        | "git/unstage"
-                        | "git/commit"
-                        | "js/fetch"
-                        | "fetch"
-                        | "read"
-                        | "write"
-                        | "edit"
-                        | "grep"
-                        | "find_files"
-                        | "list_dir"
-                        | "todo_write"
-                        | "write_todo_list"
-                        | "mcp_tool"
-                ) {
+                } else if crate::permission::is_configurable_tool_name(tool) {
                     if configured.is_string() {
                         validate_action(field, tool, configured)?;
                     } else {
@@ -725,6 +703,28 @@ impl Config {
         let regex = parse_field("permission-regex", self.permission_regex.as_ref())?;
 
         let mut perm_configs = PermissionConfigs { glob, regex };
+
+        fn validate_entries(
+            field: &str,
+            entries: &Option<HashMap<String, Vec<String>>>,
+        ) -> anyhow::Result<()> {
+            if let Some(entries) = entries {
+                let mut tools: Vec<_> = entries.keys().collect();
+                tools.sort_unstable();
+                for tool in tools {
+                    if !crate::permission::is_configurable_tool_name(tool) {
+                        anyhow::bail!(
+                            "invalid `{field}` configuration at `{tool}`: unsupported permission tool"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        validate_entries("permission-allow", &self.permission_allow)?;
+        validate_entries("permission-ask", &self.permission_ask)?;
+        validate_entries("permission-deny", &self.permission_deny)?;
 
         if let Some(allow) = &self.permission_allow {
             perm_configs.glob.allow_entries = Some(allow.clone());

@@ -67,6 +67,32 @@ pub struct PermissionConfigs {
     pub regex: PermissionConfig,
 }
 
+pub(crate) fn is_configurable_tool_name(tool: &str) -> bool {
+    matches!(
+        tool,
+        "bash"
+            | "shell"
+            | "git/status"
+            | "git/diff"
+            | "git/log"
+            | "git/show"
+            | "git/stage"
+            | "git/unstage"
+            | "git/commit"
+            | "js/fetch"
+            | "fetch"
+            | "read"
+            | "write"
+            | "edit"
+            | "grep"
+            | "find_files"
+            | "list_dir"
+            | "todo_write"
+            | "write_todo_list"
+            | "mcp_tool"
+    )
+}
+
 impl From<PermissionConfig> for PermissionConfigs {
     fn from(glob: PermissionConfig) -> Self {
         PermissionConfigs {
@@ -130,15 +156,21 @@ pub(crate) fn resolve_execution_authority(
         })?,
     };
 
-    let mode = if cli.yolo || cfg.yolo.unwrap_or(false) {
+    let mode = if cli.yolo {
         SecurityMode::Yolo
-    } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
+    } else if cli.accept_all {
         SecurityMode::Standard
     } else if cli.read_only {
         SecurityMode::ReadOnly
     } else if cli.guarded {
         SecurityMode::Guarded
-    } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
+    } else if cli.restrictive {
+        SecurityMode::Restrictive
+    } else if cfg.yolo.unwrap_or(false) {
+        SecurityMode::Yolo
+    } else if cfg.accept_all.unwrap_or(false) {
+        SecurityMode::Standard
+    } else if cfg.restrictive.unwrap_or(false) {
         SecurityMode::Restrictive
     } else {
         configured_default
@@ -449,42 +481,14 @@ pub fn default_deny_regex_rules() -> Vec<(/* tool */ &'static str, /* regex */ &
 
 pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
     vec![
-        ("ls **", Action::Allow),
-        ("cd **", Action::Allow),
         ("pwd", Action::Allow),
-        ("echo **", Action::Allow),
-        ("which **", Action::Allow),
-        ("type **", Action::Allow),
-        ("cat **", Action::Allow),
-        ("head **", Action::Allow),
-        ("tail **", Action::Allow),
-        ("wc **", Action::Allow),
-        ("sort **", Action::Allow),
-        ("uniq **", Action::Allow),
-        ("cut **", Action::Allow),
-        ("diff **", Action::Allow),
-        ("grep **", Action::Allow),
-        ("rg **", Action::Allow),
-        ("find **", Action::Allow),
-        ("fd **", Action::Allow),
-        ("fdfind **", Action::Allow),
         ("git status", Action::Allow),
-        ("git log **", Action::Allow),
-        ("git diff **", Action::Allow),
-        ("git show **", Action::Allow),
-        ("git branch **", Action::Allow),
         ("cargo check", Action::Allow),
         ("cargo build", Action::Allow),
         ("cargo test", Action::Allow),
         ("cargo fmt", Action::Allow),
         ("cargo clippy", Action::Allow),
-        ("cargo install **", Action::Allow),
-        ("mkdir **", Action::Allow),
-        ("touch **", Action::Allow),
-        ("cp **", Action::Allow),
-        ("npm run **", Action::Allow),
         ("pip list", Action::Allow),
-        ("pip show **", Action::Allow),
         ("rm -rf /**", Action::Deny),
         ("sudo rm -rf /**", Action::Deny),
         ("dd **", Action::Deny),
@@ -554,7 +558,7 @@ mod execution_authority_tests {
                 sandbox: Ok(SandboxResolution::Disabled),
             },
             Case {
-                name: "config yolo outranks cli accept all",
+                name: "cli accept all overrides config yolo",
                 cli: Cli {
                     accept_all: true,
                     ..Cli::default()
@@ -564,7 +568,7 @@ mod execution_authority_tests {
                     ..Config::default()
                 },
                 sandbox_policy: SandboxPolicy::Disabled,
-                expected_mode: SecurityMode::Yolo,
+                expected_mode: SecurityMode::Standard,
                 tools_enabled: true,
                 permission_checks_enabled: true,
                 sandbox: Ok(SandboxResolution::Disabled),
@@ -584,7 +588,7 @@ mod execution_authority_tests {
                 sandbox: Ok(SandboxResolution::Disabled),
             },
             Case {
-                name: "config accept all outranks guarded",
+                name: "cli guarded overrides config accept all",
                 cli: Cli {
                     guarded: true,
                     ..Cli::default()
@@ -594,7 +598,24 @@ mod execution_authority_tests {
                     ..Config::default()
                 },
                 sandbox_policy: SandboxPolicy::Disabled,
-                expected_mode: SecurityMode::Standard,
+                expected_mode: SecurityMode::Guarded,
+                tools_enabled: true,
+                permission_checks_enabled: true,
+                sandbox: Ok(SandboxResolution::Disabled),
+            },
+            Case {
+                name: "cli read only overrides permissive config booleans",
+                cli: Cli {
+                    read_only: true,
+                    ..Cli::default()
+                },
+                cfg: Config {
+                    yolo: Some(true),
+                    accept_all: Some(true),
+                    ..Config::default()
+                },
+                sandbox_policy: SandboxPolicy::Disabled,
+                expected_mode: SecurityMode::ReadOnly,
                 tools_enabled: true,
                 permission_checks_enabled: true,
                 sandbox: Ok(SandboxResolution::Disabled),

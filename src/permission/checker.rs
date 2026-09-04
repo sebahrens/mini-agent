@@ -169,14 +169,19 @@ impl PermissionChecker {
                 }
                 ToolPerm::Granular(map) => {
                     for (pat, action) in map {
+                        if !is_regex && is_path_tool_name(tool_name) {
+                            entries.push((Pattern::new_path(pat), *action));
+                            if let Some(canonical) = canonical_tool_path_pattern(pat) {
+                                entries.push((Pattern::new_path(&canonical), *action));
+                            }
+                            continue;
+                        }
                         let pat = if is_regex {
                             Pattern::new_regex(pat).map_err(|error| {
                                 anyhow::anyhow!(
                                     "invalid `{config_field}` rule for tool `{tool_name}` pattern `{pat}`: {error}"
                                 )
                             })?
-                        } else if is_path_tool_name(tool_name) {
-                            Pattern::new_path(pat)
                         } else {
                             Pattern::new(pat)
                         };
@@ -229,6 +234,9 @@ impl PermissionChecker {
                         let entry = rules.entry(alias.to_string()).or_default();
                         for pat in patterns {
                             let pattern = if is_path_tool_name(alias) {
+                                if let Some(canonical) = canonical_tool_path_pattern(pat) {
+                                    entry.push((Pattern::new_path(&canonical), action));
+                                }
                                 Pattern::new_path(pat)
                             } else {
                                 Pattern::new(pat)
@@ -651,15 +659,30 @@ impl PermissionChecker {
         let tool = canonical_permission_tool(tool);
         tracing::debug!("perm check path: tool={}, path={}", tool, path);
         let expanded = crate::fs::expand_tilde(path);
-        let abs_path = resolve_absolute(&expanded, &self.working_dir);
-
-        let external = self.is_external_path(&abs_path);
+        let unresolved_abs_path = resolve_absolute(&expanded, &self.working_dir);
+        let abs_path = resolve_path_allow_missing(Path::new(&unresolved_abs_path))
+            .unwrap_or_else(|| normalize_path(Path::new(&unresolved_abs_path)))
+            .to_string_lossy()
+            .into_owned();
+        let normalized_input = normalize_path(Path::new(&expanded))
+            .to_string_lossy()
+            .into_owned();
+        // Resolve `..` only after following existing symlink components. A
+        // lexical rewrite of `link/../target` can otherwise change the path's
+        // real subject before the external-workspace decision.
+        let external = self.is_external_path(&unresolved_abs_path);
         let external_action = if external {
-            self.match_ext_dir(&abs_path)
+            self.match_ext_dir(&unresolved_abs_path)
         } else {
             None
         };
-        self.check_pre_resolved_path(tool, &expanded, &abs_path, external, external_action)
+        self.check_pre_resolved_path(
+            tool,
+            &normalized_input,
+            &abs_path,
+            external,
+            external_action,
+        )
     }
 
     /// Check a canonical permission key bound by the caller to an already-open
@@ -831,7 +854,7 @@ impl PermissionChecker {
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
-                if pattern.matches(&logical) || pattern.matches(&relative) {
+                if pattern.matches_path(&logical) || pattern.matches_path(&relative) {
                     matched.push((pattern.specificity(), *action));
                 }
             }
@@ -845,9 +868,6 @@ impl PermissionChecker {
     /// the security baseline and must be evaluated before the session
     /// allowlist to prevent `AllowAlways` from bypassing them.
     fn matches_deny_rule(&self, tool: &str, inputs: &[&str]) -> bool {
-        if !self.apply_rules() {
-            return false;
-        }
         if let Some(rules) = self.rules.get(tool) {
             for (pattern, action) in rules {
                 let matches = |input: &&str| {
@@ -1131,9 +1151,12 @@ fn resolve_absolute(path: &str, working_dir: &str) -> String {
     let expanded = crate::fs::expand_tilde(path);
     let p = Path::new(&expanded);
     if p.is_absolute() {
-        p.to_string_lossy().to_string()
+        p.to_string_lossy().into_owned()
     } else {
-        Path::new(working_dir).join(p).to_string_lossy().to_string()
+        Path::new(working_dir)
+            .join(p)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -1199,6 +1222,36 @@ mod windows_workspace_authority_tests {
             CheckResult::Allowed
         );
         drop(binding);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn windows_bound_paths_match_forward_slash_policy_patterns() {
+        let workspace = std::env::temp_dir().join(format!(
+            "mini-agent-bound-path-pattern-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(workspace.join("nested")).unwrap();
+        let config = PermissionConfig {
+            write: Some(ToolPerm::Granular(
+                [("nested/**".to_string(), Action::Allow)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Restrictive,
+            Some(workspace.clone()),
+            Some(vec!["restrictive".to_string()]),
+        )
+        .unwrap();
+
+        let target = workspace.join("nested/file.txt");
+        assert_eq!(
+            checker.check_bound_path("write", &target.to_string_lossy()),
+            CheckResult::Allowed
+        );
+
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }
@@ -1294,6 +1347,20 @@ fn resolve_glob_pattern(pattern: &str) -> String {
         .join(&expanded[prefix_end..])
         .to_string_lossy()
         .into_owned()
+}
+
+/// Produce a canonical alias for an absolute filesystem glob. The authored
+/// spelling remains active for stable handle-bound checks; the alias also
+/// covers resolved path aliases and symlinked prefixes. Relative rules remain
+/// relative to the captured workspace and never consult process CWD here.
+fn canonical_tool_path_pattern(pattern: &str) -> Option<String> {
+    let expanded = crate::fs::expand_tilde(pattern);
+    if Path::new(&expanded).is_absolute() {
+        let canonical = resolve_glob_pattern(&expanded);
+        (canonical != expanded).then_some(canonical)
+    } else {
+        None
+    }
 }
 
 fn is_plan_file(path: &str) -> bool {

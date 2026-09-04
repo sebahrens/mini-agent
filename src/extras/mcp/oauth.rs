@@ -9,7 +9,6 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmcp::transport::auth::{
@@ -30,13 +29,7 @@ struct MigrationMarker {
 }
 
 fn resolved_paths() -> anyhow::Result<crate::paths::AppPaths> {
-    static PATHS: OnceLock<Result<crate::paths::AppPaths, String>> = OnceLock::new();
-    match PATHS.get_or_init(|| {
-        crate::paths::AppPaths::from_process(None).map_err(|error| error.to_string())
-    }) {
-        Ok(paths) => Ok(paths.clone()),
-        Err(error) => Err(anyhow::anyhow!(error.clone())),
-    }
+    crate::paths::process_paths().map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 fn oauth_dir(paths: &crate::paths::AppPaths) -> PathBuf {

@@ -1129,21 +1129,196 @@ pub fn verify_project_config_trust() -> std::io::Result<()> {
     result
 }
 
-pub fn save_config(cfg: &Config) -> io::Result<()> {
-    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
-    let mut cfg = cfg.clone();
+/// Persist only the edits made to an effective (global + project) config.
+///
+/// Project overrides deliberately remain in the effective values supplied to
+/// callers, so serializing `after` wholesale would copy every unchanged local
+/// setting into the user's global config. Applying the structural delta to a
+/// freshly loaded global config preserves local provenance without requiring
+/// each UI caller to understand the merge.
+pub fn save_config_changes(before: &Config, after: &Config) -> io::Result<()> {
+    save_config_changes_at(&resolve_config_path(), before, after)
+}
+
+fn save_config_changes_at(path: &Path, before: &Config, after: &Config) -> io::Result<()> {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
+        return save_toml_config_changes_at(path, before, after);
+    }
+
+    let global = if path_entry_exists(path)? {
+        parse_config_content(path, &read_config_content(path)?)?
+    } else {
+        Config::default()
+    };
+
+    let mut global_value = serde_json::to_value(global).map_err(io::Error::other)?;
+    let before_value = serde_json::to_value(before).map_err(io::Error::other)?;
+    let after_value = serde_json::to_value(after).map_err(io::Error::other)?;
+    apply_json_delta(&mut global_value, &before_value, &after_value);
+
+    let mut updated: Config = serde_json::from_value(global_value).map_err(io::Error::other)?;
+    strip_injected_mcp_defaults(&mut updated);
+    save_config_at(path, &updated)
+}
+
+fn save_toml_config_changes_at(path: &Path, before: &Config, after: &Config) -> io::Result<()> {
+    let mut global = if path_entry_exists(path)? {
+        let content = read_config_content(path)?;
+        // Reject a concurrently corrupted config rather than publishing a
+        // syntactically valid delta over values the application cannot load.
+        parse_config_content(path, &content)?;
+        toml::from_str(&content).map_err(io::Error::other)?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let before = toml::Value::try_from(before).map_err(io::Error::other)?;
+    let after = toml::Value::try_from(after).map_err(io::Error::other)?;
+    apply_toml_delta(&mut global, &before, &after);
+
+    strip_injected_mcp_defaults_toml(&mut global);
+    let _: Config = global.clone().try_into().map_err(io::Error::other)?;
+    atomic_config_write(path, &toml::to_string(&global).map_err(io::Error::other)?)?;
+    tracing::debug!("config saved to {}", path.display());
+    Ok(())
+}
+
+fn apply_toml_delta(base: &mut toml::Value, before: &toml::Value, after: &toml::Value) {
+    if before == after {
+        return;
+    }
+
+    let (Some(before), Some(after)) = (before.as_table(), after.as_table()) else {
+        *base = after.clone();
+        return;
+    };
+    if !base.is_table() {
+        *base = toml::Value::Table(toml::map::Map::new());
+    }
+    let base = base.as_table_mut().expect("base was initialized as table");
+    let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for key in keys {
+        match (before.get(key), after.get(key)) {
+            (Some(_), None) => {
+                base.remove(key);
+            }
+            (None, Some(value)) => {
+                base.insert(key.clone(), value.clone());
+            }
+            (Some(old), Some(new)) if old != new => {
+                let entry = base
+                    .entry(key.clone())
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+                apply_toml_delta(entry, old, new);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_json_delta(
+    base: &mut serde_json::Value,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) {
+    if before == after {
+        return;
+    }
+
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        *base = after.clone();
+        return;
+    };
+    if !base.is_object() {
+        *base = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let base = base
+        .as_object_mut()
+        .expect("base was initialized as object");
+    let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    for key in keys {
+        match (before.get(key), after.get(key)) {
+            (Some(_), None) => {
+                base.remove(key);
+            }
+            (None, Some(value)) => {
+                base.insert(key.clone(), value.clone());
+            }
+            (Some(old), Some(new)) if old != new => {
+                let entry = base.entry(key.clone()).or_insert(serde_json::Value::Null);
+                apply_json_delta(entry, old, new);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn strip_injected_mcp_defaults(_cfg: &mut Config) {
     #[cfg(feature = "mcp")]
     {
-        if let Some(ref mut servers) = cfg.mcp_servers {
+        if let Some(ref mut servers) = _cfg.mcp_servers {
             servers.remove("Exa Web Search");
             servers.remove("Context7");
             servers.remove("Grep.app");
         }
     }
-    let path = resolve_config_path();
-    atomic_config_write(&path, &serialize_config_content(&path, &cfg)?)?;
+}
+
+fn strip_injected_mcp_defaults_toml(_cfg: &mut toml::Value) {
+    #[cfg(feature = "mcp")]
+    if let Some(servers) = _cfg
+        .as_table_mut()
+        .and_then(|root| root.get_mut("mcp_servers"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        servers.remove("Exa Web Search");
+        servers.remove("Context7");
+        servers.remove("Grep.app");
+    }
+}
+
+fn save_config_at(path: &Path, cfg: &Config) -> io::Result<()> {
+    atomic_config_write(path, &serialize_config_content(path, cfg)?)?;
     tracing::debug!("config saved to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod config_delta_tests {
+    use super::{parse_config_content, save_config_changes_at};
+    use crate::config::Config;
+
+    #[test]
+    fn saving_effective_config_changes_does_not_copy_project_overrides_globally() {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-config-delta-{}", uuid::Uuid::new_v4()));
+        let path = root.join("config.toml");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            "model = \"global-model\"\nmax_tokens = 100\nfuture_date = 1979-05-27T07:32:00Z\n",
+        )
+        .unwrap();
+
+        let before = parse_config_content(
+            &path,
+            "model = \"project-model\"\nmax_tokens = 100\nchat_left_margin = 7\nfuture_date = 1979-05-27T07:32:00Z\n",
+        )
+        .unwrap();
+        let after = Config {
+            max_tokens: Some(200),
+            ..before.clone()
+        };
+
+        save_config_changes_at(&path, &before, &after).unwrap();
+        let saved = parse_config_content(&path, &std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.model.as_deref(), Some("global-model"));
+        assert_eq!(saved.max_tokens, Some(200));
+        assert_eq!(saved.chat_left_margin, None);
+        let raw: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["future_date"].is_datetime());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]

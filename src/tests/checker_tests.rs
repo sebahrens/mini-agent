@@ -174,6 +174,7 @@ fn guarded_asks_for_write_and_bash() {
     assert!(matches!(checker.check("bash", "wget"), CheckResult::Ask));
     // Only byte-for-byte exact Bash allow rules apply.
     assert!(matches!(checker.check("bash", "ls -la"), CheckResult::Ask));
+    assert!(matches!(checker.check("bash", "ls **"), CheckResult::Ask));
     assert!(matches!(checker.check("bash", "pwd"), CheckResult::Allowed));
 }
 
@@ -1031,7 +1032,7 @@ fn restrictive_asks_for_everything() {
     assert!(matches!(checker.check("bash", "ls"), CheckResult::Ask));
     assert!(matches!(
         checker.check("bash", "rm -rf /"),
-        CheckResult::Ask
+        CheckResult::Denied(_)
     ));
 }
 
@@ -1089,6 +1090,115 @@ fn apply_rules_skipped_when_mode_not_in_permission_modes() {
         "expected Ask when rules are skipped by permission_modes, got {:?}",
         result,
     );
+}
+
+#[test]
+fn deny_rules_remain_active_when_mode_scoped_rules_are_disabled() {
+    let config = PermissionConfig {
+        bash: Some(ToolPerm::Granular(
+            [("blocked-command".to_string(), Action::Deny)].into(),
+        )),
+        write: Some(ToolPerm::Granular(
+            [("secrets/**".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Guarded,
+        Some(test_workspace()),
+        Some(vec![]),
+    )
+    .expect("valid permission test configuration");
+
+    assert!(matches!(
+        checker.check("bash", "blocked-command"),
+        CheckResult::Denied(_)
+    ));
+    assert!(matches!(
+        checker.check_path("write", &workspace_path("secrets/token.txt")),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[test]
+fn external_directory_deny_remains_active_in_readonly_mode() {
+    let config = PermissionConfig {
+        external_directory: Some([("/tmp/restricted/**".to_string(), Action::Deny)].into()),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::ReadOnly,
+        Some(test_workspace()),
+        Some(vec![]),
+    )
+    .expect("valid permission test configuration");
+
+    assert!(matches!(
+        checker.check_path("read", "/tmp/restricted/secret.txt"),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[test]
+fn check_path_normalizes_parent_components_before_policy_matching() {
+    let config = PermissionConfig {
+        write: Some(ToolPerm::Granular(
+            [("secrets/**".to_string(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        Some(test_workspace()),
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+
+    assert!(matches!(
+        checker.check_path("write", "src/../secrets/token.txt"),
+        CheckResult::Denied(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_path_resolves_symlinks_before_normalizing_parent_components() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "mini-agent-symlink-parent-policy-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workspace = root.join("workspace");
+    let external = root.join("external");
+    std::fs::create_dir_all(external.join("dir")).unwrap();
+    std::fs::write(external.join("secret.txt"), "secret").unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    symlink(external.join("dir"), workspace.join("link")).unwrap();
+
+    let denied = external.join("secret.txt").to_string_lossy().into_owned();
+    let config = PermissionConfig {
+        read: Some(ToolPerm::Granular([(denied, Action::Deny)].into())),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        Some(workspace.clone()),
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+
+    let result = checker.check_path(
+        "read",
+        &workspace.join("link/../secret.txt").to_string_lossy(),
+    );
+    assert!(matches!(result, CheckResult::Denied(_)), "{result:?}");
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

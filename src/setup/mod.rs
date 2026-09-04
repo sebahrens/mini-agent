@@ -208,10 +208,10 @@ fn masked_key(key: &str) -> String {
     if key.is_empty() {
         return "(not set)".to_string();
     }
-    if key.len() <= 4 {
+    if key.chars().count() <= 4 {
         return "****".to_string();
     }
-    format!("{}****", &key[..4.min(key.len())])
+    format!("{}****", key.chars().take(4).collect::<String>())
 }
 
 fn provider_type_display(name: &str, cfg: &Config) -> String {
@@ -235,16 +235,16 @@ fn clear_screen() -> io::Result<()> {
 fn write_centered(row: u16, text: &str, color: Color) -> io::Result<()> {
     let mut stdout = io::stdout();
     let (cols, _) = terminal::size()?;
-    let x = if cols as usize > text.len() {
-        (cols as usize - text.len()) / 2
-    } else {
-        0
-    };
-    stdout.execute(MoveTo(x as u16, row))?;
+    stdout.execute(MoveTo(centered_column(cols, text), row))?;
     stdout.execute(SetForegroundColor(color))?;
     stdout.execute(Print(text))?;
     stdout.execute(ResetColor)?;
     Ok(())
+}
+
+fn centered_column(cols: u16, text: &str) -> u16 {
+    let width = crate::ui::utils::display_width(text).min(u16::MAX as usize) as u16;
+    cols.saturating_sub(width) / 2
 }
 
 fn write_line(row: u16, col: u16, text: &str, color: Color) -> io::Result<()> {
@@ -340,7 +340,7 @@ fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
     write_line(row, 28, "M) Manage Models", Color::White)?;
     row += 1;
     write_line(row, 2, "L) Launch agent", Color::White)?;
-    write_line(row, 28, "A) Autoconfigure", Color::White)?;
+    write_line(row, 28, "A) Launch using environment", Color::White)?;
     row += 1;
     write_line(row, 2, "Q) Quit", Color::White)?;
 
@@ -807,6 +807,7 @@ pub fn run(cfg: &mut Config) -> anyhow::Result<SetupOutcome> {
 }
 
 fn run_inner(cfg: &mut Config) -> anyhow::Result<SetupOutcome> {
+    let original = cfg.clone();
     let (cols, rows) = terminal::size()?;
     let mut ctx = Ctx {
         cfg: cfg.clone(),
@@ -827,7 +828,7 @@ fn run_inner(cfg: &mut Config) -> anyhow::Result<SetupOutcome> {
                 let result = handle_key(&ctx, key)?;
                 if let Some((outcome, new_cfg)) = apply_key_result(&mut ctx, result) {
                     *cfg = new_cfg;
-                    crate::config::save_config(cfg)?;
+                    crate::config::save_config_changes(&original, cfg)?;
                     return Ok(outcome);
                 }
             }
@@ -898,14 +899,10 @@ fn handle_main_menu_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult> {
         KeyCode::Char('l') | KeyCode::Char('L') => {
             Ok(KeyResult::Outcome(SetupOutcome::Launch, ctx.cfg.clone()))
         }
-        KeyCode::Char('a') | KeyCode::Char('A') => {
-            let mut new_cfg = ctx.cfg.clone();
-            apply_autoconfigure(&mut new_cfg);
-            Ok(KeyResult::Outcome(
-                SetupOutcome::LaunchAutoconfigure,
-                new_cfg,
-            ))
-        }
+        KeyCode::Char('a') | KeyCode::Char('A') => Ok(KeyResult::Outcome(
+            SetupOutcome::LaunchAutoconfigure,
+            ctx.cfg.clone(),
+        )),
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
             Ok(KeyResult::Outcome(SetupOutcome::Quit, ctx.cfg.clone()))
         }
@@ -1693,26 +1690,6 @@ fn handle_model_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult
     }
 }
 
-fn apply_autoconfigure(cfg: &mut Config) {
-    let providers_to_check: &[(&str, &str)] = &[
-        ("openai", "OPENAI_API_KEY"),
-        ("anthropic", "ANTHROPIC_API_KEY"),
-        ("gemini", "GEMINI_API_KEY"),
-        ("openrouter", "OPENROUTER_API_KEY"),
-    ];
-
-    for (provider, env_var) in providers_to_check {
-        if let Ok(val) = std::env::var(env_var)
-            && !val.is_empty()
-        {
-            let keys = cfg.api_keys.get_or_insert_with(HashMap::new);
-            if !keys.contains_key(*provider) {
-                keys.insert(provider.to_string(), val.clone());
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1896,5 +1873,32 @@ mod tests {
                 .is_some_and(|keys| keys.contains_key("openai")),
             "an untyped environment key must not be written to config"
         );
+    }
+
+    #[test]
+    fn launch_using_environment_does_not_copy_secrets_into_config() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[(
+            "OPENROUTER_API_KEY",
+            Some(std::ffi::OsString::from("sk-from-environment")),
+        )]);
+        let mut ctx = wizard(Config::default());
+
+        let (outcome, launched) =
+            press(&mut ctx, KeyCode::Char('a')).expect("environment launch finishes");
+
+        assert!(matches!(outcome, SetupOutcome::LaunchAutoconfigure));
+        assert!(
+            !launched
+                .api_keys
+                .as_ref()
+                .is_some_and(|keys| keys.contains_key("openrouter"))
+        );
+    }
+
+    #[test]
+    fn secret_masking_and_centering_are_unicode_safe() {
+        assert_eq!(masked_key("🔑秘密alpha"), "🔑秘密a****");
+        assert_eq!(masked_key("秘密"), "****");
+        assert_eq!(centered_column(10, "秘密"), 3);
     }
 }

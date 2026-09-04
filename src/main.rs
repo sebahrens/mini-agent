@@ -233,7 +233,7 @@ async fn run_inner() -> anyhow::Result<()> {
         match setup::run(&mut cfg)? {
             setup::SetupOutcome::Quit => return Ok(()),
             setup::SetupOutcome::LaunchAutoconfigure => {
-                // autoconfigure was already applied in setup; fall through to launch
+                // Environment-backed credentials are resolved at runtime; fall through to launch.
             }
             setup::SetupOutcome::Launch => {
                 // fall through to launch
