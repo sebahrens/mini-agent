@@ -2,14 +2,19 @@
 
 - **Document role**: normative phase specification
 - **Specification version**: 1.2.0
-- **Delivery status**: delivered
+- **Delivery status**: library/test infrastructure delivered; operator adapter not shipped
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-02
+- **Last reconciled**: 2026-09-04
 - **Entry dependencies**: Foundation, Phase 1, and Phase 3 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 4 blocker
 
-**Delivers**: a bounded `propose_skill()` host function, durable evaluation queue, independent
-held-out cases, and human approval into canary state.
+**Library contract**: a bounded `propose_skill()` host function, durable evaluation queue,
+independent held-out cases, and human approval into canary state.
+
+**Shipped-binary status**: mini-agent does not register `propose_skill`, start proposal/admission
+workers, import held-out suites, or expose approval decisions. Those APIs remain library and test
+infrastructure until an authenticated operator adapter provides the complete review lifecycle.
+This prevents proposals from being accepted into a queue that no shipped surface can drain.
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). The filename is retained for stable links, but Phase 4 does **not**
@@ -20,8 +25,9 @@ Phase 6 supersedes this phase's identity-v1 flat proposal capability payload, JS
 placement, and verifier runtime ownership. Identity-v2 proposals carry complete structured scopes,
 cross worker IPC as bounded drafts, and are canonicalized/persisted only by the parent. Phase 4's
 field bounds, independent held-out evaluation, immutable reports, and human approval gates remain
-authoritative. Brokered identity-v2 proposal transport is now the current execution path; the
-delivered checkmarks below remain evidence for Phase 4's preserved admission behavior.
+authoritative. Brokered identity-v2 proposal transport is exercised by the library test path; the
+checkmarks below are implementation evidence, not a claim that the operator workflow is exposed
+by the shipped binary.
 
 ---
 

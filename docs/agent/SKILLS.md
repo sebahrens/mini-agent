@@ -20,11 +20,12 @@ startup rebuilds run once per process in a dedicated background thread; an exact
 published before the HNSW graph, then the completed graph is atomically published while existing
 turn leases remain unchanged.
 
-Within a logical agent session, discovery storage and the proposal, admission, and telemetry
-workers are initialized lazily once for the canonical workspace and reused across model switches,
-compaction, and other full-agent rebuilds. `--no-tools`, an ineligible JS tool, or unavailable
-worker containment starts none of these services. ACP sessions retain separate service owners and
-turn contexts, so concurrent clients cannot replace one another's selected-skill bundle.
+Within a logical agent session, discovery storage and telemetry are initialized lazily once for
+the canonical workspace and reused across model switches, compaction, and other full-agent
+rebuilds. Proposal and admission workers are not started by the shipped binary. `--no-tools`, an
+ineligible JS tool, or unavailable worker containment starts none of the discovery services. ACP
+sessions retain separate service owners and turn contexts, so concurrent clients cannot replace
+one another's selected-skill bundle.
 
 At a JS call boundary, `JsTool` snapshots the current bundle. Each selected skill runs in a private
 lexical namespace, its full SHA-256 identity and exports are revalidated, and only declared,
@@ -36,10 +37,10 @@ with newly minted scoped grants. The wrapper consumes that handle before stored 
 Replaying a consumed handle or calling after parent expiry/revocation fails closed, and no ambient,
 FIFO, or metadata fallback exists. Protected host globals cannot be replaced.
 Model-authored code then runs separately as `agent.js`, preserving its line numbers. Identity,
-collision, export, source, or capability errors fail before agent code executes. When proposal
-workers are configured, model code also receives bounded `propose_skill(draft)` access through a
-separate parent grant. Stored skill initialization and exports never receive proposal authority,
-and a newly proposed skill cannot run in the proposing step.
+collision, export, source, or capability errors fail before agent code executes. The shipped agent
+does not expose `propose_skill`: there is no authenticated operator adapter for held-out suite
+import, approval/denial, activation, or purge. Proposal and admission APIs remain test/library
+infrastructure. Stored skill initialization and exports never receive proposal authority.
 
 Private realms prevent one skill from receiving another skill's source-level capability object;
 they do not contain native compromise. The parent treats the union of all live current-step grants
@@ -47,9 +48,10 @@ as the worker's maximum brokered authority and still applies exact scope, sessio
 target narrowing, durable audit, and deadline checks to every effect. The worker has no ambient
 workspace, network, credential, database, or persistence authority.
 
-Normal removal is optimistic, versioned retirement. Retirement and privacy purge publish an
-immediate immutable visibility mask without rebuilding the graph; purge also deletes persistent
-vectors, and a purged identity is tombstoned so it cannot be resurrected.
+The library's removal contract is optimistic, versioned retirement. Retirement and privacy purge
+publish an immediate immutable visibility mask without rebuilding the graph; purge also deletes
+persistent vectors, and a purged identity is tombstoned so it cannot be resurrected. No shipped
+operator command currently invokes those lifecycle mutations.
 Agent Skill instructions and learned capabilities never bypass the existing MCP, filesystem,
 network, process, or sandbox permission paths.
 

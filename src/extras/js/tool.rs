@@ -37,10 +37,10 @@ use crate::extras::js::protocol::{
     MAX_SKILL_EXPORTS_PER_ARTIFACT,
 };
 #[cfg(feature = "skills")]
-use crate::extras::js::skills::admission::AdmissionWorker;
-#[cfg(feature = "skills")]
+use crate::extras::js::skills::proposal::ProposalEffectService;
+#[cfg(all(feature = "skills", test))]
 use crate::extras::js::skills::proposal::{
-    AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalEffectService, ProposalHost, ProposalWorker,
+    AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalHost, ProposalWorker,
 };
 use crate::extras::js::supervisor::{JsWorkerSupervisor, WorkerError};
 use crate::extras::js::types::{
@@ -592,12 +592,10 @@ pub struct JsTool {
     runtime: tokio::runtime::Handle,
     #[cfg(feature = "skills")]
     skill_turn_context: Arc<crate::extras::js::skills::turn::SkillTurnContext>,
-    #[cfg(feature = "skills")]
+    #[cfg(all(feature = "skills", test))]
     _proposal_worker: Option<ProposalWorker>,
     #[cfg(feature = "skills")]
     proposal_service: Option<ProposalEffectService>,
-    #[cfg(feature = "skills")]
-    _admission_worker: Option<AdmissionWorker>,
     #[cfg(feature = "skills")]
     telemetry: Option<Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>>,
     #[cfg(feature = "skills")]
@@ -621,7 +619,7 @@ impl JsTool {
         )
     }
 
-    #[cfg(feature = "skills")]
+    #[cfg(all(feature = "skills", test))]
     pub(crate) fn new_with_proposals(
         sandbox: Sandbox,
         permission: Option<PermCheck>,
@@ -635,22 +633,6 @@ impl JsTool {
             AttemptBudget::new(DEFAULT_SESSION_ATTEMPTS),
         )));
         tool._proposal_worker = Some(proposal_worker);
-        tool
-    }
-
-    #[cfg(feature = "skills")]
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn new_with_skill_workers(
-        sandbox: Sandbox,
-        permission: Option<PermCheck>,
-        ask_tx: Option<AskSender>,
-        allow_config: AllowConfig,
-        proposal_worker: ProposalWorker,
-        admission_worker: AdmissionWorker,
-    ) -> Self {
-        let mut tool =
-            Self::new_with_proposals(sandbox, permission, ask_tx, allow_config, proposal_worker);
-        tool._admission_worker = Some(admission_worker);
         tool
     }
 
@@ -678,12 +660,10 @@ impl JsTool {
             skill_turn_context: Arc::new(crate::extras::js::skills::turn::SkillTurnContext::new(
                 crate::extras::js::skills::turn::TurnSkillBundle::empty("unconfigured"),
             )),
-            #[cfg(feature = "skills")]
+            #[cfg(all(feature = "skills", test))]
             _proposal_worker: None,
             #[cfg(feature = "skills")]
             proposal_service: None,
-            #[cfg(feature = "skills")]
-            _admission_worker: None,
             #[cfg(feature = "skills")]
             telemetry: None,
             #[cfg(feature = "skills")]
@@ -716,12 +696,6 @@ impl JsTool {
         telemetry: Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>,
     ) -> Self {
         self.telemetry = Some(telemetry);
-        self
-    }
-
-    #[cfg(feature = "skills")]
-    pub(crate) fn with_proposal_service(mut self, proposal: ProposalEffectService) -> Self {
-        self.proposal_service = Some(proposal);
         self
     }
 

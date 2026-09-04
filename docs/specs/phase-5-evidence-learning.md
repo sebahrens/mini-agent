@@ -2,15 +2,20 @@
 
 - **Document role**: normative phase specification
 - **Specification version**: 1.1.0
-- **Delivery status**: delivered
+- **Delivery status**: library/test infrastructure delivered; lifecycle operator surface not shipped
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-02
+- **Last reconciled**: 2026-09-04
 - **Entry dependencies**: Foundation and Phases 1–4 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 5 blocker
 - **Target scale**: up to 100,000 local/shared skill revisions
 
 **Delivers**: directly attributed skill telemetry, evidence-gated canary promotion, automatic
 quarantine, immutable repair revisions, supersession, rollback, and bounded audit history.
+
+**Shipped-binary status**: retrieval and directly attributed telemetry are wired. Promotion,
+repair, retention, rollback, and privacy-purge entry points remain library/test infrastructure;
+the shipped agent starts none of the proposal or admission workers and exposes no lifecycle
+mutation surface. The policy below remains normative for a future authenticated operator adapter.
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). Phase 5 owns evidence-based lifecycle automation. It cannot bypass
@@ -22,7 +27,8 @@ quarantined before Phase 6 execution, rollback cannot reactivate them, and expli
 required for identity version 2. Phase 5's evidence thresholds, transactional lifecycle/index
 coordination, immutable lineage, repair, rollback mechanics for eligible artifacts, privacy, and
 retention remain authoritative. Phase 6's identity-v1 quarantine and identity-v2 eligibility
-extension is implemented on the current production path.
+extension is implemented on the current retrieval path. Lifecycle mutations are not presented as
+production-operable until the missing adapter is shipped.
 
 ---
 

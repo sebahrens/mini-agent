@@ -442,9 +442,6 @@ fn register_js_tool_with_status(
     #[cfg(feature = "skills")]
     if let Some(services) = skill_services {
         js_tool = js_tool.with_skill_turn_context(services.turn_context());
-        if let Some(proposal) = services.proposal() {
-            js_tool = js_tool.with_proposal_service(proposal);
-        }
         if let Some(telemetry) = services.telemetry() {
             js_tool = js_tool.with_shared_telemetry(telemetry);
         }

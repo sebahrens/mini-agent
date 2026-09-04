@@ -278,7 +278,7 @@ async fn tool_description_only_advertises_spawn_with_process_tree_ownership() {
 
 #[cfg(feature = "skills")]
 #[tokio::test]
-async fn proposal_global_is_unavailable_and_not_advertised_before_a18() {
+async fn shipped_tool_omits_unserviceable_proposal_global() {
     use rig::tool::Tool;
     let tool = make_test_tool();
 

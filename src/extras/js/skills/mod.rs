@@ -5,10 +5,9 @@
 //! identity. Persistence lives in [`store`], embedding in [`embed`], and no-effect
 //! verification in [`verify`].
 //!
-//! Several admission and mutation entry points are intentionally unused by the
-//! Phase 3 runtime. Phase 4 is their first production caller.
-
-#![allow(dead_code)]
+//! Proposal, admission, repair, retention, and purge APIs are currently library/test
+//! infrastructure. The shipped agent does not expose proposal authority until an authenticated
+//! operator approval adapter is available.
 //!
 //! Identity rules (see `docs/specs/phase-3-skill-library.md`):
 //!

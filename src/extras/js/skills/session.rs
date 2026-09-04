@@ -6,17 +6,9 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use tokio::sync::OnceCell;
 
-use super::admission::{AdmissionEvaluator, AdmissionWorker};
 use super::embed::Embedder;
-use super::proposal::{
-    AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalEffectService, ProposalHost, ProposalQueue,
-    ProposalWorker,
-};
-use super::store::SkillStore;
 use super::telemetry::TelemetryDispatcher;
 use super::turn::{SkillRuntime, SkillTurnContext, shared_coordinator};
 use crate::config::EmbeddingConfig;
@@ -244,17 +236,14 @@ mod tests {
     }
 }
 
-struct MutationServices {
-    proposal: ProposalEffectService,
+struct ObservationServices {
     telemetry: Arc<TelemetryDispatcher>,
-    _proposal_worker: ProposalWorker,
-    _admission_worker: AdmissionWorker,
 }
 
 /// The initialized learned-JS runtime and parent-side service workers for one workspace session.
 pub(crate) struct SkillSessionServices {
     runtime: Arc<SkillRuntime>,
-    mutation: Option<MutationServices>,
+    observation: Option<ObservationServices>,
     turn_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -292,31 +281,25 @@ impl SkillSessionServices {
         };
         runtime.schedule_learned_rebuild();
 
-        let mutation = match Self::start_mutation_services(&paths, embedding.as_ref()) {
+        let observation = match Self::start_observation_services(&paths, embedding.as_ref()) {
             Ok(services) => Some(services),
             Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    "skill proposal storage unavailable; propose_skill is disabled"
-                );
+                tracing::warn!(error = %error, "learned-skill telemetry is disabled");
                 None
             }
         };
 
         Some(Arc::new(Self {
             runtime,
-            mutation,
+            observation,
             turn_gate: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
 
-    fn start_mutation_services(
+    fn start_observation_services(
         paths: &crate::paths::AppPaths,
         embedding: Option<&EmbeddingConfig>,
-    ) -> Result<MutationServices, String> {
-        let proposal_store = SkillStore::open_at(paths).map_err(|error| error.to_string())?;
-        let evaluator_store = SkillStore::open_at(paths).map_err(|error| error.to_string())?;
-        let embedder = Embedder::from_config(embedding).map_err(|error| error.to_string())?;
+    ) -> Result<ObservationServices, String> {
         let telemetry_embedder =
             Arc::new(Embedder::from_config(embedding).map_err(|error| error.to_string())?);
         let (coordinator, _) =
@@ -325,27 +308,7 @@ impl SkillSessionServices {
             TelemetryDispatcher::spawn_session_scoped_with_coordinator(paths, coordinator)
                 .map_err(|error| error.to_string())?,
         );
-        let evaluator = AdmissionEvaluator::new(
-            evaluator_store,
-            embedder,
-            format!("mini-agent-{}", std::process::id()),
-        )
-        .map_err(|error| error.to_string())?;
-        let admission_worker =
-            AdmissionWorker::start_session_scoped(evaluator).map_err(|error| error.to_string())?;
-        let proposal_worker =
-            ProposalQueue::start_store_worker(proposal_store, 16, Duration::from_secs(2))
-                .map_err(|error| error.to_string())?;
-        let proposal = ProposalEffectService::new(ProposalHost::new(
-            proposal_worker.sender(),
-            AttemptBudget::new(DEFAULT_SESSION_ATTEMPTS),
-        ));
-        Ok(MutationServices {
-            proposal,
-            telemetry,
-            _proposal_worker: proposal_worker,
-            _admission_worker: admission_worker,
-        })
+        Ok(ObservationServices { telemetry })
     }
 
     pub(crate) fn turn_context(&self) -> Arc<SkillTurnContext> {
@@ -360,14 +323,8 @@ impl SkillSessionServices {
         Arc::clone(&self.turn_gate)
     }
 
-    pub(crate) fn proposal(&self) -> Option<ProposalEffectService> {
-        self.mutation
-            .as_ref()
-            .map(|services| services.proposal.clone())
-    }
-
     pub(crate) fn telemetry(&self) -> Option<Arc<TelemetryDispatcher>> {
-        self.mutation
+        self.observation
             .as_ref()
             .map(|services| Arc::clone(&services.telemetry))
     }
