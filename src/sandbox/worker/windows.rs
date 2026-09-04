@@ -461,11 +461,11 @@ mod feasibility {
         ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AccessCheck,
         AclSizeInformation, CreateWellKnownSid, DACL_SECURITY_INFORMATION, DuplicateToken,
         EqualSid, FreeSid, GENERIC_MAPPING, GetAce, GetAclInformation, GetLengthSid,
-        GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE, IsValidSid, NO_INHERITANCE,
-        OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSID, SECURITY_ATTRIBUTES,
-        SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SecurityImpersonation, TOKEN_DUPLICATE,
-        TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenIsAppContainer, TokenUser,
-        WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid,
+        GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE, IsValidSid, LookupAccountNameW,
+        NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSID, SECURITY_ATTRIBUTES,
+        SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SID_NAME_USE, SecurityImpersonation,
+        TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenIsAppContainer,
+        TokenUser, WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid,
         WinBuiltinUsersSid, WinLocalSystemSid, WinWorldSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1012,6 +1012,64 @@ mod feasibility {
             }
             Ok(Self(storage))
         }
+
+        fn account_name(name: &str) -> Result<Self, GateError> {
+            let name = wide_string(name);
+            let mut sid_bytes = 0u32;
+            let mut domain_chars = 0u32;
+            let mut sid_kind: SID_NAME_USE = 0;
+            // SAFETY: this is the documented sizing call. Both output lengths and the SID-kind
+            // slot are live, while the account name is NUL terminated and the data buffers are
+            // deliberately null with zero lengths.
+            let first = unsafe {
+                LookupAccountNameW(
+                    null(),
+                    name.as_ptr(),
+                    null_mut(),
+                    &mut sid_bytes,
+                    null_mut(),
+                    &mut domain_chars,
+                    &mut sid_kind,
+                )
+            };
+            if first != 0 || sid_bytes == 0 {
+                return Err(GateError(
+                    "account SID sizing returned an invalid result".to_string(),
+                ));
+            }
+            // SAFETY: GetLastError has no pointer arguments or ownership effects.
+            if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+                return Err(last_error("size account SID"));
+            }
+
+            let slot_size = size_of::<usize>();
+            let mut storage = vec![0usize; (sid_bytes as usize).div_ceil(slot_size)];
+            let mut domain = vec![0u16; domain_chars.max(1) as usize];
+            // SAFETY: both buffers are writable for the exact lengths supplied by the sizing
+            // call. The account name remains NUL terminated and every pointer stays live through
+            // this synchronous lookup.
+            if unsafe {
+                LookupAccountNameW(
+                    null(),
+                    name.as_ptr(),
+                    storage.as_mut_ptr().cast(),
+                    &mut sid_bytes,
+                    domain.as_mut_ptr(),
+                    &mut domain_chars,
+                    &mut sid_kind,
+                )
+            } == 0
+            {
+                return Err(last_error("resolve account SID"));
+            }
+            // SAFETY: the successful lookup initialized the aligned SID buffer.
+            if unsafe { IsValidSid(storage.as_mut_ptr().cast()) } == 0 {
+                return Err(GateError(
+                    "account lookup returned an invalid SID".to_string(),
+                ));
+            }
+            Ok(Self(storage))
+        }
     }
 
     fn current_user_sid() -> Result<OwnedSid, GateError> {
@@ -1090,6 +1148,7 @@ mod feasibility {
         user: OwnedSid,
         system: OwnedSid,
         administrators: OwnedSid,
+        trusted_installer: Option<OwnedSid>,
         broad: Vec<OwnedSid>,
         restricted_packages: LocalMemory,
     }
@@ -1109,6 +1168,9 @@ mod feasibility {
                 user: current_user_sid()?,
                 system: OwnedSid::well_known(WinLocalSystemSid)?,
                 administrators: OwnedSid::well_known(WinBuiltinAdministratorsSid)?,
+                // Program Files and Windows components are commonly owned by this exact
+                // OS-maintenance service SID. Absence stays fail closed on stripped hosts.
+                trusted_installer: OwnedSid::account_name("NT SERVICE\\TrustedInstaller").ok(),
                 broad: vec![
                     OwnedSid::well_known(WinWorldSid)?,
                     OwnedSid::well_known(WinAuthenticatedUserSid)?,
@@ -1123,6 +1185,10 @@ mod feasibility {
             sid_equal(sid, self.user.as_psid())
                 || sid_equal(sid, self.system.as_psid())
                 || sid_equal(sid, self.administrators.as_psid())
+                || self
+                    .trusted_installer
+                    .as_ref()
+                    .is_some_and(|trusted_installer| sid_equal(sid, trusted_installer.as_psid()))
         }
 
         fn broad(&self, sid: PSID) -> bool {

@@ -788,6 +788,8 @@ mod tests {
         assert!(source.contains("package_allow_set_is_exact(&appcontainer_allows)"));
         assert!(source.contains("InstallLocation::ProtectedMachineWide => ["));
         assert!(source.contains("policy.restricted_packages.0"));
+        assert!(source.contains("NT SERVICE\\\\TrustedInstaller"));
+        assert!(source.contains("trusted_installer: Option<OwnedSid>"));
         assert!(!source.contains("ProbeKind::VersionBinary"));
 
         let preflight = source
