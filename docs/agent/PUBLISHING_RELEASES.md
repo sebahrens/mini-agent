@@ -162,7 +162,9 @@ jobs cannot silently overwrite the same basename. `scripts/release_artifacts.py`
 extra, duplicate, unsafe, symlinked, or non-regular candidates and writes the LF-terminated
 `SHA256SUMS` in deterministic filename order. The final publication job reconstructs the complete
 candidate set and verifies every archive byte against that manifest before creating the public
-release.
+release. It uploads the complete set to a draft, compares the remote asset names with the validated
+local set, and only then publishes the draft. A rerun removes its stale draft but refuses to replace
+an already-published release for the tag.
 
 ## GPL release checklist
 

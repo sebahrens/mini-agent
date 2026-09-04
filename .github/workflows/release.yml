@@ -719,21 +719,57 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          prerelease=""
+          release_flags=(--draft --verify-tag)
           if [[ "$tag" == *-* ]]; then
-            prerelease="--prerelease"
+            release_flags+=(--prerelease)
           fi
           version="${tag#v}"
           version="${version%%-*}"
           python3 scripts/extract-changelog.py \
             --version "$version" \
             --output release-notes.md
-          # Remove any partial release from a prior failed attempt so reruns are clean
-          gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          existing="$(gh release view "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq '.isDraft' 2>/dev/null || true)"
+          if [[ "$existing" == "true" ]]; then
+            gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY"
+          elif [[ "$existing" == "false" ]]; then
+            echo "ERROR: published release $tag already exists; refusing to replace it" >&2
+            exit 1
+          elif [[ -n "$existing" ]]; then
+            echo "ERROR: could not classify existing release $tag" >&2
+            exit 1
+          fi
+
           mapfile -t assets < <(find private-publish -type f | sort)
+          mapfile -t expected_asset_names < <(
+            printf '%s\n' "${assets[@]}" | sed 's|.*/||' | sort
+          )
           gh release create "$tag" \
             "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$tag" \
             --notes-file release-notes.md \
-            $prerelease
+            "${release_flags[@]}"
+
+          if [[ "$(gh release view "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq '.isDraft')" != "true" ]]; then
+            echo "ERROR: release candidate became public before remote verification" >&2
+            exit 1
+          fi
+          mapfile -t remote_asset_names < <(
+            gh release view "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name' | sort
+          )
+          if ! diff -u \
+            <(printf '%s\n' "${expected_asset_names[@]}") \
+            <(printf '%s\n' "${remote_asset_names[@]}"); then
+            echo "ERROR: draft release asset set differs from validated candidates" >&2
+            exit 1
+          fi
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false

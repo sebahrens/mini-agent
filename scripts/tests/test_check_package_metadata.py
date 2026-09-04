@@ -479,6 +479,12 @@ steps:
             ("python3 scripts/release_artifacts.py manifest \\", "sha256sum *.tar.gz"),
             ("python3 scripts/release_artifacts.py verify \\", "true # skipped verify"),
             ('gh release create "$tag"', 'gh release upload "$tag"'),
+            ("release_flags=(--draft --verify-tag)", "release_flags=()"),
+            ("--jq '.assets[].name' | sort", "--jq '.assets[0].name' | sort"),
+            (
+                'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false',
+                "true # left as draft",
+            ),
         )
         for old, new in mutations:
             with self.subTest(fragment=old):
@@ -488,6 +494,20 @@ steps:
                     any("private artifact" in error or "atomic publication" in error for error in errors),
                     errors,
                 )
+
+    def test_release_rejects_publication_before_draft_verification(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        create = 'gh release create "$tag"'
+        publish = 'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false'
+        modified = workflow.replace(create, "PUBLICATION_ORDER_PLACEHOLDER", 1)
+        modified = modified.replace(publish, create, 1)
+        modified = modified.replace("PUBLICATION_ORDER_PLACEHOLDER", publish, 1)
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(modified, "mini-agent")
+
+        self.assertTrue(any("atomic publication steps" in error for error in errors))
 
     def test_static_release_matrix_rejects_arm_cross_host(self) -> None:
         workflow = (

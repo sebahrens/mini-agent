@@ -501,6 +501,12 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         "--manifest private-publish/checksums/SHA256SUMS",
         'mapfile -t assets < <(find private-publish -type f | sort)',
         'gh release create "$tag"',
+        "release_flags=(--draft --verify-tag)",
+        "--json assets",
+        "--jq '.assets[].name' | sort",
+        'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false',
+        'published release $tag already exists; refusing to replace it',
+        '"${release_flags[@]}"',
     )
     missing_publication_gate = [
         fragment for fragment in publication_fragments if fragment not in publish_release_job
@@ -509,6 +515,27 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         errors.append(
             ".github/workflows/release.yml must validate the complete candidate set "
             f"before atomic publication; missing={missing_publication_gate}"
+        )
+    publication_order = (
+        "python3 scripts/release_artifacts.py validate-set \\",
+        "python3 scripts/release_artifacts.py verify \\",
+        'gh release create "$tag"',
+        "--json assets",
+        'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false',
+    )
+    publication_positions = [
+        publish_release_job.find(fragment) for fragment in publication_order
+    ]
+    if any(position < 0 for position in publication_positions) or publication_positions != sorted(
+        publication_positions
+    ):
+        errors.append(
+            ".github/workflows/release.yml atomic publication steps must remain ordered: "
+            "validate, verify checksums, create draft, verify remote assets, publish"
+        )
+    if 'gh release upload "$tag"' in publish_release_job:
+        errors.append(
+            ".github/workflows/release.yml must not append assets to an existing release"
         )
     forbidden = (
         "target/${{ matrix.target }}/release/zerostack",
