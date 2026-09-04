@@ -731,7 +731,7 @@ valid pipe standard handles, and no console, window, or device authority. The pa
 failure or timeout becomes one fixed source-free unavailable reason. Later public launch never
 retries under a weaker token or an uncontained launcher.
 
-The caller's 20-second wait starts before profile/ACL preparation and the global creation-lock
+The caller's five-second wait starts before profile/ACL preparation and the global creation-lock
 wait. The launcher propagates that absolute deadline and checks it immediately after acquiring the
 creation lock and again immediately before `CreateProcessW`, so a lock released after caller
 timeout cannot authorize a new launch. The preflight calls the raw launcher directly rather than

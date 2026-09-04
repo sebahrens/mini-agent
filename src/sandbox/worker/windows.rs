@@ -562,7 +562,7 @@ mod feasibility {
     const PROBE_NETWORK_POLICY_ENV: &str = "MINI_AGENT_WINDOWS_PROBE_NETWORK_POLICY";
     const PROBE_NETWORK_POLICY_VALUE: &str = "zero-capability-no-loopback-v1";
     const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
-    const PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
+    const PRODUCTION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
     const PRODUCTION_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
     const PRODUCTION_PREFLIGHT_HELPER_ARG: &str = "--mini-agent-windows-worker-preflight-v1";
     const PRODUCTION_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -2974,26 +2974,40 @@ mod feasibility {
     pub(super) fn launch_production(
         hooks: ProductionLaunchHooks,
     ) -> Result<WorkerProcess, GateError> {
+        launch_production_observed(hooks, |_| {})
+    }
+
+    fn launch_production_observed(
+        hooks: ProductionLaunchHooks,
+        mut observe: impl FnMut(RuntimePreflightFailureStage),
+    ) -> Result<WorkerProcess, GateError> {
         #[cfg(test)]
         let mut hooks = hooks;
+        observe(RuntimePreflightFailureStage::LaunchProfile);
         hooks.checkpoint(ProductionFailurePoint::CreateProfile)?;
         let profile = AppContainerProfile::production_zero_capability()?;
         ensure_appcontainer_network_isolated(profile.sid)?;
+        observe(RuntimePreflightFailureStage::LaunchLocation);
         hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
         let executable = production_executable(&hooks)?;
         let policy = SidPolicy::current()?;
         let deadline = hooks
             .deadline
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+        observe(RuntimePreflightFailureStage::LaunchSynchronization);
         let acl_mutation = crate::sandbox::windows::AclMutationGuard::acquire_until(deadline)
             .map_err(|error| GateError(format!("serialize worker executable ACL: {error}")))?;
+        observe(RuntimePreflightFailureStage::LaunchAcl);
         let (executable, _location, image_lock) =
             prepare_executable_acl_locked(&executable, profile.sid, &policy, &acl_mutation)?;
+        observe(RuntimePreflightFailureStage::LaunchSynchronization);
         let inheritance_guard = crate::process_creation::creation_guard()?;
         hooks.require_before_deadline()?;
+        observe(RuntimePreflightFailureStage::LaunchPipes);
         let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
         #[cfg(test)]
         let mut probe_canary_inheritance = ProbeCanaryInheritance::new(hooks.containment.as_mut())?;
+        observe(RuntimePreflightFailureStage::LaunchJob);
         let job = production_job(&hooks)?;
 
         let security_capabilities = SECURITY_CAPABILITIES {
@@ -3009,6 +3023,7 @@ mod feasibility {
         let all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
         let child_process_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
         let mitigation_policy = MITIGATION_POLICY;
+        observe(RuntimePreflightFailureStage::LaunchAttributes);
         hooks.checkpoint(ProductionFailurePoint::AllocateAttributeList)?;
         let mut attributes = AttributeList::new(6)?;
         hooks.checkpoint(ProductionFailurePoint::SecurityCapabilitiesAttribute)?;
@@ -3034,6 +3049,7 @@ mod feasibility {
         attributes.update_slice(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited_handles)?;
 
         let executable_wide = wide_null(executable.as_os_str())?;
+        observe(RuntimePreflightFailureStage::LaunchEnvironment);
         let child_directory = system_windows_directory()?;
         let child_directory_wide = wide_null(child_directory.as_os_str())?;
         let mut command_line = production_command_line(&executable, hooks.child)?;
@@ -3047,6 +3063,7 @@ mod feasibility {
         startup.lpAttributeList = attributes.pointer;
         let mut process_information = PROCESS_INFORMATION::default();
 
+        observe(RuntimePreflightFailureStage::LaunchCreateProcess);
         hooks.checkpoint(ProductionFailurePoint::CreateProcess)?;
         hooks.require_before_deadline()?;
         // CreateProcessW itself is not cancellable, so the shared creation lock and the final
@@ -3085,6 +3102,7 @@ mod feasibility {
             std::sync::atomic::Ordering::Release,
         );
 
+        observe(RuntimePreflightFailureStage::LaunchHandles);
         if let Err(error) = hooks.checkpoint(ProductionFailurePoint::OwnProcessHandle) {
             close_unowned_handle(process_information.hProcess);
             close_unowned_handle(process_information.hThread);
@@ -3120,6 +3138,7 @@ mod feasibility {
         drop(inheritance_guard);
         drop(thread);
 
+        observe(RuntimePreflightFailureStage::LaunchVerification);
         hooks.checkpoint(ProductionFailurePoint::VerifyCreationTimeJob)?;
         let mut in_creation_job = 0;
         // SAFETY: both directly owned handles are live. This verifies the exact Job supplied in
@@ -3608,58 +3627,6 @@ mod feasibility {
         LaunchSynchronization = 93,
     }
 
-    fn classify_runtime_preflight_launch_failure(
-        error: &GateError,
-    ) -> RuntimePreflightFailureStage {
-        let message = error.0.as_str();
-        if message.contains("exceeded its caller deadline") {
-            RuntimePreflightFailureStage::Deadline
-        } else if message.contains("profile") || message.contains("loopback exemption") {
-            RuntimePreflightFailureStage::LaunchProfile
-        } else if message.contains("location") || message.contains("classified root") {
-            RuntimePreflightFailureStage::LaunchLocation
-        } else if message.contains("reparse")
-            || message.contains("remote")
-            || message.contains("canonicalize")
-            || message.contains("path component")
-            || message.contains("image-path ancestor")
-            || message.contains("supported root")
-        {
-            RuntimePreflightFailureStage::LaunchPath
-        } else if message.contains("does not own") || message.contains("owner") {
-            RuntimePreflightFailureStage::LaunchOwner
-        } else if message.contains("lock inspected executable") {
-            RuntimePreflightFailureStage::LaunchImageLock
-        } else if message.contains("ACL")
-            || message.contains("ACE")
-            || message.contains("rights")
-            || message.contains("AppContainer access")
-        {
-            RuntimePreflightFailureStage::LaunchAcl
-        } else if message.contains("pipe") {
-            RuntimePreflightFailureStage::LaunchPipes
-        } else if message.contains("Job") {
-            RuntimePreflightFailureStage::LaunchJob
-        } else if message.contains("attribute") {
-            RuntimePreflightFailureStage::LaunchAttributes
-        } else if message.contains("environment")
-            || message.contains("AppContainer temp")
-            || message.contains("system Windows directory")
-        {
-            RuntimePreflightFailureStage::LaunchEnvironment
-        } else if message.contains("create zero-capability LPAC JavaScript worker") {
-            RuntimePreflightFailureStage::LaunchCreateProcess
-        } else if message.contains("handle") || message.contains("inherit") {
-            RuntimePreflightFailureStage::LaunchHandles
-        } else if message.contains("verify LPAC") || message.contains("access semantics") {
-            RuntimePreflightFailureStage::LaunchVerification
-        } else if message.contains("serialize") || message.contains("creation lock") {
-            RuntimePreflightFailureStage::LaunchSynchronization
-        } else {
-            RuntimePreflightFailureStage::LaunchUnknown
-        }
-    }
-
     #[derive(Debug)]
     struct RuntimePreflightFailure {
         stage: RuntimePreflightFailureStage,
@@ -3676,9 +3643,9 @@ mod feasibility {
         hooks: ProductionLaunchHooks,
         deadline: Instant,
     ) -> Result<(), RuntimePreflightFailure> {
-        let mut process = launch_production(hooks).map_err(|error| {
-            RuntimePreflightFailure::new(classify_runtime_preflight_launch_failure(&error), error)
-        })?;
+        let launch_stage = std::cell::Cell::new(RuntimePreflightFailureStage::LaunchUnknown);
+        let mut process = launch_production_observed(hooks, |stage| launch_stage.set(stage))
+            .map_err(|error| RuntimePreflightFailure::new(launch_stage.get(), error))?;
         let result = (|| {
             if Instant::now() >= deadline {
                 return Err(RuntimePreflightFailure::new(

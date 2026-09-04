@@ -30,13 +30,11 @@ recovering exact private preflight roots preserved by an earlier interrupted pro
 closed `windows_general_appcontainer_preflight` timing event alongside total process time; do not
 record paths, shell text, JavaScript diagnostics, or configuration contents.
 
-The JavaScript worker preflight runs in a kill-on-close Job with a 20-second run deadline and a
-one-second whole-tree cleanup deadline. The longer cold-start bound covers first-install
-AppContainer profile and executable-ACL preparation on Windows release filesystems while remaining
-finite and checked before process creation. Its executable ACL preparation, launch, and exact
-rollback share the general AppContainer ACL transaction, so concurrent preflights serialize while
-that file authority is active. A timed-out helper must be reaped and the original owner/DACL
-restored before the failed result is cached.
+The JavaScript worker preflight runs in a kill-on-close Job with a five-second run deadline and a
+one-second whole-tree cleanup deadline. Its executable ACL preparation, launch, and exact rollback
+share the general AppContainer ACL transaction, so concurrent preflights serialize while that file
+authority is active. A timed-out helper must be reaped and the original owner/DACL restored before
+the failed result is cached.
 
 Windows-native measurements are release evidence and must be appended here with the commit, host
 class, five raw samples, median, and maximum. Measurements from macOS/Linux are not substitutes.
