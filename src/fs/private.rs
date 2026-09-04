@@ -770,14 +770,35 @@ mod windows {
                     Ok(())
                 } else {
                     let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+                    if error.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+                        return Err(error);
+                    }
+
+                    if delete_share_is_locked(target) {
+                        return Err(std::io::Error::from_raw_os_error(
+                            ERROR_SHARING_VIOLATION as i32,
+                        ));
+                    }
+
+                    // MoveFileEx reports ACCESS_DENIED for a target opened
+                    // without delete sharing. The blocking handle can close
+                    // between that failure and the diagnostic open above, so
+                    // retry publication once before treating ACCESS_DENIED as
+                    // a stable permission failure. A still-live blocker is
+                    // converted to SHARING_VIOLATION for the bounded retry.
+                    if unsafe { MoveFileExW(temp_wide.as_ptr(), target_wide.as_ptr(), flags) } != 0
+                    {
+                        return Ok(());
+                    }
+                    let retry_error = std::io::Error::last_os_error();
+                    if retry_error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
                         && delete_share_is_locked(target)
                     {
                         Err(std::io::Error::from_raw_os_error(
                             ERROR_SHARING_VIOLATION as i32,
                         ))
                     } else {
-                        Err(error)
+                        Err(retry_error)
                     }
                 }
             },

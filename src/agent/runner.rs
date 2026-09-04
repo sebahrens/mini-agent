@@ -2669,7 +2669,10 @@ mod tests {
                     is_async: true,
                     condition: None,
                     once: false,
-                    trust: Default::default(),
+                    // This test isolates scoped async-child ownership. Sandbox
+                    // launch policy has separate integration coverage and must
+                    // not make this lifecycle regression depend on host bwrap.
+                    trust: crate::extras::hooks::settings::HookTrust::Trusted,
                     env: Default::default(),
                 }],
             }],
