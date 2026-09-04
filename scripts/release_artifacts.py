@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import os
 import re
@@ -18,8 +17,31 @@ from pathlib import Path
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 SHA256_LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]*)$")
-WINDOWS_SID = re.compile(r"^S-1-(?:[0-9]+-)+[0-9]+$")
 REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md")
+WINDOWS_PRIVATE_DIRECTORY_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$acl = New-Object Security.AccessControl.DirectorySecurity
+$acl.SetOwner($identity.User)
+$acl.SetAccessRuleProtection($true, $false)
+$inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor `
+    [Security.AccessControl.InheritanceFlags]::ObjectInherit
+foreach ($sidValue in @($identity.User.Value, 'S-1-5-18', 'S-1-5-32-544')) {
+    $sid = New-Object Security.Principal.SecurityIdentifier($sidValue)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+        $sid,
+        [Security.AccessControl.FileSystemRights]::FullControl,
+        $inheritance,
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    [void]$acl.AddAccessRule($rule)
+}
+[IO.Directory]::SetAccessControl(
+    $env:MINI_AGENT_RELEASE_SMOKE_DIRECTORY,
+    $acl
+)
+"""
 
 
 class ReleaseArtifactError(ValueError):
@@ -198,42 +220,41 @@ def _closed_windows_preflight_status(
 
 
 def _harden_windows_install_directory(
-    directory: Path, platform_name: str = os.name
+    directory: Path,
+    platform_name: str = os.name,
+    environment: Mapping[str, str] = os.environ,
 ) -> None:
     if platform_name != "nt":
         return
+    system_root = environment.get("SystemRoot")
+    if not system_root:
+        raise ReleaseArtifactError(
+            "cannot create a private Windows smoke-install directory"
+        )
+    powershell = (
+        Path(system_root)
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    acl_environment = dict(environment)
+    acl_environment["MINI_AGENT_RELEASE_SMOKE_DIRECTORY"] = str(directory)
     try:
-        identity = subprocess.run(
-            ["whoami", "/user", "/fo", "csv", "/nh"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        rows = list(csv.reader(identity.stdout.splitlines()))
-        sid = (
-            rows[0][1].strip()
-            if identity.returncode == 0 and len(rows) == 1 and len(rows[0]) == 2
-            else ""
-        )
-        if not WINDOWS_SID.fullmatch(sid):
-            raise ReleaseArtifactError(
-                "cannot resolve the Windows smoke-install user identity"
-            )
         hardened = subprocess.run(
             [
-                "icacls",
-                str(directory),
-                "/inheritance:r",
-                "/grant:r",
-                f"*{sid}:(OI)(CI)F",
-                "*S-1-5-18:(OI)(CI)F",
-                "*S-1-5-32-544:(OI)(CI)F",
+                str(powershell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_PRIVATE_DIRECTORY_SCRIPT,
             ],
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
+            env=acl_environment,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseArtifactError(
