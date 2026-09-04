@@ -17,6 +17,11 @@ SPEC.loader.exec_module(PACKAGE_RELEASE_BINARY)
 
 
 class PackageReleaseBinaryTests(unittest.TestCase):
+    def test_required_legal_documents_are_checked_out_with_lf_on_windows(self) -> None:
+        attributes = (SCRIPT.parents[1] / ".gitattributes").read_text(encoding="utf-8")
+        for document in ("LICENSE", "NOTICE", "SOURCE.md"):
+            self.assertIn(f"{document} text eol=lf", attributes.splitlines())
+
     def make_root(self, directory: str) -> Path:
         root = Path(directory)
         repository = SCRIPT.parents[1]
