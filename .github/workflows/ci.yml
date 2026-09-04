@@ -1841,6 +1841,8 @@ jobs:
             rig_multi_turn_run_usage_saturates_before_completion_delivery
           cargo install --locked --path "$pkgdir" --debug --root "$tmpdir/install"
           "$tmpdir/install/bin/mini-agent" --version | grep -Fq "mini-agent "
+          "$tmpdir/install/bin/mini-agent" --js-runtime-check |
+            grep -Fxq "JS runtime check: PASS (2)"
 
   dependency-policy:
     if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'

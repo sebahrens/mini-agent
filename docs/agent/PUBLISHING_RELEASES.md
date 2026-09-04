@@ -14,9 +14,12 @@ named `mini-agent-<target>.tar.gz`; lite archives are named
 `mini-agent-lite-<target>.tar.gz`. Every binary archive contains exactly four top-level files:
 `mini-agent` (or `mini-agent.exe`), `LICENSE`, `NOTICE`, and `SOURCE.md`. The release workflow checks
 that exact payload, extracts it into a clean directory, and runs the executable with `--version`
-before upload. Full archives use the supported default Cargo feature set; lite archives
-use `--no-default-features`. Opt-in native features such as `skills-embed` are not silently bundled
-into cross-platform archives and keep their platform-specific installation requirements.
+before upload. A second clean-runner gate downloads each exact private archive on its native
+platform. Full archives must pass the offline `--js-runtime-check` (`1 + 1` evaluates to `2`), while
+lite archives must reject that feature-specific diagnostic. Full archives use the supported default
+Cargo feature set; lite archives use `--no-default-features`. Opt-in native features such as
+`skills-embed` are not silently bundled into cross-platform archives and keep their
+platform-specific installation requirements.
 
 Every release also includes five platform VSIX candidates, the dual-purpose
 `mini-agent-windows-x64.msi`, their checksum manifests, and
@@ -142,6 +145,13 @@ and lite archive, the tag-matched Corresponding Source archive, five platform VS
 Windows MSI, and all three checksum manifests have been assembled and checked. The MSI job uses
 pinned WiX 6.0.2, performs a quiet per-user install, runs the installed binary, and uninstalls it
 before upload.
+
+Private archive artifacts remain in separate download directories until checksum assembly so two
+jobs cannot silently overwrite the same basename. `scripts/release_artifacts.py` rejects missing,
+extra, duplicate, unsafe, symlinked, or non-regular candidates and writes the LF-terminated
+`SHA256SUMS` in deterministic filename order. The final publication job reconstructs the complete
+candidate set and verifies every archive byte against that manifest before creating the public
+release.
 
 ## GPL release checklist
 

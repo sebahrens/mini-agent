@@ -103,6 +103,14 @@ fi
             text=True,
         )
 
+    def assert_rejected_before_install(
+        self, root: Path, release: Path, stub_bin: Path, message: str
+    ) -> None:
+        result = self.run_installer(root, release, stub_bin)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(message, result.stderr)
+        self.assertFalse((root / "prefix/bin/mini-agent").exists())
+
     def test_installs_binary_license_notice_and_source_directions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -128,6 +136,61 @@ fi
             self.assertNotEqual(0, result.returncode)
             self.assertIn("required GPL document NOTICE", result.stderr)
             self.assertFalse((root / "prefix/bin/mini-agent").exists())
+
+    def test_missing_checksum_entry_fails_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            (release / "SHA256SUMS").write_text(
+                "0" * 64 + "  mini-agent-x86_64-unknown-linux-gnu.tar.gz\n",
+                encoding="ascii",
+            )
+            self.assert_rejected_before_install(root, release, stub_bin, "has no entry")
+
+    def test_duplicate_checksum_entry_fails_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            manifest = release / "SHA256SUMS"
+            manifest.write_bytes(manifest.read_bytes() * 2)
+            self.assert_rejected_before_install(root, release, stub_bin, "duplicate entries")
+
+    def test_malformed_checksum_entry_fails_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            archive = "mini-agent-aarch64-apple-darwin.tar.gz"
+            (release / "SHA256SUMS").write_text(
+                f"not-a-sha256  {archive}\n", encoding="ascii"
+            )
+            self.assert_rejected_before_install(root, release, stub_bin, "malformed hash")
+
+    def test_noncanonical_selected_line_fails_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            manifest = release / "SHA256SUMS"
+            manifest.write_text(manifest.read_text(encoding="ascii").rstrip() + "  extra\n")
+            self.assert_rejected_before_install(root, release, stub_bin, "malformed entry")
+
+    def test_checksum_mismatch_fails_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            archive = release / "mini-agent-aarch64-apple-darwin.tar.gz"
+            archive.write_bytes(archive.read_bytes() + b"tampered")
+            self.assert_rejected_before_install(root, release, stub_bin, "checksum mismatch")
+
+    def test_filename_matching_treats_dots_literally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            canonical = "mini-agent-aarch64-apple-darwin.tar.gz"
+            misleading = canonical.replace(".", "x")
+            (release / "SHA256SUMS").write_text(
+                f"{'0' * 64}  {misleading}\n", encoding="ascii"
+            )
+            self.assert_rejected_before_install(root, release, stub_bin, "has no entry")
 
 
 if __name__ == "__main__":

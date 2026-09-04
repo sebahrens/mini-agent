@@ -44,6 +44,13 @@ pub struct Cli {
     )]
     pub project_config_trust_check: bool,
 
+    #[cfg(feature = "js")]
+    #[arg(
+        long = "js-runtime-check",
+        help = "Execute an offline JavaScript runtime self-check and exit"
+    )]
+    pub js_runtime_check: bool,
+
     #[arg(
         long = "import-agent-skill",
         value_name = "PATH",

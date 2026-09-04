@@ -192,7 +192,12 @@ RELEASE_VERSION_EXPORT = 'echo "version=$version" >> "$GITHUB_OUTPUT"'
 RELEASE_VERSION_CONSUMER = (
     "RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}"
 )
-RELEASE_VERSION_CONSUMER_JOBS = ("vscode-vsix", "vscode-candidates", "publish-release")
+RELEASE_VERSION_CONSUMER_JOBS = (
+    "archive-smoke",
+    "vscode-vsix",
+    "vscode-candidates",
+    "publish-release",
+)
 HARDCODED_RELEASE_VERSION = re.compile(r"mini-agent-v?\d+\.\d+\.\d+")
 EXPECTED_VSCODE_RELEASE_ARTIFACTS = (
     "VSIX_SHA256SUMS",
@@ -434,6 +439,40 @@ def validate_workflow(text: str, binary: str) -> list[str]:
                 f"--locked so Cargo.lock is authoritative: {command.strip()!r}"
             )
     errors.extend(validate_release_version_source(text))
+    archive_smoke_job = _workflow_job(text, "archive-smoke")
+    archive_smoke_fragments = (
+        "needs: [package-metadata, build, build-static, build-windows]",
+        "name: archives-${{ matrix.target }}",
+        "python3 scripts/release_artifacts.py smoke \\",
+        "--expect-js yes",
+        "--expect-js no",
+    )
+    missing_archive_smoke = [
+        fragment for fragment in archive_smoke_fragments if fragment not in archive_smoke_job
+    ]
+    if missing_archive_smoke:
+        errors.append(
+            ".github/workflows/release.yml must native-smoke every exact full/lite "
+            f"archive before checksums; missing={missing_archive_smoke}"
+        )
+
+    checksum_job = _workflow_job(text, "checksums")
+    checksum_fragments = (
+        "needs: [archive-smoke, corresponding-source]",
+        "python3 scripts/release_artifacts.py validate-set \\",
+        "python3 scripts/release_artifacts.py manifest \\",
+        "--root private-artifacts",
+        "--manifest SHA256SUMS",
+    )
+    missing_checksum_gate = [
+        fragment for fragment in checksum_fragments if fragment not in checksum_job
+    ]
+    if missing_checksum_gate or "merge-multiple: true" in checksum_job:
+        errors.append(
+            ".github/workflows/release.yml must checksum a complete, duplicate-visible "
+            f"private artifact set; missing={missing_checksum_gate}"
+        )
+
     publish_release_start = text.find("\n  publish-release:")
     publish_release_job = (
         text[publish_release_start:] if publish_release_start >= 0 else ""
@@ -454,6 +493,22 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         errors.append(
             ".github/workflows/release.yml must publish the versioned "
             f"CHANGELOG section; missing={missing_release_notes}"
+        )
+    publication_fragments = (
+        "needs: [package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]",
+        "python3 scripts/release_artifacts.py validate-set \\",
+        "python3 scripts/release_artifacts.py verify \\",
+        "--manifest private-publish/checksums/SHA256SUMS",
+        'mapfile -t assets < <(find private-publish -type f | sort)',
+        'gh release create "$tag"',
+    )
+    missing_publication_gate = [
+        fragment for fragment in publication_fragments if fragment not in publish_release_job
+    ]
+    if missing_publication_gate:
+        errors.append(
+            ".github/workflows/release.yml must validate the complete candidate set "
+            f"before atomic publication; missing={missing_publication_gate}"
         )
     forbidden = (
         "target/${{ matrix.target }}/release/zerostack",

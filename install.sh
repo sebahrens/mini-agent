@@ -126,8 +126,10 @@ if [[ ! -s "$MANIFEST" ]]; then
     exit 1
 fi
 
-# Count entries for this archive (must be exactly 1)
-MATCH_COUNT=$(grep -c "  ${ARCHIVE_FILE}$" "$MANIFEST" || true)
+# Match the filename as an exact whitespace-delimited field, not as a regular
+# expression. Dots and other punctuation in the platform name must stay
+# literal, and extra fields make the selected line non-canonical below.
+MATCH_COUNT=$(awk -v target="$ARCHIVE_FILE" '$2 == target { count++ } END { print count + 0 }' "$MANIFEST")
 if [[ "$MATCH_COUNT" -eq 0 ]]; then
     echo "Error: SHA256SUMS has no entry for ${ARCHIVE_FILE}." >&2
     exit 1
@@ -137,11 +139,16 @@ if [[ "$MATCH_COUNT" -gt 1 ]]; then
     exit 1
 fi
 
-EXPECTED_HASH=$(grep "  ${ARCHIVE_FILE}$" "$MANIFEST" | awk '{print $1}')
+MATCH_LINE=$(awk -v target="$ARCHIVE_FILE" '$2 == target { print }' "$MANIFEST")
+EXPECTED_HASH=$(printf '%s\n' "$MATCH_LINE" | awk '{print $1}')
 
 # Validate hash is a 64-character hex string
 if [[ ! "$EXPECTED_HASH" =~ ^[0-9a-f]{64}$ ]]; then
     echo "Error: SHA256SUMS contains a malformed hash for ${ARCHIVE_FILE}." >&2
+    exit 1
+fi
+if [[ "$MATCH_LINE" != "${EXPECTED_HASH}  ${ARCHIVE_FILE}" ]]; then
+    echo "Error: SHA256SUMS contains a malformed entry for ${ARCHIVE_FILE}." >&2
     exit 1
 fi
 

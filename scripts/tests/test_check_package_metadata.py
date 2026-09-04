@@ -454,6 +454,41 @@ steps:
             any("package-release-binary.py" in error for error in errors)
         )
 
+    def test_release_requires_native_archive_smoke_before_checksums(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        mutations = (
+            ("--expect-js yes", "--expect-js no"),
+            (
+                "needs: [archive-smoke, corresponding-source]",
+                "needs: [build, build-static, build-windows, corresponding-source]",
+            ),
+        )
+        for old, new in mutations:
+            with self.subTest(fragment=old):
+                modified = workflow.replace(old, new, 1)
+                errors = CHECK_PACKAGE_METADATA.validate_workflow(modified, "mini-agent")
+                self.assertTrue(any("native-smoke" in error or "private artifact" in error for error in errors))
+
+    def test_release_requires_strict_manifest_and_atomic_publication_gates(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        mutations = (
+            ("python3 scripts/release_artifacts.py manifest \\", "sha256sum *.tar.gz"),
+            ("python3 scripts/release_artifacts.py verify \\", "true # skipped verify"),
+            ('gh release create "$tag"', 'gh release upload "$tag"'),
+        )
+        for old, new in mutations:
+            with self.subTest(fragment=old):
+                modified = workflow.replace(old, new, 1)
+                errors = CHECK_PACKAGE_METADATA.validate_workflow(modified, "mini-agent")
+                self.assertTrue(
+                    any("private artifact" in error or "atomic publication" in error for error in errors),
+                    errors,
+                )
+
     def test_static_release_matrix_rejects_arm_cross_host(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github/workflows/release.yml"

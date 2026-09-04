@@ -289,21 +289,82 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  archive-smoke:
+    name: Smoke ${{ matrix.target }} archives
+    needs: [package-metadata, build, build-static, build-windows]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: mini-agent
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable: mini-agent
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: mini-agent
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            executable: mini-agent
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            executable: mini-agent
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            executable: mini-agent
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: mini-agent.exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download exact private archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: archives-${{ matrix.target }}
+          path: smoke-input
+
+      - name: Smoke exact full and lite archives
+        env:
+          RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          python3 scripts/release_artifacts.py smoke \
+            --archive "smoke-input/mini-agent-$RELEASE_TARGET.tar.gz" \
+            --executable-name "$RELEASE_EXECUTABLE" \
+            --expected-version "$RELEASE_VERSION" \
+            --expect-js yes
+          python3 scripts/release_artifacts.py smoke \
+            --archive "smoke-input/mini-agent-lite-$RELEASE_TARGET.tar.gz" \
+            --executable-name "$RELEASE_EXECUTABLE" \
+            --expected-version "$RELEASE_VERSION" \
+            --expect-js no
+
   checksums:
     name: SHA256SUMS
-    needs: [build, build-static, build-windows, corresponding-source]
+    needs: [archive-smoke, corresponding-source]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Download all archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: archives-*
-          merge-multiple: true
+          path: private-artifacts
 
       - name: Download Corresponding Source
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: corresponding-source
+          path: private-artifacts/corresponding-source
 
       - name: Verify expected archive set
         run: |
@@ -324,19 +385,17 @@ jobs:
             mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
             mini-agent-${GITHUB_REF_NAME}-source.tar.gz
           )
-          found=$(ls *.tar.gz | sort)
-          expected_sorted=$(printf '%s\n' "${expected[@]}" | sort)
-          if [ "$found" != "$expected_sorted" ]; then
-            echo "ERROR: Archive set mismatch"
-            echo "Expected:"
-            echo "$expected_sorted"
-            echo "Found:"
-            echo "$found"
-            exit 1
-          fi
+          printf '%s\n' "${expected[@]}" > expected-archives.txt
+          python3 scripts/release_artifacts.py validate-set \
+            --root private-artifacts \
+            --expected-file expected-archives.txt
 
       - name: Generate SHA256SUMS
-        run: sha256sum *.tar.gz | sort > SHA256SUMS
+        run: |
+          python3 scripts/release_artifacts.py manifest \
+            --root private-artifacts \
+            --expected-file expected-archives.txt \
+            --manifest SHA256SUMS
 
       - name: Upload checksums
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -557,7 +616,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub release
-    needs: [package-metadata, build, build-static, build-windows, corresponding-source, checksums, vscode-candidates, windows-msi]
+    needs: [package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}
@@ -568,27 +627,31 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: archives-*
-          merge-multiple: true
+          path: private-publish/archive-set/archives
 
       - name: Download Corresponding Source
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: corresponding-source
+          path: private-publish/archive-set/source
 
       - name: Download checksums
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: checksums
+          path: private-publish/checksums
 
       - name: Download VSIX candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: vscode-candidates
+          path: private-publish/vscode
 
       - name: Download Windows installer
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-installer
+          path: private-publish/windows
 
       - name: Verify complete release set
         run: |
@@ -623,15 +686,33 @@ jobs:
             mini-agent-${RELEASE_VERSION}-darwin-arm64.cdx.json
             mini-agent-${RELEASE_VERSION}-win32-x64.cdx.json
           )
-          for f in "${expected[@]}"; do
-            [ -f "$f" ] || { echo "ERROR: Missing expected file: $f"; exit 1; }
-          done
-          actual_count=$(ls *.tar.gz *.vsix *.cdx.json *.msi SHA256SUMS VSIX_SHA256SUMS MSI_SHA256SUMS 2>/dev/null | wc -l)
-          if [ "$actual_count" -ne "${#expected[@]}" ]; then
-            echo "ERROR: Unexpected files present (got $actual_count, expected ${#expected[@]})"
-            ls *.tar.gz *.vsix *.cdx.json *.msi SHA256SUMS VSIX_SHA256SUMS MSI_SHA256SUMS
-            exit 1
-          fi
+          printf '%s\n' "${expected[@]}" > expected-release.txt
+          python3 scripts/release_artifacts.py validate-set \
+            --root private-publish \
+            --expected-file expected-release.txt
+
+          expected_archives=(
+            mini-agent-x86_64-unknown-linux-gnu.tar.gz
+            mini-agent-aarch64-unknown-linux-gnu.tar.gz
+            mini-agent-x86_64-apple-darwin.tar.gz
+            mini-agent-aarch64-apple-darwin.tar.gz
+            mini-agent-x86_64-unknown-linux-musl.tar.gz
+            mini-agent-aarch64-unknown-linux-musl.tar.gz
+            mini-agent-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz
+            mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz
+            mini-agent-lite-x86_64-apple-darwin.tar.gz
+            mini-agent-lite-aarch64-apple-darwin.tar.gz
+            mini-agent-lite-x86_64-unknown-linux-musl.tar.gz
+            mini-agent-lite-aarch64-unknown-linux-musl.tar.gz
+            mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-${GITHUB_REF_NAME}-source.tar.gz
+          )
+          printf '%s\n' "${expected_archives[@]}" > expected-archives.txt
+          python3 scripts/release_artifacts.py verify \
+            --root private-publish/archive-set \
+            --expected-file expected-archives.txt \
+            --manifest private-publish/checksums/SHA256SUMS
 
       - name: Publish release
         env:
@@ -649,8 +730,9 @@ jobs:
             --output release-notes.md
           # Remove any partial release from a prior failed attempt so reruns are clean
           gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          mapfile -t assets < <(find private-publish -type f | sort)
           gh release create "$tag" \
-            *.tar.gz *.vsix *.cdx.json *.msi SHA256SUMS VSIX_SHA256SUMS MSI_SHA256SUMS \
+            "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$tag" \
             --notes-file release-notes.md \
