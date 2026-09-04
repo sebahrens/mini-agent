@@ -19,11 +19,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "skills")]
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::audit::{
     AuditCapability, AuditDecision, AuditError, AuditResultCode, EffectAudit, EffectCompletion,
-    EffectIntent, SanitizedTarget,
+    EffectDenial, EffectIntent, SanitizedTarget,
 };
 use super::protocol::{
     AdvisoryAttribution, EffectError, EffectErrorCode, EffectRequest, GrantId, InvocationId,
@@ -883,6 +885,18 @@ pub(crate) trait ParentEffectService: Send {
         operation: &EffectOperation,
     ) -> Result<(), HostEffectError>;
 
+    /// Performs authorization that can be decided from the raw, bounded operation before any
+    /// expensive target preparation. Spawn uses this hook so a denied executable is never opened,
+    /// hashed, or copied into an immutable snapshot.
+    fn preauthorize<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        _operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ParentEffectFuture<'a, Result<(), HostEffectError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn normalize_target<'a>(
         &'a mut self,
         authorized: &'a AuthorizedEffect,
@@ -1102,126 +1116,37 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         request: EffectRequest,
         cancellation: PermCancellation,
     ) -> Result<EffectResult, HostEffectError> {
-        self.ensure_active()?;
-        if cancellation.is_cancelled() {
-            self.cancel_invocation();
-            return Err(HostEffectError::InvocationCancelled);
-        }
-
-        let grant = match self.grants.get(&request.grant_id) {
-            Some(grant) => grant.clone(),
-            None if self.retired_grants.contains(&request.grant_id) => {
-                return Err(HostEffectError::ReplayedGrant);
-            }
-            None => return Err(HostEffectError::UnknownGrant),
-        };
-
-        if grant.bound_invocation != self.invocation_id {
-            return Err(HostEffectError::WrongInvocation);
-        }
-
-        self.ensure_grant_unexpired(&request.grant_id, grant.expires_at)?;
-
-        if !attribution_matches(&grant.principal, &request.advisory) {
-            return Err(HostEffectError::AttributionMismatch);
-        }
-
         let capability = HostCapability::for_operation(&request.operation);
-        if !grant.allowed.contains(&capability) {
-            return Err(HostEffectError::CapabilityDenied);
-        }
-        if capability == HostCapability::ProposeSkill
-            && matches!(grant.principal, GrantPrincipal::Skill { .. })
-        {
-            return Err(HostEffectError::CapabilityDenied);
-        }
-
-        let authorized = AuthorizedEffect {
-            invocation_id: self.invocation_id.clone(),
-            grant_id: grant.grant_id.clone(),
-            principal: grant.principal.clone(),
-            capability,
-        };
-        self.service
-            .validate_target(&authorized, &request.operation)?;
-
-        let normalization_result = {
-            let normalization = self.service.normalize_target(
-                &authorized,
-                &request.operation,
-                cancellation.clone(),
-            );
-            tokio::pin!(normalization);
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => Err(HostEffectError::InvocationCancelled),
-                result = &mut normalization => result,
-            }
-        };
-        if normalization_result == Err(HostEffectError::InvocationCancelled) {
-            self.cancel_invocation();
-        }
-        let normalized_target = match normalization_result {
-            Ok(target) => target,
+        // Capture only parent-authoritative attribution before preparation can retire an expired
+        // grant. A denial must never fall back to the worker's advisory identity.
+        let denial_identity = self
+            .grants
+            .get(&request.grant_id)
+            .map(|grant| audit_identity(&grant.principal))
+            .unwrap_or((None, None));
+        let preparation = self
+            .prepare_effect(&request, capability, cancellation.clone())
+            .await;
+        let (grant, authorized, audit_target) = match preparation {
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.service.discard_prepared();
+                if self
+                    .append_pre_intent_outcome(&request, capability, error, denial_identity)
+                    .is_err()
+                {
+                    self.erase_authority(InvocationState::Terminal);
+                    return Err(HostEffectError::AuditFailure);
+                }
+                if error == HostEffectError::InvocationCancelled {
+                    self.cancel_invocation();
+                }
                 return Err(error);
             }
         };
-        if let Err(error) = enforce_manifest_scope(&grant, capability, &normalized_target) {
-            self.service.discard_prepared();
-            return Err(error);
-        }
-        if !self.session_allowed.contains(&capability) {
-            self.service.discard_prepared();
-            return Err(HostEffectError::SessionDenied);
-        }
-        if let Err(error) = self.service.ensure_backend(&authorized, &request.operation) {
-            self.service.discard_prepared();
-            return Err(error);
-        }
-
-        let authorization_result = {
-            let authorization =
-                self.service
-                    .authorize(&authorized, &request.operation, cancellation.clone());
-            tokio::pin!(authorization);
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => Err(HostEffectError::InvocationCancelled),
-                result = &mut authorization => result,
-            }
-        };
-        if authorization_result == Err(HostEffectError::InvocationCancelled) {
-            self.cancel_invocation();
-        }
-        let audit_target = match authorization_result {
-            Ok(target) => target,
-            Err(error) => {
-                self.service.discard_prepared();
-                return Err(error);
-            }
-        };
-
-        if cancellation.is_cancelled() {
-            self.cancel_invocation();
-            self.service.discard_prepared();
-            return Err(HostEffectError::InvocationCancelled);
-        }
-        if let Err(error) = self.ensure_grant_unexpired(&request.grant_id, grant.expires_at) {
-            self.service.discard_prepared();
-            return Err(error);
-        }
 
         let effect_id = effect_id(&self.invocation_id, request.effect_ordinal);
-        let (artifact_id, export) = match &authorized.principal {
-            GrantPrincipal::ModelAuthored { .. } => (None, None),
-            GrantPrincipal::Skill {
-                artifact_id,
-                export,
-                ..
-            } => (Some(artifact_id.clone()), Some(export.clone())),
-        };
+        let (artifact_id, export) = audit_identity(&authorized.principal);
         let timestamp_ms = match timestamp_ms() {
             Ok(timestamp_ms) => timestamp_ms,
             Err(error) => {
@@ -1238,6 +1163,19 @@ impl<S: ParentEffectService> InvocationBroker<S> {
                 // The shared writer can be contended by another invocation. Authority is a
                 // lease, so recheck it after acquiring that lock and before persisting intent.
                 if Instant::now() >= grant.expires_at {
+                    audit
+                        .append_denial(EffectDenial {
+                            effect_id: effect_id.clone(),
+                            invocation_id: self.invocation_id.to_string(),
+                            grant_id: authorized.grant_id.get().to_string(),
+                            sequence: u64::from(request.effect_ordinal) + 1,
+                            timestamp_ms,
+                            artifact_id: artifact_id.clone(),
+                            export: export.clone(),
+                            capability: audit_capability(capability),
+                            result_code: AuditResultCode::Denied,
+                        })
+                        .map_err(HostEffectError::from)?;
                     return Err(HostEffectError::ExpiredGrant);
                 }
                 let normalized_target = sanitize_target(&audit, capability, audit_target)?;
@@ -1299,6 +1237,125 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             self.cancel_invocation();
         }
         execution_result
+    }
+
+    async fn prepare_effect(
+        &mut self,
+        request: &EffectRequest,
+        capability: HostCapability,
+        cancellation: PermCancellation,
+    ) -> Result<(InvocationGrant, AuthorizedEffect, AuthorizedTarget), HostEffectError> {
+        self.ensure_active()?;
+        if cancellation.is_cancelled() {
+            return Err(HostEffectError::InvocationCancelled);
+        }
+        let grant = match self.grants.get(&request.grant_id) {
+            Some(grant) => grant.clone(),
+            None if self.retired_grants.contains(&request.grant_id) => {
+                return Err(HostEffectError::ReplayedGrant);
+            }
+            None => return Err(HostEffectError::UnknownGrant),
+        };
+        if grant.bound_invocation != self.invocation_id {
+            return Err(HostEffectError::WrongInvocation);
+        }
+        self.ensure_grant_unexpired(&request.grant_id, grant.expires_at)?;
+        if !attribution_matches(&grant.principal, &request.advisory) {
+            return Err(HostEffectError::AttributionMismatch);
+        }
+        if !grant.allowed.contains(&capability)
+            || (capability == HostCapability::ProposeSkill
+                && matches!(grant.principal, GrantPrincipal::Skill { .. }))
+        {
+            return Err(HostEffectError::CapabilityDenied);
+        }
+
+        let authorized = AuthorizedEffect {
+            invocation_id: self.invocation_id.clone(),
+            grant_id: grant.grant_id.clone(),
+            principal: grant.principal.clone(),
+            capability,
+        };
+        self.service
+            .validate_target(&authorized, &request.operation)?;
+        enforce_manifest_operation_scope(&grant, capability, &request.operation)?;
+        if !self.session_allowed.contains(&capability) {
+            return Err(HostEffectError::SessionDenied);
+        }
+        self.service
+            .ensure_backend(&authorized, &request.operation)?;
+
+        {
+            let preauthorization =
+                self.service
+                    .preauthorize(&authorized, &request.operation, cancellation.clone());
+            tokio::pin!(preauthorization);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
+                result = &mut preauthorization => result?,
+            }
+        }
+
+        let normalized_target = {
+            let normalization = self.service.normalize_target(
+                &authorized,
+                &request.operation,
+                cancellation.clone(),
+            );
+            tokio::pin!(normalization);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
+                result = &mut normalization => result?,
+            }
+        };
+        enforce_manifest_scope(&grant, capability, &normalized_target)?;
+
+        let audit_target = {
+            let authorization =
+                self.service
+                    .authorize(&authorized, &request.operation, cancellation.clone());
+            tokio::pin!(authorization);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
+                result = &mut authorization => result?,
+            }
+        };
+        if cancellation.is_cancelled() {
+            return Err(HostEffectError::InvocationCancelled);
+        }
+        self.ensure_grant_unexpired(&request.grant_id, grant.expires_at)?;
+        Ok((grant, authorized, audit_target))
+    }
+
+    fn append_pre_intent_outcome(
+        &mut self,
+        request: &EffectRequest,
+        capability: HostCapability,
+        error: HostEffectError,
+        (artifact_id, export): (Option<String>, Option<String>),
+    ) -> Result<(), HostEffectError> {
+        let timestamp_ms = timestamp_ms()?;
+        match self
+            .audit
+            .lock()
+            .map_err(|_| HostEffectError::AuditFailure)?
+            .append_denial(EffectDenial {
+                effect_id: effect_id(&self.invocation_id, request.effect_ordinal),
+                invocation_id: self.invocation_id.to_string(),
+                grant_id: request.grant_id.get().to_string(),
+                sequence: u64::from(request.effect_ordinal) + 1,
+                timestamp_ms,
+                artifact_id,
+                export,
+                capability: audit_capability(capability),
+                result_code: audit_result_code(&Err(error)),
+            }) {
+            Ok(_) | Err(AuditError::ReplayedEffect) => Ok(()),
+            Err(error) => Err(HostEffectError::from(error)),
+        }
     }
 
     pub(crate) fn revoke_grant(&mut self, grant_id: &GrantId) -> bool {
@@ -1403,6 +1460,53 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             }
         }
     }
+}
+
+fn audit_identity(principal: &GrantPrincipal) -> (Option<String>, Option<String>) {
+    match principal {
+        GrantPrincipal::ModelAuthored { .. } => (None, None),
+        GrantPrincipal::Skill {
+            artifact_id,
+            export,
+            ..
+        } => (Some(artifact_id.clone()), Some(export.clone())),
+    }
+}
+
+#[cfg(feature = "skills")]
+fn enforce_manifest_operation_scope(
+    grant: &InvocationGrant,
+    capability: HostCapability,
+    operation: &EffectOperation,
+) -> Result<(), HostEffectError> {
+    if matches!(grant.principal, GrantPrincipal::ModelAuthored { .. })
+        || capability != HostCapability::Spawn
+    {
+        return Ok(());
+    }
+    let manifest = grant
+        .manifest
+        .as_ref()
+        .ok_or(HostEffectError::ManifestDenied)?;
+    let EffectOperation::Spawn { program, .. } = operation else {
+        return Err(HostEffectError::ManifestDenied);
+    };
+    let program = program.nfc().collect::<String>();
+    matches!(
+        manifest.scope(SkillHostCapability::Spawn),
+        Some(CapabilityScope::Spawn { programs }) if programs.contains(&program)
+    )
+    .then_some(())
+    .ok_or(HostEffectError::ManifestDenied)
+}
+
+#[cfg(not(feature = "skills"))]
+fn enforce_manifest_operation_scope(
+    _grant: &InvocationGrant,
+    _capability: HostCapability,
+    _operation: &EffectOperation,
+) -> Result<(), HostEffectError> {
+    Ok(())
 }
 
 #[cfg(feature = "skills")]
@@ -1723,9 +1827,6 @@ fn audit_result_code(result: &Result<EffectResult, HostEffectError>) -> AuditRes
             | EffectResult::Spawn {
                 stderr_truncated: true,
                 ..
-            }
-            | EffectResult::Fetch {
-                truncated: true, ..
             },
         ) => AuditResultCode::OutputLimit,
         Ok(EffectResult::Error(error)) => match error.code {

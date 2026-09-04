@@ -1,4 +1,4 @@
-use crate::extras::js::audit::AuditState;
+use crate::extras::js::audit::{AuditState, EffectAudit};
 use crate::extras::js::broker::{
     GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant,
 };
@@ -45,6 +45,16 @@ fn proposal(source_suffix: &str) -> JsProposal {
         },
         tags: vec![" Text ".to_string()],
         predecessor_id: None,
+    }
+}
+
+fn assert_denial_records(audit: &Arc<Mutex<EffectAudit>>, expected: usize) {
+    let audit = audit.lock().unwrap();
+    assert_eq!(audit.records().len(), expected);
+    for record in audit.records() {
+        assert_eq!(record.state, AuditState::Completed);
+        assert_eq!(record.decision, "denied");
+        assert!(record.result_code.is_some());
     }
 }
 
@@ -376,7 +386,7 @@ async fn model_authored_proposal_uses_one_exact_grant_and_durable_audit_envelope
 }
 
 #[tokio::test]
-async fn proposal_denial_and_cancellation_enqueue_and_audit_nothing() {
+async fn proposal_denial_and_cancellation_enqueue_nothing_and_audit_denials() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("store");
     let worker = ProposalQueue::start_store_worker(store, 4, Duration::from_secs(1)).unwrap();
@@ -455,7 +465,7 @@ async fn proposal_denial_and_cancellation_enqueue_and_audit_nothing() {
             .await
             .is_err()
     );
-    assert!(audit.lock().unwrap().records().is_empty());
+    assert_denial_records(&audit, 2);
     drop(broker);
     drop(cancelled_broker);
     drop(worker);
@@ -523,7 +533,7 @@ async fn parent_proposal_attempt_budget_precedes_canonical_validation() {
             .await
             .is_err()
     );
-    assert!(audit.lock().unwrap().records().is_empty());
+    assert_denial_records(&audit, 2);
     drop(broker);
     drop(worker);
     let store = SkillStore::open_at(&paths).unwrap();
@@ -533,7 +543,7 @@ async fn parent_proposal_attempt_budget_precedes_canonical_validation() {
 }
 
 #[tokio::test]
-async fn wire_proposal_rejects_33_nested_scope_entries_before_audit_or_enqueue() {
+async fn wire_proposal_rejects_33_nested_scope_entries_before_enqueue() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("store");
     let worker = ProposalQueue::start_store_worker(store, 4, Duration::from_secs(1)).unwrap();
@@ -579,7 +589,7 @@ async fn wire_proposal_rejects_33_nested_scope_entries_before_audit_or_enqueue()
             .await
             .is_err()
     );
-    assert!(audit.lock().unwrap().records().is_empty());
+    assert_denial_records(&audit, 1);
     drop(broker);
     drop(worker);
     let store = SkillStore::open_at(&paths).unwrap();
@@ -589,7 +599,7 @@ async fn wire_proposal_rejects_33_nested_scope_entries_before_audit_or_enqueue()
 }
 
 #[tokio::test]
-async fn wire_proposal_rejects_oversized_nested_strings_before_audit_or_enqueue() {
+async fn wire_proposal_rejects_oversized_nested_strings_before_enqueue() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("store");
     let worker = ProposalQueue::start_store_worker(store, 4, Duration::from_secs(1)).unwrap();
@@ -658,7 +668,7 @@ async fn wire_proposal_rejects_oversized_nested_strings_before_audit_or_enqueue(
                 .is_err()
         );
     }
-    assert!(audit.lock().unwrap().records().is_empty());
+    assert_denial_records(&audit, 3);
     drop(broker);
     drop(worker);
     let store = SkillStore::open_at(&paths).unwrap();

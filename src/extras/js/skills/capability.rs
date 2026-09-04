@@ -520,17 +520,12 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
     let value = match result {
         EffectResult::ReadFile { content } => serde_json::Value::String(content),
         EffectResult::WriteFile => serde_json::Value::Null,
-        EffectResult::Fetch {
-            status,
-            headers,
-            body,
-            truncated,
-        } => serde_json::json!({
-            "status": status,
-            "headers": headers.into_iter().map(|HttpHeader { name, value }| (name, value)).collect::<BTreeMap<_, _>>(),
-            "body": body,
-            "truncated": truncated,
-        }),
+        EffectResult::Fetch { status, body } => {
+            let mut response = serde_json::Map::new();
+            response.insert("status".into(), serde_json::Value::from(status));
+            response.insert("body".into(), serde_json::Value::String(body));
+            serde_json::Value::Object(response)
+        }
         EffectResult::Spawn {
             stdout,
             stderr,

@@ -263,7 +263,7 @@ fn verify_in_worker(request: VerifyArtifact) -> Result<VerificationResult, Verif
             .get_or_init(|| {
                 std::sync::Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
                     crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
-                    VERIFY_TIMEOUT + Duration::from_secs(30),
+                    VERIFY_TIMEOUT,
                 ))
             })
             .clone()

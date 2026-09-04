@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::extras::js::audit::{
     AuditCapability, AuditDecision, AuditError, AuditFailurePoint, AuditOpenOptions,
-    AuditResultCode, AuditState, EffectAudit, EffectCompletion, EffectIntent, SanitizedTarget,
+    AuditResultCode, AuditState, EffectAudit, EffectCompletion, EffectDenial, EffectIntent,
+    SanitizedTarget,
 };
 use crate::extras::js::broker::{
     AuthorizedEffect, AuthorizedTarget, EffectOperation, EffectResult, ExecutableCopyError,
@@ -27,8 +28,8 @@ use crate::extras::js::broker::{SkillCallAuthority, SkillExportAuthoritySpec};
 #[cfg(feature = "skills")]
 use crate::extras::js::protocol::SkillCallRequest;
 use crate::extras::js::protocol::{
-    AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpHeader, HttpMethod, InvocationId,
-    RunStep, SkillProposalDraft, StepOutcome,
+    AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpMethod, InvocationId, RunStep,
+    SkillProposalDraft, StepOutcome,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::{
@@ -61,6 +62,7 @@ impl InvocationEffectHandler for NoEffects {
 struct ServiceFailures {
     target: Option<HostEffectError>,
     backend: Option<HostEffectError>,
+    preauthorization: Option<HostEffectError>,
     permission: Option<HostEffectError>,
     execution: Option<HostEffectError>,
 }
@@ -68,6 +70,8 @@ struct ServiceFailures {
 #[derive(Clone, Debug, Default)]
 struct ServiceRecord {
     discards: usize,
+    preauthorizations: usize,
+    normalizations: usize,
     authorizations: usize,
     execute_calls: usize,
     executions: usize,
@@ -103,12 +107,24 @@ impl ParentEffectService for RecordingService {
         self.failures.backend.map_or(Ok(()), Err)
     }
 
+    fn preauthorize<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        _operation: &'a EffectOperation,
+        _cancellation: PermCancellation,
+    ) -> ServiceFuture<'a, Result<(), HostEffectError>> {
+        self.record.lock().unwrap().preauthorizations += 1;
+        let result = self.failures.preauthorization.map_or(Ok(()), Err);
+        Box::pin(async move { result })
+    }
+
     fn normalize_target<'a>(
         &'a mut self,
         _authorized: &'a AuthorizedEffect,
         operation: &'a EffectOperation,
         _cancellation: PermCancellation,
     ) -> ServiceFuture<'a, Result<NormalizedTarget, HostEffectError>> {
+        self.record.lock().unwrap().normalizations += 1;
         let target = self
             .normalized_target
             .clone()
@@ -312,12 +328,7 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
         EffectOperation::WriteFile { .. } => EffectResult::WriteFile,
         EffectOperation::Fetch { .. } => EffectResult::Fetch {
             status: 200,
-            headers: vec![HttpHeader {
-                name: "content-type".into(),
-                value: "text/plain".into(),
-            }],
             body: "ok".into(),
-            truncated: false,
         },
         EffectOperation::Spawn { .. } => EffectResult::Spawn {
             stdout: "hello".into(),
@@ -457,6 +468,47 @@ fn broker_with_normalized_target(
     )
 }
 
+fn assert_single_denial_record<S: ParentEffectService>(broker: &InvocationBroker<S>) {
+    let records = broker.audit_records_for_test();
+    assert_eq!(
+        records.len(),
+        1,
+        "denial must have one terminal audit record"
+    );
+    assert_eq!(records[0].state, AuditState::Completed);
+    assert_eq!(records[0].decision, "denied");
+    assert!(records[0].result_code.is_some());
+}
+
+#[test]
+fn denial_audit_record_is_terminal_source_free_and_reopens() {
+    let root = AuditTempRoot::new("denial-reopen");
+    let owner = root.owner();
+    let mut audit = EffectAudit::open(owner.clone()).unwrap();
+    audit
+        .append_denial(EffectDenial {
+            effect_id: "effect-denied".into(),
+            invocation_id: "inv-denied".into(),
+            grant_id: "grant-denied".into(),
+            sequence: 1,
+            timestamp_ms: 1,
+            artifact_id: None,
+            export: None,
+            capability: AuditCapability::Spawn,
+            result_code: AuditResultCode::Denied,
+        })
+        .unwrap();
+    drop(audit);
+
+    let reopened = EffectAudit::open(owner.clone()).unwrap();
+    let record = reopened.records().first().unwrap();
+    assert_eq!(record.state, AuditState::Completed);
+    assert_eq!(record.decision, "denied");
+    assert_eq!(record.result_code.as_deref(), Some("denied"));
+    let bytes = String::from_utf8_lossy(&audit_bytes(&owner)).into_owned();
+    assert!(bytes.contains("\"kind\":\"denied\""));
+}
+
 // Keeping each denial input explicit makes this cross-product test legible at its call sites.
 #[allow(clippy::too_many_arguments)]
 async fn assert_denied_before_execute(
@@ -484,6 +536,20 @@ async fn assert_denied_before_execute(
         record.lock().unwrap().executions,
         0,
         "{} reached the effect service",
+        case.name
+    );
+    assert_single_denial_record(&broker);
+    let expected_code = match expected {
+        HostEffectError::InvocationCancelled => "cancelled",
+        HostEffectError::AskTimedOut | HostEffectError::EffectTimedOut => "timed_out",
+        HostEffectError::OutputLimit => "output_limit",
+        HostEffectError::BackendFailure | HostEffectError::AuditFailure => "backend_failure",
+        _ => "denied",
+    };
+    assert_eq!(
+        broker.audit_records_for_test()[0].result_code.as_deref(),
+        Some(expected_code),
+        "{} recorded the wrong denial outcome",
         case.name
     );
 }
@@ -543,7 +609,7 @@ async fn scoped_capability_intersection_enforces_manifest_before_session_permiss
         );
         assert_eq!(denied_record.lock().unwrap().authorizations, 0);
         assert_eq!(denied_record.lock().unwrap().executions, 0);
-        assert!(denied_broker.audit_records_for_test().is_empty());
+        assert_single_denial_record(&denied_broker);
 
         let session_denied = scoped_skill_grant(
             &case,
@@ -567,7 +633,7 @@ async fn scoped_capability_intersection_enforces_manifest_before_session_permiss
         );
         assert_eq!(denied_record.lock().unwrap().authorizations, 0);
         assert_eq!(denied_record.lock().unwrap().executions, 0);
-        assert!(denied_broker.audit_records_for_test().is_empty());
+        assert_single_denial_record(&denied_broker);
     }
 }
 
@@ -600,7 +666,7 @@ async fn scoped_capability_intersection_keeps_model_authored_grants_session_only
         Err(HostEffectError::BackendFailure)
     );
     assert_eq!(record.lock().unwrap().authorizations, 0);
-    assert!(broker.audit_records_for_test().is_empty());
+    assert_single_denial_record(&broker);
 }
 
 #[cfg(feature = "skills")]
@@ -669,7 +735,7 @@ async fn scoped_capability_intersection_normalizes_fetch_method_and_spawn_identi
         Err(HostEffectError::ManifestDenied)
     );
     assert_eq!(record.lock().unwrap().authorizations, 0);
-    assert!(method_broker.audit_records_for_test().is_empty());
+    assert_single_denial_record(&method_broker);
 
     let spawn_case = operation_cases(&invocation_id)
         .into_iter()
@@ -698,7 +764,7 @@ async fn scoped_capability_intersection_normalizes_fetch_method_and_spawn_identi
         Err(HostEffectError::ManifestDenied)
     );
     assert_eq!(record.lock().unwrap().authorizations, 0);
-    assert!(identity_broker.audit_records_for_test().is_empty());
+    assert_single_denial_record(&identity_broker);
 }
 
 #[cfg(feature = "skills")]
@@ -764,7 +830,7 @@ async fn scoped_spawn_keeps_each_program_bound_to_its_own_executable_identity() 
     assert_eq!(record.authorizations, 0);
     assert_eq!(record.execute_calls, 0);
     assert_eq!(record.discards, 1);
-    assert!(broker.audit_records_for_test().is_empty());
+    assert_single_denial_record(&broker);
 }
 
 #[cfg(feature = "skills")]
@@ -827,7 +893,7 @@ async fn scoped_spawn_content_mismatch_denies_before_permission_audit_and_effect
     assert_eq!(record.authorizations, 0);
     assert_eq!(record.execute_calls, 0);
     assert_eq!(record.discards, 1);
-    assert!(broker.audit_records_for_test().is_empty());
+    assert_single_denial_record(&broker);
 }
 
 #[cfg(feature = "skills")]
@@ -1303,6 +1369,19 @@ async fn worker_broker_grants_deny_forged_unknown_replayed_expired_and_wrong_inv
             Err(HostEffectError::ReplayedGrant)
         );
         assert_eq!(record.lock().unwrap().executions, 0);
+        assert_single_denial_record(&expired_broker);
+        let denial_records = expired_broker.audit_records_for_test();
+        let denial = &denial_records[0];
+        let expected_identity = match &case.principal {
+            GrantPrincipal::ModelAuthored { .. } => (None, None),
+            GrantPrincipal::Skill {
+                artifact_id,
+                export,
+                ..
+            } => (Some(artifact_id.as_str()), Some(export.as_str())),
+        };
+        assert_eq!(denial.artifact_id.as_deref(), expected_identity.0);
+        assert_eq!(denial.export.as_deref(), expected_identity.1);
 
         let other = invocation("inv-other");
         let wrong = grant(&case, &other, Instant::now() + Duration::from_secs(30));
@@ -1787,7 +1866,7 @@ async fn worker_broker_grants_expiring_while_waiting_for_audit_never_execute() {
         Err(HostEffectError::ExpiredGrant)
     );
     holder.join().unwrap();
-    assert!(broker.audit_records_for_test().is_empty());
+    assert_single_denial_record(&broker);
     let record = record.lock().unwrap();
     assert_eq!(record.authorizations, 1);
     assert_eq!(
@@ -2274,7 +2353,7 @@ async fn js_effect_audit_ordering_pre_intent_failures_execute_nothing() {
             Err(HostEffectError::TargetDenied)
         );
         assert_eq!(target_record.lock().unwrap().execute_calls, 0);
-        assert!(target_broker.audit_records_for_test().is_empty());
+        assert_single_denial_record(&target_broker);
 
         let session_grant = grant(
             &case,
@@ -2294,8 +2373,76 @@ async fn js_effect_audit_ordering_pre_intent_failures_execute_nothing() {
             Err(HostEffectError::SessionDenied)
         );
         assert_eq!(session_record.lock().unwrap().execute_calls, 0);
-        assert!(session_broker.audit_records_for_test().is_empty());
+        assert_single_denial_record(&session_broker);
     }
+}
+
+#[tokio::test]
+async fn pre_intent_denial_audit_failure_erases_invocation_authority() {
+    let invocation_id = invocation("inv-denial-audit-failure");
+    let case = operation_cases(&invocation_id).remove(0);
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let (mut broker, record, _audit_root) = broker(
+        invocation_id,
+        vec![grant.clone()],
+        HostCapability::all(),
+        ServiceFailures {
+            backend: Some(HostEffectError::BackendFailure),
+            ..ServiceFailures::default()
+        },
+    );
+    broker.fail_next_audit_durability_for_test(AuditFailurePoint::Append);
+
+    assert_eq!(
+        broker
+            .dispatch(request(&case, &grant), PermCancellation::new())
+            .await,
+        Err(HostEffectError::AuditFailure)
+    );
+    assert_eq!(record.lock().unwrap().execute_calls, 0);
+    assert_eq!(broker.tracked_grant_count(), 0);
+    assert!(broker.audit_records_for_test().is_empty());
+}
+
+#[tokio::test]
+async fn spawn_permission_denial_precedes_executable_normalization() {
+    let invocation_id = invocation("inv-spawn-preauthorization");
+    let case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::Spawn)
+        .unwrap();
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let (mut broker, record, _audit_root) = broker(
+        invocation_id,
+        vec![grant.clone()],
+        BTreeSet::from([HostCapability::Spawn]),
+        ServiceFailures {
+            preauthorization: Some(HostEffectError::PermissionDenied),
+            ..ServiceFailures::default()
+        },
+    );
+
+    assert_eq!(
+        broker
+            .dispatch(request(&case, &grant), PermCancellation::new())
+            .await,
+        Err(HostEffectError::PermissionDenied)
+    );
+    let record = record.lock().unwrap();
+    assert_eq!(record.preauthorizations, 1);
+    assert_eq!(record.normalizations, 0, "denial opened the executable");
+    assert_eq!(record.authorizations, 0);
+    assert_eq!(record.execute_calls, 0);
+    drop(record);
+    assert_single_denial_record(&broker);
 }
 
 #[tokio::test]

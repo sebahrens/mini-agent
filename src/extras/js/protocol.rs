@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
 #[cfg(feature = "skills")]
@@ -580,9 +580,7 @@ pub(crate) enum EffectResult {
     WriteFile,
     Fetch {
         status: u16,
-        headers: Vec<HttpHeader>,
         body: String,
-        truncated: bool,
     },
     Spawn {
         stdout: String,
@@ -703,8 +701,6 @@ pub(crate) struct Diagnostic {
     pub(crate) class: DiagnosticClass,
     pub(crate) stage: DiagnosticStage,
     pub(crate) script_role: ScriptRole,
-    pub(crate) line: Option<u32>,
-    pub(crate) column: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -57,12 +57,14 @@ impl AuditCapability {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuditDecision {
     Authorized,
+    Denied,
 }
 
 impl AuditDecision {
     fn as_str(self) -> &'static str {
         match self {
             Self::Authorized => "authorized",
+            Self::Denied => "denied",
         }
     }
 }
@@ -104,6 +106,7 @@ pub(crate) struct SanitizedTarget {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum SanitizedTargetKind {
+    Denied,
     File {
         key_version: u16,
         storage_class: String,
@@ -125,6 +128,12 @@ enum SanitizedTargetKind {
 }
 
 impl SanitizedTarget {
+    const fn denied() -> Self {
+        Self {
+            kind: SanitizedTargetKind::Denied,
+        }
+    }
+
     fn file(key: &[u8; TARGET_KEY_BYTES], operation: &str, path: &str) -> Self {
         Self {
             kind: SanitizedTargetKind::File {
@@ -209,6 +218,19 @@ pub(crate) struct EffectIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EffectCompletion {
     pub(crate) effect_id: String,
+    pub(crate) result_code: AuditResultCode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EffectDenial {
+    pub(crate) effect_id: String,
+    pub(crate) invocation_id: String,
+    pub(crate) grant_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) timestamp_ms: i64,
+    pub(crate) artifact_id: Option<String>,
+    pub(crate) export: Option<String>,
+    pub(crate) capability: AuditCapability,
     pub(crate) result_code: AuditResultCode,
 }
 
@@ -593,6 +615,44 @@ impl EffectAudit {
         Ok(record)
     }
 
+    /// Persists a terminal, source-free record for an effect rejected before an authorized
+    /// target existed. This is deliberately a single record: no effect was dispatched, so an
+    /// intent/outcome pair would incorrectly imply that execution may have started.
+    pub(crate) fn append_denial(
+        &mut self,
+        denial: EffectDenial,
+    ) -> Result<EffectAuditRecord, AuditError> {
+        if self.poisoned {
+            return Err(AuditError::Unavailable);
+        }
+        validate_identifier(&denial.effect_id)?;
+        validate_identifier(&denial.invocation_id)?;
+        validate_identifier(&denial.grant_id)?;
+        validate_optional_identifier(denial.artifact_id.as_deref())?;
+        validate_optional_identifier(denial.export.as_deref())?;
+        if self.active.contains_key(&denial.effect_id) || self.terminal.contains(&denial.effect_id)
+        {
+            return Err(AuditError::ReplayedEffect);
+        }
+        let effect_id = denial.effect_id.clone();
+        let record = self.append_effect(EffectBody {
+            effect_id,
+            invocation_id: denial.invocation_id,
+            grant_id: denial.grant_id,
+            sequence: denial.sequence,
+            timestamp_ms: denial.timestamp_ms,
+            artifact_id: denial.artifact_id,
+            export: denial.export,
+            capability: denial.capability.as_str().into(),
+            normalized_target: SanitizedTarget::denied(),
+            state: AuditState::Completed,
+            decision: AuditDecision::Denied.as_str().into(),
+            result_code: Some(denial.result_code.as_str().into()),
+        })?;
+        self.terminal.insert(denial.effect_id);
+        Ok(record)
+    }
+
     pub(crate) fn records(&self) -> &[EffectAuditRecord] {
         &self.records
     }
@@ -742,16 +802,24 @@ impl EffectAudit {
                 self.active.insert(body.effect_id.clone(), record.clone());
             }
             AuditState::Completed | AuditState::OutcomeUnknown => {
-                let intent = self
-                    .active
-                    .remove(&body.effect_id)
-                    .ok_or(AuditError::CorruptRecord)?;
-                if self.terminal.contains(&body.effect_id)
-                    || !same_effect_metadata(&intent, &record)
-                {
-                    return Err(AuditError::ReplayedEffect);
+                if body.decision == AuditDecision::Denied.as_str() {
+                    if self.active.contains_key(&body.effect_id)
+                        || !self.terminal.insert(body.effect_id.clone())
+                    {
+                        return Err(AuditError::ReplayedEffect);
+                    }
+                } else {
+                    let intent = self
+                        .active
+                        .remove(&body.effect_id)
+                        .ok_or(AuditError::CorruptRecord)?;
+                    if self.terminal.contains(&body.effect_id)
+                        || !same_effect_metadata(&intent, &record)
+                    {
+                        return Err(AuditError::ReplayedEffect);
+                    }
+                    self.terminal.insert(body.effect_id.clone());
                 }
-                self.terminal.insert(body.effect_id.clone());
             }
         }
         self.records.push(record);
@@ -977,14 +1045,17 @@ fn validate_effect_body(body: &EffectBody) -> Result<(), AuditError> {
     if !matches!(
         body.capability.as_str(),
         "read_file" | "write_file" | "fetch" | "spawn" | "propose_skill"
-    ) || body.decision != "authorized"
-    {
+    ) {
         return Err(AuditError::InvalidMetadata);
     }
     validate_target(&body.capability, &body.normalized_target)?;
-    match body.state {
-        AuditState::Intent if body.result_code.is_none() => Ok(()),
-        AuditState::Completed
+    let has_denied_target = matches!(&body.normalized_target.kind, SanitizedTargetKind::Denied);
+    if (body.decision == "denied") != has_denied_target {
+        return Err(AuditError::InvalidMetadata);
+    }
+    match (body.decision.as_str(), body.state) {
+        ("authorized", AuditState::Intent) if body.result_code.is_none() => Ok(()),
+        ("authorized", AuditState::Completed)
             if matches!(
                 body.result_code.as_deref(),
                 Some(
@@ -999,7 +1070,17 @@ fn validate_effect_body(body: &EffectBody) -> Result<(), AuditError> {
         {
             Ok(())
         }
-        AuditState::OutcomeUnknown if body.result_code.as_deref() == Some("outcome_unknown") => {
+        ("authorized", AuditState::OutcomeUnknown)
+            if body.result_code.as_deref() == Some("outcome_unknown") =>
+        {
+            Ok(())
+        }
+        ("denied", AuditState::Completed)
+            if matches!(
+                body.result_code.as_deref(),
+                Some("denied" | "cancelled" | "timed_out" | "output_limit" | "backend_failure")
+            ) =>
+        {
             Ok(())
         }
         _ => Err(AuditError::InvalidMetadata),
@@ -1008,6 +1089,7 @@ fn validate_effect_body(body: &EffectBody) -> Result<(), AuditError> {
 
 fn validate_target(capability: &str, target: &SanitizedTarget) -> Result<(), AuditError> {
     match (&target.kind, capability) {
+        (SanitizedTargetKind::Denied, _) => Ok(()),
         (
             SanitizedTargetKind::File {
                 key_version,

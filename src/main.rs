@@ -83,6 +83,26 @@ fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 async fn run() -> anyhow::Result<()> {
+    let result = run_inner().await;
+    #[cfg(feature = "js")]
+    {
+        let shutdown = extras::js::supervisor::JsWorkerSupervisor::shutdown_shared().await;
+        return match (result, shutdown) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => Err(anyhow::anyhow!(
+                "failed to shut down JavaScript worker: {error}"
+            )),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(shutdown)) => {
+                Err(error.context(format!("JavaScript worker cleanup also failed: {shutdown}")))
+            }
+        };
+    }
+    #[cfg(not(feature = "js"))]
+    result
+}
+
+async fn run_inner() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
     #[cfg(all(feature = "loop", unix))]

@@ -126,6 +126,8 @@ impl WorkerError {
 #[derive(Clone)]
 pub(crate) struct JsWorkerSupervisor(Arc<SupervisorInner>);
 
+static SHARED_SUPERVISOR: OnceLock<Arc<JsWorkerSupervisor>> = OnceLock::new();
+
 // BEGIN AUTHORITY-FREE SUPERVISOR STATE
 struct SupervisorInner {
     transport: tokio::sync::Mutex<SupervisorState>,
@@ -391,25 +393,25 @@ impl Drop for WorkerConnection {
 
 impl JsWorkerSupervisor {
     pub(crate) fn shared() -> Arc<Self> {
-        // The worker owns the semantic deadline. Leave enough transport grace
-        // for a CPU-starved hosted runner to observe the QuickJS interrupt and
-        // encode the resulting closed diagnostic before the parent reaps it.
-        const WATCHDOG_GRACE: Duration = Duration::from_secs(30);
-        static SHARED: OnceLock<Arc<JsWorkerSupervisor>> = OnceLock::new();
-        SHARED
+        SHARED_SUPERVISOR
             .get_or_init(|| {
                 #[cfg(test)]
                 let launcher =
                     Arc::new(crate::sandbox::worker::TestWorkerLauncher::internal_worker_process());
                 #[cfg(not(test))]
                 let launcher = Arc::new(ProductionWorkerLauncher);
-                Arc::new(Self::new(
-                    launcher,
-                    cfg!(test),
-                    STEP_TIMEOUT + WATCHDOG_GRACE,
-                ))
+                Arc::new(Self::new(launcher, cfg!(test), STEP_TIMEOUT))
             })
             .clone()
+    }
+
+    /// Shuts down the process-wide worker if JavaScript was used, without initializing it merely
+    /// to perform application cleanup.
+    pub(crate) async fn shutdown_shared() -> Result<(), WorkerError> {
+        match SHARED_SUPERVISOR.get() {
+            Some(supervisor) => supervisor.shutdown().await,
+            None => Ok(()),
+        }
     }
 
     fn new(
@@ -1412,8 +1414,18 @@ async fn launch_connection(
         .protocol
         .on_receive(&ready)
         .map_err(map_protocol_error)?;
-    if !matches!(ready.message, WorkerFrame::Ready(_)) {
-        return Err(WorkerError::Protocol);
+    match ready.message {
+        WorkerFrame::Ready(_) => {}
+        WorkerFrame::ProtocolFault(fault)
+            if matches!(
+                fault.code,
+                super::protocol::ProtocolFaultCode::BuildMismatch
+                    | super::protocol::ProtocolFaultCode::VersionMismatch
+            ) =>
+        {
+            return Err(WorkerError::BuildMismatch);
+        }
+        _ => return Err(WorkerError::Protocol),
     }
     connection
         .process
@@ -1791,19 +1803,26 @@ async fn read_worker(
         }
     };
     validate_generation(connection.generation, tagged.generation)?;
-    if let Some(status) = connection
+    let exit_status = connection
         .process
         .try_wait()
-        .map_err(|_| WorkerError::Transport)?
-    {
-        return Err(classify_worker_exit(status));
-    }
+        .map_err(|_| WorkerError::Transport)?;
     match tagged.result {
-        Ok(frame) => Ok(frame),
+        // A handshake mismatch is terminal by design: the worker writes this authenticated fault
+        // and exits immediately. Preserve the frame long enough for the protocol state machine to
+        // validate it instead of flattening it into a transport failure.
+        Ok(frame) if matches!(frame.message, WorkerFrame::ProtocolFault(_)) => Ok(frame),
+        Ok(frame) => match exit_status {
+            Some(status) => Err(classify_worker_exit(status)),
+            None => Ok(frame),
+        },
         Err(error) => {
             let error = map_frame_error(error);
             if error == WorkerError::Transport {
-                Err(reconcile_transport_exit(connection, deadline).await)
+                match exit_status {
+                    Some(status) => Err(classify_worker_exit(status)),
+                    None => Err(reconcile_transport_exit(connection, deadline).await),
+                }
             } else {
                 Err(error)
             }

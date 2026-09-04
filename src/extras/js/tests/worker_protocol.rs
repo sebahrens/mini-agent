@@ -453,7 +453,7 @@ fn worker_protocol_rejects_malformed_unknown_and_wrong_direction_json() {
     ));
     assert!(matches!(
         read_frame::<_, ParentWireFrame>(&mut Cursor::new(framed(
-            br#"{"protocol_version":2,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"future_parent_message"}}"#
+            br#"{"protocol_version":3,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"future_parent_message"}}"#
         ))),
         Err(FrameError::InvalidJson)
     ));
@@ -465,7 +465,7 @@ fn worker_protocol_rejects_malformed_unknown_and_wrong_direction_json() {
 
 #[test]
 fn worker_protocol_rejects_unknown_fields_and_invalid_wire_ids() {
-    let payload = br#"{"protocol_version":2,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"shutdown"},"smuggled":"value"}"#;
+    let payload = br#"{"protocol_version":3,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"shutdown"},"smuggled":"value"}"#;
     let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
     bytes.extend_from_slice(payload);
     assert!(matches!(
@@ -479,8 +479,8 @@ fn worker_protocol_rejects_unknown_fields_and_invalid_wire_ids() {
     assert!(GrantId::new(Uuid::nil()).is_err());
 
     for hello in [
-        br#"{"protocol_version":2,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"hello","data":{}}}"#.as_slice(),
-        br#"{"protocol_version":2,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"hello","data":{"challenge":"00000000-0000-0000-0000-000000000000"}}}"#.as_slice(),
+        br#"{"protocol_version":3,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"hello","data":{}}}"#.as_slice(),
+        br#"{"protocol_version":3,"build_id":"test-build-1","invocation_id":null,"sequence":0,"message":{"kind":"hello","data":{"challenge":"00000000-0000-0000-0000-000000000000"}}}"#.as_slice(),
     ] {
         let mut bytes = (hello.len() as u32).to_be_bytes().to_vec();
         bytes.extend_from_slice(hello);

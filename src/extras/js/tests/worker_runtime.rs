@@ -10,9 +10,10 @@ use crate::extras::js::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, DiagnosticClass, DiagnosticStage,
     EffectError, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
     GrantId, InvocationId, JsErrorCode, LaunchChallenge, ParentFrame, ParentHello, ParentProtocol,
-    ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult, VerificationCase,
-    VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
-    WorkerProtocol, WorkerReady, WorkerWireFrame, read_frame, write_frame,
+    ParentWireFrame, ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole,
+    StepOutcome, StepResult, VerificationCase, VerificationCaseResult, VerificationResult,
+    VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady, WorkerWireFrame,
+    read_frame, write_frame,
 };
 use crate::extras::js::supervisor::{
     EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
@@ -296,8 +297,6 @@ fn assert_closed_error(
     assert_eq!(diagnostic.class, class);
     assert_eq!(diagnostic.stage, stage);
     assert_eq!(diagnostic.script_role, ScriptRole::Model);
-    assert_eq!(diagnostic.line, None);
-    assert_eq!(diagnostic.column, None);
 }
 
 #[test]
@@ -1162,9 +1161,7 @@ impl InvocationEffectHandler for NestedFetchEffects {
                 },
                 EffectOperation::Fetch { .. } => EffectResult::Fetch {
                     status: 200,
-                    headers: Vec::new(),
                     body: "done".into(),
-                    truncated: false,
                 },
                 _ => panic!("unexpected nested fetch operation"),
             };
@@ -2750,11 +2747,21 @@ fn run_scripted_supervisor_worker() -> ! {
         output.flush().unwrap();
         std::process::exit(72);
     }
-    let ready_build = if startup == "build-mismatch" {
-        BuildIdentity::new(format!("{}+{}", env!("CARGO_PKG_VERSION"), "f".repeat(64))).unwrap()
-    } else {
-        build.clone()
-    };
+    if startup == "build-mismatch" {
+        let fault = WireFrame {
+            protocol_version: hello.protocol_version,
+            build_id: hello.build_id,
+            invocation_id: None,
+            sequence: 1,
+            message: WorkerFrame::ProtocolFault(ProtocolFault {
+                code: ProtocolFaultCode::BuildMismatch,
+                stage: ProtocolStage::Handshake,
+            }),
+        };
+        write_frame(&mut output, &fault).unwrap();
+        output.flush().unwrap();
+        std::process::exit(74);
+    }
     let ready_payload = if startup == "challenge-mismatch" {
         WorkerReady {
             challenge: test_launch_challenge(),
@@ -2762,8 +2769,8 @@ fn run_scripted_supervisor_worker() -> ! {
     } else {
         protocol.ready().unwrap()
     };
-    let ready = WireFrame::connection(ready_build, 1, WorkerFrame::Ready(ready_payload));
-    if startup != "build-mismatch" && startup != "challenge-mismatch" {
+    let ready = WireFrame::connection(build.clone(), 1, WorkerFrame::Ready(ready_payload));
+    if startup != "challenge-mismatch" {
         protocol.on_send(&ready).unwrap();
     }
     write_frame(&mut output, &ready).unwrap();
@@ -2936,8 +2943,6 @@ fn run_scripted_supervisor_worker() -> ! {
                             class: DiagnosticClass::Internal,
                             stage: DiagnosticStage::Verification,
                             script_role: ScriptRole::EmbeddedTest,
-                            line: None,
-                            column: None,
                         }),
                         #[cfg(feature = "skills")]
                         transcript: Default::default(),
@@ -2955,8 +2960,6 @@ fn run_scripted_supervisor_worker() -> ! {
                                     class: DiagnosticClass::Internal,
                                     stage: DiagnosticStage::Verification,
                                     script_role: ScriptRole::HeldOutTest,
-                                    line: None,
-                                    column: None,
                                 },
                             ),
                             #[cfg(feature = "skills")]

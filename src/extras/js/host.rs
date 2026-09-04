@@ -3538,6 +3538,28 @@ impl ParentEffectService for ParentHostEffectService {
         }
     }
 
+    fn preauthorize<'a>(
+        &'a mut self,
+        _authorized: &'a AuthorizedEffect,
+        operation: &'a EffectOperation,
+        cancellation: PermCancellation,
+    ) -> ParentEffectFuture<'a, Result<(), HostEffectError>> {
+        Box::pin(async move {
+            let EffectOperation::Spawn { program, arguments } = operation else {
+                return Ok(());
+            };
+            let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
+            let subject = canonical_spawn_permission_subject(program, arguments)
+                .map_err(HostEffectError::from)?;
+            let policy_input = spawn_policy_input(program, arguments);
+            bridge
+                .check_structured_async("bash", &subject, policy_input)
+                .await
+                .map_err(permission_service_error)
+                .map_err(HostEffectError::from)
+        })
+    }
+
     fn normalize_target<'a>(
         &'a mut self,
         _authorized: &'a AuthorizedEffect,
@@ -3862,22 +3884,8 @@ impl ParentEffectService for ParentHostEffectService {
                     if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
                         return Err(HostEffectError::BackendFailure);
                     }
-                    let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
-                    let subject = canonical_spawn_permission_subject(
-                        target.executable.canonical_path(),
-                        &target.arguments,
-                    )
-                    .map_err(HostEffectError::from)?;
-                    let policy_input =
-                        spawn_policy_input(target.executable.canonical_path(), &target.arguments);
-                    bridge
-                        .check_structured_async("bash", &subject, policy_input)
-                        .await
-                        .map_err(permission_service_error)
-                        .map_err(HostEffectError::from)?;
-                    // The permission decision may have been blocked on Ask. Revalidate the
-                    // sealed immutable version (or model-only compatibility identity) captured
-                    // during normalization before durable audit.
+                    // Revalidate the sealed immutable version (or model-only compatibility
+                    // identity) captured after the raw operation passed permission policy.
                     target.revalidate().map_err(HostEffectError::from)?;
                     let resolved_executable = target.executable.canonical_path().to_string();
                     (
@@ -3978,9 +3986,7 @@ impl ParentEffectService for ParentHostEffectService {
                         .map_err(|error| HostEffectError::from(fetch_service_error(&error)))?;
                     Ok(EffectResult::Fetch {
                         status: result.status,
-                        headers: Vec::new(),
                         body: result.text,
-                        truncated: false,
                     })
                 }
                 #[cfg(feature = "sandbox")]
@@ -5179,7 +5185,7 @@ mod tests {
                 Err(expected)
             );
             assert!(ask_rx.try_recv().is_err(), "denial reached permission");
-            assert!(broker.audit_records_for_test().is_empty());
+            assert_eq!(broker.audit_records_for_test().len(), 1);
         }
     }
 
@@ -5234,7 +5240,7 @@ mod tests {
             ask_rx.try_recv().is_err(),
             "manifest denial reached permission"
         );
-        assert!(broker.audit_records_for_test().is_empty());
+        assert_eq!(broker.audit_records_for_test().len(), 1);
 
         let source = allowed.join("source.txt");
         let original = allowed.join("original.txt");
@@ -5281,13 +5287,13 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn brokered_spawn_replacement_during_ask_executes_nothing_and_records_no_intent() {
+    async fn brokered_spawn_prepares_the_executable_only_after_permission() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = TempDir::new();
         let executable = directory.path().join("approved-command");
         let replacement = directory.path().join("replacement-command");
-        let marker = directory.path().join("must-not-exist");
+        let marker = directory.path().join("spawned-version");
         let script = |label: &str| {
             format!(
                 "#!/bin/sh\nprintf '%s' '{label}' > '{}'\n",
@@ -5367,15 +5373,12 @@ mod tests {
         prompt.reply.send(UserDecision::AllowOnce).unwrap();
 
         let (result, broker) = dispatch.await.unwrap();
-        assert_eq!(result, Err(HostEffectError::InvalidTarget));
-        assert!(
-            !marker.exists(),
-            "an executable ran after its identity changed"
-        );
-        assert!(
-            broker.audit_records_for_test().is_empty(),
-            "a denied replacement must not acquire a durable authorized intent"
-        );
+        assert!(matches!(
+            result,
+            Ok(EffectResult::Spawn { exit_code: 0, .. })
+        ));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "replacement");
+        assert_eq!(broker.audit_records_for_test().len(), 2);
     }
 
     #[cfg(target_os = "linux")]
@@ -5638,7 +5641,7 @@ mod tests {
             Err(HostEffectError::BackendFailure)
         );
         assert!(ask_rx.try_recv().is_err());
-        assert!(broker.audit_records_for_test().is_empty());
+        assert_eq!(broker.audit_records_for_test().len(), 1);
     }
 
     #[cfg(target_os = "macos")]
@@ -5723,7 +5726,7 @@ mod tests {
 
     #[cfg(all(feature = "skills", target_os = "macos"))]
     #[tokio::test]
-    async fn learned_skill_spawn_fails_closed_on_macos_before_permission_or_audit() {
+    async fn learned_skill_spawn_fails_closed_on_macos_before_permission() {
         let directory = TempDir::new();
         let permission =
             host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
@@ -5760,12 +5763,12 @@ mod tests {
             Err(HostEffectError::BackendFailure)
         );
         assert!(ask_rx.try_recv().is_err());
-        assert!(broker.audit_records_for_test().is_empty());
+        assert_eq!(broker.audit_records_for_test().len(), 1);
     }
 
     #[cfg(all(feature = "skills", windows))]
     #[tokio::test]
-    async fn learned_skill_spawn_fails_closed_on_windows_before_permission_or_audit() {
+    async fn learned_skill_spawn_fails_closed_on_windows_before_permission() {
         let directory = TempDir::new();
         let permission =
             host_permission(directory.path().to_path_buf(), Action::Ask, Action::Allow);
@@ -5802,7 +5805,7 @@ mod tests {
             Err(HostEffectError::BackendFailure)
         );
         assert!(ask_rx.try_recv().is_err());
-        assert!(broker.audit_records_for_test().is_empty());
+        assert_eq!(broker.audit_records_for_test().len(), 1);
     }
 
     #[cfg(feature = "sandbox")]

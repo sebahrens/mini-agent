@@ -38,7 +38,7 @@ This is the single canonical checklist for Phase 6 containment. Agent instructio
 3. One `RunStep` or whole `VerifyArtifact` request is the complete QuickJS `Runtime` lifetime. The worker drops and recreates the runtime for every request, including after success, failure, timeout, cancellation, or OOM.
 4. Every runtime receives the 64 MiB heap limit, 512 KiB JavaScript stack limit, and interrupt deadline before evaluation. Pending-job draining is bounded.
 5. All JavaScript effects are typed requests executed by the parent capability broker under parent-created, invocation-bound grants and target narrowing. A brokered `spawn()` creates its general command through `Sandbox::wrap_command`; the worker itself uses only the separate broker-only, fail-closed launcher and never the workspace-readable general-process profile.
-6. Worker stdout is protocol-only. Production results, logs, and diagnostics expose only closed error classes/codes and validated source-free stage/script-role/line/column metadata—never arbitrary exception messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
+6. Worker stdout is protocol-only. Production results, logs, and diagnostics expose only closed error classes/codes and validated source-free stage/script-role metadata—never arbitrary exception messages, stacks, thrown values, source snippets, effect results, prompts, contents, or secrets.
 7. Stored-skill source initialization has no effects and no writer API. Parent policy remains authoritative even when every worker-supplied identity or attribution field is malicious.
 
 ## Threat model
@@ -171,7 +171,9 @@ Rust compiler version. Ordinary local and packaged builds therefore reject a sam
 built from different inputs without relying on Git metadata, network access, timestamps, or random
 values.
 
-Protocol version 2 binds startup to one process launch. The parent generates a fresh non-nil UUID
+Protocol version 3 retains the version 2 launch binding and removes response fields that never had
+production data: fetch response headers/truncation and diagnostic line/column positions. The
+parent generates a fresh non-nil UUID
 challenge when it constructs that launch's protocol state, sends it in `ParentHello`, and accepts
 `WorkerReady` only when the worker echoes the exact challenge. The worker records only the
 challenge received in its one accepted `ParentHello` and may send `WorkerReady` only with that
@@ -212,7 +214,9 @@ grant table from the authoritative artifact record, current turn selection, sess
 policy, and Phase 2 target-narrowing policy. Every worker effect request must name a live,
 single-invocation grant whose closed operation and declared scope cover the requested target. The
 parent re-parses and normalizes the target and arguments, obtains any required permission, applies
-deadlines and output limits, writes the effect audit, and performs the effect. A worker assertion
+deadlines and output limits, writes the effect audit, and performs the effect. Spawn first checks
+the bounded raw program and arguments against grant, session, backend, and permission policy; it
+does not open, hash, or snapshot an executable until those checks allow the request. A worker assertion
 of artifact identity, capability tier, scope, permission, or prior approval never authorizes it.
 
 `src/extras/js/broker.rs` implements the parent-only invocation grant table and the narrow
@@ -346,7 +350,7 @@ not native containment.
 
 ### Realm isolation
 
-The locked realm gate passes with `rquickjs`, `rquickjs-core`, and `rquickjs-sys` 0.12.1, whose
+The locked realm gate passes with `rquickjs`, `rquickjs-core`, and `rquickjs-sys` 0.12.2, whose
 vendored QuickJS reports version 0.15.1. Within one `Runtime`, a `Persistent<Function>` created in
 one full `Context` restores and can be invoked while an agent `Context` is active, but resolves
 `globalThis` from its defining skill context. A promise returned by that function remains pending
@@ -385,7 +389,9 @@ weaken this pure loader contract.
 ## Effect audit
 
 Before every real brokered call—including `read_file`—the parent appends and durably syncs an
-authorization/intent record. Audit failure denies the effect. The record is parent-attributed and
+authorization/intent record. A request rejected before an authorized target exists instead gets
+one source-free terminal denial record; no intent record is written because no dispatch can have
+started. Audit failure denies the effect. Each record is parent-attributed and
 contains the invocation ID, authoritative artifact/export identity when applicable, grant ID,
 normalized operation and redacted target metadata, policy decision, sequence, timestamp, and
 previous-record hash. It contains no source, prompt, argument or file content, response body,
@@ -395,17 +401,21 @@ or command argument.
 The broker owns one closed ordering for every typed operation:
 
 1. validate the worker request and parent invocation/grant identity;
-2. intersect the live grant with session policy, validate and authorize the exact target, and
-   retain the prepared parent target;
-3. derive redacted metadata from that prepared target, append the intent, and successfully sync it;
-4. execute the prepared effect exactly once;
-5. append and sync a bounded completion or explicit `outcome_unknown` record; and
-6. only then return the effect response to the worker.
+2. intersect the live grant with manifest and session policy and verify backend readiness;
+3. obtain any authorization that does not require prepared target state; for spawn this permission
+   check precedes executable resolution, opening, hashing, or immutable snapshot creation;
+4. normalize and authorize the exact target, and retain the prepared parent target;
+5. derive redacted metadata from that prepared target, append the intent, and successfully sync it;
+6. execute the prepared effect exactly once;
+7. append and sync a bounded completion or explicit `outcome_unknown` record; and
+8. only then return the effect response to the worker.
 
 Wire effect ordinals are zero-based. Audit sequences are the checked, one-based representation of
 those ordinals, while replay identity is derived from the parent invocation identity plus the
 original ordinal. A repeated invocation/ordinal pair is denied before execution. Validation,
-grant/session/target authorization, audit append, or audit sync failure executes no effect. A
+grant/session/target authorization, audit append, or audit sync failure executes no effect. Each
+pre-dispatch rejection must durably append its terminal denial record; failure to do so becomes a
+terminal audit failure and erases invocation authority. A
 completion append/sync failure returns the closed audit operational error, retires the invocation,
 and leaves the already-durable intent available for conservative `outcome_unknown` recovery; it
 never retries the effect. All brokers in one parent share one mutex-protected writer. A private
@@ -417,7 +427,7 @@ initialization attempt and can recover after the other writer exits or the stora
 
 Grant expiry remains a lease boundary while waiting for that shared writer. The broker rechecks
 expiry after acquiring the audit lock and before appending intent, so a grant that expires under
-writer contention cannot reach either the audit or the effect backend.
+writer contention receives only a terminal denial record and cannot reach the effect backend.
 
 Target correlation uses HMAC-SHA-256 with a dedicated parent-only audit key and an explicit
 metadata allow-list; plain unkeyed hashes are forbidden because paths and URLs are often guessable.
@@ -836,9 +846,8 @@ Every production failure uses a closed sanitized diagnostic contract. `class` is
 `javascript_exception`, `promise_rejection`, `host`, `permission`, `validation`, `timeout`,
 `cancelled`, `out_of_memory`, `pending_job_limit`, `protocol`, `containment`, `audit`, or
 `internal`. `code` comes from a versioned parent/worker allow-list; a worker-provided unknown code
-is a protocol fault. Optional corrective metadata is limited to a source-free location: closed
-`stage` and `script_role` enums plus validated one-based numeric line/column values within the
-submitted script. It contains no filename, function name, property/key name, target, ordinal,
+is a protocol fault. Optional corrective metadata is limited to closed, source-free `stage` and
+`script_role` enums. It contains no filename, function name, property/key name, target, ordinal,
 effect result, or other source-derived string.
 
 Worker reuse is a parent-owned, deterministic decision. A successful value or void result and the
@@ -852,8 +861,9 @@ transport failure, process exit/signal/panic, or shutdown fault also kills and r
 containment tree and erases all invocation grants before another request can launch. Warm
 processes are retired after 256 completed requests or 15 minutes, whichever comes first. The age
 deadline is enforced by an independent idle-retirement timer, so the parent reaps an expired idle
-worker even when no later request arrives. Clean shutdown retires the idle process and a later
-request starts a fresh generation.
+worker even when no later request arrives. Normal CLI completion and error exits invoke shared
+supervisor shutdown; clean shutdown retires the idle process and a later request starts a fresh
+generation.
 
 An unavailable audit prevents broker construction and therefore sends no request to a worker. An
 effect whose durable completion is `outcome_unknown` immediately erases invocation authority,

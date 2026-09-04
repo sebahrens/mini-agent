@@ -1695,12 +1695,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/extras/js/host.rs", "status: 204,", 1, "NON-PROCESS"),
     ("src/extras/js/host.rs", "status: 304,", 1, "NON-PROCESS"),
     (
-        "src/extras/js/skills/capability.rs",
-        "\"status\": status,",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/extras/js/skills/store.rs",
         "Some((ref status, ref report_id, ref reason))",
         1,
@@ -2302,13 +2296,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/js/worker.rs",
         &[(
             "2ae1572a8e3e684cff68f2fdcdb44d0c5ee3808f1bb261e9b1818446ee024674",
-            1,
-        )],
-    ),
-    (
-        "src/extras/js/skills/capability.rs",
-        &[(
-            "20ff2e59a38df1c73b89cf24447c44d4ad82d7a0ebeaf8b89a8cf70929c78661",
             1,
         )],
     ),

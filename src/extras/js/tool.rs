@@ -1274,12 +1274,6 @@ fn render_diagnostic(diagnostic: &Diagnostic, text: &mut String) {
     text.push_str(diagnostic_stage_name(diagnostic.stage));
     text.push_str("; script: ");
     text.push_str(script_role_name(diagnostic.script_role));
-    if let Some(line) = diagnostic.line {
-        text.push_str(&format!("; line {line}"));
-        if let Some(column) = diagnostic.column {
-            text.push_str(&format!(", column {column}"));
-        }
-    }
 }
 
 fn console_level_name(level: ConsoleLevel) -> &'static str {
@@ -1894,13 +1888,11 @@ mod step_result_rendering {
         }
     }
 
-    fn diagnostic(stage: DiagnosticStage, line: Option<u32>, column: Option<u32>) -> Diagnostic {
+    fn diagnostic(stage: DiagnosticStage) -> Diagnostic {
         Diagnostic {
             class: DiagnosticClass::Exception,
             stage,
             script_role: ScriptRole::Model,
-            line,
-            column,
         }
     }
 
@@ -1942,20 +1934,20 @@ mod step_result_rendering {
     }
 
     #[test]
-    fn failures_render_stage_role_position_and_console() {
+    fn failures_render_stage_role_and_console() {
         let result = step(
             StepOutcome::Error(JsErrorCode::Exception),
             vec![record(ConsoleLevel::Log, "before")],
-            Some(diagnostic(DiagnosticStage::Evaluation, Some(3), Some(7))),
+            Some(diagnostic(DiagnosticStage::Evaluation)),
         );
         assert_eq!(
             render_step_result(&result),
-            "JS error: exception (stage: evaluation; script: model; line 3, column 7)\n[console.log] before"
+            "JS error: exception (stage: evaluation; script: model)\n[console.log] before"
         );
         let oom = step(
             StepOutcome::OutOfMemory,
             Vec::new(),
-            Some(diagnostic(DiagnosticStage::Initialization, None, None)),
+            Some(diagnostic(DiagnosticStage::Initialization)),
         );
         assert_eq!(
             render_step_result(&oom),

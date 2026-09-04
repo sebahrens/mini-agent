@@ -184,7 +184,7 @@ fn linux_worker_finalizer_is_before_ready_and_denies_process_creation() {
         .find("let ready: WorkerWireFrame")
         .expect("worker bootstrap must emit Ready");
     let accepted_hello = worker
-        .find("protocol.on_receive(&hello).map_err(|_| ())?")
+        .find("if let Err(error) = protocol.on_receive(&hello)")
         .expect("worker bootstrap must authenticate Hello");
     assert!(
         accepted_hello < finalize && finalize < ready,

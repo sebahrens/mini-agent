@@ -22,9 +22,10 @@ use rquickjs::{
 use super::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass,
     DiagnosticStage, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
-    JsErrorCode, ParentFrame, ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult,
-    VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
-    WorkerProtocol, WorkerWireFrame, read_frame, write_frame,
+    JsErrorCode, ParentFrame, ParentWireFrame, ProtocolError, ProtocolFault, ProtocolFaultCode,
+    ProtocolStage, RunStep, ScriptRole, StepOutcome, StepResult, VerificationCaseResult,
+    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerWireFrame,
+    read_frame, write_frame,
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
@@ -1019,8 +1020,6 @@ fn diagnostic(class: DiagnosticClass, stage: DiagnosticStage, role: ScriptRole) 
         class,
         stage,
         script_role: role,
-        line: None,
-        column: None,
     }
 }
 
@@ -1079,7 +1078,27 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
     if !matches!(hello.message, ParentFrame::Hello(_)) {
         return Err(());
     }
-    protocol.on_receive(&hello).map_err(|_| ())?;
+    if let Err(error) = protocol.on_receive(&hello) {
+        let code = match error {
+            ProtocolError::VersionMismatch { .. } => ProtocolFaultCode::VersionMismatch,
+            ProtocolError::BuildMismatch { .. } => ProtocolFaultCode::BuildMismatch,
+            _ => return Err(()),
+        };
+        let fault = WireFrame {
+            // Echo the parent's connection identity so it can authenticate and classify the
+            // fault even though this worker belongs to an older in-place installation.
+            protocol_version: hello.protocol_version,
+            build_id: hello.build_id,
+            invocation_id: None,
+            sequence: hello.sequence.checked_add(1).ok_or(())?,
+            message: WorkerFrame::ProtocolFault(ProtocolFault {
+                code,
+                stage: ProtocolStage::Handshake,
+            }),
+        };
+        write_terminal(&mut output, &fault)?;
+        return Err(());
+    }
 
     finalize_internal_worker().map_err(|_| ())?;
     // Compile trusted, static helpers before advertising readiness. Request
@@ -1172,6 +1191,58 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
 fn write_terminal(output: &mut impl Write, frame: &WorkerWireFrame) -> Result<(), ()> {
     write_frame(output, frame).map_err(|_| ())?;
     output.flush().map_err(|_| ())
+}
+
+#[cfg(test)]
+mod bootstrap_handshake_tests {
+    use std::io::{Cursor, Write};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::extras::js::protocol::ParentProtocol;
+
+    #[derive(Clone, Default)]
+    struct SharedOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn build_mismatch_emits_authenticated_handshake_fault_before_exit() {
+        let parent_build = BuildIdentity::new("1.8.0+in-place-upgrade").unwrap();
+        let parent_protocol = ParentProtocol::new(parent_build.clone());
+        let hello = WireFrame::connection(
+            parent_build.clone(),
+            0,
+            ParentFrame::Hello(parent_protocol.hello()),
+        );
+        let mut input = Vec::new();
+        write_frame(&mut input, &hello).unwrap();
+        let sink = SharedOutput::default();
+
+        assert!(bootstrap(Cursor::new(input), sink.clone()).is_err());
+        let bytes = sink.0.lock().unwrap().clone();
+        let fault: WorkerWireFrame = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(fault.protocol_version, hello.protocol_version);
+        assert_eq!(fault.build_id, parent_build);
+        assert_eq!(fault.sequence, 1);
+        assert_eq!(fault.invocation_id, None);
+        assert_eq!(
+            fault.message,
+            WorkerFrame::ProtocolFault(ProtocolFault {
+                code: ProtocolFaultCode::BuildMismatch,
+                stage: ProtocolStage::Handshake,
+            })
+        );
+    }
 }
 
 fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
@@ -1624,8 +1695,6 @@ fn execute_run_step(
                     class: DiagnosticClass::Internal,
                     stage: DiagnosticStage::Initialization,
                     script_role: ScriptRole::SkillSource,
-                    line: None,
-                    column: None,
                 }),
                 skill_events: Vec::new(),
                 evidence_complete: false,
@@ -2599,12 +2668,7 @@ fn execute_verification_fake(
             };
             fakes
                 .fetch(&url, method)
-                .map(|body| EffectResult::Fetch {
-                    status: 200,
-                    headers: Vec::new(),
-                    body,
-                    truncated: false,
-                })
+                .map(|body| EffectResult::Fetch { status: 200, body })
                 .map_err(|_| CapabilityError::DispatchDenied)
         }
         EffectOperation::ProposeSkill { .. } => Err(CapabilityError::DispatchDenied),
