@@ -166,6 +166,7 @@ pub struct TaskTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    #[cfg(feature = "archmd")]
     architecture: Option<String>,
     deny_repeated_reads: bool,
 }
@@ -180,6 +181,7 @@ impl TaskTool {
             permission,
             ask_tx,
             workspace: None,
+            #[cfg(feature = "archmd")]
             architecture: None,
             deny_repeated_reads,
         }
@@ -193,6 +195,7 @@ impl TaskTool {
         self
     }
 
+    #[cfg(feature = "archmd")]
     pub fn with_architecture(mut self, architecture: Option<String>) -> Self {
         self.architecture = architecture;
         self
@@ -279,8 +282,6 @@ editing in a known location, grepping for a literal you will act on immediately.
 
         #[cfg(feature = "archmd")]
         let architecture = self.architecture.clone();
-        #[cfg(not(feature = "archmd"))]
-        let architecture: Option<String> = None;
 
         let authorization = SubagentAuthorization::new(
             self.permission.clone(),

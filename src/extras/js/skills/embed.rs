@@ -1552,25 +1552,19 @@ mod external_backend_tests {
         }
     }
 
+    #[cfg(not(feature = "skills-embed"))]
     #[test]
     fn local_backend_without_its_feature_is_a_clear_error_not_a_silent_downgrade() {
         let config = EmbeddingConfig {
             backend: EmbeddingBackendKind::Local,
             ..EmbeddingConfig::default()
         };
-        let result = Embedder::from_config(Some(&config));
-        #[cfg(not(feature = "skills-embed"))]
-        {
-            let error = result.expect_err("local backend must fail without its feature");
-            assert!(
-                matches!(error, EmbeddingError::InvalidConfiguration(ref m) if m.contains("skills-embed")),
-                "error must name the missing feature, got {error:?}"
-            );
-        }
-        #[cfg(feature = "skills-embed")]
-        {
-            let _ = result;
-        }
+        let error = Embedder::from_config(Some(&config))
+            .expect_err("local backend must fail without its feature");
+        assert!(
+            matches!(error, EmbeddingError::InvalidConfiguration(ref m) if m.contains("skills-embed")),
+            "error must name the missing feature, got {error:?}"
+        );
     }
 
     #[test]

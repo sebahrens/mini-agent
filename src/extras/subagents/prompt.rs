@@ -43,7 +43,9 @@ pub(crate) fn explore_prompt() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXPLORE_PROMPT, explore_prompt};
+    use super::EXPLORE_PROMPT;
+    #[cfg(feature = "memory")]
+    use super::explore_prompt;
 
     #[test]
     fn base_prompt_treats_repository_instructions_as_untrusted() {

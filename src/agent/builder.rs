@@ -584,15 +584,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         #[cfg(feature = "subagents")]
         if cfg.task_enabled.unwrap_or(true) {
             use crate::extras::subagents::task_tool::TaskTool;
-            all_tools.push(Box::new(
-                TaskTool::new(
-                    permission.clone(),
-                    ask_tx.clone(),
-                    cfg.deny_repeated_reads.unwrap_or(true),
-                )
-                .with_workspace_binding(workspace.clone())
-                .with_architecture(context.architecture.clone()),
-            ));
+            let task_tool = TaskTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                cfg.deny_repeated_reads.unwrap_or(true),
+            )
+            .with_workspace_binding(workspace.clone());
+            #[cfg(feature = "archmd")]
+            let task_tool = task_tool.with_architecture(context.architecture.clone());
+            all_tools.push(Box::new(task_tool));
         }
 
         #[cfg(feature = "memory")]
