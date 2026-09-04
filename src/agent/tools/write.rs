@@ -242,7 +242,7 @@ mod tests {
 
     use super::*;
     use crate::permission::checker::PermissionChecker;
-    use crate::permission::{PermissionConfigs, SecurityMode};
+    use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
 
     struct TempDir(PathBuf);
 
@@ -268,6 +268,66 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn plan_write_tool(workspace: &Path) -> WriteTool {
+        let checker = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig::default()),
+            SecurityMode::PlanWrite,
+            Some(workspace.to_path_buf()),
+            Some(vec!["planwrite".to_string()]),
+        )
+        .expect("valid PlanWrite permission fixture");
+        WriteTool::new(Some(Arc::new(Mutex::new(checker))), None, None)
+            .with_workspace(workspace.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn plan_write_external_lookalike_is_denied_without_mutation() {
+        let temp = TempDir::new();
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let target = external.join("PLAN-private.md");
+        let tool = plan_write_tool(&workspace);
+
+        let error = tool
+            .call(WriteArgs {
+                path: target.to_string_lossy().into_owned(),
+                content: "must not be written".to_string(),
+            })
+            .await
+            .expect_err("basename alone must not grant PlanWrite authority");
+
+        assert!(error.to_string().contains("Permission denied"));
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn plan_write_relative_symlink_parent_cannot_escape_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let sentinel = external.join("sentinel.txt");
+        std::fs::write(&sentinel, "unchanged").unwrap();
+        symlink(&external, workspace.join("plans")).unwrap();
+        let escaped = external.join("PLAN.md");
+        let tool = plan_write_tool(&workspace);
+
+        tool.call(WriteArgs {
+            path: "plans/PLAN.md".to_string(),
+            content: "must not escape".to_string(),
+        })
+        .await
+        .expect_err("workspace capability must reject a symlinked parent");
+
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "unchanged");
+        assert!(!escaped.exists());
     }
 
     #[tokio::test]
