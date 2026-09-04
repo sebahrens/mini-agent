@@ -786,7 +786,22 @@ mod tests {
         assert!(source.contains("destination_expected: contract.destination"));
         assert!(source.contains("mapped_file_mask(ace.Mask)"));
         assert!(source.contains("package_allow_set_is_exact(&appcontainer_allows)"));
+        assert!(source.contains("InstallLocation::ProtectedMachineWide => ["));
+        assert!(source.contains("policy.restricted_packages.0"));
         assert!(!source.contains("ProbeKind::VersionBinary"));
+
+        let preflight = source
+            .split("pub(super) fn run_runtime_preflight_with_timeouts(")
+            .nth(1)
+            .and_then(|source| source.split("struct SupervisedPreflightHelper").next())
+            .expect("Windows worker preflight implementation missing");
+        let unlock = preflight
+            .find("drop(mutation);")
+            .expect("worker preflight must release the ACL mutex before supervision");
+        let launch = preflight
+            .find("run_supervised_preflight_helper(")
+            .expect("worker preflight helper launch missing");
+        assert!(unlock < launch);
 
         let specification = include_str!("../../docs/specs/phase-6-brokered-js-runtime.md");
         assert!(specification.contains(

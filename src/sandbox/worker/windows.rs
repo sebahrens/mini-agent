@@ -1401,11 +1401,6 @@ mod feasibility {
         }
     }
 
-    enum ExecutableAclAuthority<'a> {
-        Local(&'a crate::sandbox::windows::AclMutationGuard),
-        Supervised,
-    }
-
     fn prepare_executable_acl(
         executable: &Path,
         appcontainer_sid: PSID,
@@ -1413,23 +1408,15 @@ mod feasibility {
     ) -> Result<(PathBuf, InstallLocation, WinHandle), GateError> {
         let mutation = crate::sandbox::windows::AclMutationGuard::acquire()
             .map_err(|error| GateError(format!("serialize worker executable ACL: {error}")))?;
-        prepare_executable_acl_with_mode(
-            executable,
-            appcontainer_sid,
-            policy,
-            ExecutableAclAuthority::Local(&mutation),
-        )
+        prepare_executable_acl_locked(executable, appcontainer_sid, policy, &mutation)
     }
 
-    fn prepare_executable_acl_with_mode(
+    fn prepare_executable_acl_locked(
         executable: &Path,
         appcontainer_sid: PSID,
         policy: &SidPolicy,
-        authority: ExecutableAclAuthority<'_>,
+        _mutation: &crate::sandbox::windows::AclMutationGuard,
     ) -> Result<(PathBuf, InstallLocation, WinHandle), GateError> {
-        if let ExecutableAclAuthority::Local(mutation) = &authority {
-            let _ = mutation;
-        }
         reject_unc_or_remote_syntax(executable)?;
         reject_reparse_components(executable)?;
         let executable = std::fs::canonicalize(executable)
@@ -1445,12 +1432,9 @@ mod feasibility {
         }
 
         let location = classify_install_location(&executable);
-        if matches!(
-            location,
-            InstallLocation::ProtectedMachineWide | InstallLocation::Unsupported
-        ) {
+        if location == InstallLocation::Unsupported {
             return Err(GateError(format!(
-                "current executable location is {location:?}; protected or unknown installs remain unsupported"
+                "current executable location is {location:?}; unknown installs remain unsupported"
             )));
         }
 
@@ -1458,7 +1442,8 @@ mod feasibility {
         validate_path_ancestors(&executable, location, policy)?;
 
         let security = read_file_security(&executable)?;
-        if !sid_equal(security.owner, policy.user.as_psid()) {
+        let protected_machine_wide = location == InstallLocation::ProtectedMachineWide;
+        if !protected_machine_wide && !sid_equal(security.owner, policy.user.as_psid()) {
             return Err(GateError(
                 "current user does not own the executable; ACL mutation refused".to_string(),
             ));
@@ -1481,7 +1466,19 @@ mod feasibility {
             ));
         }
         let required = required_image_mask();
-        if mapped_file_mask(rights) & required != required {
+        let mut effective = mapped_file_mask(rights);
+        if protected_machine_wide {
+            effective |= effective_file_rights(security.dacl, policy.restricted_packages.0)?;
+        }
+        if protected_machine_wide
+            && (effective & required != required || dangerous_write_mask(effective))
+        {
+            return Err(GateError(
+                "protected machine-wide executable lacks read/execute-only AppContainer access"
+                    .to_string(),
+            ));
+        }
+        if !protected_machine_wide && effective & required != required {
             let entry = EXPLICIT_ACCESS_W {
                 grfAccessPermissions: required,
                 grfAccessMode: GRANT_ACCESS,
@@ -1524,14 +1521,27 @@ mod feasibility {
         // Re-read after mutation: never trust a constructed ACL without
         // checking the state the filesystem actually committed.
         let committed = read_file_security(&executable)?;
-        inspect_acl(committed.dacl, policy, appcontainer_sid, true, false)?;
+        inspect_acl(
+            committed.dacl,
+            policy,
+            appcontainer_sid,
+            !protected_machine_wide,
+            false,
+        )?;
         let mut effective = 0u32;
         let result =
             unsafe { GetEffectiveRightsFromAclW(committed.dacl, &trustee, &mut effective) };
-        if result != 0
-            || mapped_file_mask(effective) & required != required
-            || dangerous_write_mask(effective)
-        {
+        if result != 0 {
+            return Err(win32_error(
+                "inspect committed AppContainer executable rights",
+                result,
+            ));
+        }
+        let mut effective = mapped_file_mask(effective);
+        if protected_machine_wide {
+            effective |= effective_file_rights(committed.dacl, policy.restricted_packages.0)?;
+        }
+        if effective & required != required || dangerous_write_mask(effective) {
             return Err(GateError(
                 "committed AppContainer access is not read/execute-only".to_string(),
             ));
@@ -1600,6 +1610,18 @@ mod feasibility {
         Ok(())
     }
 
+    fn restore_executable_dacl_if_changed(
+        executable: &Path,
+        baseline: &FileSecurity,
+        expected: &FileSecuritySnapshot,
+    ) -> Result<(), GateError> {
+        let current = read_file_security(executable)?;
+        if snapshot_file_security(&current)? == *expected {
+            return Ok(());
+        }
+        restore_executable_dacl(executable, baseline, expected)
+    }
+
     fn supported_root(path: &Path, location: InstallLocation) -> Result<PathBuf, GateError> {
         match location {
             InstallLocation::CargoInstall => {
@@ -1639,6 +1661,18 @@ mod feasibility {
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(PathBuf::from)
                 .ok_or_else(|| GateError("user archive root is unavailable".to_string())),
+            InstallLocation::ProtectedMachineWide => [
+                "SystemRoot",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "ProgramData",
+            ]
+            .iter()
+            .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+            .filter(|root| starts_with_case_insensitive(path, root))
+            .max_by_key(|root| normalized_windows_path(root).len())
+            .ok_or_else(|| GateError("protected installation root is unavailable".to_string())),
             _ => Err(GateError(
                 "unsupported location has no trusted root".to_string(),
             )),
@@ -1849,7 +1883,6 @@ mod feasibility {
     pub(super) struct ProductionLaunchHooks {
         fail_at: Option<ProductionFailurePoint>,
         deadline: Option<Instant>,
-        preflight_acl_supervised: bool,
         child: ProductionChild,
         #[cfg(test)]
         containment: Option<ContainmentProbeConfiguration>,
@@ -1995,7 +2028,6 @@ mod feasibility {
             Self {
                 fail_at: None,
                 deadline: None,
-                preflight_acl_supervised: false,
                 child: ProductionChild::Worker,
                 #[cfg(test)]
                 containment: None,
@@ -2009,7 +2041,6 @@ mod feasibility {
             Self {
                 fail_at: Some(point),
                 deadline: None,
-                preflight_acl_supervised: false,
                 child: ProductionChild::FailureTest,
                 containment: None,
                 executable_override: None,
@@ -2024,7 +2055,6 @@ mod feasibility {
             Self {
                 fail_at: Some(point),
                 deadline: None,
-                preflight_acl_supervised: false,
                 child: ProductionChild::FailureTest,
                 containment: None,
                 executable_override: Some(executable),
@@ -2039,7 +2069,6 @@ mod feasibility {
             Self {
                 fail_at: None,
                 deadline: None,
-                preflight_acl_supervised: false,
                 child: ProductionChild::ContainmentTest,
                 containment: Some(configuration),
                 executable_override: Some(executable),
@@ -2051,7 +2080,6 @@ mod feasibility {
             Self {
                 fail_at: None,
                 deadline: None,
-                preflight_acl_supervised: false,
                 child: ProductionChild::ProtocolTest,
                 containment: None,
                 executable_override: Some(executable),
@@ -2063,7 +2091,6 @@ mod feasibility {
             Self {
                 fail_at: None,
                 deadline: None,
-                preflight_acl_supervised: false,
                 child: ProductionChild::Worker,
                 containment: None,
                 executable_override: Some(executable),
@@ -2081,11 +2108,6 @@ mod feasibility {
 
         fn with_deadline(mut self, deadline: Instant) -> Self {
             self.deadline = Some(deadline);
-            self
-        }
-
-        fn with_supervised_preflight_acl(mut self) -> Self {
-            self.preflight_acl_supervised = true;
             self
         }
 
@@ -2882,24 +2904,13 @@ mod feasibility {
         hooks.checkpoint(ProductionFailurePoint::PrepareExecutableAcl)?;
         let executable = production_executable(&hooks)?;
         let policy = SidPolicy::current()?;
-        let acl_mutation = if hooks.preflight_acl_supervised {
-            None
-        } else {
-            let deadline = hooks
-                .deadline
-                .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
-            Some(
-                crate::sandbox::windows::AclMutationGuard::acquire_until(deadline).map_err(
-                    |error| GateError(format!("serialize worker executable ACL: {error}")),
-                )?,
-            )
-        };
-        let acl_mode = match acl_mutation.as_ref() {
-            Some(mutation) => ExecutableAclAuthority::Local(mutation),
-            None => ExecutableAclAuthority::Supervised,
-        };
+        let deadline = hooks
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+        let acl_mutation = crate::sandbox::windows::AclMutationGuard::acquire_until(deadline)
+            .map_err(|error| GateError(format!("serialize worker executable ACL: {error}")))?;
         let (executable, _location, image_lock) =
-            prepare_executable_acl_with_mode(&executable, profile.sid, &policy, acl_mode)?;
+            prepare_executable_acl_locked(&executable, profile.sid, &policy, &acl_mutation)?;
         let inheritance_guard = crate::process_creation::creation_guard()?;
         hooks.require_before_deadline()?;
         let mut pipes = ProtocolPipes::production_set(&hooks, &inheritance_guard)?;
@@ -3148,6 +3159,7 @@ mod feasibility {
         let image_lock = lock_executable_image(&executable)?;
         let baseline = read_file_security(&executable)?;
         let baseline_snapshot = snapshot_file_security(&baseline)?;
+        drop(mutation);
 
         let result = run_supervised_preflight_helper(
             &executable,
@@ -3156,7 +3168,20 @@ mod feasibility {
             cleanup_deadline,
         );
         if result.is_err() {
-            let rollback = restore_executable_dacl(&executable, &baseline, &baseline_snapshot);
+            let rollback =
+                crate::sandbox::windows::AclMutationGuard::acquire_until(cleanup_deadline)
+                    .map_err(|error| {
+                        GateError(format!("serialize worker preflight rollback: {error}"))
+                    })
+                    .and_then(|mutation| {
+                        let rollback = restore_executable_dacl_if_changed(
+                            &executable,
+                            &baseline,
+                            &baseline_snapshot,
+                        );
+                        drop(mutation);
+                        rollback
+                    });
             drop(image_lock);
             return match (result, rollback) {
                 (Err(error), Ok(())) => Err(error),
@@ -3167,7 +3192,6 @@ mod feasibility {
             };
         }
         drop(image_lock);
-        drop(mutation);
         Ok(())
     }
 
@@ -3461,9 +3485,7 @@ mod feasibility {
             return None;
         }
         let deadline = Instant::now() + PRODUCTION_PREFLIGHT_TIMEOUT;
-        let hooks = ProductionLaunchHooks::production()
-            .with_deadline(deadline)
-            .with_supervised_preflight_acl();
+        let hooks = ProductionLaunchHooks::production().with_deadline(deadline);
         Some(if run_runtime_preflight_owned(hooks, deadline).is_ok() {
             std::process::ExitCode::SUCCESS
         } else {
@@ -3478,12 +3500,8 @@ mod feasibility {
         let profile = AppContainerProfile::production_zero_capability()?;
         ensure_appcontainer_network_isolated(profile.sid)?;
         let policy = SidPolicy::current()?;
-        let (_executable, _location, image_lock) = prepare_executable_acl_with_mode(
-            &executable,
-            profile.sid,
-            &policy,
-            ExecutableAclAuthority::Supervised,
-        )?;
+        let (_executable, _location, image_lock) =
+            prepare_executable_acl(&executable, profile.sid, &policy)?;
         drop(image_lock);
         Ok(())
     }
@@ -3947,11 +3965,11 @@ mod feasibility {
         }
     }
 
-    pub(super) fn run_protected_install_negative_control() -> Result<(), GateError> {
+    pub(super) fn run_protected_install_control() -> Result<(), GateError> {
         let profile = AppContainerProfile::stable_zero_capability()?;
         let result = (|| {
             let policy = SidPolicy::current()?;
-            verify_protected_install_fails_closed(profile.sid, &policy)
+            verify_protected_install_uses_existing_rx(profile.sid, &policy)
         })();
         let cleanup = profile.finish();
         match (result, cleanup) {
@@ -3963,7 +3981,7 @@ mod feasibility {
         }
     }
 
-    fn verify_protected_install_fails_closed(
+    fn verify_protected_install_uses_existing_rx(
         appcontainer_sid: PSID,
         policy: &SidPolicy,
     ) -> Result<(), GateError> {
@@ -4004,13 +4022,14 @@ mod feasibility {
                 )));
             }
         }
-        let error = prepare_executable_acl(&protected, appcontainer_sid, policy)
-            .expect_err("protected machine-wide image must fail closed before ACL mutation");
-        if !error.0.contains("ProtectedMachineWide") {
+        let (_, location, image_lock) =
+            prepare_executable_acl(&protected, appcontainer_sid, policy)?;
+        if location != InstallLocation::ProtectedMachineWide {
             return Err(GateError(format!(
-                "protected machine-wide image failed for an unrelated reason: {error}"
+                "protected machine-wide image changed classification to {location:?}"
             )));
         }
+        drop(image_lock);
         let after = snapshot_file_security(&read_file_security(&protected)?)?;
         if before != after {
             return Err(GateError(
@@ -5204,8 +5223,7 @@ fn run_lpac_image_loading_gate() -> Result<(), feasibility::GateError> {
 
 #[cfg(test)]
 pub(super) fn run_containment_probe() -> io::Result<()> {
-    feasibility::run_protected_install_negative_control()
-        .map_err(|error| io::Error::other(error.0))?;
+    feasibility::run_protected_install_control().map_err(|error| io::Error::other(error.0))?;
     let hosted =
         feasibility::privatize_hosted_gate_inputs().map_err(|error| io::Error::other(error.0))?;
     feasibility::run_production_containment_probe(&hosted)

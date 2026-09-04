@@ -22,15 +22,8 @@ pub(crate) async fn verify_runtime(
     use anyhow::{Context, ensure};
     use rig::tool::Tool;
 
-    let allow = host::AllowConfig::from_settings(
-        workspace.root(),
-        None,
-        None,
-        None,
-        false,
-        false,
-    )
-    .with_workspace_binding(workspace);
+    let allow = host::AllowConfig::from_settings(workspace.root(), None, None, None, false, false)
+        .with_workspace_binding(workspace);
     let tool = tool::JsTool::new(
         crate::sandbox::Sandbox::new(false, "release-runtime-check"),
         None,

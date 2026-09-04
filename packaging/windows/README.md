@@ -4,6 +4,11 @@ The Windows installer is a WiX 6.0.2 dual-purpose MSI. It installs per-user by d
 `%LOCALAPPDATA%\Programs\mini-agent` without elevation. Administrators can request a per-machine
 install under `%ProgramFiles%\mini-agent` with standard Windows Installer properties.
 
+Per-machine launches rely on the normal inherited Windows `ALL APPLICATION PACKAGES`
+read/execute grant. mini-agent verifies that effective access and never attempts to rewrite the
+protected executable's ACL; a hardened enterprise ACL that removes this access causes the JS and
+shell containment preflights to fail closed with an explicit startup error.
+
 The package contains `mini-agent.exe`, the native win32-x64 VSIX, and the release's GPL notice and
 Corresponding Source directions. After a successful first install, a commit custom action looks
 for `code.cmd` on `PATH` and in the standard user and machine VS Code locations. If VS Code is

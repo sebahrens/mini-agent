@@ -3237,7 +3237,7 @@ mod sandbox_tests {
             "grant_read_root",
             "grant_write_root",
             "sweep_stale_profiles",
-            "MAX_STALE_PROFILE_JOURNALS",
+            "MAX_STALE_PROFILE_RECOVERIES_PER_LAUNCH",
             "terminate_and_drain_job",
             "OpenJobObjectW",
             "JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE",
@@ -3283,7 +3283,6 @@ mod sandbox_tests {
             "if let Err(error) = verify_job_membership_and_limits(job, &process)",
             "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
             "JOB_OBJECT_LIMIT_ACTIVE_PROCESS",
-            "JOB_OBJECT_LIMIT_PROCESS_MEMORY",
             "GENERAL_JOB_UI_RESTRICTIONS",
             "JOB_OBJECT_UILIMIT_ALL",
             "env_clear()",
@@ -3417,13 +3416,26 @@ mod sandbox_tests {
         assert!(control_candidate.contains("reject_reparse_components(&candidate)?"));
         assert!(control_candidate.contains("reject_reparse_components(&canonical)?"));
         assert!(!control_candidate.contains(".display()"));
-        assert!(source.contains("fn grant_access_root(\n    root: &Path,\n    grants: &mut AccessGrants,\n    parent: &Handle,\n    permissions: u32,\n    share: u32,"));
-        assert!(
-            source.contains("FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,\n        FILE_SHARE_READ,")
-        );
+        assert!(source.contains("fn grant_access_root(\n    root: &Path,\n    grants: &mut AccessGrants,\n    parent: &Handle,\n    permissions: u32,\n    require_single_link: bool,"));
+        assert!(source.contains("FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,\n        false,"));
         assert!(source.contains(
-            "FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,\n        FILE_SHARE_READ | FILE_SHARE_WRITE,"
+            "FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,\n        true,"
         ));
+        let root_grant = source
+            .split("fn grant_access_root(")
+            .nth(1)
+            .and_then(|source| source.split("fn validate_write_root_tree(").next())
+            .expect("root-scoped ACL grant missing");
+        assert_eq!(root_grant.matches("update_access_ace(").count(), 1);
+        assert!(!root_grant.contains("read_dir("));
+        assert!(root_grant.contains("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE"));
+        let root_revoke = source
+            .split("fn revoke_tree_with_deadline(")
+            .nth(1)
+            .and_then(|source| source.split("fn update_access_ace(").next())
+            .expect("root-scoped ACL recovery missing");
+        assert_eq!(root_revoke.matches("update_access_ace(").count(), 1);
+        assert!(!root_revoke.contains("read_dir("));
         assert!(!source.contains("CreateRestrictedToken"));
         assert!(!source.contains("WRITE_RESTRICTED"));
         assert!(!source.contains("RegOverridePredefKey"));
@@ -3472,6 +3484,17 @@ mod sandbox_tests {
                 .count(),
             2,
             "deadline and poll failure must both clean up the owned helper"
+        );
+        let cooperative_termination = source
+            .split("pub(crate) fn terminate_helper(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_runtime_probe(").next())
+            .expect("Windows helper termination implementation missing");
+        assert!(cooperative_termination.contains("OpenEventW("));
+        assert!(cooperative_termination.contains("SetEvent(event.raw())"));
+        assert!(
+            cooperative_termination.find("SetEvent(event.raw())")
+                < cooperative_termination.find("TerminateProcess(process.raw(), 125)")
         );
 
         let profile_creation = source
@@ -3671,6 +3694,9 @@ mod sandbox_tests {
             .find("CreateJobObjectW(&attributes")
             .expect("named Job secured creation missing");
         assert!(owner_dacl < create_job);
+        assert!(!named_job.contains("JOB_OBJECT_LIMIT_PROCESS_MEMORY"));
+        assert!(!named_job.contains("JOB_OBJECT_LIMIT_JOB_MEMORY"));
+        assert!(!named_job.contains("JOB_OBJECT_LIMIT_PROCESS_TIME"));
 
         let runtime_probe = source
             .split("fn run_runtime_probe(")

@@ -33,10 +33,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetExplicitEntriesFromAclW,
-    GetSecurityInfo, REVOKE_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT, SE_OBJECT_TYPE,
-    SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetEffectiveRightsFromAclW,
+    GetExplicitEntriesFromAclW, GetSecurityInfo, REVOKE_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo,
+    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -62,12 +62,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
-    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, OpenJobObjectW,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
+    JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -83,11 +82,11 @@ use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW,
     CreateMutexW, CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
     GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess,
-    GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
-    OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenEventW,
+    OpenProcess, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ProcessChildProcessPolicy, ReleaseMutex,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
     UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
@@ -147,9 +146,9 @@ const REQUEST_MAX_BYTES: usize = 24 * 1024;
 const APPCONTAINER_PROFILE_PREFIX: &str = "mini-agent.general.";
 const REQUEST_PIPE_BUFFER: u32 = 512;
 const MAX_REQUEST_FEEDERS: usize = 16;
-const MAX_ACL_ENTRIES: usize = 250_000;
+const MAX_CLEANUP_ATTESTATION_ENTRIES: usize = 250_000;
 const MAX_ACCESS_ROOTS: usize = 128;
-const MAX_STALE_PROFILE_JOURNALS: usize = 64;
+const MAX_STALE_PROFILE_RECOVERIES_PER_LAUNCH: usize = 64;
 const PREFLIGHT_ROOT_PREFIX: &str = "mini-agent-windows-sandbox-preflight-";
 const PREFLIGHT_OWNER_FILE: &str = ".owner-v1";
 const PRIVATE_CONTROL_ROOT_NAME: &str = ".mini-agent-appcontainer-control-v1";
@@ -162,9 +161,6 @@ const PROFILE_INTENT_EXTENSION: &str = "intent";
 const JOB_NAME_PREFIX: &str = "Global\\mini-agent-general-job-";
 const STALE_JOB_CLEANUP_EXIT_CODE: u32 = 126;
 const MAX_JOB_PROCESSES: u32 = 64;
-const PROCESS_MEMORY_BYTES: usize = 512 * 1024 * 1024;
-const JOB_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
-const PROCESS_CPU_100NS: i64 = 60 * 10_000_000;
 const ACL_MUTEX_WAIT_MS: u32 = 5_000;
 const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration = Duration::from_secs(5);
 const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,6 +171,8 @@ const GENERAL_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // that we cannot open therefore fails the launch closed.
 const ACL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-acl-v1";
 const PROFILE_CONTROL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-profile-control-v1";
+const HELPER_CANCEL_EVENT_PREFIX: &str = "Global\\mini-agent-general-sandbox-cancel-v1-";
+const EVENT_MODIFY_STATE_ACCESS: u32 = 0x0002;
 const HELPER_FAILURE_STATUS_BASE: i32 = 160;
 const HELPER_STAGE_REQUEST: u8 = 1;
 const HELPER_STAGE_SETUP: u8 = 2;
@@ -2251,6 +2249,7 @@ fn run_helper() -> Result<i32, String> {
     mark_helper_stage(HELPER_STAGE_SETUP);
     let parent = open_and_verify_parent(request.parent_pid, request.parent_created)?;
     ensure_parent_alive(&parent)?;
+    let cancel = helper_cancel_event()?;
     let (job, job_name) = bounded_job()?;
     let profile = create_appcontainer_profile(&cache, &read_roots, &write_roots, &job_name)?;
     let mut grants = AccessGrants::new(profile, read_roots, write_roots);
@@ -2364,9 +2363,15 @@ fn run_helper() -> Result<i32, String> {
         return Err(format!("publish AppContainer target readiness: {error}"));
     }
     mark_helper_stage(HELPER_STAGE_WAIT);
-    let waits = [child.raw(), parent.raw()];
+    let waits = [child.raw(), parent.raw(), cancel.raw()];
     let result = unsafe { WaitForMultipleObjects(waits.len() as u32, waits.as_ptr(), 0, u32::MAX) };
     if result == WAIT_OBJECT_0 + 1 {
+        terminate_and_drain_job(&job, 125)?;
+        grants.mark_job_quiescent();
+        grants.cleanup()?;
+        return Ok(125);
+    }
+    if result == WAIT_OBJECT_0 + 2 {
         terminate_and_drain_job(&job, 125)?;
         grants.mark_job_quiescent();
         grants.cleanup()?;
@@ -2527,13 +2532,9 @@ impl AccessGrants {
         }
         self.cleanup_attempted = true;
         let mut first_error = None;
-        for root in &self.acl_roots {
-            if let Err(error) = revoke_tree(root, self.sid())
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
+        // Live cleanup is handle-bound. Each grant is attached only to the canonical root and
+        // inherits below it, so revoking the root ACE also withdraws the inherited grant without
+        // reopening or locking every descendant.
         for object in self.objects.iter().rev() {
             if object.acl_mutated
                 && let Err(error) =
@@ -2569,12 +2570,10 @@ impl Drop for AccessGrants {
 }
 
 fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> Result<(), String> {
-    if trusted_system_read_file(root)? {
-        // Windows system executables are commonly owned by TrustedInstaller,
-        // so an unelevated helper must not try to rewrite their DACL. Keep a
-        // non-share-write/delete handle live to bind identity. A regular
-        // AppContainer receives only the system image access Windows grants to
-        // ALL APPLICATION PACKAGES; an inaccessible image still fails closed.
+    if trusted_machine_read_file(root)? {
+        // System and Program Files executables are commonly owned by TrustedInstaller. Do not
+        // rewrite their DACL: accept only an existing effective AppContainer read/execute grant.
+        // Keep a non-share-write/delete handle live to bind the selected executable's identity.
         let file = open_stable_path(
             root,
             false,
@@ -2583,6 +2582,16 @@ fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> R
         )?;
         crate::fs::windows_file_identity(&file)
             .map_err(|error| format!("sandbox: inspect trusted system identity: {error}"))?;
+        let required = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        let package_effective = effective_file_rights(&file, grants.sid())?;
+        let all_packages = sid_from_string("S-1-15-2-1")?;
+        let group_effective = effective_file_rights(&file, all_packages.0)?;
+        if package_effective & required != required && group_effective & required != required {
+            return Err(
+                "sandbox: protected machine-wide executable lacks AppContainer read/execute access"
+                    .into(),
+            );
+        }
         grants.acl_roots.retain(|candidate| candidate != root);
         grants.objects.push(GrantedObject {
             file,
@@ -2596,20 +2605,102 @@ fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> R
         grants,
         parent,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
-        FILE_SHARE_READ,
+        false,
     )
 }
 
-fn trusted_system_read_file(path: &Path) -> Result<bool, String> {
-    let Some(system_root) = std::env::var_os("SystemRoot") else {
-        return Ok(false);
-    };
-    let system_root = canonical_root(Path::new(&system_root), "Windows system root")?;
+fn trusted_machine_read_file(path: &Path) -> Result<bool, String> {
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("sandbox: inspect trusted system path: {error}"))?;
-    Ok(metadata.is_file()
-        && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-        && path.starts_with(system_root))
+        .map_err(|error| format!("sandbox: inspect trusted machine-wide path: {error}"))?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(false);
+    }
+    for name in [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+    ] {
+        let Some(root) = std::env::var_os(name) else {
+            continue;
+        };
+        let root = canonical_root(Path::new(&root), "Windows protected installation root")?;
+        if path.starts_with(root) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sid_from_string(value: &str) -> Result<Local, String> {
+    let value = wide_string(value);
+    let mut sid = null_mut();
+    if unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut sid) } == 0 || sid.is_null() {
+        return Err(last_error("convert well-known SID"));
+    }
+    Ok(Local(sid))
+}
+
+fn effective_file_rights(file: &File, sid: PSID) -> Result<u32, String> {
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 || dacl.is_null() || descriptor.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        return Err(format!(
+            "sandbox: read protected executable DACL: code {result}"
+        ));
+    }
+    let _descriptor = Local(descriptor);
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid.cast(),
+    };
+    let mut rights = 0u32;
+    let result = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+    if result != 0 {
+        return Err(format!(
+            "sandbox: inspect protected executable AppContainer rights: code {result}"
+        ));
+    }
+    Ok(map_file_access_mask(rights))
+}
+
+fn map_file_access_mask(mask: u32) -> u32 {
+    let mut mapped = mask
+        & !(GENERIC_READ
+            | windows_sys::Win32::Foundation::GENERIC_WRITE
+            | windows_sys::Win32::Foundation::GENERIC_EXECUTE
+            | GENERIC_ALL);
+    if mask & GENERIC_READ != 0 {
+        mapped |= FILE_GENERIC_READ;
+    }
+    if mask & windows_sys::Win32::Foundation::GENERIC_WRITE != 0 {
+        mapped |= FILE_GENERIC_WRITE;
+    }
+    if mask & windows_sys::Win32::Foundation::GENERIC_EXECUTE != 0 {
+        mapped |= FILE_GENERIC_EXECUTE;
+    }
+    if mask & GENERIC_ALL != 0 {
+        mapped |= FILE_ALL_ACCESS;
+    }
+    mapped
 }
 
 fn grant_write_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> Result<(), String> {
@@ -2618,7 +2709,7 @@ fn grant_write_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> 
         grants,
         parent,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        true,
     )
 }
 
@@ -2627,92 +2718,109 @@ fn grant_access_root(
     grants: &mut AccessGrants,
     parent: &Handle,
     permissions: u32,
-    share: u32,
+    require_single_link: bool,
 ) -> Result<(), String> {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        ensure_parent_alive(parent)?;
-        if grants.objects.len() >= MAX_ACL_ENTRIES {
-            return Err("sandbox: writable-root ACL traversal exceeded 250000 entries".into());
-        }
-        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-            format!("sandbox: inspect writable root {}: {error}", path.display())
-        })?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(format!(
-                "sandbox: writable root contains reparse point: {}",
-                path.display()
-            ));
-        }
-        let directory = metadata.is_dir();
-        let resolved = std::fs::canonicalize(&path).map_err(|error| {
-            format!(
-                "sandbox: revalidate writable path {}: {error}",
-                path.display()
-            )
-        })?;
-        if !resolved.starts_with(root) {
-            return Err(format!(
-                "sandbox: writable path escaped canonical root: {}",
-                path.display()
-            ));
-        }
-        let file = open_stable_path(
-            &resolved,
-            directory,
-            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
-            share,
-        )?;
-        if !directory
-            && crate::fs::windows_file_link_count(&file)
-                .map_err(|error| format!("sandbox: inspect writable link count: {error}"))?
-                != 1
-        {
-            return Err(format!(
-                "sandbox: multi-link writable file denied: {}",
-                resolved.display()
-            ));
-        }
-        let identity = crate::fs::windows_file_identity(&file)
-            .map_err(|error| format!("sandbox: inspect writable identity: {error}"))?;
-        let permissions = permissions
-            & if directory {
-                u32::MAX
-            } else {
-                !FILE_DELETE_CHILD
-            };
-        update_access_ace(&file, directory, grants.sid(), GRANT_ACCESS, permissions)?;
-        if crate::fs::windows_file_identity(&file)
-            .map_err(|error| format!("sandbox: recheck writable identity: {error}"))?
-            != identity
-        {
-            return Err("sandbox: writable identity changed while applying ACL".into());
-        }
-        grants.objects.push(GrantedObject {
-            file,
-            directory,
-            acl_mutated: true,
-        });
-        if directory {
-            for entry in std::fs::read_dir(&resolved).map_err(|error| {
-                format!(
-                    "sandbox: enumerate writable root {}: {error}",
-                    resolved.display()
-                )
-            })? {
-                pending.push(
-                    entry
-                        .map_err(|error| format!("sandbox: enumerate writable root: {error}"))?
-                        .path(),
-                );
-            }
-        }
+    ensure_parent_alive(parent)?;
+    if require_single_link {
+        validate_write_root_tree(root, parent)?;
     }
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| format!("sandbox: inspect access root {}: {error}", root.display()))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!(
+            "sandbox: access root is a reparse point: {}",
+            root.display()
+        ));
+    }
+    let directory = metadata.is_dir();
+    let share = if directory {
+        // Keep the named root stable for crash-journal recovery without locking descendants.
+        FILE_SHARE_READ | FILE_SHARE_WRITE
+    } else {
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    };
+    let file = open_stable_path(
+        root,
+        directory,
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        share,
+    )?;
+    if require_single_link
+        && !directory
+        && crate::fs::windows_file_link_count(&file)
+            .map_err(|error| format!("sandbox: inspect writable link count: {error}"))?
+            != 1
+    {
+        return Err(format!(
+            "sandbox: multi-link writable file denied: {}",
+            root.display()
+        ));
+    }
+    let identity = crate::fs::windows_file_identity(&file)
+        .map_err(|error| format!("sandbox: inspect access-root identity: {error}"))?;
+    let permissions = permissions
+        & if directory {
+            u32::MAX
+        } else {
+            !FILE_DELETE_CHILD
+        };
+    update_access_ace(&file, directory, grants.sid(), GRANT_ACCESS, permissions)?;
+    if crate::fs::windows_file_identity(&file)
+        .map_err(|error| format!("sandbox: recheck access-root identity: {error}"))?
+        != identity
+    {
+        return Err("sandbox: access-root identity changed while applying ACL".into());
+    }
+    grants.objects.push(GrantedObject {
+        file,
+        directory,
+        acl_mutated: true,
+    });
     Ok(())
 }
 
-fn revoke_tree(root: &Path, sid: PSID) -> Result<(), String> {
-    revoke_tree_with_deadline(root, sid, None)
+fn validate_write_root_tree(root: &Path, parent: &Handle) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        ensure_parent_alive(parent)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            format!("sandbox: inspect writable tree {}: {error}", path.display())
+        })?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "sandbox: writable tree contains reparse point: {}",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path)
+                .map_err(|error| format!("sandbox: enumerate writable tree: {error}"))?
+            {
+                pending.push(
+                    entry
+                        .map_err(|error| format!("sandbox: enumerate writable entry: {error}"))?
+                        .path(),
+                );
+            }
+            continue;
+        }
+        let file = open_stable_path(
+            &path,
+            false,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        if crate::fs::windows_file_link_count(&file)
+            .map_err(|error| format!("sandbox: inspect writable link count: {error}"))?
+            != 1
+        {
+            return Err(format!(
+                "sandbox: multi-link writable file denied: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn revoke_tree_until(root: &Path, sid: PSID, deadline: Instant) -> Result<(), String> {
@@ -2724,48 +2832,24 @@ fn revoke_tree_with_deadline(
     sid: PSID,
     deadline: Option<Instant>,
 ) -> Result<(), String> {
-    let mut pending = vec![root.to_path_buf()];
-    let mut seen = 0usize;
-    while let Some(path) = pending.pop() {
-        if let Some(deadline) = deadline {
-            ensure_preflight_cleanup_deadline(deadline)?;
-        }
-        seen += 1;
-        if seen > MAX_ACL_ENTRIES {
-            return Err("sandbox: cleanup ACL traversal exceeded 250000 entries".into());
-        }
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("sandbox: cleanup inspect {}: {error}", path.display()))?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(format!(
-                "sandbox: cleanup encountered reparse point: {}",
-                path.display()
-            ));
-        }
-        let directory = metadata.is_dir();
-        let file = open_stable_path(
-            &path,
-            directory,
-            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-        )?;
-        update_access_ace(&file, directory, sid, REVOKE_ACCESS, 0)?;
-        if directory {
-            for entry in std::fs::read_dir(&path)
-                .map_err(|error| format!("sandbox: cleanup enumerate: {error}"))?
-            {
-                if let Some(deadline) = deadline {
-                    ensure_preflight_cleanup_deadline(deadline)?;
-                }
-                pending.push(
-                    entry
-                        .map_err(|error| format!("sandbox: cleanup enumerate: {error}"))?
-                        .path(),
-                );
-            }
-        }
+    if let Some(deadline) = deadline {
+        ensure_preflight_cleanup_deadline(deadline)?;
     }
-    Ok(())
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| format!("sandbox: cleanup inspect {}: {error}", root.display()))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!(
+            "sandbox: cleanup encountered reparse-point root: {}",
+            root.display()
+        ));
+    }
+    let file = open_stable_path(
+        root,
+        metadata.is_dir(),
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    update_access_ace(&file, metadata.is_dir(), sid, REVOKE_ACCESS, 0)
 }
 
 fn update_access_ace(
@@ -3405,8 +3489,8 @@ fn sweep_stale_profiles_until_locked(
     for entry in std::fs::read_dir(journal_root.path())
         .map_err(|error| format!("sandbox: enumerate AppContainer cleanup journals: {error}"))?
     {
-        if entries.len() >= MAX_STALE_PROFILE_JOURNALS {
-            return Err("sandbox: stale AppContainer journal count exceeds 64".into());
+        if entries.len() >= MAX_STALE_PROFILE_RECOVERIES_PER_LAUNCH {
+            break;
         }
         entries.push(
             entry
@@ -3431,12 +3515,26 @@ fn sweep_stale_profiles_until_locked(
     // Full journals must run first: they retain the SID and root set required to revoke ACLs.
     // An overlapping intent can then safely delete the already-absent profile idempotently.
     for path in journals {
-        ensure_preflight_cleanup_deadline(deadline)?;
-        sweep_stale_profile_journal(&path, journal_root, deadline)?;
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Err(error) = sweep_stale_profile_journal(&path, journal_root, deadline) {
+            if Instant::now() >= deadline || error.contains("did not drain all descendants") {
+                break;
+            }
+            return Err(error);
+        }
     }
     for path in intents {
-        ensure_preflight_cleanup_deadline(deadline)?;
-        sweep_stale_profile_intent(&path, journal_root, deadline)?;
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Err(error) = sweep_stale_profile_intent(&path, journal_root, deadline) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -3658,15 +3756,13 @@ fn bounded_job() -> Result<(Handle, String), String> {
         return Err("sandbox: unique Job name unexpectedly already existed".into());
     }
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-        | JOB_OBJECT_LIMIT_JOB_MEMORY
-        | JOB_OBJECT_LIMIT_PROCESS_TIME;
+    // General shell commands may legitimately compile large projects or run long-lived test
+    // suites. Contain the process tree and bound its cardinality here; the caller's existing
+    // wall-clock deadline remains the resource-duration control. The JS worker keeps its much
+    // tighter, separate memory and CPU Job policy.
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
     limits.BasicLimitInformation.ActiveProcessLimit = MAX_JOB_PROCESSES;
-    limits.BasicLimitInformation.PerProcessUserTimeLimit = PROCESS_CPU_100NS;
-    limits.ProcessMemoryLimit = PROCESS_MEMORY_BYTES;
-    limits.JobMemoryLimit = JOB_MEMORY_BYTES;
     if unsafe {
         SetInformationJobObject(
             job.raw(),
@@ -3735,11 +3831,7 @@ fn active_job_processes(job: &Handle) -> Result<u32, String> {
 }
 
 fn verify_job_limits(job: &Handle) -> Result<(), String> {
-    let expected_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-        | JOB_OBJECT_LIMIT_JOB_MEMORY
-        | JOB_OBJECT_LIMIT_PROCESS_TIME;
+    let expected_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     if unsafe {
         QueryInformationJobObject(
@@ -3755,9 +3847,6 @@ fn verify_job_limits(job: &Handle) -> Result<(), String> {
     }
     if limits.BasicLimitInformation.LimitFlags != expected_flags
         || limits.BasicLimitInformation.ActiveProcessLimit != MAX_JOB_PROCESSES
-        || limits.BasicLimitInformation.PerProcessUserTimeLimit != PROCESS_CPU_100NS
-        || limits.ProcessMemoryLimit != PROCESS_MEMORY_BYTES
-        || limits.JobMemoryLimit != JOB_MEMORY_BYTES
     {
         return Err("sandbox: restricted process Job limits differ from policy".into());
     }
@@ -4177,6 +4266,21 @@ fn ensure_parent_alive(parent: &Handle) -> Result<(), String> {
     }
 }
 
+fn helper_cancel_event_name(pid: u32) -> Vec<u16> {
+    wide_string(&format!("{HELPER_CANCEL_EVENT_PREFIX}{pid}"))
+}
+
+fn helper_cancel_event() -> Result<Handle, String> {
+    let name = helper_cancel_event_name(unsafe { GetCurrentProcessId() });
+    let raw = unsafe { CreateEventW(null(), TRUE, FALSE, name.as_ptr()) };
+    let creation_error = std::io::Error::last_os_error();
+    let event = Handle::created(raw, "create cooperative sandbox-helper cancellation event")?;
+    if creation_error.raw_os_error() == Some(183) {
+        return Err("sandbox: cooperative helper cancellation event already existed".into());
+    }
+    Ok(event)
+}
+
 fn process_creation_time(process: HANDLE) -> Result<u64, String> {
     let mut created = FILETIME::default();
     let mut exited = FILETIME::default();
@@ -4194,8 +4298,38 @@ pub(crate) fn terminate_helper(pid: u32) {
         return;
     }
     if let Ok(process) = Handle::created(process, "open sandbox helper for termination") {
+        // Give the helper a bounded opportunity to terminate its Job, prove quiescence, revoke
+        // the root grants, and remove its cleanup journal. Startup races are handled by briefly
+        // polling for the helper-created event. Forced termination remains the final fallback.
+        let name = helper_cancel_event_name(pid);
+        let cooperative_deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let event = unsafe {
+                OpenEventW(
+                    EVENT_MODIFY_STATE_ACCESS | SYNCHRONIZE,
+                    FALSE,
+                    name.as_ptr(),
+                )
+            };
+            if let Ok(event) = Handle::created(event, "open sandbox-helper cancellation event") {
+                unsafe { SetEvent(event.raw()) };
+                let remaining = cooperative_deadline.saturating_duration_since(Instant::now());
+                let wait_ms = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+                if unsafe { WaitForSingleObject(process.raw(), wait_ms) } == WAIT_OBJECT_0 {
+                    return;
+                }
+                break;
+            }
+            if unsafe { WaitForSingleObject(process.raw(), 0) } == WAIT_OBJECT_0 {
+                return;
+            }
+            if Instant::now() >= cooperative_deadline {
+                break;
+            }
+            std::thread::sleep(GENERAL_PREFLIGHT_POLL_INTERVAL);
+        }
         unsafe { TerminateProcess(process.raw(), 125) };
-        let _ = unsafe { WaitForSingleObject(process.raw(), 5_000) };
+        let _ = unsafe { WaitForSingleObject(process.raw(), 1_000) };
     }
 }
 
@@ -4652,7 +4786,7 @@ fn attest_tree_has_no_explicit_sid(root: &Path, sid: PSID) -> Result<(), String>
     let mut seen = 0usize;
     while let Some(path) = pending.pop() {
         seen += 1;
-        if seen > MAX_ACL_ENTRIES {
+        if seen > MAX_CLEANUP_ATTESTATION_ENTRIES {
             return Err("cleanup attestation traversal exceeded bound".into());
         }
         let metadata = std::fs::symlink_metadata(&path)
@@ -6141,11 +6275,11 @@ mod tests {
     }
 
     #[test]
-    fn windows_system_executables_are_not_mutated_by_the_unelevated_helper() {
+    fn protected_machine_executables_are_not_mutated_by_the_unelevated_helper() {
         let cwd = std::env::current_dir().expect("current directory");
         let command = resolve_program("cmd.exe", &cwd).expect("resolve system command");
         assert!(
-            trusted_system_read_file(&command).expect("classify system command"),
+            trusted_machine_read_file(&command).expect("classify system command"),
             "{}",
             command.display()
         );
@@ -6156,7 +6290,7 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::write(&ordinary, b"not an executable").expect("write ordinary fixture");
-        assert!(!trusted_system_read_file(&ordinary).expect("classify ordinary file"));
+        assert!(!trusted_machine_read_file(&ordinary).expect("classify ordinary file"));
         std::fs::remove_file(ordinary).expect("remove ordinary fixture");
     }
 }

@@ -277,8 +277,13 @@ neither contains the other. Configured read/write conflicts likewise name both r
 AppContainer control sibling is derived with ancestor reparse rejection and checked against every
 granted role before profile or journal creation, then checked again after creation.
 
-ACL traversal is recursive, no-follow, handle-bound, and identity checked. Reparse points and
-multi-link files fail closed; cleanup revokes existing and newly created objects. `TEMP` and `TMP`
+Each canonical access root receives one handle-bound, identity-checked ACE which inherits to files
+and directories below it. Root reparse points fail closed, and writable root files must have a
+single link; read-only root files do not require a single link. Cleanup revokes the root ACE and its
+inherited grant without opening or locking repository descendants. Writable trees are still
+scanned without an entry-count ceiling before the grant to reject reparse points and hard-linked
+files, but descendant handles are closed immediately and their DACLs are never rewritten. `TEMP`
+and `TMP`
 use the OS-managed private per-profile storage directory, not a host writable root. An exclusive
 cleanup lease journals the exact SID and roots in a private sibling control directory outside all
 granted trees. That directory is owner-only with a protected DACL, and the hosted child canary must
@@ -286,8 +291,9 @@ fail both read and write access. Cleanup begins only after the exact Job reports
 processes. The journal records a unique parent-only named Job; crash recovery opens and validates
 that exact Job (or proves the name no longer exists under Job lifetime semantics) before revoking
 anything. Every ACE revoke and profile deletion must succeed before the journal is removed. Later
-launches skip live leases and reclaim at most 64 crash-stale profiles; uncertain Job state or any
-revoke/delete failure retains the journal, and malformed, aliased, or unbounded cleanup state fails
+launches skip live leases and incrementally reclaim at most 64 crash-stale profiles without
+refusing a new launch solely because more recovery work remains. Uncertain Job state or any
+non-timeout revoke/delete failure retains the journal, and malformed or aliased cleanup state fails
 closed.
 
 | Capability | Enforced Windows policy |
@@ -295,7 +301,7 @@ closed.
 | Filesystem reads | The sandbox adds access only for the canonical workspace and application cache, exact selected executable, and bounded explicit `windows-appcontainer-read-roots`; ambient `PATH`, home, Cargo, and Rustup roots are not inferred. Standard Windows system resources and any pre-existing host object readable to `ALL APPLICATION PACKAGES` remain readable, so read confidentiality is not claimed. |
 | Filesystem writes | The sandbox adds package-SID write access only for the canonical workspace plus bounded explicit `windows-appcontainer-write-roots`. A pre-existing host object that already grants write access to `ALL APPLICATION PACKAGES` remains writable; the hosted outside-write canary proves the reference runner boundary but is not a universal write-confidentiality claim. The unique profile's OS-managed storage is private ephemeral sandbox storage. |
 | Executable | The parent supplies stable identity plus SHA-256. The helper reopens and hashes the executable, denies write/delete sharing, verifies the proof, and retains that handle through `CreateProcessAsUserW`. |
-| Process lifetime | The target enters a kill-on-close Job at creation time. The Job limits active processes, per-process memory, aggregate Job memory, process CPU time, and UI operations. Descendants retain the AppContainer SID and exact Job without breakaway. Helper cancellation and parent death terminate the exact Job and wait for `ActiveProcesses == 0` before ACL/profile cleanup. |
+| Process lifetime | The target enters a kill-on-close Job at creation time. The Job limits active processes and UI operations; the caller's wall-clock command timeout is the duration bound. General build and test commands have no fixed per-process memory, aggregate memory, or CPU-time Job ceiling. The separately constrained JS worker retains its strict resource limits. Descendants retain the AppContainer SID and exact Job without breakaway. Helper cancellation first signals cooperative Job termination and waits for `ActiveProcesses == 0` before ACL/profile cleanup, with forced helper termination as a bounded fallback. |
 | Environment | The helper request travels only through inherited stdin. The target environment is cleared and rebuilt from `PATH`, `PATHEXT`, Windows system/shell variables, and non-credential locale/terminal variables. API keys, agent sockets, and credential variables are not forwarded. |
 | Network | No capability is supplied. Hosted proof requires zero `TokenCapabilities`, no current-SID loopback exemption, and failed IPv4/IPv6 TCP connection attempts against loopback and an external address. The capability and exemption checks cover both TCP and UDP; a connectionless UDP `send` completion is not accepted as evidence of delivery or authority because Winsock may only have queued the datagram locally. |
 | Registry | AppContainer-visible common registry/COM resources are inherited through `ALL APPLICATION PACKAGES`. No registry confidentiality or isolation is claimed. |
