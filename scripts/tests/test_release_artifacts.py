@@ -13,9 +13,32 @@ SPEC = importlib.util.spec_from_file_location("release_artifacts", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 RELEASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RELEASE)
+ROOT = Path(__file__).parents[2]
 
 
 class ReleaseArtifactManifestTests(unittest.TestCase):
+    def test_windows_release_smoke_is_clean_runner_and_non_publishing(self) -> None:
+        workflow = (ROOT / ".github/workflows/windows-release-smoke.yml").read_text()
+        self.assertEqual(workflow.count("runs-on: windows-latest"), 2)
+        self.assertIn("needs: build-windows-release-artifact", workflow)
+        self.assertIn("RELEASE_TARGET: x86_64-pc-windows-msvc", workflow)
+        self.assertIn(
+            'cargo build --locked --release --target "$RELEASE_TARGET"', workflow
+        )
+        self.assertIn("name: windows-release-archive-candidate", workflow)
+        self.assertIn("path: smoke-input", workflow)
+        self.assertIn("python3 scripts/release_artifacts.py smoke", workflow)
+        self.assertIn('--expected-version "$version"', workflow)
+        self.assertIn("--expect-js yes", workflow)
+        self.assertIn("python3 scripts/release_artifacts.py manifest", workflow)
+        self.assertIn("python3 scripts/release_artifacts.py verify", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertNotIn("gh release", workflow)
+        self.assertNotIn("contents: write", workflow)
+        smoke_job = workflow.split("  smoke-windows-release-artifact:", 1)[1]
+        self.assertNotIn("cargo build", smoke_job)
+        self.assertNotIn("cargo install", smoke_job)
+
     def fixture(self, directory: str) -> tuple[Path, Path, Path]:
         root = Path(directory) / "private"
         (root / "job-a").mkdir(parents=True)

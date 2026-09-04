@@ -1,0 +1,90 @@
+name: Windows release archive smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CANONICAL_BINARY: mini-agent
+  RELEASE_TARGET: x86_64-pc-windows-msvc
+  RUSTFLAGS: ""
+
+jobs:
+  build-windows-release-artifact:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: "1.96.0"
+          target: ${{ env.RELEASE_TARGET }}
+
+      - name: Build and package the exact default-feature release archive
+        run: |
+          cargo build --locked --release --target "$RELEASE_TARGET"
+          python3 scripts/package-release-binary.py \
+            --binary "target/$RELEASE_TARGET/release/${CANONICAL_BINARY}.exe" \
+            --archive "${CANONICAL_BINARY}-${RELEASE_TARGET}.tar.gz" \
+            --executable-name "${CANONICAL_BINARY}.exe"
+
+      - name: Upload the private archive candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-release-archive-candidate
+          path: mini-agent-x86_64-pc-windows-msvc.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke-windows-release-artifact:
+    needs: build-windows-release-artifact
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the exact private archive on a clean runner
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-release-archive-candidate
+          path: smoke-input
+
+      - name: Extract, install-smoke, and checksum the exact archive
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$version"
+          archive="mini-agent-$RELEASE_TARGET.tar.gz"
+          python3 scripts/release_artifacts.py smoke \
+            --archive "smoke-input/$archive" \
+            --executable-name "${CANONICAL_BINARY}.exe" \
+            --expected-version "$version" \
+            --expect-js yes
+          printf '%s\n' "$archive" > expected-windows-archive.txt
+          python3 scripts/release_artifacts.py manifest \
+            --root smoke-input \
+            --expected-file expected-windows-archive.txt \
+            --manifest SHA256SUMS
+          python3 scripts/release_artifacts.py verify \
+            --root smoke-input \
+            --expected-file expected-windows-archive.txt \
+            --manifest SHA256SUMS
+
+      - name: Archive the smoke-verified candidate and checksum
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-release-archive-smoke-verified
+          path: |
+            smoke-input/mini-agent-x86_64-pc-windows-msvc.tar.gz
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

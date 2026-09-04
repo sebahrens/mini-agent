@@ -21,6 +21,12 @@ Cargo feature set; lite archives use `--no-default-features`. Opt-in native feat
 `skills-embed` are not silently bundled into cross-platform archives and keep their
 platform-specific installation requirements.
 
+The manually dispatched `Windows release archive smoke` workflow is the non-publishing audit path
+for the Windows default-feature archive. It builds the documented target, transfers the exact
+private archive to a clean Windows runner, verifies its version and offline JS evaluation, produces
+and verifies `SHA256SUMS`, and retains the smoke-verified candidate for inspection. It has read-only
+repository permission and contains no release-publication job.
+
 Every release also includes five platform VSIX candidates, the dual-purpose
 `mini-agent-windows-x64.msi`, their checksum manifests, and
 `mini-agent-vX.Y.Z-source.tar.gz`. This Corresponding Source archive is
