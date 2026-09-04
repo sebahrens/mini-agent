@@ -910,12 +910,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(zerobox);",
-        1,
-        "TC-PROJECT-AUTOMATION",
-    ),
-    (
         "src/extras/js/host.rs",
         "if is_followable_redirect(response.status()) {",
         1,
@@ -2696,8 +2690,8 @@ const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
-        &["TC-MODEL-ACTION", "TC-MCP-STDIO"],
+        "let mut cmd = Command::new(zerobox);",
+        &["TC-MODEL-ACTION", "TC-PROJECT-AUTOMATION", "TC-MCP-STDIO"],
     ),
     (
         "src/sandbox.rs",
@@ -2832,12 +2826,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "_command: &mut tokio::process::Command,",
         1,
         "NON-PROCESS",
-    ),
-    (
-        "src/sandbox.rs",
-        "let mut cmd = Command::new(zerobox);",
-        1,
-        "TC-PROJECT-AUTOMATION",
     ),
     (
         "src/extras/js/host.rs",
@@ -3245,8 +3233,8 @@ const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
     ),
     (
         "src/sandbox.rs",
-        "let mut cmd = Command::new(\"zerobox\");",
-        &["TC-MODEL-ACTION", "TC-MCP-STDIO"],
+        "let mut cmd = Command::new(zerobox);",
+        &["TC-MODEL-ACTION", "TC-PROJECT-AUTOMATION", "TC-MCP-STDIO"],
     ),
     (
         "src/sandbox.rs",
@@ -3816,7 +3804,7 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
         ),
         (
             "src/sandbox.rs",
-            "let mut cmd = Command::new(\"zerobox\");",
+            "let mut cmd = Command::new(zerobox);",
             1,
             "TC-LIFECYCLE-HELPER",
             "a model action in the mixed sandbox family",

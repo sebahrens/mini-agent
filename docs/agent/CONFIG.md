@@ -554,7 +554,8 @@ launch zerostack clears the ambient environment, then
 restores only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`,
 `LC_ALL`, `COLORTERM`, `NO_COLOR`, `TMPDIR`, and the Windows runtime names
 `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `TEMP`, `TMP`, `USERNAME`, and
-`USERPROFILE` when present, plus the handler's `env` values and
+`USERPROFILE`, `SYSTEMDRIVE`, `ProgramFiles`, `ProgramFiles(x86)`, and
+`ProgramW6432` when present, plus the handler's `env` values and
 `ZEROSTACK_PROJECT_DIR`. API keys and other ambient credentials are therefore
 absent unless the hook owner explicitly provides them in `env`.
 Sandbox backends override `TMPDIR` with their confined temporary directory.

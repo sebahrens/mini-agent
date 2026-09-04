@@ -256,6 +256,15 @@ impl Drop for EditorTempFile {
 }
 
 pub(crate) fn edit_memory_file(path: &Path, editor: &str) -> std::io::Result<bool> {
+    #[cfg(windows)]
+    {
+        let _ = (path, editor);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "memory editor is unsupported on Windows because no portable editor-command grammar is configured",
+        ));
+    }
+    #[cfg(not(windows))]
     edit_memory_file_with_shell(Path::new("sh"), path, editor)
 }
 

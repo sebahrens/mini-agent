@@ -589,6 +589,10 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $version -notmatch '^mini-agent ') {
             throw "installed MSI binary failed its version smoke"
           }
+          & $installed --print-config | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "installed MSI binary failed its startup/configuration smoke"
+          }
           $uninstallResult = Start-Process msiexec.exe `
             -ArgumentList "/x `"$msi`" /quiet /norestart" `
             -Wait -PassThru

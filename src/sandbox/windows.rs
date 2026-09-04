@@ -35,8 +35,8 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetEffectiveRightsFromAclW,
     GetExplicitEntriesFromAclW, GetSecurityInfo, REVOKE_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT,
-    SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo,
-    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SET_ACCESS, SetEntriesInAclW,
+    SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -92,6 +92,9 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::process_creation::StdCommandCreationExt;
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    WINSTA_ACCESSGLOBALATOMS, WINSTA_ENUMDESKTOPS, WINSTA_READATTRIBUTES,
+};
 
 const HELPER_ARG: &str = "--mini-agent-windows-sandbox-helper-v1";
 const PROBE_ARG: &str = "--mini-agent-windows-sandbox-runtime-check";
@@ -167,11 +170,15 @@ const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const GENERAL_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // ACL snapshots must be serialized across terminal/RDP/service sessions. A Local\\ mutex would
 // allow two same-user helpers in different sessions to overwrite each other's read/modify/write
-// transaction. The object manager applies the creator token's default DACL; a pre-created object
-// that we cannot open therefore fails the launch closed.
+// transaction. Every predictable Global\\ object receives and re-attests an explicit owner-only
+// DACL, so a foreign pre-creation or widened object fails the launch closed.
 const ACL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-acl-v1";
 const PROFILE_CONTROL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-profile-control-v1";
 const HELPER_CANCEL_EVENT_PREFIX: &str = "Global\\mini-agent-general-sandbox-cancel-v1-";
+// The AppContainer only needs to resolve the private desktop on the inherited
+// station. Do not grant station mutation, clipboard, screen, or shutdown rights.
+const SANDBOX_WINDOW_STATION_ACCESS: u32 =
+    WINSTA_ENUMDESKTOPS as u32 | WINSTA_READATTRIBUTES as u32 | WINSTA_ACCESSGLOBALATOMS as u32;
 const EVENT_MODIFY_STATE_ACCESS: u32 = 0x0002;
 const HELPER_FAILURE_STATUS_BASE: i32 = 160;
 const HELPER_STAGE_REQUEST: u8 = 1;
@@ -254,6 +261,153 @@ impl Drop for Local {
 
 pub(crate) struct AclMutationGuard(Handle);
 
+/// Security descriptor for predictable cross-session kernel-object names.
+/// The descriptor and its backing SID/DACL allocations remain alive across
+/// the corresponding `Create*` call, preventing another local account from
+/// opening a synchronization object created by mini-agent.
+struct OwnerOnlyKernelSecurity {
+    _user: Vec<usize>,
+    _dacl: Local,
+    descriptor: SECURITY_DESCRIPTOR,
+}
+
+impl OwnerOnlyKernelSecurity {
+    fn new(access: u32, label: &str) -> Result<Self, String> {
+        let user = current_user_sid_buffer()?;
+        let user_sid = token_user_sid(&user);
+        if user_sid.is_null() {
+            return Err(format!(
+                "sandbox: current token user SID was null for {label}"
+            ));
+        }
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: access,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: 0,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: user_sid.cast(),
+            },
+        };
+        let mut dacl = null_mut();
+        let result = unsafe { SetEntriesInAclW(1, &entry, null(), &mut dacl) };
+        if result != 0 || dacl.is_null() {
+            return Err(format!(
+                "sandbox: construct owner-only {label} DACL: code {result}"
+            ));
+        }
+        let dacl = Local(dacl.cast());
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        if unsafe {
+            InitializeSecurityDescriptor(
+                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                SECURITY_DESCRIPTOR_REVISION,
+            )
+        } == 0
+            || unsafe {
+                SetSecurityDescriptorOwner(
+                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                    user_sid,
+                    0,
+                )
+            } == 0
+            || unsafe {
+                SetSecurityDescriptorDacl(
+                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                    TRUE,
+                    dacl.0.cast(),
+                    0,
+                )
+            } == 0
+        {
+            return Err(last_error(&format!(
+                "construct owner-only {label} security descriptor"
+            )));
+        }
+        Ok(Self {
+            _user: user,
+            _dacl: dacl,
+            descriptor,
+        })
+    }
+
+    fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: (&mut self.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+            bInheritHandle: 0,
+        }
+    }
+
+    fn user_sid(&self) -> PSID {
+        token_user_sid(&self._user)
+    }
+}
+
+fn attest_owner_only_kernel_object(
+    handle: HANDLE,
+    expected_user: PSID,
+    expected_access: u32,
+    label: &str,
+) -> Result<(), String> {
+    let mut owner = null_mut();
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 || owner.is_null() || dacl.is_null() || descriptor.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        return Err(format!(
+            "sandbox: inspect owner-only {label} descriptor: code {result}"
+        ));
+    }
+    let _descriptor = Local(descriptor);
+    if unsafe { EqualSid(owner, expected_user) } == 0 {
+        return Err(format!("sandbox: {label} owner differs from current user"));
+    }
+    let mut count = 0u32;
+    let mut entries = null_mut();
+    let result = unsafe { GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) };
+    if result != 0 || entries.is_null() || count != 1 {
+        if !entries.is_null() {
+            unsafe { LocalFree(entries.cast()) };
+        }
+        return Err(format!(
+            "sandbox: {label} DACL is not one explicit owner entry"
+        ));
+    }
+    let entries_allocation = Local(entries.cast());
+    let observed = unsafe { &*entries };
+    let valid = observed.grfAccessMode == SET_ACCESS
+        && observed.grfInheritance == 0
+        && observed.grfAccessPermissions == expected_access
+        && observed.Trustee.TrusteeForm == TRUSTEE_IS_SID
+        && !observed.Trustee.ptstrName.is_null()
+        && unsafe { EqualSid(observed.Trustee.ptstrName.cast(), expected_user) } != 0;
+    drop(entries_allocation);
+    if !valid {
+        return Err(format!(
+            "sandbox: {label} DACL differs from owner-only policy"
+        ));
+    }
+    Ok(())
+}
+
 impl AclMutationGuard {
     pub(crate) fn acquire() -> Result<Self, String> {
         Self::acquire_until(Instant::now() + Duration::from_millis(ACL_MUTEX_WAIT_MS.into()))
@@ -261,9 +415,17 @@ impl AclMutationGuard {
 
     pub(crate) fn acquire_until(deadline: Instant) -> Result<Self, String> {
         let name = wide_string(ACL_MUTEX_NAME);
+        let mut security = OwnerOnlyKernelSecurity::new(GENERIC_ALL, "ACL mutex")?;
+        let attributes = security.attributes();
         let mutex = Handle::created(
-            unsafe { CreateMutexW(null(), 0, name.as_ptr()) },
+            unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) },
             "open cross-process ACL mutation mutex",
+        )?;
+        attest_owner_only_kernel_object(
+            mutex.raw(),
+            security.user_sid(),
+            GENERIC_ALL,
+            "ACL mutex",
         )?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -290,9 +452,17 @@ impl ProfileControlGuard {
     fn acquire_until(deadline: Instant) -> Result<Self, String> {
         ensure_preflight_cleanup_deadline(deadline)?;
         let name = wide_string(PROFILE_CONTROL_MUTEX_NAME);
+        let mut security = OwnerOnlyKernelSecurity::new(GENERIC_ALL, "profile-control mutex")?;
+        let attributes = security.attributes();
         let mutex = Handle::created(
-            unsafe { CreateMutexW(null(), 0, name.as_ptr()) },
+            unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) },
             "open cross-process AppContainer profile-control mutex",
+        )?;
+        attest_owner_only_kernel_object(
+            mutex.raw(),
+            security.user_sid(),
+            GENERIC_ALL,
+            "profile-control mutex",
         )?;
         ensure_preflight_cleanup_deadline(deadline)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2971,7 +3141,7 @@ fn private_desktop(sid: PSID) -> Result<PrivateDesktop, String> {
         SE_WINDOW_OBJECT,
         sid,
         GRANT_ACCESS,
-        GENERIC_ALL,
+        SANDBOX_WINDOW_STATION_ACCESS,
         0,
     )?;
     let station_name = user_object_name(desktop.station, "sandbox window-station")?;
@@ -3948,6 +4118,11 @@ fn launch_appcontainer(
     cache: &Path,
     private_storage: &Path,
 ) -> Result<Handle, String> {
+    // Preserve verbatim canonical paths for policy/identity checks, but use
+    // ordinary Win32 drive paths at the final process boundary. In particular,
+    // cmd.exe rejects a `\\?\C:\...` current directory as though it were UNC.
+    let child_program = child_process_path(program);
+    let child_cwd = child_process_path(cwd);
     let _creation = crate::process_creation::creation_guard()
         .map_err(|error| format!("lock Windows process creation: {error}"))?;
     let stdout = inheritable_duplicate(std::io::stdout().as_raw_handle())?;
@@ -4015,15 +4190,15 @@ fn launch_appcontainer(
     startup.StartupInfo.hStdError = stderr.raw();
     startup.StartupInfo.lpDesktop = desktop.startup_name.as_ptr().cast_mut();
     startup.lpAttributeList = list;
-    let application = wide_null(program.as_os_str())?;
-    let command_line = windows_command_line(program, arguments);
+    let application = wide_null(child_program.as_os_str())?;
+    let command_line = windows_command_line(&child_program, arguments);
     if command_line.encode_utf16().count() >= 32_767 {
         return Err(
             "sandbox: restricted process command line exceeds the Windows UTF-16 bound".into(),
         );
     }
     let mut command_line = wide_string(&command_line);
-    let cwd = wide_null(cwd.as_os_str())?;
+    let cwd = wide_null(child_cwd.as_os_str())?;
     let environment = appcontainer_environment(cache, private_storage);
     let mut information = PROCESS_INFORMATION::default();
     if unsafe {
@@ -4180,7 +4355,8 @@ fn appcontainer_environment(cache: &Path, private_storage: &Path) -> Vec<u16> {
         .to_string_lossy()
         .into_owned();
     let cache = cache.as_os_str().to_string_lossy().into_owned();
-    entries.push(("LOCALAPPDATA".into(), private_storage));
+    entries.push(("LOCALAPPDATA".into(), private_storage.clone()));
+    entries.push(("USERPROFILE".into(), private_storage));
     entries.push(("TEMP".into(), private_temp.clone()));
     entries.push(("TMP".into(), private_temp));
     entries.push(("ZS_CACHE_DIR".into(), cache));
@@ -4200,6 +4376,7 @@ fn essential_windows_environment() -> Vec<(String, String)> {
         "SYSTEMROOT",
         "WINDIR",
         "COMSPEC",
+        "SYSTEMDRIVE",
         "LANG",
         "LC_ALL",
         "TERM",
@@ -4220,6 +4397,30 @@ fn windows_command_line(program: &Path, arguments: &[String]) -> String {
         .map(|argument| quote_windows_argument(&argument))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn child_process_path(path: &Path) -> PathBuf {
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+    if units.starts_with(VERBATIM_UNC) {
+        let mut ordinary = vec![b'\\' as u16, b'\\' as u16];
+        ordinary.extend_from_slice(&units[VERBATIM_UNC.len()..]);
+        return PathBuf::from(std::ffi::OsString::from_wide(&ordinary));
+    }
+    if units.starts_with(VERBATIM) {
+        return PathBuf::from(std::ffi::OsString::from_wide(&units[VERBATIM.len()..]));
+    }
+    path.to_path_buf()
 }
 
 fn quote_windows_argument(argument: &str) -> String {
@@ -4272,9 +4473,17 @@ fn helper_cancel_event_name(pid: u32) -> Vec<u16> {
 
 fn helper_cancel_event() -> Result<Handle, String> {
     let name = helper_cancel_event_name(unsafe { GetCurrentProcessId() });
-    let raw = unsafe { CreateEventW(null(), TRUE, FALSE, name.as_ptr()) };
+    let mut security = OwnerOnlyKernelSecurity::new(GENERIC_ALL, "helper cancellation event")?;
+    let attributes = security.attributes();
+    let raw = unsafe { CreateEventW(&attributes, TRUE, FALSE, name.as_ptr()) };
     let creation_error = std::io::Error::last_os_error();
     let event = Handle::created(raw, "create cooperative sandbox-helper cancellation event")?;
+    attest_owner_only_kernel_object(
+        event.raw(),
+        security.user_sid(),
+        GENERIC_ALL,
+        "helper cancellation event",
+    )?;
     if creation_error.raw_os_error() == Some(183) {
         return Err("sandbox: cooperative helper cancellation event already existed".into());
     }
@@ -5558,6 +5767,22 @@ mod tests {
         assert!(reject_remote_access_path(Path::new(r"\\server\share\root")).is_err());
         assert!(reject_remote_access_path(Path::new(r"\\?\UNC\server\share\root")).is_err());
         drop(authority);
+    }
+
+    #[test]
+    fn child_process_operands_drop_verbatim_namespace_only_at_launch() {
+        assert_eq!(
+            child_process_path(Path::new(r"\\?\C:\workspace\mini-agent.exe")),
+            PathBuf::from(r"C:\workspace\mini-agent.exe")
+        );
+        assert_eq!(
+            child_process_path(Path::new(r"\\?\UNC\server\share\tool.exe")),
+            PathBuf::from(r"\\server\share\tool.exe")
+        );
+        assert_eq!(
+            child_process_path(Path::new(r"C:\workspace\tool.exe")),
+            PathBuf::from(r"C:\workspace\tool.exe")
+        );
     }
 
     fn attempt_control_directory_swap(target: PathBuf, replacement: PathBuf) -> std::io::Error {

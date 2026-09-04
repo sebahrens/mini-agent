@@ -123,6 +123,9 @@ impl ShellCapability {
             if !is_executable(&candidate) {
                 return None;
             }
+            if dialect == ShellDialect::Posix && is_windows_wsl_bash_launcher(&candidate) {
+                return None;
+            }
             let identity = pin_windows_shell_path(&candidate).ok()?;
             is_windows_executable_image(&candidate).then_some((candidate, identity))
         })?;
@@ -200,6 +203,15 @@ impl ShellCapability {
             "configured workspace-relative shell is unavailable or unsupported".to_string()
         })
     }
+}
+
+#[cfg(windows)]
+fn is_windows_wsl_bash_launcher(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('/', "\\");
+    let normalized = normalized.strip_prefix(r"\\?\").unwrap_or(&normalized);
+    normalized
+        .to_ascii_lowercase()
+        .ends_with(r"\windows\system32\bash.exe")
 }
 
 #[cfg(windows)]
@@ -588,7 +600,7 @@ fn seatbelt_path() -> Option<&'static Path> {
     None
 }
 
-static ZEROBOX_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static ZEROBOX_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 const BWRAP_REQUESTED_NETWORK_POLICY: &str =
     "deny (unshare-net; backend absence/setup failure denies launch)";
 const SEATBELT_REQUESTED_NETWORK_POLICY: &str =
@@ -603,8 +615,14 @@ const HOOK_SANDBOX_READY_SCRIPT: &str = r#"if [ ! -x "$0" ]; then exit 126; fi
 printf 'MINI_AGENT_HOOK_SANDBOX_READY/1\n' >&2
 exec "$0" "$@""#;
 
+fn zerobox_path() -> Option<&'static Path> {
+    ZEROBOX_PATH
+        .get_or_init(|| find_trusted_system_executable("zerobox"))
+        .as_deref()
+}
+
 fn zerobox_exists() -> bool {
-    *ZEROBOX_AVAILABLE.get_or_init(|| which_cmd("zerobox"))
+    zerobox_path().is_some()
 }
 
 /// Explicit three-state sandbox policy — never inferred or collapsed to a bool.
@@ -638,16 +656,7 @@ pub struct SandboxCapabilityMatrix {
     pub requested_network_policy: &'static str,
 }
 
-fn which_cmd(name: &str) -> bool {
-    // Search PATH directly rather than shelling out to `which`, which may not
-    // exist on minimal images (Alpine, distroless).
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(name)))
-}
-
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "hooks")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn find_trusted_system_executable(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -656,10 +665,7 @@ fn find_trusted_system_executable(name: &str) -> Option<PathBuf> {
         .find(|candidate| is_trusted_system_path(candidate))
 }
 
-#[cfg(all(
-    feature = "hooks",
-    not(any(target_os = "linux", all(target_os = "macos", feature = "hooks")))
-))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn find_trusted_system_executable(_name: &str) -> Option<PathBuf> {
     None
 }
@@ -1008,7 +1014,12 @@ impl Sandbox {
                 filesystem_writes: "host permissions inherited",
                 process_namespace: "host namespaces inherited",
                 devices: "host devices inherited",
-                environment: "parent environment inherited",
+                environment: match self.disabled_reason {
+                    DisabledSandboxReason::UserTrustedBypass => "parent environment inherited",
+                    DisabledSandboxReason::UnavailableDefaultFallback => {
+                        "cleared, then populated from a non-credential allow-list"
+                    }
+                },
                 network: "host network inherited",
                 requested_network_policy: "not requested",
             },
@@ -1420,6 +1431,12 @@ impl Sandbox {
                 let mut cmd = Command::new(&self.shell);
                 cmd.arg(&self.shell_command_arg).arg(command);
                 cmd.current_dir(&requested_cwd);
+                if self.disabled_reason == DisabledSandboxReason::UnavailableDefaultFallback {
+                    cmd.env_clear();
+                    for (key, value) in self.get_essential_env() {
+                        cmd.env(key, value);
+                    }
+                }
                 configure_child_lifetime(&mut cmd);
                 self.bind_workspace_cwd(&mut cmd)?;
                 return Ok(cmd);
@@ -1457,7 +1474,11 @@ impl Sandbox {
                     "sandbox backend 'zerobox' cannot consume an ACP workspace handle".to_string(),
                 );
             }
-            let mut cmd = Command::new("zerobox");
+            let zerobox = zerobox_path().ok_or_else(|| {
+                "sandbox backend 'zerobox' is not a trusted system executable — refusing to run unsandboxed"
+                    .to_string()
+            })?;
+            let mut cmd = Command::new(zerobox);
             cmd.arg("--allow-write");
             cmd.arg(cwd.as_os_str());
             cmd.arg("--");
@@ -1718,7 +1739,11 @@ impl Sandbox {
                         .to_string(),
                 );
             }
-            let mut cmd = Command::new("zerobox");
+            let zerobox = zerobox_path().ok_or_else(|| {
+                "sandbox backend 'zerobox' is not a trusted system executable — refusing workspace-service launch"
+                    .to_string()
+            })?;
+            let mut cmd = Command::new(zerobox);
             cmd.env_clear();
             cmd.envs(env.iter().cloned());
             cmd.arg("--allow-write")
@@ -2772,6 +2797,10 @@ fn essential_env() -> Vec<(&'static str, String)> {
         "TMP",
         "USERNAME",
         "USERPROFILE",
+        "SYSTEMDRIVE",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
     ];
     let mut vars = Vec::with_capacity(preserve.len());
     for name in &preserve {
@@ -3054,6 +3083,20 @@ mod sandbox_tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_shell_resolution_rejects_legacy_system32_wsl_bash_launcher() {
+        assert!(is_windows_wsl_bash_launcher(Path::new(
+            r"C:\Windows\System32\bash.exe"
+        )));
+        assert!(is_windows_wsl_bash_launcher(Path::new(
+            r"\\?\C:\WINDOWS\SYSTEM32\BASH.EXE"
+        )));
+        assert!(!is_windows_wsl_bash_launcher(Path::new(
+            r"C:\Program Files\Git\bin\bash.exe"
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_shell_capability_skips_bad_images_and_pins_valid_bytes() {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
@@ -3267,12 +3310,15 @@ mod sandbox_tests {
             "SetSecurityDescriptorDacl",
             "Global\\\\mini-agent-general-job-",
             "CreateMutexW",
+            "OwnerOnlyKernelSecurity",
+            "attest_owner_only_kernel_object",
             "WAIT_ABANDONED_0",
             "AclMutationGuard::acquire()?",
             "windows_file_link_count",
             "program_proof",
             "MAX_REQUEST_FEEDERS",
             "CreateDesktopW",
+            "SANDBOX_WINDOW_STATION_ACCESS",
             "GetThreadDesktop",
             "let desktop = private_desktop(grants.sid())?",
             "startup.StartupInfo.lpDesktop",
@@ -3314,6 +3360,8 @@ mod sandbox_tests {
             "network=denied",
             "registry=not_isolated",
             "CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT",
+            "child_process_path(program)",
+            "child_process_path(cwd)",
             "process_token_is_regular_appcontainer(process.raw())",
             "ResumeThread(thread.raw())",
             "regular AppContainer ALL_APPLICATION_PACKAGES access",
@@ -4098,16 +4146,19 @@ printf LINUX_SANDBOX_POLICY_PASS
         }
 
         let unique = uuid::Uuid::new_v4();
-        let workspace_probe = std::env::current_dir()
-            .unwrap()
+        let workspace = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let workspace_probe = workspace
+            .root()
             .join(format!(".mini-agent-seatbelt-write-{unique}"));
         let workspace_probe_name = workspace_probe.file_name().unwrap().to_string_lossy();
-        let escape_link = std::env::current_dir()
-            .unwrap()
+        let escape_link = workspace
+            .root()
             .join(format!(".mini-agent-seatbelt-escape-{unique}"));
         let escape_link_name = escape_link.file_name().unwrap().to_string_lossy();
-        let outside_probe = std::env::current_dir()
-            .unwrap()
+        let outside_probe = workspace
+            .root()
             .parent()
             .expect("test repository must not be filesystem root")
             .join(format!(".mini-agent-seatbelt-denied-{unique}"));
@@ -4132,7 +4183,7 @@ printf MACOS_SEATBELT_POLICY_PASS
             workspace_probe_name = workspace_probe_name,
         );
 
-        let sandbox = Sandbox::new(true, "seatbelt");
+        let sandbox = Sandbox::new(true, "seatbelt").with_workspace_binding(workspace);
         let mut command = sandbox.wrap_command(&script).unwrap();
         command.env("MINI_AGENT_SANDBOX_SECRET", "must-not-cross-env-i");
         let output = sandbox

@@ -671,7 +671,8 @@ The launch creates or derives one stable zero-capability AppContainer profile, o
 APPLICATION PACKAGES` for LPAC, uses `DETACHED_PROCESS`, supplies an exact three-handle anonymous
 protocol/diagnostic list, and assigns an unnamed kill-on-close, single-process Job through the
 creation-time attribute list. The parent verifies membership in that exact Job. The harness child
-must verify `TokenIsAppContainer`, `TokenIsLessPrivilegedAppContainer`, zero token capabilities,
+must verify `TokenIsAppContainer`, effective LPAC semantics that disregard
+`ALL APPLICATION PACKAGES`, zero token capabilities,
 no console window or `CONIN$`/`CONOUT$`, the three distinct standard protocol handles, rejection of
 an inheritable canary omitted from `HANDLE_LIST`, and access denial for a parent-created workspace
 sentinel before emitting its fixed readiness frame. Profile and disposable-artifact cleanup errors

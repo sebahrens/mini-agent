@@ -46,6 +46,32 @@ fn implicit_unavailable_default_is_not_reported_as_an_explicit_trusted_bypass() 
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn implicit_unavailable_default_clears_ambient_credentials() {
+    let _environment = crate::tests::ScopedProcessEnv::set(&[(
+        "MINI_AGENT_FALLBACK_SECRET",
+        Some("must-not-cross".into()),
+    )]);
+    let sandbox = Sandbox::new(false, "missing-default").with_unavailable_default_fallback();
+
+    let output = sandbox
+        .output_command_with_limits(
+            "test -z \"${MINI_AGENT_FALLBACK_SECRET+x}\" && printf clean",
+            SHORT_LIMITS,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.status, CommandStatus::Completed);
+    assert!(output.exit_status.is_some_and(|status| status.success()));
+    assert_eq!(output.stdout, b"clean");
+    assert_eq!(
+        sandbox.capability_matrix().environment,
+        "cleared, then populated from a non-credential allow-list"
+    );
+}
+
 #[tokio::test]
 async fn explicit_shell_success_and_nonzero_share_one_status_policy() {
     let sandbox = Sandbox::new(false, "bwrap");

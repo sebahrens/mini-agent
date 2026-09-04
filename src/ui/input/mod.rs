@@ -225,6 +225,20 @@ impl InputEditor {
     }
 
     pub fn open_in_editor(&mut self, terminal_guard: &mut TerminalGuard) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        {
+            let _ = terminal_guard;
+            anyhow::bail!(
+                "opening $EDITOR is unsupported on Windows because no portable editor-command grammar is configured"
+            );
+        }
+
+        #[cfg(not(windows))]
+        self.open_in_editor_unix(terminal_guard)
+    }
+
+    #[cfg(not(windows))]
+    fn open_in_editor_unix(&mut self, terminal_guard: &mut TerminalGuard) -> anyhow::Result<()> {
         let editor = self
             .editor
             .clone()

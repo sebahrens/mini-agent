@@ -164,6 +164,8 @@ def validate(root: Path) -> list[str]:
         "/norestart",
         "MSI_SHA256SUMS",
         "mini-agent-windows-x64.msi",
+        "& $installed --print-config",
+        "startup/configuration smoke",
     ):
         _require(errors, fragment in workflow, f"release workflow is missing MSI gate {fragment!r}")
     _require(
