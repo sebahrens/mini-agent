@@ -22,12 +22,14 @@ incorporates into its response.
 
 ## Feature Gate
 
-Subagents are **opt-in** via the `subagents` Cargo feature:
+Subagents are gated by the `subagents` Cargo feature and are included in the
+default build:
 
 ```toml
 # Cargo.toml
 [features]
-default = ["loop", "git-worktree", "mcp", "subagents"]
+default = ["loop", "git-worktree", "mcp", "acp", "subagents", "archmd",
+           "status-signals", "multithread", "export", "js", "sandbox", "memory"]
 ```
 
 ## The `task` Tool
@@ -155,8 +157,9 @@ same path-containment and approval rules as the parent:
   nesting is impossible.
 
 The main agent's `task` tool goes through the normal permission check
-(`check_perm("task", …)`), so users can allow/ask/deny it via their
-`opencode.json` permission rules.
+(`check_perm("task", …)`), so users can allow, ask, or deny it through the
+normal TOML/YAML/JSON zerostack configuration described in
+[CONFIG.md](CONFIG.md#permission-config).
 
 ## Configuration
 
@@ -191,20 +194,18 @@ When the subagent uses a different provider than the main agent, a separate
 API client is created at startup. The subagent client is independent from the
 main agent's client and can be switched at runtime.
 
-Example `opencode.json`:
+Example `config.toml`:
 
-```json
-{
-  "task_max_turns": 20,
-  "task_max_prompts": 8,
-  "task_max_concurrency": 4,
-  "task_max_output_bytes": 262144,
-  "task_max_cost_units": 500000,
-  "task_timeout_secs": 300,
-  "task_enabled": true,
-  "subagent_model": "deepseek-v4-flash",
-  "subagent_provider": "openrouter"
-}
+```toml
+task_max_turns = 20
+task_max_prompts = 8
+task_max_concurrency = 4
+task_max_output_bytes = 262144
+task_max_cost_units = 500000
+task_timeout_secs = 300
+task_enabled = true
+subagent_model = "deepseek-v4-flash"
+subagent_provider = "openrouter"
 ```
 
 ## Slash Commands
@@ -234,9 +235,9 @@ Main Agent                               Subagent(s)
 │ grep/find_files│ ──────────────────────→│ find_files          │
 │ list_dir     │   with prompt(s)        │ list_dir            │
 │ todo         │                         │ memory_read         │
-│ task  ───────┤   spawns parallel       │ memory_search       │
-│              │   subagents via         │                     │
-│              │   tokio::spawn          │                     │
+│ task  ───────┤   polls bounded child   │ memory_search       │
+│              │   futures inline via    │                     │
+│              │   FuturesUnordered      │                     │
 │              │   ──────────────        │ runs ≤ max_turns    │
 │              │   returns findings ────→│ returns summary     │
 └──────────────┘                         └─────────────────────┘

@@ -138,11 +138,12 @@ catalog in `src/extras/skills/`. Phase 6 moved production and verification Quick
 the contained same-executable worker in `worker.rs`/`realm.rs`; `engine.rs` is retained only for
 historical regression tests. `tool.rs`, `supervisor.rs`, `broker.rs`, and `audit.rs` remain in the
 trusted parent and own invocation policy, transport, effects, and durable audit. Phase 5 is
-delivered. Phase 6 is delivered with the dedicated cross-platform containment gates and platform
-resource records from CI run 31319107422. The final validator at commit `9c6f164` independently
-aggregated those records into the reviewed baseline in `docs/benchmarks/results/`. Source line
-numbers are intentionally omitted here because they drift; tracker tasks must resolve current
-symbols before editing.
+delivered. Phase 6 has dedicated cross-platform containment gates, but the committed
+`docs/benchmarks/results/js-worker-baseline.json` still declares
+`evidence_state: pending_external_runs` and contains no platform evidence records. It is therefore
+a target-and-schema document, not proof that the external platform matrix has been aggregated or
+reviewed. Source line numbers are intentionally omitted here because they drift; tracker tasks must
+resolve current symbols before editing.
 
 Identity-v2 private learned-skill realms also include the vendored AJV 8.12.0 validator. Stored
 skill source can call `Ajv.validate(schema, data)` and inspect the frozen `Ajv.errors` array after

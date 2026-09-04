@@ -41,8 +41,8 @@ integration tests that launch the contained worker. See `src/extras/js/tests/`.
 
 ## Platform notes
 
-- On Windows, JS remains disabled unless the LPAC supported-install-location gate passes; parent-brokered JS `spawn` remains disabled until the separate general Windows command sandbox is delivered
-- Hook subprocess.rs uses `("sh", "-c")` on unix / `("powershell", "-Command")` on Windows — do not change this without updating the hooks module
+- On Windows, JS remains disabled unless the LPAC supported-install-location gate passes. Parent-brokered JS `spawn` is wired through the separate general AppContainer command sandbox and must remain unavailable when that backend or the requested executable grant cannot be established.
+- Hook handler commands are resolved and launched as direct executable-plus-argv calls. Only an explicit hook `if` condition is opaque shell text (`sh -c` on Unix or PowerShell `-Command` on Windows); preserve that distinction when changing hook launch code.
 - `sandbox.rs`: `kill_process_group` is `#[cfg(unix)]` with empty Windows arm — keep it that way
 
 ## Dependency changes

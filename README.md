@@ -205,6 +205,12 @@ Install the latest checksum-verified release on Linux or macOS:
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 ```
 
+On x86-64 Windows, the same release publishes
+`mini-agent-windows-x64.msi` plus `MSI_SHA256SUMS`. After verifying the
+checksum, open the MSI for a per-user, no-admin install; it also attempts to
+side-load the bundled VSIX when VS Code is installed. Enterprise deployment
+can use `msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart`.
+
 Or build and install the checked-out source. Do not run `cargo install mini-agent`: crates.io
 currently assigns that name to an unrelated project.
 

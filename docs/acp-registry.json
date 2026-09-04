@@ -21,12 +21,21 @@
         "request_permission": true
       },
       "tools": [
-        "bash",
+        "shell",
         "read",
         "write",
         "edit",
+        "grep",
+        "find_files",
         "list_dir",
-        "git"
+        "todo_write",
+        "git",
+        "js",
+        "task",
+        "memory_write",
+        "memory_edit",
+        "memory_read",
+        "memory_search"
       ]
     },
     "startup": {

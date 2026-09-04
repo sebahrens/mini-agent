@@ -58,10 +58,17 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
         ctx.renderer,
         "  /memory [status|search|read|write|editor|clear]  manage memory",
     );
-    write_result(ctx.renderer, "  /clear [/new]          clear screen");
+    write_result(
+        ctx.renderer,
+        "  /clear [/new]          clear the current session",
+    );
     write_result(
         ctx.renderer,
         "  /provider [name]       show or switch provider",
+    );
+    write_result(
+        ctx.renderer,
+        "  /model [name]          show or switch model",
     );
     write_result(ctx.renderer, "  /models                list quick models");
     write_result(
@@ -107,7 +114,7 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
     );
     write_result(
         ctx.renderer,
-        "  /mode <mode>           set mode (standard|restrictive|readonly|guarded|yolo)",
+        "  /mode <mode>           set mode (standard|restrictive|readonly|planwrite|guarded|yolo)",
     );
     write_result(
         ctx.renderer,
@@ -136,7 +143,6 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
             "  /mcp logout <server>   remove a server's stored OAuth token",
         );
     }
-    write_result(ctx.renderer, "  /clear [/new]          clear screen");
     write_result(
         ctx.renderer,
         "  /undo [stash]          undo last exchange (stash only when asked; never prompts)",
@@ -207,6 +213,7 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
             "  /loop [prompt]         start iterative coding loop",
         );
         write_result(ctx.renderer, "  /loop stop             stop the loop");
+        write_result(ctx.renderer, "  /loop status           show loop status");
     }
     #[cfg(not(feature = "loop"))]
     {

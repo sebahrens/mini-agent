@@ -32,6 +32,7 @@ All slash commands are available from the TUI input prompt.
 | `/queue pop` | Remove the last queued input. |
 | `/welcome` | Show the welcome/onboarding screen. |
 | `/tutorial` | Alias for `/welcome`. |
+| `/tutor` | Open the full getting-started guide in `less`, or print it when no pager is available. |
 
 HTML exports treat every session field as untrusted. Raw HTML is displayed as escaped text;
 assistant Markdown keeps normal formatting, HTTP(S)/`mailto:` or relative links, and HTTPS images,
@@ -81,6 +82,7 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/mode standard` | Allow path tools within CWD, ask for external paths. Config rules apply. |
 | `/mode restrictive` | Ask for every operation. Config rules skipped. |
 | `/mode readonly` | Allow reads only; deny writes, edits, bash, and everything else. |
+| `/mode planwrite` | Read-only except for the built-in, workspace-contained plan-file write exception. |
 | `/mode guarded` | Allow reads; ask for writes, edits, bash, and everything else. Config rules apply. |
 | `/mode yolo` | Allow everything; ask for destructive bash commands. Config rules apply. |
 
@@ -112,7 +114,7 @@ starting a session or making a model call. See
 
 Prompts may include a `%%mode=<mode>` directive on the **first line** to
 automatically switch the security mode when activated. Valid modes:
-`standard`, `restrictive`, `readonly`, `guarded`, `yolo`. Use
+`standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`. Use
 `%%mode=last_user_mode` to restore the mode the user last set via `/mode`
 or startup config. The directive line is stripped from the prompt content
 before it reaches the agent.
@@ -149,7 +151,7 @@ You are in read-only mode. Only read files and explore.
 
 ## Memory (feature-gated)
 
-Requires building with `--features memory`.
+Requires the `memory` feature, which is included in the default build.
 
 | Command | Description |
 | ------- | ----------- |
@@ -169,8 +171,9 @@ Requires building with `--features memory`.
 | `/memory clear daily` | Clear all of today's entries. |
 
 Long-term memory (MEMORY.md) and open scratchpad items are automatically injected
-into every request. Daily logs (today + yesterday) are also included. Notes and
-older daily logs are accessible via `/memory read` and `memory_search`.
+into every request. The two most recent non-empty daily logs are also included;
+they are not assumed to be today and yesterday. Notes and older daily logs are
+accessible via `/memory read` and `memory_search`.
 
 ## MCP (feature-gated)
 
@@ -299,20 +302,24 @@ message, and after the response restores the previous prompt and
 | Shortcut | Action |
 | -------- | ------ |
 | `Enter` | Send message. |
-| `Shift+Enter` | Insert newline. |
+| `Shift+Enter` or `Alt+Enter` | Insert newline. |
 | `Ctrl+C` | Cancel the current agent response, validation, or shell command; quit when idle. |
+| `Ctrl+D` | Same interrupt/quit behavior as `Ctrl+C`. |
 | `Ctrl+Shift+C` | Copy selected text through the Unicode clipboard on Windows. |
 | `Ctrl+V` | Paste Unicode clipboard text at the cursor on Windows. |
-| `Ctrl+D` | Send message (alternative). |
 | `Ctrl+W` | Delete word backwards. |
-| `Ctrl+U` | Delete to beginning of line. |
-| `Ctrl+L` | Clear terminal. |
+| `Ctrl+U` | Delete everything before the cursor. |
+| `Ctrl+K` | Delete everything after the cursor. |
+| `Ctrl+A` / `Ctrl+E` | Move to the start/end of the current input line. |
+| `Ctrl+B` / `Ctrl+F` | Move one character left/right. |
+| `Alt+B` / `Alt+F` | Move one word left/right. |
+| `Alt+D` | Delete the next word. |
+| `Ctrl+Y` / `Alt+Y` | Yank the last deletion / rotate the kill ring. |
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |
 | `Ctrl+H` | Launch `lazygit` (git TUI) in the project directory. |
-| `Ctrl+S` | Save session. |
-| `Tab` | Activate file picker / auto-complete paths. |
-| `Up / Down` | Navigate command history. |
+| `@<query>` | Activate the file picker; Tab/Enter selects and Escape closes it. |
+| `Tab` | Insert two spaces when no picker is active. |
+| `Up / Down` | Move vertically in multiline input; at an edge, navigate command history. |
 | `PageUp / PageDown` | Scroll viewport. |
-| `Home / End` | Jump to start/end of input. |
-| `Alt+Enter` | Retry last prompt. |
+| `Home / End` | Jump to the top/bottom of chat history. |
 | `Escape` | Close active picker / cancel. |

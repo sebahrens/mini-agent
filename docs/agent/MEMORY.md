@@ -6,16 +6,16 @@ description: "Persistent markdown memory in zerostack: global notes, project scr
 
 ## Overview
 
-The Memory system provides persistent, file-based storage that lets the agent recall information across sessions. It lives behind the `memory` Cargo feature flag and is **not** enabled by default (enable with `--features memory`).
+The Memory system provides persistent, file-based storage that lets the agent recall information across sessions. It lives behind the `memory` Cargo feature flag, which is included in the default build. A custom minimal build can omit it with `--no-default-features`.
 
-Memory is plain Markdown on disk — no database, no indexing service. All storage lives under the agent config directory (`<config_dir>/agent/memory/`).
+Memory is plain Markdown on disk — no database, no indexing service. All storage lives under the platform data root (`<data_dir>/memory/`), controlled by `ZS_DATA_DIR`.
 
 ---
 
 ## Storage Layout
 
 ```
-<config_dir>/agent/memory/
+<data_dir>/memory/
 ├── MEMORY.md                        # Global long-term memory (shared across projects)
 └── projects/
     └── <project-slug>/
@@ -30,7 +30,7 @@ Memory is plain Markdown on disk — no database, no indexing service. All stora
 
 ### Project Slug
 
-Per-project files (scratchpad, daily, notes) are scoped by a slug derived from the working directory. The slug is `<sanitized-basename>-<8-hex-of-full-path-hash>`, ensuring two repos with the same folder name get distinct storage. `MEMORY.md` is global — shared across all projects.
+Per-project files (scratchpad, daily, notes) are scoped by a 64-character lowercase SHA-256 component derived from a versioned namespace plus the native bytes (Unix) or UTF-16LE units (Windows) of the captured startup workspace. Display names never become persistent path components, and distinct project paths remain isolated. `MEMORY.md` is global — shared across all projects.
 
 ### Write Targets
 
@@ -61,12 +61,12 @@ Enum selecting which file to write to:
 ### `Mem`
 
 The store handle. Fields:
-- `root: PathBuf` — root of the memory store (`<config_dir>/agent/memory/`)
-- `project: String` — slug of the current working directory
+- `root: PathBuf` — root of the memory store (`<data_dir>/memory/`)
+- `project: String` — opaque identity of the captured startup workspace
 - `today: String` — today's date as `YYYY-MM-DD`
 
 Public API:
-- `Mem::open()` — opens the store, deriving project slug from CWD
+- `Mem::open()` — opens the store from initialized application paths, deriving the project identity from the captured startup workspace rather than process-global CWD
 - `write(target, content, mode, name)` — persist content to the target
 - `append_daily(heading, body)` — timestamped entry to today's log
 - `context_block()` — builds the injected `<memory>` block (see below)
@@ -263,10 +263,10 @@ Appends the `<memory>...</memory>` block to the system prompt preamble, separate
 
 ---
 
-## Prompt Instruction
+## Prompt and tool integration
 
-When `memory` is enabled, `MEMORY_TOOLS_PROMPT` is appended to the system preamble, explaining to the model:
-- When to use each write target
-- That scratchpad open items are auto-injected
-- That notes are not auto-injected (find via search, read via read)
-- That memory is reference, not instructions
+There is no separate `MEMORY_TOOLS_PROMPT` constant. When memory is enabled,
+the builder registers the four tools, whose schemas and descriptions explain
+their targets and retrieval behavior. Independently, the current bounded
+`<memory>` block is appended to the system preamble and explicitly labels its
+contents as reference material rather than instructions.

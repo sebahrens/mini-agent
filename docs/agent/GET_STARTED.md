@@ -7,7 +7,7 @@ description: "Get started with mini-agent: install the minimal Rust coding agent
 Thanks for picking up mini-agent. This guide covers installation, model setup, and the basic commands.
 
 This tutorial applies to Linux, macOS, and Windows. The checksum-verified shell installer below
-targets Linux and macOS; on Windows, build from the checked-out source. JavaScript actions expose the same brokered
+targets Linux and macOS; x86-64 Windows also has a release MSI. JavaScript actions expose the same brokered
 feature contract on all three systems, while each platform uses and reports its own containment
 assurance; see the repository README and architecture overview for those guarantees.
 
@@ -17,6 +17,15 @@ You can build from source or use the checksum-verified shell installer. The shel
 complete release in the canonical repository:
 ```
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
+```
+
+On x86-64 Windows, download `mini-agent-windows-x64.msi` and
+`MSI_SHA256SUMS` from the same GitHub release, verify the checksum, then open
+the MSI. It installs per-user without elevation by default and side-loads the
+bundled VSIX when VS Code is present. Managed machines can use:
+
+```powershell
+msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart
 ```
 
 For a source checkout, use:
@@ -60,7 +69,16 @@ You can just set the matching env var with :
 | Gemini     | `GEMINI_API_KEY`      |
 | Ollama     | (none — local)        |
 
-Then, you can change your configuration file (`~/.local/share/zerostack/config.toml` on Linux/WSL or `~/Library/Application Support/zerostack/` on macOS, unless overridden by `$ZS_CONFIG_DIR` or an existing `~/.config/zerostack/` file — see [CONFIG.md](CONFIG.md) for the full precedence) by adding `provider = [provider_name]` in order to change your default provider.
+Then, you can change your configuration file (`~/.config/zerostack/config.toml`
+on Linux, `~/Library/Application Support/zerostack/config.toml` on macOS, or
+`%APPDATA%\zerostack\config.toml` on Windows, unless overridden by
+`ZS_CONFIG_DIR`; see [CONFIG.md](CONFIG.md)) by adding
+`provider = "provider_name"`.
+
+`ZS_MODEL` selects a model through the same CLI field as `--model`. For
+compatibility, `OPENROUTER_MODEL` is also accepted as the next fallback—even
+when another provider is selected—and takes precedence over the config-file
+model. Prefer `ZS_MODEL` for provider-neutral configuration.
 
 If you are using a provider that's not your default one, use the `--provider` CLI flag:
 
@@ -147,13 +165,15 @@ Here is some keybindings to speed up your coding experience:
 | ---- | ------ |
 | `Ctrl+R` | Toggle reasoning/thinking |
 | `Ctrl+G` | Open input in `$EDITOR` |
-| `Ctrl+H` | Launches `lazygit`
-| `Ctrl+S` | Force-save session |
+| `Ctrl+H` | Launch `lazygit` |
 | `Ctrl+C` | Interrupt the agent |
 | `Ctrl+Shift+C` | Copy selected text (Windows) |
 | `Ctrl+V` | Paste Unicode clipboard text (Windows) |
 | `PgUp` / `PgDn` | Scroll chat |
 | `Home` / `End` | Jump to top/bottom |
+| `Shift+Enter` / `Alt+Enter` | Insert a newline |
+| `@<query>` | Open the file picker; Tab or Enter selects |
+| `Tab` | Insert two spaces when no picker is active |
 
 ## 5. CLI flags
 
@@ -162,16 +182,37 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | Flag | Action |
 | ---- | ------ |
 | `-p <msg>` | Sends a message |
+| `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
 | `-c` | Continues from last open session |
+| `-r`, `--resume` | List recent sessions for selection. |
 | `--name <name>` | Set a name for the new session |
 | `--session <id-or-name>` | Load session by ID prefix or name |
+| `--resume-provider <name>` / `--resume-model <id>` | Explicitly change provider/model while resuming saved context; the provider change displays and audits a privacy warning. |
+| `--no-session` | Run ephemerally without saving a session. |
+| `--restrictive` | Ask for every operation. |
 | `--read-only` | Only reads files |
-| `--yolo` | No limitations given to the agent |
+| `--guarded` | Allow reads and ask for other operations. |
+| `--accept-all` | Auto-allow operations inside the workspace while retaining the permission system. |
+| `--yolo` | Allow operations except destructive shell commands, which still ask. |
+| `--dangerously-skip-permissions` | Disable permission checks entirely. This is strictly broader than `--yolo`. |
 | `--sandbox` | Explicitly require the platform general-process sandbox; fail if unavailable |
 | `--no-sandbox` | Disable the default-on general-process sandbox |
-| `--worktree` | Run the agent inside a git worktree (Experimental) |
+| `--shell <path>` | Select Bash/sh, or PowerShell/pwsh on Windows, for explicit shell execution and the compatibility tool. |
+| `--no-color` | Disable colored TUI output. |
+| `--tutor` | Print the getting-started guide through the pager and exit. |
+| `--loop`, `--loop-prompt`, `--loop-plan`, `--loop-max`, `--loop-run` | Configure the bounded headless iterative loop and optional validation command. |
+| `--worktree <name>` | Run the agent inside a new git worktree. |
 | `--parallel` | Run the agent inside a self-managed git worktree (Experimental) |
+| `--wt-auto-merge`, `--wt-base-dir <path>` | Configure worktree merge-on-exit and its base directory. |
+| `--status-socket <path>` | Send start/stop status messages to a Unix socket. |
 | `--load-prompt <prompt>` | Use a specific prompt |
+
+Offline policy probes—`--config-preservation-check`,
+`--project-config-trust-check`, `--js-runtime-check`,
+`--memory-editor-preservation-check`, `--resume-provider-safety-check`,
+`--acp-authentication-check`, `--acp-permission-policy-check`, and
+`--loop-verification-policy-check`—run one named self-check and exit. They are
+intended for packaging and CI diagnostics rather than ordinary sessions.
 
 ## 6. Feature contract
 

@@ -20,8 +20,9 @@ The source is retained for rollback.
 current working directory, it is merged over the global config at startup.
 Any subset of keys may be set — tables (e.g. `mcp_servers`, `quick_models`,
 `api_keys`) merge per key, scalars and arrays replace the global value, and
-keys absent from the local file keep their global values. A startup note is
-printed whenever an override is applied.
+keys absent from the local file keep their global values. If sensitive values
+cannot be activated, startup prints a notice identifying the project config;
+an ordinary benign merge is visible only in diagnostic logging.
 
 ```toml
 # .zerostack/config.toml
@@ -33,9 +34,15 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 ```
 
-The local file is trusted exactly like the global config — it can enable
-`yolo`/`accept-all`, add permission rules, or spawn MCP server processes —
-so review `.zerostack/config.toml` when working in untrusted checkouts.
+Project-local values are split by authority. Presentation, model, and bounded
+resource settings such as `model`, `max_tokens`, `retry`, colors, and
+compaction settings merge immediately. Every other top-level key—including
+unknown future keys, executable/provider selections, MCP/LSP configuration,
+and permission-mode changes—remains inert until the user approves the exact
+canonical project path, config path, and SHA-256 of the file. Approval is
+stored in the private state root and is invalidated by a content change or a
+copied checkout. Headless and ACP startup never prompt; they apply only the
+benign subset and print a notice for ignored sensitive settings.
 
 Prompts and themes are loaded from multiple sources, with later sources
 overriding earlier ones for same-named files:
@@ -338,15 +345,24 @@ Accepted top-level keys:
 | `max_tokens`              | integer | Maximum tokens for a single model response (the per-request output cap sent to the provider). Default: `16384`. This never limits a whole turn; see `turn_token_budget`.     |
 | `turn_token_budget`       | integer | Optional cumulative fail-closed cap for one agentic turn: the sum of input+output tokens across every completion call the turn makes. Unset by default (no cap; turns are still bounded by `max_agent_turns`). Deliberately separate from `max_tokens` — a multi-tool-call turn legitimately accumulates many responses' worth of prompt tokens. |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `200`.                                                                                                                           |
-| `temperature`             | number  | Model temperature value. Only configurable via the `--temperature` CLI flag (`0.0` to `2.0`). Config-file value is parsed but not currently applied.                        |
+| `temperature`             | number  | Model temperature (`0.0` to `2.0`). Precedence is `--temperature`, then the active quick model's value, then this global value; values are clamped to the supported range. |
 | `extra_body`              | object  | Provider-specific JSON shallow-merged into every completion request body as a global default (e.g. OpenRouter `plugins` routing presets). A matching `quick_models` entry's `extra_body` overrides this. See Provider-specific request body parameters below. |
+| `retry`                   | object  | Retry policy with `max_attempts` (default `3`), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`). |
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
 | `no_context_files`        | boolean | Disable loading global/project `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md` (if `archmd` feature enabled) context files. Default: `false`.                               |
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. When unset, auto-detected from the selected model's catalog entry; falls back to `128000` if the model is not in the catalog. A value of `0` disables auto-compaction. |
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. When unset globally, falls back to the active quick model's `reserve_tokens` field, then to a default that scales with the context window: `window/10`, never below `16384` (so one maximal response cannot overshoot the window) and never above half the window. Examples: 128k window → 16384, 1M window → 100000. |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. When unset, scales with the context window: `window/20` clamped to `[10000, 50000]` and at most a quarter of the window. Examples: 128k window → 10000, 1M window → 50000.                          |
 | `max_text_file_size`      | integer | Maximum allowed file size in bytes for read/write tool operations. Default: `1048576` (1 MB).                                                                               |
+| `max_read_lines`          | integer | Default maximum lines returned by one `read` call. Default: `2000`. |
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
+| `max_grep_results`        | integer | Maximum grep matches returned to the main agent. Default: `150`. |
+| `max_find_results`        | integer | Maximum file matches returned to the main agent. Default: `150`. |
+| `max_list_dir_entries`    | integer | Maximum directory entries returned to the main agent. Default: `150`. |
+| `subagent_max_read_lines` | integer | Per-subagent read-line cap. Default: `2000`; requires `subagents`. |
+| `subagent_max_grep_results` | integer | Per-subagent grep-result cap. Default: `200`; requires `subagents`. |
+| `subagent_max_find_results` | integer | Per-subagent file-result cap. Default: `200`; requires `subagents`. |
+| `subagent_max_list_dir_entries` | integer | Optional per-subagent directory-entry cap; requires `subagents`. |
 | `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section within one logical session until that session edits or writes the target. Agent rebuilds retain that session's history; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, and opt-in mid-turn compaction). Default: `false`. When `false`, nothing is ever compacted automatically.            |
@@ -356,6 +372,7 @@ Accepted top-level keys:
 | `auto-update-themes`      | boolean | When `true`, always regenerate themes on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `edit_system`             | string  | Edit system mode: `"similarity"` (SEARCH/REPLACE with fuzzy matching, default) or `"hashedit"` (CRC-32 tag-based CAS edits). See Edit System Modes below.                     |
 | `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` is optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. See the OpenAI API styles section below. |
+| `embedding`               | object  | Skill-retrieval embedding backend and model settings. See Skill embeddings above. |
 | `permission`              | object  | Permission rules using glob patterns; see the permission config notes below.                                |
 | `permission-regex`        | object  | Same structure as `permission` but patterns are interpreted as regex instead of glob.                       |
 | `permission-allow`        | object  | Map of tool names to lists of glob patterns to allow. Works alongside the `permission` field. See below.    |
@@ -371,12 +388,20 @@ Accepted top-level keys:
 | `windows-appcontainer-write-roots` | array of paths | Additional Windows AppContainer read/write roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they overlap the read-only cache/configured roots, another writable root, or the private AppContainer control sibling. Deterministic conflicts are rejected before profile/journal creation. CLI: repeat `--windows-appcontainer-write-root PATH`. |
 | `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
 | `js-fetch-allow-http`     | boolean | Permit public-address HTTP origins for JS `fetch()` in addition to HTTPS. Default: `false`. Private, loopback, link-local, metadata, multicast, and reserved destinations remain denied. |
+| `js-file-base-dir`        | path    | Base used to resolve relative JS file roots. Relative values resolve from the captured startup workspace; absent uses that workspace directly. |
+| `js-read-roots`           | array   | Explicit read roots for brokered JS file effects, resolved from `js-file-base-dir`. |
+| `js-write-roots`          | array   | Explicit write roots for brokered JS file effects, resolved from `js-file-base-dir`. |
+| `js-read-unrestricted`    | boolean | Explicitly allow brokered JS reads outside configured roots; cannot be combined with `js-read-roots`. Default: `false`. |
+| `js-write-unrestricted`   | boolean | Explicitly allow brokered JS writes outside configured roots; cannot be combined with `js-write-roots`. Default: `false`. |
 | `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo` (`accept` is an alias for `standard`). Any other value is rejected at startup with the list of accepted values. |
 | `show_tool_details`       | boolean or integer | Show tool-result previews in the TUI. `false` hides output, `true` shows all lines, an integer limits to that many lines (e.g. `3`). Default: `3`. |
 | `show_reasoning`          | boolean | Show streamed reasoning text in the TUI. Can still be toggled at runtime with `Ctrl+R` or `/reasoning`. Default: `false`. |
 | `statusline`              | table   | Configurable status bar (up to 3 lines of colored segments). When absent, a built-in default layout is used. See Status bar below. |
 | `chat_left_margin`        | integer | Left padding (columns) for the chat area only; input and status rows are unaffected. Default: `0`. |
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
+| `wt-auto-merge`           | boolean | Automatically merge a CLI-created worktree on exit; requires `git-worktree`. Default: `false`. |
+| `wt-base-dir`             | path    | Base directory for CLI-created worktrees; requires `git-worktree`. |
+| `shell`                   | string  | Shell executable for the model-visible `shell` compatibility tool and explicit shell commands. Unix accepts Bash/sh; Windows also accepts PowerShell/pwsh. |
 | `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` env var, then `editor`, then `nano`).                                                                                        |
 | `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. |
 | `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "input_token_cost"?, "output_token_cost"?, "temperature"?, "extra_body"? }`. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
@@ -390,6 +415,18 @@ Accepted top-level keys:
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |
 | `acp_host`                | string  | TCP bind host for ACP server mode (equivalent to `--acp-host`).                                                                                                              |
 | `acp_port`                | integer | TCP bind port for ACP server mode (equivalent to `--acp-port`, default: 7243).                                                                                               |
+| `task_max_turns`          | integer | Maximum model turns per subagent. Default: `20`; requires `subagents`. |
+| `task_max_prompts`        | integer | Maximum prompts in one `task` call. Default: `8`; requires `subagents`. |
+| `task_max_concurrency`    | integer | Maximum concurrently polled child futures. Default: `4`; requires `subagents`. |
+| `task_max_output_bytes`   | integer | Aggregate rendered output cap for a `task` call. Default: `262144`; requires `subagents`. |
+| `task_max_cost_units`     | integer | Aggregate reported token/cost-unit cap for a `task` call. Default: `500000`; requires `subagents`. |
+| `task_timeout_secs`       | integer | Whole-call subagent deadline. Default: `300`, maximum `86400`; requires `subagents`. |
+| `task_enabled`            | boolean | Register the `task` tool when subagents are compiled in. Default: `true`. |
+| `subagent_model`          | string  | Raw model id or quick-model alias used by subagents; absent inherits the main model. |
+| `subagent_provider`       | string  | Provider used by subagents when not supplied by a quick-model alias; absent inherits the main provider. |
+| `chain`                   | object  | Chain-of-prompts configuration. See Chain-of-Prompts below. |
+| `lsp`                     | object  | Language-server configuration; requires `lsp`. See LSP below. |
+| `advisor`                 | object  | Advisor configuration; requires `advisor`. See Advisor below. |
 | `colors`                  | object  | Background color overrides for the TUI. See the colors section below.                                                                                                       |
 
 JavaScript worker containment is a runtime prerequisite, not a user-selected sandbox mode.
@@ -954,7 +991,7 @@ Example:
 
 Permission actions are lowercase strings: `allow`, `ask`, or `deny`. Each tool
 rule can be a single action or an object mapping patterns to actions. Supported
-permission tool keys are `bash`, `js/fetch`, `read`, `write`, `edit`, `grep`,
+permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch`, `read`, `write`, `edit`, `grep`,
 `find_files`, `list_dir`, `todo_write`, `git/status`, `git/diff`, `git/log`,
 `git/show`, `git/stage`, `git/unstage`, and `git/commit`. MCP-backed tools are checked under
 `mcp_tool:{server_name}:{tool_name}`. Use `"*"` for the default action,
@@ -1173,6 +1210,12 @@ Servers can also be added per project via `.zerostack/config.toml` (see
   }
 }
 ```
+
+URL servers must use HTTP(S), must not embed user information, and must resolve
+exclusively to public IP addresses. `localhost`, loopback, private, link-local,
+metadata, multicast, documentation, reserved, and other non-public destinations
+are rejected before the connection is created. Use a stdio server for a local
+service; the OAuth redirect listener is a separate product-owned loopback flow.
 
 ### OAuth for URL servers
 

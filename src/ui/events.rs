@@ -224,10 +224,9 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     feed.push_line(BlockStyle::Tool, "  Keybindings:");
     feed.push_line(BlockStyle::Plain, "    Ctrl+G     Open input in $EDITOR");
     feed.push_line(BlockStyle::Plain, "    Ctrl+H     Launch lazygit");
-    feed.push_line(BlockStyle::Plain, "    Ctrl+S     Save session");
     feed.push_line(
         BlockStyle::Plain,
-        "    Tab        File picker / auto-complete",
+        "    @query     File picker (Tab/Enter selects)",
     );
     feed.push_line(
         BlockStyle::Plain,
