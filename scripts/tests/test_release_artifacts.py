@@ -199,7 +199,9 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
 
         self.assertEqual(status, "68")
         run.assert_called_once_with(
-            Path("mini-agent.exe"), "--mini-agent-windows-worker-preflight-v1"
+            Path("mini-agent.exe"),
+            "--mini-agent-windows-worker-preflight-v1",
+            environment=None,
         )
 
     def test_windows_smoke_install_directory_gets_private_inheritable_acl(self) -> None:
@@ -258,6 +260,26 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                 RELEASE._harden_windows_install_directory(
                     Path(r"C:\private"), platform_name="nt"
                 )
+
+    def test_windows_smoke_process_uses_private_directory_as_local_app_data(self) -> None:
+        environment = {"PATH": r"C:\Windows\System32", "LOCALAPPDATA": r"C:\shared"}
+
+        result = RELEASE._smoke_environment(
+            Path(r"C:\private"), environment=environment, platform_name="nt"
+        )
+
+        self.assertEqual(
+            result,
+            {"PATH": r"C:\Windows\System32", "LOCALAPPDATA": r"C:\private"},
+        )
+        self.assertEqual(environment["LOCALAPPDATA"], r"C:\shared")
+
+    def test_non_windows_smoke_process_inherits_environment(self) -> None:
+        self.assertIsNone(
+            RELEASE._smoke_environment(
+                Path("/tmp/private"), environment={"PATH": "/bin"}, platform_name="posix"
+            )
+        )
 
     @unittest.skipIf(RELEASE.os.name == "nt", "fixture is a POSIX shell executable")
     def test_lite_archive_must_reject_js_runtime_check(self) -> None:

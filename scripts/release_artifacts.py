@@ -164,7 +164,11 @@ def _extract_regular_members(archive: Path, destination: Path) -> None:
             target.chmod(member.mode & 0o777)
 
 
-def _run(binary: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    binary: Path,
+    *arguments: str,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             [str(binary), *arguments],
@@ -172,17 +176,24 @@ def _run(binary: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
             text=True,
             timeout=45,
             check=False,
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ReleaseArtifactError(f"packaged executable failed to run: {error}") from error
 
 
 def _closed_windows_preflight_status(
-    binary: Path, platform_name: str = os.name
+    binary: Path,
+    platform_name: str = os.name,
+    environment: Mapping[str, str] | None = None,
 ) -> str:
     if platform_name != "nt":
         return "not-run"
-    helper = _run(binary, "--mini-agent-windows-worker-preflight-v1")
+    helper = _run(
+        binary,
+        "--mini-agent-windows-worker-preflight-v1",
+        environment=environment,
+    )
     return str(helper.returncode)
 
 
@@ -253,6 +264,18 @@ def _smoke_install_parent(
     return root
 
 
+def _smoke_environment(
+    destination: Path,
+    environment: Mapping[str, str] = os.environ,
+    platform_name: str = os.name,
+) -> dict[str, str] | None:
+    if platform_name != "nt":
+        return None
+    smoke_environment = dict(environment)
+    smoke_environment["LOCALAPPDATA"] = str(destination)
+    return smoke_environment
+
+
 def smoke_archive(
     archive: Path,
     executable_name: str,
@@ -272,17 +295,20 @@ def smoke_archive(
         _harden_windows_install_directory(destination)
         _extract_regular_members(archive, destination)
         binary = destination / executable_name
-        version = _run(binary, "--version")
+        smoke_environment = _smoke_environment(destination)
+        version = _run(binary, "--version", environment=smoke_environment)
         expected = f"mini-agent {expected_version}"
         if version.returncode != 0 or version.stdout.strip() != expected:
             raise ReleaseArtifactError(
                 f"packaged version smoke failed: expected={expected!r}, "
                 f"status={version.returncode}, stdout={version.stdout.strip()!r}"
             )
-        js = _run(binary, "--js-runtime-check")
+        js = _run(binary, "--js-runtime-check", environment=smoke_environment)
         if expect_js:
             if js.returncode != 0 or js.stdout.strip() != "JS runtime check: PASS (2)":
-                helper_status = _closed_windows_preflight_status(binary)
+                helper_status = _closed_windows_preflight_status(
+                    binary, environment=smoke_environment
+                )
                 raise ReleaseArtifactError(
                     "packaged JS runtime smoke failed: "
                     f"status={js.returncode}, stdout={js.stdout.strip()!r}, "
