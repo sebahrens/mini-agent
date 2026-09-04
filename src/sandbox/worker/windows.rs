@@ -1525,7 +1525,7 @@ mod feasibility {
 
         reject_unc_or_remote_syntax(&executable)?;
         observe(RuntimePreflightFailureStage::AclAncestors);
-        validate_path_ancestors(&executable, location, policy)?;
+        validate_path_ancestors_observed(&executable, location, policy, &mut observe)?;
 
         observe(RuntimePreflightFailureStage::AclSecurityRead);
         let security = read_file_security(&executable)?;
@@ -1786,6 +1786,16 @@ mod feasibility {
         location: InstallLocation,
         policy: &SidPolicy,
     ) -> Result<(), GateError> {
+        validate_path_ancestors_observed(executable, location, policy, |_| {})
+    }
+
+    fn validate_path_ancestors_observed(
+        executable: &Path,
+        location: InstallLocation,
+        policy: &SidPolicy,
+        mut observe: impl FnMut(RuntimePreflightFailureStage),
+    ) -> Result<(), GateError> {
+        observe(RuntimePreflightFailureStage::AclAncestorRoot);
         let root = std::fs::canonicalize(supported_root(executable, location)?)
             .map_err(|error| GateError(format!("canonicalize supported root: {error}")))?;
         if !starts_with_case_insensitive(executable, &root) {
@@ -1795,6 +1805,7 @@ mod feasibility {
         }
         let mut cursor = Some(executable);
         while let Some(path) = cursor {
+            observe(RuntimePreflightFailureStage::AclAncestorMetadata);
             let metadata = std::fs::symlink_metadata(path)
                 .map_err(|error| GateError(format!("inspect path component: {error}")))?;
             if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -1803,12 +1814,15 @@ mod feasibility {
                 ));
             }
             if path != executable {
+                observe(RuntimePreflightFailureStage::AclAncestorSecurityRead);
                 let security = read_file_security(path)?;
+                observe(RuntimePreflightFailureStage::AclAncestorOwner);
                 if !policy.trusted_writer(security.owner) {
                     return Err(GateError(
                         "an untrusted principal owns an image-path ancestor".to_string(),
                     ));
                 }
+                observe(RuntimePreflightFailureStage::AclAncestorInspection);
                 inspect_acl(security.dacl, policy, null_mut(), false, false)?;
             }
             if starts_with_case_insensitive(&root, path) || path == root {
@@ -3662,6 +3676,11 @@ mod feasibility {
         AclCommit = 105,
         AclCommittedVerification = 106,
         AclImageLock = 107,
+        AclAncestorRoot = 111,
+        AclAncestorMetadata = 112,
+        AclAncestorSecurityRead = 113,
+        AclAncestorOwner = 114,
+        AclAncestorInspection = 115,
     }
 
     #[derive(Debug)]

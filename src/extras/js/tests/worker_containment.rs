@@ -265,6 +265,8 @@ fn windows_worker_runtime_probe_source_covers_the_required_security_matrix() {
         "RuntimePreflightFailureStage",
         "launch_production_observed",
         "prepare_executable_acl_locked_observed",
+        "validate_path_ancestors_observed",
+        "AclAncestorInspection = 115",
         "Err(failure) => std::process::ExitCode::from(failure.stage as u8)",
         "--mini-agent-windows-worker-preflight-v1",
         "run_supervised_preflight_helper",
