@@ -900,14 +900,14 @@ mod tests {
         assert!(!probe.contains("error ="));
 
         let runtime_start = source
-            .find("fn run_runtime_preflight(")
+            .find("fn run_runtime_preflight_owned(")
             .expect("Windows preflight must exercise a live production worker");
         let runtime_end = source[runtime_start..]
             .find("\n    fn run_authenticated_round_trip(")
             .map(|offset| runtime_start + offset)
             .expect("Windows runtime preflight must delegate to the authenticated exchange");
         let runtime = &source[runtime_start..runtime_end];
-        assert!(runtime.contains("runtime_controls_match()?"));
+        assert!(runtime.contains("runtime_controls_match().map_err"));
         assert!(runtime.contains("read_worker_frame_exact_bounded"));
         assert!(runtime.contains("wait_for_protocol_worker_exit_until"));
         assert!(runtime.contains("terminate_and_reap"));
