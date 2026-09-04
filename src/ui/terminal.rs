@@ -1,7 +1,9 @@
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::ExecutableCommand;
+use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -11,6 +13,7 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlt
 const UTF8_CODE_PAGE: u32 = 65_001;
 const DROP_RESTORE_ATTEMPTS: usize = 3;
 const DROP_RESTORE_BACKOFF: Duration = Duration::from_millis(10);
+static SYSTEM_TERMINAL_ATTACHED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub struct TerminalLifecycleError {
@@ -323,23 +326,61 @@ pub struct TerminalGuard {
 
 impl TerminalGuard {
     pub fn new() -> Result<Self, TerminalLifecycleError> {
-        Ok(Self {
+        let guard = Self {
             session: TerminalSession::new(SystemTerminal)
                 .map_err(|error| TerminalLifecycleError::new("attachment", error))?,
-        })
+        };
+        SYSTEM_TERMINAL_ATTACHED.store(true, Ordering::Release);
+        Ok(guard)
     }
 
     pub fn suspend(&mut self) -> Result<(), TerminalLifecycleError> {
-        self.session
+        let result = self
+            .session
             .suspend()
-            .map_err(|error| TerminalLifecycleError::new("suspension", error))
+            .map_err(|error| TerminalLifecycleError::new("suspension", error));
+        if result.is_ok() {
+            SYSTEM_TERMINAL_ATTACHED.store(false, Ordering::Release);
+        }
+        result
     }
 
     pub fn resume(&mut self) -> Result<(), TerminalLifecycleError> {
-        self.session
+        let result = self
+            .session
             .resume()
-            .map_err(|error| TerminalLifecycleError::new("resumption", error))
+            .map_err(|error| TerminalLifecycleError::new("resumption", error));
+        if result.is_ok() {
+            SYSTEM_TERMINAL_ATTACHED.store(true, Ordering::Release);
+        }
+        result
     }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        SYSTEM_TERMINAL_ATTACHED.store(false, Ordering::Release);
+    }
+}
+
+/// Best-effort emergency restoration used by the panic hook before it prints.
+/// Normal teardown still runs during unwinding and retries any failed actions.
+pub(crate) fn restore_for_panic() {
+    if !SYSTEM_TERMINAL_ATTACHED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let mut terminal = SystemTerminal;
+    for action in [
+        TerminalAction::DisableRaw,
+        TerminalAction::PopKeyboard,
+        TerminalAction::DisablePaste,
+        TerminalAction::DisableMouse,
+        TerminalAction::LeaveAlternate,
+    ] {
+        let _ = terminal.apply(action);
+    }
+    let _ = std::io::stdout().execute(Show);
+    let _ = terminal.flush();
 }
 
 #[cfg(test)]

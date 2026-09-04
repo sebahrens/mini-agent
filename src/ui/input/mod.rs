@@ -16,6 +16,35 @@ use crate::ui::terminal::TerminalGuard;
 use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+#[cfg(not(windows))]
+struct EditorTemp {
+    path: std::path::PathBuf,
+    directory: std::path::PathBuf,
+}
+
+#[cfg(not(windows))]
+impl EditorTemp {
+    fn create(contents: &[u8]) -> std::io::Result<Self> {
+        let directory =
+            std::env::temp_dir().join(format!("zerostack-editor-{}", uuid::Uuid::new_v4()));
+        crate::fs::ensure_private_directory(&directory)?;
+        let path = directory.join("message.md");
+        if let Err(error) = crate::fs::private_atomic_create_sync(&path, contents) {
+            let _ = std::fs::remove_dir(&directory);
+            return Err(error);
+        }
+        Ok(Self { path, directory })
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for EditorTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
 const MAX_KILL_RING: usize = 30;
 const MAX_PICKER_PASTE_CHARS: usize = 256;
 
@@ -179,6 +208,8 @@ impl InputEditor {
         picker.set_monochrome(self.monochrome);
         picker.activate();
         self.picker = Some(Picker::Rewind(picker));
+        self.history_pos = None;
+        self.draft = None;
     }
 
     /// Take the rewind picker's resolved outcome, if it has one. Also clears the
@@ -245,9 +276,7 @@ impl InputEditor {
             .or_else(|| std::env::var("EDITOR").ok())
             .unwrap_or_else(|| "editor".to_string());
 
-        let tmp = std::env::temp_dir().join(format!("zerostack-{}.md", std::process::id()));
-
-        let _ = std::fs::write(&tmp, self.buffer.as_bytes());
+        let tmp = EditorTemp::create(self.buffer.as_bytes())?;
 
         terminal_guard.suspend()?;
 
@@ -255,17 +284,14 @@ impl InputEditor {
             .arg("-c")
             .arg(format!("{} \"$1\"", editor))
             .arg("sh")
-            .arg(&tmp)
+            .arg(&tmp.path)
             .status_guarded();
 
         let resume_result = terminal_guard.resume();
 
-        if let Ok(content) = std::fs::read_to_string(&tmp) {
-            self.buffer = CompactString::new(content.trim_end());
-            self.cursor = self.buffer.len();
+        if let Ok(content) = std::fs::read_to_string(&tmp.path) {
+            self.load_text(content.trim_end());
         }
-
-        let _ = std::fs::remove_file(&tmp);
         Ok(resume_result?)
     }
 
@@ -807,5 +833,29 @@ impl InputEditor {
         new_buf.push_str(after);
         self.buffer = CompactString::new(&new_buf);
         deleted
+    }
+}
+
+#[cfg(all(test, unix))]
+mod editor_temp_tests {
+    use super::EditorTemp;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn editor_temp_is_private_and_removed_on_drop() {
+        let temp = EditorTemp::create(b"secret draft").unwrap();
+        let path = temp.path.clone();
+        let directory = temp.directory.clone();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(temp);
+        assert!(!path.exists());
+        assert!(!directory.exists());
     }
 }

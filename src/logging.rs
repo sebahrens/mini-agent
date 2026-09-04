@@ -27,6 +27,7 @@ pub fn resolve_crash_log_path() -> PathBuf {
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        crate::ui::terminal::restore_for_panic();
         if let Some(path) = write_crash_report(info) {
             eprintln!("crash report written to {}", path.display());
         }

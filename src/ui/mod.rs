@@ -14,13 +14,14 @@ pub(crate) mod renderer;
 pub(crate) mod slash;
 pub(crate) mod state;
 pub(crate) mod statusline;
-mod terminal;
+pub(crate) mod terminal;
 pub(crate) mod utils;
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
@@ -262,21 +263,53 @@ impl PasteBurst {
     }
 }
 
+fn event_counts_as_paste_followup(event: &event::Event) -> bool {
+    matches!(event, event::Event::Key(key) if key.kind == KeyEventKind::Press)
+}
+
+/// Peek through non-key terminal events without treating them as pasted text.
+/// Every event read here is retained in order for normal dispatch.
+fn queue_paste_followups(pending: &mut VecDeque<event::Event>) -> bool {
+    let deadline = Instant::now() + PASTE_BURST_WINDOW;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if !matches!(event::poll(remaining), Ok(true)) {
+            return false;
+        }
+        let Ok(next) = event::read() else {
+            return false;
+        };
+        let is_key_press = event_counts_as_paste_followup(&next);
+        pending.push_back(next);
+        if is_key_press {
+            return true;
+        }
+    }
+}
+
 pub(crate) fn spawn_event_thread(
     user_tx: mpsc::Sender<UserEvent>,
     running: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut paste_burst = PasteBurst::default();
+        let mut pending_events = VecDeque::new();
         while running.load(Ordering::Relaxed) {
-            let Ok(ready) = event::poll(paste_burst.wait_timeout()) else {
-                continue;
+            let next_event = if let Some(pending) = pending_events.pop_front() {
+                Ok(pending)
+            } else {
+                let Ok(ready) = event::poll(paste_burst.wait_timeout()) else {
+                    continue;
+                };
+                if !ready {
+                    paste_burst.on_timeout();
+                    continue;
+                }
+                event::read()
             };
-            if !ready {
-                paste_burst.on_timeout();
-                continue;
-            }
-            match event::read() {
+            match next_event {
                 Ok(event::Event::Key(key)) => {
                     if key.kind != KeyEventKind::Press {
                         continue;
@@ -287,8 +320,8 @@ pub(crate) fn spawn_event_thread(
                     // PasteBurst). Enter/j with other modifiers passes
                     // through (Shift/Alt+Enter = literal newline).
                     let ev = if is_paste_newline_key(key.code, key.modifiers) {
-                        let pending = paste_burst.active
-                            || matches!(event::poll(PASTE_BURST_WINDOW), Ok(true));
+                        let pending =
+                            paste_burst.active || queue_paste_followups(&mut pending_events);
                         match paste_burst.on_enter(pending) {
                             EnterVerdict::Submit => UserEvent::Key(key),
                             // Reuse the paste path: inserts a literal '\n'
@@ -867,6 +900,24 @@ pub async fn run_interactive(
     app.run().await?;
     app.teardown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod paste_followup_tests {
+    use super::*;
+
+    #[test]
+    fn only_key_presses_extend_an_unbracketed_paste_burst() {
+        assert!(!event_counts_as_paste_followup(&event::Event::Resize(
+            80, 24
+        )));
+        assert!(!event_counts_as_paste_followup(&event::Event::Paste(
+            "payload".into()
+        )));
+        assert!(event_counts_as_paste_followup(&event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+        )));
+    }
 }
 #[cfg(feature = "advisor")]
 pub(crate) async fn handle_human_handoff(

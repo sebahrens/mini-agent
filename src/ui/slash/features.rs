@@ -111,7 +111,11 @@ async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
 }
 
 #[cfg(not(feature = "git-worktree"))]
-async fn handle_worktree(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+async fn handle_worktree(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    write_error(
+        ctx.renderer,
+        "/worktree requires a build with the git-worktree feature",
+    );
     Ok(())
 }
 
@@ -152,7 +156,11 @@ async fn handle_wt_merge(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
 }
 
 #[cfg(not(feature = "git-worktree"))]
-async fn handle_wt_merge(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+async fn handle_wt_merge(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    write_error(
+        ctx.renderer,
+        "/wt-merge requires a build with the git-worktree feature",
+    );
     Ok(())
 }
 
@@ -176,6 +184,10 @@ async fn handle_wt_exit(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
 }
 
 #[cfg(not(feature = "git-worktree"))]
-async fn handle_wt_exit(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+async fn handle_wt_exit(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    write_error(
+        ctx.renderer,
+        "/wt-exit requires a build with the git-worktree feature",
+    );
     Ok(())
 }

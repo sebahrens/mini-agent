@@ -106,6 +106,32 @@ pub(crate) fn clipboard_shortcut(
     }
 }
 
+fn is_ctrl_h(key: KeyEvent) -> bool {
+    (matches!(key.code, KeyCode::Char('h' | 'H')) && key.modifiers.contains(KeyModifiers::CONTROL))
+        || key.code == KeyCode::Char('\u{8}')
+}
+
+#[cfg(test)]
+mod ctrl_h_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_disambiguated_and_raw_control_h_without_arming_backspace() {
+        assert!(is_ctrl_h(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_ctrl_h(KeyEvent::new(
+            KeyCode::Char('\u{8}'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_ctrl_h(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE
+        )));
+    }
+}
+
 pub(crate) fn interrupt_target(
     btw_inflight: usize,
     validation_active: bool,
@@ -541,6 +567,7 @@ impl<'a> App<'a> {
                         &mut self.ui,
                         &mut self.run,
                         &mut self.user_rx,
+                        &mut self.deferred_user_events,
                     ).await?;
                     self.refresh()?;
                 }
@@ -766,6 +793,7 @@ impl<'a> App<'a> {
             Err(error) => {
                 self.renderer
                     .write_line(&format!("copy to clipboard failed: {error}"), C_ERROR)?;
+                self.renderer.clear_selection();
             }
         }
         Ok(())
@@ -854,7 +882,7 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        if key.code == KeyCode::Char('h') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if is_ctrl_h(key) {
             self.run_lazygit().await?;
             return Ok(());
         }

@@ -919,8 +919,8 @@ impl Renderer {
                 "{}",
                 SetForegroundColor(self.color(Color::DarkYellow))
             )?;
-            let take = prefix.chars().take(budget).collect::<String>();
-            budget -= display_width(&take);
+            let take = crate::ui::utils::display_prefix(prefix, budget);
+            budget -= display_width(take);
             write!(stdout, "{}", take)?;
         }
 
@@ -951,8 +951,8 @@ impl Renderer {
                     }
                     let fgc = fg.unwrap_or(Color::DarkGrey);
                     write!(stdout, "{}", SetForegroundColor(self.color(fgc)))?;
-                    let piece: String = text.chars().take(budget).collect();
-                    budget = budget.saturating_sub(display_width(&piece));
+                    let piece = crate::ui::utils::display_prefix(text, budget);
+                    budget = budget.saturating_sub(display_width(piece));
                     write!(stdout, "{}", piece)?;
                     write!(stdout, "{}", ResetColor)?;
                     if let Some(bg) = self.status_bg {
@@ -1149,7 +1149,7 @@ impl Renderer {
                 write!(stdout, "{}", ResetColor)?;
             }
 
-            let sep_below = rows.saturating_sub(reserve - 1);
+            let sep_below = rows.saturating_sub(reserve.saturating_sub(1));
             if sep_below < rows.saturating_sub(1) {
                 self.draw_separator(sep_below, cols)?;
             }
@@ -1197,7 +1197,7 @@ impl Renderer {
                 write!(stdout, "{}", ResetColor)?;
             }
 
-            let sep_below = rows.saturating_sub(reserve - 1);
+            let sep_below = rows.saturating_sub(reserve.saturating_sub(1));
             if sep_below < rows.saturating_sub(1) {
                 self.draw_separator(sep_below, cols)?;
             }
@@ -1220,13 +1220,14 @@ impl Renderer {
         let max_input_rows = available_rows.min((available_rows * 3 / 10).max(5));
         let need_scroll = line_count > max_input_rows;
 
-        let prompt = if is_running {
+        let raw_prompt = if is_running {
             let frame = SPINNER[self.spinner_frame as usize];
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len() as u8;
             frame
         } else {
             "> "
         };
+        let prompt = crate::ui::utils::display_prefix(raw_prompt, cols as usize);
         let prompt_width = display_width(prompt);
 
         let (cursor_line, cursor_col) =
@@ -1348,18 +1349,19 @@ impl Renderer {
             } else {
                 0
             };
-            let display: String = line_chars
-                .iter()
-                .skip(skip_chars)
-                .take(visible_width)
-                .collect();
+            let skip_bytes = line
+                .char_indices()
+                .nth(skip_chars)
+                .map(|(index, _)| index)
+                .unwrap_or(line.len());
+            let display = crate::ui::utils::display_prefix(&line[skip_bytes..], visible_width);
             write!(stdout, "{}", display)?;
             write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", ResetColor)?;
         }
 
         // Thin separator line below input
-        let sep_below = rows.saturating_sub(reserve - 1);
+        let sep_below = rows.saturating_sub(reserve.saturating_sub(1));
         if sep_below < rows.saturating_sub(1) {
             self.draw_separator(sep_below, cols)?;
         }
@@ -1374,7 +1376,8 @@ impl Renderer {
             .saturating_sub(first_visible)
             .min(visible_line_count.saturating_sub(1));
         let cursor_row = input_top.saturating_add(cursor_render_idx as u16);
-        let cursor_x = (prompt_width + cursor_display_col.saturating_sub(h_scroll)) as u16;
+        let cursor_x = (prompt_width + cursor_display_col.saturating_sub(h_scroll))
+            .min(cols.saturating_sub(1) as usize) as u16;
         stdout.execute(MoveTo(cursor_x, cursor_row))?;
         write!(stdout, "{}", Show)?;
         stdout.flush()?;

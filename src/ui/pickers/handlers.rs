@@ -221,16 +221,18 @@ pub fn handle_command_key(
             if let Some(cmd) = picker.selected_name() {
                 let selected = cmd.to_string();
                 let slash_pos = buffer.find('/').unwrap_or(0);
-                let before: String = buffer.chars().take(slash_pos).collect();
-                let after_offset = slash_pos + 1 + picker.query.chars().count();
-                let after: String = buffer.chars().skip(after_offset).collect();
+                let before = &buffer[..slash_pos];
+                let after_offset = slash_pos + 1 + picker.query.len();
+                let after = &buffer[after_offset.min(buffer.len())..];
                 let insertion = if after.is_empty() || after.starts_with(' ') {
                     format!("{} ", selected)
                 } else {
                     format!("{}{}", selected, after)
                 };
-                *buffer = format!("{}{}", before, insertion).into();
-                *cursor = before.len() + selected.len() + 1;
+                let new_cursor = before.len() + selected.len() + 1;
+                let replacement = format!("{}{}", before, insertion);
+                *buffer = replacement.into();
+                *cursor = new_cursor;
 
                 if selected == "/prompt" && !ctx.prompt_names.is_empty() {
                     picker.deactivate();
@@ -282,12 +284,11 @@ pub fn handle_command_key(
         }
         KeyCode::Esc => {
             let slash_pos = buffer.find('/').unwrap_or(0);
-            let before: String = buffer.chars().take(slash_pos).collect();
-            let after: String = buffer
-                .chars()
-                .skip(slash_pos + 1 + picker.query.chars().count())
-                .collect();
-            *buffer = format!("{}/{}", before, after).into();
+            let before = &buffer[..slash_pos];
+            let after_offset = slash_pos + 1 + picker.query.len();
+            let after = &buffer[after_offset.min(buffer.len())..];
+            let replacement = format!("{}/{}", before, after);
+            *buffer = replacement.into();
             *cursor = slash_pos + 1;
             picker.deactivate();
             (true, None)

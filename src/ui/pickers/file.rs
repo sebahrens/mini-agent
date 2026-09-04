@@ -263,10 +263,8 @@ impl FilePicker {
             if Path::new(&path).is_dir() {
                 display.push('/');
             }
-            let truncated: String = display
-                .chars()
-                .take(cols.saturating_sub(3) as usize)
-                .collect();
+            let truncated =
+                crate::ui::utils::display_prefix(&display, cols.saturating_sub(3) as usize);
 
             if i == self.selected {
                 write!(stdout, "{}", SetForegroundColor(self.color(Color::Green)))?;

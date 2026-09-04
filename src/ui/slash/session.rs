@@ -656,8 +656,7 @@ async fn handle_retry(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         .cloned();
     match last_user {
         Some(msg) => {
-            ctx.input.buffer = msg.content.clone();
-            ctx.input.cursor = msg.content.len();
+            ctx.input.load_text(&msg.content);
             write_ok(ctx.renderer, "edit last message and press Enter to retry");
         }
         None => {

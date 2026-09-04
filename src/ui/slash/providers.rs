@@ -396,39 +396,13 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
 }
 
 async fn handle_models_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    if parts.len() < 3 {
-        write_ok(
-            ctx.renderer,
-            "usage: /models-add <name> <provider> <model> [input_cost_per_M output_cost_per_M]",
-        );
+    const USAGE: &str =
+        "usage: /models-add <name> <provider> <model> [input_cost_per_M output_cost_per_M]";
+    let Ok((name, provider, model, input_cost, output_cost)) = parse_models_add(parts) else {
+        write_error(ctx.renderer, USAGE);
         return Ok(());
-    }
-    let name = parts[1].trim().to_string();
-    let rest = parts[2].trim();
-    let (provider, model, input_cost, output_cost) = match rest.split_once(' ') {
-        Some((p, m)) if parts.len() >= 5 => (
-            p.trim().to_string(),
-            m.trim().to_string(),
-            parts[3].trim().parse::<f64>().unwrap_or(0.0),
-            parts[4].trim().parse::<f64>().unwrap_or(0.0),
-        ),
-        Some((p, m)) => (p.trim().to_string(), m.trim().to_string(), 0.0, 0.0),
-        None => {
-            write_ok(
-                ctx.renderer,
-                "usage: /models-add <name> <provider> <model> [input_cost_per_M output_cost_per_M]",
-            );
-            return Ok(());
-        }
     };
-    if name.is_empty() || provider.is_empty() || model.is_empty() {
-        write_ok(
-            ctx.renderer,
-            "usage: /models-add <name> <provider> <model> [input_cost_per_M output_cost_per_M]",
-        );
-        return Ok(());
-    }
-    match config::save_quick_model(&name, &provider, &model, input_cost, output_cost) {
+    match config::save_quick_model(name, provider, model, input_cost, output_cost) {
         Ok(()) => {
             write_ok(
                 ctx.renderer,
@@ -443,6 +417,23 @@ async fn handle_models_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Re
         }
     }
     Ok(())
+}
+
+fn parse_models_add<'a>(parts: &'a [&'a str]) -> Result<(&'a str, &'a str, &'a str, f64, f64), ()> {
+    if !matches!(parts.len(), 4 | 6) || parts.first() != Some(&"/models-add") {
+        return Err(());
+    }
+    let (input_cost, output_cost) = if parts.len() == 6 {
+        let input = parts[4].parse::<f64>().map_err(|_| ())?;
+        let output = parts[5].parse::<f64>().map_err(|_| ())?;
+        if !input.is_finite() || !output.is_finite() || input < 0.0 || output < 0.0 {
+            return Err(());
+        }
+        (input, output)
+    } else {
+        (0.0, 0.0)
+    };
+    Ok((parts[1], parts[2], parts[3], input_cost, output_cost))
 }
 
 #[cfg(feature = "subagents")]
@@ -570,4 +561,32 @@ async fn model_for_subagent(
     )
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod models_add_tests {
+    use super::parse_models_add;
+
+    #[test]
+    fn parses_optional_cost_pair_without_corrupting_model_id() {
+        assert_eq!(
+            parse_models_add(&[
+                "/models-add",
+                "fast",
+                "openrouter",
+                "org/model",
+                "1.5",
+                "2.75"
+            ]),
+            Ok(("fast", "openrouter", "org/model", 1.5, 2.75))
+        );
+    }
+
+    #[test]
+    fn rejects_partial_invalid_and_non_finite_costs() {
+        assert!(parse_models_add(&["/models-add", "fast", "p", "m", "1.0"]).is_err());
+        assert!(parse_models_add(&["/models-add", "fast", "p", "m", "x", "2.0"]).is_err());
+        assert!(parse_models_add(&["/models-add", "fast", "p", "m", "NaN", "2.0"]).is_err());
+        assert!(parse_models_add(&["/models-add", "fast", "p", "m", "-1", "2.0"]).is_err());
+    }
 }

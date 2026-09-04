@@ -52,6 +52,15 @@ pub(crate) fn word_wrap(text: &str, max_width: usize) -> SmallVec<[CompactString
             if trimmed_w > max_width {
                 for ch in word_trimmed.chars() {
                     let cw = super::utils::char_display_width(ch);
+                    if cw > max_width {
+                        if !line.is_empty() {
+                            lines.push(CompactString::from(&line));
+                            line.clear();
+                            line_width = 0;
+                        }
+                        lines.push(CompactString::from("\u{fffd}"));
+                        continue;
+                    }
                     if line_width + cw > max_width && !line.is_empty() {
                         lines.push(CompactString::from(&line));
                         line.clear();
@@ -458,12 +467,16 @@ fn flush_table(
 
     let overhead = 3 * col_count + 1;
     let available = max_width.saturating_sub(overhead);
-    if available == 0 {
+    const MIN_COL_WIDTH: usize = 4;
+    if max_width == 0 {
+        return;
+    }
+    if available < col_count.saturating_mul(MIN_COL_WIDTH) {
+        flush_narrow_table(rows, max_width, out);
         return;
     }
 
     let mut total_req: usize = col_widths.iter().sum();
-    const MIN_COL_WIDTH: usize = 4;
     while total_req > available {
         let mut widest_idx = 0;
         let mut widest_w = 0;
@@ -494,6 +507,15 @@ fn flush_table(
         }
     }
     push_table_line(&bot, Color::DarkGrey, out);
+}
+
+fn flush_narrow_table(rows: &[Vec<String>], max_width: usize, out: &mut Vec<LineEntry>) {
+    for row in rows {
+        let text = row.join(" | ");
+        for line in word_wrap(&text, max_width) {
+            push_table_line(&line, Color::White, out);
+        }
+    }
 }
 
 fn format_table_rule(widths: &[usize], left: char, mid: char, right: char) -> String {
@@ -583,4 +605,27 @@ fn format_table_row(cells: &[String], widths: &[usize], alignments: &[Alignment]
     }
 
     lines
+}
+
+#[cfg(test)]
+mod narrow_table_tests {
+    use super::*;
+
+    #[test]
+    fn narrow_tables_are_wrapped_instead_of_dropped_or_overflowing() {
+        let rows = vec![
+            vec!["header one".into(), "header two".into()],
+            vec!["界界界".into(), "value".into()],
+        ];
+        let mut out = Vec::new();
+        flush_table(&rows, &[], 7, &mut out);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|line| display_width(&line.text) <= 7));
+    }
+
+    #[test]
+    fn a_double_width_glyph_does_not_overflow_a_one_column_wrap() {
+        let lines = word_wrap("界", 1);
+        assert!(lines.iter().all(|line| display_width(line) <= 1));
+    }
 }

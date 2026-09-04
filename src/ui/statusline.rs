@@ -250,7 +250,10 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
 /// configured smaller than the provider's), and hiding it would mask that
 /// compaction is overdue or could not recover.
 fn context_percentage(session: &Session) -> Option<u64> {
-    (session.effective_context_tokens() * 100).checked_div(session.context_window)
+    session
+        .effective_context_tokens()
+        .saturating_mul(100)
+        .checked_div(session.context_window)
 }
 
 /// Per-item color override driven by live session state, taking precedence over
@@ -615,5 +618,18 @@ pub fn default_spec() -> StatusLineConfig {
     ];
     StatusLineConfig {
         lines: vec![StatusLineLine { segments }],
+    }
+}
+
+#[cfg(test)]
+mod context_percentage_tests {
+    use super::context_percentage;
+    use crate::session::Session;
+
+    #[test]
+    fn context_percentage_saturates_instead_of_overflowing() {
+        let mut session = Session::new("provider", "model", 1, "/workspace");
+        session.overhead_tokens = u64::MAX;
+        assert_eq!(context_percentage(&session), Some(u64::MAX));
     }
 }

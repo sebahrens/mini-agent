@@ -112,7 +112,7 @@ pub(crate) fn draw_picker_list(
             Clear(crossterm::terminal::ClearType::CurrentLine)
         )?;
 
-        let truncated: String = item.chars().take(cols.saturating_sub(3) as usize).collect();
+        let truncated = crate::ui::utils::display_prefix(item, cols.saturating_sub(3) as usize);
 
         if i == selected {
             write!(

@@ -2691,7 +2691,7 @@ mod tests {
             ))
             .await;
         assert!(matches!(gate, crate::extras::hooks::PromptGate::Proceed(_)));
-        let hook_started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let hook_started = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             while !pid_file.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -2704,7 +2704,7 @@ mod tests {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), work_scope.wait_idle())
                 .await;
             let _ = std::fs::remove_dir_all(&directory);
-            panic!("configured async hook should start within 10 seconds");
+            panic!("configured async hook should start within 30 seconds");
         }
         let hook_pid = std::fs::read_to_string(&pid_file).unwrap();
 

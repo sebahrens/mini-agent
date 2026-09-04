@@ -26,6 +26,23 @@ pub(crate) fn char_display_width(c: char) -> usize {
     unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
+/// Returns the longest UTF-8 prefix that fits in `max_width` terminal columns.
+/// Unlike `chars().take(...)`, this never lets a double-width glyph cross the
+/// right edge of a terminal row.
+pub(crate) fn display_prefix(s: &str, max_width: usize) -> &str {
+    let mut width = 0usize;
+    let mut end = 0usize;
+    for (index, ch) in s.char_indices() {
+        let char_width = char_display_width(ch);
+        if width.saturating_add(char_width) > max_width {
+            break;
+        }
+        width = width.saturating_add(char_width);
+        end = index + ch.len_utf8();
+    }
+    &s[..end]
+}
+
 /// Resolves a color based on monochrome mode.
 #[inline]
 pub(crate) fn resolve_color(color: Color, monochrome: bool) -> Color {
@@ -233,7 +250,14 @@ fn descendant_pattern(path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::suggest_pattern;
+    use super::{display_prefix, display_width, suggest_pattern};
+
+    #[test]
+    fn display_prefix_respects_terminal_columns_and_utf8_boundaries() {
+        assert_eq!(display_prefix("ab界cd", 3), "ab");
+        assert_eq!(display_prefix("ab界cd", 4), "ab界");
+        assert!(display_width(display_prefix("界界", 3)) <= 3);
+    }
 
     #[test]
     fn bash_suggestion_is_the_exact_complete_script() {

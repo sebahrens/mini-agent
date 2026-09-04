@@ -393,7 +393,11 @@ fn attest_owner_only_kernel_object(
     }
     let entries_allocation = Local(entries.cast());
     let observed = unsafe { &*entries };
-    let valid = observed.grfAccessMode == SET_ACCESS
+    // `SetEntriesInAclW(SET_ACCESS)` emits one ACCESS_ALLOWED ACE;
+    // `GetExplicitEntriesFromAclW` canonically reports that ACE as
+    // `GRANT_ACCESS` on current Windows builds. Accept both representations
+    // while retaining the exact SID, mask, inheritance, and cardinality proof.
+    let valid = matches!(observed.grfAccessMode, SET_ACCESS | GRANT_ACCESS)
         && observed.grfInheritance == 0
         && observed.grfAccessPermissions == expected_access
         && observed.Trustee.TrusteeForm == TRUSTEE_IS_SID
