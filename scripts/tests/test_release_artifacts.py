@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import subprocess
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "release_artifacts.py"
@@ -187,6 +189,18 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                 ],
             )
             RELEASE.smoke_archive(archive, "mini-agent", "1.8.0", True)
+
+    def test_windows_failure_diagnostic_reports_only_closed_helper_status(self) -> None:
+        completed = subprocess.CompletedProcess([], 68, "", "ignored")
+        with mock.patch.object(RELEASE, "_run", return_value=completed) as run:
+            status = RELEASE._closed_windows_preflight_status(
+                Path("mini-agent.exe"), platform_name="nt"
+            )
+
+        self.assertEqual(status, "68")
+        run.assert_called_once_with(
+            Path("mini-agent.exe"), "--mini-agent-windows-worker-preflight-v1"
+        )
 
     @unittest.skipIf(RELEASE.os.name == "nt", "fixture is a POSIX shell executable")
     def test_lite_archive_must_reject_js_runtime_check(self) -> None:

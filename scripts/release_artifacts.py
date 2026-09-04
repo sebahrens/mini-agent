@@ -175,6 +175,15 @@ def _run(binary: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         raise ReleaseArtifactError(f"packaged executable failed to run: {error}") from error
 
 
+def _closed_windows_preflight_status(
+    binary: Path, platform_name: str = os.name
+) -> str:
+    if platform_name != "nt":
+        return "not-run"
+    helper = _run(binary, "--mini-agent-windows-worker-preflight-v1")
+    return str(helper.returncode)
+
+
 def _smoke_install_parent(
     environment: Mapping[str, str] = os.environ,
     platform_name: str = os.name,
@@ -222,10 +231,12 @@ def smoke_archive(
         js = _run(binary, "--js-runtime-check")
         if expect_js:
             if js.returncode != 0 or js.stdout.strip() != "JS runtime check: PASS (2)":
+                helper_status = _closed_windows_preflight_status(binary)
                 raise ReleaseArtifactError(
                     "packaged JS runtime smoke failed: "
                     f"status={js.returncode}, stdout={js.stdout.strip()!r}, "
-                    f"stderr={js.stderr.strip()!r}"
+                    f"stderr={js.stderr.strip()!r}, "
+                    f"closed_preflight_stage_status={helper_status}"
                 )
         elif js.returncode == 0 or "unexpected argument" not in js.stderr:
             raise ReleaseArtifactError("lite archive unexpectedly exposes the JS runtime check")

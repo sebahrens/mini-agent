@@ -3564,10 +3564,9 @@ mod feasibility {
         }
         let deadline = Instant::now() + PRODUCTION_PREFLIGHT_TIMEOUT;
         let hooks = ProductionLaunchHooks::production().with_deadline(deadline);
-        Some(if run_runtime_preflight_owned(hooks, deadline).is_ok() {
-            std::process::ExitCode::SUCCESS
-        } else {
-            std::process::ExitCode::FAILURE
+        Some(match run_runtime_preflight_owned(hooks, deadline) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(failure) => std::process::ExitCode::from(failure.stage as u8),
         })
     }
 
@@ -3584,26 +3583,65 @@ mod feasibility {
         Ok(())
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[repr(u8)]
+    enum RuntimePreflightFailureStage {
+        Launch = 65,
+        Deadline = 66,
+        RuntimeControls = 67,
+        Protocol = 68,
+        Reap = 69,
+        Exit = 70,
+    }
+
+    #[derive(Debug)]
+    struct RuntimePreflightFailure {
+        stage: RuntimePreflightFailureStage,
+        error: GateError,
+    }
+
+    impl RuntimePreflightFailure {
+        fn new(stage: RuntimePreflightFailureStage, error: GateError) -> Self {
+            Self { stage, error }
+        }
+    }
+
     fn run_runtime_preflight_owned(
         hooks: ProductionLaunchHooks,
         deadline: Instant,
-    ) -> Result<(), GateError> {
-        let mut process = launch_production(hooks)?;
+    ) -> Result<(), RuntimePreflightFailure> {
+        let mut process = launch_production(hooks).map_err(|error| {
+            RuntimePreflightFailure::new(RuntimePreflightFailureStage::Launch, error)
+        })?;
         let result = (|| {
             if Instant::now() >= deadline {
-                return Err(GateError(
-                    "Windows production worker launch completed after its caller deadline"
-                        .to_string(),
+                return Err(RuntimePreflightFailure::new(
+                    RuntimePreflightFailureStage::Deadline,
+                    GateError(
+                        "Windows production worker launch completed after its caller deadline"
+                            .to_string(),
+                    ),
                 ));
             }
-            process.process.runtime_controls_match()?;
+            process.process.runtime_controls_match().map_err(|error| {
+                RuntimePreflightFailure::new(RuntimePreflightFailureStage::RuntimeControls, error)
+            })?;
             run_authenticated_round_trip(&mut process, |process| {
                 read_worker_frame_exact_bounded(process, deadline)
+            })
+            .map_err(|error| {
+                RuntimePreflightFailure::new(RuntimePreflightFailureStage::Protocol, error)
             })?;
-            let status = wait_for_protocol_worker_exit_until(&mut process, deadline)?;
+            let status =
+                wait_for_protocol_worker_exit_until(&mut process, deadline).map_err(|error| {
+                    RuntimePreflightFailure::new(RuntimePreflightFailureStage::Reap, error)
+                })?;
             if !status.success() {
-                return Err(GateError(
-                    "Windows production protocol worker exited unsuccessfully".to_string(),
+                return Err(RuntimePreflightFailure::new(
+                    RuntimePreflightFailureStage::Exit,
+                    GateError(
+                        "Windows production protocol worker exited unsuccessfully".to_string(),
+                    ),
                 ));
             }
             Ok(())
