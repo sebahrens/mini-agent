@@ -3682,6 +3682,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_eof_without_terminal_event_malformed_fragment_recovers_within_budget() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text_additional_params(serde_json::json!({
+                    "orphan_provider_metadata": true
+                })),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(2)
+            .build();
+        let mut runner = super::spawn_agent_with_stream_policy(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            RunnerStreamPolicy::drop_next_terminal_responses(1),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut response = None;
+        while let Some(event) = runner.event_rx.recv().await {
+            match event {
+                crate::event::AgentEvent::Done { response: done, .. } => {
+                    response = Some(done.to_string());
+                    break;
+                }
+                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(model.requests().len(), 2);
+        assert_eq!(response.as_deref(), Some("recovered"));
+    }
+
+    #[tokio::test]
     async fn runner_eof_without_terminal_event_tool_result_and_text_are_replayed_in_order() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = MockCompletionModel::from_stream_turns(vec![
