@@ -202,6 +202,63 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
             Path("mini-agent.exe"), "--mini-agent-windows-worker-preflight-v1"
         )
 
+    def test_windows_smoke_install_directory_gets_private_inheritable_acl(self) -> None:
+        responses = [
+            subprocess.CompletedProcess([], 0, '"runner","S-1-5-21-1-2-3-1001"\n', ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with mock.patch.object(RELEASE.subprocess, "run", side_effect=responses) as run:
+            RELEASE._harden_windows_install_directory(
+                Path(r"C:\Users\runner\AppData\Local\smoke"), platform_name="nt"
+            )
+
+        self.assertEqual(run.call_count, 2)
+        acl_command = run.call_args_list[1].args[0]
+        self.assertEqual(
+            acl_command[:4],
+            [
+                "icacls",
+                r"C:\Users\runner\AppData\Local\smoke",
+                "/inheritance:r",
+                "/grant:r",
+            ],
+        )
+        self.assertIn("*S-1-5-21-1-2-3-1001:(OI)(CI)F", acl_command)
+        self.assertIn("*S-1-5-18:(OI)(CI)F", acl_command)
+        self.assertIn("*S-1-5-32-544:(OI)(CI)F", acl_command)
+
+    def test_windows_smoke_install_rejects_unparseable_identity(self) -> None:
+        response = subprocess.CompletedProcess([], 0, "unexpected", "")
+        with mock.patch.object(RELEASE.subprocess, "run", return_value=response):
+            with self.assertRaisesRegex(
+                RELEASE.ReleaseArtifactError, "Windows smoke-install user identity"
+            ):
+                RELEASE._harden_windows_install_directory(
+                    Path(r"C:\private"), platform_name="nt"
+                )
+
+    def test_non_windows_smoke_install_does_not_change_acl(self) -> None:
+        with mock.patch.object(RELEASE.subprocess, "run") as run:
+            RELEASE._harden_windows_install_directory(
+                Path("/tmp/private"), platform_name="posix"
+            )
+
+        run.assert_not_called()
+
+    def test_windows_smoke_install_rejects_acl_command_failure(self) -> None:
+        responses = [
+            subprocess.CompletedProcess([], 0, '"runner","S-1-5-21-1-2-3-1001"\n', ""),
+            subprocess.CompletedProcess([], 5, "", "access denied"),
+        ]
+        with mock.patch.object(RELEASE.subprocess, "run", side_effect=responses):
+            with self.assertRaisesRegex(
+                RELEASE.ReleaseArtifactError,
+                "cannot create a private Windows smoke-install directory",
+            ):
+                RELEASE._harden_windows_install_directory(
+                    Path(r"C:\private"), platform_name="nt"
+                )
+
     @unittest.skipIf(RELEASE.os.name == "nt", "fixture is a POSIX shell executable")
     def test_lite_archive_must_reject_js_runtime_check(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

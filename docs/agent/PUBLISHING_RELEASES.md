@@ -25,7 +25,11 @@ The manually dispatched `Windows release archive smoke` workflow is the non-publ
 for the Windows default-feature archive. It builds the documented target, transfers the exact
 private archive to a clean Windows runner, verifies its version and offline JS evaluation, produces
 and verifies `SHA256SUMS`, and retains the smoke-verified candidate for inspection. It has read-only
-repository permission and contains no release-publication job.
+repository permission and contains no release-publication job. Before extraction, the smoke gate
+removes inherited access from its per-user install directory and grants inheritable control only to
+the runner identity, SYSTEM, and Administrators. This gives the downloaded executable the same
+trusted-ancestor shape required by the production AppContainer launcher without weakening that
+launcher for hosted CI.
 
 Every release also includes five platform VSIX candidates, the dual-purpose
 `mini-agent-windows-x64.msi`, their checksum manifests, and

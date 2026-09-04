@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import os
 import re
@@ -17,6 +18,7 @@ from pathlib import Path
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 SHA256_LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]*)$")
+WINDOWS_SID = re.compile(r"^S-1-(?:[0-9]+-)+[0-9]+$")
 REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md")
 
 
@@ -184,6 +186,54 @@ def _closed_windows_preflight_status(
     return str(helper.returncode)
 
 
+def _harden_windows_install_directory(
+    directory: Path, platform_name: str = os.name
+) -> None:
+    if platform_name != "nt":
+        return
+    try:
+        identity = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        rows = list(csv.reader(identity.stdout.splitlines()))
+        sid = (
+            rows[0][1].strip()
+            if identity.returncode == 0 and len(rows) == 1 and len(rows[0]) == 2
+            else ""
+        )
+        if not WINDOWS_SID.fullmatch(sid):
+            raise ReleaseArtifactError(
+                "cannot resolve the Windows smoke-install user identity"
+            )
+        hardened = subprocess.run(
+            [
+                "icacls",
+                str(directory),
+                "/inheritance:r",
+                "/grant:r",
+                f"*{sid}:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseArtifactError(
+            "cannot create a private Windows smoke-install directory"
+        ) from error
+    if hardened.returncode != 0:
+        raise ReleaseArtifactError(
+            "cannot create a private Windows smoke-install directory"
+        )
+
+
 def _smoke_install_parent(
     environment: Mapping[str, str] = os.environ,
     platform_name: str = os.name,
@@ -219,6 +269,7 @@ def smoke_archive(
         prefix="mini-agent-release-smoke-", dir=install_parent
     ) as directory:
         destination = Path(directory)
+        _harden_windows_install_directory(destination)
         _extract_regular_members(archive, destination)
         binary = destination / executable_name
         version = _run(binary, "--version")
