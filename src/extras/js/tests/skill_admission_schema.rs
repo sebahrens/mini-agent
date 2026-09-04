@@ -67,7 +67,7 @@ fn report(proposal_id: &str, skill_id: &str, attempt: u32) -> EvaluationReportRe
         suite_hashes: vec!["suite-hash".to_string()],
         predecessor_id: None,
         embedding_model_id: Some("deterministic-hash".to_string()),
-        embedding_model_revision: Some("deterministic-v1".to_string()),
+        embedding_model_revision: Some("deterministic-v2".to_string()),
         outcome: "passed".to_string(),
         reason_code: None,
         summary_json: r#"{"embedded":"passed","held_out":"passed"}"#.to_string(),
@@ -334,7 +334,7 @@ fn skill_admission_schema_v6_backfills_v5_root_canary_and_can_activate() {
 }
 
 #[test]
-fn skill_admission_schema_v6_rejects_v5_root_canary_without_first_approval() {
+fn skill_admission_schema_v6_quarantines_v5_root_canary_without_first_approval() {
     let (root, paths) = paths();
     let mut store = SkillStore::open_at(&paths).expect("store");
     let artifact = artifact("/* v5-unapproved-root-canary */");
@@ -358,18 +358,21 @@ fn skill_admission_schema_v6_rejects_v5_root_canary_without_first_approval() {
         .unwrap();
     drop(store);
 
-    assert!(matches!(
-        SkillStore::open_at(&paths),
-        Err(StoreError::CorruptRow(message))
-            if message.contains("could not be backfilled exactly")
-    ));
+    let store = SkillStore::open_at(&paths).expect("ambiguous approval is quarantined");
+    let metadata = store.metadata(&artifact.id).unwrap().unwrap();
+    assert_eq!(metadata.status, "quarantined");
+    assert_eq!(
+        metadata.quarantine_reason.as_deref(),
+        Some("approval_migration_invalid")
+    );
+    drop(store);
     let database = paths.local_data_dir.join("skills/skills.db");
     let connection = Connection::open(database).unwrap();
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        5
+        i64::from(CURRENT_SCHEMA_VERSION)
     );
     assert_eq!(
         connection
@@ -380,13 +383,13 @@ fn skill_admission_schema_v6_rejects_v5_root_canary_without_first_approval() {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        0
+        1
     );
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn skill_admission_schema_v6_rejects_v5_root_canary_with_unapproved_proposal() {
+fn skill_admission_schema_v6_quarantines_v5_root_canary_with_unapproved_proposal() {
     let (root, paths) = paths();
     let mut store = SkillStore::open_at(&paths).expect("store");
     let artifact = artifact("/* v5-root-canary-unapproved-proposal */");
@@ -445,18 +448,29 @@ fn skill_admission_schema_v6_rejects_v5_root_canary_with_unapproved_proposal() {
         .unwrap();
     drop(store);
 
-    assert!(matches!(
-        SkillStore::open_at(&paths),
-        Err(StoreError::CorruptRow(message))
-            if message.contains("could not be backfilled exactly")
-    ));
+    let store = SkillStore::open_at(&paths).expect("orphaned approval is quarantined");
+    let metadata = store.metadata(&artifact.id).unwrap().unwrap();
+    assert_eq!(metadata.status, "quarantined");
+    assert_eq!(
+        metadata.quarantine_reason.as_deref(),
+        Some("approval_migration_invalid")
+    );
+    assert_eq!(
+        store
+            .get_proposal(&proposal.proposal_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ProposalStatus::Rejected
+    );
+    drop(store);
     let database = paths.local_data_dir.join("skills/skills.db");
     let connection = Connection::open(database).unwrap();
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        5
+        i64::from(CURRENT_SCHEMA_VERSION)
     );
     let lifecycle_rows: i64 = connection
         .query_row(
@@ -646,7 +660,9 @@ fn skill_admission_schema_cannot_repropose_a_privacy_purged_identity() {
     let mut store = SkillStore::open_at(&paths).expect("store");
     let artifact = artifact("");
     store.insert_verified(&artifact).expect("verified artifact");
-    store.purge(&artifact.id).expect("privacy purge");
+    crate::extras::js::skills::retention::RetentionService::new(&mut store)
+        .privacy_purge(&artifact.id, "test_request", 9)
+        .expect("privacy purge");
 
     assert!(matches!(
         store.enqueue_proposal(&artifact, None, 10),

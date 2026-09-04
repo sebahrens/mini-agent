@@ -496,6 +496,7 @@ fn fetch_options_error(message: impl Into<String>) -> rquickjs::Error {
 fn effect_error(tool: &'static str, code: EffectErrorCode) -> rquickjs::Error {
     let code = match code {
         EffectErrorCode::Denied => "denied",
+        EffectErrorCode::CapabilityDenied => "capability_denied",
         EffectErrorCode::InvalidTarget => "invalid_target",
         EffectErrorCode::Cancelled => "cancelled",
         EffectErrorCode::TimedOut => "timed_out",

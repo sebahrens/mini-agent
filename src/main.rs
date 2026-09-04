@@ -171,6 +171,39 @@ async fn run() -> anyhow::Result<()> {
 
     let (mut cfg, is_first_startup) = config::load_with_paths(&app_paths, is_interactive);
 
+    #[cfg(feature = "skills")]
+    if cli.purge_learned_skill.is_some()
+        || cli.compact_learned_skill_events
+        || cli.learned_skill_feedback.is_some()
+    {
+        let feedback = cli.learned_skill_feedback.as_deref().map(|skill_id| {
+            extras::js::skills::operations::FeedbackOperation {
+                skill_id,
+                invocation_id: cli.learned_skill_feedback_invocation.as_deref(),
+                kind: cli
+                    .learned_skill_feedback_kind
+                    .as_deref()
+                    .expect("clap requires feedback kind"),
+                reason_code: cli
+                    .learned_skill_feedback_reason
+                    .as_deref()
+                    .expect("clap requires feedback reason"),
+                idempotency_key: cli
+                    .learned_skill_feedback_key
+                    .as_deref()
+                    .expect("clap requires feedback key"),
+            }
+        });
+        extras::js::skills::operations::run(
+            cli.purge_learned_skill.as_deref(),
+            cli.compact_learned_skill_events,
+            feedback,
+            &app_paths,
+            cfg.embedding.as_ref(),
+        )?;
+        return Ok(());
+    }
+
     if cli.print_config {
         print::print_config(&cli, &cfg)?;
         return Ok(());

@@ -4,7 +4,8 @@ use crate::extras::js::skills::capability::{
 };
 use crate::extras::js::skills::telemetry::{
     EventBatch, ParentBindingError, ParentSkillBinding, ParentTelemetryContext, SkillEvent,
-    SkillEventKind, TelemetryError, TelemetryIngestor, bind_worker_events, stable_invocation_id,
+    SkillEventKind, TelemetryError, TelemetryIngestor, behavioral_window_counts_for_test,
+    bind_worker_events, stable_invocation_id,
 };
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
@@ -102,6 +103,44 @@ fn stable_ids_reuse_acknowledged_calls_but_separate_ordinals() {
     assert_eq!(first.len(), 64);
 }
 
+#[test]
+fn behavioral_quarantine_counts_only_complete_production_calls_in_recent_window() {
+    let (_root, mut store, artifact) = store();
+    let window_end = 4_000_000;
+    let old = window_end - crate::extras::js::skills::retention::DEFAULT_RAW_RETENTION_SECONDS - 1;
+    let recent = window_end - 1;
+    for ordinal in 0..40 {
+        let invocation = format!("{ordinal:064x}");
+        let created_at = if ordinal < 20 { old } else { recent };
+        let failed = ordinal < 20 || ordinal < 24;
+        for kind in [
+            SkillEventKind::Invoked,
+            if failed {
+                SkillEventKind::Threw
+            } else {
+                SkillEventKind::Returned
+            },
+        ] {
+            let mut observation = event(
+                &artifact.id,
+                &invocation,
+                kind,
+                kind.is_terminal()
+                    .then_some(if failed { "exception" } else { "fulfilled" }),
+            );
+            observation.created_at = created_at;
+            TelemetryIngestor::new(&mut store)
+                .ingest(&EventBatch::new(vec![observation]).unwrap())
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        behavioral_window_counts_for_test(&store, &artifact.id, window_end).unwrap(),
+        (20, 4)
+    );
+}
+
 fn parent_context(artifact: &SkillArtifact) -> ParentTelemetryContext {
     ParentTelemetryContext {
         turn_id: "parent-turn".into(),
@@ -116,6 +155,7 @@ fn parent_context(artifact: &SkillArtifact) -> ParentTelemetryContext {
             retrieval_score: 0.75,
             retrieval_rank: 2,
         }],
+        capability_denials: Default::default(),
     }
 }
 
@@ -192,6 +232,33 @@ fn parent_binding_rebuilds_policy_fields_and_requires_exact_selected_mapping() {
         bind_worker_events(&context, &cross_turn).unwrap_err(),
         ParentBindingError::AttributionMismatch
     );
+}
+
+#[test]
+fn parent_binding_promotes_authoritative_broker_denial_to_policy_event() {
+    let (_root, _store, artifact) = store();
+    let mut context = parent_context(&artifact);
+    let invocation = stable_invocation_id(
+        &context.turn_id,
+        &context.tool_call_id,
+        &artifact.id,
+        "run",
+        0,
+    );
+    context.capability_denials.insert(invocation);
+    let events = vec![
+        worker_claim(&context, &artifact, SkillEventKind::Injected),
+        worker_claim(&context, &artifact, SkillEventKind::Invoked),
+        worker_claim(&context, &artifact, SkillEventKind::Threw),
+    ];
+
+    let batch = bind_worker_events(&context, &events).expect("parent denial is attributable");
+    let denial = batch
+        .events()
+        .iter()
+        .find(|event| event.kind == SkillEventKind::CapabilityDenied)
+        .expect("authoritative denial must become durable telemetry");
+    assert_eq!(denial.outcome.as_deref(), Some("capability_policy"));
 }
 
 #[test]

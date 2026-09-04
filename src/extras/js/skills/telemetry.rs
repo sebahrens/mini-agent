@@ -258,6 +258,7 @@ pub(crate) struct ParentTelemetryContext {
     pub(crate) production: bool,
     pub(crate) step_outcome: StepOutcome,
     pub(crate) skills: Vec<ParentSkillBinding>,
+    pub(crate) capability_denials: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -310,6 +311,7 @@ pub(crate) fn bind_worker_events(
     let mut ordinals = BTreeMap::<(String, String), u32>::new();
     let mut open_invocations = BTreeMap::<String, (String, String)>::new();
     let mut canonical_worker_events = Vec::with_capacity(worker_events.len());
+    let mut capability_denials = context.capability_denials.clone();
     let created_at = current_timestamp().map_err(|_| ParentBindingError::InvalidShape)?;
 
     for claim in worker_events {
@@ -396,12 +398,25 @@ pub(crate) fn bind_worker_events(
             }
         }
 
-        canonical_worker_events.push(canonical_event(claim, binding, context, created_at, true));
+        let mut canonical = canonical_event(claim, binding, context, created_at, true);
+        if claim.kind.is_terminal()
+            && claim
+                .invocation_id
+                .as_ref()
+                .is_some_and(|id| capability_denials.remove(id))
+        {
+            canonical.kind = SkillEventKind::CapabilityDenied;
+            canonical.outcome = Some("capability_policy".to_string());
+        }
+        canonical_worker_events.push(canonical);
     }
 
     let expected_injections = selected.keys().copied().collect::<BTreeSet<_>>();
     let observed_injections = injected.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    if observed_injections != expected_injections || !open_invocations.is_empty() {
+    if observed_injections != expected_injections
+        || !open_invocations.is_empty()
+        || !capability_denials.is_empty()
+    {
         return Err(ParentBindingError::IncompleteEvidence);
     }
 
@@ -636,8 +651,9 @@ impl TelemetryDispatcher {
                             if let Some(coordinator) = &coordinator {
                                 apply_automatic_quarantine(&mut store, coordinator, &batch);
                             }
+                            compact_expired_events(&mut store);
                         }
-                        Ok(_) => {}
+                        Ok(_) => compact_expired_events(&mut store),
                         Err(error) => {
                             worker_observability_lost.fetch_add(1, Ordering::Relaxed);
                             // Never include event payloads in diagnostics.
@@ -669,6 +685,55 @@ impl TelemetryDispatcher {
                 TrySendError::Disconnected(_) => DispatchError::Disconnected,
             })
     }
+}
+
+fn compact_expired_events(store: &mut SkillStore) {
+    let Ok(now) = current_timestamp() else {
+        return;
+    };
+    let cutoff = now.saturating_sub(super::retention::DEFAULT_RAW_RETENTION_SECONDS);
+    if let Err(error) =
+        super::retention::RetentionService::new(store).compact_before(cutoff, 1, now)
+    {
+        tracing::warn!(error = %error, "automatic skill telemetry compaction failed");
+    }
+}
+
+fn behavioral_window_counts(
+    store: &SkillStore,
+    skill_id: &str,
+    window_end: i64,
+) -> Result<(i64, i64), rusqlite::Error> {
+    let window_start = window_end.saturating_sub(super::retention::DEFAULT_RAW_RETENTION_SECONDS);
+    store.connection().query_row(
+        "SELECT COUNT(*), COALESCE(SUM(
+             terminal.event_kind IN ('threw','timed_out','oom','capability_denied')
+         ), 0)
+         FROM skill_events AS invoked
+         JOIN skill_events AS terminal
+           ON terminal.invocation_id = invoked.invocation_id
+          AND terminal.skill_id = invoked.skill_id
+          AND terminal.event_kind IN (
+              'returned','threw','timed_out','oom','capability_denied'
+          )
+         WHERE invoked.skill_id = ?1
+           AND invoked.event_kind = 'invoked'
+           AND invoked.production = 1 AND invoked.evidence_complete = 1
+           AND terminal.production = 1 AND terminal.evidence_complete = 1
+           AND invoked.created_at >= ?2 AND invoked.created_at <= ?3
+           AND terminal.created_at >= ?2 AND terminal.created_at <= ?3",
+        params![skill_id, window_start, window_end],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn behavioral_window_counts_for_test(
+    store: &SkillStore,
+    skill_id: &str,
+    window_end: i64,
+) -> Result<(i64, i64), rusqlite::Error> {
+    behavioral_window_counts(store, skill_id, window_end)
 }
 
 impl Drop for TelemetryDispatcher {
@@ -761,12 +826,10 @@ fn apply_automatic_quarantine(
                         | SkillEventKind::Oom
                 )
         });
-        let stats: Result<(i64, i64), _> = store.connection().query_row(
-            "SELECT invoked_count, direct_failure_count
-             FROM skill_stats WHERE skill_id = ?",
-            [&skill_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        );
+        let Ok(now) = current_timestamp() else {
+            continue;
+        };
+        let stats = behavioral_window_counts(store, &skill_id, now);
         let (invocations, failures) = stats.unwrap_or((0, 0));
         let reason = match severe.map(|event| event.kind) {
             Some(SkillEventKind::CapabilityDenied) => QuarantineReason::CapabilityPolicyFault,
@@ -796,16 +859,13 @@ fn apply_automatic_quarantine(
             generation_current: generation.desired_generation == generation.applied_generation,
         };
         let policy = QuarantinePolicy::conservative("phase5-quarantine-v1");
-        let Ok(created_at) = current_timestamp() else {
-            continue;
-        };
         if let Err(error) = QuarantineExecutor::new(coordinator).apply(
             &policy,
             &evidence,
             status,
             row_version,
             generation.desired_generation as i64,
-            created_at,
+            now,
         ) {
             tracing::warn!(
                 skill_id = %skill_id,

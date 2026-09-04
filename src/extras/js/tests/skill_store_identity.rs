@@ -75,6 +75,37 @@ fn skill_store_identity_crud_is_idempotent_and_optimistic() {
 }
 
 #[test]
+fn skill_store_duplicate_policy_reads_metadata_without_artifact_bodies() {
+    let temp = TempPaths::new();
+    let mut store = SkillStore::open_at(&temp.paths).expect("open store");
+    let existing = artifact();
+    store
+        .insert_verified(&existing)
+        .expect("insert active skill");
+    let duplicate = SkillArtifact::new(
+        "function increment(_cap, value) { return value + 2; }".into(),
+        existing.description.to_uppercase(),
+        vec![],
+        existing.exports.clone(),
+        vec!["increment(1) === 3".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    let distinct = SkillArtifact::new(
+        duplicate.source.clone(),
+        "Different policy description".into(),
+        vec![],
+        duplicate.exports.clone(),
+        duplicate.tests.clone(),
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+
+    assert!(store.has_policy_duplicate(&duplicate).unwrap());
+    assert!(!store.has_policy_duplicate(&distinct).unwrap());
+}
+
+#[test]
 fn skill_store_identity_tamper_and_collision_fail_closed() {
     let temp = TempPaths::new();
     let mut store = SkillStore::open_at(&temp.paths).expect("open store");
@@ -109,7 +140,9 @@ fn skill_store_identity_purge_tombstones_and_removes_dependencies() {
         .store_embedding(&artifact.id, "model", "r1", 4, true, &bytes)
         .expect("store embedding");
 
-    store.purge(&artifact.id).expect("purge");
+    crate::extras::js::skills::retention::RetentionService::new(&mut store)
+        .privacy_purge(&artifact.id, "test_request", 10)
+        .expect("purge");
     assert!(store.get(&artifact.id).unwrap().is_none());
     assert!(
         store
@@ -117,8 +150,8 @@ fn skill_store_identity_purge_tombstones_and_removes_dependencies() {
             .unwrap()
             .is_none()
     );
-    store
-        .purge(&artifact.id)
+    crate::extras::js::skills::retention::RetentionService::new(&mut store)
+        .privacy_purge(&artifact.id, "test_request", 11)
         .expect("purge retry is idempotent");
     assert!(matches!(
         store.insert_verified(&artifact),

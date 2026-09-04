@@ -441,6 +441,25 @@ The target scale applies to active and retained revisions, not unlimited raw tel
 - An explicit privacy purge removes the artifact and all dependent data and records a non-secret
   tombstone so stale indexes cannot resurrect the ID.
 
+The shipped binary runs 30-day raw-event compaction automatically after successful telemetry
+ingestion. Operators can also force the same idempotent pass with
+`mini-agent --compact-learned-skill-events`. A local operator can irreversibly purge one exact
+identity-v2 revision through `mini-agent --purge-learned-skill <64-character-sha256>`; this command
+uses the lifecycle/index coordinator and publishes removal before reporting success. Neither
+command initializes a model provider, and neither prints artifact source or telemetry payloads.
+
+Targeted local-owner feedback is available without model initialization through
+`--learned-skill-feedback <sha256>`, together with the required `--learned-skill-feedback-kind`,
+`--learned-skill-feedback-reason`, and `--learned-skill-feedback-key` fields and the optional
+`--learned-skill-feedback-invocation`. The idempotency key makes retries exact. Severe feedback is
+restricted to the enumerated safety reason codes and immediately enters the coordinator-backed
+quarantine transition for an active or canary revision.
+
+Repair-record construction and repair-proposal submission are compiled only into the verification
+suite while the shipped learned-skill proposal pipeline is intentionally disabled. Shipping that
+surface before authenticated approval and activation exist would recreate a write-only proposal
+queue; it must be enabled with the complete operator workflow rather than as an isolated API.
+
 Key rotation changes only future correlation fingerprints; evidence snapshots retain opaque old
 fingerprints but cannot be reversed. Repair records derived from user data must pass redaction and
 fixed size limits; uncertain or value-bearing fixtures require human approval before persistence.

@@ -1658,6 +1658,48 @@ async fn worker_broker_grants_never_allow_a_skill_to_propose_another_skill() {
     .await;
 }
 
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn worker_broker_records_skill_capability_denials_for_parent_telemetry() {
+    let invocation_id = invocation("inv-skill-policy-telemetry");
+    let mut case = operation_cases(&invocation_id).remove(4);
+    let skill_invocation = "a".repeat(64);
+    case.principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-proposer".into(),
+        export: "propose".into(),
+        invocation_id: skill_invocation.clone(),
+    };
+    case.advisory = AdvisoryAttribution {
+        artifact_id: Some("artifact-proposer".into()),
+        export: Some("propose".into()),
+    };
+    let grant = grant(
+        &case,
+        &invocation_id,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let effect = request(&case, &grant);
+    let (mut broker, _record, _audit) = broker(
+        invocation_id,
+        vec![grant],
+        HostCapability::all(),
+        ServiceFailures::default(),
+    );
+    let tracker = broker.capability_denial_tracker();
+
+    let result = broker.handle_effect(effect, PermCancellation::new()).await;
+    assert!(matches!(
+        result,
+        EffectResult::Error(crate::extras::js::protocol::EffectError {
+            code: EffectErrorCode::CapabilityDenied
+        })
+    ));
+    assert_eq!(
+        tracker.snapshot().unwrap(),
+        BTreeSet::from([skill_invocation])
+    );
+}
+
 #[tokio::test]
 async fn worker_broker_grants_expiring_during_ask_never_execute() {
     let invocation_id = invocation("inv-expiring-ask");

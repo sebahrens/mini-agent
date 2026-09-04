@@ -463,14 +463,6 @@ impl IndexCoordinator {
         })
     }
 
-    /// Privacy-purge durable bytes before publishing removal to readers.
-    pub fn purge_and_publish(&self, id: &str) -> Result<u64, CoordinatorError> {
-        let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
-        self.mutate_and_publish_hidden(&mut store, HashSet::from([id.to_string()]), |store| {
-            store.purge(id)
-        })
-    }
-
     fn mutate_and_publish_hidden(
         &self,
         store: &mut SkillStore,

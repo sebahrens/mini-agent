@@ -91,6 +91,24 @@ pub(crate) enum GrantPrincipal {
     },
 }
 
+/// Parent-owned record of learned-skill invocations that hit a capability-policy denial.
+#[cfg(feature = "skills")]
+#[derive(Clone, Default)]
+pub(crate) struct CapabilityDenialTracker(Arc<Mutex<BTreeSet<String>>>);
+
+#[cfg(feature = "skills")]
+impl CapabilityDenialTracker {
+    fn record(&self, invocation_id: String) {
+        if let Ok(mut denials) = self.0.lock() {
+            denials.insert(invocation_id);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<BTreeSet<String>> {
+        self.0.lock().ok().map(|denials| denials.clone())
+    }
+}
+
 /// Immutable authority issued by the parent for exactly one invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InvocationGrant {
@@ -731,6 +749,7 @@ impl HostEffectError {
             Self::BackendFailure => EffectErrorCode::BackendFailure,
             Self::AuditFailure => EffectErrorCode::AuditFailure,
             Self::OutcomeUnknown => EffectErrorCode::OutcomeUnknown,
+            Self::CapabilityDenied | Self::ManifestDenied => EffectErrorCode::CapabilityDenied,
             Self::UnknownGrant
             | Self::ReplayedGrant
             | Self::ExpiredGrant
@@ -739,8 +758,6 @@ impl HostEffectError {
             | Self::InvocationTerminal
             | Self::InvocationRecycled
             | Self::SessionDenied
-            | Self::CapabilityDenied
-            | Self::ManifestDenied
             | Self::PermissionDenied => EffectErrorCode::Denied,
         }
     }
@@ -934,6 +951,8 @@ pub(crate) struct InvocationBroker<S> {
     skill_calls: Option<SkillCallAuthority>,
     #[cfg(feature = "skills")]
     issued_skill_grants: usize,
+    #[cfg(feature = "skills")]
+    capability_denials: CapabilityDenialTracker,
     #[cfg(test)]
     fail_completion_durability: Option<super::audit::AuditFailurePoint>,
 }
@@ -965,6 +984,8 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             skill_calls: None,
             #[cfg(feature = "skills")]
             issued_skill_grants: 0,
+            #[cfg(feature = "skills")]
+            capability_denials: CapabilityDenialTracker::default(),
             #[cfg(test)]
             fail_completion_durability: None,
         })
@@ -974,6 +995,11 @@ impl<S: ParentEffectService> InvocationBroker<S> {
     pub(crate) fn with_skill_call_authority(mut self, authority: SkillCallAuthority) -> Self {
         self.skill_calls = Some(authority);
         self
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn capability_denial_tracker(&self) -> CapabilityDenialTracker {
+        self.capability_denials.clone()
     }
 
     #[cfg(feature = "skills")]
@@ -1710,7 +1736,9 @@ fn audit_result_code(result: &Result<EffectResult, HostEffectError>) -> AuditRes
             EffectErrorCode::BackendFailure | EffectErrorCode::AuditFailure => {
                 AuditResultCode::BackendFailure
             }
-            EffectErrorCode::Denied | EffectErrorCode::InvalidTarget => AuditResultCode::Denied,
+            EffectErrorCode::Denied
+            | EffectErrorCode::CapabilityDenied
+            | EffectErrorCode::InvalidTarget => AuditResultCode::Denied,
         },
         Ok(_) => AuditResultCode::Succeeded,
         Err(HostEffectError::InvocationCancelled) => AuditResultCode::Cancelled,
@@ -1750,10 +1778,28 @@ impl<S: ParentEffectService> InvocationEffectHandler for InvocationBroker<S> {
         request: EffectRequest,
         cancellation: PermCancellation,
     ) -> EffectFuture<'_> {
+        #[cfg(feature = "skills")]
+        let skill_invocation = self.grants.get(&request.grant_id).and_then(|grant| {
+            if let GrantPrincipal::Skill { invocation_id, .. } = &grant.principal {
+                Some(invocation_id.clone())
+            } else {
+                None
+            }
+        });
         Box::pin(async move {
             match self.dispatch(request, cancellation).await {
                 Ok(result) => result,
-                Err(error) => error.into_wire_result(),
+                Err(error) => {
+                    #[cfg(feature = "skills")]
+                    if matches!(
+                        error,
+                        HostEffectError::CapabilityDenied | HostEffectError::ManifestDenied
+                    ) && let Some(invocation_id) = skill_invocation
+                    {
+                        self.capability_denials.record(invocation_id);
+                    }
+                    error.into_wire_result()
+                }
             }
         })
     }

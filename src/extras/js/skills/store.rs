@@ -542,6 +542,48 @@ impl SkillStore {
             .map_err(|_| StoreError::Constraint("active skill count is invalid".to_string()))
     }
 
+    /// Check the duplicate-admission policy without loading executable source.
+    pub(crate) fn has_policy_duplicate(
+        &self,
+        artifact: &SkillArtifact,
+    ) -> Result<bool, StoreError> {
+        let normalized_description = artifact.description.trim().to_lowercase();
+        let mut statement = self.db.prepare(
+            "SELECT id, description, exports_json
+             FROM skill_revisions
+             WHERE status = 'active' AND identity_version = 2 AND id <> ?",
+        )?;
+        let rows = statement.query_map([&artifact.id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (_id, description, exports_json) = row?;
+            if description.trim().to_lowercase() == normalized_description
+                && deserialize_exports(&exports_json)? == artifact.exports
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn is_retrievable(&self, id: &str) -> Result<bool, StoreError> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM skill_revisions
+                    WHERE id = ? AND status = 'active' AND identity_version = 2
+                 )",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
     /// Load one identity-checked active generation with compatible embeddings.
     ///
     /// Snapshot construction uses this joined scan instead of issuing metadata
@@ -846,8 +888,13 @@ impl SkillStore {
         }
     }
 
-    /// Privacy purge all durable bytes and leave a non-secret anti-resurrection tombstone.
-    pub fn purge(&mut self, id: &str) -> Result<(), StoreError> {
+    /// Migration-test cleanup for malformed legacy identifiers which cannot
+    /// enter the production privacy-purge surface.
+    #[cfg(test)]
+    pub(crate) fn purge_malformed_legacy_row_for_test(
+        &mut self,
+        id: &str,
+    ) -> Result<(), StoreError> {
         let now = current_timestamp()?;
         let tx = self.db.transaction()?;
         let exists: bool = tx.query_row(
@@ -873,9 +920,7 @@ impl SkillStore {
             params![id, id],
         )?;
         tx.execute("DELETE FROM skill_revisions WHERE id = ?", params![id])?;
-        // Legacy databases may contain malformed identifiers. Privacy deletion must
-        // still succeed for those rows, but retaining attacker-controlled/raw IDs in
-        // the tombstone set would violate the v2 identity constraint.
+        // Never retain attacker-controlled/raw IDs in the v2 tombstone set.
         if is_full_skill_id(id) {
             tx.execute(
                 "INSERT OR IGNORE INTO skill_tombstones (id, purged_at) VALUES (?, ?)",
@@ -2935,8 +2980,12 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
     if current_version < 6 {
         db.execute_batch("BEGIN IMMEDIATE;")?;
         let migration = (|| -> Result<(), StoreError> {
-            let invalid_legacy_approval: i64 = db.query_row(
-                "SELECT COUNT(*)
+            db.execute_batch(
+                "CREATE TEMP TABLE phase6_invalid_approval_skills (
+                     id TEXT PRIMARY KEY
+                 );
+                 INSERT OR IGNORE INTO phase6_invalid_approval_skills (id)
+                 SELECT p.skill_id
                    FROM skill_proposals p
                    LEFT JOIN evaluation_reports e ON e.report_id = p.report_id
                   WHERE p.status IN ('awaiting_approval', 'approved')
@@ -2945,15 +2994,8 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                          OR e.skill_id <> p.skill_id
                          OR e.outcome <> 'passed'
                          OR length(e.report_id) <> 64
-                         OR e.report_id GLOB '*[^0-9a-f]*')",
-                [],
-                |row| row.get(0),
+                         OR e.report_id GLOB '*[^0-9a-f]*');",
             )?;
-            if invalid_legacy_approval != 0 {
-                return Err(StoreError::CorruptRow(
-                    "v5 approval/report binding is ambiguous or invalid".to_string(),
-                ));
-            }
 
             db.execute_batch(
                 "UPDATE skill_revisions
@@ -3030,18 +3072,16 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                 );",
             )?;
 
-            let stranded: i64 = db.query_row(
-                "SELECT COUNT(*)
+            db.execute_batch(
+                "INSERT OR IGNORE INTO phase6_invalid_approval_skills (id)
+                 SELECT p.skill_id
                   FROM skill_proposals p
                    JOIN skill_revisions r ON r.id = p.skill_id
                   WHERE p.status IN ('awaiting_approval', 'approved')
-                    AND r.evaluation_report_id IS NOT p.report_id",
-                [],
-                |row| row.get(0),
-            )?;
-            let stranded_root_canary: i64 = db.query_row(
-                "SELECT COUNT(*)
-                   FROM skill_revisions r
+                    AND r.evaluation_report_id IS NOT p.report_id;
+
+                 INSERT OR IGNORE INTO phase6_invalid_approval_skills (id)
+                 SELECT r.id FROM skill_revisions r
                   WHERE r.status = 'canary' AND r.supersedes_id IS NULL
                     AND (
                         (SELECT COUNT(*)
@@ -3084,15 +3124,27 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                             AND l.approval_kind = 'phase4_canary'
                             AND l.evaluation_report_id = r.evaluation_report_id
                             AND l.artifact_row_version = r.row_version) <> 1
-                    )",
-                [],
-                |row| row.get(0),
+                    );
+
+                 UPDATE skill_revisions
+                    SET status = 'quarantined',
+                        quarantine_reason = 'approval_migration_invalid',
+                        row_version = row_version + 1,
+                        updated_at = CASE WHEN updated_at < 1 THEN 1 ELSE updated_at END
+                  WHERE id IN (SELECT id FROM phase6_invalid_approval_skills);
+
+                 UPDATE skill_proposals
+                    SET status = 'rejected',
+                        reason_code = 'approval_migration_invalid',
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        row_version = row_version + 1,
+                        updated_at = CASE WHEN updated_at < 1 THEN 1 ELSE updated_at END
+                  WHERE skill_id IN (SELECT id FROM phase6_invalid_approval_skills)
+                    AND status IN ('awaiting_approval', 'approved');
+
+                 DROP TABLE phase6_invalid_approval_skills;",
             )?;
-            if stranded != 0 || stranded_root_canary != 0 {
-                return Err(StoreError::CorruptRow(
-                    "v5 approval lifecycle state could not be backfilled exactly".to_string(),
-                ));
-            }
             db.pragma_update(None, "user_version", 6)?;
             Ok(())
         })();

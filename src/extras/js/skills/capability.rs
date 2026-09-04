@@ -550,6 +550,7 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
         EffectResult::Error(error) => {
             let _closed_code = match error.code {
                 EffectErrorCode::Denied
+                | EffectErrorCode::CapabilityDenied
                 | EffectErrorCode::InvalidTarget
                 | EffectErrorCode::Cancelled
                 | EffectErrorCode::TimedOut

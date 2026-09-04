@@ -69,6 +69,22 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_embedding_depends_only_on_text_not_batch_position() {
+        let backend = DeterministicBackend::new();
+        let text = "same text".to_string();
+        let batch = backend
+            .embed_documents(&["other".to_string(), text.clone()])
+            .unwrap();
+        let alone = backend
+            .embed_documents(std::slice::from_ref(&text))
+            .unwrap();
+        let query = backend.embed_query(&text).unwrap();
+
+        assert_eq!(batch[1], alone[0]);
+        assert_eq!(alone[0], query);
+    }
+
+    #[test]
     fn test_deterministic_backend_different_text_different_embedding() {
         let backend = DeterministicBackend::new();
         let doc1 = "hello";
@@ -125,7 +141,7 @@ mod tests {
         // are keyed by (model_id, model_revision), so claiming to be BGE here would
         // let hash vectors be treated as interchangeable with real BGE vectors.
         assert_eq!(backend.model_id(), "deterministic-hash");
-        assert_eq!(backend.model_revision(), "deterministic-v1");
+        assert_eq!(backend.model_revision(), "deterministic-v2");
         assert_eq!(backend.dimensions(), 384);
         assert!(backend.normalized());
     }

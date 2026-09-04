@@ -929,6 +929,8 @@ impl Tool for JsTool {
         .map_err(|_| ToolError::Msg("JS invocation authority unavailable".into()))?;
         #[cfg(feature = "skills")]
         let broker = broker.with_skill_call_authority(skill_call_authority);
+        #[cfg(feature = "skills")]
+        let capability_denials = broker.capability_denial_tracker();
         let run_step = RunStep::new(args.code).with_model_grant(model_grant_id);
         #[cfg(feature = "skills")]
         let run_step = if let Some(grant_id) = proposal_grant_id {
@@ -984,6 +986,7 @@ impl Tool for JsTool {
             &response.outcome,
             &response.skill_events,
             response.evidence_complete,
+            capability_denials.snapshot(),
         );
 
         Ok(render_step_result(&response))
@@ -1084,11 +1087,16 @@ fn dispatch_skill_telemetry(
     step_outcome: &StepOutcome,
     worker_events: &[crate::extras::js::skills::telemetry::SkillEvent],
     _worker_claimed_evidence_complete: bool,
+    capability_denials: Option<std::collections::BTreeSet<String>>,
 ) -> bool {
     use crate::extras::js::skills::telemetry::{
         ParentSkillBinding, ParentTelemetryContext, bind_worker_events, observability_lost_batch,
     };
 
+    let Some(capability_denials) = capability_denials else {
+        record_observability_lost(dispatcher, "capability_denial_binding_unavailable");
+        return false;
+    };
     let mut skills = Vec::with_capacity(bundle.skills.len());
     for skill in &bundle.skills {
         let Ok(retrieval_rank) = u32::try_from(skill.rank) else {
@@ -1115,6 +1123,7 @@ fn dispatch_skill_telemetry(
         production: true,
         step_outcome: step_outcome.clone(),
         skills,
+        capability_denials,
     };
 
     let batch = match bind_worker_events(&context, worker_events) {
@@ -1651,6 +1660,7 @@ mod js_permission_bridge {
             &StepOutcome::Value("ok".into()),
             &[forged],
             true,
+            Some(Default::default()),
         ));
         let batch = rx.try_recv().expect("parent loss event should be queued");
         assert!(
@@ -1680,6 +1690,7 @@ mod js_permission_bridge {
             &StepOutcome::Value("ok".into()),
             std::slice::from_ref(&injected),
             true,
+            Some(Default::default()),
         ));
         assert_eq!(saturated.observability_lost_for_test(), 1);
         drop(saturated_rx);
@@ -1694,6 +1705,7 @@ mod js_permission_bridge {
             &StepOutcome::Value("ok".into()),
             &[injected],
             true,
+            Some(Default::default()),
         ));
         assert_eq!(disconnected.observability_lost_for_test(), 1);
     }

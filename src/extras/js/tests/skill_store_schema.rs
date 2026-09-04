@@ -879,7 +879,7 @@ fn test_purge_deletes_invalid_legacy_id_without_raw_tombstone()
     }
 
     let mut store = SkillStore::open_at(&paths)?;
-    store.purge(invalid_id)?;
+    store.purge_malformed_legacy_row_for_test(invalid_id)?;
     assert_eq!(
         store.conn().query_row(
             "SELECT COUNT(*) FROM skill_revisions WHERE id = ?",

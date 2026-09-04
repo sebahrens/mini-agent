@@ -51,6 +51,69 @@ pub struct Cli {
     )]
     pub js_runtime_check: bool,
 
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "purge-learned-skill",
+        value_name = "SHA256",
+        conflicts_with = "compact_learned_skill_events",
+        help = "Permanently purge one learned-skill revision and its dependent records"
+    )]
+    pub purge_learned_skill: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "compact-learned-skill-events",
+        help = "Compact learned-skill telemetry older than the retention window"
+    )]
+    pub compact_learned_skill_events: bool,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "learned-skill-feedback",
+        value_name = "SHA256",
+        requires_all = [
+            "learned_skill_feedback_kind",
+            "learned_skill_feedback_reason",
+            "learned_skill_feedback_key"
+        ],
+        conflicts_with_all = ["purge_learned_skill", "compact_learned_skill_events"],
+        help = "Submit authenticated local-owner feedback for one learned skill"
+    )]
+    pub learned_skill_feedback: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "learned-skill-feedback-kind",
+        value_name = "KIND",
+        value_parser = ["positive", "negative", "severe"],
+        requires = "learned_skill_feedback"
+    )]
+    pub learned_skill_feedback_kind: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "learned-skill-feedback-reason",
+        value_name = "CODE",
+        requires = "learned_skill_feedback"
+    )]
+    pub learned_skill_feedback_reason: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "learned-skill-feedback-key",
+        value_name = "KEY",
+        requires = "learned_skill_feedback"
+    )]
+    pub learned_skill_feedback_key: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "learned-skill-feedback-invocation",
+        value_name = "SHA256",
+        requires = "learned_skill_feedback"
+    )]
+    pub learned_skill_feedback_invocation: Option<String>,
+
     #[arg(
         long = "import-agent-skill",
         value_name = "PATH",
@@ -669,6 +732,8 @@ fn canonical_tool_name(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    #[cfg(feature = "skills")]
+    use clap::Parser;
 
     use super::{Cli, default_sandbox_backend};
     use crate::config;
@@ -822,5 +887,37 @@ mod tests {
             ..Cli::default()
         };
         assert!(!refused.sandbox_explicitly_requested(&cfg));
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn learned_skill_operator_flags_require_complete_non_conflicting_inputs() {
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--learned-skill-feedback",
+                &"a".repeat(64),
+                "--learned-skill-feedback-kind",
+                "severe",
+                "--learned-skill-feedback-reason",
+                "integrity",
+                "--learned-skill-feedback-key",
+                "feedback-1",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--learned-skill-feedback", &"a".repeat(64),])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--purge-learned-skill",
+                &"a".repeat(64),
+                "--compact-learned-skill-events",
+            ])
+            .is_err()
+        );
     }
 }

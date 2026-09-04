@@ -290,22 +290,7 @@ impl AdmissionEvaluator {
     }
 
     fn is_policy_duplicate(&self, artifact: &SkillArtifact) -> Result<bool, StoreError> {
-        let normalized_description = artifact.description.trim().to_lowercase();
-        let contract = artifact
-            .exports
-            .iter()
-            .map(|export| (&export.name, &export.signature))
-            .collect::<Vec<_>>();
-        Ok(self.store.list_retrievable()?.iter().any(|existing| {
-            existing.id != artifact.id
-                && existing.description.trim().to_lowercase() == normalized_description
-                && existing
-                    .exports
-                    .iter()
-                    .map(|export| (&export.name, &export.signature))
-                    .collect::<Vec<_>>()
-                    == contract
-        }))
+        self.store.has_policy_duplicate(artifact)
     }
 
     pub(crate) fn review_and_admit<R: HumanReviewer>(
@@ -416,12 +401,7 @@ impl AdmissionEvaluator {
                     &authorization,
                     now,
                 )?;
-                if self
-                    .store
-                    .list_retrievable()?
-                    .iter()
-                    .any(|skill| skill.id == artifact.id)
-                {
+                if self.store.is_retrievable(&artifact.id)? {
                     return Err(AdmissionError::CanaryBecameRetrievable);
                 }
                 Ok(ReviewOutcome::Canary(result))

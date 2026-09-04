@@ -89,7 +89,7 @@ pub enum EmbeddingError {
 /// without external dependencies. Suitable for all tests and default usage.
 ///
 /// Implementation:
-/// - Uses SHA-256 hash of (model_revision || document_index || normalized_text)
+/// - Uses SHA-256 hash of (model_revision || normalized_text)
 /// - Projects hash bytes into R^384 via modular arithmetic
 /// - Normalizes to unit norm
 pub struct DeterministicBackend {
@@ -107,18 +107,16 @@ impl DeterministicBackend {
             // key, so claiming to be BGE here would let hash vectors be compared
             // against real BGE vectors as if they were interchangeable.
             model_id: "deterministic-hash".to_string(),
-            model_revision: "deterministic-v1".to_string(),
+            model_revision: "deterministic-v2".to_string(),
             dimensions: 384,
         }
     }
 
     /// Hash a string deterministically to a vector of f32.
-    fn hash_to_vector(text: &str, model_revision: &str, doc_index: usize, dims: usize) -> Vec<f32> {
+    fn hash_to_vector(text: &str, model_revision: &str, dims: usize) -> Vec<f32> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(model_revision.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(doc_index.to_le_bytes());
         hasher.update(b"\0");
         hasher.update(text.as_bytes());
         let hash = hasher.finalize();
@@ -162,14 +160,13 @@ impl Default for DeterministicBackend {
 impl EmbeddingBackend for DeterministicBackend {
     fn embed_documents(&self, documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let mut embeddings = Vec::with_capacity(documents.len());
-        for (i, doc) in documents.iter().enumerate() {
+        for doc in documents {
             if doc.trim().is_empty() {
                 return Err(EmbeddingError::EmptyDocument);
             }
             embeddings.push(Self::hash_to_vector(
                 doc,
                 &self.model_revision,
-                i,
                 self.dimensions,
             ));
         }
@@ -183,7 +180,6 @@ impl EmbeddingBackend for DeterministicBackend {
         Ok(Self::hash_to_vector(
             query,
             &self.model_revision,
-            0,
             self.dimensions,
         ))
     }

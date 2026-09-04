@@ -5,9 +5,9 @@
 //! identity. Persistence lives in [`store`], embedding in [`embed`], and no-effect
 //! verification in [`verify`].
 //!
-//! Proposal, admission, repair, retention, and purge APIs are currently library/test
-//! infrastructure. The shipped agent does not expose proposal authority until an authenticated
-//! operator approval adapter is available.
+//! Proposal, admission, feedback, and repair APIs remain library/test infrastructure. The shipped
+//! agent does not expose proposal authority until an authenticated operator approval adapter is
+//! available. Retention and privacy purge have explicit local-operator command surfaces.
 //!
 //! Identity rules (see `docs/specs/phase-3-skill-library.md`):
 //!
@@ -37,10 +37,12 @@ pub mod feedback;
 pub mod held_out;
 pub mod index;
 pub mod lifecycle;
+pub mod operations;
 pub mod policy;
 pub mod privacy;
 pub mod proposal;
 pub mod quarantine;
+#[cfg(test)]
 pub mod repair;
 pub mod retention;
 pub mod router;

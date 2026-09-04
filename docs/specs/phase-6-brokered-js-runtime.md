@@ -243,8 +243,10 @@ execution claim. The parent requires an exact match to the selected artifact/exp
 parent-derived turn, tool-call, deterministic invocation, and step outcome before rebuilding a
 canonical event with its own retrieval metadata, index generation, production flag, timestamp,
 and evidence status. Worker feedback, selection, observability, and capability-policy kinds are
-rejected. Positive evidence exists only after a complete canonical batch is accepted by the
-bounded dispatcher. Invalid, incomplete, saturated, disconnected, or failed dispatch records a
+rejected. The parent broker separately records capability-policy denials against its authoritative
+learned-skill grant principal and promotes the matching worker-observed terminal call to a
+canonical `CapabilityDenied` event. Positive evidence exists only after a complete canonical batch
+is accepted by the bounded dispatcher. Invalid, incomplete, saturated, disconnected, or failed dispatch records a
 parent-owned `ObservabilityLost` signal and cannot trigger feedback or quarantine. Stored
 learned-skill realms receive no effect or writer
 globals. Learned-skill ABI v2 instead passes one hidden, immutable invocation capability object as

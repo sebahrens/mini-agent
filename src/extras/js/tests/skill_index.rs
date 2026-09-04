@@ -237,8 +237,14 @@ fn skill_index_generations_publish_complete_snapshots_and_recover() {
     assert_eq!(hidden.generation(), hidden_generation);
     assert!(hidden.is_empty());
     assert_eq!(new.len(), 1, "older leases can finish after removal");
-    let purged_generation = coordinator.purge_and_publish(&skill.id).unwrap();
-    assert_eq!(coordinator.lease().unwrap().generation(), purged_generation);
+    let (purged_generation, _) =
+        crate::extras::js::skills::retention::CoordinatedRetention::new(&coordinator)
+            .privacy_purge(&skill.id, "test_request", 10)
+            .unwrap();
+    assert_eq!(
+        coordinator.lease().unwrap().generation(),
+        purged_generation as u64
+    );
 
     drop(coordinator);
     let reopened = IndexCoordinator::open(&temp.paths, Arc::new(Embedder::new().unwrap())).unwrap();
