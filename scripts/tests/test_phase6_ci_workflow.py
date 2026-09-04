@@ -368,6 +368,9 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "user-temp",
         ):
             self.assertIn(path, standard_user_step)
+        self.assertIn("S-1-15-2-2", standard_user_step)
+        self.assertIn("$restrictedPackagesSid", standard_user_step)
+        self.assertIn("FileSystemRights]::ReadAndExecute", standard_user_step)
         self.assertNotIn("phase6 standard user λ", standard_user_step)
 
     def test_windows_hosted_administrator_status_is_fail_closed(self) -> None:

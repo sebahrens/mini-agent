@@ -989,6 +989,7 @@ jobs:
           New-Item -ItemType Directory -Path $protectedRoot -Force | Out-Null
           $protected = Join-Path $protectedRoot 'mini-agent.exe'
           Copy-Item -LiteralPath $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE -Destination $protected -Force
+          $restrictedPackagesSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-15-2-2')
           $deny = [System.Security.AccessControl.AccessControlType]::Deny
           function Protect-StandardUserControl([string] $Path, [bool] $Directory) {
             if ($Directory) {
@@ -1007,6 +1008,13 @@ jobs:
             ))
             [void] $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
               $user.SID,
+              [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+              $none,
+              $propagation,
+              $allow
+            ))
+            [void] $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+              $restrictedPackagesSid,
               [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
               $none,
               $propagation,
