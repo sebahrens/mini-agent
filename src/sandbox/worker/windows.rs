@@ -1725,9 +1725,11 @@ mod feasibility {
                     "Cargo build path has no target ancestor".to_string(),
                 ))
             }
-            InstallLocation::UserArchive => std::env::var_os("LOCALAPPDATA")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(PathBuf::from)
+            InstallLocation::UserArchive => ["LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"]
+                .iter()
+                .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+                .filter(|root| starts_with_case_insensitive(path, root))
+                .max_by_key(|root| normalized_windows_path(root).len())
                 .ok_or_else(|| GateError("user archive root is unavailable".to_string())),
             InstallLocation::ProtectedMachineWide => [
                 "SystemRoot",
@@ -1745,6 +1747,14 @@ mod feasibility {
                 "unsupported location has no trusted root".to_string(),
             )),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn select_supported_root_for_test(
+        path: &Path,
+        location: InstallLocation,
+    ) -> Result<PathBuf, GateError> {
+        supported_root(path, location)
     }
 
     fn validate_path_ancestors(
@@ -5475,6 +5485,16 @@ mod tests {
                 && contract.source_location == InstallLocation::CargoInstall
                 && contract.probe == ProbeKind::ImageLoadingOnly
         }));
+    }
+
+    #[test]
+    fn windows_user_archive_root_tracks_the_environment_root_that_matched() {
+        use super::feasibility::{InstallLocation, select_supported_root_for_test};
+
+        let candidate = std::env::temp_dir().join("mini-agent-release-smoke/mini-agent.exe");
+        let root = select_supported_root_for_test(&candidate, InstallLocation::UserArchive)
+            .expect("the Windows temporary directory is a supported user archive root");
+        assert!(candidate.starts_with(root));
     }
 
     #[test]
