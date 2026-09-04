@@ -1,5 +1,5 @@
 use crate::config::types::ChainConfig;
-use crate::extras::chain::{ChainDecision, ChainPhase, parse_chain_decision};
+use crate::extras::chain::ChainPhase;
 
 #[test]
 fn test_phase_from_prompt_name() {
@@ -26,62 +26,6 @@ fn test_transition_messages_are_not_empty() {
     assert!(!ChainPhase::Brainstorm.transition_message().is_empty());
     assert!(!ChainPhase::Plan.transition_message().is_empty());
     assert!(!ChainPhase::Code.transition_message().is_empty());
-}
-
-#[test]
-fn test_parse_decision_yes() {
-    assert_eq!(parse_chain_decision("y"), ChainDecision::Accept(None));
-    assert_eq!(parse_chain_decision("Y"), ChainDecision::Accept(None));
-    assert_eq!(parse_chain_decision("yes"), ChainDecision::Accept(None));
-    assert_eq!(parse_chain_decision("YES"), ChainDecision::Accept(None));
-}
-
-#[test]
-fn test_parse_decision_no() {
-    assert_eq!(parse_chain_decision("n"), ChainDecision::Decline);
-    assert_eq!(parse_chain_decision("no"), ChainDecision::Decline);
-    assert_eq!(parse_chain_decision("N"), ChainDecision::Decline);
-    assert_eq!(parse_chain_decision("NO"), ChainDecision::Decline);
-}
-
-#[test]
-fn test_parse_decision_but() {
-    assert_eq!(
-        parse_chain_decision("but add tests"),
-        ChainDecision::Accept(Some("add tests".to_string()))
-    );
-    assert_eq!(
-        parse_chain_decision("b add tests"),
-        ChainDecision::Accept(Some("add tests".to_string()))
-    );
-    assert_eq!(
-        parse_chain_decision("yes but add tests"),
-        ChainDecision::Accept(Some("add tests".to_string()))
-    );
-    assert_eq!(
-        parse_chain_decision("y but add tests"),
-        ChainDecision::Accept(Some("add tests".to_string()))
-    );
-    assert_eq!(
-        parse_chain_decision("BUT skip step 3"),
-        ChainDecision::Accept(Some("skip step 3".to_string()))
-    );
-}
-
-#[test]
-fn test_parse_decision_not_chain() {
-    assert_eq!(
-        parse_chain_decision("what about testing?"),
-        ChainDecision::NotChain
-    );
-    assert_eq!(parse_chain_decision("maybe"), ChainDecision::NotChain);
-    assert_eq!(parse_chain_decision(""), ChainDecision::NotChain);
-}
-
-#[test]
-fn test_parse_decision_but_empty_is_not_chain() {
-    // "but " with only trailing whitespace — no actual instruction
-    assert_eq!(parse_chain_decision("but "), ChainDecision::NotChain);
 }
 
 #[test]
@@ -169,13 +113,4 @@ fn test_full_progression_all_enabled() {
         let phase = ChainPhase::from_prompt_name(name).unwrap();
         assert!(phase.is_enabled(&cfg));
     }
-}
-
-#[test]
-fn test_parse_decision_but_variants_empty_is_not_chain() {
-    // All "but" variants without actual instruction should be NotChain
-    assert_eq!(parse_chain_decision("b "), ChainDecision::NotChain);
-    assert_eq!(parse_chain_decision("yes but "), ChainDecision::NotChain);
-    assert_eq!(parse_chain_decision("y but "), ChainDecision::NotChain);
-    assert_eq!(parse_chain_decision("BUT "), ChainDecision::NotChain);
 }

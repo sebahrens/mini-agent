@@ -9,6 +9,8 @@ pub mod transcript;
 pub(crate) mod validation;
 
 pub const DEFAULT_PLAN_FILENAME: &str = "LOOP_PLAN.md";
+/// Interactive loops must terminate even when the user does not specify a bound.
+pub const DEFAULT_TUI_MAX_ITERATIONS: u32 = 100;
 pub const SUMMARY_TRUNCATION_CHARS: usize = 1024;
 
 #[cfg(unix)]

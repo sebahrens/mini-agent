@@ -237,7 +237,7 @@ cannot advance or respawn the replacement loop.
 
 | Command | Description |
 | ------- | ----------- |
-| `/loop [prompt]` | Start the iterative coding loop. |
+| `/loop [prompt]` | Start the iterative coding loop (bounded to 100 iterations). |
 | `/loop stop` | Stop the active loop. |
 | `/loop status` | Show current loop status. |
 

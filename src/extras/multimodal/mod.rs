@@ -63,6 +63,40 @@ pub fn detect_media(path: &Path) -> Option<&'static str> {
     }
 }
 
+fn sniff_media(data: &[u8]) -> Option<&'static str> {
+    let pdf_offset = data
+        .iter()
+        .take(1024)
+        .position(|byte| !byte.is_ascii_whitespace());
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if data.starts_with(b"ID3")
+        || (data.len() >= 2 && data[0] == 0xff && data[1] & 0xe0 == 0xe0 && data[1] & 0x06 != 0)
+    {
+        Some("audio/mpeg")
+    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if data.starts_with(b"OggS") {
+        Some("audio/ogg")
+    } else if data.starts_with(b"fLaC") {
+        Some("audio/flac")
+    } else if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        Some("audio/mp4")
+    } else if data.len() >= 2 && data[0] == 0xff && data[1] & 0xf6 == 0xf0 {
+        Some("audio/aac")
+    } else if pdf_offset.is_some_and(|offset| data[offset..].starts_with(b"%PDF-")) {
+        Some("application/pdf")
+    } else {
+        None
+    }
+}
+
 /// Load a media file from disk. The caller must have already verified the
 /// path exists and is a file. Returns an error if the file is too large.
 pub fn load_attachment(path: &Path) -> std::io::Result<MediaAttachment> {
@@ -79,14 +113,30 @@ pub fn load_attachment(path: &Path) -> std::io::Result<MediaAttachment> {
     }
 
     let data = std::fs::read(path)?;
-    let mime = detect_media(path)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unknown media type: {}", path.display()),
-            )
-        })?
-        .to_string();
+    let extension_mime = detect_media(path).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown media type: {}", path.display()),
+        )
+    })?;
+    let sniffed_mime = sniff_media(&data).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("media signature is not recognized: {}", path.display()),
+        )
+    })?;
+    if sniffed_mime != extension_mime {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "media signature {} does not match extension type {}: {}",
+                sniffed_mime,
+                extension_mime,
+                path.display()
+            ),
+        ));
+    }
+    let mime = sniffed_mime.to_string();
 
     // We already know the mime from detect_media — dispatch on the prefix.
     let path = path.to_path_buf();

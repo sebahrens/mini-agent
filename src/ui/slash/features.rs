@@ -57,7 +57,12 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             return Ok(());
         }
         let plan_file = std::path::PathBuf::from(crate::extras::r#loop::DEFAULT_PLAN_FILENAME);
-        let ls = crate::extras::r#loop::LoopState::new(prompt, plan_file, None, None);
+        let ls = crate::extras::r#loop::LoopState::new(
+            prompt,
+            plan_file,
+            Some(crate::extras::r#loop::DEFAULT_TUI_MAX_ITERATIONS),
+            None,
+        );
         *ctx.loop_state = Some(ls);
         write_ok(
             ctx.renderer,

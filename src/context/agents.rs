@@ -4,6 +4,63 @@ use std::path::{Path, PathBuf};
 use include_dir::{Dir, include_dir};
 
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/data/agents");
+const MAX_AGENT_PROMPT_BYTES: usize = 256 * 1024;
+
+fn valid_agent_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn normalize_agent_definition(name: String, prompt: String) -> Option<(String, String)> {
+    if !valid_agent_name(&name) || prompt.len() > MAX_AGENT_PROMPT_BYTES {
+        return None;
+    }
+    let prompt = prompt.strip_prefix('\u{feff}').unwrap_or(&prompt);
+    let Some(first_line_end) = prompt.find('\n') else {
+        return (prompt.trim_end_matches('\r') != "---").then(|| (name, prompt.to_string()));
+    };
+    if prompt[..first_line_end].trim_end_matches('\r') != "---" {
+        return Some((name, prompt.to_string()));
+    }
+
+    let yaml_start = first_line_end + 1;
+    let mut offset = yaml_start;
+    let mut yaml_end = None;
+    let mut body_start = None;
+    for line in prompt[yaml_start..].split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            yaml_end = Some(offset);
+            body_start = Some(offset + line.len());
+            break;
+        }
+        offset += line.len();
+    }
+    let (yaml_end, body_start) = (yaml_end?, body_start?);
+    let metadata: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&prompt[yaml_start..yaml_end]).ok()?;
+    let mapping = metadata.as_mapping()?;
+    if let Some(declared_name) = mapping.get(serde_yaml_ng::Value::String("name".into()))
+        && declared_name.as_str() != Some(&name)
+    {
+        return None;
+    }
+    let body = prompt[body_start..].trim_start_matches(['\r', '\n']);
+    (!body.trim().is_empty()).then(|| (name, body.to_string()))
+}
+
+fn normalize_agent_definitions(
+    definitions: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    definitions
+        .into_iter()
+        .filter_map(|(name, prompt)| normalize_agent_definition(name, prompt))
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentDefinitionSource {
@@ -49,12 +106,12 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
     let mut agents = HashMap::new();
     merge_definitions(
         &mut agents,
-        crate::context::load_embedded_files(&EMBEDDED, "md"),
+        normalize_agent_definitions(crate::context::load_embedded_files(&EMBEDDED, "md")),
         AgentDefinitionSource::Embedded,
     );
     merge_definitions(
         &mut agents,
-        crate::context::load_dir_files(&paths.agents_dir(), "md"),
+        normalize_agent_definitions(crate::context::load_dir_files(&paths.agents_dir(), "md")),
         AgentDefinitionSource::UserGlobal,
     );
     agents
@@ -70,7 +127,7 @@ pub fn load() -> HashMap<String, AgentDefinition> {
     if let Some(project_dir) = paths.project_agents_dir() {
         merge_definitions(
             &mut agents,
-            crate::context::load_dir_files(&project_dir, "md"),
+            normalize_agent_definitions(crate::context::load_dir_files(&project_dir, "md")),
             AgentDefinitionSource::ProjectOverride {
                 directory: project_dir,
             },
@@ -93,7 +150,7 @@ pub(crate) fn load_for_workspace_binding(
     {
         merge_definitions(
             &mut agents,
-            definitions,
+            normalize_agent_definitions(definitions),
             AgentDefinitionSource::ProjectOverride {
                 directory: project_dir,
             },
@@ -139,6 +196,35 @@ mod tests {
             .into_iter()
             .find_map(|(candidate, prompt)| (candidate == name).then_some(prompt))
             .unwrap_or_else(|| panic!("missing embedded specialist {name}"))
+    }
+
+    #[test]
+    fn custom_agent_frontmatter_is_validated_and_not_injected() {
+        let normalized = normalize_agent_definition(
+            "review".into(),
+            "---\nname: review\ndescription: metadata only\n---\n\nTrusted body\n".into(),
+        )
+        .unwrap();
+        assert_eq!(normalized, ("review".into(), "Trusted body\n".into()));
+        assert!(normalize_agent_definition("README".into(), "body".into()).is_none());
+        assert!(
+            normalize_agent_definition("review".into(), "---\nname: different\n---\nbody".into())
+                .is_none()
+        );
+        assert!(
+            normalize_agent_definition("review".into(), "---\ninvalid: [\n---\nbody".into())
+                .is_none()
+        );
+        assert!(normalize_agent_definition("review".into(), "---".into()).is_none());
+        assert_eq!(
+            normalize_agent_definition(
+                "review".into(),
+                "\u{feff}---\nname: review\n---\nbody".into()
+            )
+            .unwrap()
+            .1,
+            "body"
+        );
     }
 
     #[test]

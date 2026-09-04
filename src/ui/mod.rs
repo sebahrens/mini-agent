@@ -902,23 +902,6 @@ pub async fn run_interactive(
     Ok(())
 }
 
-#[cfg(test)]
-mod paste_followup_tests {
-    use super::*;
-
-    #[test]
-    fn only_key_presses_extend_an_unbracketed_paste_burst() {
-        assert!(!event_counts_as_paste_followup(&event::Event::Resize(
-            80, 24
-        )));
-        assert!(!event_counts_as_paste_followup(&event::Event::Paste(
-            "payload".into()
-        )));
-        assert!(event_counts_as_paste_followup(&event::Event::Key(
-            crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
-        )));
-    }
-}
 #[cfg(feature = "advisor")]
 pub(crate) async fn handle_human_handoff(
     req: crate::extras::advisor::HandoffRequest,
@@ -974,4 +957,22 @@ pub(crate) async fn handle_human_handoff(
 
     let _ = req.reply.send(response);
     Ok(())
+}
+
+#[cfg(test)]
+mod paste_followup_tests {
+    use super::*;
+
+    #[test]
+    fn only_key_presses_extend_an_unbracketed_paste_burst() {
+        assert!(!event_counts_as_paste_followup(&event::Event::Resize(
+            80, 24
+        )));
+        assert!(!event_counts_as_paste_followup(&event::Event::Paste(
+            "payload".into()
+        )));
+        assert!(event_counts_as_paste_followup(&event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+        )));
+    }
 }

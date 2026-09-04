@@ -90,8 +90,8 @@ caveats, and required human confirmation before large payloads such as SQL or
 architecture detail. New specialist definitions must preserve this
 caveats-first ordering.
 
-Definitions are plain markdown resolved by `src/context/agents.rs`, highest
-priority first:
+Definitions are markdown resolved by `src/context/agents.rs`, highest priority
+first:
 
 ```
 .zerostack/agents/<name>.md      # project override
@@ -104,9 +104,13 @@ When a project definition wins, the host prefixes the task result with its
 replacement visible to the calling agent instead of silently presenting it as
 the compiled-in specialist.
 
-Adding a file to `data/agents/` is enough to register a new type; the filename
-stem is the `agent_type` value. Update the `agent_type` description in
-`src/extras/subagents/task_tool.rs` so the main agent knows the type exists.
+The filename stem is the `agent_type` value and must be 1–64 lowercase ASCII
+letters, digits, or hyphens, without leading, trailing, or repeated hyphens.
+An optional YAML frontmatter block may declare a matching `name`; the block is
+validated and removed before the prompt is installed. Malformed metadata,
+mismatched names, and empty prompt bodies are ignored. The tool schema resolves
+the installed definitions dynamically, so adding a valid file does not require
+a hard-coded roster update.
 
 ## What the Subagent Can Do
 
@@ -281,6 +285,8 @@ original prompt order:
 - queued prompts contain `[not started: ...]`.
 
 Partial returns begin with a summary containing the stop reason and aggregate
-started/completed/cost accounting. A 128 KiB per-child response cap remains as
+started/completed/cost accounting. Cost includes usage already observed from
+started siblings before they were cancelled, so partial work cannot bypass the
+aggregate budget. A 128 KiB per-child response cap remains as
 defense in depth, while `task_max_output_bytes` is a final hard cap over the
 entire rendered tool result, including headings and status markers.

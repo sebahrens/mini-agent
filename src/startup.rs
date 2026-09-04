@@ -49,6 +49,15 @@ fn validate_startup_permission_policy(cli: &Cli, cfg: &Config) -> anyhow::Result
     crate::permission::build_noninteractive_permission(cfg, authority)?;
     Ok(())
 }
+
+fn require_recent_session(result: anyhow::Result<Vec<Session>>) -> anyhow::Result<Session> {
+    let sessions =
+        result.map_err(|error| anyhow::anyhow!("failed to continue session: {error}"))?;
+    sessions
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cannot continue: no saved sessions found"))
+}
 fn unavailable_sandbox_must_fail(cli: &Cli, cfg: &Config, is_windows: bool) -> bool {
     cli.resolve_sandbox(cfg) && (is_windows || cli.sandbox_explicitly_requested(cfg))
 }
@@ -623,12 +632,8 @@ impl Startup {
 
         let mut session_resumed = false;
 
-        if cli.continue_session
-            && cli.session.is_none()
-            && let Ok(sessions) = session::storage::find_recent_sessions(1)
-            && let Some(s) = sessions.into_iter().next()
-        {
-            session = s;
+        if cli.continue_session && cli.session.is_none() {
+            session = require_recent_session(session::storage::find_recent_sessions(1))?;
             session_resumed = true;
         }
 
@@ -1501,6 +1506,7 @@ impl Startup {
             &self.cli,
             &self.cfg,
             &self.context,
+            &self.session,
             self.status_signals,
             &self.sandbox,
         )
@@ -1578,12 +1584,26 @@ mod tests {
     use super::{
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
         apply_resume_provider_decision, compact_headless_session_with, headless_compaction_plan,
-        interactive_initial_message, needs_openrouter_context_refresh,
+        interactive_initial_message, needs_openrouter_context_refresh, require_recent_session,
         resolve_resume_provider_decision, run_startup_probes_concurrently,
         select_interactive_auto_trigger, unavailable_sandbox_must_fail,
         validate_startup_permission_policy,
     };
     use crate::cli::Cli;
+
+    #[test]
+    fn continue_requires_a_readable_existing_session() {
+        let missing = require_recent_session(Ok(Vec::new())).unwrap_err();
+        assert!(missing.to_string().contains("no saved sessions"));
+
+        let unreadable = require_recent_session(Err(anyhow::anyhow!("corrupt store"))).unwrap_err();
+        assert!(
+            unreadable
+                .to_string()
+                .contains("failed to continue session")
+        );
+        assert!(unreadable.to_string().contains("corrupt store"));
+    }
 
     #[test]
     fn headless_print_plans_compaction_for_an_over_budget_resumed_session() {

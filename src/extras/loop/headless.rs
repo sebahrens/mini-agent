@@ -11,6 +11,7 @@ use crate::extras::r#loop as loop_mod;
 use crate::extras::status_signals::StatusSignals;
 use crate::provider::AnyAgent;
 use crate::sandbox::Sandbox;
+use crate::session::Session;
 
 async fn await_validation_or_interrupt<F>(
     operation: loop_mod::validation::ValidationOperation,
@@ -42,6 +43,7 @@ pub(crate) async fn run_headless_loop(
     cli: &Cli,
     cfg: &Config,
     _context: &ContextFiles,
+    session: &Session,
     status_signals: Option<StatusSignals>,
     sandbox: &Sandbox,
 ) -> anyhow::Result<()> {
@@ -93,11 +95,7 @@ pub(crate) async fn run_headless_loop(
                 &iteration_prompt,
                 cli.pure_stdout,
                 &cfg.retry,
-                // The loop threads context through the plan/summary state
-                // folded into `iteration_prompt`; every iteration sends empty
-                // history. Making `--loop --continue` meaningful requires the
-                // loop to carry a real `Session` — tracked separately.
-                Vec::new(),
+                iteration_history(session),
                 #[cfg(feature = "hooks")]
                 Some(crate::extras::hooks::LoopInfo {
                     iteration: state.iteration,
@@ -164,12 +162,23 @@ pub(crate) async fn run_headless_loop(
     Ok(())
 }
 
+fn iteration_history(session: &Session) -> Vec<rig::completion::Message> {
+    crate::agent::runner::convert_history(session)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
     use crate::extras::r#loop::validation::ValidationStatus;
+
+    #[test]
+    fn resumed_session_history_is_forwarded_to_each_loop_iteration() {
+        let mut session = Session::new("provider", "model", 128_000, "");
+        session.add_message(crate::session::MessageRole::User, "prior turn");
+        assert_eq!(iteration_history(&session).len(), 1);
+    }
 
     #[tokio::test]
     async fn headless_sigint_path_cancels_and_awaits_scoped_validation() {

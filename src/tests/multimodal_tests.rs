@@ -64,14 +64,27 @@ fn load_attachment_success_for_small_media() {
     let dir = std::env::temp_dir();
     let path = dir.join("zerostack_test_media.png");
     let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(b"fake png data").unwrap();
+    f.write_all(b"\x89PNG\r\n\x1a\npayload").unwrap();
     drop(f);
     let result = load_attachment(&path);
     let _ = std::fs::remove_file(&path);
     assert!(result.is_ok(), "expected Ok, got {result:?}");
     let att = result.unwrap();
-    assert_eq!(att.size(), 13);
+    assert_eq!(att.size(), 15);
     assert_eq!(att.path().to_string_lossy(), path.to_string_lossy());
+}
+
+#[test]
+fn load_attachment_rejects_extension_signature_mismatch() {
+    let path = std::env::temp_dir().join(format!(
+        "mini-agent-media-mismatch-{}.png",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, b"%PDF-1.7\n").unwrap();
+    let error = load_attachment(&path).unwrap_err();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("does not match"));
 }
 
 // --- MediaAttachment size and path ---

@@ -53,38 +53,3 @@ impl ChainPhase {
         }
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum ChainDecision {
-    Decline,
-    Accept(Option<String>),
-    NotChain,
-}
-
-#[allow(dead_code)]
-pub fn parse_chain_decision(input: &str) -> ChainDecision {
-    let trimmed = input.trim();
-    let lower = trimmed.to_lowercase();
-
-    if lower == "n" || lower == "no" {
-        return ChainDecision::Decline;
-    }
-
-    if lower == "y" || lower == "yes" {
-        return ChainDecision::Accept(None);
-    }
-
-    // Match "but <msg>", "b <msg>", "yes but <msg>", etc.
-    for prefix in &["but ", "b ", "yes but ", "yes b ", "y but ", "y b "] {
-        if lower.starts_with(prefix) {
-            let extra = trimmed[prefix.len()..].trim().to_string();
-            if extra.is_empty() {
-                return ChainDecision::NotChain;
-            }
-            return ChainDecision::Accept(Some(extra));
-        }
-    }
-
-    ChainDecision::NotChain
-}

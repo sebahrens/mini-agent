@@ -5865,7 +5865,10 @@ mod tests {
             executable.path.clone(),
         ))
         .expect_err("process warmup must stop at the injected checkpoint");
-        assert!(process_warmup.to_string().contains("OwnProcessHandle"));
+        assert!(
+            process_warmup.to_string().contains("OwnProcessHandle"),
+            "failure-injection warmup stopped before OwnProcessHandle: {process_warmup:#}"
+        );
         let warmup_pid = LAST_PRODUCTION_TEST_PID.load(Ordering::Acquire);
         assert_ne!(warmup_pid, 0, "process warmup did not create a child");
         assert_process_exits_after_job_cleanup(warmup_pid);

@@ -272,6 +272,14 @@ fn test_build_loop_refreshes_generated_bytecode_policy_before_verification() {
     );
 }
 
+#[test]
+fn loop_script_invokes_configured_agent_as_a_quoted_array() {
+    let loop_script = include_str!("../../scripts/loop.sh");
+    assert!(loop_script.contains("read -r -a AGENT_CMD_ARGS"));
+    assert!(loop_script.matches("\"${AGENT_CMD_ARGS[@]}\"").count() >= 3);
+    assert!(!loop_script.contains("| $AGENT_CMD"));
+}
+
 #[cfg(unix)]
 #[test]
 fn test_workflow_only_headless_relevance_check_executes_embedded_policy() {

@@ -129,6 +129,11 @@ DEFAULT_DECOMPOSE_ROUNDS=10
 # (when accumulated for two rounds in a row) exits the decompose loop.
 DECOMPOSE_LOW_GROWTH_PCT=5
 AGENT_CMD="${AGENT_CMD:-claude}"
+read -r -a AGENT_CMD_ARGS <<< "$AGENT_CMD"
+if [ "${#AGENT_CMD_ARGS[@]}" -eq 0 ]; then
+    echo "AGENT_CMD must name an executable" >&2
+    exit 2
+fi
 # Array form so paths with spaces survive word-splitting. Override via env:
 #   CODEX_COMPANION_CMD=(node /path/with\ space/companion.mjs)
 if [ -z "${CODEX_COMPANION_CMD+x}" ]; then
@@ -1246,7 +1251,7 @@ run_with_claude_agent() {
     local -a agent_prefix=("$@") pipeline_status
 
     printf '%s\n' "$prompt_content" \
-        | env -u ANTHROPIC_API_KEY "${agent_prefix[@]}" $AGENT_CMD \
+        | env -u ANTHROPIC_API_KEY "${agent_prefix[@]}" "${AGENT_CMD_ARGS[@]}" \
             --dangerously-skip-permissions --verbose --output-format stream-json \
             "${AGENT_MODEL_ARGS[@]}" -p - \
         | show_agent_progress
@@ -2362,7 +2367,7 @@ If the scenario fails, cannot run, has no production path, or lacks credentials/
             agent_ok=false
         fi
     else
-        echo "$prompt_content" | $AGENT_CMD || agent_ok=false
+        echo "$prompt_content" | "${AGENT_CMD_ARGS[@]}" || agent_ok=false
     fi
 
     if [ "$agent_ok" = false ]; then
@@ -2723,7 +2728,7 @@ race to deeper layers; the next round's fresh context will pick that up.
                 agent_ok=false
             fi
         else
-            echo "$prompt_content" | $AGENT_CMD || agent_ok=false
+            echo "$prompt_content" | "${AGENT_CMD_ARGS[@]}" || agent_ok=false
         fi
 
         if [ "$agent_ok" = false ]; then

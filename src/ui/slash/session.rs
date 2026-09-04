@@ -57,12 +57,16 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
 #[cfg(feature = "export")]
 async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let default_name = format!("zerostack-session-{}.html", short_id(&ctx.session.id));
-    let path = parts
+    let requested = parts
         .get(1)
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .unwrap_or(&default_name);
-    let (content, kind) = if path.ends_with(".jsonl") {
+    let path = resolve_export_path(ctx.workspace.root(), requested);
+    let (content, kind) = if path
+        .extension()
+        .is_some_and(|extension| extension == "jsonl")
+    {
         let content = match crate::extras::export::session_to_jsonl(ctx.session) {
             Ok(content) => content,
             Err(error) => {
@@ -74,11 +78,31 @@ async fn handle_export(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     } else {
         (crate::extras::export::session_to_html(ctx.session), "HTML")
     };
-    match std::fs::write(path, content) {
-        Ok(()) => write_ok(ctx.renderer, format!("exported {} to {}", kind, path)),
+    match crate::fs::atomic_create_sync(&path, content.as_bytes()) {
+        Ok(()) => write_ok(
+            ctx.renderer,
+            format!("exported {} to {}", kind, path.display()),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => write_error(
+            ctx.renderer,
+            format!(
+                "export refused to overwrite existing file: {}",
+                path.display()
+            ),
+        ),
         Err(e) => write_error(ctx.renderer, format!("export failed: {}", e)),
     }
     Ok(())
+}
+
+#[cfg(feature = "export")]
+fn resolve_export_path(workspace_root: &std::path::Path, requested: &str) -> std::path::PathBuf {
+    let requested = std::path::Path::new(requested);
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace_root.join(requested)
+    }
 }
 
 #[cfg(feature = "export")]
@@ -699,12 +723,40 @@ async fn handle_history(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 
 #[cfg(all(test, feature = "export"))]
 mod import_tests {
-    use super::{commit_staged_import, parse_imported_session};
+    use super::{commit_staged_import, parse_imported_session, resolve_export_path};
     use crate::config::Config;
     use crate::extras::export::session_to_jsonl;
     use crate::session::{MessageRole, Session};
     use std::cell::RefCell;
     use std::path::Path;
+
+    #[test]
+    fn relative_exports_resolve_against_the_active_workspace() {
+        assert_eq!(
+            resolve_export_path(Path::new("/active-worktree"), "session.html"),
+            Path::new("/active-worktree/session.html")
+        );
+        assert_eq!(
+            resolve_export_path(Path::new("/active-worktree"), "/tmp/session.html"),
+            Path::new("/tmp/session.html")
+        );
+    }
+
+    #[test]
+    fn export_publication_is_create_only() {
+        let directory = std::env::temp_dir().join(format!(
+            "mini-agent-export-create-only-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("session.html");
+        crate::fs::atomic_create_sync(&path, b"first").unwrap();
+        let error = crate::fs::atomic_create_sync(&path, b"second").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn session_jsonl_slash_import_round_trip() {

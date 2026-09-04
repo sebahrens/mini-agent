@@ -957,6 +957,30 @@ fn subagent_memory_tool_set_excludes_memory_edit() {
     assert_eq!(MemoryEdit::NAME, "memory_edit");
 }
 
+#[test]
+fn memory_edit_permission_distinguishes_edits_from_whole_note_deletes() {
+    use crate::extras::memory::{MemoryEditArgs, memory_edit_permission_key};
+
+    let edit = MemoryEditArgs {
+        target: "note".into(),
+        name: Some("release".into()),
+        old_str: Some("old".into()),
+        new_str: "new".into(),
+    };
+    let delete = MemoryEditArgs {
+        target: "note".into(),
+        name: Some("release".into()),
+        old_str: None,
+        new_str: String::new(),
+    };
+    assert_ne!(
+        memory_edit_permission_key(&edit),
+        memory_edit_permission_key(&delete)
+    );
+    assert!(memory_edit_permission_key(&edit).contains("\"action\":\"edit\""));
+    assert!(memory_edit_permission_key(&delete).contains("\"action\":\"delete\""));
+}
+
 #[cfg(feature = "subagents")]
 #[tokio::test]
 async fn subagent_filesystem_permissions_memory_tools_inherit_parent_denial() {

@@ -11,9 +11,9 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use tokio::time::Instant;
 
-use crate::agent::runner::SharedUsageLedger;
 #[cfg(feature = "hooks")]
-use crate::agent::runner::{SubagentRunOutput, usage_saturating_add};
+use crate::agent::runner::SubagentRunOutput;
+use crate::agent::runner::{SharedUsageLedger, usage_saturating_add};
 use crate::agent::tools::{ToolError, check_perm};
 use crate::extras::subagents::builder::{self, SubagentAuthorization};
 use crate::extras::subagents::{clone_subagent_event_tx, with_config};
@@ -242,7 +242,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 },
                 "agent_type": {
                     "type": "string",
-                    "description": "Optional specialist agent type. Sets a specialization system prompt prepended before the base explore prompt. Known types: 'rust-maintainer' (broad Rust SDLC: toolchain, API/semver, ownership, tests, deps, CI, packaging — delegates to rust-async-concurrency/rust-unsafe-code-audit/rust-security-review for deep dives), 'rust-async-concurrency' (Tokio, Send/Sync, Pin/Unpin, cancel-safety), 'rust-unsafe-code-audit' (UB categories, SAFETY comments, FFI, Phase 6 invariants), 'rust-security-review' (trust boundaries, injection, secrets, supply chain, crypto, resource exhaustion), 'python-maintainer' (broad Python SDLC: interpreter compat, types, async, tests, deps, packaging, CI — framework-agnostic), 'node-typescript-maintainer' (broad Node.js/TS SDLC: module system, types, event loop, tests, deps, CI — hands VS Code work to vscode-extension-developer), 'vscode-extension-developer' (VS Code API, webview CSP, postMessage, vsce packaging), 'informatica-mapplet-to-fabric-sql' (PowerCenter/IDMC mapplet to Microsoft Fabric T-SQL, order-dependence audit, reconciliation), 'azure-cloud-architect' (Azure topology, identity, reliability, cost, IaC). Omit for general codebase exploration."
+                    "description": "Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration; unknown names return the current valid type list."
                 }
             },
             "required": ["prompts"]
@@ -298,7 +298,20 @@ editing in a known location, grepping for a literal you will act on immediately.
             let config = config.clone();
             let authorization = authorization.clone();
             let specialization = specialization.clone();
-            Box::pin(async move {
+            let initial_usage = SharedUsageLedger::default();
+            let retry_usage = SharedUsageLedger::default();
+            let cancellation_prompt = prompt_text.clone();
+            let cancellation_initial_usage = initial_usage.clone();
+            let cancellation_retry_usage = retry_usage.clone();
+            let cancellation_cost = Arc::new(move || {
+                let usage = usage_saturating_add(
+                    cancellation_initial_usage.total(),
+                    cancellation_retry_usage.total(),
+                );
+                let output = Err("subagent cancelled before completion".to_string());
+                usage_cost_units(&usage, &cancellation_prompt, &output)
+            });
+            let future = Box::pin(async move {
                 let display_prompt = prompt_text.clone();
                 #[cfg(feature = "hooks")]
                 let execution_prompt =
@@ -320,7 +333,6 @@ editing in a known location, grepping for a literal you will act on immediately.
                     specialization,
                 )
                 .await;
-                let initial_usage = SharedUsageLedger::default();
                 let result = await_subagent_run(
                     SUBAGENT_TIMEOUT,
                     initial_usage.clone(),
@@ -329,7 +341,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         max_turns,
                         event_tx.as_ref(),
                         &config.retry,
-                        initial_usage,
+                        initial_usage.clone(),
                     ),
                 )
                 .await;
@@ -351,7 +363,6 @@ editing in a known location, grepping for a literal you will act on immediately.
                 {
                     tracing::info!("hooks: SubagentStop forced continuation: {reason}");
                     let continuation = format!("{response}\n\n{reason}");
-                    let retry_usage = SharedUsageLedger::default();
                     match await_subagent_run(
                         SUBAGENT_TIMEOUT,
                         retry_usage.clone(),
@@ -360,7 +371,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                             max_turns,
                             event_tx.as_ref(),
                             &config.retry,
-                            retry_usage,
+                            retry_usage.clone(),
                         ),
                     )
                     .await
@@ -381,7 +392,11 @@ editing in a known location, grepping for a literal you will act on immediately.
                     output: run.response,
                     cost_units,
                 }
-            })
+            });
+            ScheduledChild {
+                future,
+                cancellation_cost,
+            }
         });
 
         let report = execute_tasks(args.prompts, limits, executor).await;
@@ -434,7 +449,14 @@ fn forced_continuation_timeout_child(
 
 type ChildFuture = Pin<Box<dyn Future<Output = ChildExecution> + Send>>;
 type IndexedChildFuture = Pin<Box<dyn Future<Output = (usize, ChildExecution)> + Send>>;
-type TaskExecutor = Arc<dyn Fn(usize, String) -> ChildFuture + Send + Sync>;
+type CancellationCost = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+struct ScheduledChild {
+    future: ChildFuture,
+    cancellation_cost: CancellationCost,
+}
+
+type TaskExecutor = Arc<dyn Fn(usize, String) -> ScheduledChild + Send + Sync>;
 
 struct ChildExecution {
     output: Result<String, String>,
@@ -564,6 +586,8 @@ async fn execute_tasks(
     let mut output_bytes = 0usize;
     let mut cost_units = 0u64;
     let mut stop_reason = None;
+    let mut cancellation_costs: Vec<Option<CancellationCost>> =
+        std::iter::repeat_with(|| None).take(task_count).collect();
     let deadline = Instant::now() + limits.timeout;
     let mut in_flight: FuturesUnordered<IndexedChildFuture> = FuturesUnordered::new();
 
@@ -573,7 +597,8 @@ async fn execute_tasks(
         started[index] = true;
         let prompt = prompts[index].clone();
         let child = executor(index, prompt.clone());
-        in_flight.push(indexed_child_future(index, prompt, child));
+        cancellation_costs[index] = Some(child.cancellation_cost);
+        in_flight.push(indexed_child_future(index, prompt, child.future));
     }
 
     while !in_flight.is_empty() {
@@ -651,13 +676,23 @@ async fn execute_tasks(
             started[index] = true;
             let prompt = prompts[index].clone();
             let child = executor(index, prompt.clone());
-            in_flight.push(indexed_child_future(index, prompt, child));
+            cancellation_costs[index] = Some(child.cancellation_cost);
+            in_flight.push(indexed_child_future(index, prompt, child.future));
         }
     }
 
     // Dropping the futures cancels every in-flight child before we construct
     // the report. Executors must not detach work into untracked tasks.
     drop(in_flight);
+
+    for index in 0..task_count {
+        if started[index]
+            && outcomes[index].is_none()
+            && let Some(observe_cost) = cancellation_costs[index].take()
+        {
+            cost_units = cost_units.saturating_add(observe_cost());
+        }
+    }
 
     if let Some(reason) = &stop_reason {
         let reason = reason.description(limits);
@@ -814,8 +849,9 @@ mod tests {
     fn fake_executor(steps: Vec<FakeStep>, counters: Arc<FakeCounters>) -> TaskExecutor {
         Arc::new(move |index, _prompt| {
             let step = steps[index].clone();
+            let cancellation_cost_units = step.cost_units;
             let counters = Arc::clone(&counters);
-            Box::pin(async move {
+            let future = Box::pin(async move {
                 counters.started.fetch_add(1, Ordering::SeqCst);
                 let live = counters.live.fetch_add(1, Ordering::SeqCst) + 1;
                 counters.peak.fetch_max(live, Ordering::SeqCst);
@@ -825,7 +861,11 @@ mod tests {
                     output: step.output,
                     cost_units: step.cost_units,
                 }
-            })
+            });
+            ScheduledChild {
+                future,
+                cancellation_cost: Arc::new(move || cancellation_cost_units),
+            }
         })
     }
 
@@ -1042,7 +1082,7 @@ mod tests {
 
         assert_eq!(report.started, 2);
         assert_eq!(report.completed, 1);
-        assert_eq!(report.cost_units, 7);
+        assert_eq!(report.cost_units, 8);
         assert_eq!(counters.started.load(Ordering::SeqCst), 2);
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
         assert!(rendered.starts_with("[partial: task 2 failed"));
@@ -1093,7 +1133,7 @@ mod tests {
 
         assert_eq!(report.started, 3);
         assert_eq!(report.completed, 2);
-        assert_eq!(report.cost_units, 10);
+        assert_eq!(report.cost_units, 21);
         assert_eq!(counters.started.load(Ordering::SeqCst), 3);
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
         let success = rendered.find("completed first").unwrap();
@@ -1140,6 +1180,7 @@ mod tests {
         assert_eq!(report.started, 2);
         assert_eq!(report.completed, 1);
         assert!(matches!(report.stop_reason, Some(StopReason::OutputLimit)));
+        assert_eq!(report.cost_units, 2);
         assert!(rendered.starts_with("[partial: aggregate output limit"));
         assert!(rendered.len() <= limits.max_output_bytes);
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
@@ -1181,7 +1222,7 @@ mod tests {
 
         assert_eq!(report.started, 2);
         assert_eq!(report.completed, 1);
-        assert_eq!(report.cost_units, 120);
+        assert_eq!(report.cost_units, 121);
         assert!(matches!(report.stop_reason, Some(StopReason::CostLimit)));
         assert!(rendered.starts_with("[partial: aggregate cost limit"));
         assert!(rendered.contains("[cancelled: aggregate cost limit"));
@@ -1215,6 +1256,7 @@ mod tests {
 
         assert_eq!(report.started, 2);
         assert_eq!(report.completed, 0);
+        assert_eq!(report.cost_units, 2);
         assert!(matches!(report.stop_reason, Some(StopReason::Deadline)));
         assert!(rendered.starts_with("[partial: wall-clock deadline"));
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);

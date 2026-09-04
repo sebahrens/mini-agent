@@ -1126,6 +1126,16 @@ impl MemoryEdit {
         Self { permission, ask_tx }
     }
 }
+
+pub(crate) fn memory_edit_permission_key(args: &MemoryEditArgs) -> String {
+    serde_json::json!({
+        "action": if args.old_str.is_some() { "edit" } else { "delete" },
+        "target": args.target,
+        "name": args.name,
+    })
+    .to_string()
+}
+
 impl Tool for MemoryEdit {
     const NAME: &'static str = "memory_edit";
     type Error = ToolError;
@@ -1165,7 +1175,6 @@ append or overwrite; use this to surgically fix or remove existing content."
             args.target,
             args.old_str.is_some(),
         );
-        check_perm(&self.permission, &self.ask_tx, Self::NAME, &args.target).await?;
         let target = match args.target.as_str() {
             "long_term" => WriteTarget::LongTerm,
             "scratchpad" => WriteTarget::Scratchpad,
@@ -1173,6 +1182,8 @@ append or overwrite; use this to surgically fix or remove existing content."
             "note" => WriteTarget::Note,
             other => return Err(ToolError::Msg(format!("unknown target: {other}"))),
         };
+        let permission_key = memory_edit_permission_key(&args);
+        check_perm(&self.permission, &self.ask_tx, Self::NAME, &permission_key).await?;
         Mem::open()
             .edit(
                 target,

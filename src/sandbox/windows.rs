@@ -80,14 +80,15 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW,
-    CreateMutexW, CreateProcessAsUserW, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess,
-    GetProcessMitigationPolicy, GetProcessTimes, InitializeProcThreadAttributeList, OpenEventW,
-    OpenProcess, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ProcessChildProcessPolicy, ReleaseMutex,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    CreateMutexW, CreateProcessAsUserW, CreateProcessW, EVENT_ALL_ACCESS,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
+    GetExitCodeProcess, GetProcessMitigationPolicy, GetProcessTimes,
+    InitializeProcThreadAttributeList, MUTEX_ALL_ACCESS, OpenEventW, OpenProcess, OpenProcessToken,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    ProcessChildProcessPolicy, ReleaseMutex, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, SetEvent, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use crate::process_creation::StdCommandCreationExt;
@@ -403,12 +404,19 @@ fn attest_owner_only_kernel_object(
         && observed.Trustee.TrusteeForm == TRUSTEE_IS_SID
         && !observed.Trustee.ptstrName.is_null()
         && unsafe { EqualSid(observed.Trustee.ptstrName.cast(), expected_user) } != 0;
-    drop(entries_allocation);
     if !valid {
         return Err(format!(
-            "sandbox: {label} DACL differs from owner-only policy"
+            "sandbox: {label} DACL differs from owner-only policy \
+(mode={}, inheritance=0x{:x}, access=0x{:x}, expected=0x{:x}, trustee_form={}, trustee_null={})",
+            observed.grfAccessMode,
+            observed.grfInheritance,
+            observed.grfAccessPermissions,
+            expected_access,
+            observed.Trustee.TrusteeForm,
+            observed.Trustee.ptstrName.is_null(),
         ));
     }
+    drop(entries_allocation);
     Ok(())
 }
 
@@ -419,7 +427,7 @@ impl AclMutationGuard {
 
     pub(crate) fn acquire_until(deadline: Instant) -> Result<Self, String> {
         let name = wide_string(ACL_MUTEX_NAME);
-        let mut security = OwnerOnlyKernelSecurity::new(GENERIC_ALL, "ACL mutex")?;
+        let mut security = OwnerOnlyKernelSecurity::new(MUTEX_ALL_ACCESS, "ACL mutex")?;
         let attributes = security.attributes();
         let mutex = Handle::created(
             unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) },
@@ -428,7 +436,7 @@ impl AclMutationGuard {
         attest_owner_only_kernel_object(
             mutex.raw(),
             security.user_sid(),
-            GENERIC_ALL,
+            MUTEX_ALL_ACCESS,
             "ACL mutex",
         )?;
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -456,7 +464,7 @@ impl ProfileControlGuard {
     fn acquire_until(deadline: Instant) -> Result<Self, String> {
         ensure_preflight_cleanup_deadline(deadline)?;
         let name = wide_string(PROFILE_CONTROL_MUTEX_NAME);
-        let mut security = OwnerOnlyKernelSecurity::new(GENERIC_ALL, "profile-control mutex")?;
+        let mut security = OwnerOnlyKernelSecurity::new(MUTEX_ALL_ACCESS, "profile-control mutex")?;
         let attributes = security.attributes();
         let mutex = Handle::created(
             unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) },
@@ -465,7 +473,7 @@ impl ProfileControlGuard {
         attest_owner_only_kernel_object(
             mutex.raw(),
             security.user_sid(),
-            GENERIC_ALL,
+            MUTEX_ALL_ACCESS,
             "profile-control mutex",
         )?;
         ensure_preflight_cleanup_deadline(deadline)?;
@@ -4477,7 +4485,7 @@ fn helper_cancel_event_name(pid: u32) -> Vec<u16> {
 
 fn helper_cancel_event() -> Result<Handle, String> {
     let name = helper_cancel_event_name(unsafe { GetCurrentProcessId() });
-    let mut security = OwnerOnlyKernelSecurity::new(GENERIC_ALL, "helper cancellation event")?;
+    let mut security = OwnerOnlyKernelSecurity::new(EVENT_ALL_ACCESS, "helper cancellation event")?;
     let attributes = security.attributes();
     let raw = unsafe { CreateEventW(&attributes, TRUE, FALSE, name.as_ptr()) };
     let creation_error = std::io::Error::last_os_error();
@@ -4485,7 +4493,7 @@ fn helper_cancel_event() -> Result<Handle, String> {
     attest_owner_only_kernel_object(
         event.raw(),
         security.user_sid(),
-        GENERIC_ALL,
+        EVENT_ALL_ACCESS,
         "helper cancellation event",
     )?;
     if creation_error.raw_os_error() == Some(183) {
