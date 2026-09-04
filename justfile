@@ -8,10 +8,10 @@ default:
 # ---- Build ----
 
 build:
-    cargo build --release
+    cargo install --path . --debug
 
 build-all:
-    cargo build --release --all-features
+    cargo install --path . --debug --all-features
 
 run *args:
     cargo run -- {{ args }}

@@ -18,6 +18,8 @@ def extract_version(text: str, version: str) -> str:
             continue
         if found and line.startswith("## ["):
             break
+        if found and re.match(r"^\[[^]]+\]:\s+", line):
+            break
         if found:
             lines.append(line)
 

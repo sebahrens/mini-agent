@@ -51,6 +51,10 @@ APPROVED_RELEASE_ACTIONS = {
         "actions/setup-node",
         "v4.4.0",
     ): "49933ea5288caeca8642d1e84afbd3f7d6820020",
+    (
+        "actions/attest",
+        "v4.2.2",
+    ): "1e69f48acb82d1966a394da916b4c1698aa569d6",
 }
 DISTRIBUTION_NOTICE_FRAGMENTS: dict[str, tuple[str, ...]] = {
     "packaging/homebrew/zerostack.rb": (
@@ -507,6 +511,11 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false',
         'published release $tag already exists; refusing to replace it',
         '"${release_flags[@]}"',
+        "artifact-metadata: write",
+        "attestations: write",
+        "id-token: write",
+        "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+        "subject-path: private-publish/**/*",
     )
     missing_publication_gate = [
         fragment for fragment in publication_fragments if fragment not in publish_release_job
@@ -519,6 +528,7 @@ def validate_workflow(text: str, binary: str) -> list[str]:
     publication_order = (
         "python3 scripts/release_artifacts.py validate-set \\",
         "python3 scripts/release_artifacts.py verify \\",
+        "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
         'gh release create "$tag"',
         "--json assets",
         'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false',
@@ -837,6 +847,12 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             "997b825a69d67022b169f36825632bdbcee296a0",
             "2026-07-27",
             "modified version of ZeroStack",
+            "AJV 8.12.0",
+            "The MIT License (MIT)",
+        ),
+        "editors/vscode/THIRD_PARTY_LICENSES.md": (
+            "ajv` 8.12.0, MIT",
+            "## MIT License (AJV)",
         ),
         "SOURCE.md": (
             "mini-agent-v<VERSION>-source.tar.gz",
@@ -913,6 +929,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         ),
         "packaging/conda/zerostack/build.sh": (
             'install -Dm644 THIRDPARTY.yml "${PREFIX}/THIRDPARTY.yml"',
+            'cargo auditable install --locked --no-track --bins --root "${PREFIX}" --path .',
         ),
         "justfile": (
             "bash scripts/update-release-checksums.sh all",
@@ -922,6 +939,12 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             '--release-tag "v${NEW_VERSION}"',
             "--require-clean",
             "cargo metadata --format-version 1 --no-deps >/dev/null",
+            "cargo install --path . --debug",
+        ),
+        "build.rs": (
+            "is_ignored_build_input(&path)",
+            'name == "__pycache__"',
+            'extension == "pyc" || extension == "pyo"',
         ),
         "scripts/update-release-checksums.sh": (
             CANONICAL_REPOSITORY_URL,
@@ -963,6 +986,9 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             "python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}",
             "--channel aur --channel conda-bin --channel conda-source",
             "--channel homebrew",
+            "bash scripts/test-install-checksums.sh",
+            "npm run package:linux-x64",
+            "npm run sbom",
         ),
         "src/product.rs": (
             f'pub const PUBLIC_NAME: &str = "{binary}";',
@@ -1019,6 +1045,17 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
                 errors.append(
                     f"{relative_path} references noncanonical asset {fragment!r}"
                 )
+    conda_source = (root / "packaging/conda/zerostack/build.sh").read_text(
+        encoding="utf-8"
+    )
+    if "--all-features" in conda_source:
+        errors.append(
+            "packaging/conda/zerostack/build.sh must use the supported default "
+            "feature set, not --all-features"
+        )
+    justfile = (root / "justfile").read_text(encoding="utf-8")
+    if "cargo build" in justfile:
+        errors.append("justfile must use the repository's cargo install build command")
     return errors
 
 

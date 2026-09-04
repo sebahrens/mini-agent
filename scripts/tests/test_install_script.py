@@ -15,6 +15,26 @@ PACKAGER = ROOT / "scripts/package-release-binary.py"
 
 
 class InstallScriptTests(unittest.TestCase):
+    def test_unknown_option_is_a_usage_error(self) -> None:
+        result = subprocess.run(
+            ["bash", str(INSTALLER), "--not-an-option"],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("Unknown option: --not-an-option", result.stderr)
+
+    def test_help_is_successful(self) -> None:
+        result = subprocess.run(
+            ["bash", str(INSTALLER), "--help"],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Usage: install.sh", result.stdout)
+
     def make_fixture(self, directory: str, *, include_notice: bool = True) -> tuple[Path, Path]:
         root = Path(directory)
         release = root / "release"

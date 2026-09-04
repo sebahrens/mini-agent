@@ -79,6 +79,7 @@ jobs:
             scripts.tests.test_package_release_binary \
             scripts.tests.test_package_corresponding_source \
             scripts.tests.test_install_script
+          bash scripts/test-install-checksums.sh
 
       - name: Verify release workflow policy
         run: python3 scripts/check-package-metadata.py
@@ -123,6 +124,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
       - name: Set up pinned Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -133,12 +137,21 @@ jobs:
       - name: Install locked extension dependencies
         run: npm ci --no-audit --no-fund
 
-      - name: Check extension and dependency policy
+      - name: Install native ACP candidate
+        working-directory: .
+        run: |
+          cargo install --path . --debug --locked --root "$RUNNER_TEMP/vscode-native"
+          mkdir -p editors/vscode/bin/linux-x64
+          cp "$RUNNER_TEMP/vscode-native/bin/mini-agent" editors/vscode/bin/linux-x64/mini-agent
+
+      - name: Check, package, and smoke extension candidate
         run: |
           npm run typecheck
           npm run lint
           npm test
           npm audit --audit-level=high
+          npm run package:linux-x64
+          npm run sbom
 
   clippy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')

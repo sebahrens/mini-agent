@@ -36,6 +36,10 @@ class VsCodeCiWorkflowTests(unittest.TestCase):
             "npm run lint",
             "npm test",
             "npm audit --audit-level=high",
+            "cargo install --path . --debug --locked",
+            "cp \"$RUNNER_TEMP/vscode-native/bin/mini-agent\" editors/vscode/bin/linux-x64/mini-agent",
+            "npm run package:linux-x64",
+            "npm run sbom",
         ):
             with self.subTest(command=command):
                 self.assertIn(command, self.body)

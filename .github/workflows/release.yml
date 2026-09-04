@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CANONICAL_BINARY: mini-agent
@@ -618,6 +618,11 @@ jobs:
     name: Publish GitHub release
     needs: [package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]
     runs-on: ubuntu-latest
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
     env:
       RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}
     steps:
@@ -713,6 +718,11 @@ jobs:
             --root private-publish/archive-set \
             --expected-file expected-archives.txt \
             --manifest private-publish/checksums/SHA256SUMS
+
+      - name: Attest complete release candidate
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: private-publish/**/*
 
       - name: Publish release
         env:

@@ -96,6 +96,9 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) {
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
+        if is_ignored_build_input(&path) {
+            continue;
+        }
         let file_type = entry
             .file_type()
             .unwrap_or_else(|error| panic!("failed to inspect {}: {error}", path.display()));
@@ -105,6 +108,13 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+fn is_ignored_build_input(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "__pycache__")
+        || path
+            .extension()
+            .is_some_and(|extension| extension == "pyc" || extension == "pyo")
 }
 
 fn hash_environment(digest: &mut Sha256, key: &str) {

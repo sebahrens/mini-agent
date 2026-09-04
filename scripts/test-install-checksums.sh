@@ -68,7 +68,14 @@ python3 "${ROOT_DIR}/scripts/package-release-binary.py" \
     --binary "${FIXTURE}/${BINARY_NAME}" \
     --archive "${FIXTURE}/${ARCHIVE}" \
     --executable-name "$BINARY_NAME"
-GOOD_HASH=$(sha256sum "${FIXTURE}/${ARCHIVE}" | awk '{print $1}')
+if command -v sha256sum >/dev/null 2>&1; then
+    GOOD_HASH=$(sha256sum "${FIXTURE}/${ARCHIVE}" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+    GOOD_HASH=$(shasum -a 256 "${FIXTURE}/${ARCHIVE}" | awk '{print $1}')
+else
+    echo "Error: no sha256sum or shasum found; cannot build fixture." >&2
+    exit 1
+fi
 
 # Create a valid SHA256SUMS
 printf '%s  %s\n' "$GOOD_HASH" "$ARCHIVE" > "${FIXTURE}/SHA256SUMS"
@@ -81,43 +88,21 @@ run_install() {
     manifest="$1"
     archive="$2"
 
-    # Stub curl to serve local files
-    stub_curl() {
-        local url="${@: -1}"
-        local out_flag=false out_file=""
-        for arg in "$@"; do
-            if [[ "$out_flag" == true ]]; then
-                out_file="$arg"
-                out_flag=false
-            elif [[ "$arg" == "-o" ]]; then
-                out_flag=true
-            fi
-        done
-        if [[ "$url" == */SHA256SUMS ]]; then
-            cp "$manifest" "$out_file" 2>/dev/null || true
-        else
-            cp "$archive" "$out_file" 2>/dev/null || true
-        fi
-    }
-    export -f stub_curl
-
-    # Source install.sh with curl replaced and variables pre-set
+    # Exercise the installer's checksum and extraction sequence with local files.
     (
         set +e
-        # Extract only the checksum + install logic from install.sh
-        # by running it with env vars that bypass the arg parsing and download sections
         TMPDIR="$tmpdir"
+        # shellcheck disable=SC2034 # Consumed by the sourced test body below.
         INSTALL_DIR="$install_dir"
-        BINARY_NAME="$BINARY_NAME"
-        ASSET_NAME="$ASSET_NAME"
+        # shellcheck disable=SC2034 # Consumed by the sourced test body below.
         ARCHIVE_FILE="$ARCHIVE"
-        BASE_URL="file://$FIXTURE"
 
         # Copy files into TMPDIR as curl would
         cp "$archive" "${tmpdir}/${ARCHIVE}"
         cp "$manifest" "${tmpdir}/SHA256SUMS"
 
         # Run just the verify + install portion inline
+        # shellcheck disable=SC1091 # The source is the literal heredoc below.
         source /dev/stdin <<'INNER_EOF'
 MANIFEST="${TMPDIR}/SHA256SUMS"
 if [[ ! -s "$MANIFEST" ]]; then echo "Error: checksum manifest is missing or empty." >&2; exit 1; fi

@@ -162,9 +162,11 @@ jobs cannot silently overwrite the same basename. `scripts/release_artifacts.py`
 extra, duplicate, unsafe, symlinked, or non-regular candidates and writes the LF-terminated
 `SHA256SUMS` in deterministic filename order. The final publication job reconstructs the complete
 candidate set and verifies every archive byte against that manifest before creating the public
-release. It uploads the complete set to a draft, compares the remote asset names with the validated
+release. The final job generates repository-linked SLSA build-provenance attestations for every
+candidate, uploads the complete set to a draft, compares the remote asset names with the validated
 local set, and only then publishes the draft. A rerun removes its stale draft but refuses to replace
-an already-published release for the tag.
+an already-published release for the tag. Consumers can verify a downloaded asset with
+`gh attestation verify <asset> --repo sebahrens/mini-agent`.
 
 ## GPL release checklist
 
@@ -176,6 +178,8 @@ Before treating a release as complete, verify that:
 - the source asset contains the tagged tree, locked vendored dependencies, and offline Cargo config;
 - `SHA256SUMS` covers all binary and source archives;
 - `VSIX_SHA256SUMS` and `MSI_SHA256SUMS` cover the editor and Windows installer artifacts;
+- every published asset has repository-linked SLSA build provenance that `gh attestation verify`
+  accepts;
 - the MSI installs `LICENSE.txt`, `NOTICE.txt`, and `SOURCE.md` beside its binary and VSIX; and
 - the shell installer and downstream recipes install `NOTICE` and `SOURCE.md` alongside the GPL text.
 

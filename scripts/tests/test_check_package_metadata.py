@@ -38,6 +38,8 @@ class ReleaseWorkflowValidationTests(unittest.TestCase):
             "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n"
             "  - uses: taiki-e/install-action@"
             "91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9\n"
+            "  - uses: actions/attest@"
+            "1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2\n"
         )
 
         self.assertEqual(
@@ -480,6 +482,14 @@ steps:
             ("python3 scripts/release_artifacts.py verify \\", "true # skipped verify"),
             ('gh release create "$tag"', 'gh release upload "$tag"'),
             ("release_flags=(--draft --verify-tag)", "release_flags=()"),
+            (
+                "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+                "true # skipped provenance",
+            ),
+            ("subject-path: private-publish/**/*", "subject-path: one-file"),
+            ("artifact-metadata: write", "artifact-metadata: read"),
+            ("attestations: write", "attestations: read"),
+            ("id-token: write", "id-token: none"),
             ("--jq '.assets[].name' | sort", "--jq '.assets[0].name' | sort"),
             (
                 'gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false',

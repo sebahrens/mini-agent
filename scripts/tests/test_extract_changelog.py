@@ -37,6 +37,22 @@ Next.
         with self.assertRaisesRegex(ValueError, "no release notes for 2.0.0"):
             EXTRACT_CHANGELOG.extract_version("## [1.8.0]\n\n- Present.\n", "2.0.0")
 
+    def test_oldest_release_excludes_reference_links(self) -> None:
+        changelog = """# Changelog
+
+## [1.0.0]
+
+- First release.
+
+[Unreleased]: https://example.invalid/compare/v1.0.0...HEAD
+[1.0.0]: https://example.invalid/releases/v1.0.0
+"""
+
+        self.assertEqual(
+            "- First release.\n",
+            EXTRACT_CHANGELOG.extract_version(changelog, "1.0.0"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

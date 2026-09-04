@@ -16,6 +16,7 @@ DEFAULT_DIR="${HOME}/.local/bin"
 REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md")
 
 usage() {
+    local status="${1:-0}"
     cat <<EOF
 Usage: install.sh [--dir <path>] [--release <version>]
 
@@ -25,7 +26,7 @@ Options:
                  Install an exact release (for example, 1.7.2). Defaults to latest.
   --help         Show this message
 EOF
-    exit 0
+    exit "$status"
 }
 
 # ---- parse args ----
@@ -54,7 +55,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1" >&2
-            usage
+            usage 2
             ;;
     esac
 done
